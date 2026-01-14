@@ -1,0 +1,80 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<ApplicationTitle>Sample</ApplicationTitle>
+		<ApplicationId>com.season.sample</ApplicationId>
+		<ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
+		<ApplicationVersion>1</ApplicationVersion>
+
+		<OutputType>Exe</OutputType>
+		<RootNamespace>Sample</RootNamespace>
+		<UseMaui>true</UseMaui>
+		<SingleProject>true</SingleProject>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+		<AndroidPackageFormat>apk</AndroidPackageFormat>
+		<LangVersion>preview</LangVersion>
+		<WindowsAppSDKSelfContained>True</WindowsAppSDKSelfContained>
+
+		<IsAndroid Condition="$(TargetFramework.Contains('android'))">true</IsAndroid>
+		<IsIOS Condition="$(TargetFramework.Contains('ios'))">true</IsIOS>
+		<IsMacCatalyst Condition="$(TargetFramework.Contains('maccatalyst'))">true</IsMacCatalyst>
+		<IsWindows Condition="$(TargetFramework.Contains('windows'))">true</IsWindows>
+		<IsLinux Condition="'$(TargetFramework)' == 'net10.0'">true</IsLinux>
+
+		<TargetFrameworks>net10.0;net10.0-android;net10.0-ios;net10.0-maccatalyst</TargetFrameworks>
+		<RuntimeIdentifiers Condition="'$(IsLinux)' == 'true'">linux-x64;linux-arm64</RuntimeIdentifiers>
+		<TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net10.0-windows10.0.19041.0</TargetFrameworks>
+
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">17.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'maccatalyst'">17.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">29.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</SupportedOSPlatformVersion>
+		<TargetPlatformMinVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</TargetPlatformMinVersion>
+
+		<SelfContained Condition="'$(IsWindows)' == 'true'">True</SelfContained>
+		<WindowsPackageType Condition="'$(IsLinux)' == 'true'">MSIX</WindowsPackageType>
+
+		<DefineConstants Condition="'$(IsLinux)' == 'true'">$(DefineConstants);LINUX;</DefineConstants>
+	</PropertyGroup>
+
+	<PropertyGroup Condition="'$(IsWindows)' == 'true'">
+		<GenerateAppInstallerFile>False</GenerateAppInstallerFile>
+		<AppxPackageSigningEnabled>False</AppxPackageSigningEnabled>
+		<AppxPackageSigningTimestampDigestAlgorithm>SHA256</AppxPackageSigningTimestampDigestAlgorithm>
+		<AppxAutoIncrementPackageRevision>True</AppxAutoIncrementPackageRevision>
+		<AppxSymbolPackageEnabled>False</AppxSymbolPackageEnabled>
+		<GenerateTestArtifacts>True</GenerateTestArtifacts>
+		<HoursBetweenUpdateChecks>0</HoursBetweenUpdateChecks>
+		<GenerateTemporaryStoreCertificate>True</GenerateTemporaryStoreCertificate>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<MauiIcon Include="Resources\AppIcon\appicon.svg" Color="#512BD4" />
+		<MauiSplashScreen Include="Resources\Splash\splash.svg" Color="white" BaseSize="128,128" />
+		<MauiAsset Include="Resources\Raw\**" LogicalName="%(RecursiveDir)%(Filename)%(Extension)" />
+		<PackageReference Include="Microsoft.Maui.Controls" Version="10.0.20" />
+
+		<ProjectReference Include="..\..\src\Season.csproj" />
+	</ItemGroup>
+
+	<ItemGroup Condition="'$(IsLinux)' == 'true'">
+		<Content Include="Resources\Raw\**">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+	</ItemGroup>
+
+	<Target Name="IncludeLinuxFilesForLinuxTarget" BeforeTargets="BeforeCompile" Condition="'$(IsLinux)' == 'true'">
+		<ItemGroup>
+			<Compile Include="Platforms\Linux\**\*.cs" />
+		</ItemGroup>
+	</Target>
+
+	<Target Name="ExcludeLinuxFilesForNonLinuxTargets" AfterTargets="BeforeCompile" Condition="'$(IsLinux)' != 'true'">
+		<ItemGroup>
+			<Compile Remove="Platforms\Linux\**\*.cs" />
+		</ItemGroup>
+	</Target>
+
+</Project>

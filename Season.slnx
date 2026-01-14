@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/samples/">
+    <Project Path="samples/Sample/Sample.csproj">
+      <Deploy Solution="Debug|*" />
+    </Project>
+  </Folder>
+  <Project Path="src/Season.csproj" />
+</Solution>
