@@ -1,10 +1,14 @@
 ﻿
+using Season.Platforms.Linux;
+
 namespace Sample;
 
 internal class Program
 {
-    static unsafe void Main(string[] args)
+    static void Main(string[] args)
     {
-        Season.Platforms.Linux.PlatformApp.Run();
+        var app = new App();
+
+        LinuxApp.Run(app);
     }
 }

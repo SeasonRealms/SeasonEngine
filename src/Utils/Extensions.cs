@@ -1,5 +1,6 @@
 ﻿// Copyright (c) SeasonEngine and contributors.
 // Licensed under the MIT License.
+// https://github.com/SeasonRealms/SeasonEngine
 
 namespace Season.Utils;
 
@@ -67,15 +68,24 @@ public static class Extensions
         return result;
     }
 
-    public static byte[] StreamToBytes(this Stream stream)
+    public static byte[] ReadAllBytes(this Stream stream)
     {
-        using (stream)
+        using (var ms = new MemoryStream())
         {
-            byte[] bytes = new byte[stream.Length];
-            stream.Read(bytes, 0, bytes.Length);
-            stream.Seek(0, SeekOrigin.Begin);
-            return bytes;
+            stream.CopyTo(ms);
+            return ms.ToArray();
         }
     }
+
+    //public static byte[] StreamToBytes(this Stream stream)
+    //{
+    //    using (stream)
+    //    {
+    //        byte[] bytes = new byte[stream.Length];
+    //        stream.Read(bytes, 0, bytes.Length);
+    //        stream.Seek(0, SeekOrigin.Begin);
+    //        return bytes;
+    //    }
+    //}
 
 }

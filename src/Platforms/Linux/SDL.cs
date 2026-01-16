@@ -1,9 +1,8 @@
 ﻿// Copyright (c) SeasonEngine and contributors.
 // Licensed under the MIT License.
+// https://github.com/SeasonRealms/SeasonEngine
 
-using System.Reflection;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 
 namespace Season.Platforms.Linux;
 

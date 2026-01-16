@@ -12,7 +12,8 @@ public partial class App : Microsoft.UI.Xaml.Application
 
     protected override void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
     {
+        var app = new Sample.App();
 
-        PlatformApp.Run();
+        WindowsApp.Run(app);
     }
 }

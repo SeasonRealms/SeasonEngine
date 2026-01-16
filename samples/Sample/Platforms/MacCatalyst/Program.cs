@@ -1,5 +1,5 @@
 ﻿
-using UIKit;
+using Season.Platforms.Shared.Apple;
 
 namespace Sample;
 
@@ -7,7 +7,8 @@ public class Program
 {
     static void Main(string[] args)
     {
+        var app = new App();
 
-        UIApplication.Main(args, null, typeof(Season.Platforms.Shared.Apple.AppDelegate));
+        AppleApp.Run(app);
     }
 }

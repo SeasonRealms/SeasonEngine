@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
 		<PackageId>SeasonEngine</PackageId>
@@ -59,7 +59,7 @@
 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 		</None>
 
-		<None Include="README.md" Pack="true" PackagePath="\"/>
+		<None Include="README.md" Pack="true" PackagePath="\" />
 	</ItemGroup>
 
 	<ItemGroup Condition="'$(IsLinux)' != 'true'">
@@ -92,6 +92,10 @@
 	<ItemGroup Condition="'$(IsIOS)' == 'true'">
 		<PackageReference Include="Jc.GMA.iOS" Version="12.7.0" />
 		<PackageReference Include="Jc.UMP.iOS" Version="2.7.4" />
+	</ItemGroup>
+
+	<ItemGroup>
+	  <Folder Include="Basic\" />
 	</ItemGroup>
 
 	<Target Condition="'$(IsApple)' == 'true'" Name="LinkWithSwift" DependsOnTargets="_ParseBundlerArguments;_DetectSdkLocations" BeforeTargets="_LinkNativeExecutable">
@@ -129,7 +133,7 @@
 
 	<Target Name="IncludeSharedUnixFiles" BeforeTargets="BeforeCompile" Condition="'$(IsUnixLike)' == 'true'">
 		<ItemGroup>
-			<Compile Include="Platforms\Shared\Unix\**\*.cs" />
+			<Compile Include="Platforms\Shared\LinuxAndroid\**\*.cs" />
 		</ItemGroup>
 	</Target>
 
@@ -139,7 +143,7 @@
 		</ItemGroup>
 
 		<ItemGroup Condition="'$(IsUnixLike)' != 'true'">
-			<Compile Remove="Platforms\Shared\Unix\**\*.cs" />
+			<Compile Remove="Platforms\Shared\LinuxAndroid\**\*.cs" />
 		</ItemGroup>
 
 	</Target>
