@@ -1,20 +1,16 @@
 ﻿// Copyright (c) SeasonEngine and contributors.
 // Licensed under the MIT License.
+// https://github.com/SeasonRealms/SeasonEngine
 
-using CoreAnimation;
 using CoreGraphics;
 using Foundation;
-using Metal;
-using MetalKit;
 using ObjCRuntime;
-using System.Diagnostics;
-using System.Numerics;
 using UIKit;
 
 namespace Season.Platforms.Shared.Apple;
 
 [Foundation.Register("AppDelegate")]
-public class AppDelegate : UIKit.UIApplicationDelegate
+public class AppDelegate : UIApplicationDelegate
 {
     public override bool FinishedLaunching(UIKit.UIApplication application, Foundation.NSDictionary launchOptions)
     {

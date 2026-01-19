@@ -32,6 +32,12 @@ internal static class WindowsNative
     [DllImport("user32.dll")]
     internal static extern bool SetForegroundWindow(IntPtr hWnd);
 
+    [DllImport("user32.dll", CharSet = CharSet.Ansi)]
+    internal static extern int EnumDisplaySettings(string? lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode);
+
+    [DllImport("user32.dll", CharSet = CharSet.Ansi)]
+    internal static extern int ChangeDisplaySettings(ref DEVMODE lpDevMode, uint dwFlags);
+
     [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     internal static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
 
@@ -59,4 +65,41 @@ internal static class WindowsNative
 
     [DllImport("winmm.dll", EntryPoint = "PlaySound")]
     internal static extern int PlaySound(string lpxzName, int hModul, int dwFlags);
+}
+
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+struct DEVMODE
+{
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+    public string dmDeviceName;
+    public ushort dmSpecVersion;
+    public ushort dmDriverVersion;
+    public ushort dmSize;
+    public ushort dmDriverExtra;
+    public uint dmFields;
+    public int dmPositionX;
+    public int dmPositionY;
+    public uint dmDisplayOrientation;
+    public uint dmDisplayFixedOutput;
+    public short dmColor;
+    public short dmDuplex;
+    public short dmYResolution;
+    public short dmTTOption;
+    public short dmCollate;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+    public string dmFormName;
+    public ushort dmLogPixels;
+    public uint dmBitsPerPel;
+    public uint dmPelsWidth;
+    public uint dmPelsHeight;
+    public uint dmDisplayFlags;
+    public uint dmDisplayFrequency;
+    public uint dmICMMethod;
+    public uint dmICMIntent;
+    public uint dmMediaType;
+    public uint dmDitherType;
+    public uint dmReserved1;
+    public uint dmReserved2;
+    public uint dmPanningWidth;
+    public uint dmPanningHeight;
 }

@@ -58,8 +58,6 @@
 			<PackagePath>runtimes/%(RecursiveDir)%(Filename)%(Extension)</PackagePath>
 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 		</None>
-
-		<None Include="README.md" Pack="true" PackagePath="\" />
 	</ItemGroup>
 
 	<ItemGroup Condition="'$(IsLinux)' != 'true'">
@@ -92,10 +90,6 @@
 	<ItemGroup Condition="'$(IsIOS)' == 'true'">
 		<PackageReference Include="Jc.GMA.iOS" Version="12.7.0" />
 		<PackageReference Include="Jc.UMP.iOS" Version="2.7.4" />
-	</ItemGroup>
-
-	<ItemGroup>
-	  <Folder Include="Basic\" />
 	</ItemGroup>
 
 	<Target Condition="'$(IsApple)' == 'true'" Name="LinkWithSwift" DependsOnTargets="_ParseBundlerArguments;_DetectSdkLocations" BeforeTargets="_LinkNativeExecutable">

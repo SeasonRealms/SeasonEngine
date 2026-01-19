@@ -10,7 +10,6 @@ namespace Season.Platforms.Windows;
 
 public static class WindowsApp
 {
-    internal static BaseApp App;
 
     internal static Microsoft.UI.Xaml.Window Window = null;
 
@@ -20,9 +19,8 @@ public static class WindowsApp
 
     public static void Run(BaseApp app)
     {
-        App = app;
-
         DeviceServices.Initialize(
+            baseApp: app,
             core: new WindowsDeviceCore(), 
             media: new WindowsMediaPlayer(), 
             dialog: new WindowsDialogService(), 
@@ -31,6 +29,7 @@ public static class WindowsApp
             record: new WindowsRecordService(), 
             download: new WindowsDownloadService(),
             store: new WindowsStoreService(),
+            null,
             windowsFeatures: new WindowsFeatures());
 
         Window = new Microsoft.UI.Xaml.Window();
@@ -54,6 +53,7 @@ public static class WindowsApp
         var displayArea = Microsoft.UI.Windowing.DisplayArea.Primary;
 
         AppWindow.SetIcon(@"favicon.ico");
+
         AppWindow.SetPresenter(Microsoft.UI.Windowing.AppWindowPresenterKind.Default);
 
         AppWindow.MoveAndResize(new RectInt32((displayArea.WorkArea.Width - displayArea.WorkArea.Width / 2) / 2, (displayArea.WorkArea.Height - displayArea.WorkArea.Height / 2) / 2, displayArea.WorkArea.Width / 2, displayArea.WorkArea.Height / 2));

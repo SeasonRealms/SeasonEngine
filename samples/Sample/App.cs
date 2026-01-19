@@ -3,19 +3,20 @@ namespace Sample;
 
 internal class App : BaseApp
 {
-    public string Title { get; set; } = "Sample";
-
-    public bool FullScreen { get; set; } = false;
-
-    public bool HideSystemBars { get; set; } = false;
-
     internal App()
     {
+        Title = "Sample";
 
+        FullScreen = false;
+
+        HideSystemBars = false;
+
+        BasicResolution = new Vector2(1280, 720);
     }
 
     public override async void Create()
     {
+        base.Create();
 
     }
 

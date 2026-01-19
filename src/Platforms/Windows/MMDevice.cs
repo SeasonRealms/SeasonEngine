@@ -71,9 +71,9 @@ interface IAudioEndpointVolumeNative
     [PreserveSig] int UnregisterControlChangeNotify(IntPtr pNotify);
     [PreserveSig] int GetChannelCount(out int pnChannelCount);
     [PreserveSig] int SetMasterVolumeLevel(float fLevelDB, ref Guid eventContext);
-    [PreserveSig] int SetMasterVolumeLevelScalar(float fLevel, ref Guid eventContext); // 索引必须是 4
+    [PreserveSig] int SetMasterVolumeLevelScalar(float fLevel, ref Guid eventContext); //be 4
     [PreserveSig] int GetMasterVolumeLevel(out float pfLevelDB);
-    [PreserveSig] int GetMasterVolumeLevelScalar(out float pfLevel); // 索引必须是 6
+    [PreserveSig] int GetMasterVolumeLevelScalar(out float pfLevel); //be 6
     [PreserveSig] int SetChannelVolumeLevel(uint nChannel, float fLevelDB, ref Guid eventContext);
     [PreserveSig] int SetChannelVolumeLevelScalar(uint nChannel, float fLevel, ref Guid eventContext);
     [PreserveSig] int GetChannelVolumeLevel(uint nChannel, out float pfLevelDB);

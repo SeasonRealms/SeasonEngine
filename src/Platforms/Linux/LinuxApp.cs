@@ -10,11 +10,22 @@ namespace Season.Platforms.Linux;
 
 public static class LinuxApp
 {
-    internal static BaseApp App;
 
     public static unsafe void Run(BaseApp app)
     {
-        App = app;
+        DeviceServices.Initialize(
+            baseApp: app,
+            core: new LinuxDeviceCore(),
+            media: new LinuxMediaPlayer(),
+            dialog: new LinuxDialogService(),
+            file: new LinuxFileService(),
+            gallery: new LinuxGalleryService(),
+            record: new LinuxRecordService(),
+            download: new LinuxDownloadService(),
+            store: new LinuxStoreService(),
+            ads: null,
+            windowsFeatures: null
+        );
 
         Gtk.Application.Init();
 
@@ -35,7 +46,7 @@ public static class LinuxApp
         int width = 1280;
         int height = 720;
 
-        SDL.CreateWindow("Sample", width, height, WindowFlags.Vulkan);
+        SDL.CreateWindow(app.Title, width, height, WindowFlags.Vulkan);
 
         while (true)
         {

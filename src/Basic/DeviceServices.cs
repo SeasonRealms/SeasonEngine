@@ -6,6 +6,8 @@ namespace Season.Basic;
 
 public static class DeviceServices
 {
+    public static BaseApp BaseApp { get; set; }
+
     public static IDeviceCore Core { get; private set; }
 
     public static IMediaPlayer Media { get; private set; }
@@ -22,9 +24,11 @@ public static class DeviceServices
 
     public static IStoreService Store { get; private set; }
 
+    public static IAds Ads { get; set; }
+
     public static IWindowsFeatures WindowsFeatures { get; private set; }
 
-    public static void Initialize(IDeviceCore core, IMediaPlayer media, IDialogService dialog, IFileService file, IGalleryService gallery, IRecordService record, IDownloadService download, IStoreService store, IWindowsFeatures windowsFeatures)
+    public static void Initialize(BaseApp baseApp, IDeviceCore core, IMediaPlayer media, IDialogService dialog, IFileService file, IGalleryService gallery, IRecordService record, IDownloadService download, IStoreService store, IAds ads, IWindowsFeatures windowsFeatures)
     {
         Core = core;
 
@@ -42,50 +46,10 @@ public static class DeviceServices
 
         Store = store;
 
+        Ads = ads;
+
         WindowsFeatures = windowsFeatures;
     }
-}
-
-public abstract class BaseApp
-{
-    public string Title { get; set; }
-
-    public bool FullScreen { get; set; }
-
-    public bool HideSystemBars { get; set; }
-
-    public virtual async void Create()
-    {
-
-    }
-}
-
-public enum Platform
-{
-    Windows,
-    Linux,
-    MacCatalyst,
-    Android,
-    iOS
-}
-
-public enum Channel
-{
-    None,
-    Microsoft,
-    Google,
-    Apple
-}
-
-public enum FileType
-{
-    None,
-    Image,
-    Video,
-    Audio,
-    File,
-    Link,
-    Font
 }
 
 public interface IDeviceCore
@@ -94,13 +58,19 @@ public interface IDeviceCore
 
     Channel Channel { get; }
 
+    Orientation Orientation { get; set; }
+
     string GetLocalIP();
 
-    Stream LoadFile(string res);
+    string LoadFilePath(string res);
 
     bool LoadFileExists(string res);
 
+    Stream LoadFile(string res);
+
     bool IsDarkMode();
+
+    Task<bool> RequestPermissionAsync(string[] permissions);
 }
 
 public interface IMediaPlayer
@@ -134,82 +104,6 @@ public interface IFileService
     Task<string> OpenFile(string name, string category, byte[] bytes);
 
     Task<bool> OpenLink(string name);
-}
-
-public class SeasonTask
-{
-    public string ID { get; set; }
-
-    public List<TaskFile> Files = null;
-
-    public Object Object = null;
-
-    public Action<string[]> Task = null;
-
-    public AsyncCallback Finish = null;
-
-    public DownloadColumns DownloadColumns;
-
-    public string[] Messages = null;
-
-    public string Status = null;
-
-    public CancellationTokenSource CancellationTokenSource = null;
-
-    public SeasonTask()
-    {
-
-    }
-
-    public void Start(string[] mes)
-    {
-        if (Task != null)
-        {
-            Task.Invoke(mes);
-        }
-    }
-
-    public void Complete()
-    {
-        if (Finish != null)
-        {
-            Finish.Invoke(null);
-        }
-    }
-
-    public void StartAsync()
-    {
-        if (Task != null)
-        {
-            Task.BeginInvoke(null, null, null);
-        }
-
-        if (Finish != null)
-        {
-            Finish.BeginInvoke(null, null, null);
-        }
-    }
-
-    public void Cancel()
-    {
-        if (Finish != null)
-        {
-            Finish.Invoke(null);
-        }
-    }
-}
-
-public class TaskFile
-{
-    public string Name = null;
-
-    public string Ext = null;
-
-    public string Text = null;
-
-    public byte[] Bytes = null;
-
-    public Stream Stream = null;
 }
 
 public interface IGalleryService
@@ -256,42 +150,6 @@ public enum MediaAssetType
 {
     Image, Video, File, Unknown
 }
-
-public class DownloadColumns
-{
-    public string Id { get; set; }
-
-    public string Title { get; set; }
-
-    public string Desc { get; set; }
-
-    public string Type { get; set; }
-
-    public string MediaType { get; set; }
-
-    public string LocalUri { get; set; }
-
-    public DateTime PreTime { get; set; }
-
-    public long PreAlready { get; set; }
-
-    public long Already { get; set; }
-
-    public long TotalSize { get; set; }
-
-    public long Progress { get; set; }
-
-    public long Speed { get; set; }
-
-    public string Time { get; set; }
-
-    public string Status { get; set; }
-
-    public int Current { get; set; }
-
-    public int Total { get; set; }
-}
-
 
 public interface IRecordService
 {
@@ -342,6 +200,41 @@ public interface IDownloadService
     void DownloadCancel(string requestId);
 }
 
+public class DownloadColumns
+{
+    public string Id { get; set; }
+
+    public string Title { get; set; }
+
+    public string Desc { get; set; }
+
+    public string Type { get; set; }
+
+    public string MediaType { get; set; }
+
+    public string LocalUri { get; set; }
+
+    public DateTime PreTime { get; set; }
+
+    public long PreAlready { get; set; }
+
+    public long Already { get; set; }
+
+    public long TotalSize { get; set; }
+
+    public int Progress { get; set; }
+
+    public int Speed { get; set; }
+
+    public string Time { get; set; }
+
+    public string Status { get; set; }
+
+    public int Current { get; set; }
+
+    public int Total { get; set; }
+}
+
 public class Product
 {
     public string StoreId { get; set; }
@@ -368,71 +261,51 @@ public interface IStoreService
     Task<(int version, string desc)> CheckForUpdates();
 }
 
-public class IconInfo
+public interface IAds
 {
-    public string ID { get; set; }
+    string AdUnit { get; set; }
 
-    public string Name { get; set; }
+    string InitAd();
 
-    public string Desc { get; set; }
+    Task<string> LoadAd();
 
-    public string Icon { get; set; }
-
-    public string Image { get; set; }
-
-    public string Version { get; set; }
-
-    public string Publisher { get; set; }
-
-    public string Path { get; set; }
+    Task<string> ShowAd();
 }
 
-public interface IWindowsFeatures
+public enum Platform
 {
-    bool IsActive(out DateTime? lastTime);
-
-    Task<bool> IsAutoStartEnabled(string taskId);
-
-    Task<(bool?, string)> SetAutoStart(string taskId, bool enable);
-
-    void OpenTaskbarSettings();
-
-    void SetBlockingKeys(bool block);
-
-    string ExtractIcon(string file);
-
-    List<System.Diagnostics.Process> GetChildProcesses(System.Diagnostics.Process parentProcess);
-
-    System.Diagnostics.Process GetForegroundProcess();
-
-    Shortcut? ReadLnkFile(string file);
-
-    string ConvertIcon(string icon);
-
-    int GetVolume();
-
-    bool SetVolume(int volume);
-
-    bool SetForeground(string title);
-
-    List<IconInfo> ListApps(List<string> ids, bool copyLogo);
-
-    void Shutdown();
-
-    void Reboot();
-
-    (bool, int, int) GetLockScreens(out string errMsg);
+    None,
+    Windows,
+    Linux,
+    MacCatalyst,
+    Android,
+    iOS
 }
 
-public struct Shortcut
+public enum Channel
 {
-    public string Name { get; set; } // 名称
+    None,
+    Microsoft,
+    Google,
+    Apple
+}
 
-    public string TargetPath { get; set; } // 目标路径
+public enum FileType
+{
+    None,
+    Image,
+    Video,
+    Audio,
+    File,
+    Link,
+    Font
+}
 
-    public string Arguments { get; set; } // 启动参数
-
-    public string WorkingDirectory { get; set; } // 工作目录
-
-    public string IconLocation { get; set; } // 图标位置
+public enum Orientation
+{
+    Unknown,
+    Portrait,
+    PortraitUpsideDown,
+    LandscapeLeft,
+    LandscapeRight
 }

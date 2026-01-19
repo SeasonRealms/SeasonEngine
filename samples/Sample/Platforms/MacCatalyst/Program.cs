@@ -1,5 +1,5 @@
 ﻿
-using Season.Platforms.Shared.Apple;
+using Season.Platforms.MacCatalyst;
 
 namespace Sample;
 
@@ -9,6 +9,6 @@ public class Program
     {
         var app = new App();
 
-        AppleApp.Run(app);
+        MacCatalystApp.Run(app);
     }
 }

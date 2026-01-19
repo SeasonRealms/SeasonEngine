@@ -13,11 +13,26 @@ namespace Season.Platforms.Android;
 
 public static class AndroidApp
 {
-    internal static BaseApp App;
+
+    public static Activity MainActivity = null;
+
+    public static SurfaceViewVulkan surfaceViewVulkan;
 
     public static void Run(BaseApp app)
     {
-        App = app;
+        DeviceServices.Initialize(
+            baseApp: app,
+            core: new AndroidDeviceCore(),
+            media: new AndroidMediaPlayer(),
+            dialog: new AndroidDialogService(),
+            file: new AndroidFileService(),
+            gallery: new AndroidGalleryService(),
+            record: new AndroidRecordService(),
+            download: new AndroidDownloadService(),
+            store: new AndroidStoreService(),
+            ads: new AndroidAds(),
+            windowsFeatures: null
+        );
     }
 }
 
@@ -40,9 +55,11 @@ public class BaseActivity : Activity
         try
         {
             var insetsController = base.Window.InsetsController;
+
             if (insetsController != null)
             {
                 insetsController.Hide(WindowInsets.Type.StatusBars() | WindowInsets.Type.NavigationBars());
+
                 insetsController.SystemBarsBehavior = (int)WindowInsetsControllerBehavior.ShowTransientBarsBySwipe;
             }
 
@@ -80,5 +97,20 @@ public class BaseActivity : Activity
     {
 
         base.OnRequestPermissionsResult(requestCode, permissions, grantResults);
+    }
+}
+
+public class SurfaceViewVulkan : SurfaceView
+{
+    public event Action SurfaceViewCreated;
+
+    public SurfaceViewVulkan(Context context) : base(context)
+    {
+
+    }
+
+    public void SurfaceCreated(ISurfaceHolder holder)
+    {
+        SurfaceViewCreated?.Invoke();
     }
 }

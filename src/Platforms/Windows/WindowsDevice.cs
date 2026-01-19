@@ -5,7 +5,6 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
 using Windows.Media.Core;
 using Windows.Media.Playback;
 using Windows.Services.Store;
@@ -19,6 +18,82 @@ internal class WindowsDeviceCore : IDeviceCore
     public Basic.Platform Platform => Basic.Platform.Windows;
 
     public Channel Channel { get; set; } = Channel.Microsoft;
+
+    public Orientation Orientation
+    {
+        get
+        {
+            try
+            {
+                DEVMODE dm = new DEVMODE();
+                dm.dmSize = (ushort)Marshal.SizeOf(typeof(DEVMODE));
+
+                if (WindowsNative.EnumDisplaySettings(null, ENUM_CURRENT_SETTINGS, ref dm) != 0)
+                {
+                    return dm.dmDisplayOrientation switch
+                    {
+                        0 => Orientation.LandscapeLeft,   // DMDO_DEFAULT
+                        1 => Orientation.Portrait,        // DMDO_90
+                        2 => Orientation.LandscapeRight,  // DMDO_180
+                        3 => Orientation.PortraitUpsideDown, // DMDO_270
+                        _ => Orientation.LandscapeLeft
+                    };
+                }
+            }
+            catch (Exception ex)
+            {
+                // Ignore
+            }
+            return Orientation.LandscapeLeft;
+        }
+        set
+        {
+            try
+            {
+                int orientation = value switch
+                {
+                    Orientation.LandscapeLeft => 0,   // DMDO_DEFAULT
+                    Orientation.Portrait => 1,        // DMDO_90
+                    Orientation.LandscapeRight => 2,  // DMDO_180
+                    Orientation.PortraitUpsideDown => 3, // DMDO_270
+                    _ => -1
+                };
+
+                if (orientation != -1)
+                {
+                    DEVMODE dm = new DEVMODE();
+                    dm.dmSize = (ushort)Marshal.SizeOf(typeof(DEVMODE));
+
+                    if (WindowsNative.EnumDisplaySettings(null, ENUM_CURRENT_SETTINGS, ref dm) != 0)
+                    {
+                        bool isCurrentPortrait = dm.dmDisplayOrientation == 1 || dm.dmDisplayOrientation == 3;
+                        bool isTargetPortrait = orientation == 1 || orientation == 3;
+
+                        if (isCurrentPortrait != isTargetPortrait)
+                        {
+                            uint temp = dm.dmPelsWidth;
+                            dm.dmPelsWidth = dm.dmPelsHeight;
+                            dm.dmPelsHeight = temp;
+                        }
+
+                        dm.dmDisplayOrientation = (uint)orientation;
+                        dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYORIENTATION;
+
+                        WindowsNative.ChangeDisplaySettings(ref dm, 0);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                StorageService.Log("WindowsDevice", $"Failed to set orientation: {ex.Message}");
+            }
+        }
+    }
+
+    const int ENUM_CURRENT_SETTINGS = -1;
+    const uint DM_DISPLAYORIENTATION = 0x00000080;
+    const uint DM_PELSWIDTH = 0x00080000;
+    const uint DM_PELSHEIGHT = 0x00100000;
 
     public string GetLocalIP()
     {
@@ -50,7 +125,7 @@ internal class WindowsDeviceCore : IDeviceCore
         return ipAddress;
     }
 
-    string LoadFilePath(string res)
+    public string LoadFilePath(string res)
     {
         var location = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
 
@@ -59,18 +134,18 @@ internal class WindowsDeviceCore : IDeviceCore
         return file;
     }
 
-    public Stream LoadFile(string res)
-    {
-        var file = LoadFilePath(res);
-
-        return File.OpenRead(file);
-    }
-
     public bool LoadFileExists(string res)
     {
         var file = LoadFilePath(res);
 
         return File.Exists(file);
+    }
+
+    public Stream LoadFile(string res)
+    {
+        var file = LoadFilePath(res);
+
+        return File.OpenRead(file);
     }
 
     public bool IsDarkMode()
@@ -83,6 +158,13 @@ internal class WindowsDeviceCore : IDeviceCore
 
         double luminance = (0.2126 * color.R + 0.7152 * color.G + 0.0722 * color.B) / 255.0;
         return luminance < 0.5;
+    }
+
+    public async Task<bool> RequestPermissionAsync(string[] permissions)
+    {
+        // Windows permissions are usually handled via app manifest or at runtime by the system.
+        // For simplicity, we assume permissions are granted.
+        return await Task.FromResult(true);
     }
 }
 
@@ -792,7 +874,7 @@ internal class WindowsDownloadService : IDownloadService
 
     public string Download(string url)
     {
-        var id = DateTime.Now.ToDateTimeSeconds();
+        var id = DateTime.Now.ToDateTimeMilliseconds();
 
         var fileName = Path.GetFileName(url);
 
@@ -832,7 +914,7 @@ internal class WindowsDownloadService : IDownloadService
             {
                 time -= 0.1f;
 
-                downloadColumns.Speed = (downloadColumns.Already - preAlready) * 10;
+                downloadColumns.Speed = (int)(downloadColumns.Already - preAlready) * 10;
 
                 preAlready = downloadColumns.Already;
             }
@@ -841,7 +923,7 @@ internal class WindowsDownloadService : IDownloadService
 
             }
 
-            downloadColumns.Progress = (long)percent;
+            downloadColumns.Progress = (int)percent;
 
             downloadColumns.Status = percent == 100f ? "Successful" : "Running";   //Paused   Pending  Running  Successful  Failed
         };
@@ -967,144 +1049,3 @@ internal class WindowsDownloadService : IDownloadService
     }
 }
 
-internal class WindowsStoreService : IStoreService
-{
-    public async Task<Product> Query(string storeId)
-    {
-        var product = new Product();
-
-        string[] filterList = new string[] { "Consumable", "Durable", "UnmanagedConsumable" };
-
-        var addOns = await WindowsApp.StoreContext.GetAssociatedStoreProductsAsync(filterList);
-
-        if (addOns.ExtendedError != null)
-        {
-            if (addOns.ExtendedError.HResult == IAP_E_UNEXPECTED)
-            {
-                product.Message = "This sample has not been properly configured.";
-            }
-            else
-            {
-                product.Message = $"ExtendedError: {addOns.ExtendedError.Message}";
-            }
-        }
-        else if (addOns.Products.Count == 0)
-        {
-            var description = "Add-Ons";
-
-            product.Message = $"No configured {description} found for this Store Product.";
-        }
-        else
-        {
-            var addOn = addOns.Products.Values.FirstOrDefault(pro => pro.StoreId == storeId);
-
-            if (addOn is null)
-            {
-                product.Message = $"Can't find {storeId}.";
-            }
-            else
-            {
-                product.StoreId = storeId;
-                product.Title = addOn.Title;
-                product.Type = addOn.ProductKind;
-                product.Price = addOn.Price.FormattedPrice;
-                product.InCollection = addOn.IsInUserCollection;
-            }
-        }
-
-        return product;
-    }
-
-    const int IAP_E_UNEXPECTED = unchecked((int)0x803f6107);
-
-    public async Task<string> Purchase(string storeId, Action<string> onResult)
-    {
-        var result = await WindowsApp.StoreContext.RequestPurchaseAsync(storeId);
-
-        var message = "";
-
-        if (result.ExtendedError is null)
-        {
-            if (result.Status is StorePurchaseStatus.AlreadyPurchased)
-            {
-                message = $"You already bought this AddOn.";
-            }
-            else if (result.Status is StorePurchaseStatus.Succeeded)
-            {
-                message = storeId;
-            }
-            else if (result.Status is StorePurchaseStatus.NotPurchased)
-            {
-                message = $"Product was not purchased, it may have been canceled.";
-            }
-            else if (result.Status is StorePurchaseStatus.NetworkError)
-            {
-                message = $"Product was not purchased due to a network error.";
-            }
-            else if (result.Status is StorePurchaseStatus.ServerError)
-            {
-                message = $"Product was not purchased due to a server error.";
-            }
-            else
-            {
-                message = $"Product was not purchased due to an unknown error.";
-            }
-        }
-        else
-        {
-            if (result.ExtendedError.HResult is IAP_E_UNEXPECTED)
-            {
-                message = "This sample has not been properly configured.";
-            }
-            else
-            {
-                message = $"ExtendedError: {result.ExtendedError.Message}";
-            }
-        }
-
-        return message;
-    }
-
-    public async Task<string> Review(string product)
-    {
-        var result = "";
-
-        try
-        {
-            await Launcher.OpenAsync(new Uri($"ms-windows-store://review/?ProductId={product}"));
-
-            //var review = await StoreContext.RequestRateAndReviewAppAsync();
-            //result = review.Status switch
-            //{
-            //    StoreRateAndReviewStatus.Succeeded => "Success",
-            //    StoreRateAndReviewStatus.CanceledByUser => "Cancel",
-            //    StoreRateAndReviewStatus.NetworkError => "Error",
-            //    StoreRateAndReviewStatus.Error => "Error"
-            //};
-        }
-        catch (Exception ex)
-        {
-
-        }
-
-        return result;
-    }
-
-    public async Task<(int version, string desc)> CheckForUpdates()
-    {
-        var version = 0;
-        var desc = "";
-
-        var context = StoreContext.GetDefault();
-        var updates = await context.GetAppAndOptionalStorePackageUpdatesAsync();
-
-        if (updates?.Count > 0)
-        {
-            var package = updates[0].Package;
-            version = package.Id.Version.Build;
-            desc = package.Description;
-        }
-
-        return (version, desc);
-    }
-}

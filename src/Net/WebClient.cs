@@ -55,7 +55,7 @@ public static class WebClient
 
         result = await HttpUpload(url, keyValues, keyFiles, task);
 
-        //result = text.GZipDecompressString();  // EncryptionHelper.Decrypt(text.GZipDecompressString(), des3Key, des3Salt);
+        //Consider decompression and decryption in the future
 
         return result;
     }
@@ -89,8 +89,7 @@ public static class WebClient
         }
 
         var progressContent = new ProgressableStreamContent(
-            innerContent,
-            5 * 4096,
+            innerContent, 5 * 4096,
             (sent, total) =>
             {
                 if (task == null)
