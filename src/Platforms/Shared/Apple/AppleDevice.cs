@@ -230,7 +230,7 @@ internal class AppleDialogService : IDialogService
         {
             var alertController = new UIViewController();
 
-            var width = Basic.Device.Width - 50;
+            var width = DeviceServices.BaseApp.DeviceResolution.X - 50;
 
             var textView = new UITextView(new CGRect(new CGPoint(20, 20), new CGSize(width, 350)));
 

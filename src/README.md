@@ -2,6 +2,8 @@
 
 A cross-platform application framework built for understanding and rapid development.
 
+Samples: https://github.com/SeasonRealms/SeasonEngine
+
 ## Overview
 
 SeasonEngine provides a unified abstraction layer for building applications that run seamlessly across **Windows**, **Linux**, **macOS**, **Android**, and **iOS**. It handles platform-specific implementations behind clean interfaces, allowing developers to focus on application logic rather than platform differences.

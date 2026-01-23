@@ -2,7 +2,7 @@
 
 	<PropertyGroup>
 		<PackageId>SeasonEngine</PackageId>
-		<Version>0.0.2</Version>
+		<Version>0.0.3</Version>
 		<Authors>SeasonRealms</Authors>
 		<Description>A Graphics Engine Built for Understanding</Description>
 		<Product>SeasonEngine</Product>
@@ -46,11 +46,13 @@
 	</PropertyGroup>
 
 	<ItemGroup>
-		<PackageReference Include="System.Runtime.Caching" Version="10.0.1" />
+		<PackageReference Include="System.Runtime.Caching" Version="10.0.2" />
 		<PackageReference Include="StbImageSharp" Version="2.30.15" />
 		<PackageReference Include="FontStashSharp.Rasterizers.StbTrueTypeSharp" Version="1.2.2" />
 		<PackageReference Include="SharpGLTF.Core" Version="1.0.6" />
 		<PackageReference Include="SharpGLTF.Toolkit" Version="1.0.6" />
+
+		<None Include="README.md" Pack="true" PackagePath="\" />
 
 		<None Include="Platforms/Linux/runtimes/linux-*/**/*">
 			<Link>runtimes\%(RecursiveDir)%(Filename)%(Extension)</Link>
@@ -61,7 +63,7 @@
 	</ItemGroup>
 
 	<ItemGroup Condition="'$(IsLinux)' != 'true'">
-		<PackageReference Include="Microsoft.Maui.Controls" Version="10.0.20" />
+		<PackageReference Include="Microsoft.Maui.Controls" Version="10.0.30" />
 		<PackageReference Include="Xamarin.Build.Download" Version="0.11.4" />
 	</ItemGroup>
 
@@ -69,7 +71,7 @@
 		<Content Include="Platforms\Windows\runtimes\**">
 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 		</Content>
-		<PackageReference Include="System.Drawing.Common" Version="10.0.1" />
+		<PackageReference Include="System.Drawing.Common" Version="10.0.2" />
 		<PackageReference Include="Silk.NET.Direct3D12" Version="2.22.0" />
 		<PackageReference Include="Silk.NET.Direct3D.Compilers" Version="2.22.0" />
 	</ItemGroup>

@@ -30,6 +30,8 @@ public static class DeviceServices
 
     public static void Initialize(BaseApp baseApp, IDeviceCore core, IMediaPlayer media, IDialogService dialog, IFileService file, IGalleryService gallery, IRecordService record, IDownloadService download, IStoreService store, IAds ads, IWindowsFeatures windowsFeatures)
     {
+        BaseApp = baseApp;
+
         Core = core;
 
         Media = media;
