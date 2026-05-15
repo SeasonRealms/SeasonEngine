@@ -22,6 +22,7 @@ jobs:
       ANDROID_NDK_VERSION: 26.3.11579264
       ANDROID_API_LEVEL: 21
       SHADERC_DIR: shaderc
+      BUILD_DIR: shaderc/build/android-arm64-v8a
 
     steps:
       - name: Checkout current repo
@@ -38,7 +39,9 @@ jobs:
             ninja-build \
             unzip \
             wget \
-            bison
+            bison \
+            file \
+            binutils
 
       - name: Setup Java
         uses: actions/setup-java@v5
@@ -60,8 +63,9 @@ jobs:
       - name: Accept Android licenses and install NDK
         run: |
           yes | sdkmanager --licenses
-          sdkmanager "ndk;${ANDROID_NDK_VERSION}"
+          sdkmanager "platforms;android-${ANDROID_API_LEVEL}" "ndk;${ANDROID_NDK_VERSION}"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
 
       - name: Clone shaderc
         run: |
@@ -76,13 +80,12 @@ jobs:
 
       - name: Configure shaderc for Android arm64-v8a
         run: |
-          cmake -S "${SHADERC_DIR}" -B "${SHADERC_DIR}/build/android-arm64-v8a" -G Ninja \
+          cmake -S "${SHADERC_DIR}" -B "${BUILD_DIR}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_SYSTEM_NAME=Android \
-            -DCMAKE_ANDROID_NDK="${ANDROID_NDK_HOME}" \
-            -DCMAKE_ANDROID_ARCH_ABI=arm64-v8a \
-            -DCMAKE_ANDROID_API="${ANDROID_API_LEVEL}" \
-            -DCMAKE_ANDROID_STL_TYPE=c++_shared \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-${ANDROID_API_LEVEL} \
+            -DANDROID_STL=c++_shared \
             -DCMAKE_SKIP_INSTALL_RULES=ON \
             -DSHADERC_SKIP_INSTALL=ON \
             -DSHADERC_SKIP_TESTS=ON \
@@ -94,23 +97,49 @@ jobs:
 
       - name: Build shaderc_shared
         run: |
-          cmake --build "${SHADERC_DIR}/build/android-arm64-v8a" --target shaderc_shared --config Release -j
+          cmake --build "${BUILD_DIR}" --target shaderc_shared --config Release -j
+
+      - name: Inspect generated libraries
+        run: |
+          echo "Generated shaderc_shared candidates:"
+          find "${BUILD_DIR}" -name "libshaderc_shared.so" -print || true
+
+          echo "Generated shared libraries:"
+          find "${BUILD_DIR}" -name "*.so" -print | sort || true
 
       - name: Prepare artifacts
         run: |
           mkdir -p out/arm64-v8a
-          find "${SHADERC_DIR}/build/android-arm64-v8a" -name "libshaderc_shared.so" -exec cp {} out/arm64-v8a/ \;
 
-          if [ ! -f "out/arm64-v8a/libshaderc_shared.so" ]; then
+          SO_PATH="$(find "${BUILD_DIR}" -name "libshaderc_shared.so" | head -n 1)"
+          if [ -z "${SO_PATH}" ]; then
             echo "libshaderc_shared.so not found"
-            find "${SHADERC_DIR}/build/android-arm64-v8a" -type f | sort
             exit 1
           fi
 
+          echo "Selected library: ${SO_PATH}"
+          file "${SO_PATH}"
+
+          echo "Dynamic dependencies:"
+          readelf -d "${SO_PATH}" | grep NEEDED || true
+
+          if readelf -d "${SO_PATH}" | grep -E 'libm\.so\.6|libstdc\+\+\.so\.6|libgcc_s\.so\.1'; then
+            echo "Wrong binary detected: linked against GNU/Linux runtime instead of Android bionic."
+            exit 1
+          fi
+
+          cp "${SO_PATH}" out/arm64-v8a/libshaderc_shared.so
+
           LLVM_LIBCXX_PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
           if [ -f "${LLVM_LIBCXX_PATH}" ]; then
-            cp "${LLVM_LIBCXX_PATH}" out/arm64-v8a/
+            cp "${LLVM_LIBCXX_PATH}" out/arm64-v8a/libc++_shared.so
+          else
+            echo "libc++_shared.so not found in NDK"
+            exit 1
           fi
+
+          echo "Final artifacts:"
+          ls -la out/arm64-v8a
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
