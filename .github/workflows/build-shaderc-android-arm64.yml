@@ -11,6 +11,9 @@ on:
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build-android-arm64:
     runs-on: ubuntu-latest
@@ -22,7 +25,7 @@ jobs:
 
     steps:
       - name: Checkout current repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install build tools
         run: |
@@ -37,7 +40,7 @@ jobs:
             wget
 
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -98,17 +101,17 @@ jobs:
 
           if [ ! -f "out/arm64-v8a/libshaderc_shared.so" ]; then
             echo "libshaderc_shared.so not found"
+            find "${SHADERC_DIR}/build/android-arm64-v8a" -type f | sort
             exit 1
           fi
 
-          # 如果你的宿主工程没有自带 libc++_shared.so，可以把它一起打包
           LLVM_LIBCXX_PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
           if [ -f "${LLVM_LIBCXX_PATH}" ]; then
             cp "${LLVM_LIBCXX_PATH}" out/arm64-v8a/
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: shaderc-android-arm64-v8a
           path: out/arm64-v8a/
