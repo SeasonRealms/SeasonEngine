@@ -37,7 +37,8 @@ jobs:
             cmake \
             ninja-build \
             unzip \
-            wget
+            wget \
+            bison
 
       - name: Setup Java
         uses: actions/setup-java@v5
@@ -82,13 +83,14 @@ jobs:
             -DCMAKE_ANDROID_ARCH_ABI=arm64-v8a \
             -DCMAKE_ANDROID_API="${ANDROID_API_LEVEL}" \
             -DCMAKE_ANDROID_STL_TYPE=c++_shared \
+            -DCMAKE_SKIP_INSTALL_RULES=ON \
+            -DSHADERC_SKIP_INSTALL=ON \
             -DSHADERC_SKIP_TESTS=ON \
             -DSHADERC_SKIP_EXAMPLES=ON \
-            -DSHADERC_SKIP_EXECUTABLES=ON \
-            -DSHADERC_SKIP_COPYRIGHT_CHECK=ON \
-            -DSHADERC_SKIP_INSTALL=ON \
-            -DSHADERC_ENABLE_WERROR_COMPILE=OFF \
-            -DSHADERC_ENABLE_HLSL=OFF
+            -DSKIP_GLSLANG_INSTALL=ON \
+            -DSKIP_SPIRV_TOOLS_INSTALL=ON \
+            -DENABLE_GLSLANG_BINARIES=OFF \
+            -DSHADERC_ENABLE_WERROR_COMPILE=OFF
 
       - name: Build shaderc_shared
         run: |
