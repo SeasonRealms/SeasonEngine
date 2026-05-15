@@ -1,0 +1,115 @@
+name: Build Shaderc Android arm64-v8a
+
+on:
+  workflow_dispatch:
+    inputs:
+      shaderc_ref:
+        description: "Shaderc tag / branch / commit"
+        required: true
+        default: "v2024.3"
+
+permissions:
+  contents: read
+
+jobs:
+  build-android-arm64:
+    runs-on: ubuntu-latest
+
+    env:
+      ANDROID_NDK_VERSION: 26.3.11579264
+      ANDROID_API_LEVEL: 21
+      SHADERC_DIR: shaderc
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            python3 \
+            python3-pip \
+            cmake \
+            ninja-build \
+            unzip \
+            wget
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK command-line tools
+        run: |
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O android-cmdline-tools.zip
+          mkdir -p "$HOME/android-sdk/cmdline-tools"
+          unzip -q android-cmdline-tools.zip -d "$HOME/android-sdk/cmdline-tools"
+          mv "$HOME/android-sdk/cmdline-tools/cmdline-tools" "$HOME/android-sdk/cmdline-tools/latest"
+
+          echo "ANDROID_HOME=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+
+      - name: Accept Android licenses and install NDK
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "ndk;${ANDROID_NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Clone shaderc
+        run: |
+          git clone https://github.com/google/shaderc.git "${SHADERC_DIR}"
+          cd "${SHADERC_DIR}"
+          git checkout "${{ github.event.inputs.shaderc_ref }}"
+
+      - name: Sync shaderc dependencies
+        run: |
+          cd "${SHADERC_DIR}"
+          python3 ./utils/git-sync-deps
+
+      - name: Configure shaderc for Android arm64-v8a
+        run: |
+          cmake -S "${SHADERC_DIR}" -B "${SHADERC_DIR}/build/android-arm64-v8a" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Android \
+            -DCMAKE_ANDROID_NDK="${ANDROID_NDK_HOME}" \
+            -DCMAKE_ANDROID_ARCH_ABI=arm64-v8a \
+            -DCMAKE_ANDROID_API="${ANDROID_API_LEVEL}" \
+            -DCMAKE_ANDROID_STL_TYPE=c++_shared \
+            -DSHADERC_SKIP_TESTS=ON \
+            -DSHADERC_SKIP_EXAMPLES=ON \
+            -DSHADERC_SKIP_EXECUTABLES=ON \
+            -DSHADERC_SKIP_COPYRIGHT_CHECK=ON \
+            -DSHADERC_SKIP_INSTALL=ON \
+            -DSHADERC_ENABLE_WERROR_COMPILE=OFF \
+            -DSHADERC_ENABLE_HLSL=OFF
+
+      - name: Build shaderc_shared
+        run: |
+          cmake --build "${SHADERC_DIR}/build/android-arm64-v8a" --target shaderc_shared --config Release -j
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p out/arm64-v8a
+          find "${SHADERC_DIR}/build/android-arm64-v8a" -name "libshaderc_shared.so" -exec cp {} out/arm64-v8a/ \;
+
+          if [ ! -f "out/arm64-v8a/libshaderc_shared.so" ]; then
+            echo "libshaderc_shared.so not found"
+            exit 1
+          fi
+
+          # 如果你的宿主工程没有自带 libc++_shared.so，可以把它一起打包
+          LLVM_LIBCXX_PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+          if [ -f "${LLVM_LIBCXX_PATH}" ]; then
+            cp "${LLVM_LIBCXX_PATH}" out/arm64-v8a/
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shaderc-android-arm64-v8a
+          path: out/arm64-v8a/
+          if-no-files-found: error
