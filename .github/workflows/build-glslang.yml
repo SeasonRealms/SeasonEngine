@@ -88,6 +88,11 @@ jobs:
 
       - name: Configure glslang for Android ${{ matrix.abi }}
         run: |
+          # Force visibility=default so that glslang_* C interface symbols
+          # survive into the final libglslang.so export table. glslang's
+          # CMakeLists defaults to hidden visibility for static builds, which
+          # causes runtime dlsym to fail with "entry point not found" even
+          # though --whole-archive physically pulled the .o into the .so.
           cmake -S "${GLSLANG_DIR}" -B "${GLSLANG_DIR}/build/android-${{ matrix.abi }}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=Android \
@@ -96,6 +101,9 @@ jobs:
             -DCMAKE_ANDROID_API="${{ github.event.inputs.android_api_level }}" \
             -DCMAKE_ANDROID_STL_TYPE=c++_static \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_C_VISIBILITY_PRESET=default \
+            -DCMAKE_CXX_VISIBILITY_PRESET=default \
+            -DCMAKE_VISIBILITY_INLINES_HIDDEN=OFF \
             -DBUILD_SHARED_LIBS=OFF \
             -DENABLE_HLSL=OFF \
             -DENABLE_RTTI=OFF \
@@ -211,9 +219,15 @@ jobs:
 
       - name: Configure glslang for ${{ matrix.rid }}
         run: |
+          # See Android job for visibility rationale: glslang static builds
+          # default to hidden visibility, which strips glslang_* C interface
+          # symbols from the merged libglslang.so export table.
           cmake -S "${GLSLANG_DIR}" -B "${GLSLANG_DIR}/build/${{ matrix.rid }}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_C_VISIBILITY_PRESET=default \
+            -DCMAKE_CXX_VISIBILITY_PRESET=default \
+            -DCMAKE_VISIBILITY_INLINES_HIDDEN=OFF \
             -DBUILD_SHARED_LIBS=OFF \
             -DENABLE_HLSL=OFF \
             -DENABLE_RTTI=OFF \
