@@ -18,6 +18,9 @@ permissions:
 jobs:
   # ============================================================
   # Android: 4 ABI cross-compiled with Android NDK on Linux x64.
+  # Internal glslang targets are built as STATIC libraries and
+  # then merged into a single libglslang.so via --whole-archive,
+  # with libc++ statically embedded.
   # ============================================================
   build-android:
     runs-on: ubuntu-latest
@@ -27,13 +30,13 @@ jobs:
       matrix:
         include:
           - abi: arm64-v8a
-            triple: aarch64-linux-android
+            clang_prefix: aarch64-linux-android
           - abi: armeabi-v7a
-            triple: arm-linux-androideabi
+            clang_prefix: armv7a-linux-androideabi
           - abi: x86_64
-            triple: x86_64-linux-android
+            clang_prefix: x86_64-linux-android
           - abi: x86
-            triple: i686-linux-android
+            clang_prefix: i686-linux-android
 
     env:
       ANDROID_NDK_VERSION: 26.3.11579264
@@ -97,8 +100,9 @@ jobs:
             -DCMAKE_ANDROID_NDK="${ANDROID_NDK_HOME}" \
             -DCMAKE_ANDROID_ARCH_ABI=${{ matrix.abi }} \
             -DCMAKE_ANDROID_API="${{ github.event.inputs.android_api_level }}" \
-            -DCMAKE_ANDROID_STL_TYPE=c++_shared \
-            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_ANDROID_STL_TYPE=c++_static \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_SHARED_LIBS=OFF \
             -DENABLE_HLSL=OFF \
             -DENABLE_RTTI=OFF \
             -DENABLE_OPT=OFF \
@@ -107,35 +111,50 @@ jobs:
             -DGLSLANG_TESTS=OFF \
             -DGLSLANG_ENABLE_INSTALL=OFF
 
-      - name: Build glslang shared libraries
+      - name: Build glslang static libraries
         run: |
           cmake --build "${GLSLANG_DIR}/build/android-${{ matrix.abi }}" --config Release -j
 
-      - name: Collect artifacts
+      - name: Merge static libraries into a single libglslang.so
         run: |
+          BUILD_DIR="${GLSLANG_DIR}/build/android-${{ matrix.abi }}"
           OUT="out/${{ matrix.abi }}"
           mkdir -p "$OUT"
 
-          # Copy every produced .so (libglslang, libMachineIndependent, libGenericCodeGen,
-          # libOSDependent, libSPIRV, libglslang-default-resource-limits, ...).
-          find "${GLSLANG_DIR}/build/android-${{ matrix.abi }}" -name "*.so" -exec cp -L {} "$OUT/" \;
+          # Collect every produced static archive.
+          LIBS=$(find "$BUILD_DIR" -name "*.a" -printf "%p ")
+          if [ -z "$LIBS" ]; then
+            echo "::error::No static archives produced under $BUILD_DIR"
+            exit 1
+          fi
+          echo "Static archives to merge:"
+          echo "$LIBS" | tr ' ' '\n'
 
-          if [ ! -f "$OUT/libglslang.so" ]; then
-            echo "::error::libglslang.so not found"
-            ls -la "$OUT" || true
+          TC="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
+          API="${{ github.event.inputs.android_api_level }}"
+          CXX="${TC}/bin/${{ matrix.clang_prefix }}${API}-clang++"
+
+          if [ ! -x "$CXX" ]; then
+            echo "::error::clang++ wrapper not found: $CXX"
+            ls -la "${TC}/bin" | grep clang || true
             exit 1
           fi
 
-          # Bundle libc++_shared.so so the consuming APK can dlopen glslang without extra steps.
-          LIBCXX="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ matrix.triple }}/libc++_shared.so"
-          if [ -f "${LIBCXX}" ]; then
-            cp "${LIBCXX}" "$OUT/"
-          else
-            echo "::warning::libc++_shared.so not found at ${LIBCXX}"
-          fi
+          # --whole-archive forces every object inside the static archives to be
+          # pulled into the resulting shared library, so the C interface symbols
+          # (glslang_*) and default-resource symbols are all preserved.
+          # -static-libstdc++ embeds libc++ inside libglslang.so, freeing the APK
+          # from shipping libc++_shared.so.
+          "$CXX" -shared -fPIC -fuse-ld=lld -O2 \
+            -Wl,--whole-archive $LIBS -Wl,--no-whole-archive \
+            -static-libstdc++ \
+            -Wl,--build-id=sha1 \
+            -o "$OUT/libglslang.so"
 
           echo "==== artifact contents ===="
           ls -la "$OUT"
+          file "$OUT/libglslang.so" || true
+          du -h "$OUT/libglslang.so"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -146,6 +165,8 @@ jobs:
 
   # ============================================================
   # Linux: native build on x64 + arm64 GitHub-hosted runners.
+  # Internal glslang targets are built as STATIC libraries and
+  # then merged into a single libglslang.so via --whole-archive.
   # ============================================================
   build-linux:
     name: build-linux-${{ matrix.rid }}
@@ -194,7 +215,7 @@ jobs:
           cmake -S "${GLSLANG_DIR}" -B "${GLSLANG_DIR}/build/${{ matrix.rid }}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_SHARED_LIBS=OFF \
             -DENABLE_HLSL=OFF \
             -DENABLE_RTTI=OFF \
             -DENABLE_OPT=OFF \
@@ -203,28 +224,35 @@ jobs:
             -DGLSLANG_TESTS=OFF \
             -DGLSLANG_ENABLE_INSTALL=OFF
 
-      - name: Build glslang shared libraries
+      - name: Build glslang static libraries
         run: |
           cmake --build "${GLSLANG_DIR}/build/${{ matrix.rid }}" --config Release -j
 
-      - name: Collect artifacts
+      - name: Merge static libraries into a single libglslang.so
         run: |
+          BUILD_DIR="${GLSLANG_DIR}/build/${{ matrix.rid }}"
           OUT="out/${{ matrix.rid }}"
           mkdir -p "$OUT"
 
-          # Copy every produced .so (libglslang, libMachineIndependent, libGenericCodeGen,
-          # libOSDependent, libSPIRV, libglslang-default-resource-limits, ...).
-          # -L follows symlinks so the actual SONAME files are copied rather than dangling links.
-          find "${GLSLANG_DIR}/build/${{ matrix.rid }}" -name "*.so*" -exec cp -L {} "$OUT/" \;
-
-          if [ ! -f "$OUT/libglslang.so" ]; then
-            echo "::error::libglslang.so not found"
-            ls -la "$OUT" || true
+          LIBS=$(find "$BUILD_DIR" -name "*.a" -printf "%p ")
+          if [ -z "$LIBS" ]; then
+            echo "::error::No static archives produced under $BUILD_DIR"
             exit 1
           fi
+          echo "Static archives to merge:"
+          echo "$LIBS" | tr ' ' '\n'
+
+          # System g++ links against the system libstdc++.so.6 (kept as a dynamic
+          # dependency on Linux desktops, which is the conventional behaviour).
+          g++ -shared -fPIC -O2 \
+            -Wl,--whole-archive $LIBS -Wl,--no-whole-archive \
+            -Wl,--build-id=sha1 \
+            -o "$OUT/libglslang.so"
 
           echo "==== artifact contents ===="
           ls -la "$OUT"
+          file "$OUT/libglslang.so" || true
+          du -h "$OUT/libglslang.so"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
