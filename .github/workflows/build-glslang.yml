@@ -31,12 +31,6 @@ jobs:
         include:
           - abi: arm64-v8a
             clang_prefix: aarch64-linux-android
-          - abi: armeabi-v7a
-            clang_prefix: armv7a-linux-androideabi
-          - abi: x86_64
-            clang_prefix: x86_64-linux-android
-          - abi: x86
-            clang_prefix: i686-linux-android
 
     env:
       ANDROID_NDK_VERSION: 26.3.11579264
@@ -143,10 +137,15 @@ jobs:
           # --whole-archive forces every object inside the static archives to be
           # pulled into the resulting shared library, so the C interface symbols
           # (glslang_*) and default-resource symbols are all preserved.
+          # --allow-multiple-definition tolerates the stub_library_function()
+          # placeholder that glslang adds to every CMake target (CMake requires
+          # each add_library to have at least one source file); without this
+          # flag --whole-archive triggers duplicate-symbol errors.
           # -static-libstdc++ embeds libc++ inside libglslang.so, freeing the APK
           # from shipping libc++_shared.so.
           "$CXX" -shared -fPIC -fuse-ld=lld -O2 \
             -Wl,--whole-archive $LIBS -Wl,--no-whole-archive \
+            -Wl,--allow-multiple-definition \
             -static-libstdc++ \
             -Wl,--build-id=sha1 \
             -o "$OUT/libglslang.so"
@@ -244,8 +243,12 @@ jobs:
 
           # System g++ links against the system libstdc++.so.6 (kept as a dynamic
           # dependency on Linux desktops, which is the conventional behaviour).
+          # --allow-multiple-definition tolerates glslang's stub_library_function()
+          # placeholder duplicated across every internal target (see Android job
+          # for context).
           g++ -shared -fPIC -O2 \
             -Wl,--whole-archive $LIBS -Wl,--no-whole-archive \
+            -Wl,--allow-multiple-definition \
             -Wl,--build-id=sha1 \
             -o "$OUT/libglslang.so"
 
