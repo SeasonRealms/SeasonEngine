@@ -88,11 +88,18 @@ jobs:
 
       - name: Configure glslang for Android ${{ matrix.abi }}
         run: |
-          # Force visibility=default so that glslang_* C interface symbols
-          # survive into the final libglslang.so export table. glslang's
-          # CMakeLists defaults to hidden visibility for static builds, which
-          # causes runtime dlsym to fail with "entry point not found" even
-          # though --whole-archive physically pulled the .o into the .so.
+          # Why three visibility-related knobs:
+          # 1) GLSLANG_IS_SHARED_LIBRARY makes the GLSLANG_EXPORT macro in
+          #    glslang_c_interface.h expand to __attribute__((visibility("default"))),
+          #    attaching default-visibility at *function granularity*. This is
+          #    the only way to win against glslang's internal CMakeLists, which
+          #    forces -fvisibility=hidden via target_compile_options(... PRIVATE)
+          #    (PRIVATE overrides CMAKE_CXX_VISIBILITY_PRESET).
+          # 2) CMAKE_*_VISIBILITY_PRESET=default keeps the *non-EXPORT* helpers
+          #    (e.g. glslang_default_resource lives in a separate target) visible.
+          # 3) Once the .o is born hidden, neither --version-script nor
+          #    --export-dynamic can promote it back to global, so we must fix
+          #    visibility at compile time, not link time.
           cmake -S "${GLSLANG_DIR}" -B "${GLSLANG_DIR}/build/android-${{ matrix.abi }}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=Android \
@@ -104,6 +111,8 @@ jobs:
             -DCMAKE_C_VISIBILITY_PRESET=default \
             -DCMAKE_CXX_VISIBILITY_PRESET=default \
             -DCMAKE_VISIBILITY_INLINES_HIDDEN=OFF \
+            -DCMAKE_C_FLAGS="-DGLSLANG_IS_SHARED_LIBRARY=1" \
+            -DCMAKE_CXX_FLAGS="-DGLSLANG_IS_SHARED_LIBRARY=1" \
             -DBUILD_SHARED_LIBS=OFF \
             -DENABLE_HLSL=OFF \
             -DENABLE_RTTI=OFF \
@@ -163,6 +172,22 @@ jobs:
           file "$OUT/libglslang.so" || true
           du -h "$OUT/libglslang.so"
 
+      - name: Verify exported symbols
+        run: |
+          OUT="out/${{ matrix.abi }}"
+          NM="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          echo "==== exported glslang_* symbols ===="
+          "$NM" -D --defined-only "$OUT/libglslang.so" | grep -E ' T glslang_' || true
+          COUNT=$("$NM" -D --defined-only "$OUT/libglslang.so" | grep -E ' T glslang_' | wc -l)
+          echo "Total glslang_* exports: $COUNT"
+          if [ "$COUNT" -lt 15 ]; then
+            echo "::error::libglslang.so is missing glslang_* exports (got $COUNT, expected >=15)"
+            exit 1
+          fi
+          # Sanity: the very first symbol the runtime asks for.
+          "$NM" -D --defined-only "$OUT/libglslang.so" | grep -q ' T glslang_initialize_process' \
+            || { echo "::error::glslang_initialize_process is NOT exported"; exit 1; }
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -219,15 +244,19 @@ jobs:
 
       - name: Configure glslang for ${{ matrix.rid }}
         run: |
-          # See Android job for visibility rationale: glslang static builds
-          # default to hidden visibility, which strips glslang_* C interface
-          # symbols from the merged libglslang.so export table.
+          # See Android job for the full visibility rationale. Three knobs:
+          # GLSLANG_IS_SHARED_LIBRARY → expands GLSLANG_EXPORT to visibility("default");
+          # CMAKE_*_VISIBILITY_PRESET=default → catches non-EXPORT helpers;
+          # both must be set at compile time because hidden .o symbols cannot
+          # be promoted to global by any link-time flag.
           cmake -S "${GLSLANG_DIR}" -B "${GLSLANG_DIR}/build/${{ matrix.rid }}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DCMAKE_C_VISIBILITY_PRESET=default \
             -DCMAKE_CXX_VISIBILITY_PRESET=default \
             -DCMAKE_VISIBILITY_INLINES_HIDDEN=OFF \
+            -DCMAKE_C_FLAGS="-DGLSLANG_IS_SHARED_LIBRARY=1" \
+            -DCMAKE_CXX_FLAGS="-DGLSLANG_IS_SHARED_LIBRARY=1" \
             -DBUILD_SHARED_LIBS=OFF \
             -DENABLE_HLSL=OFF \
             -DENABLE_RTTI=OFF \
@@ -270,6 +299,20 @@ jobs:
           ls -la "$OUT"
           file "$OUT/libglslang.so" || true
           du -h "$OUT/libglslang.so"
+
+      - name: Verify exported symbols
+        run: |
+          OUT="out/${{ matrix.rid }}"
+          echo "==== exported glslang_* symbols ===="
+          nm -D --defined-only "$OUT/libglslang.so" | grep -E ' T glslang_' || true
+          COUNT=$(nm -D --defined-only "$OUT/libglslang.so" | grep -E ' T glslang_' | wc -l)
+          echo "Total glslang_* exports: $COUNT"
+          if [ "$COUNT" -lt 15 ]; then
+            echo "::error::libglslang.so is missing glslang_* exports (got $COUNT, expected >=15)"
+            exit 1
+          fi
+          nm -D --defined-only "$OUT/libglslang.so" | grep -q ' T glslang_initialize_process' \
+            || { echo "::error::glslang_initialize_process is NOT exported"; exit 1; }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
