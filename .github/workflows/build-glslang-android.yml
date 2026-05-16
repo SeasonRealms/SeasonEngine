@@ -1,0 +1,142 @@
+name: Build glslang Android (multi-ABI)
+
+on:
+  workflow_dispatch:
+    inputs:
+      glslang_ref:
+        description: "glslang tag / branch / commit (e.g. 16.3.0 / main-tot)"
+        required: true
+        default: "16.3.0"
+      android_api_level:
+        description: "Minimum Android API level"
+        required: true
+        default: "24"
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            triple: aarch64-linux-android
+          - abi: armeabi-v7a
+            triple: arm-linux-androideabi
+          - abi: x86_64
+            triple: x86_64-linux-android
+          - abi: x86
+            triple: i686-linux-android
+
+    env:
+      ANDROID_NDK_VERSION: 26.3.11579264
+      GLSLANG_DIR: glslang
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            python3 \
+            python3-pip \
+            cmake \
+            ninja-build \
+            unzip \
+            wget
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK command-line tools
+        run: |
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O android-cmdline-tools.zip
+          mkdir -p "$HOME/android-sdk/cmdline-tools"
+          unzip -q android-cmdline-tools.zip -d "$HOME/android-sdk/cmdline-tools"
+          mv "$HOME/android-sdk/cmdline-tools/cmdline-tools" "$HOME/android-sdk/cmdline-tools/latest"
+
+          echo "ANDROID_HOME=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+
+      - name: Accept Android licenses and install NDK
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "ndk;${ANDROID_NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Clone glslang
+        run: |
+          git clone https://github.com/KhronosGroup/glslang.git "${GLSLANG_DIR}"
+          cd "${GLSLANG_DIR}"
+          git checkout "${{ github.event.inputs.glslang_ref }}"
+
+      - name: Sync glslang dependencies (SPIRV-Tools / SPIRV-Headers)
+        run: |
+          cd "${GLSLANG_DIR}"
+          python3 ./update_glslang_sources.py
+
+      - name: Configure glslang for Android ${{ matrix.abi }}
+        run: |
+          cmake -S "${GLSLANG_DIR}" -B "${GLSLANG_DIR}/build/android-${{ matrix.abi }}" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Android \
+            -DCMAKE_ANDROID_NDK="${ANDROID_NDK_HOME}" \
+            -DCMAKE_ANDROID_ARCH_ABI=${{ matrix.abi }} \
+            -DCMAKE_ANDROID_API="${{ github.event.inputs.android_api_level }}" \
+            -DCMAKE_ANDROID_STL_TYPE=c++_shared \
+            -DBUILD_SHARED_LIBS=ON \
+            -DENABLE_HLSL=OFF \
+            -DENABLE_RTTI=OFF \
+            -DENABLE_OPT=OFF \
+            -DENABLE_SPVREMAPPER=OFF \
+            -DENABLE_GLSLANG_BINARIES=OFF \
+            -DGLSLANG_TESTS=OFF \
+            -DGLSLANG_ENABLE_INSTALL=OFF
+
+      - name: Build glslang shared libraries
+        run: |
+          cmake --build "${GLSLANG_DIR}/build/android-${{ matrix.abi }}" --config Release -j
+
+      - name: Collect artifacts
+        run: |
+          OUT="out/${{ matrix.abi }}"
+          mkdir -p "$OUT"
+
+          # Copy every produced .so (libglslang, libMachineIndependent, libGenericCodeGen,
+          # libOSDependent, libSPIRV, libglslang-default-resource-limits, ...).
+          find "${GLSLANG_DIR}/build/android-${{ matrix.abi }}" -name "*.so" -exec cp -L {} "$OUT/" \;
+
+          if [ ! -f "$OUT/libglslang.so" ]; then
+            echo "::error::libglslang.so not found"
+            ls -la "$OUT" || true
+            exit 1
+          fi
+
+          # Bundle libc++_shared.so so the consuming APK can dlopen glslang without extra steps.
+          LIBCXX="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ matrix.triple }}/libc++_shared.so"
+          if [ -f "${LIBCXX}" ]; then
+            cp "${LIBCXX}" "$OUT/"
+          else
+            echo "::warning::libc++_shared.so not found at ${LIBCXX}"
+          fi
+
+          echo "==== artifact contents ===="
+          ls -la "$OUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: glslang-android-${{ matrix.abi }}
+          path: out/${{ matrix.abi }}/
+          if-no-files-found: error
