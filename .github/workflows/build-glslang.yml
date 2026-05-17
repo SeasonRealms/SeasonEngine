@@ -298,12 +298,19 @@ jobs:
           echo "Static archives to merge:"
           echo "$LIBS" | tr ' ' '\n'
 
-          # Linker invocation mirrors the Android job: clang++ + lld. We do NOT
-          # use -static-libstdc++ here because Linux desktops universally ship
-          # libstdc++.so, so a dynamic dependency is the conventional contract.
+          # Linker invocation mirrors the Android job: clang++ + lld with
+          # libstdc++ statically embedded. Why -static-libstdc++ on Linux too:
+          # the runner is ubuntu-latest (currently 24.04, libstdc++ 14) but
+          # consumers may run Ubuntu 22.04 / Debian 12 etc. with older
+          # libstdc++. Statically embedding libstdc++ frees libglslang.so from
+          # GLIBCXX/CXXABI version dependencies on the host system.
+          # -Wl,--exclude-libs,ALL prevents libstdc++ internal symbols from
+          # being re-exported via libglslang.so's dynsym table.
           clang++ -shared -fPIC -fuse-ld=lld -O2 \
             -Wl,--whole-archive $LIBS -Wl,--no-whole-archive \
             -Wl,--allow-multiple-definition \
+            -static-libstdc++ -static-libgcc \
+            -Wl,--exclude-libs,ALL \
             -Wl,--build-id=sha1 \
             -o "$OUT/libglslang.so"
 
