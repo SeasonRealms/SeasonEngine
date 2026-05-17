@@ -304,13 +304,14 @@ jobs:
           # consumers may run Ubuntu 22.04 / Debian 12 etc. with older
           # libstdc++. Statically embedding libstdc++ frees libglslang.so from
           # GLIBCXX/CXXABI version dependencies on the host system.
-          # -Wl,--exclude-libs,ALL prevents libstdc++ internal symbols from
-          # being re-exported via libglslang.so's dynsym table.
+          # NOTE: Do NOT add -Wl,--exclude-libs,ALL here. That flag hides ALL
+          # static archive symbols (including glslang_* APIs pulled in via
+          # --whole-archive), causing 'Total glslang_* exports: 0'. Leaking a
+          # few libstdc++ template symbols into dynsym is harmless.
           clang++ -shared -fPIC -fuse-ld=lld -O2 \
             -Wl,--whole-archive $LIBS -Wl,--no-whole-archive \
             -Wl,--allow-multiple-definition \
             -static-libstdc++ -static-libgcc \
-            -Wl,--exclude-libs,ALL \
             -Wl,--build-id=sha1 \
             -o "$OUT/libglslang.so"
 
