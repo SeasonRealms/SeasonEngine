@@ -228,6 +228,8 @@ jobs:
             python3 \
             python3-pip \
             build-essential \
+            clang \
+            lld \
             cmake \
             ninja-build
 
@@ -243,20 +245,32 @@ jobs:
           python3 ./update_glslang_sources.py
 
       - name: Configure glslang for ${{ matrix.rid }}
+        env:
+          CC: clang
+          CXX: clang++
         run: |
-          # See Android job for the full visibility rationale. Three knobs:
-          # GLSLANG_IS_SHARED_LIBRARY → expands GLSLANG_EXPORT to visibility("default");
-          # CMAKE_*_VISIBILITY_PRESET=default → catches non-EXPORT helpers;
-          # both must be set at compile time because hidden .o symbols cannot
-          # be promoted to global by any link-time flag.
+          # Linux job is intentionally aligned with the Android job's toolchain
+          # (clang + lld) because:
+          # 1) GCC has a long history of edge cases where
+          #    __attribute__((visibility("default"))) on extern "C" function
+          #    bodies fails to override a command-line -fvisibility=hidden
+          #    when -O2/LTO inlining kicks in (cf. GCC PR70435 etc.).
+          # 2) Switching to clang/lld makes the Linux .so's symbol-export
+          #    behaviour byte-for-byte identical to the proven-working Android
+          #    .so, eliminating the only environmental variable.
+          # 3) -fvisibility=default in CMAKE_*_FLAGS is a belt-and-suspenders
+          #    backstop in case glslang's CMakeLists ever re-introduces a
+          #    target_compile_options(... PRIVATE -fvisibility=hidden) line.
           cmake -S "${GLSLANG_DIR}" -B "${GLSLANG_DIR}/build/${{ matrix.rid }}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DCMAKE_C_VISIBILITY_PRESET=default \
             -DCMAKE_CXX_VISIBILITY_PRESET=default \
             -DCMAKE_VISIBILITY_INLINES_HIDDEN=OFF \
-            -DCMAKE_C_FLAGS="-DGLSLANG_IS_SHARED_LIBRARY=1" \
-            -DCMAKE_CXX_FLAGS="-DGLSLANG_IS_SHARED_LIBRARY=1" \
+            -DCMAKE_C_FLAGS="-fvisibility=default -DGLSLANG_IS_SHARED_LIBRARY=1" \
+            -DCMAKE_CXX_FLAGS="-fvisibility=default -DGLSLANG_IS_SHARED_LIBRARY=1" \
             -DBUILD_SHARED_LIBS=OFF \
             -DENABLE_HLSL=OFF \
             -DENABLE_RTTI=OFF \
@@ -284,12 +298,10 @@ jobs:
           echo "Static archives to merge:"
           echo "$LIBS" | tr ' ' '\n'
 
-          # System g++ links against the system libstdc++.so.6 (kept as a dynamic
-          # dependency on Linux desktops, which is the conventional behaviour).
-          # --allow-multiple-definition tolerates glslang's stub_library_function()
-          # placeholder duplicated across every internal target (see Android job
-          # for context).
-          g++ -shared -fPIC -O2 \
+          # Linker invocation mirrors the Android job: clang++ + lld. We do NOT
+          # use -static-libstdc++ here because Linux desktops universally ship
+          # libstdc++.so, so a dynamic dependency is the conventional contract.
+          clang++ -shared -fPIC -fuse-ld=lld -O2 \
             -Wl,--whole-archive $LIBS -Wl,--no-whole-archive \
             -Wl,--allow-multiple-definition \
             -Wl,--build-id=sha1 \
