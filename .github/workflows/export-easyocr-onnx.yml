@@ -183,10 +183,9 @@ jobs:
               craft_pth = download_and_extract(
                   craft_cfg['url'], craft_cfg['filename'], CACHE_DIR)
 
-              # 导入 CRAFT 模型
-              sys.path.insert(0, os.path.join(EASYOCR_DIR, 'easyocr'))
-              from craft import CRAFT
-              from detection import copyStateDict
+              # 导入 CRAFT 模型（必须用包导入，因为 craft.py 内部用了相对导入）
+              from easyocr.craft import CRAFT
+              from easyocr.detection import copyStateDict
 
               detector = CRAFT()
               state_dict = torch.load(craft_pth, map_location='cpu', weights_only=False)
