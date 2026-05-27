@@ -63,7 +63,7 @@ jobs:
           # 先装 EasyOCR 自身依赖，再用 CPU 版 torch 覆盖（避免下载 GPU 版）
           pip install -r "${EASYOCR_DIR}/requirements.txt"
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu --force-reinstall
-          pip install onnx onnxruntime
+          pip install onnx onnxruntime onnxscript
 
       # ============================================================
       # 2. 创建输出目录并缓存下载的权重
