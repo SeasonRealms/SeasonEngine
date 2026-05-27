@@ -325,9 +325,15 @@ jobs:
                           'input':  {0: 'batch', 3: 'width'},
                           'output': {0: 'batch', 1: 'seq_len'},
                       },
-                      # ⭐ 将字符集嵌入 ONNX metadata
-                      metadata={'character': characters},
                   )
+
+              # ⭐ PyTorch 2.x 不再支持 metadata 参数，改用 onnx 库后写入
+              import onnx
+              onnx_model = onnx.load(onnx_path)
+              meta = onnx_model.metadata_props.add()
+              meta.key = 'character'
+              meta.value = characters
+              onnx.save(onnx_model, onnx_path)
 
               # ── 验证 ONNX ──────────────────────────
               import onnxruntime
