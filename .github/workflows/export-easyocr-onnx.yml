@@ -1,0 +1,399 @@
+name: Export EasyOCR ONNX Models
+
+on:
+  workflow_dispatch:
+    inputs:
+      easyocr_ref:
+        description: "EasyOCR tag / branch / commit"
+        required: true
+        default: "v1.7.2"
+      languages:
+        description: "Recognizer languages (space-separated, e.g. 'ch_sim en ja ko')"
+        required: true
+        default: "ch_sim en"
+      opset:
+        description: "ONNX opset version"
+        required: false
+        default: "12"
+      include_detector:
+        description: "Also export CRAFT detector"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  export-onnx:
+    runs-on: ubuntu-latest
+
+    env:
+      EASYOCR_DIR: easyocr-src
+      OUT_DIR: out
+
+    steps:
+      # ============================================================
+      # 1. 环境准备
+      # ============================================================
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Clone EasyOCR official repository
+        run: |
+          git clone --depth 1 --branch "${{ github.event.inputs.easyocr_ref }}" \
+            https://github.com/JaidedAI/EasyOCR.git "${EASYOCR_DIR}"
+          echo "EasyOCR cloned: $(cd ${EASYOCR_DIR} && git describe --tags --always)"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-torch-onnx-${{ hashFiles(format('{0}/requirements.txt', env.EASYOCR_DIR)) }}
+          restore-keys: pip-${{ runner.os }}-torch-onnx-
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install onnx onnxruntime opencv-python-headless pillow numpy
+
+      # ============================================================
+      # 2. 创建输出目录并缓存下载的权重
+      # ============================================================
+      - name: Create output directories
+        run: |
+          mkdir -p "${OUT_DIR}/detector"
+          mkdir -p "${OUT_DIR}/recognizer"
+          mkdir -p models_cache
+
+      - name: Cache downloaded model weights
+        uses: actions/cache@v4
+        with:
+          path: models_cache
+          key: easyocr-weights-${{ github.event.inputs.easyocr_ref }}-${{ github.event.inputs.languages }}
+          restore-keys: easyocr-weights-${{ github.event.inputs.easyocr_ref }}-
+
+      # ============================================================
+      # 3. 导出 ONNX（detector + recognizer）
+      # ============================================================
+      - name: Export EasyOCR models to ONNX
+        id: export
+        shell: python
+        run: |
+          import os, sys, json, zipfile, urllib.request, hashlib, shutil
+          import numpy as np
+          sys.path.insert(0, os.environ['EASYOCR_DIR'])
+
+          # ── 解析输入参数 ──────────────────────────────
+          EASYOCR_DIR  = os.environ['EASYOCR_DIR']
+          OUT_DIR      = os.environ['OUT_DIR']
+          CACHE_DIR    = 'models_cache'
+          LANGUAGES    = "${{ github.event.inputs.languages }}".strip().split()
+          OPSET        = int("${{ github.event.inputs.opset }}")
+          INCLUDE_DET  = "${{ github.event.inputs.include_detector }}" == "true"
+
+          print(f"EasyOCR dir : {EASYOCR_DIR}")
+          print(f"Output dir  : {OUT_DIR}")
+          print(f"Languages   : {LANGUAGES}")
+          print(f"ONNX opset  : {OPSET}")
+          print(f"Include det : {INCLUDE_DET}")
+
+          import torch
+          import torch.nn as nn
+
+          # ── 从 config.py 读取模型配置 ──────────────────
+          # 动态导入 config 模块
+          import importlib.util
+          spec = importlib.util.spec_from_file_location(
+              "config", os.path.join(EASYOCR_DIR, "easyocr", "config.py"))
+          config = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(config)
+
+          detection_models  = config.detection_models
+          recognition_models = config.recognition_models
+
+          # ── 语言到模型 key 的映射 ─────────────────────
+          LANG_TO_MODEL = {
+              'ch_sim':  ('gen2', 'zh_sim_g2'),
+              'ch_tra':  ('gen1', 'zh_tra_g1'),
+              'en':      ('gen2', 'english_g2'),
+              'ja':      ('gen2', 'japanese_g2'),
+              'ko':      ('gen2', 'korean_g2'),
+              'latin':   ('gen2', 'latin_g2'),
+              'th':      ('gen1', 'thai_g1'),
+              'ta':      ('gen1', 'tamil_g1'),
+              'te':      ('gen2', 'telugu_g2'),
+              'kn':      ('gen2', 'kannada_g2'),
+              'ar':      ('gen1', 'arabic_g1'),
+              'ru':      ('gen2', 'cyrillic_g2'),
+              'hi':      ('gen1', 'devanagari_g1'),
+              'bn':      ('gen1', 'bengali_g1'),
+          }
+
+          def download_and_extract(url, filename, dest_dir):
+              """下载 zip 并解压，返回解压后的 .pth 文件路径"""
+              os.makedirs(dest_dir, exist_ok=True)
+              zip_path = os.path.join(dest_dir, filename + '.zip')
+              pth_path = os.path.join(dest_dir, filename)
+
+              # 检查缓存
+              if os.path.exists(pth_path):
+                  print(f"  ✓ cached: {pth_path}")
+                  return pth_path
+
+              # 检查已下载的 zip
+              if not os.path.exists(zip_path):
+                  print(f"  ↓ downloading: {url}")
+                  urllib.request.urlretrieve(url, zip_path)
+
+              # 解压
+              print(f"  ↦ extracting: {zip_path}")
+              with zipfile.ZipFile(zip_path, 'r') as z:
+                  z.extractall(dest_dir)
+
+              # 验证 pth 文件存在
+              if not os.path.exists(pth_path):
+                  # 可能解压到子目录，查找 pth 文件
+                  for root, dirs, files in os.walk(dest_dir):
+                      for f in files:
+                          if f.endswith('.pth') or f.endswith('.pt'):
+                              src = os.path.join(root, f)
+                              if src != pth_path:
+                                  shutil.move(src, pth_path)
+                                  break
+
+              assert os.path.exists(pth_path), f"Failed to find {pth_path} after extraction"
+              return pth_path
+
+          # ========================================================
+          # 4. 导出 CRAFT Detector
+          # ========================================================
+          if INCLUDE_DET:
+              print("\n" + "=" * 60)
+              print("Exporting CRAFT Detector")
+              print("=" * 60)
+
+              craft_cfg = detection_models['craft']
+              craft_pth = download_and_extract(
+                  craft_cfg['url'], craft_cfg['filename'], CACHE_DIR)
+
+              # 导入 CRAFT 模型
+              sys.path.insert(0, os.path.join(EASYOCR_DIR, 'easyocr'))
+              from craft import CRAFT
+              from detection import copyStateDict
+
+              detector = CRAFT()
+              state_dict = torch.load(craft_pth, map_location='cpu', weights_only=False)
+              detector.load_state_dict(copyStateDict(state_dict))
+              detector.eval()
+
+              # 导出 ONNX
+              detector_onnx = os.path.join(OUT_DIR, 'detector', 'craft_mlt_25k.onnx')
+              dummy = torch.randn(1, 3, 608, 800)
+
+              with torch.no_grad():
+                  y_out, feat_out = detector(dummy)
+                  torch.onnx.export(
+                      detector,
+                      dummy,
+                      detector_onnx,
+                      export_params=True,
+                      do_constant_folding=True,
+                      opset_version=OPSET,
+                      input_names=['input'],
+                      output_names=['output', 'feature'],
+                      dynamic_axes={
+                          'input':  {0: 'batch', 2: 'height', 3: 'width'},
+                          'output': {0: 'batch', 1: 'dim1', 2: 'dim2'},
+                          'feature': {0: 'batch', 1: 'dim1', 2: 'dim2', 3: 'dim3'},
+                      },
+                  )
+
+              # 验证
+              import onnxruntime
+              ort = onnxruntime.InferenceSession(detector_onnx, providers=['CPUExecutionProvider'])
+              ort_inputs = {ort.get_inputs()[0].name: dummy.cpu().numpy()}
+              ort_outs = ort.run(None, ort_inputs)
+
+              torch_y = y_out.detach().cpu().numpy()
+              np.testing.assert_allclose(torch_y, ort_outs[0], rtol=1e-2, atol=1e-3)
+              print(f"  ✓ CRAFT detector exported: {detector_onnx}")
+              print(f"    Input:  {ort.get_inputs()[0].shape}")
+              print(f"    Output: {[o.shape for o in ort_outs]}")
+
+          # ========================================================
+          # 5. 导出 Recognizer（每个语言）
+          # ========================================================
+          for lang in LANGUAGES:
+              if lang not in LANG_TO_MODEL:
+                  print(f"\n  ⚠ Unknown language '{lang}', skipping. "
+                        f"Supported: {list(LANG_TO_MODEL.keys())}")
+                  continue
+
+              gen, model_key = LANG_TO_MODEL[lang]
+              model_cfg = recognition_models[gen][model_key]
+
+              print(f"\n{'=' * 60}")
+              print(f"Exporting Recognizer: {lang} → {model_key} (gen={gen})")
+              print(f"{'=' * 60}")
+
+              # 下载权重
+              recog_pth = download_and_extract(
+                  model_cfg['url'], model_cfg['filename'], CACHE_DIR)
+
+              # ── 构建字符集 ──────────────────────────
+              characters = model_cfg['characters']
+              num_class = len(characters) + 1  # +1 for CTC blank
+
+              print(f"  charset length: {len(characters)}")
+              print(f"  num_classes   : {num_class}")
+              print(f"  first chars   : {repr(characters[:60])}")
+
+              # ── 保存 charset 文件 ───────────────────
+              txt_path = os.path.join(OUT_DIR, 'recognizer', f'recognizer_{lang}.txt')
+              with open(txt_path, 'w', encoding='utf-8') as f:
+                  f.write(characters)
+              print(f"  ✓ charset saved: {txt_path}")
+
+              # ── 构建 PyTorch 模型 ───────────────────
+              if gen == 'generation1':
+                  from easyocr.model.model import Model
+                  network_params = {
+                      'input_channel': 1,
+                      'output_channel': 512,
+                      'hidden_size': 512,
+                  }
+              else:  # generation2
+                  from easyocr.model.vgg_model import Model
+                  network_params = {
+                      'input_channel': 1,
+                      'output_channel': 256,
+                      'hidden_size': 256,
+                  }
+
+              model = Model(num_class=num_class, **network_params)
+
+              # 加载权重（去掉 'module.' 前缀）
+              state_dict = torch.load(recog_pth, map_location='cpu', weights_only=False)
+              new_state_dict = {}
+              for k, v in state_dict.items():
+                  new_key = k[7:] if k.startswith('module.') else k
+                  new_state_dict[new_key] = v
+              model.load_state_dict(new_state_dict)
+              model.eval()
+
+              # ── 包装模型（去掉 text 参数）─────────────
+              class InferenceWrapper(nn.Module):
+                  """去掉 teacher-forcing text 参数，只接受图像输入"""
+                  def __init__(self, base_model):
+                      super().__init__()
+                      self.base = base_model
+
+                  def forward(self, x):
+                      batch_size = x.size(0)
+                      text = torch.zeros(batch_size, 1, dtype=torch.long, device=x.device)
+                      return self.base(x, text)
+
+              wrapper = InferenceWrapper(model)
+
+              # ── 导出 ONNX ──────────────────────────
+              onnx_path = os.path.join(OUT_DIR, 'recognizer', f'recognizer_{lang}.onnx')
+
+              # 动态输入: [batch, 1, 64, width]
+              dummy_input = torch.randn(1, 1, 64, 200)
+
+              with torch.no_grad():
+                  test_out = wrapper(dummy_input)
+
+                  torch.onnx.export(
+                      wrapper,
+                      dummy_input,
+                      onnx_path,
+                      export_params=True,
+                      do_constant_folding=True,
+                      opset_version=OPSET,
+                      input_names=['input'],
+                      output_names=['output'],
+                      dynamic_axes={
+                          'input':  {0: 'batch', 3: 'width'},
+                          'output': {0: 'batch', 1: 'seq_len'},
+                      },
+                      # ⭐ 将字符集嵌入 ONNX metadata
+                      metadata={'character': characters},
+                  )
+
+              # ── 验证 ONNX ──────────────────────────
+              import onnxruntime
+              ort = onnxruntime.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
+
+              # 检查 metadata 中的 charset
+              meta = ort.get_modelmeta()
+              meta_charset = meta.custom_metadata_map.get('character', '')
+              print(f"  metadata charset length: {len(meta_charset)}")
+              assert meta_charset == characters, \
+                  f"Charset mismatch! metadata={len(meta_charset)}, expected={len(characters)}"
+
+              # 推理验证
+              test_np = np.random.randn(1, 1, 64, 200).astype(np.float32)
+              ort_out = ort.run(None, {'input': test_np})[0]
+
+              torch_out = test_out.detach().cpu().numpy()
+              np.testing.assert_allclose(torch_out, ort_out, rtol=1e-2, atol=1e-3)
+
+              # 检查输出维度
+              assert ort_out.shape[0] == 1, f"batch mismatch: {ort_out.shape}"
+              assert ort_out.shape[2] == num_class, \
+                  f"num_class mismatch: ONNX={ort_out.shape[2]}, expected={num_class}"
+
+              print(f"  ✓ Recognizer exported: {onnx_path}")
+              print(f"    Input shape : [{ort.get_inputs()[0].shape}]")
+              print(f"    Output shape: {ort_out.shape}")
+              print(f"    Num classes : {num_class} (blank + {len(characters)} chars)")
+              print(f"    Model size  : {os.path.getsize(onnx_path) / 1024 / 1024:.1f} MB")
+
+          # ── 输出摘要 ──────────────────────────────
+          print("\n" + "=" * 60)
+          print("Export Summary")
+          print("=" * 60)
+          for root, dirs, files in os.walk(OUT_DIR):
+              for f in sorted(files):
+                  fpath = os.path.join(root, f)
+                  size_mb = os.path.getsize(fpath) / 1024 / 1024
+                  rel = os.path.relpath(fpath, OUT_DIR)
+                  print(f"  {rel:40s} {size_mb:8.2f} MB")
+
+          # 写入 JSON manifest
+          manifest = {'languages': LANGUAGES, 'easyocr_ref': os.environ.get('EASYOCR_REF', '${{ github.event.inputs.easyocr_ref }}')}
+          with open(os.path.join(OUT_DIR, 'manifest.json'), 'w') as f:
+              json.dump(manifest, f, indent=2)
+
+      # ============================================================
+      # 6. 上传 Artifacts
+      # ============================================================
+      - name: Upload detector ONNX
+        if: ${{ github.event.inputs.include_detector == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: easyocr-detector-onnx
+          path: out/detector/
+          if-no-files-found: error
+
+      - name: Upload recognizer ONNX + charset
+        uses: actions/upload-artifact@v4
+        with:
+          name: easyocr-recognizer-onnx
+          path: out/recognizer/
+          if-no-files-found: error
+
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: easyocr-manifest
+          path: out/manifest.json
+          if-no-files-found: error
