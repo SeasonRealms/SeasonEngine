@@ -216,6 +216,10 @@ jobs:
                       },
                   )
 
+              # 将外挂 .onnx.data 合并为单文件 ONNX（PyTorch 2.x dynamo 默认外挂权重）
+              import onnx as _det_onnx
+              _det_onnx.save(_det_onnx.load(detector_onnx), detector_onnx, save_as_external_data=False)
+
               # 验证
               import onnxruntime
               ort = onnxruntime.InferenceSession(detector_onnx, providers=['CPUExecutionProvider'])
@@ -336,7 +340,8 @@ jobs:
               meta = onnx_model.metadata_props.add()
               meta.key = 'character'
               meta.value = characters
-              onnx.save(onnx_model, onnx_path)
+              # save_as_external_data=False: 将外挂 .onnx.data 合并为单文件
+              onnx.save(onnx_model, onnx_path, save_as_external_data=False)
 
               # ── 验证 ONNX ──────────────────────────
               import onnxruntime
