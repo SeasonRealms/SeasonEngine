@@ -119,6 +119,11 @@ jobs:
 
           detection_models  = config.detection_models
           recognition_models = config.recognition_models
+          latin_lang_list = config.latin_lang_list
+          arabic_lang_list = config.arabic_lang_list
+          bengali_lang_list = config.bengali_lang_list
+          cyrillic_lang_list = config.cyrillic_lang_list
+          devanagari_lang_list = config.devanagari_lang_list
 
           # ── 语言到模型 key 的映射 ─────────────────────
           LANG_TO_MODEL = {
@@ -137,6 +142,44 @@ jobs:
               'hi':      ('gen1', 'devanagari_g1'),
               'bn':      ('gen1', 'bengali_g1'),
           }
+
+          MODEL_KEY_TO_LANGS = {
+              'english_g2': ['en'],
+              'latin_g1': list(latin_lang_list),
+              'latin_g2': list(latin_lang_list),
+              'zh_tra_g1': ['ch_tra', 'en'],
+              'zh_sim_g1': ['ch_sim', 'en'],
+              'zh_sim_g2': ['ch_sim', 'en'],
+              'japanese_g1': ['ja', 'en'],
+              'japanese_g2': ['ja', 'en'],
+              'korean_g1': ['ko', 'en'],
+              'korean_g2': ['ko', 'en'],
+              'thai_g1': ['th', 'en'],
+              'tamil_g1': ['ta', 'en'],
+              'telugu_g2': ['te', 'en'],
+              'kannada_g2': ['kn', 'en'],
+              'arabic_g1': list(arabic_lang_list) + ['en'],
+              'bengali_g1': list(bengali_lang_list) + ['en'],
+              'devanagari_g1': list(devanagari_lang_list) + ['en'],
+              'cyrillic_g1': list(cyrillic_lang_list) + ['en'],
+              'cyrillic_g2': list(cyrillic_lang_list) + ['en'],
+          }
+
+          def unique_preserve_order(values):
+              seen = set()
+              result = []
+              for value in values:
+                  if value in seen:
+                      continue
+                  seen.add(value)
+                  result.append(value)
+              return result
+
+          def get_supported_languages(model_key):
+              supported = MODEL_KEY_TO_LANGS.get(model_key)
+              if supported:
+                  return unique_preserve_order(supported)
+              return []
 
           def download_and_extract(url, filename, dest_dir):
               """下载 zip 并解压，返回解压后的 .pth 文件路径"""
@@ -249,10 +292,14 @@ jobs:
 
               gen, model_key = LANG_TO_MODEL[lang]
               model_cfg = recognition_models[gen][model_key]
+              supported_languages = get_supported_languages(model_key)
+              model_lang = model_cfg.get('model_script', '')
 
               print(f"\n{'=' * 60}")
               print(f"Exporting Recognizer: {lang} → {model_key} (gen={gen})")
               print(f"{'=' * 60}")
+              print(f"  model_lang    : {model_lang}")
+              print(f"  lang_list     : {supported_languages}")
 
               # 下载权重
               recog_pth = download_and_extract(
@@ -361,12 +408,19 @@ jobs:
                       },
                   )
 
-              # ⭐ PyTorch 2.x 不再支持 metadata 参数，改用 onnx 库后写入
+              # PyTorch 2.x no longer supports metadata in torch.onnx.export, so write it afterward.
               import onnx
+              from onnx import helper as onnx_helper
               onnx_model = onnx.load(onnx_path, load_external_data=True)
-              meta = onnx_model.metadata_props.add()
-              meta.key = 'character'
-              meta.value = characters
+              onnx_helper.set_model_props(onnx_model, {
+                  'character': characters,
+                  'model_lang': model_lang,
+                  'lang_list': json.dumps(supported_languages, ensure_ascii=False),
+                  'languages': ' '.join(supported_languages),
+                  'export_language': lang,
+                  'recognizer_model_key': model_key,
+                  'recognizer_generation': gen,
+              })
               # save_as_external_data=False: 将外挂 .onnx.data 合并为单文件
               onnx.save(onnx_model, onnx_path, save_as_external_data=False)
               # 删除 torch.onnx.export 留下的 .onnx.data 残留文件
@@ -379,12 +433,21 @@ jobs:
               import onnxruntime
               ort = onnxruntime.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
 
-              # 检查 metadata 中的 charset
+              # Validate metadata written into the ONNX model.
               meta = ort.get_modelmeta()
               meta_charset = meta.custom_metadata_map.get('character', '')
+              meta_model_lang = meta.custom_metadata_map.get('model_lang', '')
+              meta_lang_list = meta.custom_metadata_map.get('lang_list', '')
+              meta_languages = meta.custom_metadata_map.get('languages', '')
               print(f"  metadata charset length: {len(meta_charset)}")
               assert meta_charset == characters, \
                   f"Charset mismatch! metadata={len(meta_charset)}, expected={len(characters)}"
+              assert meta_model_lang == model_lang, \
+                  f"model_lang mismatch! metadata={meta_model_lang}, expected={model_lang}"
+              assert meta_lang_list == json.dumps(supported_languages, ensure_ascii=False), \
+                  f"lang_list mismatch! metadata={meta_lang_list}, expected={supported_languages}"
+              assert meta_languages == ' '.join(supported_languages), \
+                  f"languages mismatch! metadata={meta_languages}, expected={' '.join(supported_languages)}"
 
               # 推理验证（PyTorch 2.x dynamo 导出会变换计算图，数值不再严格一致，
               # 只验证 ONNX 可运行、输出无 NaN/Inf、维度正确）
