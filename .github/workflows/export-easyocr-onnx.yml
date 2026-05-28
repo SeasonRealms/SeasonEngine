@@ -10,7 +10,7 @@ on:
       languages:
         description: "Recognizer languages (space-separated, e.g. 'ch_sim en ja ko')"
         required: true
-        default: "ch_sim en"
+        default: "ch_sim ch_tra en ja ko latin th ta te kn ar ru hi bn"
       opset:
         description: "ONNX opset version"
         required: false
