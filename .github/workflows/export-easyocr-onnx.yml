@@ -181,6 +181,27 @@ jobs:
                   return unique_preserve_order(supported)
               return []
 
+          def load_available_dictionaries(easyocr_dir, languages):
+              dict_dir = os.path.join(easyocr_dir, 'easyocr', 'dict')
+              embedded = {}
+              counts = {}
+
+              for lang in languages:
+                  dict_path = os.path.join(dict_dir, lang + '.txt')
+                  if not os.path.exists(dict_path):
+                      continue
+
+                  with open(dict_path, 'r', encoding='utf-8-sig') as f:
+                      lines = [line.strip() for line in f.read().splitlines() if line.strip()]
+
+                  if not lines:
+                      continue
+
+                  embedded[lang] = '\n'.join(lines)
+                  counts[lang] = len(lines)
+
+              return embedded, counts
+
           def download_and_extract(url, filename, dest_dir):
               """下载 zip 并解压，返回解压后的 .pth 文件路径"""
               os.makedirs(dest_dir, exist_ok=True)
@@ -301,6 +322,12 @@ jobs:
               print(f"  model_lang    : {model_lang}")
               print(f"  lang_list     : {supported_languages}")
 
+              embedded_dicts, embedded_dict_counts = load_available_dictionaries(EASYOCR_DIR, supported_languages)
+              if embedded_dict_counts:
+                  print(f"  embedded dicts: {embedded_dict_counts}")
+              else:
+                  print("  embedded dicts: none")
+
               # 下载权重
               recog_pth = download_and_extract(
                   model_cfg['url'], model_cfg['filename'], CACHE_DIR)
@@ -412,15 +439,21 @@ jobs:
               import onnx
               from onnx import helper as onnx_helper
               onnx_model = onnx.load(onnx_path, load_external_data=True)
-              onnx_helper.set_model_props(onnx_model, {
+              metadata_props = {
                   'character': characters,
                   'model_lang': model_lang,
                   'lang_list': json.dumps(supported_languages, ensure_ascii=False),
                   'languages': ' '.join(supported_languages),
+                  'dictionary_languages': json.dumps(list(embedded_dicts.keys()), ensure_ascii=False),
+                  'dictionary_counts': json.dumps(embedded_dict_counts, ensure_ascii=False),
                   'export_language': lang,
                   'recognizer_model_key': model_key,
                   'recognizer_generation': gen,
-              })
+              }
+              for dict_lang, dict_content in embedded_dicts.items():
+                  metadata_props[f'dict_{dict_lang}'] = dict_content
+
+              onnx_helper.set_model_props(onnx_model, metadata_props)
               # save_as_external_data=False: 将外挂 .onnx.data 合并为单文件
               onnx.save(onnx_model, onnx_path, save_as_external_data=False)
               # 删除 torch.onnx.export 留下的 .onnx.data 残留文件
@@ -439,6 +472,8 @@ jobs:
               meta_model_lang = meta.custom_metadata_map.get('model_lang', '')
               meta_lang_list = meta.custom_metadata_map.get('lang_list', '')
               meta_languages = meta.custom_metadata_map.get('languages', '')
+              meta_dictionary_languages = meta.custom_metadata_map.get('dictionary_languages', '')
+              meta_dictionary_counts = meta.custom_metadata_map.get('dictionary_counts', '')
               print(f"  metadata charset length: {len(meta_charset)}")
               assert meta_charset == characters, \
                   f"Charset mismatch! metadata={len(meta_charset)}, expected={len(characters)}"
@@ -448,6 +483,14 @@ jobs:
                   f"lang_list mismatch! metadata={meta_lang_list}, expected={supported_languages}"
               assert meta_languages == ' '.join(supported_languages), \
                   f"languages mismatch! metadata={meta_languages}, expected={' '.join(supported_languages)}"
+              assert meta_dictionary_languages == json.dumps(list(embedded_dicts.keys()), ensure_ascii=False), \
+                  f"dictionary_languages mismatch! metadata={meta_dictionary_languages}, expected={list(embedded_dicts.keys())}"
+              assert meta_dictionary_counts == json.dumps(embedded_dict_counts, ensure_ascii=False), \
+                  f"dictionary_counts mismatch! metadata={meta_dictionary_counts}, expected={embedded_dict_counts}"
+              for dict_lang, dict_content in embedded_dicts.items():
+                  meta_dict_content = meta.custom_metadata_map.get(f'dict_{dict_lang}', '')
+                  assert meta_dict_content == dict_content, \
+                      f"dict_{dict_lang} mismatch! metadata length={len(meta_dict_content)}, expected length={len(dict_content)}"
 
               # 推理验证（PyTorch 2.x dynamo 导出会变换计算图，数值不再严格一致，
               # 只验证 ONNX 可运行、输出无 NaN/Inf、维度正确）
