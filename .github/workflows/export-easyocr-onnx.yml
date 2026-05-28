@@ -273,7 +273,7 @@ jobs:
               print(f"  ✓ charset saved: {txt_path}")
 
               # ── 构建 PyTorch 模型 ───────────────────
-              if gen == 'generation1':
+              if gen == 'gen1':
                   from easyocr.model.model import Model
                   network_params = {
                       'input_channel': 1,
