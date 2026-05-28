@@ -218,7 +218,13 @@ jobs:
 
               # 将外挂 .onnx.data 合并为单文件 ONNX（PyTorch 2.x dynamo 默认外挂权重）
               import onnx as _det_onnx
-              _det_onnx.save(_det_onnx.load(detector_onnx), detector_onnx, save_as_external_data=False)
+              _det_onnx.save(_det_onnx.load(detector_onnx, load_external_data=True),
+                            detector_onnx, save_as_external_data=False)
+              # 删除 torch.onnx.export 留下的 .onnx.data 残留文件
+              for _f in (detector_onnx + '.data',):
+                  if os.path.exists(_f):
+                      os.remove(_f)
+                      print(f"  ✓ removed residual: {os.path.basename(_f)}")
 
               # 验证
               import onnxruntime
@@ -336,12 +342,17 @@ jobs:
 
               # ⭐ PyTorch 2.x 不再支持 metadata 参数，改用 onnx 库后写入
               import onnx
-              onnx_model = onnx.load(onnx_path)
+              onnx_model = onnx.load(onnx_path, load_external_data=True)
               meta = onnx_model.metadata_props.add()
               meta.key = 'character'
               meta.value = characters
               # save_as_external_data=False: 将外挂 .onnx.data 合并为单文件
               onnx.save(onnx_model, onnx_path, save_as_external_data=False)
+              # 删除 torch.onnx.export 留下的 .onnx.data 残留文件
+              data_file = onnx_path + '.data'
+              if os.path.exists(data_file):
+                  os.remove(data_file)
+                  print(f"  ✓ removed residual: {os.path.basename(data_file)}")
 
               # ── 验证 ONNX ──────────────────────────
               import onnxruntime
