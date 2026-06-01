@@ -4,17 +4,31 @@ on:
   workflow_dispatch:
     inputs:
       model_id:
-        description: "HuggingFace model id, e.g. openai/whisper-base"
+        description: "Whisper 官方模型列表，直接选择即可"
+        type: choice
         required: true
         default: "openai/whisper-base"
+        options:
+          - openai/whisper-tiny
+          - openai/whisper-tiny.en
+          - openai/whisper-base
+          - openai/whisper-base.en
+          - openai/whisper-small
+          - openai/whisper-small.en
+          - openai/whisper-medium
+          - openai/whisper-medium.en
+          - openai/whisper-large-v1
+          - openai/whisper-large-v2
+          - openai/whisper-large-v3
+          - openai/whisper-large-v3-turbo
       opset:
         description: "ONNX opset"
         required: false
         default: "18"
       language:
-        description: "Default language token for runtime manifest"
+        description: "默认留空。留空时不注入语言 token，让运行时保持自动语言识别；仅当填写如 zh/en/ja 时才导出对应语言偏置"
         required: false
-        default: "zh"
+        default: ""
       provider:
         description: "Preferred runtime provider in manifest: auto/dml/cuda/coreml/nnapi/cpu"
         required: false
@@ -74,7 +88,7 @@ jobs:
 
           out_dir = os.environ["OUT_DIR"]
           model_id = "${{ github.event.inputs.model_id }}"
-          default_language = "${{ github.event.inputs.language }}"
+          default_language = "${{ github.event.inputs.language }}".strip()
           provider = "${{ github.event.inputs.provider }}"
           opset = int("${{ github.event.inputs.opset }}")
 
@@ -202,10 +216,15 @@ jobs:
               decoder_outputs_meta.keys(),
               ["logits", "decoder_logits"])
 
-          token_ids = np.array([[tokenizer.convert_tokens_to_ids("<|startoftranscript|>"),
-                                 tokenizer.convert_tokens_to_ids(f"<|{default_language}|>") if tokenizer.convert_tokens_to_ids(f"<|{default_language}|>") is not None else tokenizer.convert_tokens_to_ids("<|startoftranscript|>"),
-                                 tokenizer.convert_tokens_to_ids("<|transcribe|>"),
-                                 tokenizer.convert_tokens_to_ids("<|notimestamps|>")]], dtype=np.int64)
+          token_id_list = [tokenizer.convert_tokens_to_ids("<|startoftranscript|>")]
+          if default_language:
+              language_token = tokenizer.convert_tokens_to_ids(f"<|{default_language}|>")
+              if language_token is None or language_token == tokenizer.unk_token_id:
+                  raise ValueError(f"Unsupported language token: {default_language}")
+              token_id_list.append(language_token)
+          token_id_list.append(tokenizer.convert_tokens_to_ids("<|transcribe|>"))
+          token_id_list.append(tokenizer.convert_tokens_to_ids("<|notimestamps|>"))
+          token_ids = np.array([token_id_list], dtype=np.int64)
 
           decoder_feeds = {}
           for name, meta in decoder_inputs.items():
@@ -282,7 +301,7 @@ jobs:
               "nMels": n_mels,
               "maxTokens": 128,
               "sot": int(tokenizer.convert_tokens_to_ids("<|startoftranscript|>")),
-              "sotLang": int(lang_map.get(default_language, tokenizer.convert_tokens_to_ids("<|startoftranscript|>"))),
+              "sotLang": int(lang_map.get(default_language, tokenizer.convert_tokens_to_ids("<|startoftranscript|>"))) if default_language else int(tokenizer.convert_tokens_to_ids("<|startoftranscript|>")),
               "transcribe": int(tokenizer.convert_tokens_to_ids("<|transcribe|>")),
               "noTime": int(tokenizer.convert_tokens_to_ids("<|notimestamps|>")),
               "eot": int(tokenizer.eos_token_id),
@@ -313,6 +332,7 @@ jobs:
               "decoder_output": decoder_output_name,
               "decoder_logits_shape": list(logits.shape),
               "default_language": default_language,
+              "use_language_token": bool(default_language),
               "language_count": len(lang_map),
               "token_vocab_size": len(inv_vocab),
               "mel_filter_count": len(mel_filters),
