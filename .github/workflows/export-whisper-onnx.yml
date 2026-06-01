@@ -50,7 +50,11 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "optimum[onnxruntime]" transformers onnx onnxruntime torch torchaudio sentencepiece
+          pip install "optimum[onnxruntime]" transformers onnx onnxruntime onnxscript torch torchaudio sentencepiece
+
+      - name: Create output directory
+        run: |
+          mkdir -p "${OUT_DIR}"
 
       - name: Export Whisper encoder/decoder ONNX
         run: |
