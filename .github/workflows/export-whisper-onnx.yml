@@ -64,99 +64,170 @@ jobs:
             --opset "${{ github.event.inputs.opset }}" \
             "${OUT_DIR}"
 
-      - name: Build preprocess ONNX + Season manifest
+      - name: Build Season manifest + validate ONNX
         shell: python
         run: |
-          import os, json, base64, torch, torchaudio, onnxruntime
+          import os, json, base64, glob
+          import numpy as np
+          import torch, torchaudio, onnxruntime
           from transformers import WhisperForConditionalGeneration, WhisperTokenizer
 
           out_dir = os.environ["OUT_DIR"]
           model_id = "${{ github.event.inputs.model_id }}"
           default_language = "${{ github.event.inputs.language }}"
           provider = "${{ github.event.inputs.provider }}"
+          opset = int("${{ github.event.inputs.opset }}")
 
           model = WhisperForConditionalGeneration.from_pretrained(model_id)
           tokenizer = WhisperTokenizer.from_pretrained(model_id)
 
-          class WhisperPreprocess(torch.nn.Module):
-              def __init__(self, sample_rate=16000, n_fft=400, hop_length=160, n_mels=80, chunk_samples=480000):
-                  super().__init__()
-                  self.sample_rate = sample_rate
-                  self.n_fft = n_fft
-                  self.hop_length = hop_length
-                  self.n_mels = n_mels
-                  self.chunk_samples = chunk_samples
-                  self.register_buffer("window", torch.hann_window(n_fft))
-                  fb = torchaudio.functional.melscale_fbanks(
-                      n_freqs=n_fft // 2 + 1,
-                      f_min=0.0,
-                      f_max=8000.0,
-                      n_mels=n_mels,
-                      sample_rate=sample_rate,
-                      norm="slaney",
-                      mel_scale="slaney",
-                  )
-                  self.register_buffer("mel_filters", fb.transpose(0, 1))
+          def rank_encoder(name: str):
+              lower = os.path.basename(name).lower()
+              score = 0
+              if "encoder_model" in lower:
+                  score -= 100
+              if "encoder" in lower:
+                  score -= 50
+              if "quant" in lower or "int8" in lower:
+                  score += 10
+              return score, lower
 
-              def forward(self, waveform):
-                  if waveform.dim() == 1:
-                      waveform = waveform.unsqueeze(0)
-                  x = waveform[:, :self.chunk_samples]
-                  if x.shape[1] < self.chunk_samples:
-                      x = torch.nn.functional.pad(x, (0, self.chunk_samples - x.shape[1]))
-                  x = torch.nn.functional.pad(x, (self.n_fft // 2, self.n_fft // 2))
-                  stft = torch.stft(
-                      x,
-                      n_fft=self.n_fft,
-                      hop_length=self.hop_length,
-                      win_length=self.n_fft,
-                      window=self.window,
-                      center=False,
-                      return_complex=True,
-                  )
-                  power = stft.abs().pow(2.0)
-                  mel = torch.matmul(self.mel_filters, power)
-                  log_spec = torch.clamp(mel, min=1e-10).log10()
-                  log_spec = torch.maximum(log_spec, log_spec.amax(dim=(-2, -1), keepdim=True) - 8.0)
-                  log_spec = (log_spec + 4.0) / 4.0
-                  return log_spec[:, :, :3000]
+          def rank_decoder(name: str):
+              lower = os.path.basename(name).lower()
+              score = 0
+              if "decoder_model_merged" in lower:
+                  score -= 120
+              elif "decoder_model" in lower:
+                  score -= 100
+              elif "decoder" in lower:
+                  score -= 50
+              if "with_past" in lower:
+                  score += 20
+              if "quant" in lower or "int8" in lower:
+                  score += 10
+              return score, lower
 
-          preprocess = WhisperPreprocess().eval()
-          preprocess_path = os.path.join(out_dir, "preprocess_model.onnx")
-          dummy = torch.randn(1, 16000 * 30)
+          onnx_files = [os.path.basename(path) for path in glob.glob(os.path.join(out_dir, "*.onnx"))]
+          encoder_pool = [name for name in onnx_files if "encoder" in name.lower() and "decoder" not in name.lower()]
+          decoder_pool = [name for name in onnx_files if "decoder" in name.lower()]
 
-          with torch.no_grad():
-              torch.onnx.export(
-                  preprocess,
-                  dummy,
-                  preprocess_path,
-                  input_names=["waveform"],
-                  output_names=["input_features"],
-                  dynamic_axes={"waveform": {0: "batch", 1: "samples"}},
-                  opset_version=int("${{ github.event.inputs.opset }}"),
-                  do_constant_folding=True,
-                  dynamo=False,
-              )
+          if not encoder_pool:
+              raise FileNotFoundError(f"No encoder ONNX found in {out_dir}. Files={onnx_files}")
+          if not decoder_pool:
+              raise FileNotFoundError(f"No decoder ONNX found in {out_dir}. Files={onnx_files}")
 
-          ort = onnxruntime.InferenceSession(preprocess_path, providers=["CPUExecutionProvider"])
-          features = ort.run(None, {"waveform": dummy.numpy()})[0]
-          assert features.shape[1] == 80, features.shape
+          encoder_name = sorted(encoder_pool, key=rank_encoder)[0]
+          decoder_name = sorted(decoder_pool, key=rank_decoder)[0]
 
-          encoder_candidates = [
-              "encoder_model.onnx",
-          ]
-          decoder_candidates = [
-              "decoder_model.onnx",
-              "decoder_model_merged.onnx",
-          ]
+          sample_rate = 16000
+          n_fft = 400
+          hop_length = 160
+          n_mels = 80
+          chunk_seconds = 30
+          max_samples = sample_rate * chunk_seconds
+          mel_filters = torchaudio.functional.melscale_fbanks(
+              n_freqs=n_fft // 2 + 1,
+              f_min=0.0,
+              f_max=8000.0,
+              n_mels=n_mels,
+              sample_rate=sample_rate,
+              norm="slaney",
+              mel_scale="slaney",
+          ).transpose(0, 1).reshape(-1).tolist()
 
-          encoder_name = next((name for name in encoder_candidates if os.path.exists(os.path.join(out_dir, name))), None)
-          decoder_name = next((name for name in decoder_candidates if os.path.exists(os.path.join(out_dir, name))), None)
+          def pick_name(keys, preferred):
+              for candidate in preferred:
+                  if candidate in keys:
+                      return candidate
+              return next(iter(keys))
 
-          if encoder_name is None:
-              raise FileNotFoundError("encoder_model.onnx not found")
-          if decoder_name is None:
-              raise FileNotFoundError("decoder_model.onnx / decoder_model_merged.onnx not found")
+          def resolve_dims(shape, fallback_last_dim=None):
+              dims = []
+              for index, dim in enumerate(shape):
+                  if isinstance(dim, int) and dim > 0:
+                      dims.append(dim)
+                  elif index == 0:
+                      dims.append(1)
+                  elif fallback_last_dim is not None and index == len(shape) - 1:
+                      dims.append(fallback_last_dim)
+                  else:
+                      dims.append(1)
+              return dims
+
+          def tensor_dtype(type_name):
+              lower = type_name.lower()
+              if "int64" in lower:
+                  return np.int64
+              if "int32" in lower:
+                  return np.int32
+              if "bool" in lower:
+                  return np.bool_
+              return np.float32
+
+          def zeros_for_meta(meta, dims):
+              return np.zeros(dims, dtype=tensor_dtype(meta.type))
+
+          encoder_path = os.path.join(out_dir, encoder_name)
+          decoder_path = os.path.join(out_dir, decoder_name)
+
+          encoder_session = onnxruntime.InferenceSession(encoder_path, providers=["CPUExecutionProvider"])
+          encoder_input_name = pick_name(encoder_session.InputMetadata.keys(), ["input_features", "mel"])
+          encoder_output_name = pick_name(encoder_session.OutputMetadata.keys(), ["last_hidden_state", "encoder_hidden_states"])
+
+          encoder_input = np.random.randn(1, n_mels, max_samples // hop_length + 1).astype(np.float32)
+          encoder_outputs = encoder_session.run(None, {encoder_input_name: encoder_input})
+          encoder_output_index = list(encoder_session.OutputMetadata.keys()).index(encoder_output_name)
+          encoder_hidden = encoder_outputs[encoder_output_index]
+
+          assert encoder_hidden.ndim == 3, f"Unexpected encoder output shape: {encoder_hidden.shape}"
+          assert not np.isnan(encoder_hidden).any(), "Encoder output contains NaN"
+          assert not np.isinf(encoder_hidden).any(), "Encoder output contains Inf"
+
+          decoder_session = onnxruntime.InferenceSession(decoder_path, providers=["CPUExecutionProvider"])
+          decoder_input_name = pick_name(
+              decoder_session.InputMetadata.keys(),
+              ["input_ids", "decoder_input_ids"])
+          decoder_encoder_input_name = pick_name(
+              decoder_session.InputMetadata.keys(),
+              ["encoder_hidden_states", "encoder_outputs"])
+          decoder_output_name = pick_name(
+              decoder_session.OutputMetadata.keys(),
+              ["logits", "decoder_logits"])
+
+          token_ids = np.array([[tokenizer.convert_tokens_to_ids("<|startoftranscript|>"),
+                                 tokenizer.convert_tokens_to_ids(f"<|{default_language}|>") if tokenizer.convert_tokens_to_ids(f"<|{default_language}|>") is not None else tokenizer.convert_tokens_to_ids("<|startoftranscript|>"),
+                                 tokenizer.convert_tokens_to_ids("<|transcribe|>"),
+                                 tokenizer.convert_tokens_to_ids("<|notimestamps|>")]], dtype=np.int64)
+
+          decoder_feeds = {}
+          for name, meta in decoder_session.InputMetadata.items():
+              lower = name.lower()
+              if name == decoder_input_name or "input_ids" in lower:
+                  decoder_feeds[name] = token_ids
+              elif name == decoder_encoder_input_name or "encoder_hidden_states" in lower or "encoder_outputs" in lower:
+                  decoder_feeds[name] = encoder_hidden.astype(np.float32)
+              elif "position_ids" in lower:
+                  decoder_feeds[name] = np.arange(token_ids.shape[1], dtype=np.int64).reshape(1, token_ids.shape[1])
+              elif "cache_position" in lower:
+                  decoder_feeds[name] = np.arange(token_ids.shape[1], dtype=np.int64)
+              elif "attention_mask" in lower:
+                  if "encoder" in lower:
+                      decoder_feeds[name] = np.ones((1, encoder_hidden.shape[1]), dtype=np.int64)
+                  else:
+                      decoder_feeds[name] = np.ones_like(token_ids, dtype=np.int64)
+              elif "use_cache_branch" in lower:
+                  decoder_feeds[name] = np.array(False, dtype=np.bool_)
+              else:
+                  dims = resolve_dims(meta.shape, fallback_last_dim=encoder_hidden.shape[-1])
+                  decoder_feeds[name] = zeros_for_meta(meta, dims)
+
+          decoder_outputs = decoder_session.run(None, decoder_feeds)
+          decoder_output_index = list(decoder_session.OutputMetadata.keys()).index(decoder_output_name)
+          logits = decoder_outputs[decoder_output_index]
+
+          assert logits.ndim >= 2, f"Unexpected decoder logits shape: {logits.shape}"
+          assert not np.isnan(logits).any(), "Decoder output contains NaN"
+          assert not np.isinf(logits).any(), "Decoder output contains Inf"
 
           byte_decoder = tokenizer.byte_decoder
           vocab = tokenizer.get_vocab()
@@ -183,20 +254,23 @@ jobs:
                   lang_map[key.replace("<|", "").replace("|>", "")] = int(value)
 
           manifest = {
-              "preprocessModel": "preprocess_model.onnx",
+              "preprocessModel": "",
               "encoderModel": encoder_name,
               "decoderModel": decoder_name,
               "preprocessInput": "waveform",
               "preprocessOutput": "input_features",
-              "encoderInput": "input_features",
-              "encoderOutput": "last_hidden_state",
-              "decoderInput": "input_ids",
-              "decoderEncoderInput": "encoder_hidden_states",
-              "decoderOutput": "logits",
+              "encoderInput": encoder_input_name,
+              "encoderOutput": encoder_output_name,
+              "decoderInput": decoder_input_name,
+              "decoderEncoderInput": decoder_encoder_input_name,
+              "decoderOutput": decoder_output_name,
               "provider": provider,
               "defaultLanguage": default_language,
-              "sampleRate": 16000,
-              "maxSamples": 480000,
+              "sampleRate": sample_rate,
+              "maxSamples": max_samples,
+              "nFft": n_fft,
+              "hopLength": hop_length,
+              "nMels": n_mels,
               "maxTokens": 128,
               "sot": int(tokenizer.convert_tokens_to_ids("<|startoftranscript|>")),
               "sotLang": int(lang_map.get(default_language, tokenizer.convert_tokens_to_ids("<|startoftranscript|>"))),
@@ -205,6 +279,7 @@ jobs:
               "eot": int(tokenizer.eos_token_id),
               "timeBegin": int(tokenizer.convert_tokens_to_ids("<|0.00|>")),
               "languages": lang_map,
+              "melFilters": mel_filters,
               "tokenBytesBase64": token_bytes_base64,
           }
 
@@ -214,6 +289,34 @@ jobs:
           print("Exported files:")
           for name in sorted(os.listdir(out_dir)):
               print(" -", name)
+
+          summary = {
+              "model_id": model_id,
+              "opset": opset,
+              "encoder_model": encoder_name,
+              "decoder_model": decoder_name,
+              "encoder_input": encoder_input_name,
+              "encoder_output": encoder_output_name,
+              "encoder_hidden_shape": list(encoder_hidden.shape),
+              "decoder_input": decoder_input_name,
+              "decoder_encoder_input": decoder_encoder_input_name,
+              "decoder_output": decoder_output_name,
+              "decoder_logits_shape": list(logits.shape),
+              "default_language": default_language,
+              "language_count": len(lang_map),
+              "token_vocab_size": len(inv_vocab),
+              "mel_filter_count": len(mel_filters),
+              "special_tokens": {
+                  "sot": manifest["sot"],
+                  "sotLang": manifest["sotLang"],
+                  "transcribe": manifest["transcribe"],
+                  "noTime": manifest["noTime"],
+                  "eot": manifest["eot"],
+                  "timeBegin": manifest["timeBegin"],
+              },
+          }
+          print("Season Whisper manifest summary:")
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
 
       - name: Upload Whisper ONNX bundle
         uses: actions/upload-artifact@v4
