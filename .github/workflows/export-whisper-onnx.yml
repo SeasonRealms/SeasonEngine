@@ -171,12 +171,14 @@ jobs:
           decoder_path = os.path.join(out_dir, decoder_name)
 
           encoder_session = onnxruntime.InferenceSession(encoder_path, providers=["CPUExecutionProvider"])
-          encoder_input_name = pick_name(encoder_session.InputMetadata.keys(), ["input_features", "mel"])
-          encoder_output_name = pick_name(encoder_session.OutputMetadata.keys(), ["last_hidden_state", "encoder_hidden_states"])
+          encoder_inputs = {meta.name: meta for meta in encoder_session.get_inputs()}
+          encoder_outputs_meta = {meta.name: meta for meta in encoder_session.get_outputs()}
+          encoder_input_name = pick_name(encoder_inputs.keys(), ["input_features", "mel"])
+          encoder_output_name = pick_name(encoder_outputs_meta.keys(), ["last_hidden_state", "encoder_hidden_states"])
 
           encoder_input = np.random.randn(1, n_mels, max_samples // hop_length + 1).astype(np.float32)
           encoder_outputs = encoder_session.run(None, {encoder_input_name: encoder_input})
-          encoder_output_index = list(encoder_session.OutputMetadata.keys()).index(encoder_output_name)
+          encoder_output_index = list(encoder_outputs_meta.keys()).index(encoder_output_name)
           encoder_hidden = encoder_outputs[encoder_output_index]
 
           assert encoder_hidden.ndim == 3, f"Unexpected encoder output shape: {encoder_hidden.shape}"
@@ -184,14 +186,16 @@ jobs:
           assert not np.isinf(encoder_hidden).any(), "Encoder output contains Inf"
 
           decoder_session = onnxruntime.InferenceSession(decoder_path, providers=["CPUExecutionProvider"])
+          decoder_inputs = {meta.name: meta for meta in decoder_session.get_inputs()}
+          decoder_outputs_meta = {meta.name: meta for meta in decoder_session.get_outputs()}
           decoder_input_name = pick_name(
-              decoder_session.InputMetadata.keys(),
+              decoder_inputs.keys(),
               ["input_ids", "decoder_input_ids"])
           decoder_encoder_input_name = pick_name(
-              decoder_session.InputMetadata.keys(),
+              decoder_inputs.keys(),
               ["encoder_hidden_states", "encoder_outputs"])
           decoder_output_name = pick_name(
-              decoder_session.OutputMetadata.keys(),
+              decoder_outputs_meta.keys(),
               ["logits", "decoder_logits"])
 
           token_ids = np.array([[tokenizer.convert_tokens_to_ids("<|startoftranscript|>"),
@@ -200,7 +204,7 @@ jobs:
                                  tokenizer.convert_tokens_to_ids("<|notimestamps|>")]], dtype=np.int64)
 
           decoder_feeds = {}
-          for name, meta in decoder_session.InputMetadata.items():
+          for name, meta in decoder_inputs.items():
               lower = name.lower()
               if name == decoder_input_name or "input_ids" in lower:
                   decoder_feeds[name] = token_ids
@@ -222,7 +226,7 @@ jobs:
                   decoder_feeds[name] = zeros_for_meta(meta, dims)
 
           decoder_outputs = decoder_session.run(None, decoder_feeds)
-          decoder_output_index = list(decoder_session.OutputMetadata.keys()).index(decoder_output_name)
+          decoder_output_index = list(decoder_outputs_meta.keys()).index(decoder_output_name)
           logits = decoder_outputs[decoder_output_index]
 
           assert logits.ndim >= 2, f"Unexpected decoder logits shape: {logits.shape}"
