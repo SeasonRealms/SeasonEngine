@@ -1,0 +1,219 @@
+name: Export Whisper ONNX Models
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_id:
+        description: "HuggingFace model id, e.g. openai/whisper-base"
+        required: true
+        default: "openai/whisper-base"
+      opset:
+        description: "ONNX opset"
+        required: false
+        default: "17"
+      language:
+        description: "Default language token for runtime manifest"
+        required: false
+        default: "zh"
+      provider:
+        description: "Preferred runtime provider in manifest: auto/dml/cuda/coreml/nnapi/cpu"
+        required: false
+        default: "auto"
+
+permissions:
+  contents: read
+
+jobs:
+  export-whisper:
+    runs-on: ubuntu-latest
+
+    env:
+      OUT_DIR: out
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-whisper-${{ github.event.inputs.model_id }}-${{ github.event.inputs.opset }}
+          restore-keys: |
+            pip-${{ runner.os }}-whisper-
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "optimum[onnxruntime]" transformers onnx onnxruntime torch torchaudio sentencepiece
+
+      - name: Export Whisper encoder/decoder ONNX
+        run: |
+          optimum-cli export onnx \
+            --model "${{ github.event.inputs.model_id }}" \
+            --task automatic-speech-recognition \
+            --opset "${{ github.event.inputs.opset }}" \
+            "${OUT_DIR}"
+
+      - name: Build preprocess ONNX + Season manifest
+        shell: python
+        run: |
+          import os, json, base64, torch, torchaudio, onnxruntime
+          from transformers import WhisperProcessor, WhisperForConditionalGeneration
+
+          out_dir = os.environ["OUT_DIR"]
+          model_id = "${{ github.event.inputs.model_id }}"
+          default_language = "${{ github.event.inputs.language }}"
+          provider = "${{ github.event.inputs.provider }}"
+
+          processor = WhisperProcessor.from_pretrained(model_id)
+          model = WhisperForConditionalGeneration.from_pretrained(model_id)
+          tokenizer = processor.tokenizer
+
+          class WhisperPreprocess(torch.nn.Module):
+              def __init__(self, sample_rate=16000, n_fft=400, hop_length=160, n_mels=80, chunk_samples=480000):
+                  super().__init__()
+                  self.sample_rate = sample_rate
+                  self.n_fft = n_fft
+                  self.hop_length = hop_length
+                  self.n_mels = n_mels
+                  self.chunk_samples = chunk_samples
+                  self.register_buffer("window", torch.hann_window(n_fft))
+                  fb = torchaudio.functional.melscale_fbanks(
+                      n_freqs=n_fft // 2 + 1,
+                      f_min=0.0,
+                      f_max=8000.0,
+                      n_mels=n_mels,
+                      sample_rate=sample_rate,
+                      norm="slaney",
+                      mel_scale="slaney",
+                  )
+                  self.register_buffer("mel_filters", fb.transpose(0, 1))
+
+              def forward(self, waveform):
+                  if waveform.dim() == 1:
+                      waveform = waveform.unsqueeze(0)
+                  x = waveform[:, :self.chunk_samples]
+                  if x.shape[1] < self.chunk_samples:
+                      x = torch.nn.functional.pad(x, (0, self.chunk_samples - x.shape[1]))
+                  x = torch.nn.functional.pad(x, (self.n_fft // 2, self.n_fft // 2))
+                  stft = torch.stft(
+                      x,
+                      n_fft=self.n_fft,
+                      hop_length=self.hop_length,
+                      win_length=self.n_fft,
+                      window=self.window,
+                      center=False,
+                      return_complex=True,
+                  )
+                  power = stft.abs().pow(2.0)
+                  mel = torch.matmul(self.mel_filters, power)
+                  log_spec = torch.clamp(mel, min=1e-10).log10()
+                  log_spec = torch.maximum(log_spec, log_spec.amax(dim=(-2, -1), keepdim=True) - 8.0)
+                  log_spec = (log_spec + 4.0) / 4.0
+                  return log_spec[:, :, :3000]
+
+          preprocess = WhisperPreprocess().eval()
+          preprocess_path = os.path.join(out_dir, "preprocess_model.onnx")
+          dummy = torch.randn(1, 16000 * 30)
+
+          with torch.no_grad():
+              torch.onnx.export(
+                  preprocess,
+                  dummy,
+                  preprocess_path,
+                  input_names=["waveform"],
+                  output_names=["input_features"],
+                  dynamic_axes={"waveform": {0: "batch", 1: "samples"}},
+                  opset_version=int("${{ github.event.inputs.opset }}"),
+                  do_constant_folding=True,
+              )
+
+          ort = onnxruntime.InferenceSession(preprocess_path, providers=["CPUExecutionProvider"])
+          features = ort.run(None, {"waveform": dummy.numpy()})[0]
+          assert features.shape[1] == 80, features.shape
+
+          encoder_candidates = [
+              "encoder_model.onnx",
+          ]
+          decoder_candidates = [
+              "decoder_model.onnx",
+              "decoder_model_merged.onnx",
+          ]
+
+          encoder_name = next((name for name in encoder_candidates if os.path.exists(os.path.join(out_dir, name))), None)
+          decoder_name = next((name for name in decoder_candidates if os.path.exists(os.path.join(out_dir, name))), None)
+
+          if encoder_name is None:
+              raise FileNotFoundError("encoder_model.onnx not found")
+          if decoder_name is None:
+              raise FileNotFoundError("decoder_model.onnx / decoder_model_merged.onnx not found")
+
+          byte_decoder = tokenizer.byte_decoder
+          vocab = tokenizer.get_vocab()
+          inv_vocab = [None] * (max(vocab.values()) + 1)
+          for token, idx in vocab.items():
+              inv_vocab[idx] = token
+
+          token_bytes_base64 = []
+          for token in inv_vocab:
+              if token is None or token.startswith("<|"):
+                  token_bytes_base64.append(None)
+                  continue
+
+              try:
+                  raw = bytes(byte_decoder[ch] for ch in token)
+                  token_bytes_base64.append(base64.b64encode(raw).decode("ascii"))
+              except Exception:
+                  token_bytes_base64.append(None)
+
+          lang_map = {}
+          gen_cfg = model.generation_config
+          if getattr(gen_cfg, "lang_to_id", None):
+              for key, value in gen_cfg.lang_to_id.items():
+                  lang_map[key.replace("<|", "").replace("|>", "")] = int(value)
+
+          manifest = {
+              "preprocessModel": "preprocess_model.onnx",
+              "encoderModel": encoder_name,
+              "decoderModel": decoder_name,
+              "preprocessInput": "waveform",
+              "preprocessOutput": "input_features",
+              "encoderInput": "input_features",
+              "encoderOutput": "last_hidden_state",
+              "decoderInput": "input_ids",
+              "decoderEncoderInput": "encoder_hidden_states",
+              "decoderOutput": "logits",
+              "provider": provider,
+              "defaultLanguage": default_language,
+              "sampleRate": 16000,
+              "maxSamples": 480000,
+              "maxTokens": 128,
+              "sot": int(tokenizer.convert_tokens_to_ids("<|startoftranscript|>")),
+              "sotLang": int(lang_map.get(default_language, tokenizer.convert_tokens_to_ids("<|startoftranscript|>"))),
+              "transcribe": int(tokenizer.convert_tokens_to_ids("<|transcribe|>")),
+              "noTime": int(tokenizer.convert_tokens_to_ids("<|notimestamps|>")),
+              "eot": int(tokenizer.eos_token_id),
+              "timeBegin": int(tokenizer.convert_tokens_to_ids("<|0.00|>")),
+              "languages": lang_map,
+              "tokenBytesBase64": token_bytes_base64,
+          }
+
+          with open(os.path.join(out_dir, "season-whisper.json"), "w", encoding="utf-8") as f:
+              json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+          print("Exported files:")
+          for name in sorted(os.listdir(out_dir)):
+              print(" -", name)
+
+      - name: Upload Whisper ONNX bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-onnx-bundle
+          path: out/
+          if-no-files-found: error
