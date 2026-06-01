@@ -10,7 +10,7 @@ on:
       opset:
         description: "ONNX opset"
         required: false
-        default: "17"
+        default: "18"
       language:
         description: "Default language token for runtime manifest"
         required: false
@@ -68,16 +68,15 @@ jobs:
         shell: python
         run: |
           import os, json, base64, torch, torchaudio, onnxruntime
-          from transformers import WhisperProcessor, WhisperForConditionalGeneration
+          from transformers import WhisperForConditionalGeneration, WhisperTokenizer
 
           out_dir = os.environ["OUT_DIR"]
           model_id = "${{ github.event.inputs.model_id }}"
           default_language = "${{ github.event.inputs.language }}"
           provider = "${{ github.event.inputs.provider }}"
 
-          processor = WhisperProcessor.from_pretrained(model_id)
           model = WhisperForConditionalGeneration.from_pretrained(model_id)
-          tokenizer = processor.tokenizer
+          tokenizer = WhisperTokenizer.from_pretrained(model_id)
 
           class WhisperPreprocess(torch.nn.Module):
               def __init__(self, sample_rate=16000, n_fft=400, hop_length=160, n_mels=80, chunk_samples=480000):
@@ -136,6 +135,7 @@ jobs:
                   dynamic_axes={"waveform": {0: "batch", 1: "samples"}},
                   opset_version=int("${{ github.event.inputs.opset }}"),
                   do_constant_folding=True,
+                  dynamo=False,
               )
 
           ort = onnxruntime.InferenceSession(preprocess_path, providers=["CPUExecutionProvider"])
