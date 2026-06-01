@@ -175,8 +175,12 @@ jobs:
           encoder_outputs_meta = {meta.name: meta for meta in encoder_session.get_outputs()}
           encoder_input_name = pick_name(encoder_inputs.keys(), ["input_features", "mel"])
           encoder_output_name = pick_name(encoder_outputs_meta.keys(), ["last_hidden_state", "encoder_hidden_states"])
+          encoder_input_meta = encoder_inputs[encoder_input_name]
+          encoder_input_shape = resolve_dims(encoder_input_meta.shape)
+          expected_n_mels = encoder_input_shape[1] if len(encoder_input_shape) > 1 else n_mels
+          max_frames = encoder_input_shape[2] if len(encoder_input_shape) > 2 and encoder_input_shape[2] > 1 else 3000
 
-          encoder_input = np.random.randn(1, n_mels, max_samples // hop_length + 1).astype(np.float32)
+          encoder_input = np.random.randn(1, expected_n_mels, max_frames).astype(np.float32)
           encoder_outputs = encoder_session.run(None, {encoder_input_name: encoder_input})
           encoder_output_index = list(encoder_outputs_meta.keys()).index(encoder_output_name)
           encoder_hidden = encoder_outputs[encoder_output_index]
@@ -272,6 +276,7 @@ jobs:
               "defaultLanguage": default_language,
               "sampleRate": sample_rate,
               "maxSamples": max_samples,
+              "maxFrames": max_frames,
               "nFft": n_fft,
               "hopLength": hop_length,
               "nMels": n_mels,
@@ -301,6 +306,7 @@ jobs:
               "decoder_model": decoder_name,
               "encoder_input": encoder_input_name,
               "encoder_output": encoder_output_name,
+              "encoder_input_shape": list(encoder_input.shape),
               "encoder_hidden_shape": list(encoder_hidden.shape),
               "decoder_input": decoder_input_name,
               "decoder_encoder_input": decoder_encoder_input_name,
