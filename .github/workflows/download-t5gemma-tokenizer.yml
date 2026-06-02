@@ -19,15 +19,6 @@ on:
         description: "输出 zip / artifact 名称（不带 .zip）"
         required: true
         default: "t5gemma-tokenizer"
-      files:
-        description: "需要下载的文件列表（每行一个 repo 根目录下的文件）"
-        required: true
-        default: |
-          tokenizer.model
-          tokenizer.json
-          tokenizer_config.json
-          special_tokens_map.json
-
 permissions:
   contents: read
 
@@ -81,16 +72,12 @@ jobs:
           bundle_subdir = "${{ github.event.inputs.bundle_subdir }}".strip().strip("/").strip("\\")
           artifact_name = "${{ github.event.inputs.artifact_name }}".strip()
 
-          files_raw = json.loads(r'''${{ toJSON(github.event.inputs.files) }}''')
           repo_files = [
-              part.strip()
-              for line in files_raw.splitlines()
-              for part in line.split(",")
-              if part.strip()
+              "tokenizer.model",
+              "tokenizer.json",
+              "tokenizer_config.json",
+              "special_tokens_map.json",
           ]
-
-          if not repo_files:
-              raise RuntimeError("files 输入为空，请至少提供一个待下载文件。")
 
           hf_token = os.environ.get("HF_TOKEN", "").strip()
           if not hf_token:
