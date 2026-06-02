@@ -136,18 +136,9 @@ jobs:
           sample_rate = 16000
           n_fft = 400
           hop_length = 160
-          n_mels = 80
+          default_n_mels = 80
           chunk_seconds = 30
           max_samples = sample_rate * chunk_seconds
-          mel_filters = torchaudio.functional.melscale_fbanks(
-              n_freqs=n_fft // 2 + 1,
-              f_min=0.0,
-              f_max=8000.0,
-              n_mels=n_mels,
-              sample_rate=sample_rate,
-              norm="slaney",
-              mel_scale="slaney",
-          ).transpose(0, 1).reshape(-1).tolist()
 
           def pick_name(keys, preferred):
               for candidate in preferred:
@@ -191,8 +182,17 @@ jobs:
           encoder_output_name = pick_name(encoder_outputs_meta.keys(), ["last_hidden_state", "encoder_hidden_states"])
           encoder_input_meta = encoder_inputs[encoder_input_name]
           encoder_input_shape = resolve_dims(encoder_input_meta.shape)
-          expected_n_mels = encoder_input_shape[1] if len(encoder_input_shape) > 1 else n_mels
+          expected_n_mels = encoder_input_shape[1] if len(encoder_input_shape) > 1 and encoder_input_shape[1] > 1 else default_n_mels
           max_frames = encoder_input_shape[2] if len(encoder_input_shape) > 2 and encoder_input_shape[2] > 1 else 3000
+          mel_filters = torchaudio.functional.melscale_fbanks(
+              n_freqs=n_fft // 2 + 1,
+              f_min=0.0,
+              f_max=8000.0,
+              n_mels=expected_n_mels,
+              sample_rate=sample_rate,
+              norm="slaney",
+              mel_scale="slaney",
+          ).transpose(0, 1).reshape(-1).tolist()
 
           encoder_input = np.random.randn(1, expected_n_mels, max_frames).astype(np.float32)
           encoder_outputs = encoder_session.run(None, {encoder_input_name: encoder_input})
@@ -298,7 +298,7 @@ jobs:
               "maxFrames": max_frames,
               "nFft": n_fft,
               "hopLength": hop_length,
-              "nMels": n_mels,
+              "nMels": expected_n_mels,
               "maxTokens": 128,
               "sot": int(tokenizer.convert_tokens_to_ids("<|startoftranscript|>")),
               "sotLang": int(lang_map.get(default_language, tokenizer.convert_tokens_to_ids("<|startoftranscript|>"))) if default_language else int(tokenizer.convert_tokens_to_ids("<|startoftranscript|>")),
@@ -327,6 +327,7 @@ jobs:
               "encoder_output": encoder_output_name,
               "encoder_input_shape": list(encoder_input.shape),
               "encoder_hidden_shape": list(encoder_hidden.shape),
+              "n_mels": expected_n_mels,
               "decoder_input": decoder_input_name,
               "decoder_encoder_input": decoder_encoder_input_name,
               "decoder_output": decoder_output_name,
