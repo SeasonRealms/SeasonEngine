@@ -82,22 +82,19 @@ jobs:
           bundle_root.mkdir(parents=True, exist_ok=True)
 
           api = HfApi()
-          tree_entries = list(
-              api.list_repo_tree(
+          all_repo_files = list(
+              api.list_repo_files(
                   repo_id=repo_id,
-                  path_in_repo=subfolder,
-                  recursive=True,
                   repo_type="model",
                   revision=revision,
               )
           )
-
-          file_entries = []
-          for entry in tree_entries:
-              entry_type = getattr(entry, "type", "")
-              entry_path = getattr(entry, "path", "")
-              if entry_type == "file" and entry_path:
-                  file_entries.append(entry_path)
+          prefix = f"{subfolder}/" if subfolder else ""
+          file_entries = [
+              repo_path
+              for repo_path in all_repo_files
+              if repo_path == subfolder or repo_path.startswith(prefix)
+          ]
 
           if not file_entries:
               raise RuntimeError(
