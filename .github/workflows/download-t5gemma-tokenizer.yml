@@ -1,0 +1,211 @@
+name: Download T5Gemma Tokenizer Bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_id:
+        description: "Hugging Face 模型仓库（需可访问）"
+        required: true
+        default: "google/t5gemma-b-b-ul2"
+      revision:
+        description: "分支 / tag / commit"
+        required: true
+        default: "main"
+      bundle_subdir:
+        description: "打包后放入 zip 的子目录"
+        required: true
+        default: "t5gemma"
+      artifact_name:
+        description: "输出 zip / artifact 名称（不带 .zip）"
+        required: true
+        default: "t5gemma-tokenizer"
+      files:
+        description: "需要下载的文件列表（每行一个 repo 根目录下的文件）"
+        required: true
+        default: |
+          tokenizer.model
+          tokenizer.json
+          tokenizer_config.json
+          special_tokens_map.json
+
+permissions:
+  contents: read
+
+jobs:
+  bundle-tokenizer:
+    runs-on: ubuntu-latest
+
+    env:
+      DOWNLOAD_DIR: download
+      DIST_DIR: dist
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache Hugging Face downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: >-
+            hf-${{ runner.os }}-${{ github.event.inputs.repo_id }}-${{
+            github.event.inputs.revision }}-${{ github.event.inputs.artifact_name }}
+          restore-keys: |
+            hf-${{ runner.os }}-${{ github.event.inputs.repo_id }}-
+            hf-${{ runner.os }}-
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install huggingface_hub
+
+      - name: Download tokenizer files and build zip
+        shell: python
+        run: |
+          import json
+          import os
+          import posixpath
+          import zipfile
+          from pathlib import Path
+          from huggingface_hub import HfApi, hf_hub_download
+          from huggingface_hub.errors import EntryNotFoundError, GatedRepoError, RepositoryNotFoundError
+
+          repo_id = "${{ github.event.inputs.repo_id }}".strip()
+          revision = "${{ github.event.inputs.revision }}".strip()
+          bundle_subdir = "${{ github.event.inputs.bundle_subdir }}".strip().strip("/").strip("\\")
+          artifact_name = "${{ github.event.inputs.artifact_name }}".strip()
+
+          files_raw = """${{ github.event.inputs.files }}"""
+          repo_files = [line.strip() for line in files_raw.splitlines() if line.strip()]
+
+          if not repo_files:
+              raise RuntimeError("files 输入为空，请至少提供一个待下载文件。")
+
+          hf_token = os.environ.get("HF_TOKEN", "").strip()
+          if not hf_token:
+              raise RuntimeError(
+                  "缺少 HF_TOKEN。该 workflow 用于下载 gated 的 T5Gemma 文件，请先在仓库 Secrets 中配置 HF_TOKEN。"
+              )
+
+          download_root = Path(os.environ["DOWNLOAD_DIR"]).resolve()
+          dist_root = Path(os.environ["DIST_DIR"]).resolve()
+          bundle_root = download_root / artifact_name
+          target_root = bundle_root / bundle_subdir if bundle_subdir else bundle_root
+          zip_path = dist_root / f"{artifact_name}.zip"
+          manifest_path = dist_root / f"{artifact_name}.manifest.json"
+
+          download_root.mkdir(parents=True, exist_ok=True)
+          dist_root.mkdir(parents=True, exist_ok=True)
+          target_root.mkdir(parents=True, exist_ok=True)
+
+          api = HfApi(token=hf_token)
+          try:
+              all_repo_files = set(
+                  api.list_repo_files(
+                      repo_id=repo_id,
+                      repo_type="model",
+                      revision=revision,
+                      token=hf_token,
+                  )
+              )
+          except GatedRepoError as ex:
+              raise RuntimeError(
+                  f"无法访问 gated repo '{repo_id}'。请确认 HF_TOKEN 已接受该模型许可并具有读取权限。"
+              ) from ex
+          except RepositoryNotFoundError as ex:
+              raise RuntimeError(f"模型仓库不存在或当前 token 无权限访问: {repo_id}") from ex
+
+          missing = [repo_path for repo_path in repo_files if repo_path not in all_repo_files]
+          if missing:
+              raise RuntimeError(
+                  "以下文件未在仓库中找到:\n" + "\n".join(f"- {name}" for name in missing)
+              )
+
+          downloaded = []
+          total_size = 0
+
+          for repo_path in repo_files:
+              try:
+                  cached_path = Path(
+                      hf_hub_download(
+                          repo_id=repo_id,
+                          filename=repo_path,
+                          revision=revision,
+                          repo_type="model",
+                          token=hf_token,
+                      )
+                  ).resolve()
+              except EntryNotFoundError as ex:
+                  raise RuntimeError(f"下载失败，仓库中不存在文件: {repo_path}") from ex
+
+              target_path = target_root / Path(*repo_path.split("/")).name
+              target_path.parent.mkdir(parents=True, exist_ok=True)
+              target_path.write_bytes(cached_path.read_bytes())
+
+              file_size = target_path.stat().st_size
+              total_size += file_size
+              downloaded.append(
+                  {
+                      "repo_path": repo_path,
+                      "bundle_path": target_path.relative_to(bundle_root).as_posix(),
+                      "size_bytes": file_size,
+                  }
+              )
+              print(f"Downloaded: {repo_path} -> {target_path.relative_to(bundle_root).as_posix()}")
+
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+              for item in sorted(bundle_root.rglob("*")):
+                  if not item.is_file():
+                      continue
+                  if ".cache" in item.relative_to(bundle_root).parts:
+                      continue
+                  arcname = posixpath.join(artifact_name, item.relative_to(bundle_root).as_posix())
+                  zf.write(item, arcname=arcname)
+                  print(f"Packed: {arcname}")
+
+          manifest = {
+              "repo_id": repo_id,
+              "revision": revision,
+              "bundle_subdir": bundle_subdir,
+              "artifact_name": artifact_name,
+              "file_count": len(downloaded),
+              "total_size_bytes": total_size,
+              "zip_path": zip_path.name,
+              "files": downloaded,
+          }
+
+          manifest_path.write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+
+          print("")
+          print("Bundle summary:")
+          print(json.dumps(
+              {
+                  "repo_id": repo_id,
+                  "revision": revision,
+                  "bundle_subdir": bundle_subdir,
+                  "file_count": len(downloaded),
+                  "total_size_bytes": total_size,
+                  "zip_size_bytes": zip_path.stat().st_size,
+                  "zip_name": zip_path.name,
+              },
+              ensure_ascii=False,
+              indent=2,
+          ))
+
+      - name: Upload zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.artifact_name }}
+          path: |
+            dist/${{ github.event.inputs.artifact_name }}.zip
+            dist/${{ github.event.inputs.artifact_name }}.manifest.json
+          if-no-files-found: error
