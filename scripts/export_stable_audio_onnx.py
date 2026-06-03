@@ -180,7 +180,7 @@ class StableAudioDiTOnnxWrapper(torch.nn.Module):
         text_conditioner_key: str,
         seconds_conditioner_key: str,
         seconds_conditioner_mode: str,
-        local_condition_key: str | None,
+        local_condition_keys: list[str],
     ) -> None:
         super().__init__()
         self.model = model.model
@@ -188,7 +188,7 @@ class StableAudioDiTOnnxWrapper(torch.nn.Module):
         self.text_conditioner_key = text_conditioner_key
         self.seconds_conditioner_key = seconds_conditioner_key
         self.seconds_conditioner_mode = seconds_conditioner_mode
-        self.local_condition_key = local_condition_key
+        self.local_condition_keys = local_condition_keys
 
         conditioner = model.conditioner.conditioners[seconds_conditioner_key]
         if not isinstance(conditioner, NumberConditioner):
@@ -349,13 +349,9 @@ def _resolve_conditioning_layout(model: torch.nn.Module) -> tuple[str, int, str,
     )
 
 
-def _resolve_local_condition_key(model: torch.nn.Module) -> str | None:
+def _resolve_local_condition_keys(model: torch.nn.Module) -> list[str]:
     _load_stable_audio_modules()
-    if len(model.local_add_cond_ids) > 1:
-        raise ValueError(
-            f"Expected at most one local-add conditioner, got {model.local_add_cond_ids!r}."
-        )
-    return model.local_add_cond_ids[0] if model.local_add_cond_ids else None
+    return list(model.local_add_cond_ids)
 
 
 def _export_dit(
@@ -365,7 +361,7 @@ def _export_dit(
     opset: int,
 ) -> dict[str, Any]:
     text_key, max_text_tokens, seconds_key, seconds_mode = _resolve_conditioning_layout(model)
-    local_key = _resolve_local_condition_key(model)
+    local_keys = _resolve_local_condition_keys(model)
 
     wrapper = StableAudioDiTOnnxWrapper(
         model=model,
@@ -373,7 +369,7 @@ def _export_dit(
         text_conditioner_key=text_key,
         seconds_conditioner_key=seconds_key,
         seconds_conditioner_mode=seconds_mode,
-        local_condition_key=local_key,
+        local_condition_keys=local_keys,
     ).eval()
 
     example_x = torch.randn(1, model.io_channels, latent_example_length, dtype=torch.float32)
@@ -421,7 +417,7 @@ def _export_dit(
         "seconds_conditioner_key": seconds_key,
         "seconds_conditioner_mode": seconds_mode,
         "text_conditioner_key": text_key,
-        "local_condition_key": local_key,
+        "local_condition_keys": local_keys,
     }
 
 
