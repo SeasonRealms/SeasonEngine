@@ -479,6 +479,7 @@ def _export_text_encoder(
     max_text_tokens: int,
     opset: int,
 ) -> dict[str, Any]:
+    import transformers.masking_utils as masking_utils
     from transformers import AutoConfig, T5GemmaEncoderModel
 
     hf_kwargs: dict[str, Any] = {"revision": revision, "token": token}
@@ -487,27 +488,59 @@ def _export_text_encoder(
 
     config = AutoConfig.from_pretrained(repo_id, **hf_kwargs)
     config.is_encoder_decoder = False
+    if hasattr(config, "_attn_implementation"):
+        config._attn_implementation = "eager"
+
+    original_create_bidirectional_mask = getattr(masking_utils, "create_bidirectional_mask", None)
+
+    def patched_create_bidirectional_mask(config: Any, input_embeds: torch.Tensor, attention_mask: torch.Tensor, **_: Any) -> torch.Tensor:
+        batch_size, seq_length = input_embeds.shape[:2]
+        if attention_mask is None:
+            return torch.zeros((batch_size, 1, seq_length, seq_length), dtype=input_embeds.dtype, device=input_embeds.device)
+
+        mask = attention_mask[:, None, None, :].to(input_embeds.dtype)
+        mask = mask.expand(batch_size, 1, seq_length, seq_length)
+        return (1.0 - mask) * torch.finfo(input_embeds.dtype).min
+
+    if original_create_bidirectional_mask is not None:
+        masking_utils.create_bidirectional_mask = patched_create_bidirectional_mask
+
     model = T5GemmaEncoderModel.from_pretrained(
         repo_id,
         config=config,
+        attn_implementation="eager",
         **hf_kwargs,
     ).eval()
+
+    if hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
+        for layer in model.encoder.layers:
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn.forward, "__wrapped__"):
+                layer.self_attn.forward = layer.self_attn.forward.__wrapped__  # type: ignore[method-assign]
 
     wrapper = T5GemmaEncoderOnnxWrapper(model).eval()
     example_input_ids = torch.zeros(1, max_text_tokens, dtype=torch.long)
     example_attention_mask = torch.ones(1, max_text_tokens, dtype=torch.long)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.onnx.export(
-        wrapper,
-        (example_input_ids, example_attention_mask),
-        str(out_path),
-        export_params=True,
-        opset_version=opset,
-        do_constant_folding=True,
-        input_names=["input_ids", "attention_mask"],
-        output_names=["hidden_states"],
-    )
+    try:
+        torch.onnx.export(
+            wrapper,
+            (example_input_ids, example_attention_mask),
+            str(out_path),
+            export_params=True,
+            opset_version=opset,
+            do_constant_folding=True,
+            input_names=["input_ids", "attention_mask"],
+            output_names=["hidden_states"],
+            dynamic_axes={
+                "input_ids": {0: "batch", 1: "sequence"},
+                "attention_mask": {0: "batch", 1: "sequence"},
+                "hidden_states": {0: "batch", 1: "sequence"},
+            },
+        )
+    finally:
+        if original_create_bidirectional_mask is not None:
+            masking_utils.create_bidirectional_mask = original_create_bidirectional_mask
 
     return {
         "path": out_path.as_posix(),
