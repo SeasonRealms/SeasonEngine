@@ -278,15 +278,21 @@ class StableAudioDecoderOnnxWrapper(torch.nn.Module):
 
 
 class T5GemmaEncoderOnnxWrapper(torch.nn.Module):
-    def __init__(self, model: torch.nn.Module) -> None:
+    def __init__(self, encoder: torch.nn.Module) -> None:
         super().__init__()
-        self.model = model
+        self.encoder = encoder
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.model(
+        batch_size, seq_length = input_ids.shape
+        extended_mask = attention_mask.view(batch_size, 1, 1, seq_length).to(torch.float32)
+        extended_mask = extended_mask.expand(batch_size, 1, seq_length, seq_length)
+        extended_mask = (1.0 - extended_mask) * torch.finfo(torch.float32).min
+
+        hidden_states = self.encoder(
             input_ids=input_ids,
-            attention_mask=attention_mask,
-        ).last_hidden_state
+            attention_mask=extended_mask,
+            return_dict=False,
+        )[0]
         return hidden_states + (attention_mask.unsqueeze(-1).to(hidden_states.dtype) * 0.0)
 
 
@@ -517,7 +523,8 @@ def _export_text_encoder(
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn.forward, "__wrapped__"):
                 layer.self_attn.forward = layer.self_attn.forward.__wrapped__  # type: ignore[method-assign]
 
-    wrapper = T5GemmaEncoderOnnxWrapper(model).eval()
+    encoder = model.encoder if hasattr(model, "encoder") else model
+    wrapper = T5GemmaEncoderOnnxWrapper(encoder).eval()
     example_input_ids = torch.zeros(1, max_text_tokens, dtype=torch.long)
     example_attention_mask = torch.ones(1, max_text_tokens, dtype=torch.long)
 
@@ -530,6 +537,7 @@ def _export_text_encoder(
             export_params=True,
             opset_version=opset,
             do_constant_folding=True,
+            dynamo=False,
             input_names=["input_ids", "attention_mask"],
             output_names=["hidden_states"],
             dynamic_axes={
