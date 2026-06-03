@@ -179,6 +179,7 @@ class StableAudioDiTOnnxWrapper(torch.nn.Module):
         max_text_tokens: int,
         text_conditioner_key: str,
         seconds_conditioner_key: str,
+        seconds_conditioner_mode: str,
         local_condition_key: str | None,
     ) -> None:
         super().__init__()
@@ -186,6 +187,7 @@ class StableAudioDiTOnnxWrapper(torch.nn.Module):
         self.max_text_tokens = max_text_tokens
         self.text_conditioner_key = text_conditioner_key
         self.seconds_conditioner_key = seconds_conditioner_key
+        self.seconds_conditioner_mode = seconds_conditioner_mode
         self.local_condition_key = local_condition_key
 
         conditioner = model.conditioner.conditioners[seconds_conditioner_key]
@@ -219,14 +221,28 @@ class StableAudioDiTOnnxWrapper(torch.nn.Module):
         # Keep the mask as a visible ONNX input even though the underlying model
         # currently does not consume it after export-time graph lowering.
         t5_hidden = t5_hidden + (t5_mask.unsqueeze(-1).to(t5_hidden.dtype) * 0.0)
-
-        global_cond = self._embed_seconds_total(seconds_total)
+        cross_attn_cond = t5_hidden
         cross_attn_mask = t5_mask > 0.5
+        global_cond = None
+
+        seconds_embed = self._embed_seconds_total(seconds_total)
+        if self.seconds_conditioner_mode == "global":
+            global_cond = seconds_embed
+        elif self.seconds_conditioner_mode == "cross_attn":
+            cross_attn_cond = torch.cat([t5_hidden, seconds_embed.unsqueeze(1)], dim=1)
+            seconds_mask = torch.ones(
+                (t5_mask.shape[0], 1),
+                dtype=torch.bool,
+                device=t5_mask.device,
+            )
+            cross_attn_mask = torch.cat([cross_attn_mask, seconds_mask], dim=1)
+        else:
+            raise ValueError(f"Unsupported seconds conditioner mode: {self.seconds_conditioner_mode}")
 
         return self.model(
             x=x,
             t=t,
-            cross_attn_cond=t5_hidden,
+            cross_attn_cond=cross_attn_cond,
             cross_attn_mask=cross_attn_mask,
             global_cond=global_cond,
             local_add_cond=local_add_cond,
@@ -299,23 +315,38 @@ def _download_tokenizer_bundle(
     }
 
 
-def _resolve_text_conditioner_info(model: torch.nn.Module) -> tuple[str, int]:
+def _resolve_conditioning_layout(model: torch.nn.Module) -> tuple[str, int, str, str]:
     _load_stable_audio_modules()
-    if len(model.cross_attn_cond_ids) != 1:
+    prompt_key = None
+    max_text_tokens = 256
+    for key in model.cross_attn_cond_ids:
+        conditioner = model.conditioner.conditioners[key]
+        if not isinstance(conditioner, NumberConditioner):
+            prompt_key = key
+            max_text_tokens = int(getattr(conditioner, "max_length", 256))
+            break
+
+    if prompt_key is None:
         raise ValueError(
-            f"Expected exactly one cross-attention conditioner, got {model.cross_attn_cond_ids!r}."
+            f"Unable to find text conditioner in cross-attention ids: {model.cross_attn_cond_ids!r}."
         )
-    key = model.cross_attn_cond_ids[0]
-    conditioner = model.conditioner.conditioners[key]
-    max_text_tokens = int(getattr(conditioner, "max_length", 256))
-    return key, max_text_tokens
 
+    for key in model.global_cond_ids:
+        conditioner = model.conditioner.conditioners[key]
+        if isinstance(conditioner, NumberConditioner):
+            return prompt_key, max_text_tokens, key, "global"
 
-def _resolve_seconds_conditioner_key(model: torch.nn.Module) -> str:
-    _load_stable_audio_modules()
-    if len(model.global_cond_ids) != 1:
-        raise ValueError(f"Expected exactly one global conditioner, got {model.global_cond_ids!r}.")
-    return model.global_cond_ids[0]
+    for key in model.cross_attn_cond_ids:
+        if key == prompt_key:
+            continue
+        conditioner = model.conditioner.conditioners[key]
+        if isinstance(conditioner, NumberConditioner):
+            return prompt_key, max_text_tokens, key, "cross_attn"
+
+    raise ValueError(
+        "Unable to locate a NumberConditioner for `seconds_total` in either "
+        f"global_cond_ids={model.global_cond_ids!r} or cross_attn_cond_ids={model.cross_attn_cond_ids!r}."
+    )
 
 
 def _resolve_local_condition_key(model: torch.nn.Module) -> str | None:
@@ -333,8 +364,7 @@ def _export_dit(
     latent_example_length: int,
     opset: int,
 ) -> dict[str, Any]:
-    text_key, max_text_tokens = _resolve_text_conditioner_info(model)
-    seconds_key = _resolve_seconds_conditioner_key(model)
+    text_key, max_text_tokens, seconds_key, seconds_mode = _resolve_conditioning_layout(model)
     local_key = _resolve_local_condition_key(model)
 
     wrapper = StableAudioDiTOnnxWrapper(
@@ -342,6 +372,7 @@ def _export_dit(
         max_text_tokens=max_text_tokens,
         text_conditioner_key=text_key,
         seconds_conditioner_key=seconds_key,
+        seconds_conditioner_mode=seconds_mode,
         local_condition_key=local_key,
     ).eval()
 
@@ -388,6 +419,7 @@ def _export_dit(
         "max_text_tokens": max_text_tokens,
         "io_channels": model.io_channels,
         "seconds_conditioner_key": seconds_key,
+        "seconds_conditioner_mode": seconds_mode,
         "text_conditioner_key": text_key,
         "local_condition_key": local_key,
     }
