@@ -278,9 +278,21 @@ class StableAudioDecoderOnnxWrapper(torch.nn.Module):
 
 
 class T5GemmaEncoderOnnxWrapper(torch.nn.Module):
-    def __init__(self, encoder: torch.nn.Module) -> None:
+    def __init__(
+        self,
+        encoder: torch.nn.Module,
+        proj_out: torch.nn.Module,
+        padding_mode: str,
+        padding_embedding: torch.nn.Parameter | None = None,
+    ) -> None:
         super().__init__()
         self.encoder = encoder
+        self.proj_out = proj_out
+        self.padding_mode = padding_mode
+        if padding_embedding is not None:
+            self.padding_embedding = torch.nn.Parameter(padding_embedding.detach().clone().to(dtype=torch.float32))
+        else:
+            self.register_parameter("padding_embedding", None)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         batch_size, seq_length = input_ids.shape
@@ -293,6 +305,23 @@ class T5GemmaEncoderOnnxWrapper(torch.nn.Module):
             attention_mask=extended_mask,
             return_dict=False,
         )[0]
+        if not isinstance(self.proj_out, torch.nn.Identity):
+            proj_out_dtype = next(self.proj_out.parameters()).dtype
+            hidden_states = hidden_states.to(proj_out_dtype)
+        hidden_states = self.proj_out(hidden_states)
+
+        mask = attention_mask.to(torch.bool)
+        if self.padding_mode == "zero":
+            hidden_states = hidden_states * mask.unsqueeze(-1).to(hidden_states.dtype)
+        elif self.padding_mode == "learned":
+            if self.padding_embedding is None:
+                raise RuntimeError("padding_mode=learned but padding_embedding is missing.")
+            mask_expanded = mask.unsqueeze(-1)
+            padding = self.padding_embedding.view(1, 1, -1).expand_as(hidden_states)
+            hidden_states = torch.where(mask_expanded, hidden_states, padding)
+        elif self.padding_mode != "none":
+            raise RuntimeError(f"Unsupported padding_mode for ONNX export: {self.padding_mode}")
+
         return hidden_states + (attention_mask.unsqueeze(-1).to(hidden_states.dtype) * 0.0)
 
 
@@ -376,6 +405,13 @@ def _resolve_conditioning_layout(model: torch.nn.Module) -> tuple[str, int, str,
 def _resolve_local_condition_keys(model: torch.nn.Module) -> list[str]:
     _load_stable_audio_modules()
     return list(model.local_add_cond_ids)
+
+
+def _resolve_text_conditioner(model: torch.nn.Module, text_key: str) -> torch.nn.Module:
+    conditioner = model.conditioner.conditioners[text_key]
+    if isinstance(conditioner, NumberConditioner):
+        raise TypeError(f"Conditioner '{text_key}' is NumberConditioner, expected text conditioner.")
+    return conditioner
 
 
 def _export_dit(
@@ -484,6 +520,7 @@ def _export_text_encoder(
     out_path: Path,
     max_text_tokens: int,
     opset: int,
+    text_conditioner: torch.nn.Module,
 ) -> dict[str, Any]:
     import transformers.masking_utils as masking_utils
     from transformers import AutoConfig, T5GemmaEncoderModel
@@ -525,7 +562,15 @@ def _export_text_encoder(
                 layer.self_attn.forward = layer.self_attn.forward.__wrapped__  # type: ignore[method-assign]
 
     encoder = (model.encoder if hasattr(model, "encoder") else model).to(dtype=torch.float32)
-    wrapper = T5GemmaEncoderOnnxWrapper(encoder).eval()
+    proj_out = text_conditioner.proj_out.to(dtype=torch.float32).eval()
+    padding_mode = str(getattr(text_conditioner, "padding_mode", "zero"))
+    padding_embedding = getattr(text_conditioner, "padding_embedding", None)
+    wrapper = T5GemmaEncoderOnnxWrapper(
+        encoder=encoder,
+        proj_out=proj_out,
+        padding_mode=padding_mode,
+        padding_embedding=padding_embedding,
+    ).eval()
     example_input_ids = torch.zeros(1, max_text_tokens, dtype=torch.long)
     example_attention_mask = torch.ones(1, max_text_tokens, dtype=torch.long)
 
@@ -554,9 +599,11 @@ def _export_text_encoder(
     return {
         "path": out_path.as_posix(),
         "max_text_tokens": max_text_tokens,
-        "hidden_size": 768,
+        "hidden_size": int(getattr(text_conditioner, "output_dim", 768)),
         "source_repo_id": repo_id,
         "source_subfolder": subfolder or "",
+        "padding_mode": padding_mode,
+        "has_proj_out": not isinstance(proj_out, torch.nn.Identity),
     }
 
 
@@ -618,6 +665,7 @@ def main() -> None:
 
     if args.export_text_encoder:
         t5_source_repo_id = args.t5_source_repo_id or args.model_id
+        text_conditioner = _resolve_text_conditioner(model, dit_summary["text_conditioner_key"])
         text_encoder_out_path = out_dir / args.t5_bundle_subdir / "encoder.onnx"
         artifacts["text_encoder"] = _export_text_encoder(
             repo_id=t5_source_repo_id,
@@ -627,6 +675,7 @@ def main() -> None:
             out_path=text_encoder_out_path,
             max_text_tokens=dit_summary["max_text_tokens"],
             opset=args.opset,
+            text_conditioner=text_conditioner,
         )
 
     if args.download_tokenizer:
