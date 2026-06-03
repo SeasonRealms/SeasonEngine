@@ -1,0 +1,142 @@
+name: Export Stable Audio Small SFX ONNX
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_id:
+        description: "Hugging Face 模型仓库"
+        required: true
+        default: "stabilityai/stable-audio-3-small-sfx"
+      revision:
+        description: "分支 / tag / commit"
+        required: true
+        default: "main"
+      artifact_name:
+        description: "输出 artifact 名称"
+        required: true
+        default: "stable-audio-3-small-sfx-onnx"
+      export_decoder:
+        description: "同时导出 SAME-S 解码器"
+        type: boolean
+        required: true
+        default: true
+      export_text_encoder:
+        description: "同时导出 stable-audio-3-small-sfx 内置 T5Gemma 文本编码器"
+        type: boolean
+        required: true
+        default: true
+      download_tokenizer:
+        description: "同时下载同仓库内的 tokenizer 文件到 t5gemma 目录"
+        type: boolean
+        required: true
+        default: true
+      t5_source_repo_id:
+        description: "T5 来源仓库，默认可与 model_id 相同"
+        required: true
+        default: "stabilityai/stable-audio-3-small-sfx"
+      t5_source_subfolder:
+        description: "T5 在来源仓库中的子目录"
+        required: true
+        default: "t5gemma-b-b-ul2"
+      opset:
+        description: "ONNX opset"
+        required: true
+        default: "17"
+
+permissions:
+  contents: read
+
+jobs:
+  export-small-sfx-onnx:
+    runs-on: ubuntu-latest
+
+    env:
+      OUT_DIR: out
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: >-
+            pip-${{ runner.os }}-stable-audio-sfx-${{ github.event.inputs.opset }}-${{
+            github.event.inputs.export_text_encoder }}-${{ github.event.inputs.download_tokenizer }}
+          restore-keys: |
+            pip-${{ runner.os }}-stable-audio-sfx-
+
+      - name: Cache Hugging Face downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: >-
+            hf-${{ runner.os }}-${{ github.event.inputs.model_id }}-${{
+            github.event.inputs.revision }}-${{ github.event.inputs.export_text_encoder }}-${{
+            github.event.inputs.download_tokenizer }}-${{ github.event.inputs.t5_source_repo_id }}-${{
+            github.event.inputs.t5_source_subfolder }}
+          restore-keys: |
+            hf-${{ runner.os }}-${{ github.event.inputs.model_id }}-
+            hf-${{ runner.os }}-
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            torch==2.7.1 \
+            torchaudio==2.7.1 \
+            huggingface_hub \
+            safetensors \
+            onnx \
+            onnxruntime \
+            einops \
+            einops-exts \
+            soundfile \
+            sentencepiece \
+            transformers
+
+      - name: Export Stable Audio Small SFX ONNX
+        run: |
+          args=(
+            python scripts/export_stable_audio_onnx.py
+            --model-id "${{ github.event.inputs.model_id }}"
+            --revision "${{ github.event.inputs.revision }}"
+            --model-alias "sa3-sm-sfx"
+            --decoder-subdir "same-s"
+            --decoder-filename "dec_dynamic_bf16.onnx"
+            --out-dir "${OUT_DIR}"
+            --opset "${{ github.event.inputs.opset }}"
+            --t5-source-repo-id "${{ github.event.inputs.t5_source_repo_id }}"
+            --t5-source-subfolder "${{ github.event.inputs.t5_source_subfolder }}"
+            --t5-bundle-subdir "t5gemma"
+          )
+
+          if [ "${{ github.event.inputs.export_decoder }}" = "true" ]; then
+            args+=(--export-decoder)
+          fi
+
+          if [ "${{ github.event.inputs.export_text_encoder }}" = "true" ]; then
+            args+=(--export-text-encoder)
+          fi
+
+          if [ "${{ github.event.inputs.download_tokenizer }}" = "true" ]; then
+            args+=(--download-tokenizer)
+          fi
+
+          "${args[@]}"
+
+      - name: Upload exported ONNX bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.artifact_name }}
+          path: out/
+          if-no-files-found: error
