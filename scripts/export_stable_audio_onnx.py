@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import importlib
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -13,49 +15,107 @@ from safetensors.torch import load_file
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_STABLE_AUDIO_REPO = "https://github.com/Stability-AI/stable-audio-3.git"
+DEFAULT_STABLE_AUDIO_REF = "main"
 VENDORED_STABLE_AUDIO = REPO_ROOT / "stable-audio-3-main"
-if str(VENDORED_STABLE_AUDIO) not in sys.path:
-    sys.path.insert(0, str(VENDORED_STABLE_AUDIO))
+FALLBACK_STABLE_AUDIO = REPO_ROOT / ".stable-audio-3-main"
 
-from stable_audio_3.factory import create_diffusion_cond_from_config  # noqa: E402
-from stable_audio_3.loading_utils import copy_state_dict  # noqa: E402
-from stable_audio_3.models.conditioners import Conditioner, NumberConditioner  # noqa: E402
+create_diffusion_cond_from_config = None
+copy_state_dict = None
+NumberConditioner = None
 
 
-class ExportOnlyT5GemmaConditioner(Conditioner):
-    T5GEMMA_MODEL_DIMS = {
-        "google/t5gemma-b-b-ul2": 768,
-    }
-
-    def __init__(
-        self,
-        output_dim: int,
-        model_name: str = "google/t5gemma-b-b-ul2",
-        max_length: int = 256,
-        project_out: bool = False,
-        padding_mode: str = "zero",
-        **_: Any,
-    ) -> None:
-        if model_name not in self.T5GEMMA_MODEL_DIMS:
-            raise ValueError(f"Unsupported T5Gemma model for export stub: {model_name}")
-        super().__init__(
-            self.T5GEMMA_MODEL_DIMS[model_name],
-            output_dim,
-            project_out=project_out,
-            padding_mode=padding_mode,
-        )
-        self.max_length = int(max_length)
-
-    def forward(self, inputs: Any, device: str) -> Any:
+def _ensure_stable_audio_source() -> Path:
+    override_dir = os.environ.get("STABLE_AUDIO_3_DIR", "").strip()
+    if override_dir:
+        candidate = Path(override_dir).resolve()
+        package_dir = candidate / "stable_audio_3"
+        if package_dir.is_dir():
+            return candidate
         raise RuntimeError(
-            "The export-only T5Gemma stub does not support runtime encoding. "
-            "Export the text encoder separately if you need it."
+            f"环境变量 STABLE_AUDIO_3_DIR 指向的目录不包含 `stable_audio_3` 包: {candidate}"
         )
+
+    for candidate in (VENDORED_STABLE_AUDIO, FALLBACK_STABLE_AUDIO):
+        if (candidate / "stable_audio_3").is_dir():
+            return candidate
+
+    repo_url = os.environ.get("STABLE_AUDIO_3_GIT_URL", DEFAULT_STABLE_AUDIO_REPO).strip()
+    repo_ref = os.environ.get("STABLE_AUDIO_3_REF", DEFAULT_STABLE_AUDIO_REF).strip() or DEFAULT_STABLE_AUDIO_REF
+    target_dir = FALLBACK_STABLE_AUDIO
+
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            repo_ref,
+            repo_url,
+            str(target_dir),
+        ],
+        check=True,
+    )
+    return target_dir
+
+
+def _load_stable_audio_modules() -> None:
+    global create_diffusion_cond_from_config
+    global copy_state_dict
+    global NumberConditioner
+
+    if create_diffusion_cond_from_config is not None:
+        return
+
+    stable_audio_root = _ensure_stable_audio_source()
+    if str(stable_audio_root) not in sys.path:
+        sys.path.insert(0, str(stable_audio_root))
+
+    factory_module = importlib.import_module("stable_audio_3.factory")
+    loading_utils_module = importlib.import_module("stable_audio_3.loading_utils")
+    conditioners_module = importlib.import_module("stable_audio_3.models.conditioners")
+
+    create_diffusion_cond_from_config = factory_module.create_diffusion_cond_from_config
+    copy_state_dict = loading_utils_module.copy_state_dict
+    NumberConditioner = conditioners_module.NumberConditioner
 
 
 def _patch_t5_conditioner() -> None:
+    _load_stable_audio_modules()
     import stable_audio_3.factory as factory_module
     import stable_audio_3.models.conditioners as conditioners_module
+
+    class ExportOnlyT5GemmaConditioner(conditioners_module.Conditioner):
+        T5GEMMA_MODEL_DIMS = {
+            "google/t5gemma-b-b-ul2": 768,
+        }
+
+        def __init__(
+            self,
+            output_dim: int,
+            model_name: str = "google/t5gemma-b-b-ul2",
+            max_length: int = 256,
+            project_out: bool = False,
+            padding_mode: str = "zero",
+            **_: Any,
+        ) -> None:
+            if model_name not in self.T5GEMMA_MODEL_DIMS:
+                raise ValueError(f"Unsupported T5Gemma model for export stub: {model_name}")
+            super().__init__(
+                self.T5GEMMA_MODEL_DIMS[model_name],
+                output_dim,
+                project_out=project_out,
+                padding_mode=padding_mode,
+            )
+            self.max_length = int(max_length)
+
+        def forward(self, inputs: Any, device: str) -> Any:
+            raise RuntimeError(
+                "The export-only T5Gemma stub does not support runtime encoding. "
+                "Export the text encoder separately if you need it."
+            )
 
     factory_module.T5GemmaConditioner = ExportOnlyT5GemmaConditioner
     conditioners_module.T5GemmaConditioner = ExportOnlyT5GemmaConditioner
@@ -100,6 +160,7 @@ def _load_diffusion_model(
     device: str,
 ) -> tuple[torch.nn.Module, dict[str, Any], str, str]:
     _patch_t5_conditioner()
+    _load_stable_audio_modules()
 
     config_path = _download_file(repo_id, "model_config.json", revision, token)
     checkpoint_path = _download_file(repo_id, "model.safetensors", revision, token)
@@ -239,6 +300,7 @@ def _download_tokenizer_bundle(
 
 
 def _resolve_text_conditioner_info(model: torch.nn.Module) -> tuple[str, int]:
+    _load_stable_audio_modules()
     if len(model.cross_attn_cond_ids) != 1:
         raise ValueError(
             f"Expected exactly one cross-attention conditioner, got {model.cross_attn_cond_ids!r}."
@@ -250,12 +312,14 @@ def _resolve_text_conditioner_info(model: torch.nn.Module) -> tuple[str, int]:
 
 
 def _resolve_seconds_conditioner_key(model: torch.nn.Module) -> str:
+    _load_stable_audio_modules()
     if len(model.global_cond_ids) != 1:
         raise ValueError(f"Expected exactly one global conditioner, got {model.global_cond_ids!r}.")
     return model.global_cond_ids[0]
 
 
 def _resolve_local_condition_key(model: torch.nn.Module) -> str | None:
+    _load_stable_audio_modules()
     if len(model.local_add_cond_ids) > 1:
         raise ValueError(
             f"Expected at most one local-add conditioner, got {model.local_add_cond_ids!r}."
