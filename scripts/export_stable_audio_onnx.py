@@ -82,6 +82,23 @@ def _load_stable_audio_modules() -> None:
     NumberConditioner = conditioners_module.NumberConditioner
 
 
+def _patch_onnx_export_compat() -> None:
+    _load_stable_audio_modules()
+    transformer_module = importlib.import_module("stable_audio_3.models.transformer")
+
+    def rms_norm_forward(self: Any, x: torch.Tensor) -> torch.Tensor:
+        work = x.float() if getattr(self, "force_fp32", False) else x
+        gamma = self.gamma.float() if getattr(self, "force_fp32", False) else self.gamma
+        variance = work.pow(2).mean(dim=-1, keepdim=True)
+        normalized = work * torch.rsqrt(variance + self.eps)
+        output = normalized * gamma
+        if getattr(self, "force_fp32", False):
+            output = output.to(x.dtype)
+        return output
+
+    transformer_module.RMSNorm.forward = rms_norm_forward
+
+
 def _patch_t5_conditioner() -> None:
     _load_stable_audio_modules()
     import stable_audio_3.factory as factory_module
@@ -160,6 +177,7 @@ def _load_diffusion_model(
     device: str,
 ) -> tuple[torch.nn.Module, dict[str, Any], str, str]:
     _patch_t5_conditioner()
+    _patch_onnx_export_compat()
     _load_stable_audio_modules()
 
     config_path = _download_file(repo_id, "model_config.json", revision, token)
