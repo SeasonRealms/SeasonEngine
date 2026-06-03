@@ -515,15 +515,16 @@ def _export_text_encoder(
         repo_id,
         config=config,
         attn_implementation="eager",
+        torch_dtype=torch.float32,
         **hf_kwargs,
-    ).eval()
+    ).to(dtype=torch.float32).eval()
 
     if hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
         for layer in model.encoder.layers:
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn.forward, "__wrapped__"):
                 layer.self_attn.forward = layer.self_attn.forward.__wrapped__  # type: ignore[method-assign]
 
-    encoder = model.encoder if hasattr(model, "encoder") else model
+    encoder = (model.encoder if hasattr(model, "encoder") else model).to(dtype=torch.float32)
     wrapper = T5GemmaEncoderOnnxWrapper(encoder).eval()
     example_input_ids = torch.zeros(1, max_text_tokens, dtype=torch.long)
     example_attention_mask = torch.ones(1, max_text_tokens, dtype=torch.long)
