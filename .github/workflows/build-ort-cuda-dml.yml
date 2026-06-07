@@ -147,99 +147,7 @@ jobs:
           Pop-Location
 
       # ============================================================
-      # 5. 预下载 Eigen（绕过 GitLab zip SHA1 不匹配问题）
-      # ============================================================
-      - name: Pre-download Eigen source
-        shell: pwsh
-        run: |
-          $ortDir = "${{ env.ORT_DIR }}"
-
-          # Search ALL cmake files for the Eigen commit hash (40-char hex adjacent to eigen/gitlab)
-          $cmakeFiles = Get-ChildItem "$ortDir\cmake" -Recurse -Filter "*.cmake" -ErrorAction SilentlyContinue
-          $allContent = $cmakeFiles | ForEach-Object { Get-Content $_.FullName -Raw }
-
-          # Strategy 1: find /archive/<40-hex>/eigen- pattern in any cmake file
-          $eigenCommit = $null
-          foreach ($c in $allContent) {
-            if ($c -match '/archive/([a-f0-9]{40})/eigen') {
-              $eigenCommit = $Matches[1]
-              break
-            }
-          }
-
-          # Strategy 2: search ALL files (not just .cmake) for DEP_SHA1_eigen / DEP_URL_eigen
-          if (-not $eigenCommit) {
-            Write-Host "Strategy 1 failed, trying strategy 2: grep for DEP_SHA1_eigen"
-            $found = Get-ChildItem "$ortDir\cmake" -Recurse -Include "*.cmake","*.txt","*.json" -ErrorAction SilentlyContinue `
-              | Select-String -Pattern "DEP_SHA1_eigen|DEP_URL_eigen" -SimpleMatch
-            Write-Host "Found matches: $($found.Count)"
-            foreach ($match in $found) {
-              if ($match.Line -match '/archive/([a-f0-9]{40})/') {
-                $eigenCommit = $Matches[1]
-                Write-Host "  Extracted commit from line: $($match.Line)"
-                break
-              }
-            }
-            # Also try full file context
-            if (-not $eigenCommit -and $found.Count -gt 0) {
-              foreach ($match in $found) {
-                $ctx = Get-Content $match.Path -Raw
-                if ($ctx -match '/archive/([a-f0-9]{40})/') {
-                  $eigenCommit = $Matches[1]
-                  Write-Host "  Extracted commit from file: $($match.Path)"
-                  break
-                }
-              }
-            }
-          }
-
-          # Strategy 3: search ALL ORT files for libeigen GitLab URL
-          if (-not $eigenCommit) {
-            Write-Host "Strategy 2 failed, trying strategy 3: broad search for libeigen GitLab URL in entire repo"
-            $broad = Get-ChildItem "$ortDir" -Recurse -Include "*.cmake","*.txt","*.json","*.py","*.cmake.in" -ErrorAction SilentlyContinue `
-              | Select-String -Pattern 'libeigen/eigen' -SimpleMatch -List `
-              | Select-Object -First 20
-            foreach ($m in $broad) {
-              $ctx = Get-Content $m.Path -Raw
-              if ($ctx -match '/archive/([a-f0-9]{40})/') {
-                $eigenCommit = $Matches[1]
-                Write-Host "  Found in: $($m.Path)"
-                break
-              }
-            }
-          }
-
-          if (-not $eigenCommit) {
-            Write-Error "Could not extract Eigen commit hash from ORT source tree."
-            Write-Host "=== Dumping cmake directory for debugging ==="
-            Get-ChildItem "$ortDir\cmake" -Recurse -Filter "*.cmake" | ForEach-Object { Write-Host $_.FullName }
-            exit 1
-          }
-
-          Write-Host "Eigen commit: $eigenCommit"
-
-          $url = "https://gitlab.com/libeigen/eigen/-/archive/${eigenCommit}/eigen-${eigenCommit}.zip"
-          $zipPath = "${{ runner.temp }}\eigen.zip"
-          $extractDir = "${{ runner.temp }}\eigen-source"
-
-          Write-Host "Downloading Eigen from: $url"
-          Invoke-WebRequest -Uri $url -OutFile $zipPath -MaximumRetryCount 3 -RetryIntervalSec 10
-
-          Write-Host "Extracting Eigen to: $extractDir"
-          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
-
-          # The zip extracts to eigen-<hash>/; find that directory
-          $eigenDir = Get-ChildItem $extractDir -Directory | Select-Object -First 1
-          if (-not $eigenDir) {
-            $eigenDir = $extractDir
-          }
-          Write-Host "Eigen source dir: $($eigenDir.FullName)"
-
-          # Store for use in cmake extra defines
-          echo "EIGEN_SOURCE_DIR=$($eigenDir.FullName)" >> $env:GITHUB_ENV
-
-      # ============================================================
-      # 6. 编译 ONNX Runtime (CPU + CUDA + DirectML)
+      # 5. 编译 ONNX Runtime (CPU + CUDA + DirectML)
       # ============================================================
       - name: Build ONNX Runtime
         shell: cmd
@@ -266,10 +174,10 @@ jobs:
             --cmake_generator Ninja ^
             --cuda_home "%CUDA_PATH%" ^
             --cudnn_home "%CUDA_PATH%" ^
-            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 FETCHCONTENT_SOURCE_DIR_eigen=%EIGEN_SOURCE_DIR%
+            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 DEP_SHA1_eigen=32b145f525a8308d7ab1c09388b2e288312d8eba
 
       # ============================================================
-      # 7. 收集 ONNX Runtime 编译产物
+      # 6. 收集 ONNX Runtime 编译产物
       # ============================================================
       - name: Collect ONNX Runtime artifacts
         shell: pwsh
@@ -306,7 +214,7 @@ jobs:
           }
 
       # ============================================================
-      # 8. 收集 CUDA 运行时 DLL（可再分发的）
+      # 7. 收集 CUDA 运行时 DLL（可再分发的）
       # ============================================================
       - name: Collect CUDA runtime DLLs
         shell: pwsh
@@ -346,7 +254,7 @@ jobs:
           Write-Host "CUDA Runtime total: $totalMB MB"
 
       # ============================================================
-      # 9. 收集 cuDNN 运行时 DLL（可再分发的）
+      # 8. 收集 cuDNN 运行时 DLL（可再分发的）
       # ============================================================
       - name: Collect cuDNN runtime DLLs
         shell: pwsh
@@ -393,7 +301,7 @@ jobs:
           }
 
       # ============================================================
-      # 10. 创建统一捆绑包（runtimes/win-x64/native 结构）
+      # 9. 创建统一捆绑包（runtimes/win-x64/native 结构）
       # ============================================================
       - name: Create combined runtime bundle
         shell: pwsh
@@ -425,7 +333,7 @@ jobs:
           Write-Host "============================================"
 
       # ============================================================
-      # 11. 上传 Artifacts
+      # 10. 上传 Artifacts
       # ============================================================
       - name: Upload ONNX Runtime (self-built)
         uses: actions/upload-artifact@v4
