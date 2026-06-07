@@ -147,7 +147,50 @@ jobs:
           Pop-Location
 
       # ============================================================
-      # 5. 编译 ONNX Runtime (CPU + CUDA + DirectML)
+      # 5. 预下载 Eigen（绕过 GitLab zip SHA1 不匹配问题）
+      # ============================================================
+      - name: Pre-download Eigen source
+        shell: pwsh
+        run: |
+          # Read Eigen commit hash from ORT cmake config
+          $eigenCmake = "${{ env.ORT_DIR }}\cmake\external\eigen.cmake"
+          if (-not (Test-Path $eigenCmake)) {
+            Write-Error "eigen.cmake not found at: $eigenCmake"
+            exit 1
+          }
+          $content = Get-Content $eigenCmake -Raw
+
+          # Extract commit hash from URL pattern like: /archive/<hash>/eigen-<hash>.zip
+          if ($content -match '/archive/([a-f0-9]{40})/') {
+            $eigenCommit = $Matches[1]
+            Write-Host "Eigen commit: $eigenCommit"
+          } else {
+            Write-Error "Could not extract Eigen commit hash from eigen.cmake"
+            exit 1
+          }
+
+          $url = "https://gitlab.com/libeigen/eigen/-/archive/${eigenCommit}/eigen-${eigenCommit}.zip"
+          $zipPath = "${{ runner.temp }}\eigen.zip"
+          $extractDir = "${{ runner.temp }}\eigen-source"
+
+          Write-Host "Downloading Eigen from: $url"
+          Invoke-WebRequest -Uri $url -OutFile $zipPath -MaximumRetryCount 3 -RetryIntervalSec 10
+
+          Write-Host "Extracting Eigen to: $extractDir"
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+          # The zip extracts to eigen-<hash>/; find that directory
+          $eigenDir = Get-ChildItem $extractDir -Directory | Select-Object -First 1
+          if (-not $eigenDir) {
+            $eigenDir = $extractDir
+          }
+          Write-Host "Eigen source dir: $($eigenDir.FullName)"
+
+          # Store for use in cmake extra defines
+          echo "EIGEN_SOURCE_DIR=$($eigenDir.FullName)" >> $env:GITHUB_ENV
+
+      # ============================================================
+      # 6. 编译 ONNX Runtime (CPU + CUDA + DirectML)
       # ============================================================
       - name: Build ONNX Runtime
         shell: cmd
@@ -174,10 +217,10 @@ jobs:
             --cmake_generator Ninja ^
             --cuda_home "%CUDA_PATH%" ^
             --cudnn_home "%CUDA_PATH%" ^
-            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0
+            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 FETCHCONTENT_SOURCE_DIR_eigen=%EIGEN_SOURCE_DIR%
 
       # ============================================================
-      # 6. 收集 ONNX Runtime 编译产物
+      # 7. 收集 ONNX Runtime 编译产物
       # ============================================================
       - name: Collect ONNX Runtime artifacts
         shell: pwsh
@@ -214,7 +257,7 @@ jobs:
           }
 
       # ============================================================
-      # 7. 收集 CUDA 运行时 DLL（可再分发的）
+      # 8. 收集 CUDA 运行时 DLL（可再分发的）
       # ============================================================
       - name: Collect CUDA runtime DLLs
         shell: pwsh
@@ -254,7 +297,7 @@ jobs:
           Write-Host "CUDA Runtime total: $totalMB MB"
 
       # ============================================================
-      # 8. 收集 cuDNN 运行时 DLL（可再分发的）
+      # 9. 收集 cuDNN 运行时 DLL（可再分发的）
       # ============================================================
       - name: Collect cuDNN runtime DLLs
         shell: pwsh
@@ -301,7 +344,7 @@ jobs:
           }
 
       # ============================================================
-      # 9. 创建统一捆绑包（runtimes/win-x64/native 结构）
+      # 10. 创建统一捆绑包（runtimes/win-x64/native 结构）
       # ============================================================
       - name: Create combined runtime bundle
         shell: pwsh
@@ -333,7 +376,7 @@ jobs:
           Write-Host "============================================"
 
       # ============================================================
-      # 10. 上传 Artifacts
+      # 11. 上传 Artifacts
       # ============================================================
       - name: Upload ONNX Runtime (self-built)
         uses: actions/upload-artifact@v4
