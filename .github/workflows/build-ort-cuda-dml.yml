@@ -42,6 +42,13 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
+      - name: Install Ninja
+        shell: pwsh
+        run: |
+          # Ninja avoids the VS CUDA toolset issue (CUDA 12.5+ removed MSBuildExtensions)
+          pip install ninja
+          ninja --version
+
       # ============================================================
       # 2. 安装 CUDA Toolkit
       # ============================================================
@@ -161,6 +168,7 @@ jobs:
             --parallel ^
             --skip_tests ^
             --build_shared_lib ^
+            --cmake_generator Ninja ^
             --cuda_home "%CUDA_PATH%" ^
             --cudnn_home "%CUDA_PATH%" ^
             --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0
