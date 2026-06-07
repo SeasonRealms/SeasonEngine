@@ -147,7 +147,59 @@ jobs:
           Pop-Location
 
       # ============================================================
-      # 5. 编译 ONNX Runtime (CPU + CUDA + DirectML)
+      # 5. 预下载 Eigen（从 deps.txt 提取 URL）
+      # ============================================================
+      - name: Pre-download Eigen
+        shell: pwsh
+        run: |
+          $ortDir = "${{ env.ORT_DIR }}"
+          $depsFile = "$ortDir\cmake\deps.txt"
+          if (-not (Test-Path $depsFile)) {
+            Write-Error "deps.txt not found at: $depsFile"
+            exit 1
+          }
+
+          # Find the line starting with "eigen" in deps.txt (format: name URL SHA1)
+          $eigenLine = Get-Content $depsFile | Where-Object { $_ -match '^eigen\s' } | Select-Object -First 1
+          if (-not $eigenLine) {
+            Write-Error "Eigen entry not found in deps.txt"
+            exit 1
+          }
+          Write-Host "Eigen deps line: $eigenLine"
+
+          # Parse: "eigen <URL> <SHA1>" — extract URL
+          if ($eigenLine -match '^eigen\s+(\S+)\s+(\S+)') {
+            $eigenUrl = $Matches[1]
+            $eigenSha1 = $Matches[2]
+            Write-Host "Eigen URL: $eigenUrl"
+            Write-Host "Eigen SHA1 (expected): $eigenSha1"
+          } else {
+            Write-Error "Could not parse Eigen line: $eigenLine"
+            exit 1
+          }
+
+          $zipPath = "${{ runner.temp }}\eigen.zip"
+          $extractDir = "${{ runner.temp }}\eigen-source"
+
+          Write-Host "Downloading Eigen from: $eigenUrl"
+          Invoke-WebRequest -Uri $eigenUrl -OutFile $zipPath -MaximumRetryCount 3 -RetryIntervalSec 10
+
+          Write-Host "Extracting Eigen to: $extractDir"
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+          # The zip extracts to eigen-<hash>/; find the actual directory
+          $eigenDir = Get-ChildItem $extractDir -Directory | Select-Object -First 1
+          if (-not $eigenDir) {
+            Write-Error "No directory found after extracting Eigen zip"
+            exit 1
+          }
+          Write-Host "Eigen source dir: $($eigenDir.FullName)"
+
+          # Set env var for cmake extra defines
+          echo "EIGEN_SOURCE_DIR=$($eigenDir.FullName)" >> $env:GITHUB_ENV
+
+      # ============================================================
+      # 6. 编译 ONNX Runtime (CPU + CUDA + DirectML)
       # ============================================================
       - name: Build ONNX Runtime
         shell: cmd
@@ -174,10 +226,10 @@ jobs:
             --cmake_generator Ninja ^
             --cuda_home "%CUDA_PATH%" ^
             --cudnn_home "%CUDA_PATH%" ^
-            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 DEP_SHA1_eigen=32b145f525a8308d7ab1c09388b2e288312d8eba
+            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 onnxruntime_USE_PREINSTALLED_EIGEN=ON eigen_SOURCE_PATH=%EIGEN_SOURCE_DIR%
 
       # ============================================================
-      # 6. 收集 ONNX Runtime 编译产物
+      # 7. 收集 ONNX Runtime 编译产物
       # ============================================================
       - name: Collect ONNX Runtime artifacts
         shell: pwsh
@@ -214,7 +266,7 @@ jobs:
           }
 
       # ============================================================
-      # 7. 收集 CUDA 运行时 DLL（可再分发的）
+      # 8. 收集 CUDA 运行时 DLL（可再分发的）
       # ============================================================
       - name: Collect CUDA runtime DLLs
         shell: pwsh
@@ -254,7 +306,7 @@ jobs:
           Write-Host "CUDA Runtime total: $totalMB MB"
 
       # ============================================================
-      # 8. 收集 cuDNN 运行时 DLL（可再分发的）
+      # 9. 收集 cuDNN 运行时 DLL（可再分发的）
       # ============================================================
       - name: Collect cuDNN runtime DLLs
         shell: pwsh
@@ -301,7 +353,7 @@ jobs:
           }
 
       # ============================================================
-      # 9. 创建统一捆绑包（runtimes/win-x64/native 结构）
+      # 10. 创建统一捆绑包（runtimes/win-x64/native 结构）
       # ============================================================
       - name: Create combined runtime bundle
         shell: pwsh
@@ -333,7 +385,7 @@ jobs:
           Write-Host "============================================"
 
       # ============================================================
-      # 10. 上传 Artifacts
+      # 11. 上传 Artifacts
       # ============================================================
       - name: Upload ONNX Runtime (self-built)
         uses: actions/upload-artifact@v4
