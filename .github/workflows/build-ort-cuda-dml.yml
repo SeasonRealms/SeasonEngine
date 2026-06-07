@@ -159,16 +159,16 @@ jobs:
             exit 1
           }
 
-          # Find the line starting with "eigen" in deps.txt (format: name URL SHA1)
-          $eigenLine = Get-Content $depsFile | Where-Object { $_ -match '^eigen\s' } | Select-Object -First 1
+          # Find the line starting with "eigen" in deps.txt (CSV format: name;URL;SHA1)
+          $eigenLine = Get-Content $depsFile | Where-Object { $_ -match '^eigen;' } | Select-Object -First 1
           if (-not $eigenLine) {
             Write-Error "Eigen entry not found in deps.txt"
             exit 1
           }
           Write-Host "Eigen deps line: $eigenLine"
 
-          # Parse: "eigen <URL> <SHA1>" — extract URL
-          if ($eigenLine -match '^eigen\s+(\S+)\s+(\S+)') {
+          # Parse: "eigen;URL;SHA1" — extract URL and SHA1
+          if ($eigenLine -match '^eigen;(\S+);(\S+)') {
             $eigenUrl = $Matches[1]
             $eigenSha1 = $Matches[2]
             Write-Host "Eigen URL: $eigenUrl"
