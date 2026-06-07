@@ -152,22 +152,71 @@ jobs:
       - name: Pre-download Eigen source
         shell: pwsh
         run: |
-          # Read Eigen commit hash from ORT cmake config
-          $eigenCmake = "${{ env.ORT_DIR }}\cmake\external\eigen.cmake"
-          if (-not (Test-Path $eigenCmake)) {
-            Write-Error "eigen.cmake not found at: $eigenCmake"
-            exit 1
-          }
-          $content = Get-Content $eigenCmake -Raw
+          $ortDir = "${{ env.ORT_DIR }}"
 
-          # Extract commit hash from URL pattern like: /archive/<hash>/eigen-<hash>.zip
-          if ($content -match '/archive/([a-f0-9]{40})/') {
-            $eigenCommit = $Matches[1]
-            Write-Host "Eigen commit: $eigenCommit"
-          } else {
-            Write-Error "Could not extract Eigen commit hash from eigen.cmake"
+          # Search ALL cmake files for the Eigen commit hash (40-char hex adjacent to eigen/gitlab)
+          $cmakeFiles = Get-ChildItem "$ortDir\cmake" -Recurse -Filter "*.cmake" -ErrorAction SilentlyContinue
+          $allContent = $cmakeFiles | ForEach-Object { Get-Content $_.FullName -Raw }
+
+          # Strategy 1: find /archive/<40-hex>/eigen- pattern in any cmake file
+          $eigenCommit = $null
+          foreach ($c in $allContent) {
+            if ($c -match '/archive/([a-f0-9]{40})/eigen') {
+              $eigenCommit = $Matches[1]
+              break
+            }
+          }
+
+          # Strategy 2: search ALL files (not just .cmake) for DEP_SHA1_eigen / DEP_URL_eigen
+          if (-not $eigenCommit) {
+            Write-Host "Strategy 1 failed, trying strategy 2: grep for DEP_SHA1_eigen"
+            $found = Get-ChildItem "$ortDir\cmake" -Recurse -Include "*.cmake","*.txt","*.json" -ErrorAction SilentlyContinue `
+              | Select-String -Pattern "DEP_SHA1_eigen|DEP_URL_eigen" -SimpleMatch
+            Write-Host "Found matches: $($found.Count)"
+            foreach ($match in $found) {
+              if ($match.Line -match '/archive/([a-f0-9]{40})/') {
+                $eigenCommit = $Matches[1]
+                Write-Host "  Extracted commit from line: $($match.Line)"
+                break
+              }
+            }
+            # Also try full file context
+            if (-not $eigenCommit -and $found.Count -gt 0) {
+              foreach ($match in $found) {
+                $ctx = Get-Content $match.Path -Raw
+                if ($ctx -match '/archive/([a-f0-9]{40})/') {
+                  $eigenCommit = $Matches[1]
+                  Write-Host "  Extracted commit from file: $($match.Path)"
+                  break
+                }
+              }
+            }
+          }
+
+          # Strategy 3: search ALL ORT files for libeigen GitLab URL
+          if (-not $eigenCommit) {
+            Write-Host "Strategy 2 failed, trying strategy 3: broad search for libeigen GitLab URL in entire repo"
+            $broad = Get-ChildItem "$ortDir" -Recurse -Include "*.cmake","*.txt","*.json","*.py","*.cmake.in" -ErrorAction SilentlyContinue `
+              | Select-String -Pattern 'libeigen/eigen' -SimpleMatch -List `
+              | Select-Object -First 20
+            foreach ($m in $broad) {
+              $ctx = Get-Content $m.Path -Raw
+              if ($ctx -match '/archive/([a-f0-9]{40})/') {
+                $eigenCommit = $Matches[1]
+                Write-Host "  Found in: $($m.Path)"
+                break
+              }
+            }
+          }
+
+          if (-not $eigenCommit) {
+            Write-Error "Could not extract Eigen commit hash from ORT source tree."
+            Write-Host "=== Dumping cmake directory for debugging ==="
+            Get-ChildItem "$ortDir\cmake" -Recurse -Filter "*.cmake" | ForEach-Object { Write-Host $_.FullName }
             exit 1
           }
+
+          Write-Host "Eigen commit: $eigenCommit"
 
           $url = "https://gitlab.com/libeigen/eigen/-/archive/${eigenCommit}/eigen-${eigenCommit}.zip"
           $zipPath = "${{ runner.temp }}\eigen.zip"
