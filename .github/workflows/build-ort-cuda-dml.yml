@@ -1,0 +1,353 @@
+name: Build ONNX Runtime (CUDA + DirectML)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ort_ref:
+        description: "ONNX Runtime tag / branch / commit"
+        required: true
+        default: "v1.19.2"
+      cuda_version:
+        description: "CUDA Toolkit version (e.g. 12.5.1)"
+        required: true
+        default: "12.5.1"
+      cudnn_version:
+        description: "cuDNN version (e.g. 9.3.0.75)"
+        required: true
+        default: "9.3.0.75"
+
+permissions:
+  contents: read
+
+jobs:
+  build-ort-cuda-dml:
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    env:
+      ORT_DIR: onnxruntime
+
+    steps:
+      # ============================================================
+      # 1. 环境准备
+      # ============================================================
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # ============================================================
+      # 2. 安装 CUDA Toolkit
+      # ============================================================
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.22
+        with:
+          cuda: "${{ github.event.inputs.cuda_version }}"
+          method: "network"
+          sub-packages: '["cudart", "cublas", "cublas_dev", "cufft", "curand", "nvrtc", "nvrtc_dev"]'
+
+      - name: Set CUDA environment variables
+        shell: pwsh
+        run: |
+          # Resolve CUDA installation path (Jimver action sets CUDA_PATH)
+          $cudaPath = "$env:CUDA_PATH"
+          if (-not $cudaPath) {
+            $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$($env:CUDA_VERSION)"
+          }
+          if (-not (Test-Path $cudaPath)) {
+            Write-Error "CUDA installation not found at: $cudaPath"
+            exit 1
+          }
+          Write-Host "CUDA_PATH: $cudaPath"
+          echo "CUDA_PATH=$cudaPath" >> $env:GITHUB_ENV
+
+      # ============================================================
+      # 3. 安装 cuDNN
+      # ============================================================
+      - name: Download cuDNN redist
+        shell: pwsh
+        run: |
+          $cudnnVer = "${{ github.event.inputs.cudnn_version }}"
+          # cuDNN redist URL (no auth required for redist packages)
+          $url = "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-${cudnnVer}_cuda12-archive.zip"
+          Write-Host "Downloading cuDNN from: $url"
+          
+          $tempZip = "${{ runner.temp }}\cudnn.zip"
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $tempZip -MaximumRetryCount 3 -RetryIntervalSec 10
+          } catch {
+            Write-Error "Failed to download cuDNN. Check that version ${cudnnVer} exists at: $url"
+            exit 1
+          }
+          echo "CUDNN_ZIP=$tempZip" >> $env:GITHUB_ENV
+
+      - name: Install cuDNN into CUDA Toolkit
+        shell: pwsh
+        run: |
+          $extractDir = "${{ runner.temp }}\cudnn-extract"
+          Expand-Archive -Path "$env:CUDNN_ZIP" -DestinationPath $extractDir -Force
+          
+          # Find the extracted directory (name varies by cuDNN version)
+          $cudnnDir = Get-ChildItem $extractDir -Directory | Select-Object -First 1
+          if (-not $cudnnDir) {
+            $cudnnDir = $extractDir
+          }
+          Write-Host "cuDNN extracted to: $($cudnnDir.FullName)"
+          
+          $cudaPath = "$env:CUDA_PATH"
+          Write-Host "Installing cuDNN into: $cudaPath"
+          
+          # Copy headers
+          if (Test-Path "$($cudnnDir.FullName)\include") {
+            Copy-Item "$($cudnnDir.FullName)\include\*.h" -Destination "$cudaPath\include\" -Force
+          }
+          
+          # Copy import libraries
+          if (Test-Path "$($cudnnDir.FullName)\lib\x64") {
+            Copy-Item "$($cudnnDir.FullName)\lib\x64\*.lib" -Destination "$cudaPath\lib\x64\" -Force
+          } elseif (Test-Path "$($cudnnDir.FullName)\lib") {
+            Copy-Item "$($cudnnDir.FullName)\lib\*.lib" -Destination "$cudaPath\lib\x64\" -Force
+          }
+          
+          # Copy runtime DLLs
+          if (Test-Path "$($cudnnDir.FullName)\bin") {
+            Copy-Item "$($cudnnDir.FullName)\bin\*.dll" -Destination "$cudaPath\bin\" -Force
+          }
+          
+          Write-Host "=== cuDNN installed ==="
+          Get-ChildItem "$cudaPath\bin\cudnn*.dll" | ForEach-Object { Write-Host "  $($_.Name)" }
+          Get-ChildItem "$cudaPath\include\cudnn*.h" | ForEach-Object { Write-Host "  $($_.Name)" }
+
+      # ============================================================
+      # 4. 克隆 ONNX Runtime 源码
+      # ============================================================
+      - name: Clone ONNX Runtime
+        shell: pwsh
+        run: |
+          $ortRef = "${{ github.event.inputs.ort_ref }}"
+          Write-Host "Cloning ONNX Runtime $ortRef ..."
+          git clone --depth 1 --branch "$ortRef" `
+            https://github.com/microsoft/onnxruntime.git "${{ env.ORT_DIR }}"
+          
+          Push-Location "${{ env.ORT_DIR }}"
+          git describe --tags --always
+          Pop-Location
+
+      # ============================================================
+      # 5. 编译 ONNX Runtime (CPU + CUDA + DirectML)
+      # ============================================================
+      - name: Build ONNX Runtime
+        shell: cmd
+        run: |
+          cd /d "${{ github.workspace }}\${{ env.ORT_DIR }}"
+          
+          echo ============================================
+          echo Building ONNX Runtime
+          echo   Config:  Release
+          echo   CUDA:    %CUDA_PATH%
+          echo   cuDNN:   %CUDA_PATH%
+          echo ============================================
+          
+          call build.bat ^
+            --use_cuda ^
+            --use_dml ^
+            --config Release ^
+            --parallel ^
+            --skip_tests ^
+            --build_shared_lib ^
+            --cuda_home "%CUDA_PATH%" ^
+            --cudnn_home "%CUDA_PATH%" ^
+            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0
+
+      # ============================================================
+      # 6. 收集 ONNX Runtime 编译产物
+      # ============================================================
+      - name: Collect ONNX Runtime artifacts
+        shell: pwsh
+        run: |
+          $ortOut = "out/onnxruntime"
+          New-Item -ItemType Directory -Force -Path $ortOut | Out-Null
+
+          $buildDir = "${{ env.ORT_DIR }}\build\Windows"
+          Write-Host "Searching for onnxruntime DLLs under: $buildDir"
+
+          # Find all ORT DLLs recursively (handles varying CMake output paths)
+          $dlls = Get-ChildItem -Path $buildDir -Recurse -Filter "onnxruntime*.dll" -ErrorAction SilentlyContinue
+          
+          if ($dlls.Count -eq 0) {
+            Write-Error "No onnxruntime DLLs found in build output!"
+            Write-Host "=== Build directory contents ==="
+            Get-ChildItem -Path $buildDir -Recurse -Depth 3 -ErrorAction SilentlyContinue | 
+              Select-Object -First 50 | ForEach-Object { Write-Host $_.FullName }
+            exit 1
+          }
+
+          Write-Host "Found DLLs:"
+          foreach ($dll in $dlls) {
+            $sizeMB = [math]::Round($dll.Length / 1MB, 1)
+            Write-Host "  $($dll.Name) ($sizeMB MB) [$($dll.DirectoryName)]"
+            Copy-Item $dll.FullName -Destination $ortOut -Force
+          }
+
+          Write-Host ""
+          Write-Host "=== ONNX Runtime artifacts ==="
+          Get-ChildItem $ortOut | ForEach-Object {
+            $sizeMB = [math]::Round($_.Length / 1MB, 1)
+            Write-Host "  $($_.Name) ($sizeMB MB)"
+          }
+
+      # ============================================================
+      # 7. 收集 CUDA 运行时 DLL（可再分发的）
+      # ============================================================
+      - name: Collect CUDA runtime DLLs
+        shell: pwsh
+        run: |
+          $cudaOut = "out/cuda-runtime"
+          New-Item -ItemType Directory -Force -Path $cudaOut | Out-Null
+
+          $cudaBin = "$env:CUDA_PATH\bin"
+          Write-Host "CUDA bin directory: $cudaBin"
+
+          # CUDA Runtime libraries permitted for redistribution (see CUDA EULA Appendix 1)
+          $cudaDlls = @(
+            "cudart64_*.dll",       # CUDA Runtime
+            "cublas64_*.dll",       # cuBLAS
+            "cublasLt64_*.dll",     # cuBLAS Lt (lightweight GEMM)
+            "cufft64_*.dll",        # cuFFT
+            "curand64_*.dll",       # cuRAND
+            "cusolver64_*.dll",     # cuSOLVER
+            "cusparse64_*.dll",     # cuSPARSE
+            "nvrtc64_*.dll",        # NVRTC (runtime compilation)
+            "nvrtc-builtins64_*.dll",
+            "nvJitLink_*.dll"       # JIT linker (needed by NVRTC)
+          )
+
+          Write-Host "Collecting CUDA runtime DLLs:"
+          foreach ($pattern in $cudaDlls) {
+            $found = Get-ChildItem -Path $cudaBin -Filter $pattern -ErrorAction SilentlyContinue
+            foreach ($dll in $found) {
+              Copy-Item $dll.FullName -Destination $cudaOut -Force
+              $sizeMB = [math]::Round($dll.Length / 1MB, 1)
+              Write-Host "  $($dll.Name) ($sizeMB MB)"
+            }
+          }
+
+          Write-Host ""
+          $totalMB = [math]::Round((Get-ChildItem $cudaOut | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
+          Write-Host "CUDA Runtime total: $totalMB MB"
+
+      # ============================================================
+      # 8. 收集 cuDNN 运行时 DLL（可再分发的）
+      # ============================================================
+      - name: Collect cuDNN runtime DLLs
+        shell: pwsh
+        run: |
+          $cudnnOut = "out/cudnn-runtime"
+          New-Item -ItemType Directory -Force -Path $cudnnOut | Out-Null
+
+          $cudaBin = "$env:CUDA_PATH\bin"
+          Write-Host "Collecting cuDNN DLLs from: $cudaBin"
+
+          # cuDNN redistributable DLLs (see cuDNN EULA)
+          $cudnnDlls = @(
+            "cudnn64_*.dll",        # cuDNN main
+            "cudnn_ops64_*.dll",    # Operations
+            "cudnn_cnn64_*.dll",    # CNN primitives
+            "cudnn_adv64_*.dll",    # Advanced features
+            "cudnn_eng64_*.dll",    # Engine (may not exist in all builds)
+            "cudnn_heu64_*.dll",    # Heuristics (may not exist)
+            "cudnn_graph64_*.dll"   # Graph API (may not exist)
+          )
+
+          $anyFound = $false
+          foreach ($pattern in $cudnnDlls) {
+            $found = Get-ChildItem -Path $cudaBin -Filter $pattern -ErrorAction SilentlyContinue
+            foreach ($dll in $found) {
+              Copy-Item $dll.FullName -Destination $cudnnOut -Force
+              $sizeMB = [math]::Round($dll.Length / 1MB, 1)
+              Write-Host "  $($dll.Name) ($sizeMB MB)"
+              $anyFound = $true
+            }
+          }
+
+          if (-not $anyFound) {
+            Write-Warning "No cuDNN DLLs found! Check cuDNN installation."
+            # Try listing what exists
+            Write-Host "All DLLs in CUDA bin:"
+            Get-ChildItem $cudaBin\*.dll | ForEach-Object { Write-Host "  $($_.Name)" }
+          }
+
+          Write-Host ""
+          if ($anyFound) {
+            $totalMB = [math]::Round((Get-ChildItem $cudnnOut | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
+            Write-Host "cuDNN total: $totalMB MB"
+          }
+
+      # ============================================================
+      # 9. 创建统一捆绑包（runtimes/win-x64/native 结构）
+      # ============================================================
+      - name: Create combined runtime bundle
+        shell: pwsh
+        run: |
+          $bundle = "out/runtimes/win-x64/native"
+          New-Item -ItemType Directory -Force -Path $bundle | Out-Null
+
+          # Merge all DLLs into a single runtime directory
+          $sources = @("out/onnxruntime", "out/cuda-runtime", "out/cudnn-runtime")
+          foreach ($src in $sources) {
+            if (Test-Path $src) {
+              Copy-Item "$src\*.dll" -Destination $bundle -Force
+            }
+          }
+
+          Write-Host "============================================"
+          Write-Host "=== Combined Runtime Bundle ==="
+          Write-Host "============================================"
+          $dlls = Get-ChildItem $bundle\*.dll | Sort-Object Name
+          foreach ($dll in $dlls) {
+            $sizeMB = [math]::Round($dll.Length / 1MB, 1)
+            Write-Host "  $($dll.Name.PadRight(35)) $($sizeMB.ToString().PadLeft(7)) MB"
+          }
+          
+          $totalMB = [math]::Round(($dlls | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
+          $count = $dlls.Count
+          Write-Host "--------------------------------------------"
+          Write-Host "  TOTAL: $count files, $totalMB MB"
+          Write-Host "============================================"
+
+      # ============================================================
+      # 10. 上传 Artifacts
+      # ============================================================
+      - name: Upload ONNX Runtime (self-built)
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-selfbuilt-cuda-dml
+          path: out/onnxruntime/
+          if-no-files-found: error
+
+      - name: Upload CUDA Runtime DLLs
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-runtime-dlls
+          path: out/cuda-runtime/
+          if-no-files-found: error
+
+      - name: Upload cuDNN Runtime DLLs
+        uses: actions/upload-artifact@v4
+        with:
+          name: cudnn-runtime-dlls
+          path: out/cudnn-runtime/
+          if-no-files-found: error
+
+      - name: Upload Combined Runtime Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-cuda-dml-bundle
+          path: out/runtimes/win-x64/native/
+          if-no-files-found: error
