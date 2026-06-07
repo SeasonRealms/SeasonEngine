@@ -153,14 +153,17 @@ jobs:
         shell: cmd
         run: |
           cd /d "${{ github.workspace }}\${{ env.ORT_DIR }}"
-          
+
           echo ============================================
           echo Building ONNX Runtime
           echo   Config:  Release
           echo   CUDA:    %CUDA_PATH%
           echo   cuDNN:   %CUDA_PATH%
           echo ============================================
-          
+
+          :: Activate MSVC environment so Ninja picks up cl.exe (not MinGW gcc)
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+
           call build.bat ^
             --use_cuda ^
             --use_dml ^
