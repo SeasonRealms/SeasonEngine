@@ -219,8 +219,8 @@ jobs:
           :: Set CUDAToolkit_ROOT for CMake find_package (env var avoids space-in-path splitting)
           set CUDAToolkit_ROOT=%CUDA_PATH%
 
-          :: CMake enable_language(CUDA) needs full path to nvcc.exe (Ninja strictness)
-          set CUDACXX=%CUDA_PATH%\bin\nvcc.exe
+          :: Add CUDA bin to PATH so CMake enable_language(CUDA) finds nvcc.exe
+          set PATH=%CUDA_PATH%\bin;%PATH%
 
           call build.bat ^
             --use_cuda ^
