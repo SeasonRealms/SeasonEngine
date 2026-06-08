@@ -199,46 +199,62 @@ jobs:
           echo "EIGEN_SOURCE_DIR=$($eigenDir.FullName)" >> $env:GITHUB_ENV
 
       # ============================================================
-      # 5b. 预下载 Howard Hinnant's date 库
+      # 5b. 预下载 FetchContent 依赖（绕过 GitHub CDN 504）
       # ============================================================
-      - name: Pre-download date library
+      - name: Pre-download FetchContent dependencies
         shell: pwsh
         run: |
-          $dateVersion = "v3.0.1"
-          $dateUrl = "https://github.com/HowardHinnant/date/archive/refs/tags/${dateVersion}.zip"
-          $zipPath = "${{ runner.temp }}\date.zip"
-          $extractDir = "${{ runner.temp }}\date-source"
+          # Map: FetchContent name → (URL, extract_subdir)
+          # Add entries here when CMake FetchContent downloads fail with HTTP 504
+          $deps = @(
+            @{
+              Name = "date"
+              Url  = "https://github.com/HowardHinnant/date/archive/refs/tags/v3.0.1.zip"
+            },
+            @{
+              Name = "pytorch_cpuinfo"
+              Url  = "https://github.com/pytorch/cpuinfo/archive/ca678952a9a8eaa6de112d154e8e104b22f9ab3f.zip"
+            }
+          )
 
-          Write-Host "Downloading date library from: $dateUrl"
-          # curl.exe retries on HTTP errors (504, 503, etc.), unlike Invoke-WebRequest
-          curl.exe --retry 10 --retry-delay 15 --retry-all-errors -L -o "$zipPath" "$dateUrl"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "curl.exe failed with exit code $LASTEXITCODE"
-            exit 1
+          foreach ($dep in $deps) {
+            $name = $dep.Name
+            $url  = $dep.Url
+            $zipPath = "${{ runner.temp }}\${name}.zip"
+            $extractDir = "${{ runner.temp }}\${name}-source"
+
+            Write-Host "=========================================="
+            Write-Host "Downloading $name from: $url"
+            # curl.exe retries on HTTP errors (504, 503), unlike Invoke-WebRequest
+            curl.exe --retry 10 --retry-delay 15 --retry-all-errors -L -o "$zipPath" "$url"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "curl.exe failed for $name with exit code $LASTEXITCODE"
+              exit 1
+            }
+
+            $fileSize = (Get-Item "$zipPath").Length
+            Write-Host "Downloaded: $fileSize bytes"
+            if ($fileSize -lt 1024) {
+              Write-Error "$name archive too small ($fileSize bytes), likely an error page"
+              Get-Content "$zipPath" -Raw
+              exit 1
+            }
+
+            Write-Host "Extracting $name to: $extractDir"
+            Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+            $innerDir = Get-ChildItem $extractDir -Directory | Select-Object -First 1
+            if (-not $innerDir) {
+              Write-Error "No directory found after extracting $name zip"
+              exit 1
+            }
+            Write-Host "$name source dir: $($innerDir.FullName)"
+
+            # CMake FetchContent skips download when FETCHCONTENT_SOURCE_DIR_<name> is set
+            $envVarName = "DEPS_$($name.ToUpper())_DIR"
+            echo "$envVarName=$($innerDir.FullName)" >> $env:GITHUB_ENV
+            Write-Host "Set $envVarName=$($innerDir.FullName)"
           }
-
-          # Verify the downloaded file is a valid zip (not an error page)
-          $fileSize = (Get-Item "$zipPath").Length
-          Write-Host "Downloaded date archive: $fileSize bytes"
-          if ($fileSize -lt 1024) {
-            Write-Error "Downloaded file too small ($fileSize bytes), likely an error page"
-            Get-Content "$zipPath" -Raw
-            exit 1
-          }
-
-          Write-Host "Extracting date to: $extractDir"
-          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
-
-          # The zip extracts to date-3.0.1/; find the actual directory
-          $dateDir = Get-ChildItem $extractDir -Directory | Select-Object -First 1
-          if (-not $dateDir) {
-            Write-Error "No directory found after extracting date zip"
-            exit 1
-          }
-          Write-Host "Date source dir: $($dateDir.FullName)"
-
-          # Pass via env var to avoid spaces in --cmake_extra_defines
-          echo "DATE_SOURCE_DIR=$($dateDir.FullName)" >> $env:GITHUB_ENV
 
       # ============================================================
       # 6. 编译 ONNX Runtime (CPU + CUDA + DirectML)
@@ -291,7 +307,7 @@ jobs:
             --cmake_generator Ninja ^
             --cuda_home "%CUDA%" ^
             --cudnn_home "%CUDA%" ^
-            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 onnxruntime_USE_PREINSTALLED_EIGEN=ON eigen_SOURCE_PATH=%EIGEN_SOURCE_DIR% CMAKE_CUDA_COMPILER=%CUDA%\bin\nvcc.exe CMAKE_CUDA_FLAGS=-diag-suppress=221 FETCHCONTENT_SOURCE_DIR_date=%DATE_SOURCE_DIR%
+            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 onnxruntime_USE_PREINSTALLED_EIGEN=ON eigen_SOURCE_PATH=%EIGEN_SOURCE_DIR% CMAKE_CUDA_COMPILER=%CUDA%\bin\nvcc.exe CMAKE_CUDA_FLAGS=-diag-suppress=221 FETCHCONTENT_SOURCE_DIR_date=%DEPS_DATE_DIR% FETCHCONTENT_SOURCE_DIR_pytorch_cpuinfo=%DEPS_PYTORCH_CPUINFO_DIR%
 
       # ============================================================
       # 7. 收集 ONNX Runtime 编译产物
