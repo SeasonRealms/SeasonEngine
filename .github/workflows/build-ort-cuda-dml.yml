@@ -231,8 +231,8 @@ jobs:
           set CUDAToolkit_ROOT=%CUDA%
           set PATH=%CUDA%\bin;%PATH%
 
-          :: MSVC CL env var: inject C++23 deprecation suppress + force C++20 mode (MSVC 14.44 defaults to C++23, breaking chrono)
-          set CL=/D_SILENCE_ALL_CXX23_DEPRECATION_WARNINGS /std:c++20
+          :: MSVC CL env var: suppress C++23 warnings + force-include <chrono> (MSVC 14.44 STL internal header chain broken)
+          set CL=/D_SILENCE_ALL_CXX23_DEPRECATION_WARNINGS /FIchrono
 
           call build.bat ^
             --use_cuda ^
