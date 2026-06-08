@@ -199,6 +199,34 @@ jobs:
           echo "EIGEN_SOURCE_DIR=$($eigenDir.FullName)" >> $env:GITHUB_ENV
 
       # ============================================================
+      # 5b. 预下载 Howard Hinnant's date 库
+      # ============================================================
+      - name: Pre-download date library
+        shell: pwsh
+        run: |
+          $dateVersion = "v3.0.1"
+          $dateUrl = "https://github.com/HowardHinnant/date/archive/refs/tags/${dateVersion}.zip"
+          $zipPath = "${{ runner.temp }}\date.zip"
+          $extractDir = "${{ runner.temp }}\date-source"
+
+          Write-Host "Downloading date library from: $dateUrl"
+          Invoke-WebRequest -Uri $dateUrl -OutFile $zipPath -MaximumRetryCount 5 -RetryIntervalSec 15
+
+          Write-Host "Extracting date to: $extractDir"
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+          # The zip extracts to date-3.0.1/; find the actual directory
+          $dateDir = Get-ChildItem $extractDir -Directory | Select-Object -First 1
+          if (-not $dateDir) {
+            Write-Error "No directory found after extracting date zip"
+            exit 1
+          }
+          Write-Host "Date source dir: $($dateDir.FullName)"
+
+          # Pass via env var to avoid spaces in --cmake_extra_defines
+          echo "DATE_SOURCE_DIR=$($dateDir.FullName)" >> $env:GITHUB_ENV
+
+      # ============================================================
       # 6. 编译 ONNX Runtime (CPU + CUDA + DirectML)
       # ============================================================
       - name: Build ONNX Runtime
@@ -249,7 +277,7 @@ jobs:
             --cmake_generator Ninja ^
             --cuda_home "%CUDA%" ^
             --cudnn_home "%CUDA%" ^
-            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 onnxruntime_USE_PREINSTALLED_EIGEN=ON eigen_SOURCE_PATH=%EIGEN_SOURCE_DIR% CMAKE_CUDA_COMPILER=%CUDA%\bin\nvcc.exe CMAKE_CUDA_FLAGS=-diag-suppress=221
+            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 onnxruntime_USE_PREINSTALLED_EIGEN=ON eigen_SOURCE_PATH=%EIGEN_SOURCE_DIR% CMAKE_CUDA_COMPILER=%CUDA%\bin\nvcc.exe CMAKE_CUDA_FLAGS=-diag-suppress=221 FETCHCONTENT_SOURCE_DIR_date=%DATE_SOURCE_DIR%
 
       # ============================================================
       # 7. 收集 ONNX Runtime 编译产物
