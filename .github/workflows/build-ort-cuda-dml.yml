@@ -249,7 +249,7 @@ jobs:
             --cmake_generator Ninja ^
             --cuda_home "%CUDA%" ^
             --cudnn_home "%CUDA%" ^
-            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 onnxruntime_USE_PREINSTALLED_EIGEN=ON eigen_SOURCE_PATH=%EIGEN_SOURCE_DIR% CMAKE_CUDA_COMPILER=%CUDA%\bin\nvcc.exe
+            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 onnxruntime_USE_PREINSTALLED_EIGEN=ON eigen_SOURCE_PATH=%EIGEN_SOURCE_DIR% CMAKE_CUDA_COMPILER=%CUDA%\bin\nvcc.exe CMAKE_CUDA_FLAGS=-diag-suppress=221
 
       # ============================================================
       # 7. 收集 ONNX Runtime 编译产物
