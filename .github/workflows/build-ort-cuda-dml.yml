@@ -226,7 +226,7 @@ jobs:
             --cmake_generator Ninja ^
             --cuda_home "%CUDA_PATH%" ^
             --cudnn_home "%CUDA_PATH%" ^
-            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 onnxruntime_USE_PREINSTALLED_EIGEN=ON eigen_SOURCE_PATH=%EIGEN_SOURCE_DIR%
+            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 onnxruntime_USE_PREINSTALLED_EIGEN=ON eigen_SOURCE_PATH=%EIGEN_SOURCE_DIR% CUDAToolkit_ROOT=%CUDA_PATH%
 
       # ============================================================
       # 7. 收集 ONNX Runtime 编译产物
