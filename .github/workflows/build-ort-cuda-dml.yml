@@ -195,22 +195,6 @@ jobs:
           }
           Write-Host "Eigen source dir: $($eigenDir.FullName)"
 
-          # Patch Eigen headers to suppress C++23 deprecated float_denorm_style warnings (MSVC 14.44+)
-          $suppressDefine = "#define _SILENCE_ALL_CXX23_DEPRECATION_WARNINGS`n"
-          $headers = @(
-            (Join-Path $eigenDir.FullName "Eigen\src\Core\arch\Default\Half.h"),
-            (Join-Path $eigenDir.FullName "Eigen\src\Core\arch\Default\BFloat16.h")
-          )
-          foreach ($h in $headers) {
-            if (Test-Path $h) {
-              $content = Get-Content $h -Raw
-              Set-Content -Path $h -Value ($suppressDefine + $content) -NoNewline
-              Write-Host "Patched: $h"
-            } else {
-              Write-Host "Warning: Header not found: $h"
-            }
-          }
-
           # Set env var for cmake extra defines
           echo "EIGEN_SOURCE_DIR=$($eigenDir.FullName)" >> $env:GITHUB_ENV
 
