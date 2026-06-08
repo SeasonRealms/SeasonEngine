@@ -204,23 +204,32 @@ jobs:
       - name: Build ONNX Runtime
         shell: cmd
         run: |
+          :: Create a directory junction to eliminate spaces in CUDA path
+          :: This fixes all space-related issues in cmake_extra_defines, PATH, CUDAToolkit_ROOT, etc.
+          mklink /J C:\cuda "%CUDA_PATH%" 2>nul || ver>nul
+          if not exist C:\cuda\bin\nvcc.exe (
+            echo ERROR: CUDA junction creation failed or nvcc.exe not found
+            dir C:\cuda\bin\nvcc* 2>nul
+            exit /b 1
+          )
+          set CUDA=C:\cuda
+
           cd /d "${{ github.workspace }}\${{ env.ORT_DIR }}"
 
           echo ============================================
           echo Building ONNX Runtime
           echo   Config:  Release
           echo   CUDA:    %CUDA_PATH%
+          echo   Junction: %CUDA%
           echo   cuDNN:   %CUDA_PATH%
           echo ============================================
 
           :: Activate MSVC environment so Ninja picks up cl.exe (not MinGW gcc)
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
 
-          :: Set CUDAToolkit_ROOT for CMake find_package (env var avoids space-in-path splitting)
-          set CUDAToolkit_ROOT=%CUDA_PATH%
-
-          :: Add CUDA bin to PATH so CMake enable_language(CUDA) finds nvcc.exe
-          set PATH=%CUDA_PATH%\bin;%PATH%
+          :: All uses of CUDA now go through the space-free junction
+          set CUDAToolkit_ROOT=%CUDA%
+          set PATH=%CUDA%\bin;%PATH%
 
           call build.bat ^
             --use_cuda ^
@@ -230,8 +239,8 @@ jobs:
             --skip_tests ^
             --build_shared_lib ^
             --cmake_generator Ninja ^
-            --cuda_home "%CUDA_PATH%" ^
-            --cudnn_home "%CUDA_PATH%" ^
+            --cuda_home "%CUDA%" ^
+            --cudnn_home "%CUDA%" ^
             --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 onnxruntime_USE_PREINSTALLED_EIGEN=ON eigen_SOURCE_PATH=%EIGEN_SOURCE_DIR%
 
       # ============================================================
