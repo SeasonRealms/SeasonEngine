@@ -231,8 +231,13 @@ jobs:
           set CUDAToolkit_ROOT=%CUDA%
           set PATH=%CUDA%\bin;%PATH%
 
-          :: MSVC CL env var: suppress C++23 warnings + force-include <chrono> (MSVC 14.44 STL internal header chain broken)
-          set CL=/D_SILENCE_ALL_CXX23_DEPRECATION_WARNINGS /FIchrono
+          :: MSVC CL env var: suppress C++23 deprecation warnings before any STL includes
+          set CL=/D_SILENCE_ALL_CXX23_DEPRECATION_WARNINGS
+
+          :: Patch ort_mutex.h: MSVC 14.44 STL doesn't transitively include <chrono> fully
+          set ORT_MUTEX=%cd%\include\onnxruntime\core\platform\ort_mutex.h
+          (echo #include ^<chrono^> && type "%ORT_MUTEX%") > "%ORT_MUTEX%.tmp"
+          move /y "%ORT_MUTEX%.tmp" "%ORT_MUTEX%"
 
           call build.bat ^
             --use_cuda ^
