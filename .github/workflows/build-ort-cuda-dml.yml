@@ -247,6 +247,9 @@ jobs:
           set CUDAToolkit_ROOT=%CUDA%
           set PATH=%CUDA%\bin;%PATH%
 
+          :: MSVC CL env var: inject C++23 deprecation suppress before any STL includes
+          set CL=/D_SILENCE_ALL_CXX23_DEPRECATION_WARNINGS
+
           call build.bat ^
             --use_cuda ^
             --use_dml ^
@@ -257,7 +260,7 @@ jobs:
             --cmake_generator Ninja ^
             --cuda_home "%CUDA%" ^
             --cudnn_home "%CUDA%" ^
-            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 onnxruntime_USE_PREINSTALLED_EIGEN=ON eigen_SOURCE_PATH=%EIGEN_SOURCE_DIR% CMAKE_CUDA_COMPILER=%CUDA%\bin\nvcc.exe CMAKE_CXX_FLAGS=/MP^ /D_SILENCE_ALL_CXX23_DEPRECATION_WARNINGS
+            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 onnxruntime_USE_PREINSTALLED_EIGEN=ON eigen_SOURCE_PATH=%EIGEN_SOURCE_DIR% CMAKE_CUDA_COMPILER=%CUDA%\bin\nvcc.exe
 
       # ============================================================
       # 7. 收集 ONNX Runtime 编译产物
