@@ -210,7 +210,21 @@ jobs:
           $extractDir = "${{ runner.temp }}\date-source"
 
           Write-Host "Downloading date library from: $dateUrl"
-          Invoke-WebRequest -Uri $dateUrl -OutFile $zipPath -MaximumRetryCount 5 -RetryIntervalSec 15
+          # curl.exe retries on HTTP errors (504, 503, etc.), unlike Invoke-WebRequest
+          curl.exe --retry 10 --retry-delay 15 --retry-all-errors -L -o "$zipPath" "$dateUrl"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "curl.exe failed with exit code $LASTEXITCODE"
+            exit 1
+          }
+
+          # Verify the downloaded file is a valid zip (not an error page)
+          $fileSize = (Get-Item "$zipPath").Length
+          Write-Host "Downloaded date archive: $fileSize bytes"
+          if ($fileSize -lt 1024) {
+            Write-Error "Downloaded file too small ($fileSize bytes), likely an error page"
+            Get-Content "$zipPath" -Raw
+            exit 1
+          }
 
           Write-Host "Extracting date to: $extractDir"
           Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
