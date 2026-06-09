@@ -243,10 +243,16 @@ jobs:
 
           set CL=/D_SILENCE_ALL_CXX23_DEPRECATION_WARNINGS
 
-          set "ORT_MUTEX=%cd%\include\onnxruntime\core\platform\ort_mutex.h"
-          findstr /C:"#include <chrono>" "%ORT_MUTEX%" >nul || (
-            (echo #include ^<chrono^> && type "%ORT_MUTEX%") > "%ORT_MUTEX%.tmp"
-            move /y "%ORT_MUTEX%.tmp" "%ORT_MUTEX%"
+          set "ORT_MUTEX="
+          if exist "%cd%\include\onnxruntime\core\platform\ort_mutex.h" set "ORT_MUTEX=%cd%\include\onnxruntime\core\platform\ort_mutex.h"
+          if not defined ORT_MUTEX if exist "%cd%\onnxruntime\core\platform\ort_mutex.h" set "ORT_MUTEX=%cd%\onnxruntime\core\platform\ort_mutex.h"
+          if defined ORT_MUTEX (
+            findstr /C:"#include <chrono>" "%ORT_MUTEX%" >nul || (
+              (echo #include ^<chrono^> && type "%ORT_MUTEX%") > "%ORT_MUTEX%.tmp"
+              move /y "%ORT_MUTEX%.tmp" "%ORT_MUTEX%"
+            )
+          ) else (
+            echo WARNING: ort_mutex.h not found, skip chrono compatibility patch
           )
 
           echo ============================================
@@ -256,7 +262,7 @@ jobs:
           echo   cuDNN:    %CUDNN_HOME%
           echo   Ninja jobs: 4
           echo   NVCC threads: 4
-          echo   Flash NVCC threads: 2
+          echo   Flash NVCC threads: N/A for ORT 1.26.0
           echo   PATH head:%CUDA%\bin
           echo ============================================
 
@@ -266,7 +272,6 @@ jobs:
             --config Release ^
             --parallel 4 ^
             --nvcc_threads 4 ^
-            --flash_nvcc_threads 2 ^
             --skip_tests ^
             --build_shared_lib ^
             --cmake_generator Ninja ^
