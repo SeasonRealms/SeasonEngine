@@ -1,0 +1,315 @@
+name: Build ONNX Runtime (CPU + CUDA + DirectML)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ort_ref:
+        description: "ONNX Runtime tag / branch / commit"
+        required: true
+        default: "v1.26.0"
+      cuda_version:
+        description: "CUDA Toolkit version"
+        required: true
+        default: "12.8.1"
+      cudnn_version:
+        description: "cuDNN version"
+        required: true
+        default: "9.8.0.87"
+
+permissions:
+  contents: read
+
+jobs:
+  build-onnxruntime:
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    env:
+      ORT_DIR: onnxruntime
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install Ninja
+        shell: pwsh
+        run: |
+          pip install ninja
+          ninja --version
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.22
+        with:
+          cuda: "${{ github.event.inputs.cuda_version }}"
+          method: "network"
+          sub-packages: '["cudart", "cublas", "cublas_dev", "cufft", "cufft_dev", "curand", "curand_dev", "cusparse", "cusparse_dev", "cusolver", "cusolver_dev", "nvrtc", "nvrtc_dev", "nvcc"]'
+
+      - name: Isolate selected CUDA toolkit
+        shell: pwsh
+        run: |
+          $cudaVersion = "${{ github.event.inputs.cuda_version }}"
+          $versionParts = $cudaVersion.Split(".")
+          if ($versionParts.Count -lt 2) {
+            throw "CUDA version must contain major.minor: $cudaVersion"
+          }
+
+          $cudaMajor = $versionParts[0]
+          $cudaMinor = $versionParts[1]
+          $cudaPath = $env:CUDA_PATH
+          if (-not $cudaPath) {
+            $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$cudaVersion"
+          }
+          if (-not (Test-Path $cudaPath)) {
+            throw "CUDA installation not found at: $cudaPath"
+          }
+
+          $sanitizedPathParts = @()
+          foreach ($part in ($env:PATH -split ";")) {
+            if (-not $part) { continue }
+            if ($part -match '(?i)\\NVIDIA GPU Computing Toolkit\\CUDA\\v\d+(\.\d+)?') {
+              continue
+            }
+            $sanitizedPathParts += $part
+          }
+
+          "CUDA_PATH=$cudaPath" >> $env:GITHUB_ENV
+          "CUDA_HOME=$cudaPath" >> $env:GITHUB_ENV
+          "CUDA_MAJOR=$cudaMajor" >> $env:GITHUB_ENV
+          "CUDA_MINOR=$cudaMinor" >> $env:GITHUB_ENV
+          "CUDA_SERIES=$cudaMajor.$cudaMinor" >> $env:GITHUB_ENV
+          "SANITIZED_PATH=$($sanitizedPathParts -join ';')" >> $env:GITHUB_ENV
+
+          Write-Host "Using CUDA root: $cudaPath"
+          Write-Host "CUDA series: $cudaMajor.$cudaMinor"
+
+      - name: Download cuDNN redist
+        shell: pwsh
+        run: |
+          $cudnnVer = "${{ github.event.inputs.cudnn_version }}"
+          $cudaMajor = "$env:CUDA_MAJOR"
+          $url = "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-${cudnnVer}_cuda${cudaMajor}-archive.zip"
+
+          Write-Host "Downloading cuDNN from: $url"
+          $tempZip = "${{ runner.temp }}\cudnn.zip"
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $tempZip -MaximumRetryCount 3 -RetryIntervalSec 10
+          } catch {
+            throw "Failed to download cuDNN from $url"
+          }
+
+          "CUDNN_ZIP=$tempZip" >> $env:GITHUB_ENV
+
+      - name: Install cuDNN into CUDA Toolkit
+        shell: pwsh
+        run: |
+          $extractDir = "${{ runner.temp }}\cudnn-extract"
+          Expand-Archive -Path "$env:CUDNN_ZIP" -DestinationPath $extractDir -Force
+
+          $cudnnDir = Get-ChildItem $extractDir -Directory | Select-Object -First 1
+          if (-not $cudnnDir) {
+            $cudnnDir = Get-Item $extractDir
+          }
+
+          $cudaPath = "$env:CUDA_PATH"
+          if (Test-Path "$($cudnnDir.FullName)\include") {
+            Copy-Item "$($cudnnDir.FullName)\include\*.h" -Destination "$cudaPath\include\" -Force
+          }
+          if (Test-Path "$($cudnnDir.FullName)\lib\x64") {
+            Copy-Item "$($cudnnDir.FullName)\lib\x64\*.lib" -Destination "$cudaPath\lib\x64\" -Force
+          } elseif (Test-Path "$($cudnnDir.FullName)\lib") {
+            Copy-Item "$($cudnnDir.FullName)\lib\*.lib" -Destination "$cudaPath\lib\x64\" -Force
+          }
+          if (Test-Path "$($cudnnDir.FullName)\bin") {
+            Copy-Item "$($cudnnDir.FullName)\bin\*.dll" -Destination "$cudaPath\bin\" -Force
+          }
+
+          Write-Host "Installed cuDNN into: $cudaPath"
+          Get-ChildItem "$cudaPath\bin\cudnn*.dll" | ForEach-Object { Write-Host "  $($_.Name)" }
+
+      - name: Clone ONNX Runtime
+        shell: pwsh
+        run: |
+          $ortRef = "${{ github.event.inputs.ort_ref }}"
+          git clone --depth 1 --branch "$ortRef" https://github.com/microsoft/onnxruntime.git "${{ env.ORT_DIR }}"
+
+          Push-Location "${{ env.ORT_DIR }}"
+          $ortCommit = git rev-parse HEAD
+          git describe --tags --always
+          Pop-Location
+
+          "ORT_COMMIT=$ortCommit" >> $env:GITHUB_ENV
+
+      - name: Pre-download Eigen
+        shell: pwsh
+        run: |
+          $depsFile = "${{ env.ORT_DIR }}\cmake\deps.txt"
+          if (-not (Test-Path $depsFile)) {
+            throw "deps.txt not found at: $depsFile"
+          }
+
+          $eigenLine = Get-Content $depsFile | Where-Object { $_ -match '^eigen;' } | Select-Object -First 1
+          if (-not $eigenLine) {
+            throw "Eigen entry not found in deps.txt"
+          }
+          if ($eigenLine -notmatch '^eigen;(\S+);(\S+)') {
+            throw "Could not parse Eigen line: $eigenLine"
+          }
+
+          $eigenUrl = $Matches[1]
+          $zipPath = "${{ runner.temp }}\eigen.zip"
+          $extractDir = "${{ runner.temp }}\eigen-source"
+
+          Invoke-WebRequest -Uri $eigenUrl -OutFile $zipPath -MaximumRetryCount 3 -RetryIntervalSec 10
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+          $eigenDir = Get-ChildItem $extractDir -Directory | Select-Object -First 1
+          if (-not $eigenDir) {
+            throw "No directory found after extracting Eigen zip"
+          }
+
+          "EIGEN_SOURCE_DIR=$($eigenDir.FullName)" >> $env:GITHUB_ENV
+
+      - name: Pre-download FetchContent dependencies
+        shell: pwsh
+        run: |
+          $deps = @(
+            @{
+              Name = "date"
+              Url = "https://github.com/HowardHinnant/date/archive/refs/tags/v3.0.1.zip"
+            },
+            @{
+              Name = "pytorch_cpuinfo"
+              Url = "https://github.com/pytorch/cpuinfo/archive/ca678952a9a8eaa6de112d154e8e104b22f9ab3f.zip"
+            }
+          )
+
+          foreach ($dep in $deps) {
+            $name = $dep.Name
+            $url = $dep.Url
+            $zipPath = "${{ runner.temp }}\${name}.zip"
+            $extractDir = "${{ runner.temp }}\${name}-source"
+
+            Write-Host "Downloading $name from: $url"
+            curl.exe --retry 10 --retry-delay 15 --retry-all-errors -L -o "$zipPath" "$url"
+            if ($LASTEXITCODE -ne 0) {
+              throw "curl.exe failed for $name with exit code $LASTEXITCODE"
+            }
+
+            Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+            $innerDir = Get-ChildItem $extractDir -Directory | Select-Object -First 1
+            if (-not $innerDir) {
+              throw "No directory found after extracting $name zip"
+            }
+
+            $envVarName = "DEPS_$($name.ToUpper())_DIR"
+            "$envVarName=$($innerDir.FullName)" >> $env:GITHUB_ENV
+          }
+
+      - name: Build ONNX Runtime
+        shell: cmd
+        run: |
+          mklink /J C:\cuda "%CUDA_PATH%" 2>nul || ver>nul
+          if not exist C:\cuda\bin\nvcc.exe (
+            echo ERROR: CUDA junction creation failed or nvcc.exe not found
+            exit /b 1
+          )
+
+          set "CUDA=C:\cuda"
+          set "PATH=%CUDA%\bin;%SANITIZED_PATH%"
+          for /f "tokens=1 delims==" %%A in ('set CUDA_PATH_V 2^>nul') do set "%%A="
+          set "CUDA_PATH=%CUDA%"
+          set "CUDA_HOME=%CUDA%"
+          set "CUDNN_HOME=%CUDA%"
+          set "CUDACXX=%CUDA%\bin\nvcc.exe"
+          set "CUDA_PATH_V%CUDA_MAJOR%_%CUDA_MINOR%=%CUDA%"
+
+          cd /d "${{ github.workspace }}\${{ env.ORT_DIR }}"
+
+          for /f "usebackq delims=" %%I in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find VC\Auxiliary\Build\vcvars64.bat`) do set "VCVARS=%%I"
+          if not defined VCVARS (
+            echo ERROR: vcvars64.bat not found
+            exit /b 1
+          )
+          call "%VCVARS%"
+
+          set CL=/D_SILENCE_ALL_CXX23_DEPRECATION_WARNINGS
+
+          set "ORT_MUTEX=%cd%\include\onnxruntime\core\platform\ort_mutex.h"
+          findstr /C:"#include <chrono>" "%ORT_MUTEX%" >nul || (
+            (echo #include ^<chrono^> && type "%ORT_MUTEX%") > "%ORT_MUTEX%.tmp"
+            move /y "%ORT_MUTEX%.tmp" "%ORT_MUTEX%"
+          )
+
+          echo ============================================
+          echo Building ONNX Runtime
+          echo   ORT ref:  ${{ github.event.inputs.ort_ref }}
+          echo   CUDA:     %CUDA_PATH%
+          echo   cuDNN:    %CUDNN_HOME%
+          echo   PATH head:%CUDA%\bin
+          echo ============================================
+
+          call build.bat ^
+            --use_cuda ^
+            --use_dml ^
+            --config Release ^
+            --parallel ^
+            --skip_tests ^
+            --build_shared_lib ^
+            --cmake_generator Ninja ^
+            --cuda_home "%CUDA%" ^
+            --cudnn_home "%CUDA%" ^
+            --cuda_version "%CUDA_SERIES%" ^
+            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 onnxruntime_USE_PREINSTALLED_EIGEN=ON eigen_SOURCE_PATH=%EIGEN_SOURCE_DIR% CMAKE_CUDA_COMPILER=%CUDA%\bin\nvcc.exe CMAKE_CUDA_FLAGS=-diag-suppress=221 FETCHCONTENT_SOURCE_DIR_date=%DEPS_DATE_DIR% FETCHCONTENT_SOURCE_DIR_pytorch_cpuinfo=%DEPS_PYTORCH_CPUINFO_DIR%
+
+      - name: Collect ONNX Runtime artifacts
+        shell: pwsh
+        run: |
+          $ortOut = "out/onnxruntime"
+          New-Item -ItemType Directory -Force -Path $ortOut | Out-Null
+
+          $buildDir = "${{ env.ORT_DIR }}\build\Windows"
+          $dlls = Get-ChildItem -Path $buildDir -Recurse -Filter "onnxruntime*.dll" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Unique
+
+          if ($dlls.Count -eq 0) {
+            throw "No onnxruntime DLLs found in build output"
+          }
+
+          foreach ($dll in $dlls) {
+            Copy-Item $dll.FullName -Destination $ortOut -Force
+          }
+
+          $metadataDir = "out/build-metadata"
+          New-Item -ItemType Directory -Force -Path $metadataDir | Out-Null
+          $manifest = [ordered]@{
+            ort_ref = "${{ github.event.inputs.ort_ref }}"
+            ort_commit = "$env:ORT_COMMIT"
+            cuda_version = "${{ github.event.inputs.cuda_version }}"
+            cudnn_version = "${{ github.event.inputs.cudnn_version }}"
+            cuda_path = "$env:CUDA_PATH"
+            note = "CUDA 11+ ships independently versioned component DLLs. Names such as curand64_10.dll, cufft64_11.dll and cudart64_12.dll can legitimately come from one CUDA 12.x toolkit."
+            artifacts = @($dlls | ForEach-Object { $_.Name } | Sort-Object)
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content "$metadataDir\build-manifest.json"
+
+      - name: Upload ONNX Runtime artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-selfbuilt-cpu-cuda-dml
+          path: out/onnxruntime/
+          if-no-files-found: error
+
+      - name: Upload build metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-build-metadata
+          path: out/build-metadata/
+          if-no-files-found: error
