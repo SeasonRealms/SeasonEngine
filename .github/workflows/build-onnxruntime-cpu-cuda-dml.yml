@@ -22,7 +22,7 @@ permissions:
 jobs:
   build-onnxruntime:
     runs-on: windows-latest
-    timeout-minutes: 180
+    timeout-minutes: 300
 
     env:
       ORT_DIR: onnxruntime
@@ -39,10 +39,11 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Install Ninja
+      - name: Install Python build dependencies
         shell: pwsh
         run: |
-          pip install ninja
+          python -m pip install --upgrade pip
+          python -m pip install ninja psutil packaging setuptools wheel
           ninja --version
 
       - name: Install CUDA Toolkit
@@ -253,6 +254,9 @@ jobs:
           echo   ORT ref:  ${{ github.event.inputs.ort_ref }}
           echo   CUDA:     %CUDA_PATH%
           echo   cuDNN:    %CUDNN_HOME%
+          echo   Ninja jobs: 4
+          echo   NVCC threads: 4
+          echo   Flash NVCC threads: 2
           echo   PATH head:%CUDA%\bin
           echo ============================================
 
@@ -260,14 +264,16 @@ jobs:
             --use_cuda ^
             --use_dml ^
             --config Release ^
-            --parallel ^
+            --parallel 4 ^
+            --nvcc_threads 4 ^
+            --flash_nvcc_threads 2 ^
             --skip_tests ^
             --build_shared_lib ^
             --cmake_generator Ninja ^
             --cuda_home "%CUDA%" ^
             --cudnn_home "%CUDA%" ^
             --cuda_version "%CUDA_SERIES%" ^
-            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 onnxruntime_USE_PREINSTALLED_EIGEN=ON eigen_SOURCE_PATH=%EIGEN_SOURCE_DIR% CMAKE_CUDA_COMPILER=%CUDA%\bin\nvcc.exe CMAKE_CUDA_FLAGS=-diag-suppress=221 FETCHCONTENT_SOURCE_DIR_date=%DEPS_DATE_DIR% FETCHCONTENT_SOURCE_DIR_pytorch_cpuinfo=%DEPS_PYTORCH_CPUINFO_DIR%
+            --cmake_extra_defines CMAKE_SYSTEM_VERSION=10.0.19041.0 onnxruntime_USE_PREINSTALLED_EIGEN=ON eigen_SOURCE_PATH=%EIGEN_SOURCE_DIR% CMAKE_CUDA_COMPILER=%CUDA%\bin\nvcc.exe "CMAKE_CUDA_FLAGS=-diag-suppress=221 -Wno-deprecated-gpu-targets" FETCHCONTENT_SOURCE_DIR_date=%DEPS_DATE_DIR% FETCHCONTENT_SOURCE_DIR_pytorch_cpuinfo=%DEPS_PYTORCH_CPUINFO_DIR%
 
       - name: Collect ONNX Runtime artifacts
         shell: pwsh
