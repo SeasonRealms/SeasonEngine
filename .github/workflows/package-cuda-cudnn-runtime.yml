@@ -1,0 +1,224 @@
+name: Package CUDA and cuDNN Runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      cuda_version:
+        description: "CUDA Toolkit version"
+        required: true
+        default: "12.8.1"
+      cudnn_version:
+        description: "cuDNN version"
+        required: true
+        default: "9.8.0.87"
+
+permissions:
+  contents: read
+
+jobs:
+  package-runtime:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.22
+        with:
+          cuda: "${{ github.event.inputs.cuda_version }}"
+          method: "network"
+          sub-packages: '["cudart", "cublas", "cufft", "curand", "cusparse", "cusolver", "nvrtc"]'
+
+      - name: Resolve CUDA toolkit
+        shell: pwsh
+        run: |
+          $cudaVersion = "${{ github.event.inputs.cuda_version }}"
+          $versionParts = $cudaVersion.Split(".")
+          if ($versionParts.Count -lt 2) {
+            throw "CUDA version must contain major.minor: $cudaVersion"
+          }
+
+          $cudaMajor = $versionParts[0]
+          $cudaPath = $env:CUDA_PATH
+          if (-not $cudaPath) {
+            $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$cudaVersion"
+          }
+          if (-not (Test-Path $cudaPath)) {
+            throw "CUDA installation not found at: $cudaPath"
+          }
+
+          "CUDA_PATH=$cudaPath" >> $env:GITHUB_ENV
+          "CUDA_MAJOR=$cudaMajor" >> $env:GITHUB_ENV
+
+          Write-Host "Using CUDA root: $cudaPath"
+
+      - name: Download cuDNN redist
+        shell: pwsh
+        run: |
+          $cudnnVer = "${{ github.event.inputs.cudnn_version }}"
+          $cudaMajor = "$env:CUDA_MAJOR"
+          $url = "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-${cudnnVer}_cuda${cudaMajor}-archive.zip"
+
+          Write-Host "Downloading cuDNN from: $url"
+          $tempZip = "${{ runner.temp }}\cudnn.zip"
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $tempZip -MaximumRetryCount 3 -RetryIntervalSec 10
+          } catch {
+            throw "Failed to download cuDNN from $url"
+          }
+
+          "CUDNN_ZIP=$tempZip" >> $env:GITHUB_ENV
+
+      - name: Install cuDNN into CUDA Toolkit
+        shell: pwsh
+        run: |
+          $extractDir = "${{ runner.temp }}\cudnn-extract"
+          Expand-Archive -Path "$env:CUDNN_ZIP" -DestinationPath $extractDir -Force
+
+          $cudnnDir = Get-ChildItem $extractDir -Directory | Select-Object -First 1
+          if (-not $cudnnDir) {
+            $cudnnDir = Get-Item $extractDir
+          }
+
+          $cudaPath = "$env:CUDA_PATH"
+          if (Test-Path "$($cudnnDir.FullName)\include") {
+            Copy-Item "$($cudnnDir.FullName)\include\*.h" -Destination "$cudaPath\include\" -Force
+          }
+          if (Test-Path "$($cudnnDir.FullName)\lib\x64") {
+            Copy-Item "$($cudnnDir.FullName)\lib\x64\*.lib" -Destination "$cudaPath\lib\x64\" -Force
+          } elseif (Test-Path "$($cudnnDir.FullName)\lib") {
+            Copy-Item "$($cudnnDir.FullName)\lib\*.lib" -Destination "$cudaPath\lib\x64\" -Force
+          }
+          if (Test-Path "$($cudnnDir.FullName)\bin") {
+            Copy-Item "$($cudnnDir.FullName)\bin\*.dll" -Destination "$cudaPath\bin\" -Force
+          }
+
+          Write-Host "Installed cuDNN into: $cudaPath"
+
+      - name: Package CUDA and cuDNN runtime DLLs
+        shell: pwsh
+        run: |
+          $cudaBin = "$env:CUDA_PATH\bin"
+          if (-not (Test-Path $cudaBin)) {
+            throw "CUDA bin directory not found: $cudaBin"
+          }
+
+          $cudaOut = "out/cuda-runtime"
+          $cudnnOut = "out/cudnn-runtime"
+          $bundleOut = "out/runtimes/win-x64/native"
+          $metadataOut = "out/runtime-metadata"
+          foreach ($dir in @($cudaOut, $cudnnOut, $bundleOut, $metadataOut)) {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          }
+
+          $cudaPatterns = @(
+            "cudart64_*.dll",
+            "cublas64_*.dll",
+            "cublasLt64_*.dll",
+            "cufft64_*.dll",
+            "curand64_*.dll",
+            "cusolver64_*.dll",
+            "cusparse64_*.dll",
+            "nvrtc64_*.dll",
+            "nvrtc-builtins64_*.dll",
+            "nvJitLink_*.dll"
+          )
+          $cudnnPatterns = @(
+            "cudnn64_*.dll",
+            "cudnn_ops64_*.dll",
+            "cudnn_cnn64_*.dll",
+            "cudnn_adv64_*.dll",
+            "cudnn_engines_precompiled64_*.dll",
+            "cudnn_engines_runtime_compiled64_*.dll",
+            "cudnn_heuristic64_*.dll",
+            "cudnn_graph64_*.dll"
+          )
+
+          function Copy-MatchingDlls {
+            param(
+              [string[]]$Patterns,
+              [string]$Destination
+            )
+
+            $items = @()
+            foreach ($pattern in $Patterns) {
+              $found = Get-ChildItem -Path $cudaBin -Filter $pattern -ErrorAction SilentlyContinue
+              foreach ($dll in $found) {
+                Copy-Item $dll.FullName -Destination $Destination -Force
+                $file = Get-Item (Join-Path $Destination $dll.Name)
+                $version = $file.VersionInfo.FileVersion
+                $items += [pscustomobject]@{
+                  name = $dll.Name
+                  source = $dll.FullName
+                  file_version = $version
+                }
+              }
+            }
+
+            return @($items | Sort-Object name -Unique)
+          }
+
+          $cudaFiles = Copy-MatchingDlls -Patterns $cudaPatterns -Destination $cudaOut
+          $cudnnFiles = Copy-MatchingDlls -Patterns $cudnnPatterns -Destination $cudnnOut
+
+          if ($cudaFiles.Count -eq 0) {
+            throw "No CUDA runtime DLLs were collected from $cudaBin"
+          }
+          if ($cudnnFiles.Count -eq 0) {
+            throw "No cuDNN runtime DLLs were collected from $cudaBin"
+          }
+
+          foreach ($src in @($cudaOut, $cudnnOut)) {
+            Copy-Item "$src\*.dll" -Destination $bundleOut -Force
+          }
+
+          $versionInfoUrl = "https://developer.download.nvidia.com/compute/cuda/repos/windows/x86_64/version_${{ github.event.inputs.cuda_version }}.json"
+          $toolkitManifest = $null
+          try {
+            $toolkitManifest = Invoke-RestMethod -Uri $versionInfoUrl
+          } catch {
+            Write-Warning "Failed to download CUDA component manifest from $versionInfoUrl"
+          }
+
+          $manifest = [ordered]@{
+            cuda_version = "${{ github.event.inputs.cuda_version }}"
+            cudnn_version = "${{ github.event.inputs.cudnn_version }}"
+            cuda_path = "$env:CUDA_PATH"
+            cuda_bin = $cudaBin
+            analysis = "CUDA 11+ versions toolkit components independently. A CUDA 12.x install may legitimately ship cudart64_12.dll, curand64_10.dll and cufft64_11.dll together."
+            validation = "All packaged DLLs are copied only from the selected CUDA_PATH\\bin, avoiding accidental pickup from preinstalled toolkits on the runner."
+            cuda_files = $cudaFiles
+            cudnn_files = $cudnnFiles
+            cuda_component_manifest = $toolkitManifest
+          }
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content "$metadataOut\runtime-manifest.json"
+
+      - name: Upload CUDA runtime DLLs
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-runtime-dlls
+          path: out/cuda-runtime/
+          if-no-files-found: error
+
+      - name: Upload cuDNN runtime DLLs
+        uses: actions/upload-artifact@v4
+        with:
+          name: cudnn-runtime-dlls
+          path: out/cudnn-runtime/
+          if-no-files-found: error
+
+      - name: Upload combined runtime bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-cudnn-runtime-bundle
+          path: out/runtimes/win-x64/native/
+          if-no-files-found: error
+
+      - name: Upload runtime metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-cudnn-runtime-metadata
+          path: out/runtime-metadata/
+          if-no-files-found: error
