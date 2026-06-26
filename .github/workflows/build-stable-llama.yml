@@ -1,0 +1,308 @@
+name: build-stable-llama.ggml
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "CMake build type"
+        required: true
+        type: choice
+        default: "Release"
+        options:
+          - Release
+          - Debug
+      llama_ref:
+        description: "SeasonRealms/llama.cpp tag / branch / commit"
+        required: true
+        default: "master"
+      ggml_ref:
+        description: "SeasonRealms/ggml tag / branch / commit"
+        required: true
+        default: "master"
+      cuda_version:
+        description: "CUDA Toolkit version, aligned with SeasonTTS"
+        required: false
+        default: "12.8.1"
+      cuda_architectures:
+        description: "CUDA architectures for the Windows CUDA build"
+        required: false
+        default: "75-virtual;80-real;86-real;89-real;90-virtual"
+      build_parallel:
+        description: "Parallel build jobs"
+        required: false
+        default: "4"
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_REPO: SeasonRealms/llama.cpp
+  GGML_REPO: SeasonRealms/ggml
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout SeasonRealms/llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LLAMA_REPO }}
+          ref: ${{ github.event.inputs.llama_ref }}
+          submodules: false
+
+      - name: Replace ggml with SeasonRealms fork
+        shell: pwsh
+        run: |
+          if (Test-Path ggml) {
+            Remove-Item ggml -Recurse -Force
+          }
+
+          git clone "https://github.com/${{ env.GGML_REPO }}.git" ggml
+          git -C ggml fetch --depth 1 origin "${{ github.event.inputs.ggml_ref }}"
+          git -C ggml checkout FETCH_HEAD
+          git -C ggml rev-parse HEAD
+
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "${{ github.event.inputs.cuda_version }}"
+
+      - name: Setup MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          Set-Location build
+
+          $cmakeArgs = @(
+            '..',
+            '-G', 'Ninja',
+            '-DCMAKE_C_COMPILER=cl.exe',
+            '-DCMAKE_CXX_COMPILER=cl.exe',
+            "-DCMAKE_BUILD_TYPE=${{ github.event.inputs.configuration }}",
+            '-DCMAKE_CXX_FLAGS=/bigobj',
+            '-DBUILD_SHARED_LIBS=ON',
+            '-DLLAMA_BUILD_TESTS=OFF',
+            '-DLLAMA_BUILD_EXAMPLES=OFF',
+            '-DLLAMA_BUILD_TOOLS=ON',
+            '-DLLAMA_BUILD_SERVER=ON',
+            '-DLLAMA_BUILD_APP=ON',
+            '-DLLAMA_BUILD_UI=OFF',
+            '-DLLAMA_OPENSSL=OFF',
+            '-DGGML_BACKEND_DL=ON',
+            '-DGGML_NATIVE=OFF',
+            '-DGGML_AVX2=ON',
+            '-DGGML_CUDA=ON',
+            '-DGGML_VULKAN=ON',
+            '-DGGML_CUDA_CUB_3DOT2=ON',
+            '-DCMAKE_CUDA_FLAGS=-Xcudafe "--diag_suppress=177" -Xcudafe "--diag_suppress=550"',
+            '-DCMAKE_CUDA_ARCHITECTURES=${{ github.event.inputs.cuda_architectures }}'
+          )
+
+          Write-Host "Running: cmake $($cmakeArgs -join ' ')"
+          & cmake @cmakeArgs
+
+      - name: Build
+        working-directory: build
+        shell: pwsh
+        run: |
+          cmake --build . --config "${{ github.event.inputs.configuration }}" --parallel "${{ github.event.inputs.build_parallel }}"
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          $out = "out/runtimes/win-x64/native/multi-backend"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          $binDir = Join-Path $PWD "build/bin"
+          if (-not (Test-Path $binDir)) {
+            throw "build/bin not found"
+          }
+
+          Copy-Item LICENSE -Destination (Join-Path $out "llama.cpp.txt")
+          if (Test-Path "ggml/LICENSE") {
+            Copy-Item "ggml/LICENSE" -Destination (Join-Path $out "ggml.txt")
+          }
+
+          foreach ($header in @("include/llama.h", "include/llama-cpp.h")) {
+            if (Test-Path $header) {
+              Copy-Item $header -Destination $out -Force
+            }
+          }
+
+          Copy-Item (Join-Path $binDir '*') -Destination $out -Recurse -Force
+
+          Get-ChildItem build -Recurse -File -Include "*.lib", "*.pdb" | ForEach-Object {
+            Copy-Item $_.FullName -Destination (Join-Path $out $_.Name) -Force
+          }
+
+          if (-not $env:CUDA_PATH) {
+            throw "CUDA_PATH is not set after installing CUDA Toolkit."
+          }
+
+          $cudaBin = Join-Path $env:CUDA_PATH "bin"
+          if (-not (Test-Path $cudaBin)) {
+            throw "CUDA bin directory not found: $cudaBin"
+          }
+
+          $cudaLib = Join-Path $env:CUDA_PATH "lib\x64"
+          $cudaSeries = ("${{ github.event.inputs.cuda_version }}" -split '\.')[0..1] -join "."
+          $searchRoots = @($cudaBin)
+          if (Test-Path $cudaLib) {
+            $searchRoots += $cudaLib
+          }
+
+          function Copy-MatchingFiles {
+            param(
+              [string[]]$Roots,
+              [string[]]$Patterns,
+              [string]$Destination
+            )
+
+            $copied = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+            foreach ($root in $Roots) {
+              if (-not (Test-Path $root)) {
+                continue
+              }
+
+              foreach ($pattern in $Patterns) {
+                Get-ChildItem -Path $root -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue | ForEach-Object {
+                  $destPath = Join-Path $Destination $_.Name
+                  Copy-Item $_.FullName -Destination $destPath -Force
+                  $null = $copied.Add($_.Name)
+                }
+              }
+            }
+
+            return @($copied | Sort-Object)
+          }
+
+          function Get-LatestNvidiaRedistArchiveUrl {
+            param(
+              [string]$Component,
+              [string]$Series
+            )
+
+            $indexUrl = "https://developer.download.nvidia.com/compute/cuda/redist/$Component/windows-x86_64/"
+            $response = Invoke-WebRequest -Uri $indexUrl -UseBasicParsing
+            $escapedComponent = [regex]::Escape($Component)
+            $escapedSeries = [regex]::Escape($Series)
+            $regex = [regex]"$escapedComponent-windows-x86_64-($escapedSeries(?:\.\d+)+)-archive\.zip"
+
+            $archives = foreach ($match in $regex.Matches($response.Content)) {
+              [pscustomobject]@{
+                FileName = $match.Value
+                Version  = [version]$match.Groups[1].Value
+              }
+            }
+
+            $latest = $archives | Sort-Object Version -Descending | Select-Object -First 1
+            if ($null -eq $latest) {
+              return $null
+            }
+
+            return $indexUrl + $latest.FileName
+          }
+
+          function Ensure-ComponentDlls {
+            param(
+              [string]$Name,
+              [string[]]$Patterns,
+              [string]$RedistComponent,
+              [bool]$Required
+            )
+
+            $copied = Copy-MatchingFiles -Roots $searchRoots -Patterns $Patterns -Destination $out
+            if ($copied.Count -gt 0) {
+              Write-Host "$Name DLLs copied from installed toolkit: $($copied -join ', ')"
+              return
+            }
+
+            Write-Warning "No local DLLs found for $Name under: $($searchRoots -join '; ')"
+
+            if ([string]::IsNullOrWhiteSpace($RedistComponent)) {
+              if ($Required) {
+                throw "Missing required CUDA DLLs for component '$Name'."
+              }
+              return
+            }
+
+            $archiveUrl = Get-LatestNvidiaRedistArchiveUrl -Component $RedistComponent -Series $cudaSeries
+            if ([string]::IsNullOrWhiteSpace($archiveUrl)) {
+              if ($Required) {
+                throw "No NVIDIA redist archive found for component '$RedistComponent' in CUDA series $cudaSeries."
+              }
+              Write-Warning "No NVIDIA redist archive found for optional component '$RedistComponent' in CUDA series $cudaSeries."
+              return
+            }
+
+            $downloadRoot = Join-Path $env:RUNNER_TEMP "cuda-redist"
+            $extractRoot = Join-Path $downloadRoot "extract-$Name"
+            New-Item -ItemType Directory -Force -Path $downloadRoot | Out-Null
+            if (Test-Path $extractRoot) {
+              Remove-Item -Path $extractRoot -Recurse -Force
+            }
+
+            $archiveName = Split-Path $archiveUrl -Leaf
+            $archivePath = Join-Path $downloadRoot $archiveName
+            Write-Host "Downloading fallback redist for ${Name}: $archiveUrl"
+            Invoke-WebRequest -Uri $archiveUrl -OutFile $archivePath -UseBasicParsing
+            Expand-Archive -Path $archivePath -DestinationPath $extractRoot -Force
+
+            $copied = Copy-MatchingFiles -Roots @($extractRoot) -Patterns $Patterns -Destination $out
+            if ($copied.Count -gt 0) {
+              Write-Host "$Name DLLs copied from NVIDIA redist: $($copied -join ', ')"
+              return
+            }
+
+            if ($Required) {
+              throw "Missing required CUDA DLLs for component '$Name' even after downloading NVIDIA redist archive '$archiveName'."
+            }
+
+            Write-Warning "Optional component '$Name' was not found even after downloading NVIDIA redist archive '$archiveName'."
+          }
+
+          Ensure-ComponentDlls -Name "cudart" -Patterns @("cudart64_*.dll", "cudart*.dll") -RedistComponent "cuda_cudart" -Required $true
+          Ensure-ComponentDlls -Name "cublas" -Patterns @("cublas64_*.dll", "cublas*.dll", "cublasLt64_*.dll", "cublasLt*.dll") -RedistComponent "libcublas" -Required $true
+          Ensure-ComponentDlls -Name "cufft" -Patterns @("cufft64_*.dll", "cufft*.dll") -RedistComponent "libcufft" -Required $false
+          Ensure-ComponentDlls -Name "curand" -Patterns @("curand64_*.dll", "curand*.dll") -RedistComponent "libcurand" -Required $false
+          Ensure-ComponentDlls -Name "cusparse" -Patterns @("cusparse64_*.dll", "cusparse*.dll") -RedistComponent "libcusparse" -Required $false
+          Ensure-ComponentDlls -Name "nvJitLink" -Patterns @("nvJitLink_*.dll", "nvJitLink*.dll") -RedistComponent "libnvjitlink" -Required $false
+          Ensure-ComponentDlls -Name "nvrtc" -Patterns @("nvrtc64_*.dll", "nvrtc*.dll") -RedistComponent "cuda_nvrtc" -Required $false
+          Ensure-ComponentDlls -Name "cudnn" -Patterns @("cudnn*.dll") -RedistComponent "" -Required $false
+
+          $manifest = Join-Path $out "README.txt"
+          @(
+            "LLAMA_REPO: https://github.com/${{ env.LLAMA_REPO }}",
+            "LLAMA_REF: ${{ github.event.inputs.llama_ref }}",
+            "Enabled backends: cpu-avx2, cuda12, vulkan",
+            "Configuration: ${{ github.event.inputs.configuration }}",
+            "GGML_REPO: ${{ env.GGML_REPO }}",
+            "GGML_REF: ${{ github.event.inputs.ggml_ref }}",
+            "CUDA Toolkit version: ${{ github.event.inputs.cuda_version }}",
+            "",
+            "This build packages llama.cpp for win-x64 with shared ggml backends, keeping CPU AVX2, CUDA and Vulkan available from one multi-backend runtime folder.",
+            "",
+            "Artifact contents:"
+          ) | Set-Content -Path $manifest -Encoding ascii
+
+          Get-ChildItem $out -File | Sort-Object Name | ForEach-Object {
+            Add-Content -Path $manifest -Value $_.Name -Encoding ascii
+          }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-llama-win-x64-multi-backend-${{ github.event.inputs.configuration }}
+          path: out/runtimes/win-x64/native/multi-backend/
+          if-no-files-found: error
