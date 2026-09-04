@@ -1,0 +1,85 @@
+@page "/SampleWasm"
+@rendermode InteractiveWebAssembly
+
+@using Season.Platforms.Web
+@using Microsoft.AspNetCore.Components.Web
+@implements IAsyncDisposable
+@inject HttpClient HttpClient
+@inject IJSRuntime JSRuntime
+
+<PageTitle>SampleWasm</PageTitle>
+
+<div class="samplewasm-root">
+    <div class="samplewasm-stage">
+        <canvas id="season-canvas"
+                class="samplewasm-canvas"
+                @ref="_canvasRef">
+        </canvas>
+    </div>
+</div>
+
+@code {
+    ElementReference _canvasRef;
+    bool _started;
+    const string CanvasId = "season-canvas";
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender || _started)
+            return;
+
+        _started = true;
+        var app = new global::Sample.App();
+
+        // _ = HttpClient.PostAsJsonAsync("/SampleApp", 
+        // new 
+        // { 
+        //     sessionId = "sampleweb-mono-assert", 
+        //     runId = "post-fix", 
+        //     hypothesisId = "A", 
+        //     location = "OnAfterRenderAsync",
+        //     msg = "", 
+        //     data = new { firstRender, started = _started, baseAddress = HttpClient.BaseAddress?.ToString() }, 
+        //     ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() 
+        // });
+
+        //         var assetBasePath = HttpClient.BaseAddress?.ToString();
+        //         var webAppType = typeof(WebApp);
+        //         #region debug-point B:webapp-type-loaded
+        //         _ = HttpClient.PostAsJsonAsync("/event", new { sessionId = "sampleweb-mono-assert", runId = "post-fix", hypothesisId = "B", location = "samples/SampleWasm/Pages/Index.razor:OnAfterRenderAsync:webapp-type", msg = "[DEBUG] WebApp type resolved", data = new { typeName = webAppType.FullName, assemblyName = webAppType.Assembly.FullName }, ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+        //         #endregion
+        //         var runMethod = webAppType.GetMethod(nameof(WebApp.Run));
+        //         #region debug-point B:webapp-run-method-loaded
+        //         _ = HttpClient.PostAsJsonAsync("/event", new { sessionId = "sampleweb-mono-assert", runId = "post-fix", hypothesisId = "B", location = "samples/SampleWasm/Pages/Index.razor:OnAfterRenderAsync:webapp-run-method", msg = "[DEBUG] WebApp.Run method resolved", data = new { found = runMethod != null, parameterCount = runMethod?.GetParameters().Length ?? -1 }, ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+        //         #endregion
+        //         #region debug-point B:before-webapp-run
+        //         _ = HttpClient.PostAsJsonAsync("/event", new { sessionId = "sampleweb-mono-assert", runId = "post-fix", hypothesisId = "B", location = "samples/SampleWasm/Pages/Index.razor:OnAfterRenderAsync:before-run", msg = "[DEBUG] About to call WebApp.Run", data = new { canvasId = CanvasId, assetBasePath }, ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+        //         #endregion
+        //         WebApp.DebugProbeSync();
+        //         #region debug-point B:webapp-sync-probe-ok
+        //         _ = HttpClient.PostAsJsonAsync("/event", new { sessionId = "sampleweb-mono-assert", runId = "post-fix", hypothesisId = "B", location = "samples/SampleWasm/Pages/Index.razor:OnAfterRenderAsync:webapp-sync-probe-ok", msg = "[DEBUG] WebApp.DebugProbeSync returned", data = new { ok = true }, ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+        //         #endregion
+        //         await WebApp.DebugProbeAsync();
+        //         #region debug-point B:webapp-async-probe-ok
+        //         _ = HttpClient.PostAsJsonAsync("/event", new { sessionId = "sampleweb-mono-assert", runId = "post-fix", hypothesisId = "B", location = "samples/SampleWasm/Pages/Index.razor:OnAfterRenderAsync:webapp-async-probe-ok", msg = "[DEBUG] WebApp.DebugProbeAsync returned", data = new { ok = true }, ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+        //         #endregion
+        //try
+        //{
+        //await ClassLibrary1.Class1.Test(HttpClient, JSRuntime);
+        await WebApp.Run(app, JSRuntime, HttpClient, CanvasId, "");   //
+         //}
+         //catch (Exception ex)
+         //{
+//             #region debug-point C:webapp-run-throw
+             //_ = HttpClient.PostAsJsonAsync("/event?me=" + ex.ToString(), new { sessionId = "sampleweb-mono-assert", runId = "post-fix", hypothesisId = "C", location = "samples/SampleWasm/Pages/Index.razor:OnAfterRenderAsync:webapp-run-throw", msg = "[DEBUG] WebApp.Run threw managed exception", data = new { type = ex.GetType().FullName, ex.Message, ex.StackTrace }, ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+// # endregion
+//             throw;
+         //}
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        //WebApp.Stop();
+        return ValueTask.CompletedTask;
+    }
+}

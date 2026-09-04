@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk.BlazorWebAssembly">
+
+	<PropertyGroup>
+		<TargetFrameworks>net10.0;net10.0-browser</TargetFrameworks>
+		<DefineConstants>$(DefineConstants);BROWSER;</DefineConstants>
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+		<LangVersion>preview</LangVersion>
+		<RootNamespace>SampleWasm</RootNamespace>
+		<NoDefaultLaunchSettingsFile>true</NoDefaultLaunchSettingsFile>
+		<StaticWebAssetProjectMode>Default</StaticWebAssetProjectMode>
+		<BlazorDisableThrowNavigationException>true</BlazorDisableThrowNavigationException>
+		<WasmEnableSIMD>true</WasmEnableSIMD>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly" Version="10.0.9" />
+		<PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.DevServer" Version="10.0.9" PrivateAssets="all" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\..\Season\Season.csproj" />
+		
+		<Compile Include="..\Engine\App.cs" Link="App.cs" />
+		<Compile Include="..\Engine\GlobalUsings.cs" Link="GlobalUsings.cs" />
+		<Compile Include="..\Engine\AI\*.cs" />
+		<Compile Include="..\Engine\Panels\*.cs" />
+		<Compile Include="..\Engine\Management\*.cs" />
+
+		<Content Include="..\Engine\Resources\Raw\Assets\*.*">
+		  <TargetPath>wwwroot\Assets\%(Filename)%(Extension)</TargetPath>
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		  <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+	  </Content>
+	</ItemGroup>
+
+	<!--<ItemGroup>
+	  <Reference Include="Season">
+	    <HintPath>..\..\src\bin\Debug\net10.0-browser\Season.dll</HintPath>
+	  </Reference>
+	</ItemGroup>-->
+
+</Project>
