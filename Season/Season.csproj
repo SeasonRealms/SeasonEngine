@@ -1,0 +1,228 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<PackageId>SeasonEngine</PackageId>
+		<Version>0.2.0</Version>
+		<Authors>SeasonRealms</Authors>
+		<Description>A cross-platform C# graphics engine and application framework for building real-time 2D and 3D apps with a unified API</Description>
+		<Product>SeasonEngine</Product>
+		<Copyright>Copyright © 2026</Copyright>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+
+		<PackageProjectUrl>https://github.com/SeasonRealms/SeasonEngine</PackageProjectUrl>
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<RepositoryUrl>https://github.com/SeasonRealms/SeasonEngine</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+
+		<IncludeSymbols>true</IncludeSymbols>
+		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+		<SingleProject>true</SingleProject>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+		<LangVersion>preview</LangVersion>
+
+		<TargetFrameworks>net10.0-android;net10.0-ios;net10.0-maccatalyst;net10.0;net10.0-browser</TargetFrameworks>
+		<TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net10.0-windows10.0.19041.0</TargetFrameworks>
+
+		<IsAndroid Condition="$(TargetFramework.Contains('android'))">true</IsAndroid>
+		<IsIOS Condition="$(TargetFramework.Contains('ios'))">true</IsIOS>
+		<IsMacCatalyst Condition="$(TargetFramework.Contains('maccatalyst'))">true</IsMacCatalyst>
+		<IsWindows Condition="$(TargetFramework.Contains('windows'))">true</IsWindows>
+
+		<IsLinux Condition="'$(TargetFramework)' == 'net10.0'">true</IsLinux>
+		<IsBrowser Condition="$(TargetFramework.Contains('browser'))">true</IsBrowser>
+		
+		<IsApple Condition="'$(IsIOS)' == 'true' or '$(IsMacCatalyst)' == 'true'">true</IsApple>
+		<IsUnixLike Condition="'$(IsAndroid)' == 'true' or '$(IsLinux)' == 'true'">true</IsUnixLike>
+
+		<UseMaui Condition="'$(IsBrowser)' != 'true' And '$(TargetFramework)' != 'net10.0'">true</UseMaui>
+
+		<SupportedOSPlatformVersion Condition="'$(IsIOS)' == 'true'">15.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="'$(IsMacCatalyst)' == 'true'">15.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="'$(IsAndroid)' == 'true'">33.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="'$(IsWindows)' == 'true'">10.0.17763.0</SupportedOSPlatformVersion>
+		<TargetPlatformMinVersion Condition="'$(IsWindows)' == 'true'">10.0.17763.0</TargetPlatformMinVersion>
+
+		<DefineConstants Condition="'$(IsLinux)' == 'true'">$(DefineConstants);LINUX;</DefineConstants>
+		<DefineConstants Condition="'$(IsBrowser)' == 'true'">$(DefineConstants);BROWSER;</DefineConstants>
+	</PropertyGroup>
+
+	<ItemGroup>
+	  <AndroidResource Remove="Rendering\Effects\Ddgi\**" />
+	  <Compile Remove="Rendering\Effects\Ddgi\**" />
+	  <EmbeddedResource Remove="Rendering\Effects\Ddgi\**" />
+	  <MauiCss Remove="Rendering\Effects\Ddgi\**" />
+	  <MauiXaml Remove="Rendering\Effects\Ddgi\**" />
+	  <None Remove="Rendering\Effects\Ddgi\**" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="SeasonMSDF" Version="0.2.0" />
+		<PackageReference Include="SharpGLTF.Core" Version="1.0.6" />
+		<PackageReference Include="SharpGLTF.Toolkit" Version="1.0.6" />
+
+		<None Include="README.md" Pack="true" PackagePath="\" />
+	</ItemGroup>
+
+	<ItemGroup Condition="'$(IsWindows)' == 'true' or '$(IsIOS)' == 'true'">		
+		<PackageReference Include="Xamarin.Build.Download" Version="0.11.4" />
+	</ItemGroup>
+
+	<ItemGroup Condition="'$(IsWindows)' == 'true'">
+		<Content Include="Platforms\Windows\runtimes\**">
+			<Link>runtimes\%(RecursiveDir)%(Filename)%(Extension)</Link>
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<PackageReference Include="System.Drawing.Common" Version="10.0.9" />
+		<PackageReference Include="Silk.NET.Direct3D12" Version="2.23.0" />
+		<PackageReference Include="Silk.NET.Direct3D.Compilers" Version="2.23.0" />
+	</ItemGroup>
+
+	<ItemGroup Condition="'$(IsLinux)' == 'true'">
+		<PackageReference Include="GtkSharp" Version="3.24.24.117-develop" />
+		<PackageReference Include="System.Drawing.Common" Version="10.0.9" />
+		<!-- Linux native assets (libSDL3.so, libglslang.so).
+		     Both are deployed to runtimes/linux-<arch>/native/ (canonical
+		     NuGet-style layout). At runtime LinuxNativeLibraryResolver
+		     (in Platforms/Linux) resolves them via SetDllImportResolver +
+		     ModuleInitializer — necessary because .NET does NOT search
+		     runtimes/<rid>/native/ for ProjectReference consumers (only
+		     NuGet packages register that path in .deps.json). -->
+		<Content Include="Platforms/Linux/runtimes/linux-*/native/*.so" Condition="'$(IsLinux)' == 'true'">
+			<Link>runtimes\%(RecursiveDir)%(Filename)%(Extension)</Link>
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<Pack>true</Pack>
+			<PackagePath>runtimes/%(RecursiveDir)%(Filename)%(Extension)</PackagePath>
+		</Content>
+	</ItemGroup>
+
+	<ItemGroup Condition="'$(IsUnixLike)' == 'true'">
+		<PackageReference Include="Silk.NET.Vulkan" Version="2.23.0" />
+		<PackageReference Include="Silk.NET.Vulkan.Extensions.KHR" Version="2.23.0" />
+		<PackageReference Include="Silk.NET.Vulkan.Extensions.EXT" Version="2.23.0" />
+	</ItemGroup>
+
+	<ItemGroup Condition="'$(TargetFramework)' == 'net10.0' or '$(TargetFramework)' == 'net10.0-browser'">
+		<PackageReference Include="Microsoft.JSInterop" Version="10.0.9" />
+	</ItemGroup>
+
+	<ItemGroup Condition="'$(IsBrowser)' == 'true' or '$(TargetFramework)' == 'net10.0'">
+		<Content Include="Platforms\Web\js\**\*.js">
+			<TargetPath>wwwroot\js\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+			<Link>wwwroot\js\%(RecursiveDir)%(Filename)%(Extension)</Link>
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<Pack>true</Pack>
+			<PackagePath>contentFiles/any/any/wwwroot/js/%(RecursiveDir)%(Filename)%(Extension)</PackagePath>
+		</Content>
+	</ItemGroup>
+
+	<ItemGroup Condition="'$(IsBrowser)' != 'true'">
+		<PackageReference Include="System.Runtime.Caching" Version="10.0.9" />
+	</ItemGroup>	
+
+	<ItemGroup Condition="'$(IsAndroid)' == 'true'">
+		<AndroidNativeLibrary Include="Platforms\Android\libs\arm64-v8a\libglslang.so" />
+		<PackageReference Include="Xamarin.Android.Google.BillingClient">
+			<Version>8.0.0</Version>
+		</PackageReference>
+		<PackageReference Include="Xamarin.GooglePlayServices.Ads.Lite">
+			<Version>124.0.0.3</Version>
+		</PackageReference>
+	</ItemGroup>
+	
+	<ItemGroup Condition="'$(IsMacCatalyst)' == 'true'">
+	</ItemGroup>
+
+	<ItemGroup Condition="'$(IsIOS)' == 'true'">
+		<!-- <PackageReference Include="Jc.GMA.iOS" Version="12.7.1" />
+		<PackageReference Include="Jc.UMP.iOS" Version="2.7.5" /> -->
+	</ItemGroup>
+
+	<ItemGroup>
+	  <Folder Include="Entities\" />
+	</ItemGroup>
+
+	<Target Condition="'$(IsApple)' == 'true'" Name="LinkWithSwift" DependsOnTargets="_ParseBundlerArguments;_DetectSdkLocations" BeforeTargets="_LinkNativeExecutable">
+		<PropertyGroup>
+			<_SwiftPlatform Condition="$(RuntimeIdentifier.StartsWith('iossimulator-'))">iphonesimulator</_SwiftPlatform>
+			<_SwiftPlatform Condition="$(RuntimeIdentifier.StartsWith('ios-'))">iphoneos</_SwiftPlatform>
+		</PropertyGroup>
+		<ItemGroup>
+			<_CustomLinkFlags Include="-L" />
+			<_CustomLinkFlags Include="/usr/lib/swift" />
+			<_CustomLinkFlags Include="-L" />
+			<_CustomLinkFlags Include="$(_SdkDevPath)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(_SwiftPlatform)" />
+			<_CustomLinkFlags Include="-Wl,-rpath" />
+			<_CustomLinkFlags Include="-Wl,/usr/lib/swift" />
+		</ItemGroup>
+	</Target>
+
+	<Target Name="IncludeLinuxFilesForLinuxTarget" BeforeTargets="BeforeCompile" Condition="'$(IsLinux)' == 'true'">
+		<ItemGroup>
+			<Compile Include="Platforms\Linux\**\*.cs" />
+		</ItemGroup>
+	</Target>
+
+	<Target Name="ExcludeLinuxFilesForNonLinuxTargets" AfterTargets="BeforeCompile" Condition="'$(IsLinux)' != 'true'">
+		<ItemGroup>
+			<Compile Remove="Platforms\Linux\**\*.cs" />
+		</ItemGroup>
+	</Target>
+
+	<Target Name="ExcludeWindowsFilesForNonWindowsTargets" AfterTargets="BeforeCompile" Condition="'$(IsWindows)' != 'true'">
+		<ItemGroup>
+			<Compile Remove="Platforms\Windows\**\*.cs" />
+		</ItemGroup>
+	</Target>
+
+	<Target Name="ExcludeAndroidFilesForNonAndroidTargets" AfterTargets="BeforeCompile" Condition="'$(IsAndroid)' != 'true'">
+		<ItemGroup>
+			<Compile Remove="Platforms\Android\**\*.cs" />
+		</ItemGroup>
+	</Target>
+
+	<Target Name="ExcludeiOSFilesForNoniOSTargets" AfterTargets="BeforeCompile" Condition="'$(IsIOS)' != 'true'">
+		<ItemGroup>
+			<Compile Remove="Platforms\iOS\**\*.cs" />
+		</ItemGroup>
+	</Target>
+
+	<Target Name="ExcludeMacCatalystFilesForNonMacCatalystTargets" AfterTargets="BeforeCompile" Condition="'$(IsMacCatalyst)' != 'true'">
+		<ItemGroup>
+			<Compile Remove="Platforms\MacCatalyst\**\*.cs" />
+		</ItemGroup>
+	</Target>
+
+	<Target Name="IncludeSharedAppleFiles" BeforeTargets="BeforeCompile" Condition="'$(IsApple)' == 'true'">
+		<ItemGroup>
+			<Compile Include="Platforms\Shared\Apple\**\*.cs" />
+		</ItemGroup>
+	</Target>
+
+	<Target Name="IncludeSharedUnixFiles" BeforeTargets="BeforeCompile" Condition="'$(IsUnixLike)' == 'true'">
+		<ItemGroup>
+			<Compile Include="Platforms\Shared\LinuxAndroid\**\*.cs" />
+		</ItemGroup>
+	</Target>
+
+	<Target Name="ExcludeSharedFiles" AfterTargets="BeforeCompile">
+		<ItemGroup Condition="'$(IsApple)' != 'true'">
+			<Compile Remove="Platforms\Shared\Apple\**\*.cs" />
+		</ItemGroup>
+
+		<ItemGroup Condition="'$(IsUnixLike)' != 'true'">
+			<Compile Remove="Platforms\Shared\LinuxAndroid\**\*.cs" />
+		</ItemGroup>
+
+	</Target>
+
+	<Target Name="IncludeWebFilesForBrowserTarget" BeforeTargets="BeforeCompile" Condition="'$(IsBrowser)' == 'true' or '$(TargetFramework)' == 'net10.0'">
+		<ItemGroup>
+			<Compile Include="Platforms\Web\**\*.cs" />
+		</ItemGroup>
+	</Target>
+
+</Project>
