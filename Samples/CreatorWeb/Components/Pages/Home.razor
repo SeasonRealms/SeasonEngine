@@ -1,0 +1,14 @@
+@page "/"
+
+@* <PageTitle>Home</PageTitle>
+
+<div style="display:flex; align-items:center;">
+    <h1 style="margin:0;">SampleWasm</h1>
+    <a href="javascript:void(0)"
+       onclick="sampleWebHome.requestFullscreenById('samplewasm-fullscreen-host')"
+       style="margin-left:50px;">全屏</a>
+</div> *@
+
+<div id="samplewasm-fullscreen-host" style="width:100%; height:100%;">
+    <SampleWasm.Pages.Index />
+</div>
