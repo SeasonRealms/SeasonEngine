@@ -10,6 +10,8 @@ This repository is now organized around three top-level areas:
 - `Apps/` - official applications and reference runtimes built on top of the engine
 - `Samples/` - smaller framework examples, including the `Creator` series
 
+<img src="Apps/Sun shine.jpg" width="750" alt="Sun shine" />
+
 The goal of the project is not just to provide a rendering wrapper, but to make engine architecture understandable while still supporting real scene composition, post effects, compute workflows, interaction, and cross-platform execution.
 
 Github: https://github.com/SeasonRealms/SeasonEngine
@@ -38,6 +40,8 @@ The core library provides:
 If you want to understand the reusable engine layer, start here:
 
 - [Core library README](Season/README.md)
+
+<img src="Apps/Debug mode.jpg" width="750" alt="Debug mode" />
 
 ### `Apps/`
 
@@ -74,6 +78,8 @@ Current sample applications include:
 - `Samples/CreatorWeb`
 
 These projects are intended to be easier onboarding and framework examples, rather than the main reference runtime used to validate the full graphics stack.
+
+<img src="Apps/Global illumination.jpg" width="750" alt="Global illumination" />
 
 ## Open Source Foundation, Commercial AI Layer
 
@@ -128,6 +134,8 @@ Planned store entry:
 - Windows Store application page: coming soon
 
 This model aims to keep the ecosystem technically open at the foundation level while still allowing a practical commercial offering at the application layer.
+
+<img src="Apps/Island picker.jpg" width="750" alt="Island picker" />
 
 ## Why SeasonEngine Exists
 
@@ -232,6 +240,8 @@ It is best understood as a reference app and regression target, not as a beginne
 By contrast, the `Creator` series under `Samples/` is better suited for application-framework examples and onboarding.
 
 The model and font assets used in the demo scene are third-party works; their upstream sources and licenses are recorded in [MODEL_FONT_SOURCES_AND_LICENSES.md](Apps/Engine/Resources/Raw/Assets/MODEL_FONT_SOURCES_AND_LICENSES.md).
+
+<img src="Apps/Image generation.jpg" width="750" alt="Image generation" />
 
 ## Getting Started
 
