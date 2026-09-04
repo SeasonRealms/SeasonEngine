@@ -1,0 +1,121 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<ApplicationTitle>SeasonEngine</ApplicationTitle>
+		<ApplicationId>com.season.engine</ApplicationId>
+		<ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
+		<ApplicationVersion>1</ApplicationVersion>
+
+		<OutputType>Exe</OutputType>
+		<RootNamespace>Engine</RootNamespace>
+		<UseMaui>true</UseMaui>
+		<SingleProject>true</SingleProject>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+		<AndroidPackageFormat>apk</AndroidPackageFormat>
+		<LangVersion>preview</LangVersion>
+		<WindowsAppSDKSelfContained>True</WindowsAppSDKSelfContained>
+
+		<IsAndroid Condition="$(TargetFramework.Contains('android'))">true</IsAndroid>
+		<IsIOS Condition="$(TargetFramework.Contains('ios'))">true</IsIOS>
+		<IsMacCatalyst Condition="$(TargetFramework.Contains('maccatalyst'))">true</IsMacCatalyst>
+		<IsWindows Condition="$(TargetFramework.Contains('windows'))">true</IsWindows>
+		<IsLinux Condition="'$(TargetFramework)' == 'net10.0'">true</IsLinux>
+
+		<TargetFrameworks>net10.0;net10.0-android;net10.0-ios;net10.0-maccatalyst</TargetFrameworks>
+		<RuntimeIdentifiers Condition="'$(IsLinux)' == 'true'">linux-x64;linux-arm64</RuntimeIdentifiers>
+		<TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net10.0-windows10.0.19041.0</TargetFrameworks>
+
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">17.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'maccatalyst'">17.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">33.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.19041.0</SupportedOSPlatformVersion>
+		<TargetPlatformMinVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.19041.0</TargetPlatformMinVersion>
+
+		<SelfContained Condition="'$(IsWindows)' == 'true'">True</SelfContained>
+		<WindowsPackageType>MSIX</WindowsPackageType>
+		<!--<WindowsPackageType>None</WindowsPackageType>-->
+
+		<DefineConstants Condition="'$(IsLinux)' == 'true'">$(DefineConstants);LINUX;</DefineConstants>
+
+		<DefaultLanguage>en-us</DefaultLanguage>
+
+		<GenerateAppInstallerFile>False</GenerateAppInstallerFile>
+
+		<AppxPackageSigningEnabled>False</AppxPackageSigningEnabled>
+
+		<AppxPackageSigningTimestampDigestAlgorithm>SHA256</AppxPackageSigningTimestampDigestAlgorithm>
+
+		<AppxAutoIncrementPackageRevision>True</AppxAutoIncrementPackageRevision>
+
+		<AppxSymbolPackageEnabled>True</AppxSymbolPackageEnabled>
+
+		<GenerateTestArtifacts>False</GenerateTestArtifacts>
+
+		<GenerateTemporaryStoreCertificate>True</GenerateTemporaryStoreCertificate>
+
+		<HoursBetweenUpdateChecks>0</HoursBetweenUpdateChecks>
+	</PropertyGroup>
+
+	<PropertyGroup Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+		<RuntimeIdentifiers Condition="'$(IsIOS)' == 'true' And '$(RuntimeIdentifier)' == ''">iossimulator-arm64;iossimulator-x64;ios-arm64</RuntimeIdentifiers>
+		<RuntimeIdentifiers Condition="'$(IsIOS)' == 'true' And '$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</RuntimeIdentifiers>
+		<RuntimeIdentifiers Condition="'$(IsMacCatalyst)' == 'true'">maccatalyst-arm64;maccatalyst-x64</RuntimeIdentifiers>
+	</PropertyGroup>
+	
+	<PropertyGroup Condition="'$(IsWindows)' == 'true'">
+		<GenerateAppInstallerFile>False</GenerateAppInstallerFile>
+		<AppxPackageSigningEnabled>False</AppxPackageSigningEnabled>
+		<AppxPackageSigningTimestampDigestAlgorithm>SHA256</AppxPackageSigningTimestampDigestAlgorithm>
+		<AppxAutoIncrementPackageRevision>True</AppxAutoIncrementPackageRevision>
+		<AppxSymbolPackageEnabled>False</AppxSymbolPackageEnabled>
+		<GenerateTestArtifacts>True</GenerateTestArtifacts>
+		<HoursBetweenUpdateChecks>0</HoursBetweenUpdateChecks>
+		<GenerateTemporaryStoreCertificate>True</GenerateTemporaryStoreCertificate>
+	</PropertyGroup>
+
+	<PropertyGroup Condition="'$(TargetFramework)'=='net10.0-ios'">
+	  <ProvisioningType>automatic</ProvisioningType>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<MauiIcon Include="Resources\AppIcon\appicon.svg" Color="#ffffff" />
+		<MauiSplashScreen Include="Resources\Splash\splash.svg" Color="white" BaseSize="128,128" />
+		<MauiAsset Include="Resources\Raw\**" LogicalName="%(RecursiveDir)%(Filename)%(Extension)" />
+
+		<ProjectReference Include="..\..\Season\Season.csproj" />
+		<!--<ProjectReference Include="..\..\SeasonAI\SeasonAI.csproj" />-->
+		<!--<PackageReference Include="SeasonEngine" Version="0.0.2" />-->
+
+	</ItemGroup>
+	
+	<ItemGroup Condition="'$(IsWindows)' == 'true' or '$(IsLinux)' == 'true'">
+		<Content Include="Resources\Raw\**" CopyToOutputDirectory="PreserveNewest" Link="%(RecursiveDir)%(Filename)%(Extension)" />
+	</ItemGroup>
+
+	<Target Name="IncludeLinuxFilesForLinuxTarget" BeforeTargets="BeforeCompile" Condition="'$(IsLinux)' == 'true'">
+		<ItemGroup>
+			<Compile Include="Platforms\Linux\**\*.cs" />
+		</ItemGroup>
+	</Target>
+
+	<Target Name="ExcludeLinuxFilesForNonLinuxTargets" AfterTargets="BeforeCompile" Condition="'$(IsLinux)' != 'true'">
+		<ItemGroup>
+			<Compile Remove="Platforms\Linux\**\*.cs" />
+		</ItemGroup>
+	</Target>
+
+	<!-- cudacudnn-runtime -->
+	<!--<Target Name="ReplaceWindowsAppSdkOnnxRuntime" AfterTargets="CopyFilesToOutputDirectory" Condition="'$(IsWindows)' == 'true'">
+		<ItemGroup>
+			<_SelfBuiltOrtDlls Include="..\..\..\cudacudnn-runtime\win-x64\native\*.dll" />
+		</ItemGroup>
+		<Copy SourceFiles="@(_SelfBuiltOrtDlls)" DestinationFolder="$(OutDir)" OverwriteReadOnlyFiles="true" SkipUnchangedFiles="false" />
+	</Target>-->
+
+	<ItemGroup>
+	  <Content Update="Resources\Raw\Assets\NotoSansMono-VariableFont.ttf" Link="Assets\NotoSansMono-VariableFont.ttf" />
+	</ItemGroup>
+
+</Project>
