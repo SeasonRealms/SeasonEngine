@@ -1,0 +1,16 @@
+{
+  "profiles": {
+    "Windows Project": {
+      "commandName": "Project",
+      "nativeDebugging": true
+    },
+    "Windows MsixPackage": {
+      "commandName": "MsixPackage",
+      "nativeDebugging": true
+    },
+    "WSL": {
+      "commandName": "WSL2",
+      "distributionName": ""
+    }
+  }
+}
