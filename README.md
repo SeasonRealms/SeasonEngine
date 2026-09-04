@@ -266,7 +266,7 @@ dotnet add package SeasonEngine
 Or reference the project directly in this repository:
 
 ```xml
-<ProjectReference Include="..\Src\Season.csproj" />
+<ProjectReference Include="..\Season\Season.csproj" />
 ```
 
 Minimal app:
