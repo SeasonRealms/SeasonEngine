@@ -1,0 +1,42 @@
+@page "/SampleWasm"
+@rendermode InteractiveWebAssembly
+
+@using Season.Platforms.Web
+@using Microsoft.AspNetCore.Components.Web
+@implements IAsyncDisposable
+@inject HttpClient HttpClient
+@inject IJSRuntime JSRuntime
+
+<PageTitle>SampleWasm</PageTitle>
+
+<div class="samplewasm-root">
+    <div class="samplewasm-stage">
+        <canvas id="season-canvas"
+                class="samplewasm-canvas"
+                @ref="_canvasRef">
+        </canvas>
+    </div>
+</div>
+
+@code {
+    ElementReference _canvasRef;
+    bool _started;
+    const string CanvasId = "season-canvas";
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender || _started)
+            return;
+
+        _started = true;
+        var app = new global::Creator.App();
+
+        await WebApp.Run(app, JSRuntime, HttpClient, CanvasId, "");
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        //WebApp.Stop();
+        return ValueTask.CompletedTask;
+    }
+}
