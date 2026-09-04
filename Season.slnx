@@ -1,0 +1,17 @@
+<Solution>
+  <Folder Name="/Apps/">
+    <Project Path="Apps/Engine/Engine.csproj">
+      <Deploy Solution="Debug|*" />
+    </Project>
+    <Project Path="Apps/EngineWasm/EngineWasm.csproj" />
+    <Project Path="Apps/EngineWeb/EngineWeb.csproj" />
+  </Folder>
+  <Folder Name="/Samples/">
+    <Project Path="Samples/Creator/Creator.csproj">
+      <Deploy Solution="Debug|*" />
+    </Project>
+    <Project Path="Samples/CreatorWasm/CreatorWasm.csproj" />
+    <Project Path="Samples/CreatorWeb/CreatorWeb.csproj" />
+  </Folder>
+  <Project Path="Season/Season.csproj" />
+</Solution>

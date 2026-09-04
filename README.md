@@ -1,213 +1,346 @@
 # SeasonEngine
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![.NET](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
+SeasonEngine is a cross-platform C# graphics engine and application framework for building real-time 2D and 3D apps with a unified API.
 
-A cross-platform application framework built for understanding and rapid development.
+**A cross-platform C# engine for people who want real-time graphics architecture to stay visible, understandable, and usable.**
 
-## Overview
+This repository is now organized around three top-level areas:
 
-SeasonEngine provides a unified abstraction layer for building applications that run seamlessly across **Windows**, **Linux**, **macOS**, **Android**, and **iOS**. It handles platform-specific implementations behind clean interfaces, allowing developers to focus on application logic rather than platform differences.
+- `Season/` - the reusable `SeasonEngine` core library
+- `Apps/` - official applications and reference runtimes built on top of the engine
+- `Samples/` - smaller framework examples, including the `Creator` series
 
-## Supported Platforms
+The goal of the project is not just to provide a rendering wrapper, but to make engine architecture understandable while still supporting real scene composition, post effects, compute workflows, interaction, and cross-platform execution.
 
-| Platform | Status | Entry Point |
-|----------|--------|-------------|
-| Windows | ✅ Supported | `WindowsApp.Run()` |
-| Linux | ✅ Supported | `LinuxApp.Run()` |
-| macOS (Catalyst) | ✅ Supported | `MacCatalystApp.Run()` |
-| Android | ✅ Supported | `AndroidApp.Run()` |
-| iOS | ✅ Supported | `iOSApp.Run()` |
+Github: https://github.com/SeasonRealms/SeasonEngine
 
-## Architecture
+Demo: https://apps.microsoft.com/detail/9NHDQ4F67MHM
 
+## Where This Sits
+
+SeasonEngine is code-first and editor-free by design. There is no scene editor to learn and no project format to adopt: you declare `Sprite2D`, `Model`, and `InstancedModel` in ordinary C#, and `AddControl` / `AddPanel` define load order and layering for 2D and 3D alike. You never call `Draw` by hand, but update order stays yours to override.
+
+What makes it different from the nearest starting point is the renderer. PBR materials, glTF animation, shadows, and global illumination are the baseline rather than an upgrade path, and there is one implementation per domain — glTF for animation, MSDF for text, one graphics API per platform, no OpenGL or WebGL fallback. Platform divergence is confined to `DeviceServices`, so code and visual results stay consistent everywhere.
+
+## What This Repository Contains
+
+### `Season/`
+
+The core library provides:
+
+- a `BaseApp` application host
+- a recursive `Panel` tree for scene and UI composition
+- drawable `Control` types for 2D, 3D, text, models, shapes, and textures
+- platform backends for desktop, mobile, and web
+- a fixed render-pass pipeline with optional shadow, post, and compute stages
+- asynchronous resource loading for controls and panels
+
+If you want to understand the reusable engine layer, start here:
+
+- [Core library README](Season/README.md)
+
+### `Apps/`
+
+`Apps/` contains the official higher-level applications built on top of `SeasonEngine`.
+
+Current applications include:
+
+- `Apps/Engine`
+- `Apps/EngineWasm`
+- `Apps/EngineWeb`
+
+`Engine` is not a minimal demo. It is the reference application used to validate how the core library behaves when multiple systems run together in one app:
+
+- real scene composition
+- lighting and atmosphere
+- compute-driven rendering effects
+- picking and collision
+- movement and camera interaction
+- debug views
+- early editor-style workflows
+
+If you want to see how the engine is used in practice, start here:
+
+- [Engine application README](Apps/Engine/README.md)
+
+### `Samples/`
+
+`Samples/` remains the home for lighter application-framework examples.
+
+Current sample applications include:
+
+- `Samples/Creator`
+- `Samples/CreatorWasm`
+- `Samples/CreatorWeb`
+
+These projects are intended to be easier onboarding and framework examples, rather than the main reference runtime used to validate the full graphics stack.
+
+## Open Source Foundation, Commercial AI Layer
+
+The Season project is intentionally split between an open source foundation and a commercial application layer.
+
+### MIT Open Source Foundation
+
+The following parts are intended to stay broadly usable as MIT-licensed building blocks:
+
+- `Season/` as the core graphics engine and application framework
+- the `Apps/Engine` reference runtime used to demonstrate the engine in practice
+- foundational Season AI libraries such as `SeasonAudio`, `SeasonGGML`, `SeasonONNX`, `SeasonTTS`, `SeasonVision`, and related lower-level components
+
+These layers are about capabilities: rendering, runtime architecture, inference backends, and reusable AI primitives.
+
+### SeasonAI As The Commercial Layer
+
+`SeasonAI` sits above those foundations as a product-oriented orchestration layer.
+
+It is not primarily a new inference backend. Its value is in making local AI practical inside a real application:
+
+- task-oriented UI panels
+- model loading and backend selection
+- generation result handling
+- media export and workflow integration
+- the heavy UI scheduling and state management needed by local AI apps
+
+That is the layer intended to support commercial monetization.
+
+In other words:
+
+- the engine and foundational AI libraries remain open and reusable
+- `SeasonAI` is where the productized local-AI application experience is assembled
+
+### How It Connects Today
+
+The current bridge happens inside `Apps/Engine`, where the app can host `Season.AI.Panels.AIButton` and `Season.AI.Panels.AIPanel` directly in the engine UI.
+
+That integration lets the reference runtime demonstrate how a Season-based application can surface AI features without forcing the engine itself to become a closed product.
+
+### Commercial Plan
+
+The planned commercial path is:
+
+- open source builds continue to expose the engine and foundational libraries
+- the open source `AIPanel` surface can act as a notice, preview, and upgrade entry point
+- store builds of the SeasonEngine application can offer in-app purchase unlocking for SeasonAI features
+- licensed customers can obtain the commercial SeasonAI source package under its own license terms
+
+Planned store entry:
+
+- Windows Store application page: coming soon
+
+This model aims to keep the ecosystem technically open at the foundation level while still allowing a practical commercial offering at the application layer.
+
+## Why SeasonEngine Exists
+
+SeasonEngine is shaped by a few deliberate choices:
+
+- **Explicit structure over hidden automation**  
+  Lifecycle, loading, render passes, and ownership boundaries are visible in code.
+
+- **Shared engine contracts over ad hoc helpers**  
+  `BaseApp`, `Panel`, `IControl`, `IGraphics`, and `FrameSchedule` form the core model.
+
+- **Cross-platform consistency without pretending all backends are identical**  
+  The app-facing model stays shared, while D3D12, Vulkan, Metal, and web paths remain free to differ internally.
+
+- **Real runtime concerns treated as first-class architecture**  
+  Loading, resize, off-screen targets, synchronization, and feature fallback are part of the design, not patchwork.
+
+This makes the project feel closer to a small real-time runtime than to a loose collection of rendering utilities.
+
+## Core Capabilities
+
+- Cross-platform app bootstrap for Windows, Linux, Android, iOS, Mac Catalyst, and Web
+- 2D and 3D rendering through one composition model
+- glTF model loading, animation support, instancing, and picking helpers
+- MSDF-based text rendering
+- scene camera, lighting, environment, shadow, and atmosphere systems
+- compute-driven effects such as bloom, GTAO, TAA, DDGI, and sky atmosphere
+- unified device services for dialogs, files, media, gallery, recording, downloads, store, and ads
+- asynchronous loading queues for smoother startup and scene population
+
+## Repository Architecture
+
+At a high level, the repository is organized like this:
+
+```text
+SeasonEngine
+├── Season/            Reusable core engine library
+│   ├── Basic/
+│   ├── Controls/
+│   ├── Fonts/
+│   ├── Models/
+│   ├── Panels/
+│   ├── Platforms/
+│   ├── Rendering/
+│   ├── Storage/
+│   └── Utils/
+├── Apps/
+│   ├── Engine/        Reference runtime application
+│   ├── EngineWasm/    WebAssembly-oriented engine host
+│   └── EngineWeb/     Web-oriented engine host
+└── Samples/
+    ├── Creator/       Application-framework example
+    ├── CreatorWasm/   WebAssembly-oriented framework example
+    └── CreatorWeb/    Web-oriented framework example
 ```
-┌─────────────────────────────────────────────────────┐
-│                   Your Application                   │
-│                     (BaseApp)                        │
-├─────────────────────────────────────────────────────┤
-│                  DeviceServices                      │
-│   Core │ Media │ Dialog │ File │ Gallery │ Store    │
-├─────────────────────────────────────────────────────┤
-│              Platform Implementations                │
-│   Windows │ Linux │ macOS │ Android │ iOS           │
-└─────────────────────────────────────────────────────┘
+
+And the runtime model looks like this:
+
+```text
+BaseApp
+  -> Panel tree
+     -> Controls (2D, 3D, text, models, shapes, ...)
+        -> IGraphics backend
+           -> Direct3D 12 / Vulkan / Metal / Web path
 ```
 
-## Installation
+`Apps/Engine` builds on top of this model and shows what it looks like when scene content, overlay UI, debug tooling, and compute effects all run together in one application, while `Samples/Creator` and its web variants stay focused on framework-level examples.
 
-### NuGet Package
+## Rendering Model
+
+SeasonEngine uses a fixed pass schedule rather than a full frame graph.
+
+Typical flow:
+
+```text
+FrameStart Compute
+  -> Shadow
+  -> Scene
+  -> AfterScene Compute
+  -> Post
+  -> FinalBlit
+  -> Overlay
+```
+
+This is a deliberate tradeoff. It gives up some scheduling generality, but keeps the frame structure legible, easier to debug, and easier to align across multiple rendering backends.
+
+## The Engine App
+
+The `Engine` app is where the repository becomes more than a library.
+
+It demonstrates:
+
+- a mixed outdoor and indoor sample world
+- procedural sky and atmosphere integration
+- sea, mountains, rocks, props, and animated characters
+- movement, jump skill, picking, and collision
+- debug overlays for intermediate render targets
+- runtime modes such as `Show`, `Play`, `Edit`, and `Debug`
+
+It is best understood as a reference app and regression target, not as a beginner template.
+
+By contrast, the `Creator` series under `Samples/` is better suited for application-framework examples and onboarding.
+
+The model and font assets used in the demo scene are third-party works; their upstream sources and licenses are recorded in [MODEL_FONT_SOURCES_AND_LICENSES.md](Apps/Engine/Resources/Raw/Assets/MODEL_FONT_SOURCES_AND_LICENSES.md).
+
+## Getting Started
+
+### Use The Core Library
+
+Install from NuGet:
 
 ```bash
 dotnet add package SeasonEngine
 ```
 
-### Build from Source
+Or reference the project directly in this repository:
 
-```bash
-git clone https://github.com/SeasonRealms/SeasonEngine.git
-cd SeasonEngine
-dotnet build src/Season.csproj
+```xml
+<ProjectReference Include="..\Src\Season.csproj" />
 ```
 
-## Quick Start
-
-### 1. Create Your Application
+Minimal app:
 
 ```csharp
+using System.Numerics;
 using Season.Basic;
 
-public class MyApp : BaseApp
+public sealed class MyApp : BaseApp
 {
     public MyApp()
     {
-        Title = "My Application";
-        FullScreen = false;
+        Title = "My Season App";
+        DesignResolution = new Vector2(1280, 720);
         BasicResolution = new Vector2(1280, 720);
+        BackgroundColor = Colors.White;
     }
 
-    public override async void Create()
+    public override void Create()
     {
-        // Your application initialization logic here
+        base.Create();
     }
 }
 ```
 
-### 2. Launch on Your Target Platform
+Run on Windows:
 
-**Windows:**
 ```csharp
+using Season.Platforms.Windows;
+
 WindowsApp.Run(new MyApp());
 ```
 
-**Linux:**
-```csharp
-LinuxApp.Run(new MyApp());
+### Run The Reference App
+
+Build the app:
+
+```bash
+dotnet build Apps/Engine/Engine.csproj
 ```
 
-**Android (MainActivity.cs):**
-```csharp
-AndroidApp.Run(new MyApp());
+Run on Windows:
+
+```bash
+dotnet run --project Apps/Engine/Engine.csproj -f net10.0-windows10.0.19041.0
 ```
 
-## Core Services
+Run on Linux:
 
-SeasonEngine provides the following services through `DeviceServices`:
-
-| Service | Interface | Description |
-|---------|-----------|-------------|
-| **Core** | `IDeviceCore` | Platform info, orientation, dark mode detection |
-| **Media** | `IMediaPlayer` | Audio playback and volume control |
-| **Dialog** | `IDialogService` | Message boxes and keyboard input dialogs |
-| **File** | `IFileService` | File/folder picker, open and save operations |
-| **Gallery** | `IGalleryService` | Media gallery access and management |
-| **Record** | `IRecordService` | Camera and audio recording |
-| **Download** | `IDownloadService` | Background download management |
-| **Store** | `IStoreService` | In-app purchases and app store integration |
-| **Ads** | `IAds` | Advertisement integration |
-
-### Usage Examples
-
-**Get Platform Information:**
-```csharp
-var platform = DeviceServices.Core.Platform;        // e.g., Platform.Windows
-var orientation = DeviceServices.Core.Orientation;  // e.g., Orientation.LandscapeLeft
-var isDark = DeviceServices.Core.IsDarkMode();      // true or false
+```bash
+dotnet run --project Apps/Engine/Engine.csproj -f net10.0
 ```
 
-**Play Audio:**
-```csharp
-DeviceServices.Media.PlayMedia("Music", "path/to/audio.mp3", "80");
-DeviceServices.Media.SetVolume(music: 80, sound: 100);
-```
+For Engine-specific controls and runtime modes, see the [Engine application README](Apps/Engine/README.md).
 
-**Show Dialog:**
-```csharp
-var result = await DeviceServices.Dialog.ShowMessage(
-    title: "Confirm",
-    desc: "Are you sure?",
-    buttons: new[] { "Yes", "No" },
-    text: "This action cannot be undone."
-);
-```
+## Supported Platforms
 
-**Pick Files:**
-```csharp
-var files = await DeviceServices.File.PickFiles(
-    fileType: FileType.Image,
-    exts: new[] { ".png", ".jpg" },
-    multiple: true,
-    open: true
-);
-```
+| Platform | Core Library Target | Backend Direction |
+|----------|---------------------|-------------------|
+| Windows | `net10.0-windows10.0.19041.0` | Direct3D 12 |
+| Linux | `net10.0` | Vulkan |
+| Android | `net10.0-android` | Vulkan |
+| iOS | `net10.0-ios` | Metal |
+| Mac Catalyst | `net10.0-maccatalyst` | Metal |
+| Web | `net10.0-browser` | Web rendering path |
 
-**Access Media Gallery:**
-```csharp
-var assets = await DeviceServices.Gallery.MediaGallery();
-foreach (var asset in assets)
-{
-    Console.WriteLine($"{asset.Name} - {asset.Type}");
-}
-```
+Actual runtime support also depends on the selected target, graphics backend status, platform SDKs, and native dependencies.
 
-## Project Structure
+## Who This Repository Is For
 
-```
-src/
-├── Basic/                  # Core abstractions and interfaces
-│   └── DeviceServices.cs   # Central service registry
-├── Platforms/              # Platform-specific implementations
-│   ├── Windows/
-│   ├── Linux/
-│   ├── MacCatalyst/
-│   ├── Android/
-│   ├── iOS/
-│   └── Shared/             # Shared code between platforms
-├── Storage/                # Database, localization, and storage
-├── Net/                    # HTTP client with progress support
-└── Utils/                  # Extension methods and utilities
-```
+This repository is a good fit if you want:
 
-## Platform-Specific Features
+- a C# engine with visible runtime structure
+- one composition model for scene content and overlay UI
+- multi-backend rendering without giving up backend-specific control
+- a reference app that exercises the engine in realistic ways
+- smaller framework examples for onboarding and application scaffolding
+- a codebase that prioritizes architecture clarity over tutorial-style minimalism
 
-For Windows-only features, use `IWindowsFeatures`:
+Two foundational libraries carry the low-level work, and the engine uses them deeply rather than wrapping them away:
 
-```csharp
-if (DeviceServices.WindowsFeatures != null)
-{
-    var volume = DeviceServices.WindowsFeatures.GetVolume();
-    DeviceServices.WindowsFeatures.SetVolume(50);
-    
-    var apps = DeviceServices.WindowsFeatures.ListApps(ids: null, copyLogo: true);
-}
-```
+- [**Silk.NET**](https://github.com/dotnet/Silk.NET) supplies the Direct3D 12 and Vulkan bindings behind the platform backends.
+- [**SharpGLTF**](https://github.com/vpenades/SharpGLTF) powers glTF loading and animation — the one animation format the engine supports.
 
-## Requirements
+`Season/` keeps its own architecture above them: the render-pass model, the control tree, and the cross-backend contracts are the engine's, not the bindings'.
 
-- **.NET 10.0** or later
-- **Windows**: Windows 10 version 1809 (10.0.17763.0) or later
-- **Android**: API Level 21 (Android 5.0) or later
-- **iOS/macOS**: iOS 15.0 / macOS 15.0 or later
+## Project Status
 
-## Contributing
+SeasonEngine is under active development.
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+The core architecture is already substantial, and the `Engine` app is a strong reference application, but APIs, backend coverage, and higher-level workflows are still evolving.
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+[`Roadmap.md`](Roadmap.md) is the current plan. It audits what is actually implemented against what is not — including the absent pieces, such as indirect draw, texture compression, and scene serialization — and orders future work by dependency rather than by appeal. Read it before assuming a capability exists.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Links
-
-- **Repository**: [https://github.com/SeasonRealms/SeasonEngine](https://github.com/SeasonRealms/SeasonEngine)
-- **Issues**: [https://github.com/SeasonRealms/SeasonEngine/issues](https://github.com/SeasonRealms/SeasonEngine/issues)
-
----
-
-*Built with ❤️ for cross-platform development*
+SeasonEngine is licensed under the MIT License.
