@@ -2188,9 +2188,12 @@ float4 PSMain(PSInput input) : SV_TARGET
         float normalStrength = 1.0; // Strength multiplier
         float3 normal = normalMap.Sample(linearSampler, input.texCoord).rgb * 2.0 - 1.0;
         normal.xy *= normalStrength;
-        //normal = normalize(normal);
         //normal.y = -normal.y; // Match the DirectX texture-coordinate convention
-        N = mul(normal, TBN);
+        // 2-6 clause 5: normalize the world-space result, matching what the WebGPU shader already did. Any filtered
+        // fetch of a normal map returns a vector shorter than unit length - bilinear interpolation between two
+        // differing normals already does, and with a mip chain the shortening grows with distance - so leaving it
+        // unnormalized makes both N dot L and Fresnel drift with camera distance.
+        N = normalize(mul(normal, TBN));
         
         //float3 debug = normal * 0.5 + 0.5;
         //return float4(debug, 1.0);

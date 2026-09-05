@@ -67,7 +67,8 @@ public static class WindowsApp
             download: new WindowsDownloadService(),
             store: new WindowsStoreService(),
             ads: null,
-            windowsFeatures: new WindowsFeatures());
+            windowsFeatures: new WindowsFeatures(),
+            recorder: new WindowsMediaRecorder());
 
         var birate = VideoEncodingHelper.EstimateBitrate(832, 480, 16, 90);
 

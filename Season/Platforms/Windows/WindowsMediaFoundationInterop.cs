@@ -12,8 +12,16 @@ internal static class WindowsMediaFoundationInterop
     public const int MFVideoInterlace_Progressive = 2;
 
     public static readonly Guid MF_TRANSCODE_CONTAINERTYPE = new("150ff23f-4abc-478b-ac4f-e1916fba1cca");
-    public static readonly Guid MFTranscodeContainerType_MPEG4 = new("dc6cd05d-b9d0-40ef-bd5f-66f502d8c837");
+    public static readonly Guid MFTranscodeContainerType_MPEG4 = new("dc6cd05d-b9d0-40ef-bd35-fa622c1ab28a");
     public static readonly Guid MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS = new("a634a91c-822b-41b9-a494-4de4643612b0");
+
+    /// <summary>
+    /// Stops the sink writer from pacing WriteSample against the sample
+    /// timestamps. Live capture already paces itself against wall-clock time, so
+    /// throttling would only add latency and force back pressure on the encode
+    /// queue for no benefit.
+    /// </summary>
+    public static readonly Guid MF_SINK_WRITER_DISABLE_THROTTLING = new("08b845d8-2b74-4afe-9d53-be16d2d5ae4f");
 
     public static readonly Guid MF_MT_MAJOR_TYPE = new("48eba18e-f8c9-4687-bf11-0a74c9f96a8f");
     public static readonly Guid MF_MT_SUBTYPE = new("f7e34c9a-42e8-4714-b74b-cb29d72c35e5");
@@ -25,7 +33,7 @@ internal static class WindowsMediaFoundationInterop
     public static readonly Guid MF_MT_ALL_SAMPLES_INDEPENDENT = new("c9173739-5e56-461c-b713-46fb995cb95f");
     public static readonly Guid MF_MT_FIXED_SIZE_SAMPLES = new("b8ebefaf-b718-4e04-b0a9-116775e3321b");
     public static readonly Guid MF_MT_SAMPLE_SIZE = new("dad3ab78-1990-408b-bce2-eba673dacc10");
-    public static readonly Guid MF_MT_MPEG2_PROFILE = new("ad76a80b-ce3c-43d2-896c-f6b19244d58f");
+    public static readonly Guid MF_MT_MPEG2_PROFILE = new("ad76a80b-2d5c-4e0b-b375-64e520137036");
 
     public static readonly Guid MFMediaType_Video = new("73646976-0000-0010-8000-00aa00389b71");
     public static readonly Guid MFMediaType_Audio = new("73647561-0000-0010-8000-00aa00389b71");

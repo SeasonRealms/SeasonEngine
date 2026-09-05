@@ -36,10 +36,35 @@ public unsafe class DXTexture : IDisposable
 
     Format _format = Format.FormatR8G8B8A8Unorm;
     ulong _offsetInSharedHeap;
-    uint _rowPitch;
-    uint _numRows;
     byte[] _imageData;
-    PlacedSubresourceFootprint _footprint;
+
+    /// <summary>
+    /// 2-6 clause 4: subresource count of this texture, which for a non-array 2D texture is exactly the mip level
+    /// count. Stays 1 unless <see cref="MipChain.ShouldGenerate"/> approved a chain for the requested policy, so
+    /// every existing caller keeps the pre-2-6 single-level layout untouched.
+    /// </summary>
+    uint _mipLevels = 1;
+
+    /// <summary>
+    /// Geometry of each level inside <see cref="_imageData"/>. This is the *source* layout - tightly packed with no
+    /// row padding - and must not be confused with <see cref="_footprints"/>, which is the D3D12 upload-heap layout
+    /// where every row is padded to 256 bytes and every subresource starts on a 512-byte boundary. Keeping both is
+    /// what makes <see cref="CopyDataToSharedHeap"/> a straight re-pitch rather than a second layout computation.
+    /// </summary>
+    MipLevelInfo[] _mipInfos;
+
+    /// <summary>Upload-heap footprint per subresource, offsets relative to the start of this texture's own region.</summary>
+    PlacedSubresourceFootprint[] _footprints;
+
+    /// <summary>Row count per subresource, as reported by GetCopyableFootprints.</summary>
+    uint[] _numRows;
+
+    /// <summary>
+    /// The policy this texture was created with, retained so that in-place replacement through
+    /// <see cref="UploadPixels"/> can regenerate the chain instead of leaving levels 1..N holding stale content.
+    /// </summary>
+    TextureMipPolicy _mipPolicy = TextureMipPolicy.None;
+
     ulong _totalBytes;
     ulong _textureUploadHeapCapacity;
 
@@ -84,12 +109,12 @@ public unsafe class DXTexture : IDisposable
     {
     }
 
-    internal DXTexture(INativeImageDecoder decoder)
+    internal DXTexture(INativeImageDecoder decoder, TextureMipPolicy mipPolicy = TextureMipPolicy.None)
     {
-        ProcessDecoder(decoder);
+        ProcessDecoder(decoder, mipPolicy);
     }
 
-    internal DXTexture(string name, SharpGLTF.Schema2.Image image)
+    internal DXTexture(string name, SharpGLTF.Schema2.Image image, TextureMipPolicy mipPolicy = TextureMipPolicy.None)
     {
         INativeImageDecoder decoder = null;
 
@@ -124,7 +149,7 @@ public unsafe class DXTexture : IDisposable
 
         if (decoder != null)
         {
-            ProcessDecoder(decoder);
+            ProcessDecoder(decoder, mipPolicy);
         }
     }
 
@@ -143,13 +168,13 @@ public unsafe class DXTexture : IDisposable
         public void Dispose() { }
     }
 
-    void ProcessDecoder(INativeImageDecoder decoder)
+    void ProcessDecoder(INativeImageDecoder decoder, TextureMipPolicy mipPolicy)
     {
         DescriptorID = Device.DescriptorAllocator.Allocate();
         CpuDescriptorHandle = Device.SrvHeapManager.GetCpuHandle(DescriptorID);
         GpuDescriptorHandle = Device.SrvHeapManager.GetGpuHandle(DescriptorID);
 
-        PrepareForBatchUpload(decoder);
+        PrepareForBatchUpload(decoder, mipPolicy);
 
         // Only accumulate into the batch-upload queue here, without submitting
         // immediately. Graphics.ExecuteUpload performs the centralized flush.
@@ -158,19 +183,26 @@ public unsafe class DXTexture : IDisposable
         decoder.Dispose();
     }
 
-    internal static DXTexture GetOrCreate(string name, SharpGLTF.Schema2.Image image)
+    internal static DXTexture GetOrCreate(string name, SharpGLTF.Schema2.Image image, TextureMipPolicy mipPolicy = TextureMipPolicy.None)
     {
         DXTexture texture;
 
-        if (DirectX.Device.DictionaryDXTexture.TryGetValue(name, out texture))
+        // 2-6 clause 4: the policy is part of the cache identity. The same image file can legitimately be bound as
+        // base colour in one material and as a normal map in another, and those two need different chains (one box
+        // filtered, one renormalized). Keying on the name alone would silently hand the second caller whatever the
+        // first one happened to ask for. The suffix is only appended for non-default policies so that every
+        // pre-2-6 cache key stays byte-identical.
+        string key = mipPolicy == TextureMipPolicy.None ? name : $"{name}#mip{mipPolicy}";
+
+        if (DirectX.Device.DictionaryDXTexture.TryGetValue(key, out texture))
         {
             texture.AddRef();
         }
         else
         {
-            texture = new DXTexture(name, image);
+            texture = new DXTexture(name, image, mipPolicy);
 
-            DirectX.Device.DictionaryDXTexture.Add(name, texture);
+            DirectX.Device.DictionaryDXTexture.Add(key, texture);
         }
 
         return texture;
@@ -181,9 +213,9 @@ public unsafe class DXTexture : IDisposable
     /// It is not inserted into the global cache, so the caller owns its
     /// lifetime. Used by the "create new texture for material replacement" path.
     /// </summary>
-    internal static DXTexture CreateFromDecoder(INativeImageDecoder decoder)
+    internal static DXTexture CreateFromDecoder(INativeImageDecoder decoder, TextureMipPolicy mipPolicy = TextureMipPolicy.None)
     {
-        var tex = new DXTexture(decoder);
+        var tex = new DXTexture(decoder, mipPolicy);
         return tex;
     }
 
@@ -327,19 +359,36 @@ public unsafe class DXTexture : IDisposable
 
         bool closed = false;
 
+        // 2-6 clause 4: in-place replacement has to refresh the whole chain. The incoming span only describes level
+        // 0, so if this texture owns a chain the lower levels are regenerated here - otherwise they would keep
+        // showing the previous content at distance, which is far more confusing to diagnose than no mipmaps at all.
+        byte[] chain = null;
+        MipLevelInfo[] chainInfos = null;
+        if (_mipLevels > 1)
+            chain = MipChain.Build(rgbaPixels, (int)Width, (int)Height, _mipPolicy, out chainInfos);
+
         try
         {
             void* mappedData = null;
             uploadBuf->Map(0, null, &mappedData);
-            byte* dstRow = (byte*)mappedData;
-            fixed (byte* src = rgbaPixels)
+            byte* mapped = (byte*)mappedData;
+
+            if (chain != null)
             {
-                uint srcRowPitch = Width * 4;
-                for (uint row = 0; row < Height; row++)
+                fixed (byte* src = chain)
                 {
-                    Unsafe.CopyBlock(dstRow + row * _rowPitch, src + row * srcRowPitch, srcRowPitch);
+                    for (uint level = 0; level < _mipLevels; level++)
+                        RePitchLevel(mapped, src + chainInfos[level].ByteOffset, (uint)chainInfos[level].Width, level);
                 }
             }
+            else
+            {
+                fixed (byte* src = rgbaPixels)
+                {
+                    RePitchLevel(mapped, src, Width, 0);
+                }
+            }
+
             uploadBuf->Unmap(0, null);
 
             var cmdList = Device.UploadCommandList;
@@ -356,22 +405,25 @@ public unsafe class DXTexture : IDisposable
                 cmdList->ResourceBarrier(1, &barrier);
             }
 
-            // 4. CopyTextureRegion
-            var dst = new TextureCopyLocation
+            // 4. CopyTextureRegion, once per subresource.
+            for (uint level = 0; level < _mipLevels; level++)
             {
-                Type = TextureCopyType.SubresourceIndex,
-                Anonymous = { SubresourceIndex = 0 },
-                PResource = _textureResource
-            };
+                var dst = new TextureCopyLocation
+                {
+                    Type = TextureCopyType.SubresourceIndex,
+                    Anonymous = { SubresourceIndex = level },
+                    PResource = _textureResource
+                };
 
-            var srcLoc = new TextureCopyLocation
-            {
-                Type = TextureCopyType.PlacedFootprint,
-                Anonymous = { PlacedFootprint = _footprint },
-                PResource = uploadBuf
-            };
+                var srcLoc = new TextureCopyLocation
+                {
+                    Type = TextureCopyType.PlacedFootprint,
+                    Anonymous = { PlacedFootprint = _footprints[level] },
+                    PResource = uploadBuf
+                };
 
-            cmdList->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, null);
+                cmdList->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, null);
+            }
 
             // 5. Barrier: CopyDest -> Common
             // Finish the full state transition within the same queue.
@@ -507,7 +559,7 @@ public unsafe class DXTexture : IDisposable
 
     // ──────── Upload preparation ────────
 
-    void PrepareForBatchUpload(INativeImageDecoder decoder)
+    void PrepareForBatchUpload(INativeImageDecoder decoder, TextureMipPolicy mipPolicy)
     {
         Width = (uint)decoder.Width;
         Height = (uint)decoder.Height;
@@ -525,6 +577,22 @@ public unsafe class DXTexture : IDisposable
             var dstRow = new Span<byte>(_imageData, y * dstStride, dstStride);
             srcRow.CopyTo(dstRow);
         }
+
+        // 2-6 clause 3: the de-strided buffer above is exactly the tightly packed input MipChain.Build requires,
+        // which is why generation belongs here and not earlier - this is the first point where the pixels are in a
+        // known-dense layout, and the last point before the D3D12-specific upload layout is derived.
+        if (MipChain.ShouldGenerate(mipPolicy, (int)Width, (int)Height))
+        {
+            _imageData = MipChain.Build(_imageData, (int)Width, (int)Height, mipPolicy, out _mipInfos);
+            _mipLevels = (uint)_mipInfos.Length;
+            _mipPolicy = mipPolicy;
+        }
+        else
+        {
+            _mipInfos = [new MipLevelInfo((int)Width, (int)Height, 0)];
+            _mipLevels = 1;
+        }
+
         PrepareTextureLayout();
     }
 
@@ -539,32 +607,37 @@ public unsafe class DXTexture : IDisposable
             Width = Width,
             Height = Height,
             DepthOrArraySize = 1,
-            MipLevels = 1,
+            MipLevels = (ushort)_mipLevels,
             Format = _format,
             SampleDesc = new SampleDesc(1, 0),
             Layout = TextureLayout.LayoutUnknown,
             Flags = ResourceFlags.None
         };
 
-        PlacedSubresourceFootprint footprint;
-        uint numRows;
-        ulong rowSizeInBytes;
+        _footprints = new PlacedSubresourceFootprint[_mipLevels];
+        _numRows = new uint[_mipLevels];
+        var rowSizes = new ulong[_mipLevels];
         ulong totalBytes;
 
-        Device.D3dDevice->GetCopyableFootprints(
-            &textureDesc,
-            0,
-            1,
-            0,
-            &footprint,
-            &numRows,
-            &rowSizeInBytes,
-            &totalBytes
-        );
+        // Asking for all subresources in one call is what makes the per-level offsets correct: D3D12 pads each row
+        // to 256 bytes and starts each subresource on a 512-byte boundary, and letting the runtime lay that out is
+        // the only way to be sure the CPU-side re-pitch below agrees with what CopyTextureRegion will read.
+        fixed (PlacedSubresourceFootprint* pFootprints = _footprints)
+        fixed (uint* pNumRows = _numRows)
+        fixed (ulong* pRowSizes = rowSizes)
+        {
+            Device.D3dDevice->GetCopyableFootprints(
+                &textureDesc,
+                0,
+                _mipLevels,
+                0,
+                pFootprints,
+                pNumRows,
+                pRowSizes,
+                &totalBytes
+            );
+        }
 
-        _footprint = footprint;
-        _rowPitch = footprint.Footprint.RowPitch;
-        _numRows = numRows;
         _totalBytes = totalBytes;
     }
 
@@ -574,22 +647,25 @@ public unsafe class DXTexture : IDisposable
         return (_totalBytes + placementAlignment - 1) & ~(placementAlignment - 1);
     }
 
-    public TextureCopyLocation GetCopySourceLocation()
+    /// <summary>Subresource count to iterate when copying this texture; 1 for every single-level texture.</summary>
+    public uint MipLevels => _mipLevels;
+
+    public TextureCopyLocation GetCopySourceLocation(uint mipLevel = 0)
     {
         return new TextureCopyLocation
         {
             Type = TextureCopyType.PlacedFootprint,
-            Anonymous = { PlacedFootprint = _footprint },
+            Anonymous = { PlacedFootprint = _footprints[mipLevel] },
             PResource = null
         };
     }
 
-    public TextureCopyLocation GetCopyDestLocation()
+    public TextureCopyLocation GetCopyDestLocation(uint mipLevel = 0)
     {
         return new TextureCopyLocation
         {
             Type = TextureCopyType.SubresourceIndex,
-            Anonymous = { SubresourceIndex = 0 },
+            Anonymous = { SubresourceIndex = mipLevel },
             PResource = _textureResource
         };
     }
@@ -601,18 +677,34 @@ public unsafe class DXTexture : IDisposable
 
         fixed (byte* pSrcData = _imageData)
         {
-            byte* pDst = sharedUploadPtr + offset;
-            uint srcRowPitch = Width * 4;
-
-            for (int row = 0; row < _numRows; row++)
+            for (uint level = 0; level < _mipLevels; level++)
             {
-                uint copySize = Math.Min(srcRowPitch, _rowPitch);
-                Unsafe.CopyBlock(pDst, pSrcData + row * srcRowPitch, copySize);
-                pDst += _rowPitch;
+                var info = _mipInfos[level];
+                // The footprint offsets are relative to this texture's own region, so the batch offset shifts the
+                // whole layout rather than being folded into each level.
+                RePitchLevel(sharedUploadPtr + offset, pSrcData + info.ByteOffset, (uint)info.Width, level);
             }
         }
 
         _offsetInSharedHeap = offset;
+    }
+
+    /// <summary>
+    /// Copies one densely packed level into its slot in a mapped upload buffer, converting the source stride to the
+    /// 256-byte-aligned destination row pitch that D3D12 reported for that subresource.
+    /// </summary>
+    void RePitchLevel(byte* mappedBase, byte* src, uint levelWidth, uint level)
+    {
+        var footprint = _footprints[level];
+        uint dstRowPitch = footprint.Footprint.RowPitch;
+        uint srcRowPitch = levelWidth * 4;
+        uint copySize = Math.Min(srcRowPitch, dstRowPitch);
+        byte* dst = mappedBase + footprint.Offset;
+
+        for (uint row = 0; row < _numRows[level]; row++)
+        {
+            Unsafe.CopyBlock(dst + row * dstRowPitch, src + row * srcRowPitch, copySize);
+        }
     }
 
     static ulong AlignUp(ulong value, ulong alignment)
@@ -741,7 +833,7 @@ public unsafe class DXTexture : IDisposable
             Width = Width,
             Height = Height,
             DepthOrArraySize = 1,
-            MipLevels = 1,
+            MipLevels = (ushort)_mipLevels,
             Format = _format,
             SampleDesc = new SampleDesc(1, 0),
             Layout = TextureLayout.LayoutUnknown,
@@ -782,7 +874,7 @@ public unsafe class DXTexture : IDisposable
             Shader4ComponentMapping = DefaultShader4ComponentMapping,
             Texture2D = new Tex2DSrv
             {
-                MipLevels = 1,
+                MipLevels = _mipLevels,
                 MostDetailedMip = 0
             }
         };

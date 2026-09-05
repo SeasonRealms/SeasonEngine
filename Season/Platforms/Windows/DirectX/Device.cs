@@ -138,6 +138,9 @@ internal unsafe static class Device
     static uint _captureWidth;
     static uint _captureHeight;
     static bool _capturePending;
+    /// <summary>Byte size the readback buffer was allocated for, so it can be
+    /// rebuilt when the window grows instead of copying past its end.</summary>
+    static uint _captureReadbackBytes;
     /// <summary>Fence value recorded by CaptureBackBuffer; CompleteCapture waits
     /// for it before calling Map.</summary>
     static ulong _captureFenceValue;
@@ -985,31 +988,141 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     // ── CaptureApp GPU readback implementation ──
 
     /// <summary>
-    /// Called after MSAA resolve. Copies the backbuffer (currently in
-    /// <paramref name="startingState"/>) into the readback buffer via
-    /// CopyTextureRegion, then transitions it back to Present for display.
-    /// The readback result is mapped and delivered to the caller in
-    /// CompleteCapture.
+    /// Pixel size of the backbuffer that capture and recording read from. Taken
+    /// from the resource description rather than the viewport, because that is the
+    /// surface CopyTextureRegion actually reads, and it falls back to the viewport
+    /// only before the swap chain exists.
+    /// </summary>
+    internal static (int Width, int Height) GetBackBufferSize()
+    {
+        var targets = _renderTargetsCache;
+        var backbuffer = targets != null && FrameIndex < targets.Length
+            ? targets[FrameIndex]
+            : null;
+
+        if (backbuffer != null)
+        {
+            var desc = backbuffer->GetDesc();
+            if (desc.Width > 0 && desc.Height > 0)
+                return ((int)desc.Width, (int)desc.Height);
+        }
+
+        var viewport = Viewport;
+        return ((int)viewport.Width, (int)viewport.Height);
+    }
+
+    /// <summary>
+    /// Pixel size of the sub-rectangle of the backbuffer that is actually on
+    /// screen. The swap chain is composed into the panel without an inverse
+    /// composition-scale transform, so the renderer compensates the other way
+    /// around: its output is shrunk into the top-left 1/CompositionScale corner of
+    /// the backbuffer (the DPI transform in DXPrimitiveGroup.Update, matching the
+    /// 2D "layout coordinates / scale" rule), and composition then magnifies that
+    /// corner back to full panel size.
+    /// Because that transform is applied after projection it widens the clip
+    /// volume, so the rest of the backbuffer is not padding but real geometry from
+    /// outside the visible frustum. Copying it out would make a screenshot or a
+    /// recording show a wider view than the game does, aligned at the top-left and
+    /// overshooting at the bottom-right.
+    /// Degenerates to <see cref="GetBackBufferSize"/> when CompositionScale is 1,
+    /// which is the case on every non-desktop backend.
+    /// </summary>
+    internal static (int Width, int Height) GetPresentedSize()
+    {
+        var (width, height) = GetBackBufferSize();
+
+        var app = DeviceServices.BaseApp;
+        float scaleX = app?.CompositionScale.X ?? 1f;
+        float scaleY = app?.CompositionScale.Y ?? 1f;
+
+        // A scale of 0 means the panel has not reported its composition scale
+        // yet; the full backbuffer is the only meaningful answer at that point.
+        if (scaleX > 1e-4f)
+            width = Math.Clamp((int)MathF.Round(width / scaleX), 1, width);
+
+        if (scaleY > 1e-4f)
+            height = Math.Clamp((int)MathF.Round(height / scaleY), 1, height);
+
+        return (width, height);
+    }
+
+    /// <summary>
+    /// Shared copy-out for every readback consumer. The backbuffer (currently in
+    /// <paramref name="startingState"/>) is transitioned to CopySource exactly
+    /// once, each interested consumer records its own CopyTextureRegion inside
+    /// that window, and the backbuffer then goes straight to Present. This keeps a
+    /// screenshot taken during a recording session from costing a second pair of
+    /// barriers.
     /// </summary>
     /// <param name="startingState">Current D3D12 resource state of the
     /// backbuffer (ResolveDest in the MSAA path).</param>
-    internal static void CaptureBackBuffer(ResourceStates startingState)
+    /// <param name="singleShot">Serve a pending CaptureApp request; the result is
+    /// mapped and delivered in CompleteCapture.</param>
+    /// <param name="record">Serve the active recording session through
+    /// <see cref="DXCaptureRing"/>.</param>
+    /// <param name="recordFrameIndex">Constant-rate output frame index this
+    /// backbuffer belongs to, or -1 when <paramref name="record"/> is false.</param>
+    static void CopyBackBufferForCapture(ResourceStates startingState, bool singleShot, bool record, long recordFrameIndex)
     {
         var backbuffer = renderTargets[FrameIndex];
         if (backbuffer == null) return;
 
-        var desc = backbuffer->GetDesc();
-        _captureWidth = (uint)desc.Width;
-        _captureHeight = (uint)desc.Height;
+        var (width, height) = GetPresentedSize();
+        if (width <= 0 || height <= 0) return;
+
+        // Every consumer reads the same on-screen corner, never the whole
+        // backbuffer; see GetPresentedSize for why the remainder must be dropped.
+        var sourceBox = new Box
+        {
+            Left = 0,
+            Top = 0,
+            Front = 0,
+            Right = (uint)width,
+            Bottom = (uint)height,
+            Back = 1,
+        };
+
+        // 1) Transition state: starting state -> CopySource
+        var barrierToCopy = InitTransition(backbuffer, startingState, ResourceStates.CopySource);
+        GraphicsCommandList->ResourceBarrier(1, &barrierToCopy);
+
+        // 2) CopyTextureRegion: backbuffer -> readback buffer(s)
+        if (singleShot)
+            CopyToSingleShotReadback(backbuffer, (uint)width, (uint)height, &sourceBox);
+
+        if (record)
+            DXCaptureRing.Enqueue(backbuffer, recordFrameIndex, (uint)width, (uint)height, &sourceBox);
+
+        // 3) Transition state: CopySource -> Present
+        // (takes over the normal RenderTarget -> Present transition)
+        var barrierToPresent = InitTransition(backbuffer, ResourceStates.CopySource, ResourceStates.Present);
+        GraphicsCommandList->ResourceBarrier(1, &barrierToPresent);
+    }
+
+    static void CopyToSingleShotReadback(ID3D12Resource* backbuffer, uint width, uint height, Box* sourceBox)
+    {
+        _captureWidth = width;
+        _captureHeight = height;
 
         // D3D12 requires row pitch alignment to
         // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (256 bytes)
         uint rowPitch = ((_captureWidth * 4) + 255) & ~255u;
         uint totalBytes = rowPitch * _captureHeight;
 
-        // Create or reuse the readback buffer
-        if (_captureReadbackBuffer == null)
+        // Create or reuse the readback buffer. It must also be recreated when the
+        // window grew, otherwise the copy would run past the end of a buffer sized
+        // for the old resolution.
+        if (_captureReadbackBuffer == null || _captureReadbackBytes < totalBytes)
         {
+            if (_captureReadbackBuffer != null)
+            {
+                // The previous buffer can only be referenced by already completed
+                // frames, because CompleteCapture drains every capture in the same
+                // frame that recorded it.
+                _captureReadbackBuffer->Release();
+                _captureReadbackBuffer = null;
+            }
+
             var heapProps = new HeapProperties(HeapType.Readback);
             var bufferDesc = new ResourceDesc(
                 ResourceDimension.Buffer,
@@ -1029,13 +1142,9 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
                 &riid, &pResource);
             CheckResult(hr);
             _captureReadbackBuffer = (ID3D12Resource*)pResource;
+            _captureReadbackBytes = totalBytes;
         }
 
-        // 1) Transition state: starting state -> CopySource
-        var barrierToCopy = InitTransition(backbuffer, startingState, ResourceStates.CopySource);
-        GraphicsCommandList->ResourceBarrier(1, &barrierToCopy);
-
-        // 2) CopyTextureRegion: backbuffer -> readback buffer
         TextureCopyLocation dstLoc = default;
         dstLoc.PResource = _captureReadbackBuffer;
         dstLoc.Type = TextureCopyType.PlacedFootprint;
@@ -1051,12 +1160,7 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         srcLoc.Type = TextureCopyType.SubresourceIndex;
         srcLoc.SubresourceIndex = 0;
 
-        GraphicsCommandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, null);
-
-        // 3) Transition state: CopySource -> Present
-        // (takes over the normal RenderTarget -> Present transition)
-        var barrierToPresent = InitTransition(backbuffer, ResourceStates.CopySource, ResourceStates.Present);
-        GraphicsCommandList->ResourceBarrier(1, &barrierToPresent);
+        GraphicsCommandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, sourceBox);
 
         _capturePending = true;
         // Record the current frame's fence value so CompleteCapture can wait for
@@ -1736,8 +1840,8 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     /// - MSAA Scene: resolve to ResolveDest
     ///   (backbuffer -> Present/Capture; offscreen -> remain in ResolveDest for
     ///   Blit to take over);
-    /// - direct backbuffer rendering: transition to Present (including the
-    ///   Capture branch);
+    /// - direct backbuffer rendering: transition to Present (readback for capture
+    ///   and recording happens once per frame in AfterRender, not here);
     /// - offscreen without MSAA: remain in RenderTarget, and later consumers
     ///   (Post/Blit) will transition to PixelShaderResource themselves.
     /// </summary>
@@ -1789,22 +1893,40 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     }
 
     /// <summary>
-    /// Finalization when the backbuffer is the pass endpoint: normally
-    /// transition to Present. CaptureApp starts from the currently tracked state
-    /// (ResolveDest for direct MSAA rendering, RenderTarget for the blit path)
-    /// and internally performs -> CopySource -> Present.
+    /// Finalization when the backbuffer is the pass endpoint: transition to
+    /// Present. Readback is deliberately not done here, because the backbuffer is
+    /// the endpoint of more than one pass per frame (FinalBlit and then Overlay),
+    /// so capturing here would sometimes catch the frame before the 2D controls
+    /// were drawn. <see cref="CaptureFinishedFrame"/> runs once per frame instead.
     /// </summary>
     static void FinishBackbufferForPresent(DXRenderTarget backbuffer)
     {
-        if (BaseApp.CaptureAppTcs != null)
-        {
-            CaptureBackBuffer(backbuffer.CurrentState);
-            backbuffer.CurrentState = ResourceStates.Present;
-        }
-        else
-        {
-            backbuffer.TransitionTo(GraphicsCommandList, ResourceStates.Present);
-        }
+        backbuffer.TransitionTo(GraphicsCommandList, ResourceStates.Present);
+    }
+
+    /// <summary>
+    /// Copies the finished frame out for screenshots and recording. Called from
+    /// <see cref="AfterRender"/> right before the command list closes, which is
+    /// the only point where the backbuffer is guaranteed to hold the complete
+    /// frame including the Overlay pass, and the only point that is reached
+    /// exactly once per frame — recording pacing must not be sampled twice, or the
+    /// frame that wins the time slice becomes a coin flip between the pre-Overlay
+    /// and post-Overlay contents.
+    /// The backbuffer is in Present by then, and Present -> CopySource -> Present
+    /// costs one extra barrier pair only while a capture is actually running.
+    /// </summary>
+    static void CaptureFinishedFrame()
+    {
+        bool singleShot = BaseApp.CaptureAppTcs != null;
+        bool record = DXCaptureRing.WantsFrame(out long recordFrameIndex);
+
+        if (!singleShot && !record) return;
+
+        var backbuffer = BackbufferRTs[FrameIndex];
+        if (backbuffer == null) return;
+
+        CopyBackBufferForCapture(backbuffer.CurrentState, singleShot, record, recordFrameIndex);
+        backbuffer.CurrentState = ResourceStates.Present;
     }
 
     /// <summary>
@@ -1926,6 +2048,10 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     {
         CheckResult();
 
+        // Last chance to read the frame out: the backbuffer now holds every pass
+        // including Overlay, and the command list is still open.
+        CaptureFinishedFrame();
+
         var result = GraphicsCommandList->Close();
         CheckResult(result);
 
@@ -1948,6 +2074,10 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         // Complete the CaptureApp GPU readback; by this point the GPU has
         // already executed all commands for this frame
         CompleteCapture();
+
+        // Hand every recording readback whose fence has already passed to the
+        // encoder. Never blocks here: unfinished slots are picked up next frame.
+        DXCaptureRing.Tick();
 
         CheckResult();
     }

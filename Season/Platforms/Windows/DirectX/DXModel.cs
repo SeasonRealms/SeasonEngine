@@ -732,7 +732,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
             }
             else
             {
-                var dXTexture = DXTexture.GetOrCreate($"{_asset.Model.Name}-baseColor-{baseColorImage.LogicalIndex}", baseColorImage);
+                var dXTexture = DXTexture.GetOrCreate($"{_asset.Model.Name}-baseColor-{baseColorImage.LogicalIndex}", baseColorImage, TextureMipPolicy.Color);
 
                 primitiveData.BaseColorTexture = dXTexture;
                 primitiveData.MaterialParams.UseAlbedoMap = 1u;
@@ -746,7 +746,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
             }
             else
             {
-                var dXTexture = DXTexture.GetOrCreate($"{_asset.Model.Name}-normal-{normalImage.LogicalIndex}", normalImage);
+                var dXTexture = DXTexture.GetOrCreate($"{_asset.Model.Name}-normal-{normalImage.LogicalIndex}", normalImage, TextureMipPolicy.Normal);
 
                 primitiveData.NormalTexture = dXTexture;
                 primitiveData.MaterialParams.UseNormalMap = 1u;
@@ -760,7 +760,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
             }
             else
             {
-                var dXTexture = DXTexture.GetOrCreate($"{_asset.Model.Name}-metallicRoughness-{metallicRoughnessImage.LogicalIndex}", metallicRoughnessImage);
+                var dXTexture = DXTexture.GetOrCreate($"{_asset.Model.Name}-metallicRoughness-{metallicRoughnessImage.LogicalIndex}", metallicRoughnessImage, TextureMipPolicy.Linear);
 
                 primitiveData.MetallicRoughnessTexture = dXTexture;
                 primitiveData.MaterialParams.UseMetallicRoughnessMap = 1u;
@@ -773,7 +773,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
             }
             else
             {
-                var dXTexture = DXTexture.GetOrCreate($"{_asset.Model.Name}-occlusion-{occlusionImage.LogicalIndex}", occlusionImage);
+                var dXTexture = DXTexture.GetOrCreate($"{_asset.Model.Name}-occlusion-{occlusionImage.LogicalIndex}", occlusionImage, TextureMipPolicy.Linear);
 
                 primitiveData.OcclusionTexture = dXTexture;
                 primitiveData.MaterialParams.UseOcclusionMap = 1u;
@@ -787,7 +787,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
             }
             else
             {
-                var dXTexture = DXTexture.GetOrCreate($"{_asset.Model.Name}-emissive-{emissiveImage.LogicalIndex}", emissiveImage);
+                var dXTexture = DXTexture.GetOrCreate($"{_asset.Model.Name}-emissive-{emissiveImage.LogicalIndex}", emissiveImage, TextureMipPolicy.Color);
 
                 primitiveData.EmissiveTexture = dXTexture;
                 primitiveData.MaterialParams.UseEmissiveMap = 1u;

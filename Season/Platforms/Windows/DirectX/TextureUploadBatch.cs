@@ -151,23 +151,31 @@ internal unsafe class TextureUploadBatch
         // The callers ExecuteFullUploads and ExecuteSubRectUpload already guarantee that
         // precondition via EnsureCommonForCopyQueue.
 
-        var srcLocation = dxTexture.GetCopySourceLocation();
-        srcLocation.PResource = sharedUploadHeap;
-        srcLocation.Anonymous.PlacedFootprint.Offset = offset;
+        // 2-6 clause 4: one CopyTextureRegion per subresource. CopyTextureRegion has no notion of "copy the whole
+        // chain", so a texture with N mip levels needs N commands - and this loop degenerates to the pre-2-6 single
+        // command whenever MipLevels is 1.
+        for (uint level = 0; level < dxTexture.MipLevels; level++)
+        {
+            var srcLocation = dxTexture.GetCopySourceLocation(level);
+            srcLocation.PResource = sharedUploadHeap;
+            // The per-level footprint offset is relative to this texture's region, so the batch offset is added to
+            // it rather than replacing it. This matches how CopyDataToSharedHeap placed the bytes.
+            srcLocation.Anonymous.PlacedFootprint.Offset += offset;
 
-        var dstLocation = dxTexture.GetCopyDestLocation();
+            var dstLocation = dxTexture.GetCopyDestLocation(level);
 
-        // The D3D12 Debug Layer triggers an SEHException, effectively a memory access violation,
-        // when PResource is null.
-        if (dstLocation.PResource == null)
-            throw new InvalidOperationException(
-                $"Texture '{dxTexture.Name}' has null destination resource. " +
-                "The texture may not have been properly initialized.");
-        if (srcLocation.PResource == null)
-            throw new InvalidOperationException(
-                "Source upload heap is null for CopyTextureRegion.");
+            // The D3D12 Debug Layer triggers an SEHException, effectively a memory access violation,
+            // when PResource is null.
+            if (dstLocation.PResource == null)
+                throw new InvalidOperationException(
+                    $"Texture '{dxTexture.Name}' has null destination resource. " +
+                    "The texture may not have been properly initialized.");
+            if (srcLocation.PResource == null)
+                throw new InvalidOperationException(
+                    "Source upload heap is null for CopyTextureRegion.");
 
-        commandList->CopyTextureRegion(&dstLocation, 0, 0, 0, &srcLocation, null);
+            commandList->CopyTextureRegion(&dstLocation, 0, 0, 0, &srcLocation, null);
+        }
     }
 
     // ════════════════════════════════════════════════════════════════

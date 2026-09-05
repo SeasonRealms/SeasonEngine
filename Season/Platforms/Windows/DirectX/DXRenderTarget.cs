@@ -25,7 +25,7 @@ namespace Season.Platforms.Windows.DirectX;
 /// tracking are forbidden because they desynchronize state tracking and break
 /// idempotence checks, causing missed or duplicated transitions.
 /// The only exception is the internal transition inside
-/// Device.CaptureBackBuffer, which writes back CurrentState afterward
+/// Device.CopyBackBufferForCapture, which writes back CurrentState afterward
 /// (see FinishBackbufferForPresent).
 /// Calls are restricted to BeginPass / EndPass / platform binding APIs such as
 /// BlitToBackbuffer and the Target path of DispatchCompute. Pass-body content
