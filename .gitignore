@@ -37,6 +37,7 @@ ScaffoldingReadMe.txt
 *.snupkg
 
 # Others
+*.user
 ~$*
 *~
 CodeCoverage/
