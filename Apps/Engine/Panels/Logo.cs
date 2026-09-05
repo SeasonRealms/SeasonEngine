@@ -17,7 +17,27 @@ internal class Logo : Panel
             Name = "Assets/favicon.png",
             OnClick = async () =>
             {
-                if (App.Instance.Mode is Mode.Edit)
+                if (App.Instance.Mode is Mode.Play)
+                {
+                    if (CelestialLighting.DayNightSpeed == 0f)
+                    {
+                        CelestialLighting.DayNightSpeed = 0.05f;
+                    }
+                    else
+                    {
+                        CelestialLighting.DayNightSpeed = 0f;
+                    }
+                    //// 开始
+                    //await DeviceServices.Recorder.Start(new RecordSessionOptions { FramesPerSecond = 30 });
+
+                    //await Task.Delay(TimeSpan.FromSeconds(10));
+
+                    //// 结束
+                    //var result = await DeviceServices.Recorder.Stop();
+                    //// result.FilePath   → 输出的 mp4 路径
+                    //// result.Stats      → 掉帧诚实度量（见下）
+                }
+                else if (App.Instance.Mode is Mode.Edit)
                 {
                     if (App.Instance.ViewType is ViewType.Ming)
                     {

@@ -27,7 +27,7 @@ internal class CelestialLighting
 
     // Day-night parameters. Phase counts elapsed day cycles, and since Step C the sun and moon follow independent full arcs
     // so both bodies can appear in the sky at the same time. Elevation still controls visibility and peak intensity.
-    const float DayNightSpeed = 0.02f;      // Phase increment per second, giving an about 50-second day.
+    internal static float DayNightSpeed = 0.01f;      // Phase increment per second, giving an about 100-second day.
     // Shortened synodic cycle for the sample so a full moon-phase loop completes in a few minutes rather than taking far too long to observe.
     const float MoonSynodicDays = 4f;
     // Weather cycle period in seconds. It intentionally differs from the day-night period so weather does not always repeat at the same time of day.
