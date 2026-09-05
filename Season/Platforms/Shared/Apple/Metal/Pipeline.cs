@@ -2027,7 +2027,9 @@ fragment SEASON_FS_OUT fragment_main(
 
     if (mat.useNormalMap != 0u) {
         float3 nrm = normalMap.sample(texSampler, in.vUV).rgb * 2.0 - 1.0;
-        N = TBN * nrm;
+        // 2-6 clause 5: normalize the world-space result. Any filtered fetch of a normal map returns a vector
+        // shorter than unit length, and with a mip chain the shortening grows with distance.
+        N = normalize(TBN * nrm);
     }
 
     float3 V = normalize(lights.cameraPos.xyz - in.vWorldPos);

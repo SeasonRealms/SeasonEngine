@@ -1157,6 +1157,18 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         }
     }
 
+    /// <summary>
+    /// 2-6 clause 1: mip policy implied by a material slot. Runtime replacement must resolve this the same way the
+    /// glTF load path does, otherwise an overridden texture would silently lose the chain its neighbours have.
+    /// </summary>
+    static TextureMipPolicy MipPolicyForSlot(TextureSlot slot) => slot switch
+    {
+        TextureSlot.Normal => TextureMipPolicy.Normal,
+        TextureSlot.MetallicRoughness => TextureMipPolicy.Linear,
+        TextureSlot.Occlusion => TextureMipPolicy.Linear,
+        _ => TextureMipPolicy.Color,
+    };
+
     /// <summary>Replace the texture in the specified slot on all Primitives.
     /// The current implementation always uses the recreate path.</summary>
     internal void ReplaceTextureBySlot(TextureSlot slot, INativeImageDecoder decoder)
@@ -1174,11 +1186,13 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
 
         if (sameSize && exclusive)
         {
+            // UploadPixels regenerates the whole chain from the policy the texture was created with, so the fast path
+            // stays correct for mipmapped textures too.
             oldTex.UploadPixels(decoder.PixelSpan);
         }
         else
         {
-            var newTex = Texture.CreateFromDecoder(decoder);
+            var newTex = Texture.CreateFromDecoder(decoder, MipPolicyForSlot(slot));
             foreach (var primitive in _drawList)
             {
                 SetTextureBySlot(primitive, slot, newTex);

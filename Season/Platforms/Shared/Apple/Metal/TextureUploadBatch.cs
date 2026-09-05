@@ -43,12 +43,14 @@ internal sealed class TextureUploadBatch : IDisposable
         if (_tasks.Count == 0) return;
 
         // 1. Compute the total size and align it to 4 bytes.
+        // 2-6 clause 4: the size must come from ImageData rather than Width*Height*4, because a texture that owns a
+        // mip chain carries every level in that same buffer.
         ulong totalSize = 0;
         var offsets = new ulong[_tasks.Count];
         for (int i = 0; i < _tasks.Count; i++)
         {
             offsets[i] = totalSize;
-            ulong size = (ulong)(_tasks[i].Width * _tasks[i].Height * 4u);
+            ulong size = (ulong)(_tasks[i].ImageData?.Length ?? (int)(_tasks[i].Width * _tasks[i].Height * 4u));
             totalSize += AlignUp(size, 4);
         }
 
@@ -64,7 +66,7 @@ internal sealed class TextureUploadBatch : IDisposable
                 var t = _tasks[i];
                 if (t.ImageData == null) continue;
                 fixed (byte* pSrc = t.ImageData)
-                    Unsafe.CopyBlock(basePtr + offsets[i], pSrc, (uint)(t.Width * t.Height * 4u));
+                    Unsafe.CopyBlock(basePtr + offsets[i], pSrc, (uint)t.ImageData.Length);
             }
 
             // 3. Record the blit command buffer.
@@ -74,16 +76,25 @@ internal sealed class TextureUploadBatch : IDisposable
             for (int i = 0; i < _tasks.Count; i++)
             {
                 var t = _tasks[i];
-                blit.CopyFromBuffer(
-                    sourceBuffer: staging,
-                    sourceOffset: (nuint)offsets[i],
-                    sourceBytesPerRow: (nuint)(t.Width * 4u),
-                    sourceBytesPerImage: (nuint)(t.Width * t.Height * 4u),
-                    sourceSize: new MTLSize((nint)t.Width, (nint)t.Height, 1),
-                    destinationTexture: t.Image,
-                    destinationSlice: 0,
-                    destinationLevel: 0,
-                    destinationOrigin: new MTLOrigin(0, 0, 0));
+                // One copy per subresource, degenerating to the pre-2-6 single copy whenever MipLevels is 1.
+                for (uint level = 0; level < t.MipLevels; level++)
+                {
+                    var info = t.MipInfos != null
+                        ? t.MipInfos[level]
+                        : new MipLevelInfo((int)t.Width, (int)t.Height, 0);
+                    blit.CopyFromBuffer(
+                        sourceBuffer: staging,
+                        // Per-level offsets are relative to this texture's own block, so the batch offset shifts the
+                        // whole layout rather than being folded into each level.
+                        sourceOffset: (nuint)(offsets[i] + (ulong)info.ByteOffset),
+                        sourceBytesPerRow: (nuint)(info.Width * 4),
+                        sourceBytesPerImage: (nuint)(info.Width * info.Height * 4),
+                        sourceSize: new MTLSize(info.Width, info.Height, 1),
+                        destinationTexture: t.Image,
+                        destinationSlice: 0,
+                        destinationLevel: (nuint)level,
+                        destinationOrigin: new MTLOrigin(0, 0, 0));
+                }
             }
 
             blit.EndEncoding();

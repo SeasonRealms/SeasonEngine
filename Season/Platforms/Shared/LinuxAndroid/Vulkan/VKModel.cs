@@ -747,7 +747,8 @@ internal unsafe class VKModel : VKPrimitiveGroup
             else
             {
                 p.BaseColorTexture = Texture.GetOrCreate(
-                    $"{_asset.Model.Name}-baseColor-{baseColorImage.LogicalIndex}", baseColorImage);
+                    $"{_asset.Model.Name}-baseColor-{baseColorImage.LogicalIndex}", baseColorImage,
+                    TextureMipPolicy.Color);
                 p.MaterialParams.UseAlbedoMap = 1u;
             }
 
@@ -760,7 +761,8 @@ internal unsafe class VKModel : VKPrimitiveGroup
             else
             {
                 p.NormalTexture = Texture.GetOrCreate(
-                    $"{_asset.Model.Name}-normal-{normalImage.LogicalIndex}", normalImage);
+                    $"{_asset.Model.Name}-normal-{normalImage.LogicalIndex}", normalImage,
+                    TextureMipPolicy.Normal);
                 p.MaterialParams.UseNormalMap = 1u;
             }
 
@@ -773,7 +775,8 @@ internal unsafe class VKModel : VKPrimitiveGroup
             else
             {
                 p.MetallicRoughnessTexture = Texture.GetOrCreate(
-                    $"{_asset.Model.Name}-metallicRoughness-{metallicRoughnessImage.LogicalIndex}", metallicRoughnessImage);
+                    $"{_asset.Model.Name}-metallicRoughness-{metallicRoughnessImage.LogicalIndex}", metallicRoughnessImage,
+                    TextureMipPolicy.Linear);
                 p.MaterialParams.UseMetallicRoughnessMap = 1u;
             }
 
@@ -785,7 +788,8 @@ internal unsafe class VKModel : VKPrimitiveGroup
             else
             {
                 p.OcclusionTexture = Texture.GetOrCreate(
-                    $"{_asset.Model.Name}-occlusion-{occlusionImage.LogicalIndex}", occlusionImage);
+                    $"{_asset.Model.Name}-occlusion-{occlusionImage.LogicalIndex}", occlusionImage,
+                    TextureMipPolicy.Linear);
                 p.MaterialParams.UseOcclusionMap = 1u;
             }
 
@@ -798,7 +802,8 @@ internal unsafe class VKModel : VKPrimitiveGroup
             else
             {
                 p.EmissiveTexture = Texture.GetOrCreate(
-                    $"{_asset.Model.Name}-emissive-{emissiveImage.LogicalIndex}", emissiveImage);
+                    $"{_asset.Model.Name}-emissive-{emissiveImage.LogicalIndex}", emissiveImage,
+                    TextureMipPolicy.Color);
                 p.MaterialParams.UseEmissiveMap = 1u;
                 p.MaterialParams.EmissiveFactor = gLTFMaterial1!.EmissiveFactor.AsVector4();
             }

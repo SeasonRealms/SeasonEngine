@@ -55,13 +55,15 @@ internal unsafe class TextureUploadBatch : IDisposable
     {
         if (_tasks.Count == 0) return;
 
-        // 1. Calculate the total size and align to 4 bytes (CmdCopyBufferToImage requires 4-byte alignment by default)
+        // 1. Calculate the total size and align to 4 bytes (CmdCopyBufferToImage requires 4-byte alignment by default).
+        // 2-6 clause 4: the size must come from ImageData rather than Width*Height*4, because a texture that owns a
+        // mip chain carries every level in that same buffer.
         ulong totalSize = 0;
         var offsets = new ulong[_tasks.Count];
         for (int i = 0; i < _tasks.Count; i++)
         {
             offsets[i] = totalSize;
-            ulong size = (ulong)(_tasks[i].Width * _tasks[i].Height * 4);
+            ulong size = (ulong)(_tasks[i].ImageData?.Length ?? (int)(_tasks[i].Width * _tasks[i].Height * 4));
             totalSize += AlignUp(size, 4);
         }
 
@@ -82,7 +84,7 @@ internal unsafe class TextureUploadBatch : IDisposable
                 var t = _tasks[i];
                 if (t.ImageData == null) continue;
                 fixed (byte* pSrc = t.ImageData)
-                    Unsafe.CopyBlock(basePtr + offsets[i], pSrc, (uint)(t.Width * t.Height * 4));
+                    Unsafe.CopyBlock(basePtr + offsets[i], pSrc, (uint)t.ImageData.Length);
             }
             _vk.UnmapMemory(_device, staging.Memory);
 
@@ -102,23 +104,38 @@ internal unsafe class TextureUploadBatch : IDisposable
                 // Undefined → TransferDstOptimal
                 BarrierToTransferDst(cmd, t);
 
-                // CopyBufferToImage
-                var region = new BufferImageCopy
+                // CopyBufferToImage, one region per subresource. This degenerates to the pre-2-6 single region
+                // whenever MipLevels is 1, since MipInfos then holds exactly level 0 at offset 0.
+                var regions = new BufferImageCopy[t.MipLevels];
+                for (uint level = 0; level < t.MipLevels; level++)
                 {
-                    BufferOffset = offsets[i],
-                    BufferRowLength = 0,        // tightly packed
-                    BufferImageHeight = 0,
-                    ImageSubresource = new ImageSubresourceLayers
+                    var info = t.MipInfos != null
+                        ? t.MipInfos[level]
+                        : new MipLevelInfo((int)t.Width, (int)t.Height, 0);
+                    regions[level] = new BufferImageCopy
                     {
-                        AspectMask = ImageAspectFlags.ColorBit,
-                        MipLevel = 0,
-                        BaseArrayLayer = 0,
-                        LayerCount = 1
-                    },
-                    ImageOffset = new Offset3D(0, 0, 0),
-                    ImageExtent = new Extent3D(t.Width, t.Height, 1)
-                };
-                _vk.CmdCopyBufferToImage(cmd, staging.Buffer, t.Image, ImageLayout.TransferDstOptimal, 1, in region);
+                        // Per-level offsets are relative to this texture's own block, so the batch offset shifts the
+                        // whole layout rather than being folded into each level.
+                        BufferOffset = offsets[i] + (ulong)info.ByteOffset,
+                        BufferRowLength = 0,        // tightly packed
+                        BufferImageHeight = 0,
+                        ImageSubresource = new ImageSubresourceLayers
+                        {
+                            AspectMask = ImageAspectFlags.ColorBit,
+                            MipLevel = level,
+                            BaseArrayLayer = 0,
+                            LayerCount = 1
+                        },
+                        ImageOffset = new Offset3D(0, 0, 0),
+                        ImageExtent = new Extent3D((uint)info.Width, (uint)info.Height, 1)
+                    };
+                }
+
+                fixed (BufferImageCopy* pRegions = regions)
+                {
+                    _vk.CmdCopyBufferToImage(cmd, staging.Buffer, t.Image,
+                        ImageLayout.TransferDstOptimal, t.MipLevels, pRegions);
+                }
             }
 
             _vk.EndCommandBuffer(cmd);
@@ -188,7 +205,7 @@ internal unsafe class TextureUploadBatch : IDisposable
             {
                 AspectMask = ImageAspectFlags.ColorBit,
                 BaseMipLevel = 0,
-                LevelCount = 1,
+                LevelCount = t.MipLevels,
                 BaseArrayLayer = 0,
                 LayerCount = 1
             },

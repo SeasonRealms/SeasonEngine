@@ -34,6 +34,33 @@ internal sealed class Texture : IDisposable
     /// <summary>Raw RGBA8 pixel data. It can be discarded immediately after TextureUploadBatch copies it into the staging buffer.</summary>
     public byte[]? ImageData;
 
+    /// <summary>
+    /// 2-6 clause 4: mip level count of this texture. Stays 1 unless MipChain.ShouldGenerate approved a chain for the
+    /// requested policy, so every pre-2-6 caller keeps the single-level layout untouched.
+    /// </summary>
+    public uint MipLevels = 1;
+
+    /// <summary>
+    /// Geometry of each level inside <see cref="ImageData"/>, tightly packed with no row padding. Metal takes an
+    /// explicit sourceBytesPerRow per copy, so the level width carried here is what the blit encoder needs and no
+    /// separate upload-heap layout has to be derived as on D3D12.
+    /// </summary>
+    public MipLevelInfo[]? MipInfos;
+
+    /// <summary>
+    /// The policy this texture was created with, retained so in-place replacement through <see cref="UploadPixels"/>
+    /// can regenerate the chain instead of leaving levels 1..N holding stale content.
+    /// </summary>
+    TextureMipPolicy _mipPolicy = TextureMipPolicy.None;
+
+    /// <summary>
+    /// Key this texture occupies in Device.DictionaryTexture, which is not always <see cref="Name"/>: once a mip
+    /// policy participates in cache identity the key carries a suffix. Dispose must remove that exact key, otherwise
+    /// the dictionary would keep handing a released texture to the next GetOrCreate with the same policy.
+    /// Empty for textures registered by other paths, which key on Name.
+    /// </summary>
+    string _cacheKey = string.Empty;
+
     int _refCount = 1;
 
     public int RefCount => _refCount;
@@ -45,22 +72,37 @@ internal sealed class Texture : IDisposable
         if (Interlocked.Decrement(ref _refCount) == 0) Dispose();
     }
 
-    void ProcessImageResult(INativeImageDecoder imageResult)
+    void ProcessImageResult(INativeImageDecoder imageResult, TextureMipPolicy mipPolicy)
     {
         Width = (uint)imageResult.Width;
         Height = (uint)imageResult.Height;
         ImageData = imageResult.PixelSpan.ToArray();
 
-        Image = Device.ResourceManager.CreateTexture2D((int)Width, (int)Height, Format);
+        // 2-6 clause 3: generate before creating the MTLTexture, because the level count has to be baked into the
+        // descriptor. The array above is already tightly packed, which is exactly what MipChain.Build requires.
+        if (MipChain.ShouldGenerate(mipPolicy, (int)Width, (int)Height))
+        {
+            ImageData = MipChain.Build(ImageData, (int)Width, (int)Height, mipPolicy, out var infos);
+            MipInfos = infos;
+            MipLevels = (uint)infos.Length;
+            _mipPolicy = mipPolicy;
+        }
+        else
+        {
+            MipInfos = [new MipLevelInfo((int)Width, (int)Height, 0)];
+            MipLevels = 1;
+        }
+
+        Image = Device.ResourceManager.CreateTexture2D((int)Width, (int)Height, Format, MipLevels);
         Device.TextureUploadBatch.AddTextureUpload(this);
     }
 
-    internal Texture(INativeImageDecoder imageResult)
+    internal Texture(INativeImageDecoder imageResult, TextureMipPolicy mipPolicy = TextureMipPolicy.None)
     {
-        ProcessImageResult(imageResult);
+        ProcessImageResult(imageResult, mipPolicy);
     }
 
-    internal Texture(string name, SharpGLTF.Schema2.Image? image)
+    internal Texture(string name, SharpGLTF.Schema2.Image? image, TextureMipPolicy mipPolicy = TextureMipPolicy.None)
     {
         Name = name;
         INativeImageDecoder imageResult;
@@ -80,26 +122,35 @@ internal sealed class Texture : IDisposable
             imageResult = ImageUtils.GetImageFromStream(stream, null);
         }
 
-        ProcessImageResult(imageResult);
+        ProcessImageResult(imageResult, mipPolicy);
     }
 
-    internal static Texture GetOrCreate(string name, SharpGLTF.Schema2.Image? image)
+    internal static Texture GetOrCreate(string name, SharpGLTF.Schema2.Image? image,
+        TextureMipPolicy mipPolicy = TextureMipPolicy.None)
     {
-        if (Device.DictionaryTexture.TryGetValue(name, out var texture))
+        // 2-6 clause 4: the policy is part of the cache identity. The same image can legitimately be bound as base
+        // colour in one material and as a normal map in another, and those two need different chains (one box
+        // filtered, one renormalized). The suffix is only appended for non-default policies so every pre-2-6 key
+        // stays byte-identical.
+        string key = mipPolicy == TextureMipPolicy.None ? name : $"{name}#mip{mipPolicy}";
+
+        if (Device.DictionaryTexture.TryGetValue(key, out var texture))
         {
             texture.AddRef();
             return texture;
         }
 
-        texture = new Texture(name, image);
-        Device.DictionaryTexture[name] = texture;
+        texture = new Texture(name, image, mipPolicy);
+        texture._cacheKey = key;
+        Device.DictionaryTexture[key] = texture;
         return texture;
     }
 
     /// <summary>Create a new texture directly from decoded pixels without joining the global cache. The caller owns the lifetime.</summary>
-    internal static Texture CreateFromDecoder(INativeImageDecoder decoder)
+    internal static Texture CreateFromDecoder(INativeImageDecoder decoder,
+        TextureMipPolicy mipPolicy = TextureMipPolicy.None)
     {
-        return new Texture(decoder);
+        return new Texture(decoder, mipPolicy);
     }
 
     /// <summary>
@@ -114,30 +165,47 @@ internal sealed class Texture : IDisposable
                 $"Pixel data size mismatch. Expected {expectedSize} bytes for {Width}×{Height}, got {rgbaPixels.Length}.");
 
         var mtlDevice = Device.MtlDevice;
-        var staging = mtlDevice.CreateBuffer((nuint)expectedSize, MTLResourceOptions.StorageModeShared)
+
+        // 2-6 clause 4: in-place replacement has to refresh the whole chain. The incoming span only describes level 0,
+        // so if this texture owns a chain the lower levels are regenerated here - otherwise they would keep showing the
+        // previous content at distance, which is far harder to diagnose than no mipmaps at all.
+        byte[]? chain = null;
+        MipLevelInfo[]? chainInfos = null;
+        if (MipLevels > 1)
+            chain = MipChain.Build(rgbaPixels, (int)Width, (int)Height, _mipPolicy, out chainInfos);
+
+        int stagingSize = chain?.Length ?? expectedSize;
+        var staging = mtlDevice.CreateBuffer((nuint)stagingSize, MTLResourceOptions.StorageModeShared)
             ?? throw new Exception("staging IMTLBuffer.CreateBuffer failed");
 
         try
         {
             // Copy pixels into the staging buffer through an intermediate array to avoid pointer manipulation.
-            var pixels = rgbaPixels.ToArray();
-            System.Runtime.InteropServices.Marshal.Copy(pixels, 0, staging.Contents, expectedSize);
+            var pixels = chain ?? rgbaPixels.ToArray();
+            System.Runtime.InteropServices.Marshal.Copy(pixels, 0, staging.Contents, stagingSize);
 
             // Blit copy
             var cmd = Device.GraphicsQueue.CreateCommandBuffer();
             var blit = cmd.CreateBlitCommandEncoder(new MTLBlitPassDescriptor())
                 ?? throw new Exception("CreateBlitCommandEncoder failed");
 
-            blit.CopyFromBuffer(
-                staging,
-                0,
-                (nuint)(Width * 4),
-                (nuint)(Width * Height * 4),
-                new MTLSize((nint)Width, (nint)Height, 1),
-                Image,
-                0,
-                0,
-                new MTLOrigin(0, 0, 0));
+            // One CopyFromBuffer per subresource; this degenerates to the pre-2-6 single copy when MipLevels is 1.
+            for (uint level = 0; level < MipLevels; level++)
+            {
+                var info = chainInfos != null
+                    ? chainInfos[level]
+                    : new MipLevelInfo((int)Width, (int)Height, 0);
+                blit.CopyFromBuffer(
+                    staging,
+                    (nuint)info.ByteOffset,
+                    (nuint)(info.Width * 4),
+                    (nuint)(info.Width * info.Height * 4),
+                    new MTLSize(info.Width, info.Height, 1),
+                    Image,
+                    0,
+                    (nuint)level,
+                    new MTLOrigin(0, 0, 0));
+            }
 
             blit.EndEncoding();
             cmd.Commit();
@@ -157,8 +225,9 @@ internal sealed class Texture : IDisposable
             Image = null!;
         }
 
-        if (!string.IsNullOrEmpty(Name))
-            Device.DictionaryTexture.Remove(Name);
+        var key = string.IsNullOrEmpty(_cacheKey) ? Name : _cacheKey;
+        if (!string.IsNullOrEmpty(key))
+            Device.DictionaryTexture.Remove(key);
     }
 
     /// <summary>

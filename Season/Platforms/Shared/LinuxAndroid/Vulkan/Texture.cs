@@ -53,6 +53,33 @@ internal unsafe class Texture : IDisposable
     /// <summary>Raw pixel data, RGBA8. It can be discarded after TextureUploadBatch copies it into the staging buffer.</summary>
     public byte[]? ImageData;
 
+    /// <summary>
+    /// 2-6 clause 4: mip level count of this image. Stays 1 unless MipChain.ShouldGenerate approved a chain for the
+    /// requested policy, so every pre-2-6 caller keeps the single-level layout untouched.
+    /// </summary>
+    public uint MipLevels = 1;
+
+    /// <summary>
+    /// Geometry of each level inside <see cref="ImageData"/>, tightly packed with no row padding. Vulkan needs no
+    /// per-level pitch conversion - BufferRowLength 0 means "derive from ImageExtent" - so the byte offset carried
+    /// here is directly usable as BufferOffset, which is why no upload-heap counterpart is needed as on D3D12.
+    /// </summary>
+    public MipLevelInfo[]? MipInfos;
+
+    /// <summary>
+    /// The policy this texture was created with, retained so in-place replacement through <see cref="UploadPixels"/>
+    /// can regenerate the chain instead of leaving levels 1..N holding stale content.
+    /// </summary>
+    TextureMipPolicy _mipPolicy = TextureMipPolicy.None;
+
+    /// <summary>
+    /// Key this texture occupies in Device.DictionaryTexture, which is not always <see cref="Name"/>: once a mip
+    /// policy participates in cache identity the key carries a suffix. Dispose must remove that exact key, otherwise
+    /// the dictionary would keep handing a released texture to the next GetOrCreate with the same policy.
+    /// Empty for textures registered by other paths, which key on Name.
+    /// </summary>
+    string _cacheKey = string.Empty;
+
     int _refCount = 1;
 
     public int RefCount => _refCount;
@@ -64,7 +91,7 @@ internal unsafe class Texture : IDisposable
         if (Interlocked.Decrement(ref _refCount) == 0) Dispose();
     }
 
-    void ProcessImageResult(INativeImageDecoder imageResult)
+    void ProcessImageResult(INativeImageDecoder imageResult, TextureMipPolicy mipPolicy)
     {
         Width = (uint)imageResult.Width;
         Height = (uint)imageResult.Height;
@@ -110,18 +137,41 @@ internal unsafe class Texture : IDisposable
             }
         }
 
+        BuildMipChain(mipPolicy);
+
         CreateImageResource();
         CreateImageView();
 
         Device.TextureUploadBatch.AddTextureUpload(this);
     }
 
-    internal Texture(INativeImageDecoder imageResult)
+    /// <summary>
+    /// 2-6 clause 3: the de-strided buffer produced above is exactly the tightly packed input MipChain.Build requires,
+    /// which is why generation belongs here - this is the first point where the pixels are in a known-dense layout and
+    /// the last point before the image is created with a level count baked into it.
+    /// </summary>
+    void BuildMipChain(TextureMipPolicy mipPolicy)
     {
-        ProcessImageResult(imageResult);
+        if (ImageData != null && MipChain.ShouldGenerate(mipPolicy, (int)Width, (int)Height))
+        {
+            ImageData = MipChain.Build(ImageData, (int)Width, (int)Height, mipPolicy, out var infos);
+            MipInfos = infos;
+            MipLevels = (uint)infos.Length;
+            _mipPolicy = mipPolicy;
+        }
+        else
+        {
+            MipInfos = [new MipLevelInfo((int)Width, (int)Height, 0)];
+            MipLevels = 1;
+        }
     }
 
-    internal Texture(string name, SharpGLTF.Schema2.Image? image)
+    internal Texture(INativeImageDecoder imageResult, TextureMipPolicy mipPolicy = TextureMipPolicy.None)
+    {
+        ProcessImageResult(imageResult, mipPolicy);
+    }
+
+    internal Texture(string name, SharpGLTF.Schema2.Image? image, TextureMipPolicy mipPolicy = TextureMipPolicy.None)
     {
         Name = name;
         INativeImageDecoder imageResult;
@@ -141,26 +191,35 @@ internal unsafe class Texture : IDisposable
             imageResult = ImageUtils.GetImageFromStream(stream, null);
         }
 
-        ProcessImageResult(imageResult);
+        ProcessImageResult(imageResult, mipPolicy);
     }
 
-    internal static Texture GetOrCreate(string name, SharpGLTF.Schema2.Image? image)
+    internal static Texture GetOrCreate(string name, SharpGLTF.Schema2.Image? image,
+        TextureMipPolicy mipPolicy = TextureMipPolicy.None)
     {
-        if (Device.DictionaryTexture.TryGetValue(name, out var texture))
+        // 2-6 clause 4: the policy is part of the cache identity. The same image can legitimately be bound as base
+        // colour in one material and as a normal map in another, and those two need different chains (one box
+        // filtered, one renormalized). The suffix is only appended for non-default policies so every pre-2-6 key
+        // stays byte-identical.
+        string key = mipPolicy == TextureMipPolicy.None ? name : $"{name}#mip{mipPolicy}";
+
+        if (Device.DictionaryTexture.TryGetValue(key, out var texture))
         {
             texture.AddRef();
             return texture;
         }
 
-        texture = new Texture(name, image);
-        Device.DictionaryTexture.Add(name, texture);
+        texture = new Texture(name, image, mipPolicy);
+        texture._cacheKey = key;
+        Device.DictionaryTexture.Add(key, texture);
         return texture;
     }
 
     /// <summary>Create a new texture directly from decoded pixels. It is not added to the global cache and its lifetime is managed by the caller.</summary>
-    internal static Texture CreateFromDecoder(INativeImageDecoder decoder)
+    internal static Texture CreateFromDecoder(INativeImageDecoder decoder,
+        TextureMipPolicy mipPolicy = TextureMipPolicy.None)
     {
-        return new Texture(decoder);
+        return new Texture(decoder, mipPolicy);
     }
 
     /// <summary>
@@ -177,7 +236,18 @@ internal unsafe class Texture : IDisposable
         var vk = Device.Vk;
         var d = Device.LogicalDevice;
         var rm = Device.ResourceManager;
-        ulong size = (ulong)expectedSize;
+
+        // 2-6 clause 4: in-place replacement has to refresh the whole chain. The incoming span only describes level 0,
+        // so if this texture owns a chain the lower levels are regenerated here - otherwise they would keep showing the
+        // previous content at distance, which is far harder to diagnose than no mipmaps at all.
+        byte[]? chain = null;
+        MipLevelInfo[]? chainInfos = null;
+        if (MipLevels > 1)
+        {
+            chain = MipChain.Build(rgbaPixels, (int)Width, (int)Height, _mipPolicy, out chainInfos);
+        }
+
+        ulong size = (ulong)(chain?.Length ?? expectedSize);
 
         // 1. Create the staging buffer, HOST_VISIBLE | HOST_COHERENT.
         var staging = rm.CreateBuffer(size,
@@ -188,8 +258,16 @@ internal unsafe class Texture : IDisposable
         {
             void* mapped;
             vk.MapMemory(d, staging.Memory, 0, size, 0, &mapped);
-            fixed (byte* src = rgbaPixels)
-                Unsafe.CopyBlock(mapped, src, (uint)expectedSize);
+            if (chain != null)
+            {
+                fixed (byte* src = chain)
+                    Unsafe.CopyBlock(mapped, src, (uint)chain.Length);
+            }
+            else
+            {
+                fixed (byte* src = rgbaPixels)
+                    Unsafe.CopyBlock(mapped, src, (uint)expectedSize);
+            }
             vk.UnmapMemory(d, staging.Memory);
 
             // 2. Allocate a one-time transfer command buffer.
@@ -221,24 +299,36 @@ internal unsafe class Texture : IDisposable
                 PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit,
                 0, AccessFlags.TransferWriteBit);
 
-            // 4. CopyBufferToImage
-            var copyRegion = new BufferImageCopy
+            // 4. CopyBufferToImage, one region per subresource. Every level is tightly packed, so its byte offset in
+            // the staging buffer is already a multiple of the 4-byte RGBA8 texel size that vkCmdCopyBufferToImage
+            // demands, and BufferRowLength 0 lets the driver derive the pitch from ImageExtent.
+            var copies = new BufferImageCopy[MipLevels];
+            for (uint level = 0; level < MipLevels; level++)
             {
-                BufferOffset = 0,
-                BufferRowLength = 0,
-                BufferImageHeight = 0,
-                ImageSubresource = new ImageSubresourceLayers
+                var info = chainInfos != null
+                    ? chainInfos[level]
+                    : new MipLevelInfo((int)Width, (int)Height, 0);
+                copies[level] = new BufferImageCopy
                 {
-                    AspectMask = ImageAspectFlags.ColorBit,
-                    MipLevel = 0,
-                    BaseArrayLayer = 0,
-                    LayerCount = 1
-                },
-                ImageOffset = new Offset3D(0, 0, 0),
-                ImageExtent = new Extent3D(Width, Height, 1)
-            };
-            vk.CmdCopyBufferToImage(cmd, staging.Buffer, Image,
-                ImageLayout.TransferDstOptimal, 1, in copyRegion);
+                    BufferOffset = (ulong)info.ByteOffset,
+                    BufferRowLength = 0,
+                    BufferImageHeight = 0,
+                    ImageSubresource = new ImageSubresourceLayers
+                    {
+                        AspectMask = ImageAspectFlags.ColorBit,
+                        MipLevel = level,
+                        BaseArrayLayer = 0,
+                        LayerCount = 1
+                    },
+                    ImageOffset = new Offset3D(0, 0, 0),
+                    ImageExtent = new Extent3D((uint)info.Width, (uint)info.Height, 1)
+                };
+            }
+            fixed (BufferImageCopy* pCopies = copies)
+            {
+                vk.CmdCopyBufferToImage(cmd, staging.Buffer, Image,
+                    ImageLayout.TransferDstOptimal, MipLevels, pCopies);
+            }
 
             // 5. Barrier: TransferDst to ShaderReadOnly.
             // The transfer queue must not reference FragmentShader stages or accesses.
@@ -281,7 +371,7 @@ internal unsafe class Texture : IDisposable
             ImageType = ImageType.Type2D,
             Format = Format,
             Extent = new Extent3D(Width, Height, 1),
-            MipLevels = 1,
+            MipLevels = MipLevels,
             ArrayLayers = 1,
             Samples = SampleCountFlags.Count1Bit,
             Tiling = ImageTiling.Optimal,
@@ -326,7 +416,7 @@ internal unsafe class Texture : IDisposable
             {
                 AspectMask = ImageAspectFlags.ColorBit,
                 BaseMipLevel = 0,
-                LevelCount = 1,
+                LevelCount = MipLevels,
                 BaseArrayLayer = 0,
                 LayerCount = 1
             }
@@ -359,7 +449,9 @@ internal unsafe class Texture : IDisposable
             {
                 AspectMask = ImageAspectFlags.ColorBit,
                 BaseMipLevel = 0,
-                LevelCount = 1,
+                // 2-6 clause 4: the whole chain transitions as one unit. Levels are never in different layouts here,
+                // because every level is written by the same upload command buffer and read by the same sampler.
+                LevelCount = MipLevels,
                 BaseArrayLayer = 0,
                 LayerCount = 1
             },
@@ -714,6 +806,6 @@ internal unsafe class Texture : IDisposable
             if (oldMemory.Handle != 0) vk.FreeMemory(d, oldMemory, null);
         });
 
-        Device.DictionaryTexture.Remove(Name);
+        Device.DictionaryTexture.Remove(string.IsNullOrEmpty(_cacheKey) ? Name : _cacheKey);
     }
 }
