@@ -26,6 +26,7 @@
 		<Compile Include="..\Engine\GlobalUsings.cs" Link="GlobalUsings.cs" />
 		<Compile Include="..\Engine\AI\*.cs" />
 		<Compile Include="..\Engine\Panels\*.cs" />
+		<Compile Include="..\Engine\Panels\SeasonAI\*.cs" />
 		<Compile Include="..\Engine\Management\*.cs" />
 
 		<Content Include="..\Engine\Resources\Raw\Assets\*.*">
