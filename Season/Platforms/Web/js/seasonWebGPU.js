@@ -625,7 +625,11 @@ window.seasonWebGPU = (() => {
     // FPS / frame-time statistics
     let _fpsLastSec = 0, _fpsFrameCount = 0, _fpsMaxFrameMs = 0, _fpsFrameStartMs = 0;
 
-    async function initialize(canvasId, shaderSource, blitShaderSource, hdrSceneColor, shadowDepthBias, shadowSlopeBias, velocityOutput) {
+    // overlayShaderSource is accepted but not yet consumed: the C# side already derives an HDR_CHAIN=false module for
+    // the Overlay family and passes it here, while this backend still bakes the overlay PSOs from the main module.
+    // The parameter is declared so the positional slot is visible rather than silently dropped, which is what let the
+    // trailing maxAnisotropy argument be added safely behind it.
+    async function initialize(canvasId, shaderSource, blitShaderSource, hdrSceneColor, shadowDepthBias, shadowSlopeBias, velocityOutput, overlayShaderSource, maxAnisotropy = 1) {
         _mesh3DShader = shaderSource;
         _blitShaderWGSL = blitShaderSource;
         // 1-5 contract 4:
@@ -697,12 +701,18 @@ window.seasonWebGPU = (() => {
         // 2-6 clause 5: mipmapFilter defaults to 'nearest' in WebGPU, which would snap between levels at the LOD
         // boundary and make a mipmapped texture pop more visibly than an unfiltered one - the opposite of the point.
         // It has no effect on the single-level textures this sampler also serves, so it is set unconditionally.
+        //
+        // 2-6 clause 6: maxAnisotropy is only honoured when magFilter, minFilter and mipmapFilter are all 'linear',
+        // which the three lines below guarantee. The value is already clamped to [1,16] on the C# side; WebGPU clamps
+        // further to whatever the implementation supports, so an unsupported count degrades rather than throwing.
+        const _aniso = Math.max(1, Math.min(16, maxAnisotropy | 0));
         _samplers['linear'] = _device.createSampler({
             magFilter: 'linear',
             minFilter: 'linear',
             mipmapFilter: 'linear',
             addressModeU: 'clamp-to-edge',
             addressModeV: 'clamp-to-edge',
+            maxAnisotropy: _aniso,
         });
 
         // 2-5 Step C: wrap sampler for cloud noise (binding 20, Repeat).

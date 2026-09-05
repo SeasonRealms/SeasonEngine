@@ -517,7 +517,10 @@ internal class Graphics : IGraphics
             : null;
         await _jsRuntime.InvokeVoidAsync("seasonWebGPU.initialize", _canvasId, meshShader, WebGPUPipeline.BlitShader, HdrSceneColor,
             RenderQuality.Current.ShadowDepthBias, RenderQuality.Current.ShadowSlopeScaledDepthBias,
-            velocityOutput, overlayMeshShader);
+            velocityOutput, overlayMeshShader,
+            // 2-6 clause 6: clamped here rather than in JS so all four backends resolve the count through the same
+            // helper; the JS side re-clamps only because a stale host mirror could otherwise pass an illegal value.
+            RenderQuality.ClampAnisotropy(RenderQuality.Current.TextureMaxAnisotropy));
         _initialized = true;
     }
 
@@ -896,22 +899,57 @@ internal class Graphics : IGraphics
     }
 
 
-    async Task<bool> LoadTextureAsync(string name, bool deferDecodeToNextFrame = false)
+    /// <summary>
+    /// Loads one asset-backed texture and registers it under the policy-keyed name from
+    /// <see cref="MipChain.CacheKey"/>, so a material's chained copy of a file is a different entry from the bare-path
+    /// one a Sprite registers for that same file. Sprites ask with no policy and therefore keep the bare path they
+    /// always had; only a caller that states a policy gets a separate, chained entry.
+    /// </summary>
+    async Task<bool> LoadTextureAsync(string name, bool deferDecodeToNextFrame = false,
+        TextureMipPolicy mipPolicy = TextureMipPolicy.None)
     {
-        if (DictionaryWGPUTexture.ContainsKey(name))
+        var key = MipChain.CacheKey(name, mipPolicy);
+        if (DictionaryWGPUTexture.ContainsKey(key))
         {
             return true;
         }
 
-        var url = ResolveAssetPath(name);
-        var totalStopwatch = System.Diagnostics.Stopwatch.StartNew();
-        var result = await _jsRuntime.InvokeAsync<WebTextureUploadResult>("seasonWebGPU.loadTexture", name, url, deferDecodeToNextFrame);
-        var success = result?.success == true;
-        if (success)
+        // 2-6 clause 3: once a policy is asked for, the encoded bytes are fetched on the C# side so MipChain builds
+        // the chain here rather than a JS-side filter doing it, which is what keeps the levels bit-identical to the
+        // three native backends. The cost is honest: LoadFileAsync writes every miss back into WebDeviceCore's file
+        // cache, so the encoded bytes stay resident for the process lifetime.
+        //
+        // 2-6 clause 5: a normal map takes this route even with mipmaps off, because its alpha channel belongs to the
+        // engine and only MipChain writes it. Skipping it here would make this the one backend where an authored alpha
+        // in a normal map reaches the shader and is read as a variance measurement.
+        WebTextureUploadResult result = null;
+        if (mipPolicy == TextureMipPolicy.Normal || (mipPolicy != TextureMipPolicy.None && RenderQuality.Current.TextureMipmaps))
         {
-            DictionaryWGPUTexture[name] = new WGPUTexture
+            try
             {
-                Name = name,
+                var encodedBytes = await StorageService.LoadBytesAsync(name);
+                result = await UploadEncodedTextureWithMips(key, encodedBytes, mipPolicy);
+            }
+            catch (Exception ex)
+            {
+                DeviceServices.BaseApp.AddLog(LogType.Error,
+                    $"{DateTime.UtcNow} [LoadTextureAsync] {name} byte fetch failed, falling back to the JS fetch: {ex.Message}");
+            }
+        }
+
+        // The fallback registers under the same key, so a failure here costs the chain and not the texture. The url
+        // still comes from the bare name: the key names the cache entry, it was never the address of the asset.
+        if (result?.success != true)
+        {
+            var url = ResolveAssetPath(name);
+            result = await _jsRuntime.InvokeAsync<WebTextureUploadResult>("seasonWebGPU.loadTexture", key, url, deferDecodeToNextFrame);
+        }
+
+        if (result?.success == true)
+        {
+            DictionaryWGPUTexture[key] = new WGPUTexture
+            {
+                Name = key,
                 Width = (uint)(result?.width ?? 0),
                 Height = (uint)(result?.height ?? 0),
             };
@@ -1759,26 +1797,22 @@ internal class Graphics : IGraphics
         _ => TextureMipPolicy.Color,
     };
 
-    /// <summary>Surface-slot form of <see cref="MipPolicyForChannel"/>.</summary>
-    static TextureMipPolicy MipPolicyForSurfaceSlot(SurfaceTextureSlot slot) => slot switch
-    {
-        SurfaceTextureSlot.Normal => TextureMipPolicy.Normal,
-        SurfaceTextureSlot.MetallicRoughness => TextureMipPolicy.Linear,
-        SurfaceTextureSlot.Occlusion => TextureMipPolicy.Linear,
-        _ => TextureMipPolicy.Color,
-    };
+    /// <summary>
+    /// Surface-slot form of <see cref="MipPolicyForChannel"/>. Delegates to the shared mapping rather than repeating
+    /// it, because the duplicated copies are exactly what let the three native backends miss this policy on their
+    /// pixel branch while this one had it.
+    /// </summary>
+    static TextureMipPolicy MipPolicyForSurfaceSlot(SurfaceTextureSlot slot) => MipChain.PolicyForSurfaceSlot(slot);
 
     /// <summary>
     /// 2-6 clause 3: builds the packed chain for pixels the C# side already holds, returning the level count to pass
     /// as the trailing createTextureFromPixels argument. Unlike the glTF path this costs no interop round trip, so
-    /// every material texture fed from a pixel source gets the same treatment as one loaded from the asset.
+    /// every material texture fed from a pixel source gets the same treatment as one loaded from the asset. Routed
+    /// through Prepare so a normal map denied a chain still gets clause 5's alpha contract.
     /// </summary>
     static int BuildMipChainForUpload(ref byte[] rgba, int width, int height, TextureMipPolicy policy)
     {
-        if (!MipChain.ShouldGenerate(policy, width, height))
-            return 1;
-
-        rgba = MipChain.Build(rgba, width, height, policy, out var levels);
+        rgba = MipChain.Prepare(rgba, width, height, policy, out var levels);
         return levels.Length;
     }
 
@@ -1800,13 +1834,18 @@ internal class Graphics : IGraphics
         // 2-6 clause 3: the chain is generated by MipChain on the C# side rather than by a JS-side filter, so this
         // backend stores levels bit-identical to the other three. The price is a pixel round trip - the browser is
         // the only decoder available here, so encoded bytes go out, RGBA8 comes back, and the packed chain goes out
-        // again - and it is paid only when a chain is actually wanted. With mipmaps off, the encoded bytes still go
-        // straight to createImageBitmap exactly as before.
+        // again - and it is paid only when the pixels actually have to be touched. With mipmaps off, the encoded bytes
+        // still go straight to createImageBitmap exactly as before.
+        //
+        // 2-6 clause 5: a normal map is the one exception to that. Its alpha channel belongs to the engine, so it has
+        // to pass through MipChain even with mipmaps off - the other three backends get this for free because they
+        // decode on the CPU regardless, and letting this one skip it would leave a normal map that packs something in
+        // alpha shaded differently on the web than everywhere else.
         var policy = MipPolicyForChannel(channel);
         var uploadStopwatch = System.Diagnostics.Stopwatch.StartNew();
         WebTextureUploadResult result = null;
-        if (policy != TextureMipPolicy.None && RenderQuality.Current.TextureMipmaps)
-            result = await UploadGltfImageTextureWithMips(texName, encodedBytes, policy);
+        if (policy == TextureMipPolicy.Normal || (policy != TextureMipPolicy.None && RenderQuality.Current.TextureMipmaps))
+            result = await UploadEncodedTextureWithMips(texName, encodedBytes, policy);
 
         if (result?.success != true)
         {
@@ -1830,11 +1869,12 @@ internal class Graphics : IGraphics
     }
 
     /// <summary>
-    /// Decode-then-generate upload for one glTF image. Returns null when the browser decode or the multi-level
-    /// upload fails, so the caller falls back to the direct createImageBitmap path: losing the chain is a quality
-    /// regression, losing the texture would be a visible defect.
+    /// Decode-then-generate upload for one encoded image, whether it came out of a glTF container or off the asset
+    /// path. Returns null when the browser decode or the multi-level upload fails, so the caller falls back to the
+    /// direct createImageBitmap path: losing the chain is a quality regression, losing the texture would be a
+    /// visible defect.
     /// </summary>
-    async Task<WebTextureUploadResult> UploadGltfImageTextureWithMips(string texName, byte[] encodedBytes, TextureMipPolicy policy)
+    async Task<WebTextureUploadResult> UploadEncodedTextureWithMips(string texName, byte[] encodedBytes, TextureMipPolicy policy)
     {
         try
         {
@@ -1845,14 +1885,9 @@ internal class Graphics : IGraphics
                 decoded.RgbaData.Length < decoded.Width * decoded.Height * 4)
                 return null;
 
-            // The canvas readback is tightly packed RGBA8, which is exactly the layout MipChain.Build requires.
-            var pixels = decoded.RgbaData;
-            int mipLevelCount = 1;
-            if (MipChain.ShouldGenerate(policy, decoded.Width, decoded.Height))
-            {
-                pixels = MipChain.Build(pixels, decoded.Width, decoded.Height, policy, out var levels);
-                mipLevelCount = levels.Length;
-            }
+            // The canvas readback is tightly packed RGBA8, which is exactly the layout MipChain requires.
+            var pixels = MipChain.Prepare(decoded.RgbaData, decoded.Width, decoded.Height, policy, out var levels);
+            int mipLevelCount = levels.Length;
 
             return await _jsRuntime.InvokeAsync<WebTextureUploadResult>("seasonWebGPU.createTextureFromPixels",
                 texName,
@@ -2179,7 +2214,7 @@ internal class Graphics : IGraphics
     /// Resolve a single Surface texture slot into a JS-side texture name:
     /// - Image branch (procedural pixels): upload directly through createTextureFromPixels with no temp file,
     ///   and register WGPUTexture metadata under the synthesized name;
-    /// - Path branch: reuse LoadTextureAsync (HTTP fetch), using the path itself as the name;
+    /// - Path branch: reuse LoadTextureAsync, which keys the entry by path plus mip policy;
     /// - Empty source: fall back to "White".
     /// </summary>
     async Task<string> ResolveSurfaceSlotTexture(string meshName, long meshId, int surfaceIndex, Surface surface, SurfaceTextureSlot slot)
@@ -2216,12 +2251,16 @@ internal class Graphics : IGraphics
             return name;
         }
 
-        // 2-6 known gap: the path branch keeps the JS-side fetch plus createImageBitmap and therefore stays
-        // single-level. Unlike the pixel branch above, the texture here is keyed by the path alone and shared with
-        // every other consumer of that path (sprites included), so giving it a chain requires the same policy-keyed
-        // cache identity the native backends use, plus moving the fetch to the C# side to get at the bytes.
-        await LoadTextureAsync(source.Path);
-        return source.Path;
+        // 2-6 clause 1: the path branch states its policy too. It stayed single-level for one round longer than the
+        // pixel branch above because its texture was keyed by the path alone and thus shared with every other consumer
+        // of that path, sprites included; the policy-keyed identity MipChain.CacheKey provides is what makes a chain
+        // safe to attach here without deciding for those other consumers.
+        // PolicyForNamedTexture rather than MipPolicyForSurfaceSlot: this slot can name a compute output instead of an
+        // asset, and such a name must keep its bare key or nothing will answer to it - LoadTextureAsync would try to
+        // fetch "compute://..." over HTTP and the resolved name would then bind White.
+        var policy = MipChain.PolicyForNamedTexture(source.Path, slot);
+        await LoadTextureAsync(source.Path!, mipPolicy: policy);
+        return MipChain.CacheKey(source.Path!, policy);
     }
 
     /// <summary>
@@ -2506,7 +2545,10 @@ internal class Graphics : IGraphics
 
     /// <summary>Prefer the snapshot resolved at Load time (including synthesized names for pixel sources and
     /// the "declared means enabled" flags). Fall back to path-based inference when no snapshot exists,
-    /// for compatibility with callers that did not go through the new loading path.</summary>
+    /// for compatibility with callers that did not go through the new loading path.
+    /// The fallback yields bare paths, never the policy-keyed names of 2-6, and that is correct rather than a
+    /// mismatch: a mesh with no snapshot never went through ResolveSurfaceSlotTexture, so no policy-keyed entry was
+    /// ever registered for it and the bare path is the only name that can name a texture here.</summary>
     static (string textureName, string normalTextureName, string metallicRoughnessTextureName, string occlusionTextureName, string emissiveTextureName, int textureFlags) GetSurfaceTextureInfo(Surface surface, WGPUMesh3D.ResolvedTextureSet resolved)
     {
         if (resolved != null)

@@ -1076,10 +1076,27 @@ fn shade(input: ShadeInput) -> vec4f {
         let T = normalize(T0 - dot(T0, N) * N);
         let B = cross(N, T) * input.tangent.w;
         let TBN = mat3x3f(T, B, N);
-        let sampledNormal = textureSample(uNormalTexture, uSampler, input.uv).rgb * 2.0 - 1.0;
+        let normalSample = textureSample(uNormalTexture, uSampler, input.uv);
+        let sampledNormal = normalSample.rgb * 2.0 - 1.0;
         // TBN built from columns must be pre-multiplied (tangent -> world, aligned with VK GLSL).
         // Post-multiplication would effectively use the transpose, i.e. the inverse transform, and produce completely wrong normals.
         N = normalize(TBN * sampledNormal);
+
+        // 2-6 clause 5, Toksvig: alpha encodes the mean resultant length of the normals this texel averaged, written
+        // by MipChain - see MipChain.Renormalize for why it stores 1 - sqrt(1 - length) rather than the length. The
+        // normalize above restores the direction but not the lobe width, so it is folded into roughness here. The
+        // combination is in GGX alpha-squared space because slope variances are what add (a_new^2 = a_old^2 + 2/kappa,
+        // with a = roughness*roughness as DistributionGGX above defines it); the D3D12 shader carries the full
+        // derivation, including why 1 - sigma^2 is reconstructed from the stored complement instead of from sigma. A
+        // no-op at 1 up to rounding, which is how RenderQuality.TextureNormalVariance switches this off from the CPU
+        // with no branch here; the denominator is guarded so that 0 saturates roughness instead of dividing by zero.
+        let t = 1.0 - normalSample.a;
+        let tSq = t * t;
+        let oneMinusSigmaSq = tSq * (2.0 - tSq);
+        let sigma = 1.0 - tSq;
+        let twoOverKappa = 2.0 * oneMinusSigmaSq / max(sigma * (2.0 + oneMinusSigmaSq), 1e-4);
+        let ggxAlpha = roughness * roughness;
+        roughness = min(1.0, sqrt(sqrt(ggxAlpha * ggxAlpha + twoOverKappa)));
     }
 
     let V = normalize(uLights.cameraPos.xyz - input.worldPos);
