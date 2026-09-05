@@ -37,6 +37,9 @@ ScaffoldingReadMe.txt
 *.snupkg
 
 # Others
+.qoder/
+.DS_Store
+Thumbs.db
 *.user
 ~$*
 *~
