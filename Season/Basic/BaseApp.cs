@@ -152,6 +152,17 @@ public abstract class BaseApp : Panel
     /// </summary>
     public static TaskCompletionSource<INativeImageDecoder?>? CaptureAppTcs;
 
+    /// <summary>
+    /// Continuous backbuffer readback request installed by <see cref="DeviceServices.Recorder"/>.
+    /// Null means no recording session is running, and the render path must then
+    /// behave exactly as it did before recording existed: the per-frame cost of
+    /// this field is one null check.
+    /// Unlike <see cref="CaptureAppTcs"/>, which is a one-shot shutter that the
+    /// backend clears after delivering a single image, this request stays
+    /// installed for the whole session and paces itself against wall-clock time.
+    /// </summary>
+    public static FrameCaptureRequest? ActiveFrameCapture;
+
     public Words Words { get; set; }
 
     public Settings Settings = null;

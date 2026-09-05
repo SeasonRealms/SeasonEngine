@@ -24,6 +24,14 @@ public static class DeviceServices
 
     public static IRecordService Record { get; private set; }
 
+    /// <summary>
+    /// Recorder for the application's own rendered output (video, later audio).
+    /// This is the "inside the engine" counterpart to <see cref="Record"/>, which
+    /// captures the microphone. Null on platforms without an implementation yet;
+    /// callers must null-check.
+    /// </summary>
+    public static IMediaRecorder Recorder { get; private set; }
+
     public static IDownloadService Download { get; private set; }
 
     public static IStoreService Store { get; private set; }
@@ -32,7 +40,7 @@ public static class DeviceServices
 
     public static IWindowsFeatures WindowsFeatures { get; private set; }
 
-    public static void Initialize(BaseApp baseApp, IDeviceCore core, IMediaPlayer media, IVideoPlayerService video, IDialogService dialog, IFileService file, IImageService image, IGalleryService gallery, IRecordService record, IDownloadService download, IStoreService store, IAds ads, IWindowsFeatures windowsFeatures)
+    public static void Initialize(BaseApp baseApp, IDeviceCore core, IMediaPlayer media, IVideoPlayerService video, IDialogService dialog, IFileService file, IImageService image, IGalleryService gallery, IRecordService record, IDownloadService download, IStoreService store, IAds ads, IWindowsFeatures windowsFeatures, IMediaRecorder recorder = null)
     {
         BaseApp = baseApp;
 
@@ -51,6 +59,8 @@ public static class DeviceServices
         Gallery = gallery;
 
         Record = record;
+
+        Recorder = recorder;
 
         Download = download;
 

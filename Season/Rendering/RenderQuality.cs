@@ -61,6 +61,49 @@ public enum SkyMode
 }
 
 /// <summary>
+/// 2-6 clause 1: per-texture mipmap policy. This is deliberately opt-in per texture rather than a global
+/// "give every RGBA8 texture a chain", because the main pixel shader reaches several very different kinds of
+/// texture through the same albedo slot and the same static sampler s0.
+///
+/// The distinction that matters is implicit versus explicit LOD. Material maps are read with Sample(), so the
+/// hardware derives LOD from screen-space derivatives and a chain takes effect automatically with no shader
+/// change. Everything that must not be affected already reads with SampleLevel(..., 0): cloud noise, the
+/// sky-view LUT, the environment cube, the aerial-perspective LUT and the DDGI atlas. The one implicit-LOD
+/// consumer that must stay single-level is the MSDF glyph atlas, where neighbouring glyphs are unrelated and
+/// downsampling would bleed across their boundaries while the text itself is drawn near 1:1 and never minifies.
+/// Hence <see cref="None"/> is the default and callers opt in explicitly.
+/// </summary>
+public enum TextureMipPolicy
+{
+    /// <summary>Single level. Identical behaviour to the pre-2-6 engine, and the default for every texture that does not ask otherwise.</summary>
+    None,
+
+    /// <summary>
+    /// Box-filtered chain for colour data (base colour, emissive). Filtering happens directly on the stored bytes:
+    /// the engine has no sRGB decode anywhere (textures are created as plain UNORM and the shader consumes the
+    /// sampled value as linear), so the byte space *is* the space the shader interprets, and averaging there is
+    /// self-consistent. Decoding to physical linear first would be correct in the absolute sense but inconsistent
+    /// with how the value is used, which is the property that actually matters for filtering.
+    /// </summary>
+    Color,
+
+    /// <summary>
+    /// Box-filtered chain plus per-level renormalization, for tangent-space normal maps. Averaging two normals
+    /// that differ in direction always produces a vector shorter than unit length, so without this step the
+    /// shading normal shrinks with distance and both N dot L and the Fresnel term drift.
+    /// </summary>
+    Normal,
+
+    /// <summary>
+    /// Box-filtered chain with no renormalization, for scalar material data packed per channel
+    /// (metallic-roughness, ambient occlusion). Note that plain averaging of roughness is not the physically
+    /// correct answer for specular antialiasing - that requires folding normal variance into roughness
+    /// (Toksvig / LEAN). This tier is deliberately the naive filter; variance-aware roughness is separate work.
+    /// </summary>
+    Linear,
+}
+
+/// <summary>
 /// Render quality configuration (introduced in 1-4). Step 6 merged the old static Season.Rendering.RenderQuality
 /// into this runtime class: static fields became the Default* sources below, and the old properties became runtime instance properties.
 /// BaseApp.Init() snapshots Default* into <see cref="Settings.RenderQuality"/> for new or empty settings, after which rendering always consumes that instance.
@@ -125,6 +168,9 @@ public class RenderQuality
 
     /// <summary>Default value for CascadeSplitLambda (overrideable in the app constructor and captured by Init()).</summary>
     public static float DefaultCascadeSplitLambda = 0.6f;
+
+    /// <summary>Default value for ShadowLightAngleStep (overrideable in the app constructor and captured by Init()).</summary>
+    public static float DefaultShadowLightAngleStep = 0.25f;
 
     /// <summary>Default value for ShadowDepthBias (overrideable in the app constructor and captured by Init()).</summary>
     public static int DefaultShadowDepthBias = 4;
@@ -264,6 +310,15 @@ public class RenderQuality
     /// <summary>Default value for AerialIntensity (overrideable in the app constructor and captured by Init()).</summary>
     public static float DefaultAerialIntensity = 1f;
 
+    /// <summary>Default value for TextureMipmaps (overrideable in the app constructor and captured by Init()).</summary>
+    public static bool DefaultTextureMipmaps = true;
+
+    /// <summary>Default value for TextureMipMinSize (overrideable in the app constructor and captured by Init()).</summary>
+    public static int DefaultTextureMipMinSize = 64;
+
+    /// <summary>Default value for TextureMaxAnisotropy (overrideable in the app constructor and captured by Init()).</summary>
+    public static int DefaultTextureMaxAnisotropy = 1;
+
     // -- Runtime properties (snapshot from Default* in the constructor; editable at runtime and persisted through Settings). --
 
     /// <summary>1-4 tier: HDR SceneColor (Rgba16Float) plus FinalBlit tonemap. Fixed at initialization and not meant to change at runtime.</summary>
@@ -308,6 +363,16 @@ public class RenderQuality
 
     /// <summary>1-5 clause 9: practical-split blend factor (0=pure uniform, 1=pure logarithmic). Default 0.6 gives denser near cascades.</summary>
     public float CascadeSplitLambda { get; set; } = DefaultCascadeSplitLambda;
+
+    /// <summary>1-5 clause 9: angular grid step in degrees used to quantize the directional-light direction before the cascade
+    /// matrices are derived; 0 disables quantization. Texel snapping aligns the light-space translation to the texel grid, but
+    /// that grid is the light basis itself, so a continuously rotating sun makes snapping quantize into a moving frame of
+    /// reference and the whole atlas re-samples at a new sub-texel phase every frame. Freezing the direction onto a fixed grid
+    /// makes the cascade matrix bitwise identical within one cell, so the atlas is bitwise identical and temporal accumulation
+    /// has something stable to converge on. The cost is that the shadow direction lags the shading direction by up to half a
+    /// step, and that light motion is batched rather than removed: a larger step buys a longer stable interval and pays with a
+    /// proportionally larger jump when the cell changes. Runtime-tunable.</summary>
+    public float ShadowLightAngleStep { get; set; } = DefaultShadowLightAngleStep;
 
     /// <summary>1-5 clause 4: constant depth bias for the shadow PSO. Baked into the PSO at initialization.</summary>
     public int ShadowDepthBias { get; set; } = DefaultShadowDepthBias;
@@ -451,6 +516,33 @@ public class RenderQuality
 
     /// <summary>2-5 clause 12: aerial-perspective intensity scale. Runtime knob; values above 1 are allowed for artistic amplification on small-scale scenes.</summary>
     public float AerialIntensity { get; set; } = DefaultAerialIntensity;
+
+    /// <summary>
+    /// 2-6 clause 2: master switch for material-texture mip chains. Unlike most tiers this is locked at texture creation
+    /// rather than per frame: a chain is either baked into the resource at upload time or it is not, so flipping this at
+    /// runtime only affects textures created afterwards. Turning it off restores the pre-2-6 single-level behaviour exactly.
+    /// </summary>
+    public bool TextureMipmaps { get; set; } = DefaultTextureMipmaps;
+
+    /// <summary>
+    /// 2-6 clause 2: textures whose larger dimension is below this many pixels keep a single level even when their policy
+    /// asks for a chain. Small maps are rarely minified enough to alias, while a chain still costs an extra resource
+    /// footprint and, on D3D12, an extra 256-byte-aligned row-pitch block per level - which for tiny textures is a
+    /// larger relative overhead than the 33% the geometric series suggests.
+    /// </summary>
+    public int TextureMipMinSize { get; set; } = DefaultTextureMipMinSize;
+
+    /// <summary>
+    /// 2-6 clause 2: anisotropic sample count for the material sampler; 1 means isotropic trilinear filtering.
+    /// This is the knob that trades blur against aliasing. Trilinear alone picks its level from the longer screen-space
+    /// axis, so surfaces seen at a grazing angle - distant hillsides, ground receding to the horizon - are filtered as if
+    /// they were minified equally in both directions and come out over-blurred. Anisotropy is the actual fix for that,
+    /// not a refinement of it. It is left at 1 by default so that mip chains can be validated on their own first;
+    /// raising it while mips are still being verified makes it much harder to attribute what changed.
+    /// Values above 1 are ignored by a backend that does not support them, and are harmless on single-level textures
+    /// because anisotropic filtering degenerates to bilinear when there is only one level to choose from.
+    /// </summary>
+    public int TextureMaxAnisotropy { get; set; } = DefaultTextureMaxAnisotropy;
 
     static RenderQuality? _currentFallback;
 

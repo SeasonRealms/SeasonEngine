@@ -20,7 +20,10 @@ namespace Season.Rendering;
 /// - Practical split: lambda-blended log/uniform partitioning over [Near, min(Far, ShadowDistance)];
 /// - For each cascade, orthographic projection is built from the bounding sphere of the 8 corners of the frustum slice
 ///   (a sphere is invariant to camera rotation, so shadow-map coverage stays stable and does not shimmer under rotation);
-/// - Texel snapping: align light-space translation to the texel grid, with tile resolution = atlas/2, to remove shimmer from camera translation;
+/// - Texel snapping: align the full light-space translation to the texel grid, with tile resolution = atlas/2, to remove shimmer from camera translation;
+/// - Light-direction quantization: snap the sun direction onto a fixed angular grid before deriving anything from it, because the
+///   snapping grid above is the light basis and would otherwise rotate along with the sun, leaving snapping quantizing into a
+///   moving frame of reference. Together these two make the cascade matrix bitwise stable rather than merely similar;
 /// - Move the light-space eye back by radius + zPad so caster geometry outside the slice but on the light side, such as room walls, still fits into the depth range;
 /// - Matrix conventions stay aligned with the engine: LH + [0,1] depth + row vectors via the System.Numerics Create*LeftHanded family.
 ///
@@ -209,6 +212,11 @@ public static class CascadedShadow
             return;
         sunDir = Vector3.Normalize(sunDir);
 
+        // Clause 9: quantize before anything else derives from the direction. Everything below - the light basis, the
+        // snapping grid, the eye position - is a function of sunDir, so this single substitution is what makes the whole
+        // cascade matrix reproducible frame to frame. See QuantizeLightDirection for why snapping alone is not enough.
+        sunDir = QuantizeLightDirection(sunDir);
+
         int count = Math.Clamp(RenderQuality.Current.ShadowCascadeCount, 2, MaxCascades);
         float near = camera.Near;
         float far = MathF.Max(MathF.Min(camera.Far, RenderQuality.Current.ShadowDistance), near + 1e-3f);
@@ -276,10 +284,16 @@ public static class CascadedShadow
             var eye = sphereCenter - sunDir * (radius + zPad);
             var view = Matrix4x4.CreateLookAtLeftHanded(eye, sphereCenter, lightUp);
 
-            // Texel snapping: align the translation terms of the view matrix, M41/M42, which are the light-space XY offsets, to the texel grid per contract clause 9.
+            // Texel snapping: align the translation terms of the view matrix, which are the light-space offsets, to the texel
+            // grid per contract clause 9. All three components are snapped, not just XY: an unsnapped Z lets every stored
+            // depth drift continuously as the camera moves, so surfaces sitting near the bias margin cross the depth
+            // comparison at different moments and produce acne that churns. With the direction quantized, the radius
+            // quantized and the full translation snapped, view*proj is bitwise identical while the camera moves less than a
+            // texel inside one angular cell, which makes the atlas itself bitwise identical rather than merely similar.
             float texelSize = radius * 2f / tileRes;
             view.M41 = MathF.Floor(view.M41 / texelSize) * texelSize;
             view.M42 = MathF.Floor(view.M42 / texelSize) * texelSize;
+            view.M43 = MathF.Floor(view.M43 / texelSize) * texelSize;
 
             var proj = Matrix4x4.CreateOrthographicLeftHanded(radius * 2f, radius * 2f, 0f, (radius + zPad) * 2f);
             CascadeViewProj[c] = view * proj;
@@ -294,6 +308,54 @@ public static class CascadedShadow
             far);
         ActiveCascadeCount = count;
         SunActive = true;
+    }
+
+    /// <summary>
+    /// Quantizes the directional-light direction onto a fixed spherical grid whose step is
+    /// <see cref="RenderQuality.ShadowLightAngleStep"/> degrees. Returns the input unchanged when the step is not positive.
+    ///
+    /// Why snapping alone is insufficient: texel snapping aligns the light-space translation to the texel grid, but that grid
+    /// *is* the light basis. When the sun rotates continuously, the grid rotates with it, so snapping quantizes into a frame of
+    /// reference that is itself moving and the guarantee it was supposed to provide - "sub-texel camera motion changes nothing"
+    /// - no longer holds. Every texel in the atlas re-samples the depth surface at a new sub-texel phase each frame, which
+    /// shows up as shadow-edge crawling and as a self-shadowing speckle pattern that churns even with the camera and all
+    /// casters perfectly still.
+    ///
+    /// What quantization buys: inside one angular cell the light basis is fixed, so the rotation part of the view matrix is
+    /// bit-identical, the per-cascade radius is already quantized to 1/16 and depends only on constant projection parameters,
+    /// and the snapped translation is bit-identical while the camera moves less than a texel. The cascade matrix is therefore
+    /// bitwise unchanged, the atlas is bitwise unchanged, and temporal accumulation finally has a stable signal to converge on.
+    /// When the cell does change, the shadow advances in one coherent step instead of dissolving pixel by pixel.
+    ///
+    /// What it costs, stated plainly: the shadow direction lags the shading direction by at most half a step, and the
+    /// accumulated light motion is batched rather than removed. A larger step buys a longer stable interval and pays with a
+    /// proportionally larger jump, so the step should stay small enough that one jump is on the order of a texel for typical
+    /// caster heights. Only shadow matrices consume the quantized value; N-dot-L shading keeps the exact direction from the
+    /// lighting UBO, so this never changes how surfaces are lit.
+    ///
+    /// Angles are quantized rather than components: cell boundaries then stay fixed in world space and the result stays unit
+    /// length by construction, which is what makes the basis reproducible instead of merely close.
+    /// </summary>
+    static Vector3 QuantizeLightDirection(Vector3 dir)
+    {
+        float stepDegrees = RenderQuality.Current.ShadowLightAngleStep;
+        // Inverted rather than <=0 so a NaN coming out of a malformed settings file also takes the bypass.
+        // A NaN would otherwise propagate into the cascade matrix and silently remove every shadow in the scene.
+        if (!(stepDegrees > 0f))
+            return dir;
+
+        float step = stepDegrees * (MathF.PI / 180f);
+        float azimuth = MathF.Atan2(dir.X, dir.Z);
+        float elevation = MathF.Asin(Math.Clamp(dir.Y, -1f, 1f));
+
+        azimuth = MathF.Round(azimuth / step) * step;
+        elevation = MathF.Round(elevation / step) * step;
+
+        float cosElevation = MathF.Cos(elevation);
+        return new Vector3(
+            MathF.Sin(azimuth) * cosElevation,
+            MathF.Sin(elevation),
+            MathF.Cos(azimuth) * cosElevation);
     }
 
     /// <summary>
