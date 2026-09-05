@@ -28,7 +28,7 @@ namespace Season.Rendering.Effects;
 ///
 /// Binding layout (declaration order defines the cross-backend slot convention;
 /// see ComputeBindingType summary):
-/// [0] Params 32B (width, height, 1/width, 1/height, feedback, clipGamma, historyValid, _pad) -> HLSL b0
+/// [0] Params 32B (width, height, 1/width, 1/height, feedback, clipGamma, historyValid, staticFeedback) -> HLSL b0
 /// [1] SampledTexture (SceneColor target, rgba16float) -> HLSL t0
 /// [2] SampledTexture (SceneVelocity target, rg16float) -> HLSL t1
 /// [3] SampledTexture (history storage texture) -> HLSL t2
@@ -170,7 +170,10 @@ public sealed class TaaEffect : ComputeEffect
         p[4] = _historyValid ? RenderQuality.Current.TaaFeedback : 0f;
         p[5] = RenderQuality.Current.TaaVarianceClipGamma;
         p[6] = _historyValid ? 1f : 0f;
-        p[7] = 0f;
+        // Clause 10: static-pixel feedback. The shader interpolates between this and TaaFeedback
+        // by reprojection length, so a still camera gets the longer accumulation window that
+        // jitter convergence needs while moving pixels keep the original, ghost-free weight.
+        p[7] = _historyValid ? RenderQuality.Current.TaaStaticFeedback : 0f;
 
         g.DispatchCompute(new ComputeDispatchArgs
         {
@@ -212,13 +215,37 @@ public sealed class TaaEffect : ComputeEffect
     //   2. History sampling: bilinear. This is the only sample that needs filtering.
     //      Scene and velocity always use texel loads: filtering velocity would mix motion
     //      from adjacent objects, and filtering scene at the same resolution is meaningless.
-    //   3. Neighborhood clamping: one 3x3 pass computes first/second moments plus min/max.
+    //   3. Reversible tonemap domain: every scene tap and the reprojected history are mapped
+    //      through c/(1+luma(c)) before statistics, clipping and blending, and the result is
+    //      mapped back with the exact inverse c/(1-luma(c)). Steps 4 and 5 therefore operate on
+    //      a perceptual quantity instead of raw linear HDR radiance.
+    //      Why this is required rather than cosmetic: a jittered sample that lands on a
+    //      high-frequency highlight (mipmap-free material detail on distant geometry is the
+    //      typical source) carries radiance one or two orders of magnitude above its neighbours.
+    //      Averaged in linear HDR, that single tap drags the pixel up by (1-feedback) of a huge
+    //      delta and then decays over ~1/(1-feedback) frames, which is exactly the per-frame
+    //      "boiling" that makes jitter visible. In the tonemapped domain the same tap is bounded
+    //      by construction, so the accumulated mean is the perceptual mean of the subpixel
+    //      samples, which is what jitter is supposed to reconstruct in the first place.
+    //      Scene taps are clamped to >= 0 before the mapping: 1+luma must stay strictly positive,
+    //      and negative radiance is reachable when a consumer extrapolates (AerialIntensity > 1
+    //      is a lerp weight, not a multiplier).
+    //   4. Neighborhood clamping: one 3x3 pass computes first/second moments plus min/max.
     //      Clamp range = [mean-gamma*sigma, mean+gamma*sigma] intersected with [min, max].
     //      When gamma <= 0, this degenerates into a pure min/max bounding box.
-    //      The operation stays in linear RGB per channel, without converting to YCoCg,
+    //      The operation stays in the tonemapped domain per channel, without converting to YCoCg,
     //      prioritizing consistency across backends.
-    //   4. Blending: lerp(cur, clamp(hist), feedback). If reprojection lands outside the
-    //      screen or history is invalid, CPU-side logic has already forced feedback to zero.
+    //      Note the division of labour with step 5: on smooth surfaces sigma collapses, so the
+    //      clamp pins history to the local mean and lighting changes are tracked with no lag;
+    //      on edges sigma is wide, so history is free to accumulate. The clamp handles change,
+    //      the feedback weight handles noise. They must not be tuned as if they were one knob.
+    //   5. Blending: lerp(cur, clamp(hist), fb). fb interpolates from staticFeedback at zero
+    //      reprojection to feedback at one pixel of motion per frame. A still camera is the case
+    //      where jitter has the most frames to converge and therefore tolerates the highest
+    //      feedback, while anything actually moving keeps the original weight so no new ghosting
+    //      is introduced. Setting staticFeedback equal to feedback restores uniform blending.
+    //      If reprojection lands outside the screen or history is invalid, CPU-side logic has
+    //      already forced both weights to zero.
 
     /// <summary>D3D12 cs_5_0 (fxc; single exit avoids X4000). When Texture2D&lt;float4&gt; reads an
     /// rg16float SRV, missing components are filled as (0,1); taking .xy yields velocity,
@@ -233,7 +260,7 @@ cbuffer TaaParams : register(b0)
     float uFeedback;
     float uClipGamma;
     float uHistoryValid;
-    float uPad0;
+    float uStaticFeedback;
 };
 
 Texture2D<float4> uScene : register(t0);
@@ -242,25 +269,42 @@ Texture2D<float4> uHistory : register(t2);
 SamplerState uLinearClamp : register(s0);
 RWTexture2D<float4> uOutput : register(u0);
 
+float TaaLuma(float3 c)
+{
+    return dot(c, float3(0.2126, 0.7152, 0.0722));
+}
+
+float3 TaaTonemap(float3 c)
+{
+    float3 x = max(c, 0.0);
+    return x / (1.0 + TaaLuma(x));
+}
+
+float3 TaaUntonemap(float3 c)
+{
+    return c / max(1.0 - TaaLuma(c), 1e-4);
+}
+
 [numthreads(8, 8, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
     if (id.x < (uint)uWidth && id.y < (uint)uHeight)
     {
         int2 maxCoord = int2((int)uWidth - 1, (int)uHeight - 1);
-        float4 cur = uScene.Load(int3(id.xy, 0));
+        float4 curRaw = uScene.Load(int3(id.xy, 0));
+        float3 cur = TaaTonemap(curRaw.rgb);
 
         // 3x3 neighborhood statistics: compute first/second moments and the min/max bounding box in one pass.
         float3 m1 = 0.0;
         float3 m2 = 0.0;
-        float3 nmin = cur.rgb;
-        float3 nmax = cur.rgb;
+        float3 nmin = cur;
+        float3 nmax = cur;
         [unroll] for (int y = -1; y <= 1; ++y)
         {
             [unroll] for (int x = -1; x <= 1; ++x)
             {
                 int2 c = clamp(int2(id.xy) + int2(x, y), int2(0, 0), maxCoord);
-                float3 s = uScene.Load(int3(c, 0)).rgb;
+                float3 s = TaaTonemap(uScene.Load(int3(c, 0)).rgb);
                 m1 += s;
                 m2 += s * s;
                 nmin = min(nmin, s);
@@ -277,15 +321,19 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         float2 v = uVelocity.Load(int3(id.xy, 0)).xy;
         float2 prevUv = uv - v;
 
-        float3 hist = uHistory.SampleLevel(uLinearClamp, prevUv, 0.0).rgb;
+        float3 hist = TaaTonemap(uHistory.SampleLevel(uLinearClamp, prevUv, 0.0).rgb);
         float3 clamped = clamp(hist, lo, hi);
+
+        // Motion-adaptive feedback: reprojection length in pixels, saturated at one pixel per frame.
+        float vPixels = length(v * float2(uWidth, uHeight));
+        float fb = lerp(uStaticFeedback, uFeedback, clamp(vPixels, 0.0, 1.0));
 
         // Reprojection outside the screen means no valid history.
         // Clamping out-of-range history to the border would be wrong and leaves ghosts along the frame edge.
         bool inside = all(prevUv > 0.0) && all(prevUv < 1.0);
-        float w = (uHistoryValid > 0.5 && inside) ? uFeedback : 0.0;
+        float w = (uHistoryValid > 0.5 && inside) ? fb : 0.0;
 
-        uOutput[id.xy] = float4(max(lerp(cur.rgb, clamped, w), 0.0), cur.a);
+        uOutput[id.xy] = float4(max(TaaUntonemap(lerp(cur, clamped, w)), 0.0), curRaw.a);
     }
 }
 ";
@@ -303,7 +351,7 @@ layout(push_constant) uniform TaaParams
     float uFeedback;
     float uClipGamma;
     float uHistoryValid;
-    float uPad0;
+    float uStaticFeedback;
 };
 
 layout(binding = 1) uniform sampler2D uScene;
@@ -311,24 +359,41 @@ layout(binding = 2) uniform sampler2D uVelocity;
 layout(binding = 3) uniform sampler2D uHistory;
 layout(binding = 4, rgba16f) uniform writeonly image2D uOutput;
 
+float TaaLuma(vec3 c)
+{
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 TaaTonemap(vec3 c)
+{
+    vec3 x = max(c, vec3(0.0));
+    return x / (1.0 + TaaLuma(x));
+}
+
+vec3 TaaUntonemap(vec3 c)
+{
+    return c / max(1.0 - TaaLuma(c), 1e-4);
+}
+
 void main()
 {
     uvec2 id = gl_GlobalInvocationID.xy;
     if (id.x < uint(uWidth) && id.y < uint(uHeight))
     {
         ivec2 maxCoord = ivec2(int(uWidth) - 1, int(uHeight) - 1);
-        vec4 cur = texelFetch(uScene, ivec2(id), 0);
+        vec4 curRaw = texelFetch(uScene, ivec2(id), 0);
+        vec3 cur = TaaTonemap(curRaw.rgb);
 
         vec3 m1 = vec3(0.0);
         vec3 m2 = vec3(0.0);
-        vec3 nmin = cur.rgb;
-        vec3 nmax = cur.rgb;
+        vec3 nmin = cur;
+        vec3 nmax = cur;
         for (int y = -1; y <= 1; ++y)
         {
             for (int x = -1; x <= 1; ++x)
             {
                 ivec2 c = clamp(ivec2(id) + ivec2(x, y), ivec2(0), maxCoord);
-                vec3 s = texelFetch(uScene, c, 0).rgb;
+                vec3 s = TaaTonemap(texelFetch(uScene, c, 0).rgb);
                 m1 += s;
                 m2 += s * s;
                 nmin = min(nmin, s);
@@ -345,13 +410,16 @@ void main()
         vec2 v = texelFetch(uVelocity, ivec2(id), 0).xy;
         vec2 prevUv = uv - v;
 
-        vec3 hist = textureLod(uHistory, prevUv, 0.0).rgb;
+        vec3 hist = TaaTonemap(textureLod(uHistory, prevUv, 0.0).rgb);
         vec3 clamped = clamp(hist, lo, hi);
 
-        bool inside = all(greaterThan(prevUv, vec2(0.0))) && all(lessThan(prevUv, vec2(1.0)));
-        float w = (uHistoryValid > 0.5 && inside) ? uFeedback : 0.0;
+        float vPixels = length(v * vec2(uWidth, uHeight));
+        float fb = mix(uStaticFeedback, uFeedback, clamp(vPixels, 0.0, 1.0));
 
-        imageStore(uOutput, ivec2(id), vec4(max(mix(cur.rgb, clamped, w), vec3(0.0)), cur.a));
+        bool inside = all(greaterThan(prevUv, vec2(0.0))) && all(lessThan(prevUv, vec2(1.0)));
+        float w = (uHistoryValid > 0.5 && inside) ? fb : 0.0;
+
+        imageStore(uOutput, ivec2(id), vec4(max(TaaUntonemap(mix(cur, clamped, w)), vec3(0.0)), curRaw.a));
     }
 }
 ";
@@ -370,8 +438,24 @@ struct TaaParams
     float uFeedback;
     float uClipGamma;
     float uHistoryValid;
-    float uPad0;
+    float uStaticFeedback;
 };
+
+static inline float TaaLuma(float3 c)
+{
+    return dot(c, float3(0.2126, 0.7152, 0.0722));
+}
+
+static inline float3 TaaTonemap(float3 c)
+{
+    float3 x = max(c, float3(0.0));
+    return x / (1.0 + TaaLuma(x));
+}
+
+static inline float3 TaaUntonemap(float3 c)
+{
+    return c / max(1.0 - TaaLuma(c), 1e-4);
+}
 
 kernel void CSMain(
     constant TaaParams& params [[buffer(0)]],
@@ -385,18 +469,19 @@ kernel void CSMain(
     if (id.x < (uint)params.uWidth && id.y < (uint)params.uHeight)
     {
         int2 maxCoord = int2((int)params.uWidth - 1, (int)params.uHeight - 1);
-        float4 cur = uScene.read(id);
+        float4 curRaw = uScene.read(id);
+        float3 cur = TaaTonemap(curRaw.rgb);
 
         float3 m1 = float3(0.0);
         float3 m2 = float3(0.0);
-        float3 nmin = cur.rgb;
-        float3 nmax = cur.rgb;
+        float3 nmin = cur;
+        float3 nmax = cur;
         for (int y = -1; y <= 1; ++y)
         {
             for (int x = -1; x <= 1; ++x)
             {
                 int2 c = clamp(int2(id) + int2(x, y), int2(0), maxCoord);
-                float3 s = uScene.read(uint2(c)).rgb;
+                float3 s = TaaTonemap(uScene.read(uint2(c)).rgb);
                 m1 += s;
                 m2 += s * s;
                 nmin = min(nmin, s);
@@ -413,13 +498,16 @@ kernel void CSMain(
         float2 v = uVelocity.read(id).xy;
         float2 prevUv = uv - v;
 
-        float3 hist = uHistory.sample(uLinearClamp, prevUv, level(0.0)).rgb;
+        float3 hist = TaaTonemap(uHistory.sample(uLinearClamp, prevUv, level(0.0)).rgb);
         float3 clamped = clamp(hist, lo, hi);
 
-        bool inside = all(prevUv > float2(0.0)) && all(prevUv < float2(1.0));
-        float w = (params.uHistoryValid > 0.5 && inside) ? params.uFeedback : 0.0;
+        float vPixels = length(v * float2(params.uWidth, params.uHeight));
+        float fb = mix(params.uStaticFeedback, params.uFeedback, clamp(vPixels, 0.0, 1.0));
 
-        uOutput.write(float4(max(mix(cur.rgb, clamped, w), float3(0.0)), cur.a), id);
+        bool inside = all(prevUv > float2(0.0)) && all(prevUv < float2(1.0));
+        float w = (params.uHistoryValid > 0.5 && inside) ? fb : 0.0;
+
+        uOutput.write(float4(max(TaaUntonemap(mix(cur, clamped, w)), float3(0.0)), curRaw.a), id);
     }
 }
 ";
@@ -435,7 +523,7 @@ struct TaaParams
     uFeedback : f32,
     uClipGamma : f32,
     uHistoryValid : f32,
-    uPad0 : f32,
+    uStaticFeedback : f32,
 };
 
 @group(0) @binding(0) var<uniform> params : TaaParams;
@@ -445,6 +533,22 @@ struct TaaParams
 @group(0) @binding(4) var uOutput : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(15) var uLinearClamp : sampler;
 
+fn TaaLuma(c : vec3<f32>) -> f32
+{
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+fn TaaTonemap(c : vec3<f32>) -> vec3<f32>
+{
+    let x = max(c, vec3<f32>(0.0));
+    return x / (1.0 + TaaLuma(x));
+}
+
+fn TaaUntonemap(c : vec3<f32>) -> vec3<f32>
+{
+    return c / max(1.0 - TaaLuma(c), 1e-4);
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
 {
@@ -452,18 +556,19 @@ fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
     {
         let coord = vec2<i32>(i32(id.x), i32(id.y));
         let maxCoord = vec2<i32>(i32(params.uWidth) - 1, i32(params.uHeight) - 1);
-        let cur = textureLoad(uScene, coord, 0);
+        let curRaw = textureLoad(uScene, coord, 0);
+        let cur = TaaTonemap(curRaw.rgb);
 
         var m1 = vec3<f32>(0.0);
         var m2 = vec3<f32>(0.0);
-        var nmin = cur.rgb;
-        var nmax = cur.rgb;
+        var nmin = cur;
+        var nmax = cur;
         for (var y : i32 = -1; y <= 1; y = y + 1)
         {
             for (var x : i32 = -1; x <= 1; x = x + 1)
             {
                 let c = clamp(coord + vec2<i32>(x, y), vec2<i32>(0, 0), maxCoord);
-                let s = textureLoad(uScene, c, 0).rgb;
+                let s = TaaTonemap(textureLoad(uScene, c, 0).rgb);
                 m1 = m1 + s;
                 m2 = m2 + s * s;
                 nmin = min(nmin, s);
@@ -485,17 +590,20 @@ fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
         let v = textureLoad(uVelocity, coord, 0).xy;
         let prevUv = uv - v;
 
-        let hist = textureSampleLevel(uHistory, uLinearClamp, prevUv, 0.0).rgb;
+        let hist = TaaTonemap(textureSampleLevel(uHistory, uLinearClamp, prevUv, 0.0).rgb);
         let clamped = clamp(hist, lo, hi);
+
+        let vPixels = length(v * vec2<f32>(params.uWidth, params.uHeight));
+        let fb = mix(params.uStaticFeedback, params.uFeedback, clamp(vPixels, 0.0, 1.0));
 
         let inside = all(prevUv > vec2<f32>(0.0)) && all(prevUv < vec2<f32>(1.0));
         var w = 0.0;
         if (params.uHistoryValid > 0.5 && inside)
         {
-            w = params.uFeedback;
+            w = fb;
         }
 
-        textureStore(uOutput, coord, vec4<f32>(max(mix(cur.rgb, clamped, w), vec3<f32>(0.0)), cur.a));
+        textureStore(uOutput, coord, vec4<f32>(max(TaaUntonemap(mix(cur, clamped, w)), vec3<f32>(0.0)), curRaw.a));
     }
 }
 ";
