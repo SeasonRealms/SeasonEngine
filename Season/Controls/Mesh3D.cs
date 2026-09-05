@@ -147,6 +147,23 @@ public class Surface
         _ => default,
     };
 
+    /// <summary>
+    /// The authored path of one slot, ignoring any TextureOverride. This is deliberately not
+    /// <see cref="GetTextureSource"/>: the backends need it while <em>releasing</em> a mesh's texture references, and by
+    /// then Load has cleared every Override under the single-consumption contract, so GetTextureSource can no longer
+    /// report which branch actually ran. Reading the path alone gives release the same answer the path branch of
+    /// EnsureSurfaceTexture saw at Load time, independent of override state.
+    /// </summary>
+    public string? GetTexturePath(SurfaceTextureSlot slot) => slot switch
+    {
+        SurfaceTextureSlot.BaseColor => BaseColorTexturePath,
+        SurfaceTextureSlot.Normal => NormalTexturePath,
+        SurfaceTextureSlot.MetallicRoughness => MetallicRoughnessTexturePath,
+        SurfaceTextureSlot.Occlusion => OcclusionTexturePath,
+        SurfaceTextureSlot.Emissive => EmissiveTexturePath,
+        _ => null,
+    };
+
     /// <summary>Whether the specified slot has an effective texture source, either a path or pixels. Drives the Use*Map material flags under the "declared means enabled" rule.</summary>
     public bool HasTexture(SurfaceTextureSlot slot) => GetTextureSource(slot).HasValue;
 
