@@ -1,5 +1,5 @@
 using Microsoft.AspNetCore.Components;
-using SampleWeb.Components;
+using EngineWeb.Components;
 
 var builder = WebApplication.CreateBuilder(args);
 
