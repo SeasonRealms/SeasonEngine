@@ -177,6 +177,9 @@ public class RenderQuality
     /// <summary>Default value for TaaVarianceClipGamma (overrideable in the app constructor and captured by Init()).</summary>
     public static float DefaultTaaVarianceClipGamma = 1.0f;
 
+    /// <summary>Default value for TaaStaticFeedback (overrideable in the app constructor and captured by Init()).</summary>
+    public static float DefaultTaaStaticFeedback = 0.97f;
+
     /// <summary>Default value for GlobalIllumination (overrideable in the app constructor and captured by Init()).</summary>
     public static GiMode DefaultGlobalIllumination = GiMode.Off;
 
@@ -351,8 +354,16 @@ public class RenderQuality
     /// <summary>2-3 contract clause 4: TAA jitter phase count for the Halton sequence. Runtime knob.</summary>
     public int JitterPhaseCount { get; set; } = DefaultJitterPhaseCount;
 
-    /// <summary>2-3 contract clause 10: TAA history feedback weight in lerp(cur, clampedHist, TaaFeedback). Runtime knob.</summary>
+    /// <summary>2-3 contract clause 10: TAA history feedback weight in lerp(cur, clampedHist, fb). This is the value used
+    /// once a pixel reprojects by a full pixel or more per frame; static pixels use TaaStaticFeedback instead. Runtime knob.</summary>
     public float TaaFeedback { get; set; } = DefaultTaaFeedback;
+
+    /// <summary>2-3 contract clause 10: TAA history feedback weight for pixels with zero reprojection. The resolve kernel
+    /// interpolates from this value to TaaFeedback over the first pixel of per-frame motion, which gives a still camera the
+    /// long accumulation window that jitter convergence needs (1/(1-fb) frames) without adding ghosting to moving content.
+    /// Lower it toward TaaFeedback if lighting that changes very fast starts to smear; setting the two equal restores
+    /// uniform blending. Runtime knob.</summary>
+    public float TaaStaticFeedback { get; set; } = DefaultTaaStaticFeedback;
 
     /// <summary>2-3 contract clause 10: TAA neighborhood variance-clipping range. Runtime knob.</summary>
     public float TaaVarianceClipGamma { get; set; } = DefaultTaaVarianceClipGamma;
