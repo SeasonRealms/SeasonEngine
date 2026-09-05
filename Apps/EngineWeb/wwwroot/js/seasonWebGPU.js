@@ -694,9 +694,13 @@ window.seasonWebGPU = (() => {
             alphaMode: 'premultiplied',
         });
 
+        // 2-6 clause 5: mipmapFilter defaults to 'nearest' in WebGPU, which would snap between levels at the LOD
+        // boundary and make a mipmapped texture pop more visibly than an unfiltered one - the opposite of the point.
+        // It has no effect on the single-level textures this sampler also serves, so it is set unconditionally.
         _samplers['linear'] = _device.createSampler({
             magFilter: 'linear',
             minFilter: 'linear',
+            mipmapFilter: 'linear',
             addressModeU: 'clamp-to-edge',
             addressModeV: 'clamp-to-edge',
         });
@@ -708,6 +712,7 @@ window.seasonWebGPU = (() => {
         _samplers['repeat'] = _device.createSampler({
             magFilter: 'linear',
             minFilter: 'linear',
+            mipmapFilter: 'linear',
             addressModeU: 'repeat',
             addressModeV: 'repeat',
         });
@@ -812,11 +817,40 @@ window.seasonWebGPU = (() => {
         return { success, width: meta.width || 0, height: meta.height || 0 };
     }
 
-    function _storeTexture(name, texture, width, height) {
+    function _storeTexture(name, texture, width, height, mipLevelCount = 1) {
         _textures[name] = texture;
         _textureViews[name] = texture.createView();
-        _textureMeta[name] = { width, height };
+        _textureMeta[name] = { width, height, mipLevelCount };
         return _getTextureResult(name, true);
+    }
+
+    // 2-6 clause 3: the level geometry is not transported across interop. Every backend derives it from the same
+    // halving rule MipChain.Build uses - level n is max(1, w0 >> n) by max(1, h0 >> n), tightly packed in order with
+    // no padding - so shipping a table alongside the bytes would only create a second source of truth able to
+    // disagree with them. WebGPU needs no re-pitch either: bytesPerRow is stated per level.
+    function _packedChainByteLength(width, height, mipLevelCount) {
+        let total = 0, w = width, h = height;
+        for (let level = 0; level < mipLevelCount; level++) {
+            total += w * h * 4;
+            w = Math.max(1, w >> 1);
+            h = Math.max(1, h >> 1);
+        }
+        return total;
+    }
+
+    // One writeTexture per subresource. Degenerates to the pre-2-6 single call whenever mipLevelCount is 1.
+    function _writeTextureLevels(texture, bytes, width, height, mipLevelCount) {
+        let offset = 0, w = width, h = height;
+        for (let level = 0; level < mipLevelCount; level++) {
+            _device.queue.writeTexture(
+                { texture, mipLevel: level },
+                bytes,
+                { offset, bytesPerRow: w * 4, rowsPerImage: h },
+                { width: w, height: h, depthOrArrayLayers: 1 });
+            offset += w * h * 4;
+            w = Math.max(1, w >> 1);
+            h = Math.max(1, h >> 1);
+        }
     }
 
     function _createTextureFromExternalSource(name, source, width, height) {
@@ -850,37 +884,42 @@ window.seasonWebGPU = (() => {
             console.error(`updateTexturePixels: texture '${name}' not found`);
             return false;
         }
-        const expectedSize = width * height * 4;
+        rgbaPixels = _interopToU8(rgbaPixels);
+        // 2-6 clause 4: a texture that owns a chain is fed the whole packed block, so the expected size is the sum
+        // over levels rather than level 0 alone. Writing only level 0 would leave the lower levels showing the
+        // previous content at distance, which is much harder to diagnose than having no mipmaps at all.
+        const mipLevelCount = (_textureMeta[name] || {}).mipLevelCount || 1;
+        const expectedSize = _packedChainByteLength(width, height, mipLevelCount);
         if (rgbaPixels.length !== expectedSize) {
             console.error(`updateTexturePixels: size mismatch, got ${rgbaPixels.length}, expected ${expectedSize}`);
             return false;
         }
-        if (!(rgbaPixels instanceof Uint8Array)) rgbaPixels = new Uint8Array(rgbaPixels);
 
-        _device.queue.writeTexture(
-            { texture: tex },
-            rgbaPixels,
-            { bytesPerRow: width * 4, rowsPerImage: height },
-            { width, height, depthOrArrayLayers: 1 }
-        );
+        _writeTextureLevels(tex, rgbaPixels, width, height, mipLevelCount);
         return true;
     }
 
-    function createTextureFromPixels(name, rgbaPixels, width, height, forceNew = false) {
+    // mipLevelCount > 1 means rgbaPixels carries the packed chain produced by MipChain.Build rather than level 0
+    // alone. The parameter is trailing and defaults to 1, so every pre-2-6 five-argument call produces a
+    // byte-identical descriptor and a single writeTexture.
+    function createTextureFromPixels(name, rgbaPixels, width, height, forceNew = false, mipLevelCount = 1) {
+        mipLevelCount = Math.max(1, mipLevelCount | 0);
         if (!forceNew && _textures[name]) {
             const meta = _textureMeta[name] || {};
-            if (meta.width === width && meta.height === height)
+            // The level count is part of the reuse test: a texture created single-level cannot absorb a chain,
+            // because mipLevelCount is fixed at creation time.
+            if (meta.width === width && meta.height === height && (meta.mipLevelCount || 1) === mipLevelCount)
                 return updateTexturePixels(name, rgbaPixels, width, height) ? { success: true, width, height } : { success: false, width: 0, height: 0 };
             _textures[name].destroy();
             delete _textures[name]; delete _textureViews[name]; delete _textureMeta[name];
         }
-        if (!(rgbaPixels instanceof Uint8Array)) rgbaPixels = new Uint8Array(rgbaPixels);
+        rgbaPixels = _interopToU8(rgbaPixels);
         const texture = _device.createTexture({
-            size: [width, height], format: 'rgba8unorm',
+            size: [width, height], format: 'rgba8unorm', mipLevelCount,
             usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
         });
-        _device.queue.writeTexture({ texture }, rgbaPixels, { bytesPerRow: width * 4, rowsPerImage: height }, { width, height, depthOrArrayLayers: 1 });
-        return _storeTexture(name, texture, width, height);
+        _writeTextureLevels(texture, rgbaPixels, width, height, mipLevelCount);
+        return _storeTexture(name, texture, width, height, mipLevelCount);
     }
 
     // 1-7 cubemap (contract clause 3):
