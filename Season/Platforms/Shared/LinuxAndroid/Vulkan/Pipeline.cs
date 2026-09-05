@@ -814,6 +814,14 @@ public static VkPipeline TransparentBackFacePipelineState;
 
     static Sampler CreateImmutableSampler()
     {
+        // 2-6 clause 6: this is the only sampler that gets anisotropy. It is bound immutably into the descriptor set
+        // layout, so the count is fixed for the process lifetime and a change takes a restart - the same restriction
+        // the DX root signature has, and the reason the knob is an A/B variable rather than a live slider.
+        // The clamp is against the device limit rather than a constant, because Vulkan reports it per device and
+        // exceeding it is invalid; when the feature is missing entirely the ceiling is 1 and this degrades to trilinear.
+        int anisotropy = Device.SupportsSamplerAnisotropy
+            ? RenderQuality.ClampAnisotropy(RenderQuality.Current.TextureMaxAnisotropy, (int)Device.MaxSamplerAnisotropy)
+            : 1;
         var info = new SamplerCreateInfo
         {
             SType = StructureType.SamplerCreateInfo,
@@ -824,7 +832,8 @@ public static VkPipeline TransparentBackFacePipelineState;
             AddressModeU = SamplerAddressMode.ClampToEdge,
             AddressModeV = SamplerAddressMode.ClampToEdge,
             AddressModeW = SamplerAddressMode.ClampToEdge,
-            AnisotropyEnable = false,
+            AnisotropyEnable = anisotropy > 1,
+            MaxAnisotropy = anisotropy,
             BorderColor = BorderColor.FloatOpaqueBlack,
             CompareEnable = false,
             CompareOp = CompareOp.Always,
@@ -2656,10 +2665,27 @@ void main() {
     mat3 TBN = mat3(T, B, N);
 
     if (useNormalMap != 0u) {
-        vec3 nrm = texture(normalMap, vUV).rgb * 2.0 - 1.0;
+        vec4 nrmSample = texture(normalMap, vUV);
+        vec3 nrm = nrmSample.rgb * 2.0 - 1.0;
         // 2-6 clause 5: normalize the world-space result. Any filtered fetch of a normal map returns a vector
         // shorter than unit length, and with a mip chain the shortening grows with distance.
         N = normalize(TBN * nrm);
+
+        // 2-6 clause 5, Toksvig: alpha encodes the mean resultant length of the normals this texel averaged, written
+        // by MipChain - see MipChain.Renormalize for why it stores 1 - sqrt(1 - length) rather than the length. The
+        // normalize above restores the direction but not the lobe width, so it is folded into roughness here. The
+        // combination is in GGX alpha-squared space because slope variances are what add (a_new^2 = a_old^2 + 2/kappa,
+        // with a = roughness*roughness as DistributionGGX above defines it); the D3D12 shader carries the full
+        // derivation, including why 1 - sigma^2 is reconstructed from the stored complement instead of from sigma. A
+        // no-op at 1 up to rounding, which is how RenderQuality.TextureNormalVariance switches this off from the CPU
+        // with no branch here; the denominator is guarded so that 0 saturates roughness instead of dividing by zero.
+        float t = 1.0 - nrmSample.a;
+        float tSq = t * t;
+        float oneMinusSigmaSq = tSq * (2.0 - tSq);
+        float sigma = 1.0 - tSq;
+        float twoOverKappa = 2.0 * oneMinusSigmaSq / max(sigma * (2.0 + oneMinusSigmaSq), 1e-4);
+        float ggxAlpha = roughness * roughness;
+        roughness = min(1.0, sqrt(sqrt(ggxAlpha * ggxAlpha + twoOverKappa)));
     }
 
     vec3 V = normalize(cameraPos.xyz - vWorldPos);

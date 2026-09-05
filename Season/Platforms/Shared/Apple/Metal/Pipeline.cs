@@ -615,6 +615,10 @@ internal static class Pipeline
 
     static IMTLSamplerState CreateStaticSampler()
     {
+        // 2-6 clause 6: anisotropy goes on the material sampler only. Metal caps the count at 16 and rejects 0, which
+        // is exactly what ClampAnisotropy guarantees, so no Metal-specific ceiling is needed here. The sampler state is
+        // created once during Pipeline initialization, so a change to the knob takes a restart as on the other backends.
+        int anisotropy = RenderQuality.ClampAnisotropy(RenderQuality.Current.TextureMaxAnisotropy);
         var desc = new MTLSamplerDescriptor
         {
             MinFilter = MTLSamplerMinMagFilter.Linear,
@@ -624,6 +628,8 @@ internal static class Pipeline
             TAddressMode = MTLSamplerAddressMode.ClampToEdge,
             RAddressMode = MTLSamplerAddressMode.ClampToEdge,
             CompareFunction = MTLCompareFunction.Always,
+            // 1 is Metal's own default and means isotropic, so the isotropic path stays identical to the pre-2-6 state.
+            MaxAnisotropy = (nuint)anisotropy,
             LodMinClamp = 0,
             LodMaxClamp = float.MaxValue,
         };
@@ -2026,10 +2032,27 @@ fragment SEASON_FS_OUT fragment_main(
     float3x3 TBN = float3x3(T, B, N);
 
     if (mat.useNormalMap != 0u) {
-        float3 nrm = normalMap.sample(texSampler, in.vUV).rgb * 2.0 - 1.0;
+        float4 nrmSample = normalMap.sample(texSampler, in.vUV);
+        float3 nrm = nrmSample.rgb * 2.0 - 1.0;
         // 2-6 clause 5: normalize the world-space result. Any filtered fetch of a normal map returns a vector
         // shorter than unit length, and with a mip chain the shortening grows with distance.
         N = normalize(TBN * nrm);
+
+        // 2-6 clause 5, Toksvig: alpha encodes the mean resultant length of the normals this texel averaged, written
+        // by MipChain - see MipChain.Renormalize for why it stores 1 - sqrt(1 - length) rather than the length. The
+        // normalize above restores the direction but not the lobe width, so it is folded into roughness here. The
+        // combination is in GGX alpha-squared space because slope variances are what add (a_new^2 = a_old^2 + 2/kappa,
+        // with a = roughness*roughness as DistributionGGX above defines it); the D3D12 shader carries the full
+        // derivation, including why 1 - sigma^2 is reconstructed from the stored complement instead of from sigma. A
+        // no-op at 1 up to rounding, which is how RenderQuality.TextureNormalVariance switches this off from the CPU
+        // with no branch here; the denominator is guarded so that 0 saturates roughness instead of dividing by zero.
+        float t = 1.0 - nrmSample.a;
+        float tSq = t * t;
+        float oneMinusSigmaSq = tSq * (2.0 - tSq);
+        float sigma = 1.0 - tSq;
+        float twoOverKappa = 2.0 * oneMinusSigmaSq / max(sigma * (2.0 + oneMinusSigmaSq), 1e-4);
+        float ggxAlpha = roughness * roughness;
+        roughness = min(1.0, sqrt(sqrt(ggxAlpha * ggxAlpha + twoOverKappa)));
     }
 
     float3 V = normalize(lights.cameraPos.xyz - in.vWorldPos);

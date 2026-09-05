@@ -55,6 +55,21 @@ internal unsafe static class Device
 
     internal static PhysicalDevice PhysicalDevice;
 
+    /// <summary>
+    /// 2-6 clause 6: whether the picked physical device advertises the samplerAnisotropy feature. Unlike D3D12 and
+    /// Metal, where anisotropic filtering is guaranteed by the API level, Vulkan makes it optional, and a sampler that
+    /// sets AnisotropyEnable without the feature being enabled at device creation is a validation error rather than a
+    /// silent downgrade. Populated by PickPhysicalDevice before CreateLogicalDevice reads it.
+    /// </summary>
+    internal static bool SupportsSamplerAnisotropy;
+
+    /// <summary>
+    /// 2-6 clause 6: limits.maxSamplerAnisotropy for the picked device, the per-device ceiling the requested count is
+    /// clamped against. The specification only guarantees 16, and requesting above the reported limit is invalid, so
+    /// the value is read from the device rather than assumed. Zero until PickPhysicalDevice runs; 1 when unsupported.
+    /// </summary>
+    internal static float MaxSamplerAnisotropy;
+
     internal static Silk.NET.Vulkan.Device LogicalDevice;
 
     // ===== Queue families =====
@@ -417,6 +432,15 @@ internal unsafe static class Device
             throw new Exception("No suitable Vulkan device");
 
         PhysicalDevice = picked;
+
+        // 2-6 clause 6: cache the anisotropy feature bit and its device ceiling before the logical device is created,
+        // because CreateLogicalDevice has to decide whether to request the feature and Pipeline has to decide what to
+        // clamp against. Both read these fields rather than re-querying, so there is one answer per run.
+        Vk.GetPhysicalDeviceFeatures(picked, out var pickedFeatures);
+        Vk.GetPhysicalDeviceProperties(picked, out var pickedProps);
+        SupportsSamplerAnisotropy = pickedFeatures.SamplerAnisotropy;
+        MaxSamplerAnisotropy = SupportsSamplerAnisotropy ? pickedProps.Limits.MaxSamplerAnisotropy : 1f;
+
         FindQueueFamilies(picked);
     }
 
@@ -519,9 +543,13 @@ internal unsafe static class Device
             };
         }
 
+        // 2-6 clause 6: the feature is now requested only when the device advertises it. It was previously requested
+        // unconditionally, which happens to work on every desktop and virtually every Android driver, but enabling an
+        // unsupported feature makes vkCreateDevice fail outright - a hard startup failure in exchange for a filtering
+        // refinement is the wrong trade, so the sampler degrades to isotropic instead.
         var features = new PhysicalDeviceFeatures
         {
-            SamplerAnisotropy = true
+            SamplerAnisotropy = SupportsSamplerAnisotropy
         };
 
         // Vulkan 1.2 feature:

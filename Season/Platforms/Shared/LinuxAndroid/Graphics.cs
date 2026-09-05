@@ -1682,7 +1682,15 @@ internal unsafe class Graphics : IGraphics
             VkTexture view = null!;
             lock (DictionaryVKTexture)
             {
-                if (!DictionaryVKTexture.TryGetValue(sprite.Name, out view!))
+                if (DictionaryVKTexture.TryGetValue(sprite.Name, out view!))
+                {
+                    // A cache hit hands this Sprite3D a reference, so it has to be booked as one. Without the AddRef
+                    // the entry's single count is shared by every Sprite3D on this name while DisposeSprite3D still
+                    // gives one back each time: the first one destroyed would take the texture out from under the
+                    // others.
+                    view.AddRef();
+                }
+                else
                 {
                     INativeImageDecoder imageResult = null!;
                     if (ImageUtils.CreateImageExist(sprite.Name))
@@ -1785,13 +1793,20 @@ internal unsafe class Graphics : IGraphics
         }
         vkSprite3D?.Dispose();
 
-        lock (DictionaryVKTexture)
+        // Give back the texture reference only when this Sprite3D actually held one: LoadSprite3D takes it in the same
+        // step that registers the DictionarySprite3D entry, so a missing entry means it never loaded, or was already
+        // disposed. Releasing regardless would decrement whatever else answers to this name - the guard DisposeSprite2D
+        // already has.
+        if (vkSprite3D != null)
         {
-            if (DictionaryVKTexture.TryGetValue(sprite.Name, out var vkTex) && vkTex != null)
+            lock (DictionaryVKTexture)
             {
-                vkTex.Release();
-                if (vkTex.RefCount == 0)
-                    DictionaryVKTexture.Remove(sprite.Name);
+                if (DictionaryVKTexture.TryGetValue(sprite.Name, out var vkTex) && vkTex != null)
+                {
+                    vkTex.Release();
+                    if (vkTex.RefCount == 0)
+                        DictionaryVKTexture.Remove(sprite.Name);
+                }
             }
         }
         sprite.Ready = false;
@@ -1801,17 +1816,33 @@ internal unsafe class Graphics : IGraphics
     /// Load a single texture into DictionaryVKTexture on demand and return the VkTexture.
     /// Reuses the LoadSprite3D loading chain:
     /// StorageService -> ImageResult -> new VkTexture(imageResult) + ExecuteUpload.
+    /// 2-6 clause 1: the policy is a required argument, not a defaulted one. This function has exactly one caller -
+    /// the path branch of EnsureSurfaceTexture - and it was a defaulted policy elsewhere that quietly left every
+    /// material without a chain, so any future caller is made to state its intent instead of inheriting a default.
     /// </summary>
-    VkTexture EnsureVKTexture(string name)
+    VkTexture EnsureVKTexture(string name, TextureMipPolicy mipPolicy)
     {
         if (name.IsNullOrWhiteSpace())
             return null!;
 
+        // 2-6 clause 4: the entry is keyed by policy, so a material's copy of an asset is a different entry from the
+        // bare-path one a Sprite registers for the same file. They used to share one: whichever loaded first decided
+        // whether the other had a chain, and either one's release could pull the texture out from under the other.
+        string key = MipChain.CacheKey(name, mipPolicy);
+
         VkTexture view = null!;
         lock (DictionaryVKTexture)
         {
-            if (DictionaryVKTexture.TryGetValue(name, out view!))
+            if (DictionaryVKTexture.TryGetValue(key, out view!))
+            {
+                // 2-7: a cache hit is an acquisition and is booked as one, matching LoadSprite2D. This branch used to
+                // return the entry unbooked while the mesh dispose paths handed a reference back anyway, so the entry's
+                // lone count was spent by whichever consumer was destroyed first. The sharpest case was a compute
+                // output: a procedural skybox names the same Sky-View LUT on all six faces, so disposing that mesh drove
+                // the count of a resource the sky pass still writes every frame to zero and destroyed it for good.
+                view.AddRef();
                 return view;
+            }
 
             INativeImageDecoder imageResult = null!;
             if (ImageUtils.CreateImageExist(name))
@@ -1834,13 +1865,13 @@ internal unsafe class Graphics : IGraphics
 
             if (imageResult != null)
             {
-                view = new VkTexture(imageResult);
+                view = new VkTexture(imageResult, mipPolicy);
                 view.Name = name;
                 ExecuteUpload();
             }
 
             if (view != null)
-                DictionaryVKTexture.Add(name, view);
+                DictionaryVKTexture.Add(key, view);
 
             return view!;
         }
@@ -1852,6 +1883,18 @@ internal unsafe class Graphics : IGraphics
 
     static string ProcTextureName(string meshName, long meshId, int surfaceIndex, SurfaceTextureSlot slot)
         => $"proc:{meshName}:{meshId}:{surfaceIndex}:{slot}";
+
+    /// <summary>
+    /// 2-6 clause 4: the one derivation of a Surface slot's DictionaryVKTexture key, shared by the code that inserts
+    /// the entry and the resolver that later looks it up. Those two used to spell the name out independently, which
+    /// was survivable only while the path branch keyed on the bare path. Now that a material's path texture carries
+    /// its policy, a lookup spelled differently from its insert would miss silently and fall back to White - a visible
+    /// defect standing in for a one-line divergence.
+    /// </summary>
+    static string SurfaceTextureCacheName(string meshName, long meshId, int surfaceIndex, TextureUpdateSource source, SurfaceTextureSlot slot)
+        => source.Image != null
+            ? ProcTextureName(meshName, meshId, surfaceIndex, slot)
+            : MipChain.CacheKey(source.Path!, MipChain.PolicyForNamedTexture(source.Path, slot));
 
     /// <summary>
     /// Resolve the texture source of one Surface slot into a VkTexture registered in DictionaryVKTexture:
@@ -1883,7 +1926,9 @@ internal unsafe class Graphics : IGraphics
                 }
             }
 
-            var tex = VkTexture.CreateFromDecoder(source.Image);
+            // 2-6 clause 1: same omission the DX and Metal pixel branches had - without the policy the overload
+            // default makes the texture single-level, so a material fed from an in-memory decoder never got a chain.
+            var tex = VkTexture.CreateFromDecoder(source.Image, MipChain.PolicyForSurfaceSlot(slot));
             source.Image.Dispose();
             tex.Name = name;
             ExecuteUpload();
@@ -1894,7 +1939,12 @@ internal unsafe class Graphics : IGraphics
             return tex;
         }
 
-        return EnsureVKTexture(source.Path);
+        // 2-6 clause 1: the path branch now states its policy too. It stayed single-level for one more round than the
+        // pixel branch because its texture is keyed by path alone and shared with every other consumer of that path,
+        // sprites included; the policy-keyed identity MipChain.CacheKey provides is what makes a chain safe here.
+        // PolicyForNamedTexture rather than PolicyForSurfaceSlot: this slot can name a compute output instead of an
+        // asset, and such a name must keep its bare key or nothing will answer to it.
+        return EnsureVKTexture(source.Path!, MipChain.PolicyForNamedTexture(source.Path, slot));
     }
 
     /// <summary>Pre-resolve all five texture slots of a single Surface
@@ -1933,9 +1983,7 @@ internal unsafe class Graphics : IGraphics
             if (!source.HasValue)
                 return null!;
 
-            var name = source.Image != null
-                ? ProcTextureName(meshName, meshId, surfaces.IndexOf(surface), (SurfaceTextureSlot)slot)
-                : source.Path;
+            var name = SurfaceTextureCacheName(meshName, meshId, surfaces.IndexOf(surface), source, (SurfaceTextureSlot)slot);
 
             lock (DictionaryVKTexture)
             {
@@ -1945,25 +1993,60 @@ internal unsafe class Graphics : IGraphics
         };
     }
 
-    /// <summary>Release procedural textures registered under the five composed slot names of one Surface
+    /// <summary>Drops one DictionaryVKTexture reference on <paramref name="key"/>
     /// (the caller must hold the DictionaryVKTexture lock).</summary>
-    void ReleaseProcSurfaceTextures(string meshName, long meshId, int surfaceIndex)
+    void ReleaseTextureRef(string key)
     {
-        ReleaseProcTexture(ProcTextureName(meshName, meshId, surfaceIndex, SurfaceTextureSlot.BaseColor));
-        ReleaseProcTexture(ProcTextureName(meshName, meshId, surfaceIndex, SurfaceTextureSlot.Normal));
-        ReleaseProcTexture(ProcTextureName(meshName, meshId, surfaceIndex, SurfaceTextureSlot.MetallicRoughness));
-        ReleaseProcTexture(ProcTextureName(meshName, meshId, surfaceIndex, SurfaceTextureSlot.Occlusion));
-        ReleaseProcTexture(ProcTextureName(meshName, meshId, surfaceIndex, SurfaceTextureSlot.Emissive));
+        if (string.IsNullOrEmpty(key))
+            return;
 
-        void ReleaseProcTexture(string name)
+        if (DictionaryVKTexture.TryGetValue(key, out var tex) && tex != null)
         {
-            if (DictionaryVKTexture.TryGetValue(name, out var tex) && tex != null)
-            {
-                tex.Release();
-                if (tex.RefCount == 0)
-                    DictionaryVKTexture.Remove(name);
-            }
+            tex.Release();
+            if (tex.RefCount == 0)
+                DictionaryVKTexture.Remove(key);
         }
+    }
+
+    /// <summary>
+    /// 2-7: gives back the one reference EnsureSurfaceTexture took for a single Surface slot (the caller must hold the
+    /// DictionaryVKTexture lock). Release has to be keyed exactly the way acquisition was, and which of the two
+    /// branches ran is no longer readable from the Surface, because Load cleared TextureOverride under the
+    /// single-consumption contract. The procedural entry is the record: it exists if and only if the pixel branch
+    /// registered one for this slot, so probing it first recovers the branch. Releasing the path key for a slot that
+    /// was fed pixels would decrement a texture this mesh never took a reference on.
+    /// </summary>
+    void ReleaseSurfaceTexture(string meshName, long meshId, int surfaceIndex, Season.Controls.Surface surface, SurfaceTextureSlot slot)
+    {
+        var procName = ProcTextureName(meshName, meshId, surfaceIndex, slot);
+        if (DictionaryVKTexture.ContainsKey(procName))
+        {
+            ReleaseTextureRef(procName);
+            return;
+        }
+
+        var path = surface.GetTexturePath(slot);
+        if (string.IsNullOrEmpty(path))
+            return;
+
+        // 2-6 clause 4: release the policy-keyed name the path branch inserted. Releasing the bare path would leak this
+        // mesh's entry and decrement a Sprite's texture the mesh never owned.
+        ReleaseTextureRef(MipChain.CacheKey(path, MipChain.PolicyForNamedTexture(path, slot)));
+    }
+
+    /// <summary>
+    /// 2-7: releases all five slots of one Surface, mirroring EnsureSurfaceTextures one for one (the caller must hold
+    /// the DictionaryVKTexture lock). Both sides have to cover the same five slots: Load acquires every one of them,
+    /// so releasing BaseColor alone - which is what this did before - retained the other four for the process
+    /// lifetime.
+    /// </summary>
+    void ReleaseSurfaceTextures(string meshName, long meshId, int surfaceIndex, Season.Controls.Surface surface)
+    {
+        ReleaseSurfaceTexture(meshName, meshId, surfaceIndex, surface, SurfaceTextureSlot.BaseColor);
+        ReleaseSurfaceTexture(meshName, meshId, surfaceIndex, surface, SurfaceTextureSlot.Normal);
+        ReleaseSurfaceTexture(meshName, meshId, surfaceIndex, surface, SurfaceTextureSlot.MetallicRoughness);
+        ReleaseSurfaceTexture(meshName, meshId, surfaceIndex, surface, SurfaceTextureSlot.Occlusion);
+        ReleaseSurfaceTexture(meshName, meshId, surfaceIndex, surface, SurfaceTextureSlot.Emissive);
     }
 
     public async Task<bool> LoadMesh3D(Season.Controls.Mesh3D mesh)
@@ -2041,26 +2124,12 @@ internal unsafe class Graphics : IGraphics
         if (vkMesh != null)
             Vulkan.Device.EnqueueDeferredRelease(vkMesh.Dispose);
 
-        // Release textures referenced by the Surface list
-        // based on VkTexture reference counting
+        // 2-7: give back exactly the references EnsureSurfaceTextures took - all five slots of every Surface, each
+        // keyed the way it was acquired.
         lock (DictionaryVKTexture)
         {
-            // Release procedural pixel-source textures slot by slot
-            // (registered under composed names and owned by the mesh)
             for (int i = 0; i < mesh.Surfaces.Count; i++)
-                ReleaseProcSurfaceTextures(mesh.Name, mesh.ID, i);
-
-            foreach (var surface in mesh.Surfaces)
-            {
-                var path = surface.BaseColorTexturePath;
-                if (string.IsNullOrEmpty(path)) continue;
-                if (DictionaryVKTexture.TryGetValue(path, out var vkTex) && vkTex != null)
-                {
-                    vkTex.Release();
-                    if (vkTex.RefCount == 0)
-                        DictionaryVKTexture.Remove(path);
-                }
-            }
+                ReleaseSurfaceTextures(mesh.Name, mesh.ID, i, mesh.Surfaces[i]);
         }
 
         mesh.Ready = false;
@@ -2140,26 +2209,12 @@ internal unsafe class Graphics : IGraphics
         if (vkMesh != null)
             Vulkan.Device.EnqueueDeferredRelease(vkMesh.Dispose);
 
+        // 2-7: give back exactly the references EnsureSurfaceTextures took - all five slots of every Surface, each
+        // keyed the way it was acquired.
         lock (DictionaryVKTexture)
         {
-            // Release procedural pixel-source textures slot by slot
-            // (registered under composed names and owned by the mesh)
             for (int i = 0; i < mesh.Surfaces.Count; i++)
-                ReleaseProcSurfaceTextures(mesh.Name, mesh.ID, i);
-
-            foreach (var surface in mesh.Surfaces)
-            {
-                var path = surface.BaseColorTexturePath;
-                if (string.IsNullOrEmpty(path))
-                    continue;
-
-                if (DictionaryVKTexture.TryGetValue(path, out var vkTex) && vkTex != null)
-                {
-                    vkTex.Release();
-                    if (vkTex.RefCount == 0)
-                        DictionaryVKTexture.Remove(path);
-                }
-            }
+                ReleaseSurfaceTextures(mesh.Name, mesh.ID, i, mesh.Surfaces[i]);
         }
 
         mesh.Ready = false;

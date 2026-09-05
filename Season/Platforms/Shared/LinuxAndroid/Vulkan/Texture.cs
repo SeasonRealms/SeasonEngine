@@ -146,24 +146,25 @@ internal unsafe class Texture : IDisposable
     }
 
     /// <summary>
-    /// 2-6 clause 3: the de-strided buffer produced above is exactly the tightly packed input MipChain.Build requires,
-    /// which is why generation belongs here - this is the first point where the pixels are in a known-dense layout and
-    /// the last point before the image is created with a level count baked into it.
+    /// 2-6 clause 3: the de-strided buffer produced above is exactly the tightly packed input MipChain requires, which
+    /// is why generation belongs here - this is the first point where the pixels are in a known-dense layout and the
+    /// last point before the image is created with a level count baked into it. Prepare rather than
+    /// ShouldGenerate/Build so the no-chain branch still gets the normal-slot alpha contract of clause 5.
     /// </summary>
     void BuildMipChain(TextureMipPolicy mipPolicy)
     {
-        if (ImageData != null && MipChain.ShouldGenerate(mipPolicy, (int)Width, (int)Height))
-        {
-            ImageData = MipChain.Build(ImageData, (int)Width, (int)Height, mipPolicy, out var infos);
-            MipInfos = infos;
-            MipLevels = (uint)infos.Length;
-            _mipPolicy = mipPolicy;
-        }
-        else
+        _mipPolicy = mipPolicy;
+
+        if (ImageData == null)
         {
             MipInfos = [new MipLevelInfo((int)Width, (int)Height, 0)];
             MipLevels = 1;
+            return;
         }
+
+        ImageData = MipChain.Prepare(ImageData, (int)Width, (int)Height, mipPolicy, out var infos);
+        MipInfos = infos;
+        MipLevels = (uint)infos.Length;
     }
 
     internal Texture(INativeImageDecoder imageResult, TextureMipPolicy mipPolicy = TextureMipPolicy.None)
@@ -199,9 +200,8 @@ internal unsafe class Texture : IDisposable
     {
         // 2-6 clause 4: the policy is part of the cache identity. The same image can legitimately be bound as base
         // colour in one material and as a normal map in another, and those two need different chains (one box
-        // filtered, one renormalized). The suffix is only appended for non-default policies so every pre-2-6 key
-        // stays byte-identical.
-        string key = mipPolicy == TextureMipPolicy.None ? name : $"{name}#mip{mipPolicy}";
+        // filtered, one renormalized). The formula itself is shared so the Ensure paths cannot key differently.
+        string key = MipChain.CacheKey(name, mipPolicy);
 
         if (Device.DictionaryTexture.TryGetValue(key, out var texture))
         {
@@ -239,13 +239,9 @@ internal unsafe class Texture : IDisposable
 
         // 2-6 clause 4: in-place replacement has to refresh the whole chain. The incoming span only describes level 0,
         // so if this texture owns a chain the lower levels are regenerated here - otherwise they would keep showing the
-        // previous content at distance, which is far harder to diagnose than no mipmaps at all.
-        byte[]? chain = null;
-        MipLevelInfo[]? chainInfos = null;
-        if (MipLevels > 1)
-        {
-            chain = MipChain.Build(rgbaPixels, (int)Width, (int)Height, _mipPolicy, out chainInfos);
-        }
+        // previous content at distance, which is far harder to diagnose than no mipmaps at all. A null result means the
+        // span is already exactly what the image wants.
+        byte[]? chain = MipChain.Refresh(rgbaPixels, (int)Width, (int)Height, (int)MipLevels, _mipPolicy, out var chainInfos);
 
         ulong size = (ulong)(chain?.Length ?? expectedSize);
 
