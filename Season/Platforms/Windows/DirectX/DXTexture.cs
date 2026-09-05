@@ -190,9 +190,8 @@ public unsafe class DXTexture : IDisposable
         // 2-6 clause 4: the policy is part of the cache identity. The same image file can legitimately be bound as
         // base colour in one material and as a normal map in another, and those two need different chains (one box
         // filtered, one renormalized). Keying on the name alone would silently hand the second caller whatever the
-        // first one happened to ask for. The suffix is only appended for non-default policies so that every
-        // pre-2-6 cache key stays byte-identical.
-        string key = mipPolicy == TextureMipPolicy.None ? name : $"{name}#mip{mipPolicy}";
+        // first one happened to ask for. The formula itself is shared so the Ensure paths cannot key differently.
+        string key = MipChain.CacheKey(name, mipPolicy);
 
         if (DirectX.Device.DictionaryDXTexture.TryGetValue(key, out texture))
         {
@@ -362,10 +361,8 @@ public unsafe class DXTexture : IDisposable
         // 2-6 clause 4: in-place replacement has to refresh the whole chain. The incoming span only describes level
         // 0, so if this texture owns a chain the lower levels are regenerated here - otherwise they would keep
         // showing the previous content at distance, which is far more confusing to diagnose than no mipmaps at all.
-        byte[] chain = null;
-        MipLevelInfo[] chainInfos = null;
-        if (_mipLevels > 1)
-            chain = MipChain.Build(rgbaPixels, (int)Width, (int)Height, _mipPolicy, out chainInfos);
+        // A null result means the span is already exactly what the resource wants.
+        byte[] chain = MipChain.Refresh(rgbaPixels, (int)Width, (int)Height, (int)_mipLevels, _mipPolicy, out var chainInfos);
 
         try
         {
@@ -578,20 +575,13 @@ public unsafe class DXTexture : IDisposable
             srcRow.CopyTo(dstRow);
         }
 
-        // 2-6 clause 3: the de-strided buffer above is exactly the tightly packed input MipChain.Build requires,
-        // which is why generation belongs here and not earlier - this is the first point where the pixels are in a
-        // known-dense layout, and the last point before the D3D12-specific upload layout is derived.
-        if (MipChain.ShouldGenerate(mipPolicy, (int)Width, (int)Height))
-        {
-            _imageData = MipChain.Build(_imageData, (int)Width, (int)Height, mipPolicy, out _mipInfos);
-            _mipLevels = (uint)_mipInfos.Length;
-            _mipPolicy = mipPolicy;
-        }
-        else
-        {
-            _mipInfos = [new MipLevelInfo((int)Width, (int)Height, 0)];
-            _mipLevels = 1;
-        }
+        // 2-6 clause 3: the de-strided buffer above is exactly the tightly packed input MipChain requires, which is
+        // why generation belongs here and not earlier - this is the first point where the pixels are in a
+        // known-dense layout, and the last point before the D3D12-specific upload layout is derived. Prepare rather
+        // than ShouldGenerate/Build so the no-chain branch still gets the normal-slot alpha contract of clause 5.
+        _imageData = MipChain.Prepare(_imageData, (int)Width, (int)Height, mipPolicy, out _mipInfos);
+        _mipLevels = (uint)_mipInfos.Length;
+        _mipPolicy = mipPolicy;
 
         PrepareTextureLayout();
     }

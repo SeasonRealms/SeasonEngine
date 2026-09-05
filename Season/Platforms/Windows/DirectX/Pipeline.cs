@@ -757,13 +757,27 @@ internal static unsafe class Pipeline
         // opposite side and cause cross-texture color bleeding (for example a 1-pixel bright seam across
         // skybox face boundaries). Clamp samples only the outermost pixel, matching Wrap for standalone
         // [0,1] textures while removing the seam.
+        //
+        // 2-6 clause 6: the anisotropic sample count is resolved once here, because static samplers live in the
+        // root signature and the root signature is built exactly once. Changing the knob therefore takes a restart,
+        // which is also what makes it a clean A/B variable: nothing else about the frame can drift between runs.
+        int s0Anisotropy = RenderQuality.ClampAnisotropy(RenderQuality.Current.TextureMaxAnisotropy);
         var staticSamplers = stackalloc StaticSamplerDesc[3];
         staticSamplers[0] = new StaticSamplerDesc
         {
-            Filter = Filter.MinMagMipLinear,
+            // Filter.Anisotropic implies linear min/mag/mip, so it is a strict superset of MinMagMipLinear and the
+            // isotropic path stays byte-identical to the pre-2-6 descriptor whenever the count resolves to 1.
+            Filter = s0Anisotropy > 1 ? Filter.Anisotropic : Filter.MinMagMipLinear,
             AddressU = TextureAddressMode.Clamp,
             AddressV = TextureAddressMode.Clamp,
             AddressW = TextureAddressMode.Clamp,
+            MaxAnisotropy = (uint)s0Anisotropy,
+            // 2-6 clause 6: MaxLOD must be stated explicitly. D3D12 clamps the computed LOD to [MinLOD, MaxLOD], and
+            // a zero-initialized descriptor means MaxLOD = 0, which pins every fetch to the most detailed level - so
+            // a texture carrying a mip chain would be sampled as if it had none, and the chain would cost memory
+            // while changing nothing on screen. It has no effect on the single-level textures this sampler also
+            // serves, since level 0 is the only level there is.
+            MaxLOD = float.MaxValue,
             ShaderRegister = 0, // s0
             ShaderVisibility = ShaderVisibility.Pixel
         };
@@ -2186,7 +2200,8 @@ float4 PSMain(PSInput input) : SV_TARGET
     if (useNormalMap != 0)
     {
         float normalStrength = 1.0; // Strength multiplier
-        float3 normal = normalMap.Sample(linearSampler, input.texCoord).rgb * 2.0 - 1.0;
+        float4 normalSample = normalMap.Sample(linearSampler, input.texCoord);
+        float3 normal = normalSample.rgb * 2.0 - 1.0;
         normal.xy *= normalStrength;
         //normal.y = -normal.y; // Match the DirectX texture-coordinate convention
         // 2-6 clause 5: normalize the world-space result, matching what the WebGPU shader already did. Any filtered
@@ -2194,6 +2209,35 @@ float4 PSMain(PSInput input) : SV_TARGET
         // differing normals already does, and with a mip chain the shortening grows with distance - so leaving it
         // unnormalized makes both N dot L and Fresnel drift with camera distance.
         N = normalize(mul(normal, TBN));
+
+        // 2-6 clause 5, Toksvig: alpha carries the mean resultant length of the normals this texel averaged, written
+        // by MipChain - see MipChain.Build for why it is stored there and why it is exactly 1 at level 0. The
+        // normalize above hands back one unit normal and leaves roughness untouched, so the specular lobe width lost
+        // to filtering has to be restored here.
+        //
+        // The combination happens in GGX alpha-squared space, not in roughness space, and that is not
+        // interchangeable. Slope variances are what add; a Beckmann/GGX lobe of alpha a has slope variance a*a/2, and
+        // a vMF of concentration kappa has 1/kappa, so a_new^2 = a_old^2 + 2/kappa. Since this engine's
+        // DistributionGGX uses a = roughness*roughness, that lands on roughness^4 - adding the term to roughness*
+        // roughness instead would be a dimensional mismatch and would under-correct badly at low roughness, which is
+        // exactly where the flicker lives.
+        //
+        // A no-op at alpha 1 up to floating-point rounding, which is what lets
+        // RenderQuality.TextureNormalVariance be a CPU-side switch needing no branch and no constant here. The
+        // denominator is guarded because 0 means the footprint's normals cancelled out, which must saturate roughness
+        // rather than divide by zero.
+        //
+        // Alpha stores 1 - sqrt(1 - sigma), so that eight bits resolve a small spread near sigma = 1 - see
+        // MipChain.Renormalize. Working from that complement t rather than reconstructing sigma and squaring it is
+        // also the numerically sound order: 1 - sigma*sigma would cancel to a few significant bits right where the
+        // encoding is finest, whereas t*t*(2 - t*t) is that same quantity exactly, and cheaper.
+        float t = 1.0 - normalSample.a;
+        float tSq = t * t;
+        float oneMinusSigmaSq = tSq * (2.0 - tSq);          // 1 - sigma^2, with sigma = 1 - t^2
+        float sigma = 1.0 - tSq;
+        float twoOverKappa = 2.0 * oneMinusSigmaSq / max(sigma * (2.0 + oneMinusSigmaSq), 1e-4);
+        float ggxAlpha = roughness * roughness;
+        roughness = min(1.0, sqrt(sqrt(ggxAlpha * ggxAlpha + twoOverKappa)));
         
         //float3 debug = normal * 0.5 + 0.5;
         //return float4(debug, 1.0);

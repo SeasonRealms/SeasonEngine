@@ -1863,7 +1863,14 @@ internal unsafe class Graphics : IGraphics
         DXTexture view = null;
         lock (DictionaryDXTexture)
         {
-            if (!DictionaryDXTexture.TryGetValue(sprite.Name, out view))
+            if (DictionaryDXTexture.TryGetValue(sprite.Name, out view))
+            {
+                // A cache hit hands this Sprite3D a reference, so it has to be booked as one. Without the AddRef the
+                // entry's single count is shared by every Sprite3D on this name while DisposeSprite3D still gives one
+                // back each time: the first one destroyed would take the texture out from under the others.
+                view.AddRef();
+            }
+            else
             {
                 INativeImageDecoder iNativeImageDecoder = null;
 
@@ -1957,13 +1964,20 @@ internal unsafe class Graphics : IGraphics
         }
         dxSprite3D?.Dispose();
 
-        lock (DictionaryDXTexture)
+        // Give back the texture reference only when this Sprite3D actually held one: LoadSprite3D takes it in the same
+        // step that registers the DictionarySprite3D entry, so a missing entry means it never loaded, or was already
+        // disposed. Releasing regardless would decrement whatever else answers to this name - the guard DisposeSprite2D
+        // already has.
+        if (dxSprite3D != null)
         {
-            if (DictionaryDXTexture.TryGetValue(sprite.Name, out var dxTexture) && dxTexture != null)
+            lock (DictionaryDXTexture)
             {
-                dxTexture.Release();
-                if (dxTexture.RefCount == 0)
-                    DictionaryDXTexture.Remove(sprite.Name);
+                if (DictionaryDXTexture.TryGetValue(sprite.Name, out var dxTexture) && dxTexture != null)
+                {
+                    dxTexture.Release();
+                    if (dxTexture.RefCount == 0)
+                        DictionaryDXTexture.Remove(sprite.Name);
+                }
             }
         }
         sprite.Ready = false;
@@ -1973,17 +1987,33 @@ internal unsafe class Graphics : IGraphics
     /// Loads a single texture into DictionaryDXTexture on demand and returns the DXTexture.
     /// Reuses the LoadSprite3D loading chain: StorageService -> ImageResult ->
     /// new DXTexture(imageResult) + ExecuteUpload.
+    /// 2-6 clause 1: the policy is a required argument, not a defaulted one. This function has exactly one caller -
+    /// the path branch of EnsureSurfaceTexture - and it was a defaulted policy elsewhere that quietly left every
+    /// material without a chain, so any future caller is made to state its intent instead of inheriting a default.
     /// </summary>
-    DXTexture EnsureDXTexture(string name)
+    DXTexture EnsureDXTexture(string name, TextureMipPolicy mipPolicy)
     {
         if (name.IsNullOrWhiteSpace())
             return null;
 
+        // 2-6 clause 4: the entry is keyed by policy, so a material's copy of an asset is a different entry from the
+        // bare-path one a Sprite registers for the same file. They used to share one: whichever loaded first decided
+        // whether the other had a chain, and either one's release could pull the texture out from under the other.
+        string key = MipChain.CacheKey(name, mipPolicy);
+
         DXTexture view = null;
         lock (DictionaryDXTexture)
         {
-            if (DictionaryDXTexture.TryGetValue(name, out view))
+            if (DictionaryDXTexture.TryGetValue(key, out view))
+            {
+                // 2-7: a cache hit is an acquisition and is booked as one, matching LoadSprite2D. This branch used to
+                // return the entry unbooked while the mesh dispose paths handed a reference back anyway, so the entry's
+                // lone count was spent by whichever consumer was destroyed first. The sharpest case was a compute
+                // output: a procedural skybox names the same Sky-View LUT on all six faces, so disposing that mesh drove
+                // the count of a resource the sky pass still writes every frame to zero and destroyed it for good.
+                view.AddRef();
                 return view;
+            }
 
             INativeImageDecoder iNativeImageDecoder = null;
 
@@ -2008,11 +2038,11 @@ internal unsafe class Graphics : IGraphics
 
             if (iNativeImageDecoder != null)
             {
-                view = new DXTexture(iNativeImageDecoder);
+                view = new DXTexture(iNativeImageDecoder, mipPolicy);
             }
 
             if (view != null)
-                DictionaryDXTexture.Add(name, view);
+                DictionaryDXTexture.Add(key, view);
 
             return view;
         }
@@ -2025,6 +2055,18 @@ internal unsafe class Graphics : IGraphics
     /// </summary>
     static string ProcTextureName(string meshName, long meshId, int surfaceIndex, SurfaceTextureSlot slot)
         => $"proc:{meshName}:{meshId}:{surfaceIndex}:{slot}";
+
+    /// <summary>
+    /// 2-6 clause 4: the one derivation of a Surface slot's DictionaryDXTexture key, shared by the code that inserts
+    /// the entry and the resolver that later looks it up. Those two used to spell the name out independently, which
+    /// was survivable only while the path branch keyed on the bare path. Now that a material's path texture carries
+    /// its policy, a lookup spelled differently from its insert would miss silently and fall back to White - a visible
+    /// defect standing in for a one-line divergence.
+    /// </summary>
+    static string SurfaceTextureCacheName(string meshName, long meshId, int surfaceIndex, TextureUpdateSource source, SurfaceTextureSlot slot)
+        => source.Image != null
+            ? ProcTextureName(meshName, meshId, surfaceIndex, slot)
+            : MipChain.CacheKey(source.Path!, MipChain.PolicyForNamedTexture(source.Path, slot));
 
     /// <summary>
     /// Resolves the texture source of a single Surface slot into a DXTexture registered in
@@ -2055,7 +2097,11 @@ internal unsafe class Graphics : IGraphics
                 }
             }
 
-            var tex = DXTexture.CreateFromDecoder(source.Image);
+            // 2-6 clause 1: the policy must be passed here. Without it the overload default applies and the texture is
+            // created single-level, which is what kept every TextureOverride-fed material - the background mountains
+            // among them - out of the mip chain while the glTF path had one. The chain and the anisotropy knob both had
+            // nothing to act on for those assets.
+            var tex = DXTexture.CreateFromDecoder(source.Image, MipChain.PolicyForSurfaceSlot(slot));
             tex.Name = name;
 
             lock (DictionaryDXTexture)
@@ -2064,7 +2110,12 @@ internal unsafe class Graphics : IGraphics
             return tex;
         }
 
-        return EnsureDXTexture(source.Path);
+        // 2-6 clause 1: the path branch now states its policy too. It stayed single-level for one more round than the
+        // pixel branch because its texture is keyed by path alone and shared with every other consumer of that path,
+        // sprites included; the policy-keyed identity MipChain.CacheKey provides is what makes a chain safe here.
+        // PolicyForNamedTexture rather than PolicyForSurfaceSlot: this slot can name a compute output instead of an
+        // asset, and such a name must keep its bare key or nothing will answer to it.
+        return EnsureDXTexture(source.Path, MipChain.PolicyForNamedTexture(source.Path, slot));
     }
 
     /// <summary>Pre-resolves all five texture slots of a single Surface (empty sources are skipped automatically).</summary>
@@ -2100,9 +2151,7 @@ internal unsafe class Graphics : IGraphics
             if (!source.HasValue)
                 return null;
 
-            var name = source.Image != null
-                ? ProcTextureName(meshName, meshId, surfaces.IndexOf(surface), (SurfaceTextureSlot)slot)
-                : source.Path;
+            var name = SurfaceTextureCacheName(meshName, meshId, surfaces.IndexOf(surface), source, (SurfaceTextureSlot)slot);
 
             lock (DictionaryDXTexture)
             {
@@ -2112,33 +2161,69 @@ internal unsafe class Graphics : IGraphics
         };
     }
 
-    /// <summary>Releases procedural textures registered under the five synthetic names of a single
-    /// Surface (the caller must hold the DictionaryDXTexture lock).
-    /// Resources whose reference count drops to zero are moved to the deferred release queue to
-    /// avoid competing with in-flight frames (same contract as DisposeSprite2D).</summary>
-    void ReleaseProcSurfaceTextures(string meshName, long meshId, int surfaceIndex, ulong retireFence)
+    /// <summary>Drops one DictionaryDXTexture reference on <paramref name="key"/> (the caller must hold the
+    /// DictionaryDXTexture lock). A resource whose count reaches zero is unregistered here and destroyed on the
+    /// deferred release queue, so it cannot compete with in-flight frames (same contract as DisposeSprite2D).
+    /// The entry is removed before the release is queued rather than after it runs, which is why this reads
+    /// RefCount &lt;= 1 instead of releasing first and testing for zero.</summary>
+    void ReleaseTextureRef(string key, ulong retireFence)
     {
-        ReleaseProcTexture(ProcTextureName(meshName, meshId, surfaceIndex, SurfaceTextureSlot.BaseColor));
-        ReleaseProcTexture(ProcTextureName(meshName, meshId, surfaceIndex, SurfaceTextureSlot.Normal));
-        ReleaseProcTexture(ProcTextureName(meshName, meshId, surfaceIndex, SurfaceTextureSlot.MetallicRoughness));
-        ReleaseProcTexture(ProcTextureName(meshName, meshId, surfaceIndex, SurfaceTextureSlot.Occlusion));
-        ReleaseProcTexture(ProcTextureName(meshName, meshId, surfaceIndex, SurfaceTextureSlot.Emissive));
+        if (string.IsNullOrEmpty(key))
+            return;
 
-        void ReleaseProcTexture(string name)
+        if (DictionaryDXTexture.TryGetValue(key, out var tex) && tex != null)
         {
-            if (DictionaryDXTexture.TryGetValue(name, out var tex) && tex != null)
+            if (tex.RefCount <= 1)
             {
-                if (tex.RefCount <= 1)
-                {
-                    DictionaryDXTexture.Remove(name);
-                    EnqueueDeferredRelease(retireFence, tex.Release);
-                }
-                else
-                {
-                    tex.Release();
-                }
+                DictionaryDXTexture.Remove(key);
+                EnqueueDeferredRelease(retireFence, tex.Release);
+            }
+            else
+            {
+                tex.Release();
             }
         }
+    }
+
+    /// <summary>
+    /// 2-7: gives back the one reference EnsureSurfaceTexture took for a single Surface slot (the caller must hold the
+    /// DictionaryDXTexture lock). Release has to be keyed exactly the way acquisition was, and which of the two
+    /// branches ran is no longer readable from the Surface, because Load cleared TextureOverride under the
+    /// single-consumption contract. The procedural entry is the record: it exists if and only if the pixel branch
+    /// registered one for this slot, so probing it first recovers the branch. Releasing the path key for a slot that
+    /// was fed pixels would decrement a texture this mesh never took a reference on.
+    /// </summary>
+    void ReleaseSurfaceTexture(string meshName, long meshId, int surfaceIndex, Surface surface, SurfaceTextureSlot slot, ulong retireFence)
+    {
+        var procName = ProcTextureName(meshName, meshId, surfaceIndex, slot);
+        if (DictionaryDXTexture.ContainsKey(procName))
+        {
+            ReleaseTextureRef(procName, retireFence);
+            return;
+        }
+
+        var path = surface.GetTexturePath(slot);
+        if (string.IsNullOrEmpty(path))
+            return;
+
+        // 2-6 clause 4: release the policy-keyed name the path branch inserted. Releasing the bare path would leak this
+        // mesh's entry and decrement a Sprite's texture the mesh never owned.
+        ReleaseTextureRef(MipChain.CacheKey(path, MipChain.PolicyForNamedTexture(path, slot)), retireFence);
+    }
+
+    /// <summary>
+    /// 2-7: releases all five slots of one Surface, mirroring EnsureSurfaceTextures one for one (the caller must hold
+    /// the DictionaryDXTexture lock). Both sides have to cover the same five slots: Load acquires every one of them,
+    /// so releasing BaseColor alone - which is what this did before - retained the other four for the process
+    /// lifetime.
+    /// </summary>
+    void ReleaseSurfaceTextures(string meshName, long meshId, int surfaceIndex, Surface surface, ulong retireFence)
+    {
+        ReleaseSurfaceTexture(meshName, meshId, surfaceIndex, surface, SurfaceTextureSlot.BaseColor, retireFence);
+        ReleaseSurfaceTexture(meshName, meshId, surfaceIndex, surface, SurfaceTextureSlot.Normal, retireFence);
+        ReleaseSurfaceTexture(meshName, meshId, surfaceIndex, surface, SurfaceTextureSlot.MetallicRoughness, retireFence);
+        ReleaseSurfaceTexture(meshName, meshId, surfaceIndex, surface, SurfaceTextureSlot.Occlusion, retireFence);
+        ReleaseSurfaceTexture(meshName, meshId, surfaceIndex, surface, SurfaceTextureSlot.Emissive, retireFence);
     }
 
     public async Task<bool> LoadMesh3D(Season.Controls.Mesh3D mesh)
@@ -2214,30 +2299,12 @@ internal unsafe class Graphics : IGraphics
         if (dxMesh != null)
             EnqueueDeferredRelease(retireFence, dxMesh.Dispose);
 
-        // Release textures referenced by Surface according to the DXTexture reference count:
-        // path sources follow the old contract and release only the BaseColor path, while
-        // procedural pixel sources release all five synthetic names (private to this mesh).
+        // 2-7: give back exactly the references EnsureSurfaceTextures took - all five slots of every Surface, each
+        // keyed the way it was acquired.
         lock (DictionaryDXTexture)
         {
             for (int i = 0; i < mesh.Surfaces.Count; i++)
-            {
-                var path = mesh.Surfaces[i].BaseColorTexturePath;
-                if (!string.IsNullOrEmpty(path)
-                    && DictionaryDXTexture.TryGetValue(path, out var dxTexture) && dxTexture != null)
-                {
-                    if (dxTexture.RefCount <= 1)
-                    {
-                        DictionaryDXTexture.Remove(path);
-                        EnqueueDeferredRelease(retireFence, dxTexture.Release);
-                    }
-                    else
-                    {
-                        dxTexture.Release();
-                    }
-                }
-
-                ReleaseProcSurfaceTextures(mesh.Name, mesh.ID, i, retireFence);
-            }
+                ReleaseSurfaceTextures(mesh.Name, mesh.ID, i, mesh.Surfaces[i], retireFence);
         }
 
         mesh.Ready = false;
@@ -2316,30 +2383,12 @@ internal unsafe class Graphics : IGraphics
         if (dxMesh != null)
             EnqueueDeferredRelease(retireFence, dxMesh.Dispose);
 
-        // Release textures referenced by Surface according to the DXTexture reference count:
-        // path sources follow the old contract and release only the BaseColor path, while
-        // procedural pixel sources release all five synthetic names (private to this mesh).
+        // 2-7: give back exactly the references EnsureSurfaceTextures took - all five slots of every Surface, each
+        // keyed the way it was acquired.
         lock (DictionaryDXTexture)
         {
             for (int i = 0; i < mesh.Surfaces.Count; i++)
-            {
-                var path = mesh.Surfaces[i].BaseColorTexturePath;
-                if (!string.IsNullOrEmpty(path)
-                    && DictionaryDXTexture.TryGetValue(path, out var dxTexture) && dxTexture != null)
-                {
-                    if (dxTexture.RefCount <= 1)
-                    {
-                        DictionaryDXTexture.Remove(path);
-                        EnqueueDeferredRelease(retireFence, dxTexture.Release);
-                    }
-                    else
-                    {
-                        dxTexture.Release();
-                    }
-                }
-
-                ReleaseProcSurfaceTextures(mesh.Name, mesh.ID, i, retireFence);
-            }
+                ReleaseSurfaceTextures(mesh.Name, mesh.ID, i, mesh.Surfaces[i], retireFence);
         }
 
         mesh.Ready = false;
