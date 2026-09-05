@@ -91,14 +91,20 @@ public enum TextureMipPolicy
     /// Box-filtered chain plus per-level renormalization, for tangent-space normal maps. Averaging two normals
     /// that differ in direction always produces a vector shorter than unit length, so without this step the
     /// shading normal shrinks with distance and both N dot L and the Fresnel term drift.
+    ///
+    /// 2-6 clause 5: the length discarded by that renormalization is measured first and stored in the alpha channel,
+    /// so this policy takes ownership of alpha in the normal slot - an authored normal map that packed something else
+    /// there will have it overwritten. See <see cref="RenderQuality.TextureNormalVariance"/> and MipChain.Build.
     /// </summary>
     Normal,
 
     /// <summary>
     /// Box-filtered chain with no renormalization, for scalar material data packed per channel
-    /// (metallic-roughness, ambient occlusion). Note that plain averaging of roughness is not the physically
-    /// correct answer for specular antialiasing - that requires folding normal variance into roughness
-    /// (Toksvig / LEAN). This tier is deliberately the naive filter; variance-aware roughness is separate work.
+    /// (metallic-roughness, ambient occlusion). Plain averaging of roughness is not the physically correct answer for
+    /// specular antialiasing - that requires folding normal variance into roughness (Toksvig / LEAN) - so this tier is
+    /// deliberately the naive filter and stays that way. 2-6 clause 5 does the variance-aware part elsewhere, in the
+    /// normal map's alpha channel and in the shader, precisely so that it does not depend on a material having one of
+    /// these textures at all: most materials in this engine pair a normal map with a scalar roughness factor.
     /// </summary>
     Linear,
 }
@@ -317,7 +323,10 @@ public class RenderQuality
     public static int DefaultTextureMipMinSize = 64;
 
     /// <summary>Default value for TextureMaxAnisotropy (overrideable in the app constructor and captured by Init()).</summary>
-    public static int DefaultTextureMaxAnisotropy = 1;
+    public static int DefaultTextureMaxAnisotropy = 16;
+
+    /// <summary>Default value for TextureNormalVariance (overrideable in the app constructor and captured by Init()).</summary>
+    public static bool DefaultTextureNormalVariance = true;
 
     // -- Runtime properties (snapshot from Default* in the constructor; editable at runtime and persisted through Settings). --
 
@@ -537,12 +546,52 @@ public class RenderQuality
     /// This is the knob that trades blur against aliasing. Trilinear alone picks its level from the longer screen-space
     /// axis, so surfaces seen at a grazing angle - distant hillsides, ground receding to the horizon - are filtered as if
     /// they were minified equally in both directions and come out over-blurred. Anisotropy is the actual fix for that,
-    /// not a refinement of it. It is left at 1 by default so that mip chains can be validated on their own first;
-    /// raising it while mips are still being verified makes it much harder to attribute what changed.
+    /// not a refinement of it.
+    ///
+    /// 2-6 clause 6: the default is 16, chosen from a measured A/B rather than convention. Enabling mip chains alone
+    /// costs about 7.5% of the spatial high-frequency energy on distant grazing rock while cutting frame-to-frame
+    /// difference by 9-24% - it trades visible sharpness for stability. Anisotropy buys that sharpness back: the
+    /// high-frequency energy returns to within 2% of the un-mipped image at a count of 4 and does not improve further
+    /// at 8 or 16. What continues to improve past 4 is temporal stability, and only 16 keeps the frame-to-frame
+    /// difference clearly below the un-mipped baseline while holding the restored sharpness. 4 and 8 recover the
+    /// sharpness but let the shimmer return to roughly the un-mipped level, which would defeat the reason mip chains
+    /// were added. Note that the A/B measured image quality only; the GPU cost of the count was not measured, so a
+    /// platform that finds 16 too expensive should lower this rather than assume it is free.
+    ///
     /// Values above 1 are ignored by a backend that does not support them, and are harmless on single-level textures
     /// because anisotropic filtering degenerates to bilinear when there is only one level to choose from.
     /// </summary>
     public int TextureMaxAnisotropy { get; set; } = DefaultTextureMaxAnisotropy;
+
+    /// <summary>
+    /// 2-6 clause 5: whether normal-map mip generation measures the variance it filters away and folds it into
+    /// roughness in the shader (Toksvig). Mip filtering plus renormalization gives a coarse texel one unit normal and
+    /// leaves its authored roughness alone, so a footprint that really covers many differing normals keeps a narrow
+    /// specular lobe it has no right to - which is what makes distant specular highlights flicker as the footprint
+    /// shifts between frames. Anisotropy and more mip levels cannot fix this; the lost lobe width has to be returned
+    /// as roughness.
+    ///
+    /// Like <see cref="TextureMipmaps"/> this is locked at texture creation, because the measurement is baked into the
+    /// normal map's alpha channel at upload time. Switching it off writes the neutral value into that channel instead,
+    /// which makes the shader's mapping an exact no-op - so the off state costs no shader branch and no extra
+    /// constant, and only affects textures created afterwards.
+    ///
+    /// Expect the effect to be narrow rather than global. It does nothing for a material without a normal map, and
+    /// almost nothing for one that is already near-fully rough, since the perturbed roughness saturates. The materials
+    /// it visibly changes are those pairing a detailed normal map with low roughness.
+    /// </summary>
+    public bool TextureNormalVariance { get; set; } = DefaultTextureNormalVariance;
+
+    /// <summary>
+    /// 2-6 clause 6: resolves <see cref="TextureMaxAnisotropy"/> against a backend's own ceiling. The value is shared
+    /// by all four backends but their ceilings are not: D3D12 and Metal both cap the count at 16 by specification,
+    /// WebGPU leaves it implementation-defined and silently clamps, and Vulkan exposes it per device as
+    /// limits.maxSamplerAnisotropy - which is why the cap is a parameter rather than a constant. Clamping here rather
+    /// than at each call site keeps an out-of-range setting from becoming a device-creation failure on one backend and
+    /// a silent no-op on another; 1 is returned for any request at or below 1, which is the isotropic case.
+    /// </summary>
+    public static int ClampAnisotropy(int requested, int backendMax = 16)
+        => Math.Clamp(requested, 1, Math.Max(1, backendMax));
 
     static RenderQuality? _currentFallback;
 
