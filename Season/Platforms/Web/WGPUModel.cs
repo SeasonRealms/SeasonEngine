@@ -557,9 +557,18 @@ internal class WGPUModel
 
         if (gltfMaterial != null)
         {
+            // glTF defines the effective value as factor * texture channel, so both factors are written
+            // unconditionally here and multiplied against the map inside the fragment shader.
             primData.MetallicFactor = gltfMaterial.MetallicFactor;
             primData.RoughnessFactor = gltfMaterial.RoughnessFactor;
             primData.EmissiveFactor = gltfMaterial.EmissiveFactor;
+        }
+        else
+        {
+            // No glTF material at all: match the other three backends and fall back to the engine's
+            // documented neutral dielectric instead of the spec default material's fully metallic 1/1.
+            primData.MetallicFactor = 0f;
+            primData.RoughnessFactor = 0.5f;
         }
 
         if (images.Count > 0)

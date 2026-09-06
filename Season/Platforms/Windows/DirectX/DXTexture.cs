@@ -481,6 +481,33 @@ public unsafe class DXTexture : IDisposable
         }
     }
 
+    /// <summary>
+    /// Rebuilds the mip chain of a normal map so a change to <see cref="RenderQuality.TextureNormalVariance"/> takes
+    /// effect without reloading the scene. That switch is read inside <see cref="MipChain.Build"/> and nowhere else, so
+    /// it used to be frozen into whatever it was when the texture was first uploaded - which made an A/B comparison
+    /// require a restart and two screenshots.
+    ///
+    /// Only the alpha channel of the levels below zero changes, so the level count and the GPU resource stay as they
+    /// are and the existing in-place <see cref="UploadPixels"/> path can carry it: the retained <c>_imageData</c> still
+    /// holds the authored level-0 pixels at its front, and Build derives everything else from them. Nothing else the
+    /// texture knobs control can be redone this way - the mipmap master switch changes the level count, which is baked
+    /// into the resource, and the LOD bias is a shader compile-time constant.
+    /// </summary>
+    /// <returns>True when this texture was actually rebuilt.</returns>
+    internal bool RebuildNormalVarianceChain()
+    {
+        if (_mipPolicy != TextureMipPolicy.Normal) return false;
+        if (_mipLevels <= 1) return false;
+        if (!Ready) return false;
+
+        int level0Length = (int)(Width * Height * 4);
+        if (_imageData is null || _imageData.Length < level0Length) return false;
+
+        // UploadPixels never writes _imageData, so handing it a span into that same array is safe.
+        UploadPixels(_imageData.AsSpan(0, level0Length));
+        return true;
+    }
+
     public void UploadSubRects(ReadOnlySpan<byte> rgbaPixels, int sourceWidth, int sourceHeight, ReadOnlySpan<TextureUploadRect> dirtyRects)
     {
         if (dirtyRects.Length == 0)

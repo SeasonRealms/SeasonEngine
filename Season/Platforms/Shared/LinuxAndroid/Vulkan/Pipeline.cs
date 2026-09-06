@@ -2791,8 +2791,13 @@ void main() {
         return;
     }
 
+    // glTF defines the effective values as factor * texture channel, so the scalar factors apply on both
+    // paths. Sampling the map without the factors used to force metallicFactor 0 materials (grass, most
+    // props) to whatever the packed ORM blue channel held, i.e. fully metallic.
     if (useMetallicRoughnessMap != 0u) {
-        metallicRoughness = texture(metallicRoughnessMap, vUV, TEXTURE_LOD_BIAS).rgb;
+        vec3 metallicRoughnessSample = texture(metallicRoughnessMap, vUV, TEXTURE_LOD_BIAS).rgb;
+        metallicRoughness.b = metallicFactor * metallicRoughnessSample.b;
+        metallicRoughness.g = roughnessFactor * metallicRoughnessSample.g;
     } else {
         metallicRoughness.b = metallicFactor;
         metallicRoughness.g = roughnessFactor;

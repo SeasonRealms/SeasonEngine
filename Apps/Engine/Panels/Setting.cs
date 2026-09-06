@@ -47,9 +47,9 @@ internal class SettingPanel : BoardPanel
 
     Texts title;
 
-    Input inputMode, inputMovement, inputFov, inputStep, inputShadowOffset, inputShadowSoftness, inputShadowContact, inputLog;
+    Input inputMode, inputMovement, inputFov, inputStep, inputShadowOffset, inputShadowSoftness, inputShadowContact, inputNormalVariance, inputLog;
 
-    Texts textsMode, textsMovement, textsFov, textsStep, textsShadowOffset, textsShadowSoftness, textsShadowContact, textsLog;
+    Texts textsMode, textsMovement, textsFov, textsStep, textsShadowOffset, textsShadowSoftness, textsShadowContact, textsNormalVariance, textsLog;
 
     BaseControl current = null;
 
@@ -135,6 +135,18 @@ internal class SettingPanel : BoardPanel
             Scale = Vector2.One * 1f
         };
         AddControl(textsShadowContact);
+
+        // 2-6 clause 5: Toksvig normal-map variance. Unlike the shadow rows above this one is not read from a UBO - the
+        // measurement lives in the alpha channel of the normal map's mip levels - so switching it here re-runs the chains
+        // through Graphics.RebuildNormalVarianceTextures. It exists as a row because the effect is narrow enough that
+        // judging it needs an A/B in one session rather than two launches and two screenshots.
+        textsNormalVariance = new Texts()
+        {
+            Content = "Normal variance",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsNormalVariance);
 
         textsLog = new Texts()
         {
@@ -548,6 +560,55 @@ internal class SettingPanel : BoardPanel
         };
         AddPanel(inputShadowContact);
 
+        inputNormalVariance = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                var sources = new List<Season.Entities.EData>
+                {
+                    new Season.Entities.EData() { Key = "0", Title = "Off (neutral alpha)" },
+                    new Season.Entities.EData() { Key = "1", Title = "On (Toksvig)" }
+                };
+
+                current = inputNormalVariance;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null)
+                        {
+                            RenderQuality.Current.TextureNormalVariance = picked.Key == "1";
+
+                            // The switch is only read while a mip chain is being built, so setting it changes nothing on its
+                            // own. Rebuilding blocks on a GPU fence per texture, which is why it happens once here on
+                            // selection instead of being checked per frame.
+                            var rebuilt = Season.Basic.Graphics.Instance?.RebuildNormalVarianceTextures() ?? 0;
+
+                            App.Instance.AddLog(LogType.Backend,
+                                $"{DateTime.UtcNow} [Setting] TextureNormalVariance={RenderQuality.Current.TextureNormalVariance}, " +
+                                $"normal maps rebuilt={rebuilt}");
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputNormalVariance);
+
         inputLog = new Input()
         {
             WidthMin = WidthMin,
@@ -589,7 +650,8 @@ internal class SettingPanel : BoardPanel
         textsShadowOffset.Update(time, posX: PosX + padding, posY: textsStep.PosY + paddingH);
         textsShadowSoftness.Update(time, posX: PosX + padding, posY: textsShadowOffset.PosY + paddingH);
         textsShadowContact.Update(time, posX: PosX + padding, posY: textsShadowSoftness.PosY + paddingH);
-        textsLog.Update(time, posX: PosX + padding, posY: textsShadowContact.PosY + paddingH);
+        textsNormalVariance.Update(time, posX: PosX + padding, posY: textsShadowContact.PosY + paddingH);
+        textsLog.Update(time, posX: PosX + padding, posY: textsNormalVariance.PosY + paddingH);
 
         var width0 = 180; var inputLeft = 200; var height0 = 70;
         inputMode.Text = App.Instance.Mode.ToString();
@@ -633,6 +695,12 @@ internal class SettingPanel : BoardPanel
         inputShadowContact.Text = RenderQuality.Current.ShadowContactHardening ? "On" : "Off";
         inputShadowContact.Color = inputShadowContact.MouseOver ? Season.Basic.Colors.Red : Season.Basic.Colors.Black;
         if (inputShadowContact.Update(time, posX: (int)textsShadowContact.PosX + inputLeft, posY: (int)textsShadowContact.PosY, width: width0, height: height0))
+        {
+            result = true;
+        }
+        inputNormalVariance.Text = RenderQuality.Current.TextureNormalVariance ? "On" : "Off";
+        inputNormalVariance.Color = inputNormalVariance.MouseOver ? Season.Basic.Colors.Red : Season.Basic.Colors.Black;
+        if (inputNormalVariance.Update(time, posX: (int)textsNormalVariance.PosX + inputLeft, posY: (int)textsNormalVariance.PosY, width: width0, height: height0))
         {
             result = true;
         }

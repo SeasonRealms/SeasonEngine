@@ -827,6 +827,11 @@ public class RenderQuality
     /// which makes the shader's mapping an exact no-op - so the off state costs no shader branch and no extra
     /// constant, and only affects textures created afterwards.
     ///
+    /// Unlike TextureMipmaps it can nevertheless be redone in place, which is what IGraphics.RebuildNormalVarianceTextures
+    /// exists for: only the alpha of the levels below zero changes, so the level count and the GPU resource survive and an
+    /// in-place pixel upload from the retained level-0 pixels carries it. That path is D3D12-only, because Vulkan and Metal
+    /// release those pixels once the upload batch has run; elsewhere this still needs a restart to compare.
+    ///
     /// Expect the effect to be narrow rather than global. It does nothing for a material without a normal map, and
     /// almost nothing for one that is already near-fully rough, since the perturbed roughness saturates. The materials
     /// it visibly changes are those pairing a detailed normal map with low roughness.

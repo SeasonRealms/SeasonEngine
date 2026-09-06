@@ -2302,8 +2302,15 @@ float4 PSMain(PSInput input) : SV_TARGET
     // renderMode == 1: PBR path (below)
     // renderMode == 2: reserved for TextMsdf, currently falls back to PBR
     
+    // glTF defines the effective values as factor * texture channel, so the scalar factors apply on both
+    // paths. Sampling the map without the factors used to force metallicFactor 0 materials (grass, most
+    // props) to whatever the packed ORM blue channel held, i.e. fully metallic.
     [branch] if (useMetallicRoughnessMap != 0)
-        metallicRoughness = metallicRoughnessMap.SampleBias(linearSampler, input.texCoord, TEXTURE_LOD_BIAS).rgb;
+    {
+        float3 metallicRoughnessSample = metallicRoughnessMap.SampleBias(linearSampler, input.texCoord, TEXTURE_LOD_BIAS).rgb;
+        metallicRoughness.b = metallicFactor * metallicRoughnessSample.b;  // Metallic
+        metallicRoughness.g = roughnessFactor * metallicRoughnessSample.g; // Roughness
+    }
     else
     {
         // Use material parameters when there is no metallic-roughness map

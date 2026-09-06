@@ -731,6 +731,20 @@ internal unsafe class VKModel : VKPrimitiveGroup
             // The caller-side MaterialColor acts as a tint
             // and is multiplied by the original glTF BaseColorFactor
             p.MaterialParams.BaseColor *= gLTFMaterial1.BaseColorFactor;
+
+            // The two scalar factors are written unconditionally: glTF defines the effective value as
+            // factor * texture channel, so the shader needs them even when a metallic-roughness map exists.
+            // They used to be written only in the "map missing" branches (and MetallicFactor was keyed off the
+            // normal map by mistake), which left every textured material multiplying against a stale zero.
+            p.MaterialParams.MetallicFactor = gLTFMaterial1.MetallicFactor;
+            p.MaterialParams.RoughnessFactor = gLTFMaterial1.RoughnessFactor;
+        }
+        else
+        {
+            // No glTF material at all: fall back to the engine's documented neutral dielectric rather than
+            // the all-zero struct default, whose roughness 0 would read as a perfect mirror.
+            p.MaterialParams.MetallicFactor = 0f;
+            p.MaterialParams.RoughnessFactor = 0.5f;
         }
 
         if (images.Count == 0)
@@ -755,7 +769,6 @@ internal unsafe class VKModel : VKPrimitiveGroup
             var normalImage = images[1];
             if (normalImage is null)
             {
-                p.MaterialParams.MetallicFactor = gLTFMaterial1!.MetallicFactor;
                 p.MaterialParams.UseNormalMap = 0u;
             }
             else
@@ -770,7 +783,6 @@ internal unsafe class VKModel : VKPrimitiveGroup
             if (metallicRoughnessImage is null)
             {
                 p.MaterialParams.UseMetallicRoughnessMap = 0u;
-                p.MaterialParams.RoughnessFactor = gLTFMaterial1!.RoughnessFactor;
             }
             else
             {

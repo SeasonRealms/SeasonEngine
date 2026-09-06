@@ -167,6 +167,12 @@ internal unsafe class TextureUploadBatch : IDisposable
                 throw new Exception("vkQueueSubmit (texture upload) failed");
 
             // 5. Mark the fence value and state for each texture
+            //
+            // 2-6 clause 5: dropping ImageData here is why IGraphics.RebuildNormalVarianceTextures stays a no-op on this
+            // backend - re-running a normal map's chain needs the authored level-0 pixels, and D3D12 can only offer that
+            // knob because it keeps them for the resource's lifetime. Retaining them here would cost W*H*4 per normal map
+            // permanently on Android, which is not worth paying for a development-time A/B; the switch still works there,
+            // it just takes a restart to change. Keep the two in step if this ever changes.
             foreach (var t in _tasks)
             {
                 t.UploadFenceValue = signalValue;

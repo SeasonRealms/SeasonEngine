@@ -489,6 +489,49 @@ internal unsafe class Graphics : IGraphics
         }
     }
 
+    /// <summary>
+    /// 2-6 clause 5: re-runs the normal-map chains so a change to RenderQuality.TextureNormalVariance applies to textures
+    /// that are already resident (contract on IGraphics). Both registries are swept, because a model's normal map lives in
+    /// the static Device.DictionaryDXTexture under its policy-keyed name while the instance dictionary here holds sprite
+    /// and compute entries; DXTexture filters by policy itself, so the entries that cannot be affected cost one field test.
+    ///
+    /// Textures created by DXPrimitiveGroup.ReplaceTextureBySlot through CreateFromDecoder are not in either dictionary by
+    /// design - the caller owns them - so a normal map installed at runtime keeps the variance state it was built with
+    /// until it is replaced again. That is the one gap, and it cannot be closed from here without a second registry.
+    /// </summary>
+    public int RebuildNormalVarianceTextures()
+    {
+        if (DirectX.Device.D3dDevice == null) return 0;
+
+        // Snapshots are taken under the locks and the rebuilds run outside them: UploadPixels submits on the graphics
+        // queue and blocks on a fence, which is not something to hold a dictionary lock across.
+        var candidates = new List<DXTexture>();
+
+        lock (DirectX.Device.DictionaryDXTexture)
+            candidates.AddRange(DirectX.Device.DictionaryDXTexture.Values);
+
+        lock (DictionaryDXTexture)
+            candidates.AddRange(DictionaryDXTexture.Values);
+
+        int rebuilt = 0;
+        foreach (var tex in candidates)
+        {
+            if (tex == null) continue;
+
+            try
+            {
+                if (tex.RebuildNormalVarianceChain()) rebuilt++;
+            }
+            catch (Exception ex)
+            {
+                DeviceServices.BaseApp.AddLog(LogType.Error,
+                    $"{DateTime.UtcNow} [RebuildNormalVarianceTextures] '{tex.Name}' rebuild failed: {ex.Message}");
+            }
+        }
+
+        return rebuilt;
+    }
+
     public void DispatchCompute(in Season.Rendering.ComputeDispatchArgs args)
     {
         var cmd = DirectX.Device.GraphicsCommandList;

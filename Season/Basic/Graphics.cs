@@ -194,6 +194,27 @@ public interface IGraphics
 
     Season.Rendering.TextureCube? CreateTextureCube(string name, int size,
         Season.Rendering.TextureCubeFormat format, INativeImageDecoder[] faces) => null;
+
+    /// <summary>
+    /// Re-runs normal-map mip generation on every already-loaded normal map so a change to
+    /// <see cref="RenderQuality.TextureNormalVariance"/> takes effect in the running process. Without this the switch is
+    /// frozen into whatever it was when each texture was uploaded, because MipChain.Build reads it and nothing else does,
+    /// so comparing it on against off meant restarting and lining up two screenshots.
+    ///
+    /// It is deliberately the only texture knob offered this way. <see cref="RenderQuality.TextureMipmaps"/> decides the
+    /// level count, which is baked into the resource at creation, and <see cref="RenderQuality.TextureLodBias"/> is a
+    /// shader compile-time constant; neither can be redone without rebuilding what holds it. Variance only rewrites the
+    /// alpha channel of the levels below zero, so the level count and the resource survive and an in-place pixel upload
+    /// carries it.
+    ///
+    /// The default is a no-op returning zero, which is honest rather than lazy: a backend can only implement this if it
+    /// still holds the authored level-0 pixels. Vulkan and Metal drop them once the upload batch has run (see the note at
+    /// that release), and the Web backend never keeps them on the C# side at all - its JS fallback loader does not even
+    /// decode them there. So this is D3D12-only by decision, not by omission: it buys a development-time A/B on the one
+    /// platform that A/B is performed on, and everywhere else the switch still applies, just from the next launch.
+    /// </summary>
+    /// <returns>How many textures were rebuilt. Zero means the platform does not support it, or nothing was eligible.</returns>
+    int RebuildNormalVarianceTextures() => 0;
 }
 
 public interface INativeImageDecoder : IDisposable

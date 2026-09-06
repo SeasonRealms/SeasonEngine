@@ -72,6 +72,13 @@ public static class GLTFTools
                     // or GLTFMaterial needs to be extended to support Specular-Glossiness directly.
                     metallicRoughnessImage = ResolveTextureImage(specularGlossiness.Texture, out var metallicRoughnessIndex);
                     gLTFMaterial1.MetallicRoughnessIndex = metallicRoughnessIndex;
+
+                    // The metallic/roughness factors are deliberately left at 1.0 here. A real conversion needs
+                    // glossiness from the texture alpha (roughness = 1 - glossinessFactor * alpha), but the shader
+                    // reads .b/.g of this texture as metallic/roughness, so the channel mapping is wrong to begin
+                    // with. Folding in only the scalar glossinessFactor would turn a fully glossy material into
+                    // roughness 0, i.e. a mirror. Keeping 1.0 makes factor * texture reduce to the historical
+                    // "sample the texture directly" behaviour until Specular-Glossiness is supported for real.
                 }
             }
             else
@@ -88,6 +95,15 @@ public static class GLTFTools
                 {
                     metallicRoughnessImage = ResolveTextureImage(metallicRoughness.Texture, out var metallicRoughnessIndex);
                     gLTFMaterial1.MetallicRoughnessIndex = metallicRoughnessIndex;
+
+                    // The two scalar factors must be read even when a metallic-roughness texture is present:
+                    // glTF defines the effective value as factor * texture channel, so dropping them here is
+                    // what used to leave every material at the 1.0 fallback (i.e. fully metallic).
+                    if (TryGetChannelFactor(metallicRoughness, "MetallicFactor", out var metallicFactor))
+                        gLTFMaterial1.MetallicFactor = metallicFactor;
+
+                    if (TryGetChannelFactor(metallicRoughness, "RoughnessFactor", out var roughnessFactor))
+                        gLTFMaterial1.RoughnessFactor = roughnessFactor;
                 }
             }
 
@@ -120,6 +136,28 @@ public static class GLTFTools
         }
 
         return (gLTFMaterial1, images);
+    }
+
+    /// <summary>
+    /// Reads a named scalar factor out of a material channel. The channel parameter list is scanned by name
+    /// instead of calling GetFactor so that a channel which does not expose the parameter simply leaves the
+    /// caller's default in place rather than throwing.
+    /// </summary>
+    static bool TryGetChannelFactor(MaterialChannel channel, string name, out float value)
+    {
+        foreach (var parameter in channel.Parameters)
+        {
+            if (!string.Equals(parameter.Name, name, StringComparison.Ordinal)) continue;
+
+            switch (parameter.Value)
+            {
+                case float single: value = single; return true;
+                case double dbl: value = (float)dbl; return true;
+            }
+        }
+
+        value = 0.0f;
+        return false;
     }
 
     static SharpGLTF.Schema2.Image ResolveTextureImage(SharpGLTF.Schema2.Texture texture, out int imageIndex)

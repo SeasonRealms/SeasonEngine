@@ -717,6 +717,20 @@ internal unsafe class DXModel : DXPrimitiveGroup
             // the glTF BaseColorFactor so glTF default white / material colors do
             // not override the intended tint when no base-color texture exists.
             primitiveData.MaterialParams.BaseColor *= gLTFMaterial1.BaseColorFactor;
+
+            // The two scalar factors are written unconditionally: glTF defines the effective value as
+            // factor * texture channel, so the shader needs them even when a metallic-roughness map exists.
+            // They used to be written only in the "map missing" branches (and MetallicFactor was keyed off the
+            // normal map by mistake), which left every textured material multiplying against a stale zero.
+            primitiveData.MaterialParams.MetallicFactor = gLTFMaterial1.MetallicFactor;
+            primitiveData.MaterialParams.RoughnessFactor = gLTFMaterial1.RoughnessFactor;
+        }
+        else
+        {
+            // No glTF material at all: fall back to the engine's documented neutral dielectric rather than
+            // the all-zero struct default, whose roughness 0 would read as a perfect mirror.
+            primitiveData.MaterialParams.MetallicFactor = 0.0f;
+            primitiveData.MaterialParams.RoughnessFactor = 0.5f;
         }
 
         if (images.Count == 0)
@@ -741,7 +755,6 @@ internal unsafe class DXModel : DXPrimitiveGroup
             var normalImage = images[1];
             if (normalImage is null)
             {
-                primitiveData.MaterialParams.MetallicFactor = gLTFMaterial1.MetallicFactor;
                 primitiveData.MaterialParams.UseNormalMap = 0u;
             }
             else
@@ -756,7 +769,6 @@ internal unsafe class DXModel : DXPrimitiveGroup
             if (metallicRoughnessImage is null)
             {
                 primitiveData.MaterialParams.UseMetallicRoughnessMap = 0u;
-                primitiveData.MaterialParams.RoughnessFactor = gLTFMaterial1.RoughnessFactor;
             }
             else
             {

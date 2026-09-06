@@ -1189,6 +1189,8 @@ fn shade(input: ShadeInput) -> vec4f {
         return vec4f(colorUnlit, alpha);
     }
 
+    // glTF defines the effective values as factor * texture channel. This backend was already spec-correct
+    // here; the other three have been brought in line, so do not "simplify" the multiplies away.
     var metallic: f32 = u.material.x;
     var roughness: f32 = u.material.y;
     if (HasTexture(1)) {
