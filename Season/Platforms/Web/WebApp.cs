@@ -210,6 +210,21 @@ public static class WebApp
                     SampleCount = 1,
                 });
             }
+
+            // Supplement to contract 2-3 clause 2: the velocity path also needs SceneDepth to be explicit,
+            // so TAA can read the current frame's depth and dilate velocity towards the closest neighbour
+            // (clause 10). Mirrors WindowsApp/LinuxApp/AndroidApp/AppDelegate. SampleCount 1 needs no guard
+            // here for a different reason than on D3D12: this backend has no MSAA offscreen chain at all and
+            // rewrote Msaa4x to Fxaa during tier finalization, so a multisampled scene is unreachable.
+            if (RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
+            {
+                Season.Rendering.FrameSchedule.SceneDepth = _graphics.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
+                {
+                    DepthFormat = Season.Rendering.RtFormat.D32Float,
+                    MatchBackbufferSize = true,
+                    SampleCount = 1,
+                });
+            }
             
             var jsSize = await jsRuntime.InvokeAsync<CanvasSize>("seasonWebGPU.getCanvasSize");
             

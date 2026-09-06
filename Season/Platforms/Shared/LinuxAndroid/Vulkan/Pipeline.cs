@@ -1217,7 +1217,12 @@ public static VkPipeline TransparentBackFacePipelineState;
                 // DDGI tier selection now prefers Settings.RenderQuality, which can be persisted, and falls back to the static default source when null.
                 // This shares the same gate as DdgiEffect.Initialize, ensuring that the main shader variant and atlas resources are created in sync.
                 + ((Season.Basic.DeviceServices.BaseApp?.Settings?.RenderQuality?.GlobalIllumination ?? RenderQuality.DefaultGlobalIllumination) == Season.Rendering.GiMode.Ddgi ? "#define DDGI_ENABLED 1\n" : "#define DDGI_ENABLED 0\n") + shadowDefs
-                + (outlineMask ? "#define OUTLINE_MASK 1\n" : "#define OUTLINE_MASK 0\n"));
+                + (outlineMask ? "#define OUTLINE_MASK 1\n" : "#define OUTLINE_MASK 0\n")
+                // 2-6 clause 7: material-fetch LOD bias, injected as a literal rather than carried in the material UBO.
+                // The value is fixed for the process (RenderQuality is locked before graphics initialization), so a UBO
+                // field would cost a per-draw write to express something glslang can fold. Only the FS needs it, since
+                // the VS samples nothing.
+                + "#define TEXTURE_LOD_BIAS " + RenderQuality.Current.TextureLodBiasLiteral + "\n");
             fsModule = ShaderCompiler.CreateShaderModule(
                 Device.Vk, Device.LogicalDevice, fragmentSrc, ShaderStageFlags.FragmentBit, "main", "pipeline.frag", debug);
         }
@@ -1862,6 +1867,19 @@ layout(binding = 5) uniform sampler2D normalMap;
 layout(binding = 6) uniform sampler2D metallicRoughnessMap;
 layout(binding = 7) uniform sampler2D aoMap;
 layout(binding = 8) uniform sampler2D emissiveMap;
+
+// 2-6 clause 7: every material fetch below passes TEXTURE_LOD_BIAS as texture()'s third argument, which is the literal
+// 0.0 outside the TAA tier, so the level selected there is the one an unbiased fetch would pick. Whether the zero is
+// folded away or kept as an operand is up to glslang and the driver; fxc keeps it, so do not assume the neutral tier is
+// free of a bias-capable fetch here either. The uniform call form is deliberate regardless - WGSL has no preprocessor
+// to switch forms with, so branching here would buy a saving on one backend at the price of four structurally
+// different shader sources.
+//
+// The bias is not applied to the MSDF text fetch or the
+// outline-mask fetch that share albedoMap: a distance field is not colour, and its coverage maths derives screen pixel
+// range from uv derivatives rather than from the level actually sampled, so a bias would desynchronize the two. Both of
+// those atlases carry TextureMipPolicy.None today, which makes the distinction free rather than a cost - but it is
+// written out so that giving one a chain later cannot silently change glyph coverage.
 
 // 1-7:
 // environment radiance cube on binding 16, single mip.
@@ -2613,7 +2631,7 @@ void main() {
     }
 
     if (useAlbedoMap != 0u) {
-        vec4 sampled = texture(albedoMap, vUV);
+        vec4 sampled = texture(albedoMap, vUV, TEXTURE_LOD_BIAS);
         albedo *= sampled.rgb;
         alpha *= sampled.a;
     }
@@ -2641,16 +2659,16 @@ void main() {
     }
 
     if (useMetallicRoughnessMap != 0u) {
-        metallicRoughness = texture(metallicRoughnessMap, vUV).rgb;
+        metallicRoughness = texture(metallicRoughnessMap, vUV, TEXTURE_LOD_BIAS).rgb;
     } else {
         metallicRoughness.b = metallicFactor;
         metallicRoughness.g = roughnessFactor;
     }
 
-    if (useAoMap != 0u) ao = texture(aoMap, vUV).r;
+    if (useAoMap != 0u) ao = texture(aoMap, vUV, TEXTURE_LOD_BIAS).r;
 
     if (useEmissiveMap != 0u) {
-        emissive = texture(emissiveMap, vUV).rgb;
+        emissive = texture(emissiveMap, vUV, TEXTURE_LOD_BIAS).rgb;
     } else {
         emissive = emissiveFactor.rgb;
     }
@@ -2665,7 +2683,7 @@ void main() {
     mat3 TBN = mat3(T, B, N);
 
     if (useNormalMap != 0u) {
-        vec4 nrmSample = texture(normalMap, vUV);
+        vec4 nrmSample = texture(normalMap, vUV, TEXTURE_LOD_BIAS);
         vec3 nrm = nrmSample.rgb * 2.0 - 1.0;
         // 2-6 clause 5: normalize the world-space result. Any filtered fetch of a normal map returns a vector
         // shorter than unit length, and with a mip chain the shortening grows with distance.

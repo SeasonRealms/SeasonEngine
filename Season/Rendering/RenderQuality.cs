@@ -137,6 +137,9 @@ public enum TextureMipPolicy
 ///   and keeps graceful fallback to the pre-GI image. Probe validity classification and Chebyshev visibility are runtime-tunable.
 /// - 2-5 procedural sky: the sky path uses SkyAtmosphereEffect LUTs, a dual-light sun/moon model, optional procedural clouds,
 ///   and optional aerial perspective. Procedural sky, clouds, and AP all use explicit readiness gates and clean fallback paths.
+/// - 2-6 material texture filtering: mip chains are opt-in per texture slot, generated once on the CPU and keyed into the shared
+///   texture dictionary by policy, filtered with anisotropy, variance-corrected through Toksvig, and sharpened by a
+///   TAA-only LOD bias. Every gate degrades to the pre-2-6 single-level image rather than to a different one.
 /// </summary>
 public class RenderQuality
 {
@@ -327,6 +330,9 @@ public class RenderQuality
 
     /// <summary>Default value for TextureNormalVariance (overrideable in the app constructor and captured by Init()).</summary>
     public static bool DefaultTextureNormalVariance = true;
+
+    /// <summary>Default value for TextureLodBias (overrideable in the app constructor and captured by Init()).</summary>
+    public static float DefaultTextureLodBias = -0.5f;
 
     // -- Runtime properties (snapshot from Default* in the constructor; editable at runtime and persisted through Settings). --
 
@@ -581,6 +587,66 @@ public class RenderQuality
     /// it visibly changes are those pairing a detailed normal map with low roughness.
     /// </summary>
     public bool TextureNormalVariance { get; set; } = DefaultTextureNormalVariance;
+
+    /// <summary>
+    /// 2-6 clause 7: mip level-of-detail bias applied to the material texture fetches in the main pixel shader.
+    /// Negative sharpens by selecting a finer level than the screen-space derivatives ask for.
+    ///
+    /// This only has a defensible meaning under TAA, which is why <see cref="EffectiveTextureLodBias"/> zeroes it in
+    /// every other tier rather than leaving that gate to each backend. Jitter is subpixel supersampling: with the
+    /// default Halton(2,3) sequence of <see cref="JitterPhaseCount"/> phases a converged pixel is the mean of eight
+    /// distinct subpixel positions, so it carries roughly 2.8x the linear sampling density of a single sample and can
+    /// reconstruct detail that one sample per pixel would alias. Mip selection, however, is computed per fetch from
+    /// derivatives that know nothing about jitter, so it keeps picking the level appropriate to one sample - and the
+    /// extra density is spent re-resolving detail that was already filtered away. The bias is what hands that
+    /// headroom back. Without accumulation the same bias is simply undersampling, which is why it is tier-gated and
+    /// not a free sharpening knob.
+    ///
+    /// The default -0.5 is half a level, or 1.41x linear resolution, which sits well inside the 2.8x budget. -1.0 is
+    /// the point where the bias consumes the whole budget and leaves nothing for the aliasing that jitter was
+    /// supposed to absorb, so it is the ceiling of what is reasonable rather than the next step up.
+    ///
+    /// Interaction with <see cref="TextureNormalVariance"/> is self-consistent rather than conflicting: a finer normal
+    /// level carries a mean resultant length nearer 1, so Toksvig folds less variance into roughness. That is the
+    /// correct answer, not a cancellation - a sharper footprint really does average fewer differing normals.
+    ///
+    /// Textures with a single level are unaffected: a negative bias clamps at level 0. That is what makes the
+    /// shared albedo slot safe, since sprites and MSDF font atlases ask for <see cref="TextureMipPolicy.None"/>.
+    /// </summary>
+    public float TextureLodBias { get; set; } = DefaultTextureLodBias;
+
+    /// <summary>
+    /// 2-6 clause 7: <see cref="TextureLodBias"/> resolved against the anti-aliasing tier and clamped to a range every
+    /// backend can honour. Zero outside <see cref="AaMode.Taa"/>, for the reason given on that property.
+    ///
+    /// The bound is 2 because Vulkan only guarantees maxSamplerLodBias >= 2.0 and WGSL requires the bias operand to
+    /// stay within [-16, 15.99]; a request past that would be silently clamped on one backend and honoured on another,
+    /// which is exactly the kind of per-backend divergence a shared tier value exists to prevent.
+    ///
+    /// Read at shader-assembly time, which happens after each platform app has finished rewriting the tier, so a
+    /// backend that downgraded TAA is seen as downgraded here. A per-frame TAA bypass (clause 15, size mismatch during
+    /// resize) cannot be seen, since the value is baked: those frames render slightly sharper without accumulation,
+    /// which is a transient, not the frame-to-frame shaking that made jitter itself worth gating per frame.
+    ///
+    /// Get-only on purpose, and not only for immutability: this type is persisted through JsonUtils.Serialize, whose
+    /// options set IgnoreReadOnlyProperties, so this and <see cref="TextureLodBiasLiteral"/> stay out of Settings.json.
+    /// Giving either one a setter would start writing a derived value into the file, where it would then be read back as
+    /// though it were the authored one - <see cref="TextureLodBias"/> is the only member here that should round-trip.
+    /// </summary>
+    public float EffectiveTextureLodBias
+        => AntiAliasing == AaMode.Taa ? Math.Clamp(TextureLodBias, -2f, 2f) : 0f;
+
+    /// <summary>
+    /// 2-6 clause 7: <see cref="EffectiveTextureLodBias"/> formatted as a shader-source literal, wrapped in
+    /// parentheses so it stays one token wherever the four backends paste it - HLSL and GLSL and MSL take it through a
+    /// #define, WGSL through the const substitution it uses for HDR_CHAIN.
+    ///
+    /// It lives here rather than at the four injection sites because the formatting is culture-sensitive: on a locale
+    /// whose decimal separator is a comma, the default ToString would emit (-0,5) and every shader in the process
+    /// would fail to compile. One invariant formatter is what keeps that from being four separate latent bugs.
+    /// </summary>
+    public string TextureLodBiasLiteral
+        => "(" + EffectiveTextureLodBias.ToString("0.0#####", System.Globalization.CultureInfo.InvariantCulture) + ")";
 
     /// <summary>
     /// 2-6 clause 6: resolves <see cref="TextureMaxAnisotropy"/> against a backend's own ceiling. The value is shared

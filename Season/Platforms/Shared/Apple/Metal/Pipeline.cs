@@ -182,6 +182,13 @@ internal static class Pipeline
         // SHADOW_ENABLED controls main-FS PCF sampling according to the quality tier, while SHADOW_PASS selects the depth-only VS variant.
         // Contract clause 3 of 2-3 makes VELOCITY_OUTPUT the only new compile-time switch added to the main shader.
         // Regular variants keep it at 0, leaving runtime branch-free.
+        //
+        // 2-6 clause 7: material-fetch LOD bias, injected as a literal rather than carried in the material buffer.
+        // The value is fixed for the process (RenderQuality is locked before graphics initialization), so a buffer field
+        // would cost a per-draw write to express something the Metal compiler can fold. It is bound to a local because
+        // every library variant below needs it, including the shadow one: MetalShaderSource is a single translation unit
+        // holding fragment_main, so an undefined macro would break a compile that only asks for vertex_main.
+        var lodBiasDefine = "#define TEXTURE_LOD_BIAS " + RenderQuality.Current.TextureLodBiasLiteral + "\n";
         var msl = (Device.HdrSceneColor ? "#define HDR_CHAIN 1\n" : "#define HDR_CHAIN 0\n")
             + (RenderQuality.Current.ShadowsEnabled ? "#define SHADOW_ENABLED 1\n" : "#define SHADOW_ENABLED 0\n")
             // Step 6:
@@ -190,7 +197,7 @@ internal static class Pipeline
             // This matches the gate used by DdgiEffect.Initialize,
             // ensuring the main shader variant and atlas resources are created in sync.
             + ((Season.Basic.DeviceServices.BaseApp?.Settings?.RenderQuality?.GlobalIllumination ?? RenderQuality.DefaultGlobalIllumination) == Season.Rendering.GiMode.Ddgi ? "#define DDGI_ENABLED 1\n" : "#define DDGI_ENABLED 0\n")
-            + "#define SHADOW_PASS 0\n#define VELOCITY_OUTPUT 0\n" + MetalShaderSource;
+            + "#define SHADOW_PASS 0\n#define VELOCITY_OUTPUT 0\n" + lodBiasDefine + MetalShaderSource;
         Library = MTLShaderCompiler.Compile(Device.MtlDevice, msl);
         VertexFunction = Library.CreateFunction("vertex_main")
             ?? throw new Exception("MSL function 'vertex_main' not found");
@@ -253,7 +260,7 @@ internal static class Pipeline
         if (RenderQuality.Current.ShadowsEnabled)
         {
             var shadowMsl = (Device.HdrSceneColor ? "#define HDR_CHAIN 1\n" : "#define HDR_CHAIN 0\n")
-                + "#define SHADOW_ENABLED 1\n#define SHADOW_PASS 1\n#define VELOCITY_OUTPUT 0\n#define DDGI_ENABLED 0\n" + MetalShaderSource;
+                + "#define SHADOW_ENABLED 1\n#define SHADOW_PASS 1\n#define VELOCITY_OUTPUT 0\n#define DDGI_ENABLED 0\n" + lodBiasDefine + MetalShaderSource;
             ShadowLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, shadowMsl);
             ShadowVertexFunction = ShadowLibrary.CreateFunction("vertex_main")
                 ?? throw new Exception("MSL function 'vertex_main' (shadow) not found");
@@ -274,7 +281,7 @@ internal static class Pipeline
                 // Step 6:
                 // same rule as above, preferring Settings.RenderQuality and sharing the same gate as DdgiEffect.
                 + ((Season.Basic.DeviceServices.BaseApp?.Settings?.RenderQuality?.GlobalIllumination ?? RenderQuality.DefaultGlobalIllumination) == Season.Rendering.GiMode.Ddgi ? "#define DDGI_ENABLED 1\n" : "#define DDGI_ENABLED 0\n")
-                + "#define SHADOW_PASS 0\n#define VELOCITY_OUTPUT 1\n" + MetalShaderSource;
+                + "#define SHADOW_PASS 0\n#define VELOCITY_OUTPUT 1\n" + lodBiasDefine + MetalShaderSource;
             VelocityLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, velocityMsl);
             VelocityVertexFunction = VelocityLibrary.CreateFunction("vertex_main")
                 ?? throw new Exception("MSL function 'vertex_main' (velocity) not found");
@@ -301,7 +308,7 @@ internal static class Pipeline
         var overlayMsl = "#define HDR_CHAIN 0\n"
             + (RenderQuality.Current.ShadowsEnabled ? "#define SHADOW_ENABLED 1\n" : "#define SHADOW_ENABLED 0\n")
             + ((Season.Basic.DeviceServices.BaseApp?.Settings?.RenderQuality?.GlobalIllumination ?? RenderQuality.DefaultGlobalIllumination) == Season.Rendering.GiMode.Ddgi ? "#define DDGI_ENABLED 1\n" : "#define DDGI_ENABLED 0\n")
-            + "#define SHADOW_PASS 0\n#define VELOCITY_OUTPUT 0\n" + MetalShaderSource;
+            + "#define SHADOW_PASS 0\n#define VELOCITY_OUTPUT 0\n" + lodBiasDefine + MetalShaderSource;
         OverlayLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, overlayMsl);
         OverlayVertexFunction = OverlayLibrary.CreateFunction("vertex_main")
             ?? throw new Exception("MSL function 'vertex_main' (overlay) not found");
@@ -1797,6 +1804,18 @@ fragment SEASON_FS_OUT fragment_main(
     texture2d<float> metallicRoughnessMap [[texture(2)]],
     texture2d<float> aoMap                [[texture(3)]],
     texture2d<float> emissiveMap          [[texture(4)]],
+    // 2-6 clause 7: every material fetch in this function passes bias(TEXTURE_LOD_BIAS), which is the literal 0.0
+    // outside the TAA tier, so the level selected there is the one an unbiased fetch would pick. Whether the zero is
+    // folded away or kept as an operand is the Metal compiler's business; fxc keeps it, so do not assume the neutral
+    // tier is free of a bias-capable fetch here either. The uniform call form is deliberate regardless - WGSL has no
+    // preprocessor to switch forms with, so branching here would buy a saving on one backend at the price of four
+    // structurally different shader sources.
+    //
+    // The bias is not applied to the MSDF text fetch or the
+    // outline-mask fetch that share albedoMap: a distance field is not colour, and its coverage maths derives screen
+    // pixel range from uv derivatives rather than from the level actually sampled, so a bias would desynchronize the
+    // two. Both of those atlases carry TextureMipPolicy.None today, which makes the distinction free rather than a
+    // cost - but it is written out so that giving one a chain later cannot silently change glyph coverage.
     sampler texSampler                    [[sampler(0)]],
     // 1-7 environment radiance cube at texture(6), because texture(5) is already occupied by the 1-5 shadow atlas.
     // It is a single-mip cube.
@@ -1982,7 +2001,7 @@ fragment SEASON_FS_OUT fragment_main(
     }
 
     if (mat.useAlbedoMap != 0u) {
-        float4 sampled = albedoMap.sample(texSampler, in.vUV);
+        float4 sampled = albedoMap.sample(texSampler, in.vUV, bias(TEXTURE_LOD_BIAS));
         albedo *= sampled.rgb;
         alpha *= sampled.a;
     }
@@ -2008,16 +2027,16 @@ fragment SEASON_FS_OUT fragment_main(
     }
 
     if (mat.useMetallicRoughnessMap != 0u) {
-        metallicRoughness = metallicRoughnessMap.sample(texSampler, in.vUV).rgb;
+        metallicRoughness = metallicRoughnessMap.sample(texSampler, in.vUV, bias(TEXTURE_LOD_BIAS)).rgb;
     } else {
         metallicRoughness.b = mat.metallicFactor;
         metallicRoughness.g = mat.roughnessFactor;
     }
 
-    if (mat.useAoMap != 0u) ao = aoMap.sample(texSampler, in.vUV).r;
+    if (mat.useAoMap != 0u) ao = aoMap.sample(texSampler, in.vUV, bias(TEXTURE_LOD_BIAS)).r;
 
     if (mat.useEmissiveMap != 0u) {
-        emissive = emissiveMap.sample(texSampler, in.vUV).rgb;
+        emissive = emissiveMap.sample(texSampler, in.vUV, bias(TEXTURE_LOD_BIAS)).rgb;
     } else {
         emissive = mat.emissiveFactor.rgb;
     }
@@ -2032,7 +2051,7 @@ fragment SEASON_FS_OUT fragment_main(
     float3x3 TBN = float3x3(T, B, N);
 
     if (mat.useNormalMap != 0u) {
-        float4 nrmSample = normalMap.sample(texSampler, in.vUV);
+        float4 nrmSample = normalMap.sample(texSampler, in.vUV, bias(TEXTURE_LOD_BIAS));
         float3 nrm = nrmSample.rgb * 2.0 - 1.0;
         // 2-6 clause 5: normalize the world-space result. Any filtered fetch of a normal map returns a vector
         // shorter than unit length, and with a mip chain the shortening grows with distance.

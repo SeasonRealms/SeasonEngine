@@ -62,6 +62,21 @@ const VELOCITY_OUTPUT : bool = false;
 // C# replaces it with true by string substitution before InitializeAsync when RenderQuality.GlobalIllumination==Ddgi.
 const DDGI_ENABLED : bool = false;
 
+// ── 2-6 clause 7: material-fetch mip LOD bias (mirroring the TEXTURE_LOD_BIAS #define on DX/VK/Metal):
+// negative sharpens, and the value is 0.0 outside the TAA tier, where textureSampleBias selects the same level
+// textureSample would. The equivalence claimed there is the level chosen, not the instruction: fxc keeps a zero bias as
+// an operand rather than folding it away, so assume Tint may do the same. Using the biased form unconditionally is what
+// keeps this source the same shape as the other three, which have no way to express the unbiased form here anyway since
+// WGSL has no preprocessor to branch with.
+// C# substitutes the resolved literal before InitializeAsync, the same way it does for the three switches above.
+//
+// Unlike the other three backends this shader has a single albedo fetch shared by the PBR, Sprite2D, MSDF text and
+// procedural sky paths, so the bias reaches text as well. That is safe rather than merely tolerated: sprite and font
+// atlases ask for TextureMipPolicy.None, so they have one level and a negative bias clamps to it. If a font atlas ever
+// gains a chain, this fetch has to be split, because MSDF coverage derives its screen pixel range from uv derivatives
+// rather than from the level actually sampled and a biased fetch would desynchronize the two.
+const TEXTURE_LOD_BIAS : f32 = 0.0;
+
 struct VertexInput {
     @location(0) position: vec3f,
     @location(1) uv: vec2f,
@@ -950,7 +965,7 @@ struct FragmentOutput {
 };
 
 fn shade(input: ShadeInput) -> vec4f {
-    let texColor = textureSample(uTexture, uSampler, input.uv);
+    let texColor = textureSampleBias(uTexture, uSampler, input.uv, TEXTURE_LOD_BIAS);
     let albedo = texColor.rgb * u.baseColor.rgb;
     let alpha = texColor.a * u.material.z;
 
@@ -1055,19 +1070,19 @@ fn shade(input: ShadeInput) -> vec4f {
     var metallic: f32 = u.material.x;
     var roughness: f32 = u.material.y;
     if (HasTexture(1)) {
-        let mr = textureSample(uMetallicRoughnessTexture, uSampler, input.uv);
+        let mr = textureSampleBias(uMetallicRoughnessTexture, uSampler, input.uv, TEXTURE_LOD_BIAS);
         metallic = u.material.x * mr.b;
         roughness = u.material.y * mr.g;
     }
 
     var ao = u.emissive.w;
     if (HasTexture(4)) {
-        ao = textureSample(uAoTexture, uSampler, input.uv).r;
+        ao = textureSampleBias(uAoTexture, uSampler, input.uv, TEXTURE_LOD_BIAS).r;
     }
 
     var emissive = u.emissive.xyz;
     if (HasTexture(8)) {
-        emissive = textureSample(uEmissiveTexture, uSampler, input.uv).rgb;
+        emissive = textureSampleBias(uEmissiveTexture, uSampler, input.uv, TEXTURE_LOD_BIAS).rgb;
     }
 
     var N = normalize(input.normal);
@@ -1076,7 +1091,7 @@ fn shade(input: ShadeInput) -> vec4f {
         let T = normalize(T0 - dot(T0, N) * N);
         let B = cross(N, T) * input.tangent.w;
         let TBN = mat3x3f(T, B, N);
-        let normalSample = textureSample(uNormalTexture, uSampler, input.uv);
+        let normalSample = textureSampleBias(uNormalTexture, uSampler, input.uv, TEXTURE_LOD_BIAS);
         let sampledNormal = normalSample.rgb * 2.0 - 1.0;
         // TBN built from columns must be pre-multiplied (tangent -> world, aligned with VK GLSL).
         // Post-multiplication would effectively use the transpose, i.e. the inverse transform, and produce completely wrong normals.

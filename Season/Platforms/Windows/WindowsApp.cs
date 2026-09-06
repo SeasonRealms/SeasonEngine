@@ -679,6 +679,24 @@ public static class WindowsApp
             });
         }
 
+        // Supplement to contract 2-3 clause 2: the velocity path also needs SceneDepth to be explicit,
+        // so that TAA can read the current frame's depth and dilate velocity towards the closest
+        // neighbour (clause 10). Vulkan, Metal, and Android already created it here because their
+        // velocity render pass demands three real attachments; D3D12 can run the MRT scene pass against
+        // the backend default depth, which is why this platform was the one still leaving it null and
+        // why the dilation input was missing on exactly the validated backend.
+        // SampleCount 1 is unconditionally correct here: MotionVectors and Msaa4x were already made
+        // mutually exclusive above, so this branch is never reached with a multisampled scene.
+        if (RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
+        {
+            Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
+            {
+                DepthFormat = Season.Rendering.RtFormat.D32Float,
+                MatchBackbufferSize = true,
+                SampleCount = 1,
+            });
+        }
+
         DeviceServices.BaseApp.Create();
 
         // Create() registers the compute effects, so this second reading covers graphics plus every kernel that

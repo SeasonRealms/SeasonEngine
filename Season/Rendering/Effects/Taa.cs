@@ -32,9 +32,19 @@ namespace Season.Rendering.Effects;
 /// [1] SampledTexture (SceneColor target, rgba16float) -> HLSL t0
 /// [2] SampledTexture (SceneVelocity target, rg16float) -> HLSL t1
 /// [3] SampledTexture (history storage texture) -> HLSL t2
-/// [4] StorageTextureWrite rgba16float (current-frame output) -> HLSL u0
+/// [4] DepthTexture (SceneDepth target, texel load without sampler) -> HLSL t3
+/// [5] StorageTextureWrite rgba16float (current-frame output) -> HLSL u0
 /// Sampler s0 (linear-clamp) is provided statically by the engine and is only needed for
-/// history reprojection filtering. Scene and velocity always use texel loads.
+/// history reprojection filtering. Scene, velocity and depth always use texel loads.
+///
+/// Why depth is a hard dependency rather than an optimization: velocity is a per-pixel quantity
+/// but a pixel on a silhouette is a mixture of two surfaces, and the one that ends up in the
+/// velocity buffer is whichever fragment won the depth test, not the one that dominates the
+/// colour. Reprojecting the whole pixel along the losing surface's motion is the standard source
+/// of edge ghosting, so the velocity fetch is dilated towards the closest of the nine neighbours
+/// (clause 10). SceneDepth is therefore required, and every platform app now creates it whenever
+/// MotionVectors is on - Vulkan, Metal and Android already did because their velocity render pass
+/// needs three real attachments, while D3D12 and WebGPU were extended for this.
 ///
 /// Step B was shaped on D3D12 only (HLSL is the validated backend). The other three shader
 /// sources are already provided in the aligned four-backend form and will be validated one by one in Step D.
@@ -74,7 +84,11 @@ public sealed class TaaEffect : ComputeEffect
         // offscreen SceneColor. If either is missing, the whole effect stays inactive.
         if (RenderQuality.Current.AntiAliasing != AaMode.Taa || !RenderQuality.Current.MotionVectors)
             return false;
-        if (FrameSchedule.SceneColor == null || FrameSchedule.SceneVelocity == null)
+        // SceneDepth feeds velocity dilation. It is created by every platform app on the MotionVectors
+        // condition, so with the check above this branch is unreachable in a correctly wired backend;
+        // it stays as the shape dependency that keeps a missing depth target a clean bypass rather than
+        // a kernel built against a resource array with a null in it.
+        if (FrameSchedule.SceneColor == null || FrameSchedule.SceneVelocity == null || FrameSchedule.SceneDepth == null)
             return false;
 
         _kernel = g.CreateComputeKernel(new ComputeKernelDesc
@@ -94,6 +108,7 @@ public sealed class TaaEffect : ComputeEffect
                 new ComputeBindingDesc { Type = ComputeBindingType.SampledTexture },
                 new ComputeBindingDesc { Type = ComputeBindingType.SampledTexture },
                 new ComputeBindingDesc { Type = ComputeBindingType.SampledTexture },
+                new ComputeBindingDesc { Type = ComputeBindingType.DepthTexture },
                 new ComputeBindingDesc
                 {
                     Type = ComputeBindingType.StorageTextureWrite,
@@ -119,6 +134,7 @@ public sealed class TaaEffect : ComputeEffect
                 FrameSchedule.SceneColor,
                 FrameSchedule.SceneVelocity,
                 _names[p ^ 1],  // History = previous frame's writer
+                FrameSchedule.SceneDepth,
                 _names[p],      // Output = current frame's writer
             };
         }
@@ -210,11 +226,18 @@ public sealed class TaaEffect : ComputeEffect
     // cross-backend contract constant and should be ported literally when aligned).
     //
     // Algorithm (clause 10):
-    //   1. Reprojection: prevUV = uv - velocity. Clause 5 defines velocity as
-    //      "current pointing to history", so it can be used directly.
+    //   1. Reprojection: prevUV = uv - velocity, where velocity is dilated. The 3x3 neighborhood is
+    //      searched for the smallest depth and that neighbour's velocity is used, while the uv being
+    //      reprojected stays the centre pixel's. Depth is [0,1] with 0 at the near plane, so the
+    //      smallest value is the closest surface, and the comparison needs no linearization because
+    //      the mapping is monotonic. The search is seeded with the centre pixel and uses a strict
+    //      less-than, so ties resolve to the centre: on flat depth, such as sky, a non-strict
+    //      comparison would systematically pick a corner tap and shift the whole reprojection by a
+    //      pixel. Clause 5 defines velocity as "current pointing to history", so it can be used directly.
     //   2. History sampling: bilinear. This is the only sample that needs filtering.
-    //      Scene and velocity always use texel loads: filtering velocity would mix motion
-    //      from adjacent objects, and filtering scene at the same resolution is meaningless.
+    //      Scene, velocity and depth always use texel loads: filtering velocity would mix motion
+    //      from adjacent objects, filtering depth would invent surfaces between silhouettes, and
+    //      filtering scene at the same resolution is meaningless.
     //   3. Reversible tonemap domain: every scene tap and the reprojected history are mapped
     //      through c/(1+luma(c)) before statistics, clipping and blending, and the result is
     //      mapped back with the exact inverse c/(1-luma(c)). Steps 4 and 5 therefore operate on
@@ -230,11 +253,24 @@ public sealed class TaaEffect : ComputeEffect
     //      Scene taps are clamped to >= 0 before the mapping: 1+luma must stay strictly positive,
     //      and negative radiance is reachable when a consumer extrapolates (AerialIntensity > 1
     //      is a lerp weight, not a multiplier).
-    //   4. Neighborhood clamping: one 3x3 pass computes first/second moments plus min/max.
+    //   4. Neighborhood clamping in YCoCg: one 3x3 pass computes first/second moments plus min/max,
+    //      all of it in YCoCg rather than per RGB channel.
     //      Clamp range = [mean-gamma*sigma, mean+gamma*sigma] intersected with [min, max].
     //      When gamma <= 0, this degenerates into a pure min/max bounding box.
-    //      The operation stays in the tonemapped domain per channel, without converting to YCoCg,
-    //      prioritizing consistency across backends.
+    //      Why not RGB: across an edge between two differently coloured surfaces, every RGB channel
+    //      spans both the luminance step and the hue difference, so the axis-aligned RGB box around
+    //      the nine samples is far larger than the set of colours that actually occur there, and
+    //      history that is wrong in hue passes the clamp untouched. YCoCg puts the luminance step on
+    //      one axis and leaves the two chroma axes narrow, so the same nine samples give a much
+    //      tighter box. That reduces flicker and ghosting at the same time for about ten operations
+    //      per tap, which is why it is preferred over widening or narrowing gamma.
+    //      The reconstructed colour is then intersected with the tonemapped RGB min/max box, and that
+    //      second clamp is load-bearing rather than defensive: the YCoCg box is not a subset of the
+    //      RGB one, so a corner of it can reconstruct to a triple whose Rec709 luma reaches one -
+    //      take a neighbourhood holding a saturated red and a saturated green tap and combine the
+    //      largest Y with the largest Cg. That is precisely where step 3's inverse divides by
+    //      1-luma, which would scale the pixel by four orders of magnitude and then feed the result
+    //      back into history. The RGB box is a set whose members are invertible by construction.
     //      Note the division of labour with step 5: on smooth surfaces sigma collapses, so the
     //      clamp pins history to the local mean and lighting changes are tracked with no lag;
     //      on edges sigma is wide, so history is free to accumulate. The clamp handles change,
@@ -266,6 +302,7 @@ cbuffer TaaParams : register(b0)
 Texture2D<float4> uScene : register(t0);
 Texture2D<float4> uVelocity : register(t1);
 Texture2D<float4> uHistory : register(t2);
+Texture2D<float> uDepth : register(t3);
 SamplerState uLinearClamp : register(s0);
 RWTexture2D<float4> uOutput : register(u0);
 
@@ -285,6 +322,23 @@ float3 TaaUntonemap(float3 c)
     return c / max(1.0 - TaaLuma(c), 1e-4);
 }
 
+// Lifting matrix, exactly invertible in real arithmetic: Y is the (1,2,1)/4 average, Co the red-blue
+// difference, Cg the green-magenta difference. Chosen over a Rec601 YCbCr rotation because both
+// directions are a handful of adds and one multiply, with no matrix constants to keep in sync across
+// four shading languages.
+float3 TaaRgbToYCoCg(float3 c)
+{
+    return float3((c.r + 2.0 * c.g + c.b) * 0.25,
+                  (c.r - c.b) * 0.5,
+                  (-c.r + 2.0 * c.g - c.b) * 0.25);
+}
+
+float3 TaaYCoCgToRgb(float3 c)
+{
+    float t = c.x - c.z;
+    return float3(t + c.y, c.x + c.z, t - c.y);
+}
+
 [numthreads(8, 8, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
@@ -294,35 +348,52 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         float4 curRaw = uScene.Load(int3(id.xy, 0));
         float3 cur = TaaTonemap(curRaw.rgb);
 
-        // 3x3 neighborhood statistics: compute first/second moments and the min/max bounding box in one pass.
+        // 3x3 neighborhood statistics: first/second moments and the min/max box in YCoCg, plus the
+        // RGB box kept for the invertibility clamp, computed in one pass.
+        // The same walk carries the velocity dilation search, so the nine taps are paid for once.
         float3 m1 = 0.0;
         float3 m2 = 0.0;
+        float3 cmin = TaaRgbToYCoCg(cur);
+        float3 cmax = cmin;
         float3 nmin = cur;
         float3 nmax = cur;
+        int2 nearest = int2(id.xy);
+        float nearestDepth = uDepth.Load(int3(id.xy, 0));
         [unroll] for (int y = -1; y <= 1; ++y)
         {
             [unroll] for (int x = -1; x <= 1; ++x)
             {
                 int2 c = clamp(int2(id.xy) + int2(x, y), int2(0, 0), maxCoord);
-                float3 s = TaaTonemap(uScene.Load(int3(c, 0)).rgb);
+                float3 sRgb = TaaTonemap(uScene.Load(int3(c, 0)).rgb);
+                nmin = min(nmin, sRgb);
+                nmax = max(nmax, sRgb);
+
+                float3 s = TaaRgbToYCoCg(sRgb);
                 m1 += s;
                 m2 += s * s;
-                nmin = min(nmin, s);
-                nmax = max(nmax, s);
+                cmin = min(cmin, s);
+                cmax = max(cmax, s);
+
+                float d = uDepth.Load(int3(c, 0));
+                if (d < nearestDepth)
+                {
+                    nearestDepth = d;
+                    nearest = c;
+                }
             }
         }
         float3 mean = m1 / 9.0;
         float3 sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0));
         float3 ext = uClipGamma * sigma;
-        float3 lo = (uClipGamma > 0.0) ? max(mean - ext, nmin) : nmin;
-        float3 hi = (uClipGamma > 0.0) ? min(mean + ext, nmax) : nmax;
+        float3 lo = (uClipGamma > 0.0) ? max(mean - ext, cmin) : cmin;
+        float3 hi = (uClipGamma > 0.0) ? min(mean + ext, cmax) : cmax;
 
         float2 uv = (float2(id.xy) + 0.5) * float2(uTexelX, uTexelY);
-        float2 v = uVelocity.Load(int3(id.xy, 0)).xy;
+        float2 v = uVelocity.Load(int3(nearest, 0)).xy;
         float2 prevUv = uv - v;
 
         float3 hist = TaaTonemap(uHistory.SampleLevel(uLinearClamp, prevUv, 0.0).rgb);
-        float3 clamped = clamp(hist, lo, hi);
+        float3 clamped = clamp(TaaYCoCgToRgb(clamp(TaaRgbToYCoCg(hist), lo, hi)), nmin, nmax);
 
         // Motion-adaptive feedback: reprojection length in pixels, saturated at one pixel per frame.
         float vPixels = length(v * float2(uWidth, uHeight));
@@ -357,7 +428,8 @@ layout(push_constant) uniform TaaParams
 layout(binding = 1) uniform sampler2D uScene;
 layout(binding = 2) uniform sampler2D uVelocity;
 layout(binding = 3) uniform sampler2D uHistory;
-layout(binding = 4, rgba16f) uniform writeonly image2D uOutput;
+layout(binding = 4) uniform sampler2D uDepth;
+layout(binding = 5, rgba16f) uniform writeonly image2D uOutput;
 
 float TaaLuma(vec3 c)
 {
@@ -375,6 +447,19 @@ vec3 TaaUntonemap(vec3 c)
     return c / max(1.0 - TaaLuma(c), 1e-4);
 }
 
+vec3 TaaRgbToYCoCg(vec3 c)
+{
+    return vec3((c.r + 2.0 * c.g + c.b) * 0.25,
+                (c.r - c.b) * 0.5,
+                (-c.r + 2.0 * c.g - c.b) * 0.25);
+}
+
+vec3 TaaYCoCgToRgb(vec3 c)
+{
+    float t = c.x - c.z;
+    return vec3(t + c.y, c.x + c.z, t - c.y);
+}
+
 void main()
 {
     uvec2 id = gl_GlobalInvocationID.xy;
@@ -386,32 +471,47 @@ void main()
 
         vec3 m1 = vec3(0.0);
         vec3 m2 = vec3(0.0);
+        vec3 cmin = TaaRgbToYCoCg(cur);
+        vec3 cmax = cmin;
         vec3 nmin = cur;
         vec3 nmax = cur;
+        ivec2 nearest = ivec2(id);
+        float nearestDepth = texelFetch(uDepth, ivec2(id), 0).r;
         for (int y = -1; y <= 1; ++y)
         {
             for (int x = -1; x <= 1; ++x)
             {
                 ivec2 c = clamp(ivec2(id) + ivec2(x, y), ivec2(0), maxCoord);
-                vec3 s = TaaTonemap(texelFetch(uScene, c, 0).rgb);
+                vec3 sRgb = TaaTonemap(texelFetch(uScene, c, 0).rgb);
+                nmin = min(nmin, sRgb);
+                nmax = max(nmax, sRgb);
+
+                vec3 s = TaaRgbToYCoCg(sRgb);
                 m1 += s;
                 m2 += s * s;
-                nmin = min(nmin, s);
-                nmax = max(nmax, s);
+                cmin = min(cmin, s);
+                cmax = max(cmax, s);
+
+                float d = texelFetch(uDepth, c, 0).r;
+                if (d < nearestDepth)
+                {
+                    nearestDepth = d;
+                    nearest = c;
+                }
             }
         }
         vec3 mean = m1 / 9.0;
         vec3 sigma = sqrt(max(m2 / 9.0 - mean * mean, vec3(0.0)));
         vec3 ext = uClipGamma * sigma;
-        vec3 lo = (uClipGamma > 0.0) ? max(mean - ext, nmin) : nmin;
-        vec3 hi = (uClipGamma > 0.0) ? min(mean + ext, nmax) : nmax;
+        vec3 lo = (uClipGamma > 0.0) ? max(mean - ext, cmin) : cmin;
+        vec3 hi = (uClipGamma > 0.0) ? min(mean + ext, cmax) : cmax;
 
         vec2 uv = (vec2(id) + 0.5) * vec2(uTexelX, uTexelY);
-        vec2 v = texelFetch(uVelocity, ivec2(id), 0).xy;
+        vec2 v = texelFetch(uVelocity, nearest, 0).xy;
         vec2 prevUv = uv - v;
 
         vec3 hist = TaaTonemap(textureLod(uHistory, prevUv, 0.0).rgb);
-        vec3 clamped = clamp(hist, lo, hi);
+        vec3 clamped = clamp(TaaYCoCgToRgb(clamp(TaaRgbToYCoCg(hist), lo, hi)), nmin, nmax);
 
         float vPixels = length(v * vec2(uWidth, uHeight));
         float fb = mix(uStaticFeedback, uFeedback, clamp(vPixels, 0.0, 1.0));
@@ -457,12 +557,26 @@ static inline float3 TaaUntonemap(float3 c)
     return c / max(1.0 - TaaLuma(c), 1e-4);
 }
 
+static inline float3 TaaRgbToYCoCg(float3 c)
+{
+    return float3((c.r + 2.0 * c.g + c.b) * 0.25,
+                  (c.r - c.b) * 0.5,
+                  (-c.r + 2.0 * c.g - c.b) * 0.25);
+}
+
+static inline float3 TaaYCoCgToRgb(float3 c)
+{
+    float t = c.x - c.z;
+    return float3(t + c.y, c.x + c.z, t - c.y);
+}
+
 kernel void CSMain(
     constant TaaParams& params [[buffer(0)]],
     texture2d<float, access::sample> uScene [[texture(0)]],
     texture2d<float, access::sample> uVelocity [[texture(1)]],
     texture2d<float, access::sample> uHistory [[texture(2)]],
-    texture2d<float, access::write> uOutput [[texture(3)]],
+    depth2d<float, access::read> uDepth [[texture(3)]],
+    texture2d<float, access::write> uOutput [[texture(4)]],
     sampler uLinearClamp [[sampler(0)]],
     uint2 id [[thread_position_in_grid]])
 {
@@ -474,32 +588,47 @@ kernel void CSMain(
 
         float3 m1 = float3(0.0);
         float3 m2 = float3(0.0);
+        float3 cmin = TaaRgbToYCoCg(cur);
+        float3 cmax = cmin;
         float3 nmin = cur;
         float3 nmax = cur;
+        int2 nearest = int2(id);
+        float nearestDepth = uDepth.read(id);
         for (int y = -1; y <= 1; ++y)
         {
             for (int x = -1; x <= 1; ++x)
             {
                 int2 c = clamp(int2(id) + int2(x, y), int2(0), maxCoord);
-                float3 s = TaaTonemap(uScene.read(uint2(c)).rgb);
+                float3 sRgb = TaaTonemap(uScene.read(uint2(c)).rgb);
+                nmin = min(nmin, sRgb);
+                nmax = max(nmax, sRgb);
+
+                float3 s = TaaRgbToYCoCg(sRgb);
                 m1 += s;
                 m2 += s * s;
-                nmin = min(nmin, s);
-                nmax = max(nmax, s);
+                cmin = min(cmin, s);
+                cmax = max(cmax, s);
+
+                float d = uDepth.read(uint2(c));
+                if (d < nearestDepth)
+                {
+                    nearestDepth = d;
+                    nearest = c;
+                }
             }
         }
         float3 mean = m1 / 9.0;
         float3 sigma = sqrt(max(m2 / 9.0 - mean * mean, float3(0.0)));
         float3 ext = params.uClipGamma * sigma;
-        float3 lo = (params.uClipGamma > 0.0) ? max(mean - ext, nmin) : nmin;
-        float3 hi = (params.uClipGamma > 0.0) ? min(mean + ext, nmax) : nmax;
+        float3 lo = (params.uClipGamma > 0.0) ? max(mean - ext, cmin) : cmin;
+        float3 hi = (params.uClipGamma > 0.0) ? min(mean + ext, cmax) : cmax;
 
         float2 uv = (float2(id) + 0.5) * float2(params.uTexelX, params.uTexelY);
-        float2 v = uVelocity.read(id).xy;
+        float2 v = uVelocity.read(uint2(nearest)).xy;
         float2 prevUv = uv - v;
 
         float3 hist = TaaTonemap(uHistory.sample(uLinearClamp, prevUv, level(0.0)).rgb);
-        float3 clamped = clamp(hist, lo, hi);
+        float3 clamped = clamp(TaaYCoCgToRgb(clamp(TaaRgbToYCoCg(hist), lo, hi)), nmin, nmax);
 
         float vPixels = length(v * float2(params.uWidth, params.uHeight));
         float fb = mix(params.uStaticFeedback, params.uFeedback, clamp(vPixels, 0.0, 1.0));
@@ -530,7 +659,8 @@ struct TaaParams
 @group(0) @binding(1) var uScene : texture_2d<f32>;
 @group(0) @binding(2) var uVelocity : texture_2d<f32>;
 @group(0) @binding(3) var uHistory : texture_2d<f32>;
-@group(0) @binding(4) var uOutput : texture_storage_2d<rgba16float, write>;
+@group(0) @binding(4) var uDepth : texture_depth_2d;
+@group(0) @binding(5) var uOutput : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(15) var uLinearClamp : sampler;
 
 fn TaaLuma(c : vec3<f32>) -> f32
@@ -549,6 +679,19 @@ fn TaaUntonemap(c : vec3<f32>) -> vec3<f32>
     return c / max(1.0 - TaaLuma(c), 1e-4);
 }
 
+fn TaaRgbToYCoCg(c : vec3<f32>) -> vec3<f32>
+{
+    return vec3<f32>((c.r + 2.0 * c.g + c.b) * 0.25,
+                     (c.r - c.b) * 0.5,
+                     (-c.r + 2.0 * c.g - c.b) * 0.25);
+}
+
+fn TaaYCoCgToRgb(c : vec3<f32>) -> vec3<f32>
+{
+    let t = c.x - c.z;
+    return vec3<f32>(t + c.y, c.x + c.z, t - c.y);
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
 {
@@ -561,37 +704,52 @@ fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
 
         var m1 = vec3<f32>(0.0);
         var m2 = vec3<f32>(0.0);
+        var cmin = TaaRgbToYCoCg(cur);
+        var cmax = cmin;
         var nmin = cur;
         var nmax = cur;
+        var nearest = coord;
+        var nearestDepth = textureLoad(uDepth, coord, 0);
         for (var y : i32 = -1; y <= 1; y = y + 1)
         {
             for (var x : i32 = -1; x <= 1; x = x + 1)
             {
                 let c = clamp(coord + vec2<i32>(x, y), vec2<i32>(0, 0), maxCoord);
-                let s = TaaTonemap(textureLoad(uScene, c, 0).rgb);
+                let sRgb = TaaTonemap(textureLoad(uScene, c, 0).rgb);
+                nmin = min(nmin, sRgb);
+                nmax = max(nmax, sRgb);
+
+                let s = TaaRgbToYCoCg(sRgb);
                 m1 = m1 + s;
                 m2 = m2 + s * s;
-                nmin = min(nmin, s);
-                nmax = max(nmax, s);
+                cmin = min(cmin, s);
+                cmax = max(cmax, s);
+
+                let d = textureLoad(uDepth, c, 0);
+                if (d < nearestDepth)
+                {
+                    nearestDepth = d;
+                    nearest = c;
+                }
             }
         }
         let mean = m1 / 9.0;
         let sigma = sqrt(max(m2 / 9.0 - mean * mean, vec3<f32>(0.0)));
         let ext = params.uClipGamma * sigma;
-        var lo = nmin;
-        var hi = nmax;
+        var lo = cmin;
+        var hi = cmax;
         if (params.uClipGamma > 0.0)
         {
-            lo = max(mean - ext, nmin);
-            hi = min(mean + ext, nmax);
+            lo = max(mean - ext, cmin);
+            hi = min(mean + ext, cmax);
         }
 
         let uv = (vec2<f32>(f32(id.x), f32(id.y)) + vec2<f32>(0.5)) * vec2<f32>(params.uTexelX, params.uTexelY);
-        let v = textureLoad(uVelocity, coord, 0).xy;
+        let v = textureLoad(uVelocity, nearest, 0).xy;
         let prevUv = uv - v;
 
         let hist = TaaTonemap(textureSampleLevel(uHistory, uLinearClamp, prevUv, 0.0).rgb);
-        let clamped = clamp(hist, lo, hi);
+        let clamped = clamp(TaaYCoCgToRgb(clamp(TaaRgbToYCoCg(hist), lo, hi)), nmin, nmax);
 
         let vPixels = length(v * vec2<f32>(params.uWidth, params.uHeight));
         let fb = mix(params.uStaticFeedback, params.uFeedback, clamp(vPixels, 0.0, 1.0));

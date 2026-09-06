@@ -877,6 +877,12 @@ internal static unsafe class Pipeline
             // static default source), using the same gate as DdgiEffect.Initialize so the main shader variants
             // and atlas resources are created in sync.
             + ((Season.Basic.DeviceServices.BaseApp?.Settings?.RenderQuality?.GlobalIllumination ?? RenderQuality.DefaultGlobalIllumination) == GiMode.Ddgi ? "#define DDGI_ENABLED 1\n" : "#define DDGI_ENABLED 0\n")
+            // 2-6 clause 7: material-fetch LOD bias, injected as a literal rather than carried in a constant buffer.
+            // The value is fixed for the process (RenderQuality is locked before graphics initialization), so a cbuffer
+            // field would cost a per-draw write and a register to express something the compiler can fold. Note this has
+            // to be defined for every variant including the shadow pass: fxc parses the whole translation unit, so an
+            // undefined macro inside PSMain would break a compile that only asks for VSMain.
+            + "#define TEXTURE_LOD_BIAS " + RenderQuality.Current.TextureLodBiasLiteral + "\n"
             + @"cbuffer Matrices : register(b0)
 {
     float4x4 world;
@@ -1344,6 +1350,19 @@ Texture2D aoMap : register(t3);
 Texture2D emissiveMap : register(t4);
 
 SamplerState linearSampler : register(s0);
+
+// 2-6 clause 7: every material fetch below goes through SampleBias with TEXTURE_LOD_BIAS, which is the literal 0.0
+// outside the TAA tier, so the level selected there is the one a plain Sample would have picked. Not quite free,
+// though: fxc keeps the zero as an operand instead of folding it, emitting sample_b with l(0.000000) rather than
+// sample, so the neutral tier pays whatever a bias-capable fetch costs over a plain one. The uniform call form is
+// deliberate anyway - WGSL has no preprocessor to switch forms with, so branching here would buy a saving on one
+// backend at the price of four structurally different shader sources.
+//
+// The bias is not applied to the MSDF text fetch or the
+// outline-mask fetch that share this slot: a distance field is not colour, and its coverage maths derives screen
+// pixel range from uv derivatives rather than from the level actually sampled, so a bias would desynchronize the two.
+// Both of those atlases carry TextureMipPolicy.None today, which makes the distinction free rather than a cost - but
+// it is written out so that giving one a chain later cannot silently change glyph coverage.
 
 // 1-7: environment radiance cube (t11, single mip). A 1x1 all-black dummy is bound when no environment
 // map is available, so sampling is always valid here. envParams.w carries the enable switch
@@ -2126,7 +2145,7 @@ float4 PSMain(PSInput input) : SV_TARGET
     // Sample textures when enabled
     [branch] if (useAlbedoMap != 0)
     {
-        float4 sampledAlbedo = albedoMap.Sample(linearSampler, input.texCoord);
+        float4 sampledAlbedo = albedoMap.SampleBias(linearSampler, input.texCoord, TEXTURE_LOD_BIAS);
         albedo *= sampledAlbedo.rgb;
         alpha *= sampledAlbedo.a;
     }
@@ -2155,7 +2174,7 @@ float4 PSMain(PSInput input) : SV_TARGET
     // renderMode == 2: reserved for TextMsdf, currently falls back to PBR
     
     [branch] if (useMetallicRoughnessMap != 0)
-        metallicRoughness = metallicRoughnessMap.Sample(linearSampler, input.texCoord).rgb;
+        metallicRoughness = metallicRoughnessMap.SampleBias(linearSampler, input.texCoord, TEXTURE_LOD_BIAS).rgb;
     else
     {
         // Use material parameters when there is no metallic-roughness map
@@ -2164,11 +2183,11 @@ float4 PSMain(PSInput input) : SV_TARGET
     }
     
     [branch] if (useAoMap != 0)
-        ao = aoMap.Sample(linearSampler, input.texCoord).r;
+        ao = aoMap.SampleBias(linearSampler, input.texCoord, TEXTURE_LOD_BIAS).r;
     
     [branch] if (useEmissiveMap != 0)
     {
-        emissive = emissiveMap.Sample(linearSampler, input.texCoord).rgb;
+        emissive = emissiveMap.SampleBias(linearSampler, input.texCoord, TEXTURE_LOD_BIAS).rgb;
     }
     else
     {
@@ -2200,7 +2219,7 @@ float4 PSMain(PSInput input) : SV_TARGET
     if (useNormalMap != 0)
     {
         float normalStrength = 1.0; // Strength multiplier
-        float4 normalSample = normalMap.Sample(linearSampler, input.texCoord);
+        float4 normalSample = normalMap.SampleBias(linearSampler, input.texCoord, TEXTURE_LOD_BIAS);
         float3 normal = normalSample.rgb * 2.0 - 1.0;
         normal.xy *= normalStrength;
         //normal.y = -normal.y; // Match the DirectX texture-coordinate convention

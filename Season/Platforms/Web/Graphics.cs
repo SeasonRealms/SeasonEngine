@@ -506,6 +506,16 @@ internal class Graphics : IGraphics
             meshShader = meshShader.Replace(
                 "const DDGI_ENABLED : bool = false;", "const DDGI_ENABLED : bool = true;");
 
+        // 2-6 clause 7: material-fetch LOD bias, substituted into the same kind of foldable const the switches above
+        // use because WGSL has no preprocessor. A uniform field was the alternative and was rejected for the same
+        // reason as on the other three backends: the value is fixed for the process, so it would cost a per-draw write
+        // to express something Tint can fold. The substitution is unconditional rather than gated on a non-zero bias,
+        // so the neutral tier differs only by the parentheses the shared literal formatter adds and the source keeps
+        // one shape.
+        meshShader = meshShader.Replace(
+            "const TEXTURE_LOD_BIAS : f32 = 0.0;",
+            "const TEXTURE_LOD_BIAS : f32 = " + RenderQuality.Current.TextureLodBiasLiteral + ";");
+
         // Overlay-family module (aligned with the Metal overlay library at HDR_CHAIN=0): textually identical
         // to the main module except HDR_CHAIN is forced to false. Overlay renders directly to the backbuffer
         // without FinalBlit, so semantics such as text inverse-ACES compensation / Sprite2D linear direct
