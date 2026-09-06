@@ -131,6 +131,8 @@ public enum TextureMipPolicy
 /// - 2-2 AO: GTAO-lite uses explicit SceneDepth, depth-texture compute input, half-resolution kernels, and AO composition before ACES. Mesh-level AO exclusion remains supported.
 /// - 2-3 motion vectors + TAA: velocity is an independent tier, SceneVelocity is explicit, jitter is injected from a single Camera3D path,
 ///   history data rides existing constant buffers, transparent geometry does not write velocity, and TAA uses ping-pong history with controlled degradation.
+///   Clause 16 resamples reprojected history through a renormalized 5-tap Catmull-Rom filter instead of one bilinear fetch, because the per-frame
+///   softening of a single fetch compounds across the whole feedback window rather than being paid once.
 /// - 1-7 cubemap + IBL: TextureCube is a minimal cross-platform type, SH9 irradiance/radiance ride the lighting UBO, diffuse picks either SH9 or constant ambient,
 ///   and the entire path falls back cleanly to the old ambient-only baseline.
 /// - 2-4 DDGI + SDF: GI uses box/sphere proxies, accepts one-frame latency, stores all runtime parameters in the existing lighting UBO tail,

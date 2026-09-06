@@ -6,7 +6,7 @@ namespace Season.Rendering.Effects;
 
 /// <summary>
 /// Engine built-in compute effect: TAA resolve
-/// (2-3 Step B implementation body; see clauses 10-15 in section 2-3 of the RenderQuality class header).
+/// (2-3 Step B implementation body; see clauses 10-16 in section 2-3 of the RenderQuality class header).
 ///
 /// Behavior: one kernel in the AfterScene phase, running at full resolution in linear HDR
 /// space before tonemapping. It reads the current frame's SceneColor + SceneVelocity +
@@ -35,7 +35,8 @@ namespace Season.Rendering.Effects;
 /// [4] DepthTexture (SceneDepth target, texel load without sampler) -> HLSL t3
 /// [5] StorageTextureWrite rgba16float (current-frame output) -> HLSL u0
 /// Sampler s0 (linear-clamp) is provided statically by the engine and is only needed for
-/// history reprojection filtering. Scene, velocity and depth always use texel loads.
+/// history reprojection filtering, where clause 16 spends it on five taps instead of one.
+/// Scene, velocity and depth always use texel loads.
 ///
 /// Why depth is a hard dependency rather than an optimization: velocity is a per-pixel quantity
 /// but a pixel on a silhouette is a mixture of two surfaces, and the one that ends up in the
@@ -234,10 +235,23 @@ public sealed class TaaEffect : ComputeEffect
     //      less-than, so ties resolve to the centre: on flat depth, such as sky, a non-strict
     //      comparison would systematically pick a corner tap and shift the whole reprojection by a
     //      pixel. Clause 5 defines velocity as "current pointing to history", so it can be used directly.
-    //   2. History sampling: bilinear. This is the only sample that needs filtering.
+    //   2. History sampling: 5-tap Catmull-Rom (clause 16). This is the only sample that needs filtering.
     //      Scene, velocity and depth always use texel loads: filtering velocity would mix motion
     //      from adjacent objects, filtering depth would invent surfaces between silhouettes, and
     //      filtering scene at the same resolution is meaningless.
+    //      Why not the single bilinear fetch this started as: reprojection almost never lands on a texel
+    //      centre, so history was resampled every frame through a filter whose response is already well
+    //      down before Nyquist, and the loss compounds inside the feedback loop. At staticFeedback 0.97 a
+    //      converged pixel is the accumulation of roughly 1/(1-0.97) = 33 frames, which is what turns a
+    //      few percent of per-frame softening into the dominant reason a resolved image looks softer than
+    //      the jittered samples it was built from. Catmull-Rom is interpolating and carries a mild negative
+    //      lobe, so it holds the passband close to flat instead of trading it away.
+    //      The negative lobe can overshoot, including below zero next to a highlight, which is bounded
+    //      rather than avoided: step 3 clamps at zero entering the tonemapped domain and step 4's box
+    //      bounds the positive side, so ringing has nowhere to accumulate.
+    //      The filter runs in linear HDR and is tonemapped afterwards, which is the order the single
+    //      bilinear fetch already used (hardware filtering is linear too), so this is a filter-quality
+    //      change rather than a domain change. Cost is five bilinear fetches where there was one.
     //   3. Reversible tonemap domain: every scene tap and the reprojected history are mapped
     //      through c/(1+luma(c)) before statistics, clipping and blending, and the result is
     //      mapped back with the exact inverse c/(1-luma(c)). Steps 4 and 5 therefore operate on
@@ -339,6 +353,54 @@ float3 TaaYCoCgToRgb(float3 c)
     return float3(t + c.y, c.x + c.z, t - c.y);
 }
 
+// Clause 16: 5-tap Catmull-Rom history resampling. A separable Catmull-Rom needs four taps per axis, but the
+// (w1,w2) pair on each axis is exactly reproducible by one bilinear fetch placed at their weighted midpoint,
+// which takes the 4x4 footprint from sixteen texels to a 3x3 arrangement of nine; the four corners of that
+// arrangement are then dropped, leaving the five of a cross.
+float3 TaaSampleHistory(float2 uv)
+{
+    float2 samplePos = uv * float2(uWidth, uHeight);
+    float2 texPos1 = floor(samplePos - 0.5) + 0.5;
+    float2 f = samplePos - texPos1;
+    float2 f2 = f * f;
+    float2 f3 = f2 * f;
+
+    float2 w0 = -0.5 * f3 + f2 - 0.5 * f;
+    float2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+    float2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+    float2 w3 = 0.5 * f3 - 0.5 * f2;
+
+    // w1 + w2 simplifies to 1 + 0.5 * f * (1 - f), so it stays inside [1, 1.125] and this divide needs no guard.
+    float2 w12 = w1 + w2;
+    float2 off12 = w2 / w12;
+
+    float2 texel = float2(uTexelX, uTexelY);
+    float2 p0 = (texPos1 - 1.0) * texel;
+    float2 p3 = (texPos1 + 2.0) * texel;
+    float2 p12 = (texPos1 + off12) * texel;
+
+    float k0 = w12.x * w0.y;
+    float k1 = w0.x * w12.y;
+    float k2 = w12.x * w12.y;
+    float k3 = w3.x * w12.y;
+    float k4 = w12.x * w3.y;
+
+    float3 sum = uHistory.SampleLevel(uLinearClamp, float2(p12.x, p0.y), 0.0).rgb * k0
+               + uHistory.SampleLevel(uLinearClamp, float2(p0.x, p12.y), 0.0).rgb * k1
+               + uHistory.SampleLevel(uLinearClamp, float2(p12.x, p12.y), 0.0).rgb * k2
+               + uHistory.SampleLevel(uLinearClamp, float2(p3.x, p12.y), 0.0).rgb * k3
+               + uHistory.SampleLevel(uLinearClamp, float2(p12.x, p3.y), 0.0).rgb * k4;
+
+    // Renormalization is load-bearing, not tidiness. The nine separable weights sum to one, but the five kept
+    // here sum to 1 - (1 - w12.x) * (1 - w12.y), which reaches its minimum of 0.984375 at the half-texel offset.
+    // Uncorrected that is a per-frame energy loss sitting inside the feedback loop: the steady state of
+    // h = (1 - fb) * cur + fb * k * h is cur * (1 - fb) / (1 - fb * k), which at fb = 0.97 and k = 0.984375 is
+    // 0.66 - a third of the brightness gone. A flat region is rescued by step 4 (min equals max there, so the
+    // clamp pins history to cur), which means the loss would have shown up specifically on the detailed and
+    // edge pixels where the clamp is loose, i.e. the ones this filter exists to preserve.
+    return sum / (k0 + k1 + k2 + k3 + k4);
+}
+
 [numthreads(8, 8, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
@@ -392,7 +454,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         float2 v = uVelocity.Load(int3(nearest, 0)).xy;
         float2 prevUv = uv - v;
 
-        float3 hist = TaaTonemap(uHistory.SampleLevel(uLinearClamp, prevUv, 0.0).rgb);
+        float3 hist = TaaTonemap(TaaSampleHistory(prevUv));
         float3 clamped = clamp(TaaYCoCgToRgb(clamp(TaaRgbToYCoCg(hist), lo, hi)), nmin, nmax);
 
         // Motion-adaptive feedback: reprojection length in pixels, saturated at one pixel per frame.
@@ -460,6 +522,44 @@ vec3 TaaYCoCgToRgb(vec3 c)
     return vec3(t + c.y, c.x + c.z, t - c.y);
 }
 
+// Clause 16: 5-tap Catmull-Rom history resampling. See the HLSL source for the derivation and for why the
+// renormalization at the end is load-bearing.
+vec3 TaaSampleHistory(vec2 uv)
+{
+    vec2 samplePos = uv * vec2(uWidth, uHeight);
+    vec2 texPos1 = floor(samplePos - 0.5) + 0.5;
+    vec2 f = samplePos - texPos1;
+    vec2 f2 = f * f;
+    vec2 f3 = f2 * f;
+
+    vec2 w0 = -0.5 * f3 + f2 - 0.5 * f;
+    vec2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+    vec2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+    vec2 w3 = 0.5 * f3 - 0.5 * f2;
+
+    vec2 w12 = w1 + w2;
+    vec2 off12 = w2 / w12;
+
+    vec2 texel = vec2(uTexelX, uTexelY);
+    vec2 p0 = (texPos1 - 1.0) * texel;
+    vec2 p3 = (texPos1 + 2.0) * texel;
+    vec2 p12 = (texPos1 + off12) * texel;
+
+    float k0 = w12.x * w0.y;
+    float k1 = w0.x * w12.y;
+    float k2 = w12.x * w12.y;
+    float k3 = w3.x * w12.y;
+    float k4 = w12.x * w3.y;
+
+    vec3 sum = textureLod(uHistory, vec2(p12.x, p0.y), 0.0).rgb * k0
+             + textureLod(uHistory, vec2(p0.x, p12.y), 0.0).rgb * k1
+             + textureLod(uHistory, vec2(p12.x, p12.y), 0.0).rgb * k2
+             + textureLod(uHistory, vec2(p3.x, p12.y), 0.0).rgb * k3
+             + textureLod(uHistory, vec2(p12.x, p3.y), 0.0).rgb * k4;
+
+    return sum / (k0 + k1 + k2 + k3 + k4);
+}
+
 void main()
 {
     uvec2 id = gl_GlobalInvocationID.xy;
@@ -510,7 +610,7 @@ void main()
         vec2 v = texelFetch(uVelocity, nearest, 0).xy;
         vec2 prevUv = uv - v;
 
-        vec3 hist = TaaTonemap(textureLod(uHistory, prevUv, 0.0).rgb);
+        vec3 hist = TaaTonemap(TaaSampleHistory(prevUv));
         vec3 clamped = clamp(TaaYCoCgToRgb(clamp(TaaRgbToYCoCg(hist), lo, hi)), nmin, nmax);
 
         float vPixels = length(v * vec2(uWidth, uHeight));
@@ -570,6 +670,49 @@ static inline float3 TaaYCoCgToRgb(float3 c)
     return float3(t + c.y, c.x + c.z, t - c.y);
 }
 
+// Clause 16: 5-tap Catmull-Rom history resampling. See the HLSL source for the derivation and for why the
+// renormalization at the end is load-bearing. Unlike the other three backends the parameter block is a
+// function argument here rather than module scope, so the two sizes are passed in explicitly.
+static inline float3 TaaSampleHistory(
+    texture2d<float, access::sample> tex,
+    sampler samp,
+    float2 uv,
+    float2 texSize,
+    float2 texel)
+{
+    float2 samplePos = uv * texSize;
+    float2 texPos1 = floor(samplePos - 0.5) + 0.5;
+    float2 f = samplePos - texPos1;
+    float2 f2 = f * f;
+    float2 f3 = f2 * f;
+
+    float2 w0 = -0.5 * f3 + f2 - 0.5 * f;
+    float2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+    float2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+    float2 w3 = 0.5 * f3 - 0.5 * f2;
+
+    float2 w12 = w1 + w2;
+    float2 off12 = w2 / w12;
+
+    float2 p0 = (texPos1 - 1.0) * texel;
+    float2 p3 = (texPos1 + 2.0) * texel;
+    float2 p12 = (texPos1 + off12) * texel;
+
+    float k0 = w12.x * w0.y;
+    float k1 = w0.x * w12.y;
+    float k2 = w12.x * w12.y;
+    float k3 = w3.x * w12.y;
+    float k4 = w12.x * w3.y;
+
+    float3 sum = tex.sample(samp, float2(p12.x, p0.y), level(0.0)).rgb * k0
+               + tex.sample(samp, float2(p0.x, p12.y), level(0.0)).rgb * k1
+               + tex.sample(samp, float2(p12.x, p12.y), level(0.0)).rgb * k2
+               + tex.sample(samp, float2(p3.x, p12.y), level(0.0)).rgb * k3
+               + tex.sample(samp, float2(p12.x, p3.y), level(0.0)).rgb * k4;
+
+    return sum / (k0 + k1 + k2 + k3 + k4);
+}
+
 kernel void CSMain(
     constant TaaParams& params [[buffer(0)]],
     texture2d<float, access::sample> uScene [[texture(0)]],
@@ -627,7 +770,9 @@ kernel void CSMain(
         float2 v = uVelocity.read(uint2(nearest)).xy;
         float2 prevUv = uv - v;
 
-        float3 hist = TaaTonemap(uHistory.sample(uLinearClamp, prevUv, level(0.0)).rgb);
+        float3 hist = TaaTonemap(TaaSampleHistory(uHistory, uLinearClamp, prevUv,
+                                                  float2(params.uWidth, params.uHeight),
+                                                  float2(params.uTexelX, params.uTexelY)));
         float3 clamped = clamp(TaaYCoCgToRgb(clamp(TaaRgbToYCoCg(hist), lo, hi)), nmin, nmax);
 
         float vPixels = length(v * float2(params.uWidth, params.uHeight));
@@ -692,6 +837,46 @@ fn TaaYCoCgToRgb(c : vec3<f32>) -> vec3<f32>
     return vec3<f32>(t + c.y, c.x + c.z, t - c.y);
 }
 
+// Clause 16: 5-tap Catmull-Rom history resampling. See the HLSL source for the derivation and for why the
+// renormalization at the end is load-bearing. All five fetches use textureSampleLevel with an explicit level,
+// which takes no derivatives and therefore carries no uniform-control-flow requirement - the same reason the
+// single fetch it replaces was already legal inside the bounds check this is called from.
+fn TaaSampleHistory(uv : vec2<f32>) -> vec3<f32>
+{
+    let samplePos = uv * vec2<f32>(params.uWidth, params.uHeight);
+    let texPos1 = floor(samplePos - vec2<f32>(0.5)) + vec2<f32>(0.5);
+    let f = samplePos - texPos1;
+    let f2 = f * f;
+    let f3 = f2 * f;
+
+    let w0 = -0.5 * f3 + f2 - 0.5 * f;
+    let w1 = 1.5 * f3 - 2.5 * f2 + vec2<f32>(1.0);
+    let w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+    let w3 = 0.5 * f3 - 0.5 * f2;
+
+    let w12 = w1 + w2;
+    let off12 = w2 / w12;
+
+    let texel = vec2<f32>(params.uTexelX, params.uTexelY);
+    let p0 = (texPos1 - vec2<f32>(1.0)) * texel;
+    let p3 = (texPos1 + vec2<f32>(2.0)) * texel;
+    let p12 = (texPos1 + off12) * texel;
+
+    let k0 = w12.x * w0.y;
+    let k1 = w0.x * w12.y;
+    let k2 = w12.x * w12.y;
+    let k3 = w3.x * w12.y;
+    let k4 = w12.x * w3.y;
+
+    let sum = textureSampleLevel(uHistory, uLinearClamp, vec2<f32>(p12.x, p0.y), 0.0).rgb * k0
+            + textureSampleLevel(uHistory, uLinearClamp, vec2<f32>(p0.x, p12.y), 0.0).rgb * k1
+            + textureSampleLevel(uHistory, uLinearClamp, vec2<f32>(p12.x, p12.y), 0.0).rgb * k2
+            + textureSampleLevel(uHistory, uLinearClamp, vec2<f32>(p3.x, p12.y), 0.0).rgb * k3
+            + textureSampleLevel(uHistory, uLinearClamp, vec2<f32>(p12.x, p3.y), 0.0).rgb * k4;
+
+    return sum / (k0 + k1 + k2 + k3 + k4);
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
 {
@@ -748,7 +933,7 @@ fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
         let v = textureLoad(uVelocity, nearest, 0).xy;
         let prevUv = uv - v;
 
-        let hist = TaaTonemap(textureSampleLevel(uHistory, uLinearClamp, prevUv, 0.0).rgb);
+        let hist = TaaTonemap(TaaSampleHistory(prevUv));
         let clamped = clamp(TaaYCoCgToRgb(clamp(TaaRgbToYCoCg(hist), lo, hi)), nmin, nmax);
 
         let vPixels = length(v * vec2<f32>(params.uWidth, params.uHeight));
