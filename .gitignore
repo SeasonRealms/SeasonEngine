@@ -41,6 +41,7 @@ ScaffoldingReadMe.txt
 .DS_Store
 Thumbs.db
 *.user
+*.csproj.user
 ~$*
 *~
 CodeCoverage/
@@ -57,3 +58,4 @@ CodeCoverage/
 TestResult.xml
 nunit-*.xml
 /.vs
+/Apps/Engine/Engine.csproj.user
