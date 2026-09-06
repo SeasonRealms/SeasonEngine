@@ -43,8 +43,10 @@ internal unsafe sealed class DescriptorAllocator : IDisposable
     /// binding 12 had previously been omitted, leaving the pool undersized without actually exhausting it.
     /// It is now included together with 1-7.
     /// 2-4 adds 17 and 18 to reach 9, and 2-5 adds 19 and 20 to reach 11.
+    /// 1-5 clause 15 adds binding 21 to reach 12: it is the shadow atlas a second time, through a point sampler instead of
+    /// the comparison one, so it consumes a pool slot even though no new image is involved.
     /// </summary>
-    public const uint SampledImagesPerSet = 11;
+    public const uint SampledImagesPerSet = 12;
 
     /// <summary>Number of storage buffers per set, aligned with PipelineLayout.</summary>
     public const uint StorageBuffersPerSet = 2;

@@ -30,6 +30,11 @@ public class InstancedModel : InstancedMesh3DBase
     /// </summary>
     internal Season.Models.GltfAsset Asset { get; set; }
 
+    /// <summary>1-5 clause 12: reports the shared asset's animation clock for shadow-atlas reuse. One clock covers the whole
+    /// batch because every instance replays the same clip from the same player; the per-instance transforms are folded in
+    /// separately by <see cref="InstancedMesh3DBase.DrawShadow"/>.</summary>
+    protected override int ShadowPoseKey => Asset?.ShadowPoseKey ?? 0;
+
     protected override bool HasContent => !string.IsNullOrEmpty(ModelName);
 
     public override async Task<bool> Load()

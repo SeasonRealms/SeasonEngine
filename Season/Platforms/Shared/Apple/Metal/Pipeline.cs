@@ -1713,25 +1713,107 @@ inline float3 AcesFilmInv(float3 y)
 // The atlas has four quadrant tiles, slots 0 through 2 for CSM and slot 3 for the spotlight.
 // The sampling function mirrors DX and VK one to one with a single exit.
 // MSL has no global resources, so atlas, sampler, and lights are passed explicitly through parameters.
+// Uses hardware comparison sampling plus the clause 14 rotated eight-tap disk.
 
-// Single-tile 3 by 3 PCF.
+// Clause 14: per-pixel orientation for the PCF disk, returned as a unit vector so the sampling loop needs no trigonometry.
+// The spatial term is interleaved gradient noise, which is constructed to decorrelate immediate neighbours - the property
+// that matters here, because TAA resolves a pixel from its own history and from the pixels next to it. The temporal term
+// arrives in shadowParams1.w already spread over the circle by the golden-ratio sequence, and adding it before the turn
+// spins the whole kernel frame to frame, which is what turns the sampling error into something a history can average away
+// rather than a fixed pattern it would preserve.
+inline float2 ShadowKernelRotation(constant SceneLights& lights, float2 pixel) {
+    float ign = fract(52.9829189 * fract(dot(pixel, float2(0.06711056, 0.00583715))));
+    float angle = (ign + lights.shadowParams1.w) * 6.28318531;
+    return float2(cos(angle), sin(angle));
+}
+
+// Clause 14: eight taps on a Vogel disk, oriented by rot and scaled to radiusTexels. A Vogel spiral rather than a ring
+// because the golden angle fills the disk evenly at any tap count, so this one loop keeps working whatever radius it is
+// handed - which is what lets a variable penumbra reuse it later instead of forcing a second sampler into all four
+// backends. Each tap advances by one complex multiply by the golden angle, and that stays unit length across all eight.
+//
+// Clause 15: a negative radiusTexels means its magnitude is a ceiling rather than the radius, and the radius is derived
+// per pixel from a blocker search run first on the very same disk. Two properties of this projection setup are what keep
+// that search cheap. The separation is measured in stored-depth units, which are the cascade's own depth range normalized
+// to [0,1], and CascadedShadow builds every cascade with a depth range of exactly four times its bounding radius against a
+// texel footprint of two radii over the tile resolution - so radius cancels out of their ratio and one mapping from
+// separation to width is correct in all three cascades with nothing per-cascade uploaded. The mapping is deliberately not
+// the textbook light-angle one: a physically sized sun puts the penumbra at a near-constant 0.6 to 0.8 texels in every
+// cascade, for that same reason of scales growing together, and 0.7 texels of softening is invisible. Reaching the ceiling
+// at a quarter of the depth range keeps every property that matters - hard on contact, widening with separation,
+// consistent across cascades - and leaves the absolute width as the artistic knob it has to be to be worth having.
+//
+// The blocker search reads the atlas as plain depth, which the comparison sampler cannot do - it answers pass/fail. On
+// Metal that costs no binding at all: MSL allows a sampler to be declared inside the shader, so unlike the other three
+// backends nothing is added to the pipeline's resource layout here. Filtering must be nearest - averaging two depths across
+// a silhouette yields a value lying on no surface, and a blocker distance derived from it would be fiction.
+constexpr sampler shadowPointSampler(filter::nearest, address::clamp_to_edge);
+
 // shadowNdc is light-space NDC after dividing by w, and sampling is clamped inside the tile to avoid leakage.
-inline float SampleShadowTile(depth2d<float> shadowAtlas, sampler shadowSampler, float texel, int slot, float3 shadowNdc) {
+inline float SampleShadowTile(depth2d<float> shadowAtlas, sampler shadowSampler, float texel, int slot, float3 shadowNdc, float2 rot, float radiusTexels) {
     float result = 1.0;
     float2 uv = float2(shadowNdc.x * 0.5 + 0.5, 0.5 - shadowNdc.y * 0.5);
     if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0 &&
         shadowNdc.z > 0.0 && shadowNdc.z < 1.0) {
         float2 tileOrigin = float2(slot & 1, slot >> 1) * 0.5;
-        float2 tileMin = tileOrigin + texel * 1.5;
-        float2 tileMax = tileOrigin + 0.5 - texel * 1.5;
         float2 atlasUV = tileOrigin + uv * 0.5;
-        float sum = 0.0;
-        for (int dy = -1; dy <= 1; ++dy)
-            for (int dx = -1; dx <= 1; ++dx) {
-                float2 sampleUV = clamp(atlasUV + float2(dx, dy) * texel, tileMin, tileMax);
-                sum += shadowAtlas.sample_compare(shadowSampler, sampleUV, shadowNdc.z);
+
+        float radius = abs(radiusTexels);
+        // Clause 15: set when the blocker search finds nothing above the receiver, which lets the comparison pass be
+        // skipped outright - the answer is already known to be fully lit, and that is the common case over open ground.
+        bool unoccluded = false;
+        if (radiusTexels < 0.0) {
+            // Search at the ceiling radius, because the radius being solved for is not known yet and a search narrower
+            // than the final kernel would miss occluders the kernel then samples, which reads as an edge that snaps.
+            float2 searchInset = float2(min(texel * (radius + 0.5), 0.2499));
+            float2 searchMin = tileOrigin + searchInset;
+            float2 searchMax = tileOrigin + 0.5 - searchInset;
+            float2 searchDir = rot;
+            float searchStepUV = radius * texel;
+            float depthSum = 0.0;
+            float depthCount = 0.0;
+            for (int j = 0; j < 8; ++j) {
+                float rj = sqrt((float(j) + 0.5) * 0.125);
+                float2 searchUV = clamp(atlasUV + searchDir * (rj * searchStepUV), searchMin, searchMax);
+                float stored = shadowAtlas.sample(shadowPointSampler, searchUV);
+                // Only depths in front of the receiver are occluders; averaging the rest in would pull the estimate
+                // towards the receiver's own surface and collapse the penumbra wherever the disk straddles a silhouette.
+                float isBlocker = stored < shadowNdc.z ? 1.0 : 0.0;
+                depthSum += stored * isBlocker;
+                depthCount += isBlocker;
+                searchDir = float2(searchDir.x * -0.7373689 - searchDir.y * 0.6754903,
+                                   searchDir.x * 0.6754903 + searchDir.y * -0.7373689);
             }
-        result = sum / 9.0;
+            if (depthCount < 0.5) {
+                unoccluded = true;
+            } else {
+                // Floor at half a texel: that is the reach of the hardware 2x2 comparison filter, so a smaller disk
+                // would collapse all eight taps onto one bilinear footprint and cost eight samples for one result.
+                float separation = shadowNdc.z - depthSum / depthCount;
+                radius = clamp(radius * separation * 4.0, 0.5, radius);
+            }
+        }
+
+        if (!unoccluded) {
+            // Shrink the quadrant inward by the disk radius plus the half texel the hardware 2x2 comparison filter reaches, so
+            // no tap can bleed into a neighbouring quadrant however wide the disk is. Capped just under the half-quadrant so a
+            // pathological radius degenerates into sampling the tile centre instead of inverting the clamp bounds.
+            float2 inset = float2(min(texel * (radius + 0.5), 0.2499));
+            float2 tileMin = tileOrigin + inset;
+            float2 tileMax = tileOrigin + 0.5 - inset;
+
+            float2 dir = rot;
+            float stepUV = radius * texel;
+            float sum = 0.0;
+            for (int k = 0; k < 8; ++k) {
+                float r = sqrt((float(k) + 0.5) * 0.125);
+                float2 sampleUV = clamp(atlasUV + dir * (r * stepUV), tileMin, tileMax);
+                sum += shadowAtlas.sample_compare(shadowSampler, sampleUV, shadowNdc.z);
+                // Advance by the golden angle 2.39996323 rad, whose (cos, sin) is (-0.7373689, 0.6754903).
+                dir = float2(dir.x * -0.7373689 - dir.y * 0.6754903, dir.x * 0.6754903 + dir.y * -0.7373689);
+            }
+            result = sum * 0.125;
+        }
     }
     return result;
 }
@@ -1739,7 +1821,11 @@ inline float SampleShadowTile(depth2d<float> shadowAtlas, sampler shadowSampler,
 // Directional light, CSM:
 // select the cascade slot by view-space depth, then project into light space, sample it,
 // and mix the result into shadowStrength.
-inline float ComputeSunShadow(constant SceneLights& lights, depth2d<float> shadowAtlas, sampler shadowSampler, float3 worldPos, float viewDepth) {
+//
+// Clause 13 normal-offset: geoNormal is the interpolated mesh normal, taken before any normal map perturbs it, because the
+// offset has to follow the surface the depth buffer actually holds rather than the shading normal. lightDir points towards
+// the light and is only used for the foreshortening factor, so its sign does not matter.
+inline float ComputeSunShadow(constant SceneLights& lights, depth2d<float> shadowAtlas, sampler shadowSampler, float3 worldPos, float3 geoNormal, float3 lightDir, float viewDepth, float2 shadowRot) {
     float result = 1.0;
     int cascadeCount = int(lights.shadowParams0.y);
     if (lights.shadowParams0.x >= 0.5 && viewDepth <= lights.cascadeSplits[cascadeCount - 1]) {
@@ -1749,7 +1835,36 @@ inline float ComputeSunShadow(constant SceneLights& lights, depth2d<float> shado
         // Pre-multiplication, contract clause 1:
         // raw row-major bytes are read by MSL as M transpose, and M transpose times v is equivalent to CPU-side pos times M.
         float4 lightPos = lights.cascadeViewProj[slot] * float4(worldPos, 1.0);
-        float visibility = SampleShadowTile(shadowAtlas, shadowSampler, lights.shadowParams0.z, slot, lightPos.xyz / lightPos.w);
+        float3 ndc = lightPos.xyz / lightPos.w;
+
+        // Clause 13: displace the lookup along the surface normal, in this cascade's tile NDC rather than in world space.
+        // One texel is a fixed 2/(atlasSize/2) = 4*shadowParams0.z of tile NDC however wide the cascade is, so a single
+        // uploaded texel count is right for all three cascades and no per-cascade world scale has to reach the shader.
+        //
+        // The direction is the normal put through the same matrix the position went through, as a direction (w=0), then
+        // normalized. Writing the multiply in the same order as lightPos above means the transposed read described there
+        // applies to the normal identically, which keeps this a transcription of the other three backends. Normalizing is the
+        // load-bearing step: an orthographic projection scales every direction by 2/cascadeWidth, so the raw projected length
+        // carries the cascade's extent and using it unnormalized would make the offset inversely proportional to cascade
+        // width - far too large near, far too small far out. That length also carried the sqrt(1 - NdotL^2) foreshortening,
+        // which is why it has to be reapplied by hand once the scale is gone. Its effect is that the offset vanishes on
+        // surfaces facing the light and peaks on grazing ones, which is exactly where a texel's worth of depth quantization
+        // spans the most world distance.
+        //
+        // Only xy moves. Displacing z would push stored depth away from the light again, which is the peter-panning this
+        // clause exists to avoid buying. The length guard costs nothing real: the projected normal only collapses when the
+        // surface faces the light dead on, and that is precisely where the foreshortening would have zeroed the offset too.
+        if (lights.shadowParams1.z > 0.0) {
+            float2 ndcN = (lights.cascadeViewProj[slot] * float4(geoNormal, 0.0)).xy;
+            float ndcLen = length(ndcN);
+            if (ndcLen > 1e-8) {
+                float ndl = dot(geoNormal, lightDir);
+                float sinTheta = sqrt(saturate(1.0 - ndl * ndl));
+                ndc.xy += (ndcN / ndcLen) * (sinTheta * lights.shadowParams1.z * 4.0 * lights.shadowParams0.z);
+            }
+        }
+
+        float visibility = SampleShadowTile(shadowAtlas, shadowSampler, lights.shadowParams0.z, slot, ndc, shadowRot, lights.shadowParams0.w);
         result = mix(1.0, visibility, lights.shadowParams1.y);
     }
     return result;
@@ -1757,12 +1872,14 @@ inline float ComputeSunShadow(constant SceneLights& lights, depth2d<float> shado
 
 // Spot light:
 // single tile at slot 3, sampled after perspective divide.
-inline float ComputeSpotShadow(constant SceneLights& lights, depth2d<float> shadowAtlas, sampler shadowSampler, float3 worldPos) {
+// No normal-offset here (clause 13 covers the cascades only): under a perspective projection a texel covers a world
+// distance that grows with depth, so a single texel count cannot describe the offset. The spot keeps the PSO depth biases.
+inline float ComputeSpotShadow(constant SceneLights& lights, depth2d<float> shadowAtlas, sampler shadowSampler, float3 worldPos, float2 shadowRot) {
     float result = 1.0;
     if (lights.shadowParams1.x >= 0.5) {
         float4 lightPos = lights.spotShadowViewProj * float4(worldPos, 1.0);
         if (lightPos.w > 0.0) {
-            float visibility = SampleShadowTile(shadowAtlas, shadowSampler, lights.shadowParams0.z, 3, lightPos.xyz / lightPos.w);
+            float visibility = SampleShadowTile(shadowAtlas, shadowSampler, lights.shadowParams0.z, 3, lightPos.xyz / lightPos.w, shadowRot, lights.shadowParams0.w);
             result = mix(1.0, visibility, lights.shadowParams1.y);
         }
     }
@@ -2050,6 +2167,11 @@ fragment SEASON_FS_OUT fragment_main(
     float3 B = cross(N, T) * in.vTangent.w;
     float3x3 TBN = float3x3(T, B, N);
 
+    // 1-5 clause 13: keep the geometric normal before the normal map overwrites N below. Shadow lookups are displaced along
+    // this one, not the shading normal: the depth buffer holds the interpolated surface, so a perturbed normal would push
+    // the sample off that surface and reintroduce acne exactly where the map is strongest.
+    float3 Ngeo = N;
+
     if (mat.useNormalMap != 0u) {
         float4 nrmSample = normalMap.sample(texSampler, in.vUV, bias(TEXTURE_LOD_BIAS));
         float3 nrm = nrmSample.rgb * 2.0 - 1.0;
@@ -2098,7 +2220,7 @@ fragment SEASON_FS_OUT fragment_main(
             radiance = lights.lights[i].colorIntensity.xyz * lights.lights[i].colorIntensity.w;
 #if SHADOW_ENABLED
             if (i == dirShadowIdx)
-                radiance *= ComputeSunShadow(lights, shadowAtlas, shadowSampler, in.vWorldPos, in.vViewDepth);
+                radiance *= ComputeSunShadow(lights, shadowAtlas, shadowSampler, in.vWorldPos, Ngeo, L, in.vViewDepth, ShadowKernelRotation(lights, in.position.xy));
 #endif
             // Step C of 2-5, cloud shadows:
             // evaluate them separately for every directional light using its own L,
@@ -2135,7 +2257,7 @@ fragment SEASON_FS_OUT fragment_main(
             // Spot shadow at slot 3:
             // only the spot light pointed to by params0.w participates, aligned with DX, VK, and CascadedShadow.ComputeSpot.
             if (i == spotShadowIdx && type > 0.5)
-                radiance *= ComputeSpotShadow(lights, shadowAtlas, shadowSampler, in.vWorldPos);
+                radiance *= ComputeSpotShadow(lights, shadowAtlas, shadowSampler, in.vWorldPos, ShadowKernelRotation(lights, in.position.xy));
 #endif
         }
 

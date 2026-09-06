@@ -289,11 +289,22 @@ public abstract class Mesh3DBase : Control, ITransparentSortable
     /// It uses GetWorldBounds, not GetWorldBoundsRaw, because animated models need the conservative
     /// AnimatedBoundsScale-expanded bounds here. The culling box must err on the large side,
     /// consistent with main-pass camera culling.
+    ///
+    /// Clause 12 adds the fingerprint branch, placed after the gating and before culling for the reasons given in
+    /// <see cref="CascadedShadow.AccumulatingCasters"/>. The bounds folded in are the same ones culling uses, so the digest
+    /// sees exactly the box the pass would have rasterized against.
     /// </summary>
     public override void DrawShadow()
     {
         if (!CastShadows || !Ready || !HasContent || !Enable)
             return;
+
+        if (CascadedShadow.AccumulatingCasters)
+        {
+            CascadedShadow.MixCaster(GetWorldBounds());
+            CascadedShadow.MixCaster(ShadowPoseKey);
+            return;
+        }
 
         if (CullingEnabled && CascadedShadow.IsCulled(GetWorldBounds()))
             return;

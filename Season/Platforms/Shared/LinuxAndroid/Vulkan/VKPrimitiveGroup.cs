@@ -714,7 +714,7 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         { ImageView = p.EmissiveTexture.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
 
         var set = p.DescriptorSets[fi];
-        var writes = stackalloc WriteDescriptorSet[21];
+        var writes = stackalloc WriteDescriptorSet[22];
         writes[0] = MakeBufferWrite(set, 0, DescriptorType.UniformBuffer, &matrixInfo);
         writes[1] = MakeBufferWrite(set, 1, DescriptorType.UniformBuffer, &lightInfo);
         writes[2] = MakeBufferWrite(set, 2, DescriptorType.UniformBuffer, &materialInfo);
@@ -749,6 +749,10 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
             { ImageView = fallback.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
         }
         writes[12] = MakeImageWrite(set, 12, &shadowInfo);
+        // 1-5 clause 15: binding 21 is the same view again, reached through the immutable point sampler so the blocker search
+        // can read stored depth - binding 12's comparison sampler only ever yields pass/fail. Sharing shadowInfo is what makes
+        // this a second descriptor rather than a second image, including the disabled-shadows placeholder case above.
+        writes[21] = MakeImageWrite(set, 21, &shadowInfo);
 
         // 2-3 Step C: previous-frame SSBO data (binding 13/14/15).
         // Derived classes can override this to provide the actual prev buffers.
@@ -822,7 +826,7 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         if (p.AerialLutViewVersions != null)
             p.AerialLutViewVersions[fi] = aerialLut.ViewVersion;
 
-        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 21, writes, 0, null);
+        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 22, writes, 0, null);
     }
 
     /// <summary>2-3 Step C: derived classes may override this to return the prev bone SSBO

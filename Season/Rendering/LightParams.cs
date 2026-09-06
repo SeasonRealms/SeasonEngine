@@ -167,12 +167,17 @@ public struct SceneLightParams
     public System.Numerics.Vector4 CascadeSplits;
 
     /// <summary>Offset 896: x = directional-shadow enable flag, active when &gt;0.5; y = cascadeCount, stored as a float integer;
-    /// z = 1/shadowAtlasSize, the texel size used as the PCF step baseline; w reserved as 0.
+    /// z = 1/shadowAtlasSize, the texel size used as the PCF step baseline;
+    /// w = 1-5 clause 14 radius of the rotated PCF disk, in cascade-tile texels, on the same footing as <see cref="ShadowParams1"/>.z.
     /// All zeros means shadows are fully disabled.</summary>
     public System.Numerics.Vector4 ShadowParams0;
 
     /// <summary>Offset 912: x = spotlight-shadow enable flag, active when &gt;0.5 and applied to the spotlight referenced by Params0.W, see the 1-5 clauses in RenderQuality;
-    /// y = shadow strength in 0~1, where 1 means direct light drops fully to zero under complete occlusion; zw reserved as 0.</summary>
+    /// y = shadow strength in 0~1, where 1 means direct light drops fully to zero under complete occlusion;
+    /// z = 1-5 clause 13 normal-offset in cascade-tile texels, where 0 disables it and the shader derives the NDC displacement
+    /// from <see cref="ShadowParams0"/>.z;
+    /// w = 1-5 clause 14 per-frame rotation seed in 0~1 for the PCF disk, added to the shader's own per-pixel noise so the
+    /// kernel orientation moves every frame and TAA can average the sampling error away instead of preserving it.</summary>
     public System.Numerics.Vector4 ShadowParams1;
 
     /// <summary>Offset 928, 2-3 contract clause 6: xy = subpixel jitter of the current frame in NDC units, used for de-jittering in the pixel shader;

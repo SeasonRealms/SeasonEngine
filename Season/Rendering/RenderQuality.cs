@@ -149,13 +149,21 @@ public enum TextureMipPolicy
 ///   culling never skips the fixed pass chain, and the whole path is allocation-free and runtime-toggleable.
 /// - 1-5 shadows: CSM plus spot shadow maps use one atlas, controlled per-slot viewports, depth-only shadow shaders, hardware comparison sampling with fixed PCF,
 ///   and CPU-side cascade setup with texel snapping. Shadow ownership is chosen every frame by SceneLighting.Bake.
+///   Clauses 10-12 form one chain built on the fact that clause 9 makes the cascade matrix bitwise stable rather than merely similar:
+///   clause 10 measures how long that stability actually lasts, clause 11 sizes the angular step from the light's measured speed so the
+///   interval lands on a target instead of being whatever 0.25 degrees happens to buy, and clause 12 cashes the interval in by skipping
+///   the shadow pass on frames where the atlas would be reproduced exactly. Clause 12 changes no pixel; what it buys is the headroom to
+///   raise atlas resolution. Clause 13 is independent of that chain: a normal-offset bias that removes acne by moving the sample along
+///   the receiver's surface instead of pushing stored depth away from the light, which is what lets the depth biases - and the
+///   peter-panning they cause - come back down.
 /// - 2-1 post stack: bloom is an AfterScene compute chain and FXAA is a post-tonemap raster pass. Both use the final HDR->LDR composite point and degrade cleanly when unavailable.
 /// - 2-2 AO: GTAO-lite uses explicit SceneDepth, depth-texture compute input, half-resolution kernels, and AO composition before ACES. Mesh-level AO exclusion remains supported.
 /// - 2-3 motion vectors + TAA: velocity is an independent tier, SceneVelocity is explicit, jitter is injected from a single Camera3D path,
 ///   history data rides existing constant buffers, transparent geometry does not write velocity, and TAA uses ping-pong history with controlled degradation.
 ///   Clause 16 resamples reprojected history through a renormalized 5-tap Catmull-Rom filter instead of one bilinear fetch, because the per-frame
 ///   softening of a single fetch compounds across the whole feedback window rather than being paid once. Clause 17 then borrows the Post slot that
-///   2-1 built for FXAA and resolves with FSR1 RCAS, which is the only place a display-referred sharpener can legally run in this engine.
+///   2-1 built for FXAA and resolves with FSR1 RCAS, which is the only place a display-referred sharpener can legally run in this engine;
+///   it is off by default because owning that slot costs a whole extra pass, and TaaSharpness above zero is the switch that buys it.
 /// - 1-7 cubemap + IBL: TextureCube is a minimal cross-platform type, SH9 irradiance/radiance ride the lighting UBO, diffuse picks either SH9 or constant ambient,
 ///   and the entire path falls back cleanly to the old ambient-only baseline.
 /// - 2-4 DDGI + SDF: GI uses box/sphere proxies, accepts one-frame latency, stores all runtime parameters in the existing lighting UBO tail,
@@ -205,6 +213,37 @@ public class RenderQuality
 
     /// <summary>Default value for ShadowLightAngleStep (overrideable in the app constructor and captured by Init()).</summary>
     public static float DefaultShadowLightAngleStep = 0.25f;
+
+    /// <summary>Default value for ShadowTargetStableFrames (overrideable in the app constructor and captured by Init()).
+    /// 8 rather than something longer: at the sample scene's day length the ladder settles on 1 degree - measured, with the
+    /// resulting average interval coming out at 8.4 frames against this target of 8 - and the jump paid when a cell changes
+    /// stays around a few texels in the near cascade, which TAA absorbs in one or two frames. Doubling the target doubles
+    /// both the interval and that jump.</summary>
+    public static int DefaultShadowTargetStableFrames = 8;
+
+    /// <summary>Default value for ShadowAtlasReuse (overrideable in the app constructor and captured by Init()).
+    /// False because the fingerprint is a single digest over the whole atlas, so one animating caster disqualifies every
+    /// quadrant, and scenes here tend to keep animations running; see <see cref="RenderQuality.ShadowAtlasReuse"/> for the
+    /// measurements behind that and for when turning it on is worth it.</summary>
+    public static bool DefaultShadowAtlasReuse = false;
+
+    /// <summary>Default value for ShadowNormalOffset (overrideable in the app constructor and captured by Init()).
+    /// Expressed in shadow-map texels, so it keeps meaning when the atlas is resized. 1.5 covers the 3x3 PCF footprint's
+    /// outer ring, which is the actual distance a receiver can be misjudged by, and is low enough not to visibly detach
+    /// contact shadows on the near cascade.</summary>
+    public static float DefaultShadowNormalOffset = 1.5f;
+
+    /// <summary>Default value for ShadowSoftnessTexels (overrideable in the app constructor and captured by Init()).
+    /// 2 texels puts the outermost of the eight taps at about 1.9 texels, which with the hardware 2x2 comparison filter on
+    /// each tap covers slightly more than the 3x3 grid it replaces, so the default is a softer edge at the same tap count
+    /// rather than a change of scale.</summary>
+    public static float DefaultShadowSoftnessTexels = 2.0f;
+
+    /// <summary>Default value for ShadowContactHardening (overrideable in the app constructor and captured by Init()).
+    /// Off, because turning it on redefines <see cref="DefaultShadowSoftnessTexels"/> from "the edge width" into "the width a
+    /// well separated occluder reaches", so the two have to be calibrated as a pair and the constant-radius look is the
+    /// reference the pair is judged against.</summary>
+    public static bool DefaultShadowContactHardening = false;
 
     /// <summary>Default value for ShadowDepthBias (overrideable in the app constructor and captured by Init()).</summary>
     public static int DefaultShadowDepthBias = 4;
@@ -261,10 +300,23 @@ public class RenderQuality
     public static float DefaultTaaStaticFeedback = 0.97f;
 
     /// <summary>Default value for TaaSharpness (overrideable in the app constructor and captured by Init()).
-    /// One stop below FSR1's maximum (exp2(-1)), chosen because clause 16 already removed the resampling loss that
-    /// used to be the main reason a resolved frame looked soft; what is left for clause 17 to hide is the jitter
-    /// footprint itself, which does not need an aggressive lobe.</summary>
-    public static float DefaultTaaSharpness = 0.5f;
+    ///
+    /// <b>Zero by default, and that choice is about cost, not about taste.</b> This value is the whole-feature gate for
+    /// clause 17: a value above zero at initialization is what makes the TAA tier register PostColor and RenderPost,
+    /// which costs one extra full-screen Post pass (the HDR-&gt;LDR uber composite moves out of FinalBlit into its own
+    /// pass, writing an extra full-size LDR target) plus one RCAS blit. At zero, both slots stay null and the TAA tier
+    /// keeps exactly the pre-clause-17 pipeline with no residue - which is why zero is the default: the tier should not
+    /// silently buy a pass that not every scene needs.
+    ///
+    /// <b>To enable sharpening, set this above zero before Init(), for example in the app constructor.</b> A reasonable
+    /// starting point is 0.5f, one stop below FSR1's maximum (its "stops" parameter maps here as exp2(-stops), so 0.5
+    /// is one stop and 0.25 is two). One stop rather than full strength because clause 16 already removed the
+    /// resampling loss that used to be the main reason a resolved frame looked soft; what is left for clause 17 to hide
+    /// is the jitter footprint itself, which does not need an aggressive lobe.
+    ///
+    /// Changing it at runtime through <see cref="TaaSharpness"/> only scales the lobe and can never create or remove
+    /// the pass, so a process that started at zero cannot gain sharpening later. See that property for the full rule.</summary>
+    public static float DefaultTaaSharpness = 0f;
 
     /// <summary>Default value for GlobalIllumination (overrideable in the app constructor and captured by Init()).</summary>
     public static GiMode DefaultGlobalIllumination = GiMode.Off;
@@ -410,15 +462,152 @@ public class RenderQuality
     /// <summary>1-5 clause 9: practical-split blend factor (0=pure uniform, 1=pure logarithmic). Default 0.6 gives denser near cascades.</summary>
     public float CascadeSplitLambda { get; set; } = DefaultCascadeSplitLambda;
 
-    /// <summary>1-5 clause 9: angular grid step in degrees used to quantize the directional-light direction before the cascade
-    /// matrices are derived; 0 disables quantization. Texel snapping aligns the light-space translation to the texel grid, but
-    /// that grid is the light basis itself, so a continuously rotating sun makes snapping quantize into a moving frame of
-    /// reference and the whole atlas re-samples at a new sub-texel phase every frame. Freezing the direction onto a fixed grid
-    /// makes the cascade matrix bitwise identical within one cell, so the atlas is bitwise identical and temporal accumulation
-    /// has something stable to converge on. The cost is that the shadow direction lags the shading direction by up to half a
-    /// step, and that light motion is batched rather than removed: a larger step buys a longer stable interval and pays with a
-    /// proportionally larger jump when the cell changes. Runtime-tunable.</summary>
+    /// <summary>1-5 clause 9: <b>base</b> angular grid step in degrees for quantizing the directional-light direction before the
+    /// cascade matrices are derived; 0 disables quantization entirely. Texel snapping aligns the light-space translation to the
+    /// texel grid, but that grid is the light basis itself, so a continuously rotating sun makes snapping quantize into a moving
+    /// frame of reference and the whole atlas re-samples at a new sub-texel phase every frame. Freezing the direction onto a
+    /// fixed grid makes the cascade matrix bitwise identical within one cell, so the atlas is bitwise identical and temporal
+    /// accumulation has something stable to converge on. The cost is that the shadow direction lags the shading direction by up
+    /// to half a step, and that light motion is batched rather than removed: a larger step buys a longer stable interval and pays
+    /// with a proportionally larger jump when the cell changes.
+    ///
+    /// Clause 11 turned this from the final step into the centre of a ladder: the step actually used is this value times a power
+    /// of two, picked each frame from the light's measured angular speed so that one cell lasts about
+    /// <see cref="ShadowTargetStableFrames"/> frames. Raising this raises the whole ladder. Read
+    /// <see cref="CascadedShadow.EffectiveLightAngleStep"/> to see what is actually in force. Runtime-tunable.</summary>
     public float ShadowLightAngleStep { get; set; } = DefaultShadowLightAngleStep;
+
+    /// <summary>1-5 clause 11: how many consecutive frames the cascade matrices should ideally stay bitwise identical. The
+    /// adaptive angular step solves for this - it is sized so one angular cell lasts roughly this long at the light's current
+    /// speed. Values below 2 disable adaptation and pin the step at <see cref="ShadowLightAngleStep"/>.
+    ///
+    /// This is the one knob that states the actual tradeoff, which is why it is the one exposed: raising it lengthens the interval
+    /// TAA gets to converge over and proportionally enlarges the jump when the cell finally changes, because the accumulated
+    /// light motion is batched rather than removed. It is also the ceiling on what clause 12 can skip, so a target of N frames
+    /// means at most (N-1)/N of shadow passes avoided.
+    ///
+    /// Runtime-tunable, and meant to be surfaced in the control panel for tuning next to the [ShadowStable] diagnostic, whose
+    /// reported average interval is the direct feedback signal for this value.</summary>
+    public int ShadowTargetStableFrames { get; set; } = DefaultShadowTargetStableFrames;
+
+    /// <summary>1-5 clause 12: whether the shadow pass may be skipped entirely on frames where the atlas would come out
+    /// identical. Disabled by default; see below. This is purely a cost optimization and changes no pixel: the reuse predicate
+    /// demands bitwise-identical cascade matrices <b>and</b> an unchanged caster set, and under those two conditions a redraw
+    /// would reproduce the existing atlas exactly, since a depth-only pass reduces to a per-texel minimum and cannot depend on
+    /// submission order.
+    ///
+    /// The caster half of the predicate is a fingerprint built by walking the caster tree once immediately before the pass,
+    /// not collected during it, so detection never lags: an object that starts moving is caught on that very frame. The
+    /// arrangement also pays for itself in CPU terms, since the pass replays the tree once per atlas quadrant - a redraw frame
+    /// costs one extra traversal and a skipped frame saves four.
+    ///
+    /// Off by default on measured grounds rather than caution. That fingerprint is a single digest covering the whole atlas, so
+    /// any one caster in motion disqualifies all four quadrants even where it is not visible, and scenes in this engine keep
+    /// animations running continuously - a looping idle on the player, gulls flapping, instanced robots each on their own clip.
+    /// Across sixty diagnostic windows of a populated scene the skip rate was 0% in every single one. Fifteen seconds of that
+    /// was night, with the sun down and only a static spot light left, which isolates the cause: the matrices were provably
+    /// still and the fingerprint was the only half of the predicate failing. In that state the mechanism is a net loss, one
+    /// extra caster traversal per frame in exchange for nothing. Camera motion closes the other half independently - while the
+    /// camera moved, matrix stability measured 0%, not merely reduced, since translation past a single texel invalidates the
+    /// snap.
+    ///
+    /// A startup trace bounds both ends of that on one run. In the window before the animated models finished loading, the skip
+    /// rate and the matrix stability rate came out identical to the frame - 49/59, 83% - because with a still caster set the
+    /// predicate reduces to its matrix half, and 83% is therefore the whole of what this mechanism can ever deliver at a target
+    /// of 8 frames. Four animated models loaded over the next three seconds; the next window read 1/60 against a matrix
+    /// stability of 93%, and every window for the following forty-five seconds read 0/60. The entire gap between 83% and 0% is
+    /// attributable to the digest being global, which is what makes per-quadrant digests the only change that would move this
+    /// number - not a wider tolerance or a longer target.
+    ///
+    /// Worth enabling for a static or near-static scene, where it is the difference between running the pass every frame and
+    /// running it once. Read the [ShadowReuse] diagnostic to confirm rather than assuming: a non-zero skip rate there is the
+    /// only evidence that it is paying for itself. Turning it off also rules the mechanism out while diagnosing a stale-shadow
+    /// artifact.
+    ///
+    /// The other reason to care about it, where it does pay: with the pass running on roughly
+    /// 1/<see cref="ShadowTargetStableFrames"/> of frames, raising <see cref="ShadowAtlasSize"/> costs proportionally less, and
+    /// texel density is the most direct lever there is on shadow-edge detail. Runtime-tunable, and intended for the control
+    /// panel next to that diagnostic.</summary>
+    public bool ShadowAtlasReuse { get; set; } = DefaultShadowAtlasReuse;
+
+    /// <summary>1-5 clause 13: normal-offset shadow bias, in shadow-map texels of the cascade being sampled; 0 disables it.
+    /// The lookup is displaced along the receiver's geometric normal - the one interpolated from the mesh, before any normal
+    /// map perturbs it, since the offset has to follow the surface the depth buffer actually holds.
+    ///
+    /// The unit is texels rather than world distance, and that is what makes one uploaded value serve all three cascades: the
+    /// shader applies the displacement in the cascade's tile NDC, where one texel is a fixed fraction of the tile no matter how
+    /// much world space that tile covers. A texel count therefore lands on the right world distance in each cascade with no
+    /// per-cascade constant being uploaded, and it also survives a change of <see cref="ShadowAtlasSize"/> unchanged.
+    ///
+    /// The offset is additionally scaled by sqrt(1 - NdotL^2), the length of the normal's projection onto the plane
+    /// perpendicular to the light, so it vanishes on surfaces facing the light and peaks on grazing ones - which is exactly
+    /// where a texel's worth of depth quantization spans the most world distance and self-shadowing acne appears.
+    ///
+    /// Why this exists next to the depth biases rather than instead of them: <see cref="ShadowDepthBias"/> and
+    /// <see cref="ShadowSlopeScaledDepthBias"/> fight acne by pushing stored depth away from the light, which also detaches
+    /// the shadow from the object's contact point - peter-panning. Offsetting along the surface instead moves the sample
+    /// sideways into the receiver's own texel without touching depth at all, so acne can be removed without buying
+    /// peter-panning. With this active the depth biases can usually come down; they are baked into the PSO at initialization
+    /// and so remain the only defence for casters whose normals are unusable.
+    ///
+    /// Applies to the cascades only. The spotlight projects perspectively, so a texel covers a world distance that grows with
+    /// depth and a single texel count cannot describe the offset there; the spot keeps the depth biases alone.
+    ///
+    /// Runtime-tunable, and intended for the control panel: it and the two depth biases are one tuning group, best adjusted
+    /// together while watching a grazing-lit surface for acne and a contact edge for detachment.</summary>
+    public float ShadowNormalOffset { get; set; } = DefaultShadowNormalOffset;
+
+    /// <summary>1-5 clause 14: radius of the rotated PCF disk, in shadow-map texels, uploaded to ShadowParams0.W.
+    ///
+    /// The kernel is eight taps on a Vogel disk whose orientation is chosen per pixel, replacing the fixed 3x3 grid. A fixed
+    /// grid can only be widened by adding taps, because widening the spacing alone turns the penumbra into visible steps at
+    /// the grid pitch. Rotating instead converts that structured banding into noise, and noise is what TAA is able to remove:
+    /// each frame lands a different orientation on the same pixel, so the history average converges on the true coverage that
+    /// far more taps would have cost. This is why the clause was not worth attempting before the atlas stopped churning -
+    /// clause 11 had to make the shadow matrices hold still for several frames first, or the history TAA accumulates would be
+    /// of a moving shadow map and there would be nothing coherent to average.
+    ///
+    /// The unit is texels for the same reason as <see cref="ShadowNormalOffset"/>: the shader scales by shadowParams0.z, so
+    /// one uploaded number means the same edge width in all three cascades and survives a change of <see cref="ShadowAtlasSize"/>.
+    ///
+    /// Raising this widens the penumbra at no extra sample cost, and the ceiling is set by noise rather than by performance:
+    /// eight taps spread over a wide disk leave residual variance that TAA can only partly absorb, and it shows up as a faint
+    /// crawl along the edge under camera motion. Note also that the quadrant is shrunk by this radius plus half a texel to
+    /// keep taps inside their own tile, so a very large radius starts clamping taps at the tile border.
+    ///
+    /// Runtime-tunable, and one tuning group with <see cref="ShadowNormalOffset"/>: the offset is expressed in terms of the
+    /// footprint this radius defines, so changing one invalidates the other's calibration.</summary>
+    public float ShadowSoftnessTexels { get; set; } = DefaultShadowSoftnessTexels;
+
+    /// <summary>1-5 clause 15: contact hardening. When on, the PCF disk radius is chosen per pixel from how far the occluder
+    /// stands above the receiver instead of being the constant <see cref="ShadowSoftnessTexels"/>, so an edge is sharp where
+    /// the two touch and widens as they separate. That is the single strongest cue that a shadow belongs to its object, and its
+    /// absence is what makes a uniformly soft edge read as a decal.
+    ///
+    /// It reuses the clause 14 disk twice: once with the raw depth of the atlas to average the depths that are in front of the
+    /// receiver, then again as the actual comparison with the radius that average implies. The first pass is the reason this
+    /// clause costs a binding change on every backend - the atlas had only ever been reachable through a comparison sampler,
+    /// which returns a pass/fail and not a depth.
+    ///
+    /// On the mapping from separation to width, stated plainly because it is not the textbook one: a physically sized sun
+    /// (0.53 degrees across) produces a penumbra that is almost exactly a constant 0.6 to 0.8 texels wide in every cascade.
+    /// The reason is that this projection setup makes depth range and texel footprint scale together - the cascade's bounding
+    /// sphere radius cancels out of their ratio exactly - so a physical light angle buys a width below one texel and therefore
+    /// no visible softening at any atlas size worth shipping. What the shader uses instead is the separation as a fraction of
+    /// the cascade's own depth range, reaching <see cref="ShadowSoftnessTexels"/> at one quarter of it. That keeps every
+    /// property this clause is actually for - hard on contact, softer with distance, consistent across cascades - and leaves
+    /// the absolute width where it can be judged by eye, which is the softness knob above.
+    ///
+    /// The spotlight shares the code and gets a weaker version of the effect: its projection is perspective, so stored depth is
+    /// not linear in distance and the same fraction means a different world separation near the light than far from it. The
+    /// ordering still holds - touching is still hard, separated is still soft - so it is left on rather than special-cased.
+    ///
+    /// Has no effect when <see cref="ShadowSoftnessTexels"/> is zero, since the ceiling it would scale is zero; the sign that
+    /// carries this flag to the shader is the sign of that same number, and a signed zero compares equal to zero.
+    ///
+    /// Off by default: it makes <see cref="ShadowSoftnessTexels"/> a ceiling reached only by well separated occluders rather
+    /// than the width everywhere, so the two have to be calibrated together and the constant-radius look stays the reference.</summary>
+    public bool ShadowContactHardening { get; set; } = DefaultShadowContactHardening;
 
     /// <summary>1-5 clause 4: constant depth bias for the shadow PSO. Baked into the PSO at initialization.</summary>
     public int ShadowDepthBias { get; set; } = DefaultShadowDepthBias;
@@ -485,6 +674,9 @@ public class RenderQuality
     /// at initialization is what makes the TAA tier register PostColor and RenderPost, and that decision is fixed for
     /// the process. Lowering it to 0 later leaves the extra Post pass in place and merely zeroes the lobe, which makes
     /// the filter an identity - the same shape as BloomIntensity, which disables bloom visually without freeing anything.
+    /// Symmetrically, raising it above zero in a process that started at zero does nothing at all, because the slots
+    /// were never registered. <b>The default is 0, so sharpening is off unless
+    /// <see cref="DefaultTaaSharpness"/> is raised before Init(); see there for the cost this gate is guarding.</b>
     /// Only effective under AaMode.Taa; the Fxaa tier owns the same slot and resolves with FXAA instead.</summary>
     public float TaaSharpness { get; set; } = DefaultTaaSharpness;
 

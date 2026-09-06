@@ -218,6 +218,11 @@ public class Model : Mesh3DBase
         return Asset.GetCurrentAnimationName();
     }
 
+    /// <summary>1-5 clause 12: reports the asset's animation clock so shadow-atlas reuse can tell one skinned pose from
+    /// another; see <see cref="Control.ShadowPoseKey"/> for why bounds cannot answer this. Zero before the asset is injected,
+    /// which is also when the control is not Ready and therefore casts nothing.</summary>
+    protected override int ShadowPoseKey => Asset?.ShadowPoseKey ?? 0;
+
     public override bool Draw()
     {
         var result = false;

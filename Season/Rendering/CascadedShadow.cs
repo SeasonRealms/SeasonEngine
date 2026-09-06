@@ -94,6 +94,164 @@ public static class CascadedShadow
     static readonly int[] _submitted = new int[SlotCount];
     static readonly int[] _culled = new int[SlotCount];
 
+    /// <summary>
+    /// 1-5 clause 10: whether every active slot's light-space ViewProj is bit-for-bit unchanged from the previous frame.
+    /// Written once per frame by <see cref="Apply"/> and read-only afterwards; false until the first pair of frames exists.
+    ///
+    /// Why this is exactly equivalent to "the atlas would come out identical": the atlas is the rasterization of a fixed
+    /// caster set under these matrices, the depth-only pass reduces to a per-texel minimum and is therefore independent of
+    /// submission order, and the shadow PSO is baked once. Same matrices plus same casters therefore give the same image,
+    /// not merely a similar one. That makes this flag half of the clause 12 reuse predicate; the caster half is
+    /// <see cref="CasterFingerprint"/>.
+    ///
+    /// Float equality is used rather than a byte comparison, and it is not a shortcut. The only values it treats as equal
+    /// while their bits differ are +0 and -0, and a matrix is consumed exclusively by multiply-add, where the two are
+    /// interchangeable. In the other direction a NaN anywhere in the matrix compares unequal to itself, so a malformed
+    /// frame reports unstable and forces a redraw, which is the safe answer.
+    /// </summary>
+    public static bool MatricesStable;
+
+    // -- Previous-frame matrix mirror backing MatricesStable. Not the same data as the public arrays: those are
+    // overwritten in place by ComputeSun before anything can compare against them. --
+    static readonly Matrix4x4[] _prevCascadeViewProj = new Matrix4x4[MaxCascades];
+    static Matrix4x4 _prevSpotViewProj;
+    static int _prevCascadeCount;
+    static bool _prevSunActive;
+    static bool _prevSpotActive;
+
+    /// <summary>Whether the mirror above holds a usable previous frame. Cleared whenever shadows were skipped entirely,
+    /// because <see cref="FrameSchedule"/> clears the atlas on entry even when the pass body returns immediately, so the
+    /// stored matrices no longer describe any surviving atlas content.</summary>
+    static bool _prevValid;
+
+    // -- Stability statistics over the current diagnostic window. Only frames with SunActive are folded in; see
+    // EvaluateStability for why, and ReportStability for how to read what comes out. --
+    static int _stableFrames;
+    static int _evaluatedFrames;
+    static int _stableRun;
+    static int _runSum;
+    static int _runCount;
+
+    /// <summary>How many intervals in the current window were longer than <see cref="DiagFrameInterval"/> and so entered the
+    /// average clamped to it. Reported alongside the average, because a clamped average is a lower bound, and a mean that
+    /// silently understates is the same class of misleading number the clamp exists to prevent.</summary>
+    static int _cappedRuns;
+
+    /// <summary>Longest stable interval relevant to the current diagnostic window, reset with the other window counters.
+    /// An interval spanning the window boundary carries its full accumulated length into the next window's figure rather than
+    /// being truncated, for the same reason <see cref="_stableRun"/> is not reset there: it is one interval, still running.
+    /// It is raised both as a run grows and as one closes, so it always bounds every interval this window's average reports;
+    /// updating it only on growth let a run that grew in the previous window and ended on this window's first frame enter the
+    /// average while the peak still read 1, a contradiction on the face of the line.</summary>
+    static int _windowLongestRun;
+
+    /// <summary>Longest stable interval seen since process start, kept across diagnostic windows because the peak is what
+    /// tells you whether the angular step is sized for the light's actual speed.</summary>
+    static int _longestRun;
+
+    /// <summary>
+    /// 1-5 clause 11: the angular quantization step in degrees actually applied this frame, after the ladder in
+    /// <see cref="UpdateAngularStep"/> scaled <see cref="RenderQuality.ShadowLightAngleStep"/> by a power of two.
+    /// 0 means quantization is bypassed. Read-only outside this class; exposed for diagnostics and control panels.
+    /// </summary>
+    public static float EffectiveLightAngleStep;
+
+    // -- Angular-speed estimator backing the clause 11 ladder. The direction stored here is the raw one handed to
+    // ComputeSun, never the quantized result: differencing quantized directions would only ever see whole cells and could
+    // not measure a speed finer than the step it is supposed to choose. --
+    static Vector3 _prevRawSunDir;
+    static bool _prevRawValid;
+    static float _smoothedDeltaDegrees;
+
+    // -- Held ladder position. The rung is kept rather than recomputed from scratch each frame because the hysteresis band
+    // and the confirmation count below are both statements about history, and a stateless choice has none. _rungBaseStep
+    // records which base the exponent was measured against, since the exponent alone does not describe a step without it. --
+    static int _rung;
+    static bool _rungValid;
+    static int _rungPendingWant;
+    static int _rungPending;
+    static float _rungBaseStep;
+
+    /// <summary>How many powers of two the step may travel either side of the configured base, giving a 64x range.
+    /// Bounded rather than open so a malformed frame time or a light that teleports cannot pick a step large enough to
+    /// quantize the sun into a different hemisphere.</summary>
+    const int StepLadderRange = 3;
+
+    /// <summary>Smoothing rates for the per-frame angular delta, deliberately asymmetric: the estimate rises quickly and
+    /// falls slowly. Rising fast matters because an underestimate means the step is too small for the light's real speed,
+    /// which is the churn this whole mechanism exists to prevent. Falling slowly matters because every change of ladder
+    /// rung is itself a discontinuity, so a light that briefly slows should not trigger one. The asymmetry is only safe
+    /// alongside <see cref="DeltaOutlierRatio"/>: rising fast on an unbounded sample and then falling slowly is precisely
+    /// how one stalled frame captures the estimate for hundreds of frames.</summary>
+    const float DeltaRiseAlpha = 0.5f;
+    const float DeltaFallAlpha = 0.02f;
+
+    /// <summary>Extra distance in log2 units, beyond the half-rung that rounding already gives, that the estimate must travel
+    /// before a rung is abandoned without waiting for confirmation. Rounding compares the estimate against a boundary; this
+    /// compares it against the rung actually held, which is the whole of what gives the choice a memory.
+    ///
+    /// 0.25 puts the thresholds at 1.68x either side of a rung centre. Sized against measurement, not taste: a sun observed at
+    /// 0.09 deg/frame jittered across a log2 span of 0.105 between diagnostic windows, so the band carries roughly a 5x margin
+    /// over the noise it exists to reject. It is deliberately wider than the half-rung rounding uses, which leaves a zone where
+    /// two adjacent rungs are both defensible answers for one light speed; <see cref="RungConfirmFrames"/> settles that zone.
+    /// Outside the band the disagreement is too large to be noise, so the move is taken at once.</summary>
+    const float RungHysteresis = 0.25f;
+
+    /// <summary>How many consecutive frames must agree on the same alternative rung, while the estimate sits inside the band
+    /// above, before the change is committed.
+    ///
+    /// This is what distinguishes an estimate that is drifting from one that is merely straddling a boundary, and the two cannot
+    /// be told apart from a single frame. Noise around a boundary flips the rounded answer back and forth, so the count keeps
+    /// resetting and nothing is committed; a light whose speed genuinely leans towards the neighbouring rung produces the same
+    /// answer every frame and eventually gets it. Counting time since the last change instead would not work: under boundary
+    /// noise every change resets that clock, which then permits the next one, and the measured flip rate barely improves.
+    ///
+    /// The count also repairs a bad acquisition. The smoothed delta needs a handful of frames to reach the light's real speed,
+    /// and a rung chosen on the way up can land inside the band of the correct one, where the band alone would hold it for good -
+    /// on a clean ramp to 0.09 deg/frame that cost half the step and half the stable interval, permanently.
+    ///
+    /// 240 frames is about four seconds. It has to exceed the longest run of same-direction noise, which for a boundary straddle
+    /// is a few tens of frames, and the cost of erring long is only a step one rung finer than ideal for those seconds.</summary>
+    const int RungConfirmFrames = 240;
+
+    /// <summary>How many times the current estimate a single frame's measured delta may exceed before it is capped.
+    ///
+    /// A frame is not a fixed slice of the day-night cycle. A stalled or hitching frame advances the sun by the whole stall,
+    /// and differencing across it reports a per-frame speed the light never had: one load stall produced a 14 deg/frame sample
+    /// against a true 0.09, which pinned the step at the coarse end of the ladder for roughly 420 frames because
+    /// <see cref="DeltaFallAlpha"/> then needs seconds to unwind it. Capping bounds the damage of any one frame to less than a
+    /// rung while still tracking a genuine speed change within a few frames.</summary>
+    const float DeltaOutlierRatio = 3f;
+
+    /// <summary>
+    /// 1-5 clause 12: FNV-1a digest of the caster set as it stood during this frame's fingerprint walk, folding every
+    /// enabled caster's world bounds, instance transforms and animation pose in traversal order. Together with
+    /// <see cref="MatricesStable"/> it forms the reuse predicate evaluated by <see cref="EvaluateReuse"/>.
+    ///
+    /// Order-sensitive on purpose. Reordering the control tree while keeping the same set cannot change the atlas, because
+    /// a depth-only pass reduces to a per-texel minimum, so an order-sensitive digest can only ever report a change that
+    /// did not happen. Being wrong in that direction costs one redundant redraw; being wrong in the other direction would
+    /// leave a stale shadow on screen, so every ambiguity here is resolved towards redrawing.
+    ///
+    /// What it deliberately does not cover: geometry replaced in place under unchanged bounds, and vertex-stage motion that
+    /// no CPU-side value reflects. Neither exists in this engine today; both would need their own contribution here.
+    /// </summary>
+    public static ulong CasterFingerprint;
+
+    // -- FNV-1a parameters. Chosen over a hash-code combiner so the digest is reproducible run to run, which is what makes
+    // it worth printing when a reuse decision has to be explained after the fact. --
+    const ulong FnvOffsetBasis = 14695981039346656037UL;
+    const ulong FnvPrime = 1099511628211UL;
+
+    static ulong _fingerprintAccum;
+    static ulong _prevCasterFingerprint;
+    static bool _prevFingerprintValid;
+    static bool _fingerprintWalk;
+
+    // -- Reuse statistics over the current diagnostic window. --
+    static int _reuseSkipped;
+    static int _reuseEvaluated;
+
     /// <summary>Print interval in frames for diagnostic summaries. Logging every frame would flood the log, and these group-level counts are stable enough that per-frame output is unnecessary.</summary>
     const int DiagFrameInterval = 60;
 
@@ -104,10 +262,17 @@ public static class CascadedShadow
     public static void BeginFrame()
     {
         ReportCulling();
+        ReportStability();
+        ReportReuse();
 
         Epoch++;
         SunActive = false;
         SpotActive = false;
+
+        // Cleared pessimistically rather than left to Apply: when shadows are disabled or no light is active, Apply
+        // returns before evaluating, and a stale true from an earlier frame would let clause 12 reuse an atlas that was
+        // cleared in the meantime.
+        MatricesStable = false;
 
         ActiveSlot = -1;
         Array.Clear(_submitted);
@@ -203,6 +368,301 @@ public static class CascadedShadow
     }
 
     /// <summary>
+    /// 1-5 clause 10: compares this frame's active slot matrices against the previous frame, publishes
+    /// <see cref="MatricesStable"/>, folds the result into the diagnostic window, and then rotates the mirror.
+    ///
+    /// Called from <see cref="Apply"/> rather than exposed as its own entry point. Apply is already the single place where
+    /// every backend closes out the frame's shadow state - after every Compute call and before any consumer - which is
+    /// exactly the window this evaluation has to land in. A separate public method would be a fifth call site for four
+    /// backends to forget.
+    ///
+    /// The cascade count and both active flags participate in the comparison because a change in either reshapes which
+    /// quadrants hold meaning, which invalidates the atlas just as thoroughly as a matrix change.
+    /// </summary>
+    static void EvaluateStability()
+    {
+        bool stable = _prevValid
+            && _prevSunActive == SunActive
+            && _prevSpotActive == SpotActive
+            && _prevCascadeCount == ActiveCascadeCount;
+
+        if (stable && SunActive)
+        {
+            for (int i = 0; i < ActiveCascadeCount; i++)
+            {
+                if (CascadeViewProj[i] != _prevCascadeViewProj[i])
+                {
+                    stable = false;
+                    break;
+                }
+            }
+        }
+
+        if (stable && SpotActive && SpotViewProj != _prevSpotViewProj)
+            stable = false;
+
+        MatricesStable = stable;
+
+        // The statistics fold only frames with the sun up, while MatricesStable above stays unconditional. That flag is a
+        // clause 12 precondition and a spot-only frame whose matrix held still is genuinely reusable, but the window below
+        // exists to size the clause 11 angular step, which steers the sun and nothing else. Counting sun-down frames there
+        // scored them as hits - cascade matrices are trivially unchanged when no cascade is being computed - so a single
+        // night pulled the reported rate towards 100% while saying nothing at all about the step. With the sun down the
+        // window now receives nothing, ReportStability prints no line, and the gap in the log is unambiguous.
+        //
+        // The pending interval is closed on the way down rather than left dangling: an interval interrupted by sunset
+        // belongs to the window where the sun set, and carrying it across the night made it surface hundreds of frames
+        // later, in a window it had nothing to do with, large enough to swamp that window's average on its own.
+        if (!SunActive)
+            CloseStableRun();
+        else
+        {
+            _evaluatedFrames++;
+            if (stable)
+            {
+                _stableFrames++;
+                _stableRun++;
+                if (_stableRun > _windowLongestRun)
+                    _windowLongestRun = _stableRun;
+                if (_stableRun > _longestRun)
+                    _longestRun = _stableRun;
+            }
+            else
+                CloseStableRun();
+        }
+
+        if (SunActive)
+        {
+            for (int i = 0; i < ActiveCascadeCount; i++)
+                _prevCascadeViewProj[i] = CascadeViewProj[i];
+        }
+        if (SpotActive)
+            _prevSpotViewProj = SpotViewProj;
+
+        _prevCascadeCount = ActiveCascadeCount;
+        _prevSunActive = SunActive;
+        _prevSpotActive = SpotActive;
+        _prevValid = true;
+    }
+
+    /// <summary>
+    /// 1-5 clause 10: folds the pending stable interval into the window average and clears it. A no-op when no interval is
+    /// pending, so every path that ends one may call it unconditionally.
+    ///
+    /// A run of k stable frames means k+1 consecutive frames shared one matrix set; the reported interval adds that first
+    /// frame back so the number can be compared directly against the target in clause 11.
+    ///
+    /// The clamp to <see cref="DiagFrameInterval"/> keeps one outlier from taking over the mean. Without it a single interval
+    /// longer than the window dominates a sample of two or three and yields an average larger than the window itself, which
+    /// is not a number anything can be tuned against. Intervals that long stay visible through the capped count and through
+    /// the all-time peak, so the clamp loses no information; it only stops the mean from claiming to carry some.
+    ///
+    /// Both peaks are raised from the unclamped length, so they stay the honest record the clamped mean points back to.
+    /// </summary>
+    static void CloseStableRun()
+    {
+        if (_stableRun == 0)
+            return;
+
+        if (_stableRun > _windowLongestRun)
+            _windowLongestRun = _stableRun;
+        if (_stableRun > _longestRun)
+            _longestRun = _stableRun;
+
+        int interval = _stableRun + 1;
+        if (interval > DiagFrameInterval)
+        {
+            interval = DiagFrameInterval;
+            _cappedRuns++;
+        }
+
+        _runSum += interval;
+        _runCount++;
+        _stableRun = 0;
+    }
+
+    /// <summary>
+    /// 1-5 clause 10: every <see cref="DiagFrameInterval"/> frames, reports how often the cascade matrices held still.
+    ///
+    /// Only frames with the sun up are counted, so no line appears at all while it is down; see
+    /// <see cref="EvaluateStability"/>. A window straddling sunrise reports a denominator smaller than the interval, which is
+    /// why <c>hit</c> is printed as a fraction and not only as a percentage.
+    ///
+    /// How to read it: <c>hit</c> is the fraction of frames whose matrices matched the frame before, which is the upper
+    /// bound on what clause 12 can skip. <c>avg</c> is the mean length of a completed stable interval in frames and is the
+    /// number clause 11 is steering towards <see cref="RenderQuality.ShadowTargetStableFrames"/>; a trailing <c>capped</c>
+    /// count means at least one interval outran the window and entered the mean clamped, making the mean a lower bound.
+    /// <c>peak</c> gives the longest interval for this window first and since process start second. A low average with a high
+    /// window peak means the light is fine and the camera is what keeps breaking the interval, since translation past one
+    /// texel invalidates the snap just as a new angular cell does. A low average with a low window peak but a high all-time
+    /// peak only means the scene was quieter earlier, and the figure to compare against the target is the window one.
+    ///
+    /// The window counters reset here but <c>_stableRun</c> deliberately does not: an interval spanning the window
+    /// boundary is still one interval, and truncating it would bias the average downwards exactly when it is longest.
+    /// </summary>
+    static void ReportStability()
+    {
+        if (Epoch % DiagFrameInterval != 0 || _evaluatedFrames == 0)
+            return;
+
+        float avgRun = _runCount > 0 ? _runSum / (float)_runCount : 0f;
+
+        DeviceServices.BaseApp?.AddLog(LogType.Backend,
+            $"{DateTime.UtcNow} [ShadowStable] " +
+            $"hit {_stableFrames}/{_evaluatedFrames} ({_stableFrames * 100 / _evaluatedFrames}%)  " +
+            $"avg {avgRun:F1} frames over {_runCount} intervals" +
+            (_cappedRuns > 0 ? $" ({_cappedRuns} capped)" : "") + "  " +
+            $"peak {_windowLongestRun + 1} window / {_longestRun + 1} all-time  " +
+            $"step {EffectiveLightAngleStep:F4} deg for {_smoothedDeltaDegrees:F4} deg/frame  " +
+            $"target {RenderQuality.Current.ShadowTargetStableFrames}");
+
+        _stableFrames = 0;
+        _evaluatedFrames = 0;
+        _runSum = 0;
+        _runCount = 0;
+        _cappedRuns = 0;
+        _windowLongestRun = 0;
+    }
+
+    /// <summary>
+    /// 1-5 clause 12: true while the control tree is being walked purely to build <see cref="CasterFingerprint"/>, with no
+    /// pass open and no backend pipeline state set. A control overriding DrawShadow must, in this mode, fold its caster
+    /// state through <see cref="MixCaster(float)"/> and return without submitting anything.
+    ///
+    /// Where the check belongs in an override: after the CastShadows and readiness gating, because a control that would not
+    /// draw must not contribute, and before per-cascade culling, which has no meaning here. No slot is active during the
+    /// walk, and a caster invisible to one cascade may be exactly the one that matters to another - fingerprinting only what
+    /// the current slot can see would miss a distant object's motion on precisely the frames it was going to be skipped.
+    /// </summary>
+    public static bool AccumulatingCasters => _fingerprintWalk;
+
+    /// <summary>1-5 clause 12: folds one float into the running caster digest, by its bit pattern rather than its value.
+    /// Bits rather than value because +0 and -0 must be distinguished here: they are interchangeable inside a matrix, but a
+    /// coordinate that flipped sign is a coordinate that was written by different code, and treating that as "no change" is
+    /// the one class of mistake this digest cannot afford.</summary>
+    public static void MixCaster(float value) => MixCaster(BitConverter.SingleToInt32Bits(value));
+
+    /// <summary>1-5 clause 12: folds one 32-bit value into the running caster digest, byte by byte per FNV-1a.
+    /// A no-op outside the fingerprint walk, so a control may call it unconditionally.</summary>
+    public static void MixCaster(int value)
+    {
+        if (!_fingerprintWalk)
+            return;
+
+        ulong h = _fingerprintAccum;
+        for (int i = 0; i < 4; i++)
+        {
+            h ^= (byte)(value >> (i * 8));
+            h *= FnvPrime;
+        }
+        _fingerprintAccum = h;
+    }
+
+    /// <summary>1-5 clause 12: folds a vector into the running caster digest.</summary>
+    public static void MixCaster(in Vector3 value)
+    {
+        MixCaster(value.X);
+        MixCaster(value.Y);
+        MixCaster(value.Z);
+    }
+
+    /// <summary>1-5 clause 12: folds a rotation into the running caster digest.</summary>
+    public static void MixCaster(in Quaternion value)
+    {
+        MixCaster(value.X);
+        MixCaster(value.Y);
+        MixCaster(value.Z);
+        MixCaster(value.W);
+    }
+
+    /// <summary>1-5 clause 12: folds a world bounding box into the running caster digest. This is the whole of what a rigid
+    /// caster contributes: the box is derived from the same world matrix the shadow pass would rasterize with, so any change
+    /// of position, rotation or scale reaches the digest through it.</summary>
+    public static void MixCaster(in Bounds3D value)
+    {
+        MixCaster(value.Center);
+        MixCaster(value.Extents);
+    }
+
+    /// <summary>
+    /// 1-5 clause 12: decides whether this frame's shadow pass can be skipped entirely, and returns true when it can.
+    ///
+    /// Two conditions, both necessary: the cascade matrices are bitwise unchanged (<see cref="MatricesStable"/>) and the
+    /// caster digest is unchanged. Under both, a redraw would reproduce the existing atlas exactly rather than approximately,
+    /// so this buys cost and changes no pixel. Reuse is also impossible on the first eligible frame of a run, since there is
+    /// nothing yet to compare the digest against.
+    ///
+    /// Why the digest is built by walking the tree here instead of being collected during the pass, which would be free: a
+    /// digest collected during the pass is only refreshed on frames the pass actually ran, so during a skip run it would go
+    /// stale and a caster that started moving mid-run would keep its old shadow until the run ended. Walking here costs one
+    /// extra traversal on redraw frames and replaces four with one on skipped frames - the pass replays the tree once per atlas
+    /// quadrant - so it is a net reduction in CPU traversals whenever anything is being skipped at all, and a flat surcharge of
+    /// one traversal per frame whenever nothing is. Which of the two applies is what <see cref="ReportReuse"/> is for; the
+    /// surcharge is why <see cref="RenderQuality.ShadowAtlasReuse"/> defaults off.
+    ///
+    /// The digest is one value for the whole atlas, not one per quadrant, so a caster moving anywhere disqualifies every slot
+    /// including those it is culled from. Per-quadrant digests would be cheap to accumulate, but skipping a single quadrant is
+    /// not expressible today: the pass clears the entire atlas on entry, so partial reuse needs a scissored clear in all four
+    /// backends before it could mean anything.
+    ///
+    /// The walk is deliberately not culled against any slot; see <see cref="AccumulatingCasters"/>.
+    ///
+    /// Safety of reusing the previous frame's atlas contents: the atlas render target is created once during backend startup
+    /// at ShadowAtlasSize, which is a locked tier value, and is never resized or recreated, so nothing else can invalidate it
+    /// between frames. It is the pass itself that destroys the contents, by clearing on entry, which is why the caller must
+    /// bypass BeginPass and not merely return early from the pass body.
+    /// </summary>
+    public static bool EvaluateReuse(BaseApp app)
+    {
+        if (app == null || !RenderQuality.Current.ShadowAtlasReuse
+            || !RenderQuality.Current.ShadowsEnabled || (!SunActive && !SpotActive))
+        {
+            // Nothing was fingerprinted, so the stored digest no longer describes a known frame.
+            _prevFingerprintValid = false;
+            return false;
+        }
+
+        _fingerprintAccum = FnvOffsetBasis;
+        _fingerprintWalk = true;
+        app.DrawShadow();
+        _fingerprintWalk = false;
+
+        CasterFingerprint = _fingerprintAccum;
+        bool reuse = MatricesStable && _prevFingerprintValid && CasterFingerprint == _prevCasterFingerprint;
+        _prevCasterFingerprint = CasterFingerprint;
+        _prevFingerprintValid = true;
+
+        _reuseEvaluated++;
+        if (reuse)
+            _reuseSkipped++;
+
+        return reuse;
+    }
+
+    /// <summary>
+    /// 1-5 clause 12: every <see cref="DiagFrameInterval"/> frames, reports the fraction of shadow passes actually avoided.
+    /// This is the number to pair with <see cref="RenderQuality.ShadowTargetStableFrames"/> when tuning: a target of N frames
+    /// caps this at (N-1)/N, and falling well short of that cap means something in the scene is breaking the interval rather
+    /// than the step being sized wrongly - compare against the avg reported by <see cref="ReportStability"/> to tell which.
+    ///
+    /// Note that skipped frames contribute nothing to the <c>[ShadowCull]</c> counters, since no slot is entered, so that
+    /// diagnostic naturally reports fewer tests once reuse is achieving anything.
+    /// </summary>
+    static void ReportReuse()
+    {
+        if (Epoch % DiagFrameInterval != 0 || _reuseEvaluated == 0)
+            return;
+
+        DeviceServices.BaseApp?.AddLog(LogType.Backend,
+            $"{DateTime.UtcNow} [ShadowReuse] " +
+            $"skipped {_reuseSkipped}/{_reuseEvaluated} " +
+            $"({_reuseSkipped * 100 / _reuseEvaluated}% of shadow passes avoided)");
+
+        _reuseSkipped = 0;
+        _reuseEvaluated = 0;
+    }
+
+    /// <summary>
     /// Computes the directional-light CSM cascade matrices. The camera must already have completed UpdateIfChanged for this frame so aspect and frustum parameters are ready.
     /// sunDir is the world-space propagation direction pointing toward the lit surface, matching the semantics of directional-light DirType.xyz, and is normalized internally.
     /// </summary>
@@ -215,7 +675,9 @@ public static class CascadedShadow
         // Clause 9: quantize before anything else derives from the direction. Everything below - the light basis, the
         // snapping grid, the eye position - is a function of sunDir, so this single substitution is what makes the whole
         // cascade matrix reproducible frame to frame. See QuantizeLightDirection for why snapping alone is not enough.
-        sunDir = QuantizeLightDirection(sunDir);
+        // Clause 11 chooses the step first, from the raw direction, because the estimator has to see motion finer than one cell.
+        float angleStep = UpdateAngularStep(sunDir);
+        sunDir = QuantizeLightDirection(sunDir, angleStep);
 
         int count = Math.Clamp(RenderQuality.Current.ShadowCascadeCount, 2, MaxCascades);
         float near = camera.Near;
@@ -311,8 +773,8 @@ public static class CascadedShadow
     }
 
     /// <summary>
-    /// Quantizes the directional-light direction onto a fixed spherical grid whose step is
-    /// <see cref="RenderQuality.ShadowLightAngleStep"/> degrees. Returns the input unchanged when the step is not positive.
+    /// Quantizes the directional-light direction onto a fixed spherical grid whose step is <paramref name="stepDegrees"/>,
+    /// as chosen by <see cref="UpdateAngularStep"/>. Returns the input unchanged when the step is not positive.
     ///
     /// Why snapping alone is insufficient: texel snapping aligns the light-space translation to the texel grid, but that grid
     /// *is* the light basis. When the sun rotates continuously, the grid rotates with it, so snapping quantizes into a frame of
@@ -336,9 +798,8 @@ public static class CascadedShadow
     /// Angles are quantized rather than components: cell boundaries then stay fixed in world space and the result stays unit
     /// length by construction, which is what makes the basis reproducible instead of merely close.
     /// </summary>
-    static Vector3 QuantizeLightDirection(Vector3 dir)
+    static Vector3 QuantizeLightDirection(Vector3 dir, float stepDegrees)
     {
-        float stepDegrees = RenderQuality.Current.ShadowLightAngleStep;
         // Inverted rather than <=0 so a NaN coming out of a malformed settings file also takes the bypass.
         // A NaN would otherwise propagate into the cascade matrix and silently remove every shadow in the scene.
         if (!(stepDegrees > 0f))
@@ -356,6 +817,131 @@ public static class CascadedShadow
             MathF.Sin(azimuth) * cosElevation,
             MathF.Sin(elevation),
             MathF.Cos(azimuth) * cosElevation);
+    }
+
+    /// <summary>
+    /// 1-5 clause 11: sizes the angular quantization step from the light's own measured speed, so that one cell lasts about
+    /// <see cref="RenderQuality.ShadowTargetStableFrames"/> frames instead of however long a fixed step happens to buy.
+    /// Publishes and returns <see cref="EffectiveLightAngleStep"/>.
+    ///
+    /// Why speed is measured here rather than read from whatever drives the sun: the app owns the day-night rate and the
+    /// engine cannot see it, and even if it could, the rate is not the only thing that moves the light - a script, a dragged
+    /// slider, or the sun/moon ownership handover in SceneLighting.Bake all change the direction too. Differencing the
+    /// direction the shadow system was actually handed covers every one of those without a dependency, and it needs no frame
+    /// time because the target is expressed in frames: the ideal step is simply the per-frame angular delta times the target.
+    ///
+    /// The rungs are powers of two of the configured base, and that is load-bearing rather than tidy. An adaptive step would
+    /// otherwise defeat itself: a step that drifts every frame moves the cell boundaries every frame, so the direction would
+    /// never be reproducible and clause 9 would buy nothing. A discrete ladder makes the step constant over long stretches.
+    /// Powers of two specifically because those grids nest: every boundary of a coarser rung is also a boundary of a finer one,
+    /// so stepping down the ladder cannot move the current direction at all, and stepping up moves it by at most half of the
+    /// new step. Any other ratio would relocate every boundary and discard the current cell.
+    ///
+    /// Rounding in log space places the boundary between rungs but supplies no hysteresis, having no memory of the rung it is
+    /// currently on: an estimate sitting near a boundary flips on noise alone. Measured in this engine, a sun at 0.09 deg/frame
+    /// against a target of 8 lands within a percent of the 1x/2x boundary, and the rung changed six times across eight
+    /// diagnostic windows, every time on a delta jitter under 6%. Since each upward change relocates the grid by up to half the
+    /// new step, every flip truncated the very interval it was trying to lengthen - the same scene averaged 4.8 stable frames
+    /// while the rung oscillated and 8.4 once it settled, at a slightly *higher* light speed. Left unguarded, the mechanism is
+    /// its own dominant source of churn, so <see cref="RungHysteresis"/>, <see cref="RungConfirmFrames"/> and
+    /// <see cref="DeltaOutlierRatio"/> each close one route by which it could be.
+    ///
+    /// The scale factor is built by integer shifting rather than a pow call because the step feeds the cascade matrix, whose
+    /// whole value here is being bit-identical across frames and backends. Multiplying and dividing by an exact power of two
+    /// is exact by construction and leaves no room for a library's rounding to differ.
+    ///
+    /// A motionless light lands on the bottom rung, which is the correct answer rather than a degenerate one: a direction that
+    /// does not change is already perfectly stable at any step, so the finest available grid is free precision.
+    /// </summary>
+    static float UpdateAngularStep(Vector3 rawDir)
+    {
+        float baseStep = RenderQuality.Current.ShadowLightAngleStep;
+
+        // Inverted comparison so a NaN from a malformed settings file also disables quantization rather than poisoning the matrix.
+        if (!(baseStep > 0f))
+        {
+            _prevRawValid = false;
+            _rungValid = false;
+            EffectiveLightAngleStep = 0f;
+            return 0f;
+        }
+
+        int target = RenderQuality.Current.ShadowTargetStableFrames;
+        if (target < 2)
+        {
+            // Adaptation off: behave exactly as clause 9 did before the ladder existed. The estimator state is dropped so
+            // re-enabling it later starts from measurement rather than from a stale delta.
+            _prevRawValid = false;
+            _smoothedDeltaDegrees = 0f;
+            _rungValid = false;
+            EffectiveLightAngleStep = baseStep;
+            return baseStep;
+        }
+
+        // The held rung is an exponent relative to the base, so a base retuned from a control panel would silently
+        // reinterpret it into a different step. Dropping it there costs one re-acquisition and keeps it meaning what it says.
+        if (_rungBaseStep != baseStep)
+            _rungValid = false;
+        _rungBaseStep = baseStep;
+
+        float deltaDegrees = 0f;
+        if (_prevRawValid)
+        {
+            float cos = Math.Clamp(Vector3.Dot(rawDir, _prevRawSunDir), -1f, 1f);
+            deltaDegrees = MathF.Acos(cos) * (180f / MathF.PI);
+        }
+        _prevRawSunDir = rawDir;
+        _prevRawValid = true;
+
+        // Seeded at the delta that asks for the base step exactly, so acquisition begins at rung 0 rather than letting the
+        // first sample become the whole estimate - at startup that sample is a load stall more often than not.
+        if (!(_smoothedDeltaDegrees > 0f))
+            _smoothedDeltaDegrees = baseStep / target;
+
+        float ceiling = _smoothedDeltaDegrees * DeltaOutlierRatio;
+        if (deltaDegrees > ceiling)
+            deltaDegrees = ceiling;
+
+        float alpha = deltaDegrees > _smoothedDeltaDegrees ? DeltaRiseAlpha : DeltaFallAlpha;
+        _smoothedDeltaDegrees += (deltaDegrees - _smoothedDeltaDegrees) * alpha;
+
+        // exact is the rung the estimate asks for as a real number; want is the nearest reachable one. Keeping both is what
+        // lets the band be measured from the rung actually held instead of from the rounded answer, which is where the
+        // hysteresis lives: rounding compares against a boundary, this compares against a position.
+        float ideal = _smoothedDeltaDegrees * target;
+        float exact = ideal > 0f ? MathF.Log2(ideal / baseStep) : -StepLadderRange;
+        int want = Math.Clamp((int)MathF.Round(exact), -StepLadderRange, StepLadderRange);
+
+        if (!_rungValid)
+        {
+            _rung = want;
+            _rungValid = true;
+            _rungPendingWant = want;
+            _rungPending = 0;
+        }
+        else if (MathF.Abs(exact - _rung) > 0.5f + RungHysteresis)
+        {
+            // Too far out to be noise about a boundary, so this is the light's speed having actually changed.
+            _rung = want;
+            _rungPendingWant = want;
+            _rungPending = 0;
+        }
+        else if (want != _rungPendingWant)
+        {
+            // The rounded answer moved, so whatever was accumulating was noise rather than a lean. Start over.
+            _rungPendingWant = want;
+            _rungPending = 0;
+        }
+        else if (want != _rung && ++_rungPending >= RungConfirmFrames)
+        {
+            _rung = want;
+            _rungPending = 0;
+        }
+
+        EffectiveLightAngleStep = _rung >= 0
+            ? baseStep * (1 << _rung)
+            : baseStep / (1 << -_rung);
+        return EffectiveLightAngleStep;
     }
 
     /// <summary>
@@ -387,6 +973,12 @@ public static class CascadedShadow
     /// <summary>
     /// Writes this frame's shadow results into the lighting UBO mirror. This is the single write entry point for shadow fields under contract clause 1.
     /// When ShadowsEnabled=false or no light is active this frame, zeros are written so shader-side ShadowParams all become zero and shadows are fully disabled.
+    ///
+    /// Clause 10 additionally makes this the frame's shadow-state closing point: it evaluates <see cref="MatricesStable"/>
+    /// here, because this runs after every Compute call and before any consumer, and it is already called by all four
+    /// backends. The disabled arm invalidates the previous-frame mirror instead of evaluating, since
+    /// <see cref="FrameSchedule"/> clears the atlas whenever the pass is entered at all - even with a body that returns
+    /// immediately - so nothing survives for a later frame to be compared against.
     /// </summary>
     public static void Apply(ref SceneLightParams scene)
     {
@@ -394,8 +986,14 @@ public static class CascadedShadow
         {
             scene.ShadowParams0 = default;
             scene.ShadowParams1 = default;
+            _prevValid = false;
+            // Folded rather than dropped: the interval up to here happened, and discarding it silently biased the average
+            // downwards every time shadows were toggled off or the last light left the frame.
+            CloseStableRun();
             return;
         }
+
+        EvaluateStability();
 
         if (SunActive)
         {
@@ -407,16 +1005,40 @@ public static class CascadedShadow
         if (SpotActive)
             scene.SpotShadowViewProj = SpotViewProj;
 
+        // Clause 15: contact hardening rides on the sign of the same slot rather than on a field of its own. The shader needs
+        // exactly one more bit here - constant radius or occluder-derived radius - and the magnitude means the same thing
+        // either way, a ceiling in texels. Spending a new vec4 on one bit would have grown SceneLightParams, and its size is
+        // mirrored by hand in SCENE_LIGHT_BYTES across three copies of the web JS, so a layout change is the most expensive
+        // way this codebase has of expressing a boolean. Negative is the opt-in so the untouched default stays positive.
+        float softnessTexels = MathF.Max(RenderQuality.Current.ShadowSoftnessTexels, 0f);
+        if (RenderQuality.Current.ShadowContactHardening)
+            softnessTexels = -softnessTexels;
+
         scene.ShadowParams0 = new Vector4(
             SunActive ? 1f : 0f,
             SunActive ? ActiveCascadeCount : 0f,
             1f / RenderQuality.Current.ShadowAtlasSize,
-            0f);
+            // Clause 14: w carries the rotated-disk radius in texels of the cascade tile, on the same footing as the
+            // normal-offset in ShadowParams1.z - the shader turns texels into a tile-NDC step itself from z above.
+            // Clause 15: a negative w means the same magnitude is a ceiling and the radius is derived per pixel instead.
+            softnessTexels);
+        // Clause 13: z carries the normal-offset in texels of the cascade tile, and is the whole of what that clause costs
+        // the UBO - the shader converts texels to an NDC displacement itself from shadowParams0.z, so no per-cascade world
+        // scale has to be uploaded. Zero disables the offset entirely, which is what the shader's own branch tests.
+        //
+        // Clause 14: w is the per-frame rotation seed for the PCF disk. The shader gets its spatial variation from
+        // interleaved gradient noise over pixel coordinates, which is fixed for a given pixel, so without a term that moves
+        // every frame TAA would average a constant pattern and bake the noise in permanently instead of resolving it. The
+        // sequence is the golden-ratio additive one because it is the low-discrepancy choice for a one-dimensional series:
+        // any short run of frames - which is all a TAA history is - lands close to evenly spread over the circle. The index
+        // is masked to 1024 so the multiply stays exact; restarting the sequence that rarely is invisible against a history
+        // an order of magnitude shorter.
+        float rotationSeed = (float)((Epoch & 1023) * 0.61803398874989485 % 1.0);
         scene.ShadowParams1 = new Vector4(
             SpotActive ? 1f : 0f,
             Math.Clamp(RenderQuality.Current.ShadowStrength, 0f, 1f),
-            0f,
-            0f);
+            MathF.Max(RenderQuality.Current.ShadowNormalOffset, 0f),
+            rotationSeed);
     }
 
     /// <summary>

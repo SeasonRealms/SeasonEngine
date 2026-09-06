@@ -306,11 +306,33 @@ public abstract class InstancedMesh3DBase : Control
     /// batch-level: per-instance culling would require rebuilding the instance buffer for every cascade and uploading
     /// it every frame, violating the 1-3 clause 2 rule that pure CPU work may only reduce cost and never add cost.
     /// That is outside the authorization of clause 7.
+    ///
+    /// Clause 12 adds the fingerprint branch, placed after the gating and before culling per
+    /// <see cref="CascadedShadow.AccumulatingCasters"/>. Here it folds the per-instance transform fields rather than derived
+    /// world bounds: the fields are what determine the pose, they are cheaper than building a matrix per instance, and
+    /// digesting the source instead of a derived box removes any chance of two distinct layouts collapsing onto one box.
+    /// Disabled instances are skipped, so enabling or disabling one changes the digest through the sequence itself.
     /// </summary>
     public override void DrawShadow()
     {
         if (!CastShadows || !Ready || !Enable || !HasContent || Instances.Count == 0 || Alpha == 0f)
             return;
+
+        if (CascadedShadow.AccumulatingCasters)
+        {
+            CascadedShadow.MixCaster(ShadowPoseKey);
+            for (int i = 0; i < Instances.Count; i++)
+            {
+                var instance = Instances[i];
+                if (!instance.Enable)
+                    continue;
+
+                CascadedShadow.MixCaster(new Vector3(instance.PosX, instance.PosY, instance.PosZ));
+                CascadedShadow.MixCaster(instance.Rotation);
+                CascadedShadow.MixCaster(new Vector3(instance.Width, instance.Height, instance.Depth));
+            }
+            return;
+        }
 
         if (CullingEnabled && CascadedShadow.CullingActive
             && CascadedShadow.Register(IsCulledBy(in CascadedShadow.ActiveFrustum)))

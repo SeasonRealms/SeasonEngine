@@ -676,6 +676,12 @@ internal unsafe class Graphics : IGraphics
         {
             if (sprite2D.IsDisposed) return false;
 
+            // An unnamed sprite has no texture to resolve, and reaching the name-keyed dictionary below with a null name
+            // throws rather than missing. SimplePicker builds one row image per entry and leaves the name null whenever the
+            // entry carries no icon, hiding it by alpha instead; without this guard every such row costs an exception and a
+            // hitch each time a picker opens, which is enough to disturb the shadow stability window being measured.
+            if (sprite2D.Name.IsNullOrWhiteSpace()) return false;
+
             if (DictionarySprite.TryGetValue((sprite2D.Name, sprite2D.ID), out dxSprite2D))
             {
                 if (dxSprite2D == null || dxSprite2D.DXTexture == null)

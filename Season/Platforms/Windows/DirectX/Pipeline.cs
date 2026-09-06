@@ -762,7 +762,7 @@ internal static unsafe class Pipeline
         // root signature and the root signature is built exactly once. Changing the knob therefore takes a restart,
         // which is also what makes it a clean A/B variable: nothing else about the frame can drift between runs.
         int s0Anisotropy = RenderQuality.ClampAnisotropy(RenderQuality.Current.TextureMaxAnisotropy);
-        var staticSamplers = stackalloc StaticSamplerDesc[3];
+        var staticSamplers = stackalloc StaticSamplerDesc[4];
         staticSamplers[0] = new StaticSamplerDesc
         {
             // Filter.Anisotropic implies linear min/mag/mip, so it is a strict superset of MinMagMipLinear and the
@@ -810,6 +810,22 @@ internal static unsafe class Pipeline
             ShaderRegister = 2, // s2
             ShaderVisibility = ShaderVisibility.Pixel
         };
+        // 1-5 clause 15: point sampler for reading the shadow atlas as ordinary depth values (s3). The atlas had only ever
+        // been reachable through the comparison sampler at s1, which answers "is the receiver in front of what is stored"
+        // with a filtered pass/fail and never yields the stored depth itself - and contact hardening needs that depth, since
+        // the whole point is to measure how far the occluder stands above the receiver. Filtering must be Point: averaging
+        // two depths across a silhouette produces a value that lies on no surface at all, and the blocker distance derived
+        // from it would be pure fiction. This costs one root-signature entry and no descriptor-heap space, because the
+        // texture at t7 is unchanged - only the way it is read is new.
+        staticSamplers[3] = new StaticSamplerDesc
+        {
+            Filter = Filter.MinMagMipPoint,
+            AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp,
+            ShaderRegister = 3, // s3
+            ShaderVisibility = ShaderVisibility.Pixel
+        };
 
         // Pin the rootParameters array with a fixed block
         fixed (RootParameter* pRootParameters = rootParameters)
@@ -820,7 +836,7 @@ internal static unsafe class Pipeline
                 Flags = RootSignatureFlags.AllowInputAssemblerInputLayout,
                 NumParameters = (uint)rootParameters.Length,
                 PParameters = pRootParameters,
-                NumStaticSamplers = 3,
+                NumStaticSamplers = 4,
                 PStaticSamplers = staticSamplers
             };
 
@@ -1512,47 +1528,129 @@ float3 SampleProbeIrradiance(float3 worldPos, float3 N, float3 fallback)
 #if SHADOW_ENABLED
 // 1-5 shadow sampling (contract clauses 2/5): a single D32 atlas split into four quadrants, with slot i
 // origin at ((i%2)*1/2, (i/2)*1/2). Slots 0..2 are cascades and slot 3 is the spotlight.
-// Uses hardware comparison sampling via SampleCmpLevelZero plus fixed 3x3 PCF with step size shadowParams0.z.
+// Uses hardware comparison sampling via SampleCmpLevelZero plus the clause 14 rotated eight-tap disk.
 Texture2D shadowAtlas : register(t7);
 SamplerComparisonState shadowSampler : register(s1);
+// Clause 15: the same atlas read as plain depth, for the blocker search. Point filtering is required - see the sampler.
+SamplerState shadowPointSampler : register(s3);
 
-float SampleShadowTile(int slot, float3 shadowNdc)
+// Clause 14: per-pixel orientation for the PCF disk, returned as a unit vector so the sampling loop needs no trigonometry.
+// The spatial term is interleaved gradient noise, which is constructed to decorrelate immediate neighbours - the property
+// that matters here, because TAA resolves a pixel from its own history and from the pixels next to it. The temporal term
+// arrives in shadowParams1.w already spread over the circle by the golden-ratio sequence, and adding it before the turn
+// spins the whole kernel frame to frame, which is what turns the sampling error into something a history can average away
+// rather than a fixed pattern it would preserve.
+float2 ShadowKernelRotation(float2 pixel)
+{
+    float ign = frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
+    float angle = (ign + shadowParams1.w) * 6.28318531;
+    return float2(cos(angle), sin(angle));
+}
+
+// Clause 14: eight taps on a Vogel disk, oriented by rot and scaled to radiusTexels. A Vogel spiral rather than a ring
+// because the golden angle fills the disk evenly at any tap count, so this one loop keeps working whatever radius it is
+// handed - which is what lets a variable penumbra reuse it later instead of forcing a second sampler into all four
+// backends. Each tap advances by one complex multiply by the golden angle, and that stays unit length across all eight.
+//
+// Clause 15: a negative radiusTexels means its magnitude is a ceiling rather than the radius, and the radius is derived
+// per pixel from a blocker search run first on the very same disk. Two properties of this projection setup are what keep
+// that search cheap. The separation is measured in stored-depth units, which are the cascade's own depth range normalized
+// to [0,1], and CascadedShadow builds every cascade with a depth range of exactly four times its bounding radius against a
+// texel footprint of two radii over the tile resolution - so radius cancels out of their ratio and one mapping from
+// separation to width is correct in all three cascades with nothing per-cascade uploaded. The mapping is deliberately not
+// the textbook light-angle one: a physically sized sun puts the penumbra at a near-constant 0.6 to 0.8 texels in every
+// cascade, for that same reason of scales growing together, and 0.7 texels of softening is invisible. Reaching the ceiling
+// at a quarter of the depth range keeps every property that matters - hard on contact, widening with separation,
+// consistent across cascades - and leaves the absolute width as the artistic knob it has to be to be worth having.
+//
+// Single exit + preinitialized result avoids the fxc X4000 false positive
+// (potentially uninitialized) on early returns from inlined functions.
+float SampleShadowTile(int slot, float3 shadowNdc, float2 rot, float radiusTexels)
 {
     // NDC -> tile UV (D3D depth is [0,1], Y is flipped). Anything outside the light frustum or near plane
     // is treated as unoccluded, so result starts at 1.0.
-    // Single exit + preinitialized result avoids the fxc X4000 false positive
-    // (potentially uninitialized) on early returns from inlined functions.
     float result = 1.0;
     float2 uv = float2(shadowNdc.x * 0.5 + 0.5, 0.5 - shadowNdc.y * 0.5);
     if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0 && shadowNdc.z > 0.0 && shadowNdc.z < 1.0)
     {
         float texel = shadowParams0.z; // 1/atlasSize
         float2 tileOrigin = float2(slot & 1, slot >> 1) * 0.5;
-        // Shrink the quadrant inward by 1.5 texels to prevent bilinear leakage across quadrants
-        // on the outer ring of the 3x3 PCF kernel.
-        float2 tileMin = tileOrigin + texel * 1.5;
-        float2 tileMax = tileOrigin + 0.5 - texel * 1.5;
         float2 atlasUV = tileOrigin + uv * 0.5;
 
-        float sum = 0.0;
-        [unroll]
-        for (int dy = -1; dy <= 1; dy++)
+        float radius = abs(radiusTexels);
+        // Clause 15: set when the blocker search finds nothing above the receiver, which lets the comparison pass be
+        // skipped outright - the answer is already known to be fully lit, and that is the common case over open ground.
+        bool unoccluded = false;
+        [branch] if (radiusTexels < 0.0)
         {
+            // Search at the ceiling radius, because the radius being solved for is not known yet and a search narrower
+            // than the final kernel would miss occluders the kernel then samples, which reads as an edge that snaps.
+            float2 searchInset = min(texel * (radius + 0.5), 0.2499);
+            float2 searchMin = tileOrigin + searchInset;
+            float2 searchMax = tileOrigin + 0.5 - searchInset;
+            float2 searchDir = rot;
+            float searchStepUV = radius * texel;
+            float depthSum = 0.0;
+            float depthCount = 0.0;
             [unroll]
-            for (int dx = -1; dx <= 1; dx++)
+            for (int j = 0; j < 8; j++)
             {
-                float2 sampleUV = clamp(atlasUV + float2(dx, dy) * texel, tileMin, tileMax);
-                sum += shadowAtlas.SampleCmpLevelZero(shadowSampler, sampleUV, shadowNdc.z);
+                float rj = sqrt((j + 0.5) * 0.125);
+                float2 searchUV = clamp(atlasUV + searchDir * (rj * searchStepUV), searchMin, searchMax);
+                float stored = shadowAtlas.SampleLevel(shadowPointSampler, searchUV, 0.0).r;
+                // Only depths in front of the receiver are occluders; averaging the rest in would pull the estimate
+                // towards the receiver's own surface and collapse the penumbra wherever the disk straddles a silhouette.
+                float isBlocker = stored < shadowNdc.z ? 1.0 : 0.0;
+                depthSum += stored * isBlocker;
+                depthCount += isBlocker;
+                searchDir = float2(searchDir.x * -0.7373689 - searchDir.y * 0.6754903,
+                                   searchDir.x * 0.6754903 + searchDir.y * -0.7373689);
+            }
+            if (depthCount < 0.5)
+                unoccluded = true;
+            else
+            {
+                // Floor at half a texel: that is the reach of the hardware 2x2 comparison filter, so a smaller disk
+                // would collapse all eight taps onto one bilinear footprint and cost eight samples for one result.
+                float separation = shadowNdc.z - depthSum / depthCount;
+                radius = clamp(radius * separation * 4.0, 0.5, radius);
             }
         }
-        result = sum / 9.0;
+
+        [branch] if (!unoccluded)
+        {
+            // Shrink the quadrant inward by the disk radius plus the half texel the hardware 2x2 comparison filter reaches, so
+            // no tap can bleed into a neighbouring quadrant however wide the disk is. Capped just under the half-quadrant so a
+            // pathological radius degenerates into sampling the tile centre instead of inverting the clamp bounds.
+            float2 inset = min(texel * (radius + 0.5), 0.2499);
+            float2 tileMin = tileOrigin + inset;
+            float2 tileMax = tileOrigin + 0.5 - inset;
+
+            float2 dir = rot;
+            float stepUV = radius * texel;
+            float sum = 0.0;
+            [unroll]
+            for (int k = 0; k < 8; k++)
+            {
+                float r = sqrt((k + 0.5) * 0.125);
+                float2 sampleUV = clamp(atlasUV + dir * (r * stepUV), tileMin, tileMax);
+                sum += shadowAtlas.SampleCmpLevelZero(shadowSampler, sampleUV, shadowNdc.z);
+                // Advance by the golden angle 2.39996323 rad, whose (cos, sin) is (-0.7373689, 0.6754903).
+                dir = float2(dir.x * -0.7373689 - dir.y * 0.6754903, dir.x * 0.6754903 + dir.y * -0.7373689);
+            }
+            result = sum * 0.125;
+        }
     }
     return result;
 }
 
 // Directional-light CSM: choose the cascade by view-space depth -> project to light space -> run PCF;
 // returns visibility after strength interpolation.
-float ComputeSunShadow(float3 worldPos, float viewDepth)
+//
+// Clause 13 normal-offset: geoNormal is the interpolated mesh normal, taken before any normal map perturbs it, because the
+// offset has to follow the surface the depth buffer actually holds rather than the shading normal. lightDir points towards
+// the light and is only used for the foreshortening factor, so its sign does not matter.
+float ComputeSunShadow(float3 worldPos, float3 geoNormal, float3 lightDir, float viewDepth, float2 shadowRot)
 {
     float result = 1.0;
     int cascadeCount = (int)shadowParams0.y;
@@ -1568,14 +1666,45 @@ float ComputeSunShadow(float3 worldPos, float viewDepth)
 
         // Orthographic projection has w=1, but keep the division conservatively.
         float4 lightPos = mul(float4(worldPos, 1.0), cascadeViewProj[slot]);
-        float visibility = SampleShadowTile(slot, lightPos.xyz / lightPos.w);
+        float3 ndc = lightPos.xyz / lightPos.w;
+
+        // Clause 13: displace the lookup along the surface normal, in this cascade's tile NDC rather than in world space.
+        // One texel is a fixed 2/(atlasSize/2) = 4*shadowParams0.z of tile NDC however wide the cascade is, so a single
+        // uploaded texel count is right for all three cascades and no per-cascade world scale has to reach the shader.
+        //
+        // The direction is the normal put through the same matrix the position went through, as a direction (w=0), then
+        // normalized. Normalizing is the load-bearing step: an orthographic projection scales every direction by
+        // 2/cascadeWidth, so the raw projected length carries the cascade's extent and using it unnormalized would make the
+        // offset inversely proportional to cascade width - far too large near, far too small far out. That length also
+        // carried the sqrt(1 - NdotL^2) foreshortening, which is why it has to be reapplied by hand once the scale is gone.
+        // Its effect is that the offset vanishes on surfaces facing the light and peaks on grazing ones, which is exactly
+        // where a texel's worth of depth quantization spans the most world distance.
+        //
+        // Only xy moves. Displacing z would push stored depth away from the light again, which is the peter-panning this
+        // clause exists to avoid buying. The length guard costs nothing real: the projected normal only collapses when the
+        // surface faces the light dead on, and that is precisely where the foreshortening would have zeroed the offset too.
+        [branch] if (shadowParams1.z > 0.0)
+        {
+            float2 ndcN = mul(float4(geoNormal, 0.0), cascadeViewProj[slot]).xy;
+            float ndcLen = length(ndcN);
+            [branch] if (ndcLen > 1e-8)
+            {
+                float ndl = dot(geoNormal, lightDir);
+                float sinTheta = sqrt(saturate(1.0 - ndl * ndl));
+                ndc.xy += (ndcN / ndcLen) * (sinTheta * shadowParams1.z * 4.0 * shadowParams0.z);
+            }
+        }
+
+        float visibility = SampleShadowTile(slot, ndc, shadowRot, shadowParams0.w);
         result = lerp(1.0, visibility, shadowParams1.y);
     }
     return result;
 }
 
-// Spotlight shadow (contract clause 8: Lights[0] only): perspective projection, sampled from slot 3 after dividing by w
-float ComputeSpotShadow(float3 worldPos)
+// Spotlight shadow (contract clause 8: Lights[0] only): perspective projection, sampled from slot 3 after dividing by w.
+// No normal-offset here (clause 13 covers the cascades only): under a perspective projection a texel covers a world
+// distance that grows with depth, so a single texel count cannot describe the offset. The spot keeps the PSO depth biases.
+float ComputeSpotShadow(float3 worldPos, float2 shadowRot)
 {
     float result = 1.0;
     [branch] if (shadowParams1.x >= 0.5)
@@ -1583,7 +1712,7 @@ float ComputeSpotShadow(float3 worldPos)
         float4 lightPos = mul(float4(worldPos, 1.0), spotShadowViewProj);
         if (lightPos.w > 0.0)
         {
-            float visibility = SampleShadowTile(3, lightPos.xyz / lightPos.w);
+            float visibility = SampleShadowTile(3, lightPos.xyz / lightPos.w, shadowRot, shadowParams0.w);
             result = lerp(1.0, visibility, shadowParams1.y);
         }
     }
@@ -2206,6 +2335,11 @@ float4 PSMain(PSInput input) : SV_TARGET
     float3 B = cross(N, T) * input.tangent.w; // Note the cross-product order: cross(T, N) * input.tangent.w would be wrong here
     float3x3 TBN = float3x3(T, B, N);
 
+    // 1-5 clause 13: keep the geometric normal before the normal map overwrites N below. Shadow lookups are displaced along
+    // this one, not the shading normal: the depth buffer holds the interpolated surface, so a perturbed normal would push
+    // the sample off that surface and reintroduce acne exactly where the map is strongest.
+    float3 Ngeo = N;
+
     //if (abs(length(cross(T, B)) - 1.0) > 0.1 || abs(dot(T, B)) > 0.1)
     //{
     //    // Return different colors to represent different errors
@@ -2290,7 +2424,7 @@ float4 PSMain(PSInput input) : SV_TARGET
             radiance = lights[i].colorIntensity.xyz * lights[i].colorIntensity.w;
 #if SHADOW_ENABLED
             [branch] if (i == dirShadowIdx)
-                radiance *= ComputeSunShadow(input.worldPos, input.viewDepth);
+                radiance *= ComputeSunShadow(input.worldPos, Ngeo, L, input.viewDepth, ShadowKernelRotation(input.position.xy));
 #endif
             // 2-5 Step C: cloud shadows are evaluated independently for **every** directional light using its own L,
             // so sun and moon cast their own shadows. Unlike CSM, which only applies to dirShadowIdx,
@@ -2328,7 +2462,7 @@ float4 PSMain(PSInput input) : SV_TARGET
             // Spotlight shadow (contract clause 8): only the spotlight pointed to by params0.w participates,
             // because atlas slot 3 has only one shadow map.
             [branch] if (i == spotShadowIdx && type > 0.5)
-                radiance *= ComputeSpotShadow(input.worldPos);
+                radiance *= ComputeSpotShadow(input.worldPos, ShadowKernelRotation(input.position.xy));
 #endif
         }
 

@@ -739,6 +739,17 @@ window.seasonWebGPU = (() => {
             addressModeV: 'clamp-to-edge',
             compare: 'less-equal',
         });
+        // 1-5 clause 15: non-filtering sampler for reading the binding-11 atlas as a plain depth value, which the
+        // comparison sampler at binding 12 cannot do - it yields pass/fail. WebGPU only permits non-comparison sampling of a
+        // depth texture through a non-filtering sampler, which is also the correct filter here: a depth averaged across a
+        // silhouette lies on no surface, so a blocker distance derived from it would be fiction. Nearest on both filters is
+        // what makes it non-filtering as far as validation is concerned.
+        _samplers['shadowPoint'] = _device.createSampler({
+            magFilter: 'nearest',
+            minFilter: 'nearest',
+            addressModeU: 'clamp-to-edge',
+            addressModeV: 'clamp-to-edge',
+        });
         _defaultShadowTexture = _device.createTexture({
             size: [1, 1], format: 'depth32float',
             usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
@@ -1417,6 +1428,10 @@ window.seasonWebGPU = (() => {
                 { binding: 18, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
                 { binding: 19, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
                 { binding: 20, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+                // 1-5 clause 15: the shadow atlas read as plain depth for the blocker search. Only a sampler slot is added -
+                // the texture is the one already at binding 11. Referenced statically only by fs_main, so
+                // _shadowBindGroupLayout is not expanded, same as binding 20 above.
+                { binding: 21, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'non-filtering' } },
             ]
         });
 
@@ -2543,6 +2558,8 @@ window.seasonWebGPU = (() => {
                 // apParams0.x gating only saves the sampling cost.
                 { binding: 19, resource: _getAerialLutView() },
                 { binding: 20, resource: _samplers['repeat'] },
+                // 1-5 clause 15: same atlas as binding 11, reached non-comparatively so the blocker search can read depth.
+                { binding: 21, resource: _samplers['shadowPoint'] },
             ]
         });
     }

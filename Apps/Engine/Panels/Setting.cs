@@ -47,9 +47,9 @@ internal class SettingPanel : BoardPanel
 
     Texts title;
 
-    Input inputMode, inputMovement, inputFov, inputStep, inputLog;
+    Input inputMode, inputMovement, inputFov, inputStep, inputShadowOffset, inputShadowSoftness, inputShadowContact, inputLog;
 
-    Texts textsMode, textsMovement, textsFov, textsStep, textsLog;
+    Texts textsMode, textsMovement, textsFov, textsStep, textsShadowOffset, textsShadowSoftness, textsShadowContact, textsLog;
 
     BaseControl current = null;
 
@@ -99,6 +99,42 @@ internal class SettingPanel : BoardPanel
             Scale = Vector2.One * 1f
         };
         AddControl(textsStep);
+
+        // 1-5 clause 13: the normal-offset is the one member of the shadow bias trio that is read from the UBO every frame
+        // rather than baked into the shadow PSO, so it is the only one that can honestly be offered as a runtime knob here.
+        // ShadowDepthBias and ShadowSlopeScaledDepthBias are deliberately absent: D3D12 and Vulkan fix them at pipeline
+        // creation, so a picker for them would appear to work and change nothing until the next launch.
+        textsShadowOffset = new Texts()
+        {
+            Content = "Shadow offset",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsShadowOffset);
+
+        // 1-5 clause 14: radius of the rotated PCF disk, also read from the UBO every frame, so it belongs here for the same
+        // reason the offset above does. Unlike the offset this one is visible at a glance - it is the width of the soft edge
+        // itself rather than a sub-texel correction - which makes it the row to sweep when judging whether the rotation is
+        // resolving into smooth penumbra or leaving visible noise.
+        textsShadowSoftness = new Texts()
+        {
+            Content = "Shadow softness",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsShadowSoftness);
+
+        // 1-5 clause 15: contact hardening, which redefines what the row above means rather than adding to it - softness stops
+        // being the edge width everywhere and becomes the width a well separated occluder reaches, with contact edges sharp.
+        // The two therefore have to be judged as a pair, which is the reason they sit adjacent. Also read from the UBO every
+        // frame, through the sign of the same field, so it is honestly live like the other two shadow rows.
+        textsShadowContact = new Texts()
+        {
+            Content = "Contact harden",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsShadowContact);
 
         textsLog = new Texts()
         {
@@ -338,7 +374,7 @@ internal class SettingPanel : BoardPanel
                     }
                 };
 
-                current = inputFov;
+                current = inputStep;
 
                 var result = new List<Season.Entities.EData> { };
 
@@ -365,6 +401,152 @@ internal class SettingPanel : BoardPanel
             }
         };
         AddPanel(inputStep);
+
+        inputShadowOffset = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                // Values are in shadow-map texels. 0 turns the offset off entirely, which is what the shader's own branch
+                // tests, and is the reference image showing what the two depth biases achieve alone. 1.5 reaches the outer
+                // ring of the current 3x3 PCF footprint and is the standing default; the entries above it exist because the
+                // right number is whatever just removes acne on a grazing-lit surface without detaching a contact shadow.
+                var sources = new List<Season.Entities.EData>();
+
+                foreach (var texels in new[] { "0", "0.5", "1", "1.5", "2", "3", "4" })
+                {
+                    sources.Add(new Season.Entities.EData()
+                    {
+                        Key = texels,
+                        Title = texels == "0" ? "0 (off)" : texels + " texel"
+                    });
+                }
+
+                current = inputShadowOffset;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null)
+                        {
+                            // Invariant culture because the keys are authored with a dot, and the value reaches the UBO on the
+                            // next Apply with no rebuild: RenderQuality.Current is Settings.RenderQuality itself.
+                            RenderQuality.Current.ShadowNormalOffset =
+                                float.Parse(picked.Key, System.Globalization.CultureInfo.InvariantCulture);
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputShadowOffset);
+
+        inputShadowSoftness = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                // Values are the disk radius in shadow-map texels. 0 collapses all eight taps onto one point, which is a
+                // single hardware 2x2 comparison fetch and therefore the hard-edge reference. 1 reproduces the reach of the
+                // 3x3 kernel this replaced, so it is the like-for-like comparison against the old look. Above that the edge
+                // keeps widening on the same eight taps, so the useful ceiling is wherever the rotation stops resolving and
+                // the penumbra starts to crawl - which is the thing this row exists to find.
+                var sources = new List<Season.Entities.EData>();
+
+                foreach (var texels in new[] { "0", "1", "2", "3", "4", "6", "8" })
+                {
+                    sources.Add(new Season.Entities.EData()
+                    {
+                        Key = texels,
+                        Title = texels == "0" ? "0 (hard)" : texels + " texel"
+                    });
+                }
+
+                current = inputShadowSoftness;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null)
+                        {
+                            RenderQuality.Current.ShadowSoftnessTexels =
+                                float.Parse(picked.Key, System.Globalization.CultureInfo.InvariantCulture);
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputShadowSoftness);
+
+        inputShadowContact = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                // Off is the clause 14 behaviour: one constant radius everywhere. On makes the radius per pixel, so the same
+                // Shadow softness number now describes only the widest the edge is allowed to get. Expect the scene to look
+                // sharper overall when switching it on, which is why the softness above usually wants raising afterwards.
+                var sources = new List<Season.Entities.EData>
+                {
+                    new Season.Entities.EData() { Key = "0", Title = "Off (constant)" },
+                    new Season.Entities.EData() { Key = "1", Title = "On (per pixel)" }
+                };
+
+                current = inputShadowContact;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null)
+                        {
+                            RenderQuality.Current.ShadowContactHardening = picked.Key == "1";
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputShadowContact);
 
         inputLog = new Input()
         {
@@ -404,7 +586,10 @@ internal class SettingPanel : BoardPanel
         textsMovement.Update(time, posX: PosX + padding, posY: textsMode.PosY + paddingH);
         textsFov.Update(time, posX: PosX + padding, posY: textsMovement.PosY + paddingH);
         textsStep.Update(time, posX: PosX + padding, posY: textsFov.PosY + paddingH);
-        textsLog.Update(time, posX: PosX + padding, posY: textsStep.PosY + paddingH);
+        textsShadowOffset.Update(time, posX: PosX + padding, posY: textsStep.PosY + paddingH);
+        textsShadowSoftness.Update(time, posX: PosX + padding, posY: textsShadowOffset.PosY + paddingH);
+        textsShadowContact.Update(time, posX: PosX + padding, posY: textsShadowSoftness.PosY + paddingH);
+        textsLog.Update(time, posX: PosX + padding, posY: textsShadowContact.PosY + paddingH);
 
         var width0 = 180; var inputLeft = 200; var height0 = 70;
         inputMode.Text = App.Instance.Mode.ToString();
@@ -428,6 +613,26 @@ internal class SettingPanel : BoardPanel
         inputStep.Text = App.Instance.step.ToString();
         inputStep.Color = inputStep.MouseOver ? Season.Basic.Colors.Red : Season.Basic.Colors.Black;
         if (inputStep.Update(time, posX: (int)textsStep.PosX + inputLeft, posY: (int)textsStep.PosY, width: width0, height: height0))
+        {
+            result = true;
+        }
+        inputShadowOffset.Text = RenderQuality.Current.ShadowNormalOffset.ToString("0.##",
+            System.Globalization.CultureInfo.InvariantCulture) + " texel";
+        inputShadowOffset.Color = inputShadowOffset.MouseOver ? Season.Basic.Colors.Red : Season.Basic.Colors.Black;
+        if (inputShadowOffset.Update(time, posX: (int)textsShadowOffset.PosX + inputLeft, posY: (int)textsShadowOffset.PosY, width: width0, height: height0))
+        {
+            result = true;
+        }
+        inputShadowSoftness.Text = RenderQuality.Current.ShadowSoftnessTexels.ToString("0.##",
+            System.Globalization.CultureInfo.InvariantCulture) + " texel";
+        inputShadowSoftness.Color = inputShadowSoftness.MouseOver ? Season.Basic.Colors.Red : Season.Basic.Colors.Black;
+        if (inputShadowSoftness.Update(time, posX: (int)textsShadowSoftness.PosX + inputLeft, posY: (int)textsShadowSoftness.PosY, width: width0, height: height0))
+        {
+            result = true;
+        }
+        inputShadowContact.Text = RenderQuality.Current.ShadowContactHardening ? "On" : "Off";
+        inputShadowContact.Color = inputShadowContact.MouseOver ? Season.Basic.Colors.Red : Season.Basic.Colors.Black;
+        if (inputShadowContact.Update(time, posX: (int)textsShadowContact.PosX + inputLeft, posY: (int)textsShadowContact.PosY, width: width0, height: height0))
         {
             result = true;
         }

@@ -1043,6 +1043,21 @@ internal class GltfAsset
         return _animationPlayer.GetCurrentAnimationName();
     }
 
+    /// <summary>
+    /// 1-5 clause 12: a value that changes exactly when the skinned or morphed pose changes, used by the shadow-atlas reuse
+    /// digest. Zero when the asset carries no clips, in which case the geometry is rigid and its bounds already describe it.
+    ///
+    /// The clock is folded in rather than an is-playing flag, because a paused clip is a legitimately static pose that should
+    /// remain eligible for reuse, while a seek performed while paused still changes the pose and must be caught. Both fall out
+    /// of digesting the time itself. The clip index joins it because switching clips can land on the same time value while
+    /// producing an entirely different pose.
+    /// </summary>
+    public int ShadowPoseKey
+        => _animationPlayer.AnimationCount == 0
+            ? 0
+            : BitConverter.SingleToInt32Bits(_animationPlayer.AnimationTime)
+              ^ (_animationPlayer.CurrentAnimationIndex * 0x51ED2701);
+
     public void StopAnimation()
     {
         _animationPlayer.Stop();

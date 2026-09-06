@@ -250,6 +250,10 @@ struct SceneLights {
 // Three-axis Clamp + trilinear filtering reuse binding 1 uSampler, so no extra slot is needed.
 @group(0) @binding(19) var uAerialLut: texture_3d<f32>;
 @group(0) @binding(20) var uWrapSampler: sampler;
+// 1-5 clause 15: non-filtering sampler for reading the atlas at binding 11 as a plain depth value. WebGPU permits a depth
+// texture to be sampled non-comparatively only through a non-filtering sampler, which is also what the blocker search wants
+// - a filtered depth across a silhouette lies on no surface. This is a sampler slot only; the texture is unchanged.
+@group(0) @binding(21) var uShadowPointSampler: sampler;
 
 fn getMorphWeight(weights: vec4f, index: u32) -> f32 {
     switch (index) {
@@ -881,33 +885,119 @@ fn AcesFilmInv(yIn: vec3f) -> vec3f {
 }
 
 // ── 1-5 shadow sampling (textual translation from the VK GLSL source):
-// single-tile 3x3 PCF, clamped inside the tile to avoid leakage.
+// the clause 14 rotated eight-tap disk, clamped inside the tile to avoid leakage.
 // textureSampleCompareLevel, not textureSampleCompare, avoids WGSL uniformity restrictions in non-uniform control flow.
-fn SampleShadowTile(slot: i32, shadowNdc: vec3f) -> f32 {
+
+// Clause 14: per-pixel orientation for the PCF disk, returned as a unit vector so the sampling loop needs no trigonometry.
+// The spatial term is interleaved gradient noise, which is constructed to decorrelate immediate neighbours - the property
+// that matters here, because TAA resolves a pixel from its own history and from the pixels next to it. The temporal term
+// arrives in shadowParams1.w already spread over the circle by the golden-ratio sequence, and adding it before the turn
+// spins the whole kernel frame to frame, which is what turns the sampling error into something a history can average away
+// rather than a fixed pattern it would preserve.
+fn ShadowKernelRotation(pixel: vec2f) -> vec2f {
+    let ign = fract(52.9829189 * fract(dot(pixel, vec2f(0.06711056, 0.00583715))));
+    let angle = (ign + uLights.shadowParams1.w) * 6.28318531;
+    return vec2f(cos(angle), sin(angle));
+}
+
+// Clause 14: eight taps on a Vogel disk, oriented by rot and scaled to radiusTexels. A Vogel spiral rather than a ring
+// because the golden angle fills the disk evenly at any tap count, so this one loop keeps working whatever radius it is
+// handed - which is what lets a variable penumbra reuse it later instead of forcing a second sampler into all four
+// backends. Each tap advances by one complex multiply by the golden angle, and that stays unit length across all eight.
+//
+// Clause 15: a negative radiusTexels means its magnitude is a ceiling rather than the radius, and the radius is derived
+// per pixel from a blocker search run first on the very same disk. Two properties of this projection setup are what keep
+// that search cheap. The separation is measured in stored-depth units, which are the cascade's own depth range normalized
+// to [0,1], and CascadedShadow builds every cascade with a depth range of exactly four times its bounding radius against a
+// texel footprint of two radii over the tile resolution - so radius cancels out of their ratio and one mapping from
+// separation to width is correct in all three cascades with nothing per-cascade uploaded. The mapping is deliberately not
+// the textbook light-angle one: a physically sized sun puts the penumbra at a near-constant 0.6 to 0.8 texels in every
+// cascade, for that same reason of scales growing together, and 0.7 texels of softening is invisible. Reaching the ceiling
+// at a quarter of the depth range keeps every property that matters - hard on contact, widening with separation,
+// consistent across cascades - and leaves the absolute width as the artistic knob it has to be to be worth having.
+//
+// The blocker search needs the stored depth, which the comparison sampler cannot give - it returns pass/fail. WebGPU allows
+// a depth texture to be read as a plain value only through a non-filtering sampler, which is binding 21; the texture at
+// binding 11 is the same one. Non-filtering is also the correct choice on its own terms - averaging two depths across a
+// silhouette yields a value lying on no surface, and a blocker distance derived from it would be fiction.
+fn SampleShadowTile(slot: i32, shadowNdc: vec3f, rot: vec2f, radiusTexels: f32) -> f32 {
     var result = 1.0;
     let uv = vec2f(shadowNdc.x * 0.5 + 0.5, 0.5 - shadowNdc.y * 0.5);
     if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0 &&
         shadowNdc.z > 0.0 && shadowNdc.z < 1.0) {
         let texel = uLights.shadowParams0.z;
         let tileOrigin = vec2f(f32(slot & 1), f32(slot >> 1)) * 0.5;
-        let tileMin = tileOrigin + texel * 1.5;
-        let tileMax = tileOrigin + 0.5 - texel * 1.5;
         let atlasUV = tileOrigin + uv * 0.5;
-        var sum = 0.0;
-        for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
-            for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-                let sampleUV = clamp(atlasUV + vec2f(f32(dx), f32(dy)) * texel, tileMin, tileMax);
-                sum = sum + textureSampleCompareLevel(uShadowAtlas, uShadowSampler, sampleUV, shadowNdc.z);
+
+        var radius = abs(radiusTexels);
+        // Clause 15: set when the blocker search finds nothing above the receiver, which lets the comparison pass be
+        // skipped outright - the answer is already known to be fully lit, and that is the common case over open ground.
+        var unoccluded = false;
+        if (radiusTexels < 0.0) {
+            // Search at the ceiling radius, because the radius being solved for is not known yet and a search narrower
+            // than the final kernel would miss occluders the kernel then samples, which reads as an edge that snaps.
+            let searchInset = vec2f(min(texel * (radius + 0.5), 0.2499));
+            let searchMin = tileOrigin + searchInset;
+            let searchMax = tileOrigin + 0.5 - searchInset;
+            var searchDir = rot;
+            let searchStepUV = radius * texel;
+            var depthSum = 0.0;
+            var depthCount = 0.0;
+            for (var j: i32 = 0; j < 8; j = j + 1) {
+                let rj = sqrt((f32(j) + 0.5) * 0.125);
+                let searchUV = clamp(atlasUV + searchDir * (rj * searchStepUV), searchMin, searchMax);
+                // The level argument is an integer here, not a float: WGSL's depth-texture overload of textureSampleLevel
+                // takes a concrete integer level, unlike the texture_2d<f32> one.
+                let stored = textureSampleLevel(uShadowAtlas, uShadowPointSampler, searchUV, 0);
+                // Only depths in front of the receiver are occluders; averaging the rest in would pull the estimate
+                // towards the receiver's own surface and collapse the penumbra wherever the disk straddles a silhouette.
+                let isBlocker = select(0.0, 1.0, stored < shadowNdc.z);
+                depthSum = depthSum + stored * isBlocker;
+                depthCount = depthCount + isBlocker;
+                searchDir = vec2f(searchDir.x * -0.7373689 - searchDir.y * 0.6754903,
+                                  searchDir.x * 0.6754903 + searchDir.y * -0.7373689);
+            }
+            if (depthCount < 0.5) {
+                unoccluded = true;
+            } else {
+                // Floor at half a texel: that is the reach of the hardware 2x2 comparison filter, so a smaller disk
+                // would collapse all eight taps onto one bilinear footprint and cost eight samples for one result.
+                let separation = shadowNdc.z - depthSum / depthCount;
+                radius = clamp(radius * separation * 4.0, 0.5, radius);
             }
         }
-        result = sum / 9.0;
+
+        if (!unoccluded) {
+            // Shrink the quadrant inward by the disk radius plus the half texel the hardware 2x2 comparison filter reaches, so
+            // no tap can bleed into a neighbouring quadrant however wide the disk is. Capped just under the half-quadrant so a
+            // pathological radius degenerates into sampling the tile centre instead of inverting the clamp bounds.
+            let inset = vec2f(min(texel * (radius + 0.5), 0.2499));
+            let tileMin = tileOrigin + inset;
+            let tileMax = tileOrigin + 0.5 - inset;
+
+            var dir = rot;
+            let stepUV = radius * texel;
+            var sum = 0.0;
+            for (var k: i32 = 0; k < 8; k = k + 1) {
+                let r = sqrt((f32(k) + 0.5) * 0.125);
+                let sampleUV = clamp(atlasUV + dir * (r * stepUV), tileMin, tileMax);
+                sum = sum + textureSampleCompareLevel(uShadowAtlas, uShadowSampler, sampleUV, shadowNdc.z);
+                // Advance by the golden angle 2.39996323 rad, whose (cos, sin) is (-0.7373689, 0.6754903).
+                dir = vec2f(dir.x * -0.7373689 - dir.y * 0.6754903, dir.x * 0.6754903 + dir.y * -0.7373689);
+            }
+            result = sum * 0.125;
+        }
     }
     return result;
 }
 
 // Directional light (CSM): choose the cascade slot by view-space depth, then sample after light-space projection and mix by shadowStrength.
 // cascadeSplits is first copied into a local var because dynamic vec4f indexing requires reference semantics.
-fn ComputeSunShadow(worldPos: vec3f, viewDepth: f32) -> f32 {
+//
+// Clause 13 normal-offset: geoNormal is the interpolated mesh normal, taken before any normal map perturbs it, because the
+// offset has to follow the surface the depth buffer actually holds rather than the shading normal. lightDir points towards
+// the light and is only used for the foreshortening factor, so its sign does not matter.
+fn ComputeSunShadow(worldPos: vec3f, geoNormal: vec3f, lightDir: vec3f, viewDepth: f32, shadowRot: vec2f) -> f32 {
     var result = 1.0;
     let cascadeCount = i32(uLights.shadowParams0.y);
     var splits = uLights.cascadeSplits;
@@ -917,19 +1007,51 @@ fn ComputeSunShadow(worldPos: vec3f, viewDepth: f32) -> f32 {
             if (viewDepth <= splits[c]) { slot = c; }
         }
         let lightPos = uLights.cascadeViewProj[slot] * vec4f(worldPos, 1.0);
-        let visibility = SampleShadowTile(slot, lightPos.xyz / lightPos.w);
+        var ndc = lightPos.xyz / lightPos.w;
+
+        // Clause 13: displace the lookup along the surface normal, in this cascade's tile NDC rather than in world space.
+        // One texel is a fixed 2/(atlasSize/2) = 4*shadowParams0.z of tile NDC however wide the cascade is, so a single
+        // uploaded texel count is right for all three cascades and no per-cascade world scale has to reach the shader.
+        //
+        // The direction is the normal put through the same matrix the position went through, as a direction (w=0), then
+        // normalized. Writing the multiply in the same order as lightPos above is what keeps this identical to the other
+        // three backends despite the differing matrix convention. Normalizing is the load-bearing step: an orthographic
+        // projection scales every direction by 2/cascadeWidth, so the raw projected length carries the cascade's extent and
+        // using it unnormalized would make the offset inversely proportional to cascade width - far too large near, far too
+        // small far out. That length also carried the sqrt(1 - NdotL^2) foreshortening, which is why it has to be reapplied by
+        // hand once the scale is gone. Its effect is that the offset vanishes on surfaces facing the light and peaks on
+        // grazing ones, which is exactly where a texel's worth of depth quantization spans the most world distance.
+        //
+        // Only xy moves, and it is rebuilt rather than assigned through a swizzle because WGSL has no swizzled assignment.
+        // Displacing z would push stored depth away from the light again, which is the peter-panning this clause exists to
+        // avoid buying. The length guard costs nothing real: the projected normal only collapses when the surface faces the
+        // light dead on, and that is precisely where the foreshortening would have zeroed the offset too.
+        if (uLights.shadowParams1.z > 0.0) {
+            let ndcN = (uLights.cascadeViewProj[slot] * vec4f(geoNormal, 0.0)).xy;
+            let ndcLen = length(ndcN);
+            if (ndcLen > 1e-8) {
+                let ndl = dot(geoNormal, lightDir);
+                let sinTheta = sqrt(clamp(1.0 - ndl * ndl, 0.0, 1.0));
+                let ndcStep = (ndcN / ndcLen) * (sinTheta * uLights.shadowParams1.z * 4.0 * uLights.shadowParams0.z);
+                ndc = vec3f(ndc.xy + ndcStep, ndc.z);
+            }
+        }
+
+        let visibility = SampleShadowTile(slot, ndc, shadowRot, uLights.shadowParams0.w);
         result = mix(1.0, visibility, uLights.shadowParams1.y);
     }
     return result;
 }
 
 // Spotlight: single tile at slot 3, sampled after perspective divide.
-fn ComputeSpotShadow(worldPos: vec3f) -> f32 {
+// No normal-offset here (clause 13 covers the cascades only): under a perspective projection a texel covers a world
+// distance that grows with depth, so a single texel count cannot describe the offset. The spot keeps the PSO depth biases.
+fn ComputeSpotShadow(worldPos: vec3f, shadowRot: vec2f) -> f32 {
     var result = 1.0;
     if (uLights.shadowParams1.x >= 0.5) {
         let lightPos = uLights.spotShadowViewProj * vec4f(worldPos, 1.0);
         if (lightPos.w > 0.0) {
-            let visibility = SampleShadowTile(3, lightPos.xyz / lightPos.w);
+            let visibility = SampleShadowTile(3, lightPos.xyz / lightPos.w, shadowRot, uLights.shadowParams0.w);
             result = mix(1.0, visibility, uLights.shadowParams1.y);
         }
     }
@@ -1086,6 +1208,11 @@ fn shade(input: ShadeInput) -> vec4f {
     }
 
     var N = normalize(input.normal);
+
+    // 1-5 clause 13: keep the geometric normal before the normal map overwrites N below. Shadow lookups are displaced along
+    // this one, not the shading normal: the depth buffer holds the interpolated surface, so a perturbed normal would push
+    // the sample off that surface and reintroduce acne exactly where the map is strongest.
+    let Ngeo = N;
     if (HasTexture(2)) {
         let T0 = normalize(input.tangent.xyz);
         let T = normalize(T0 - dot(T0, N) * N);
@@ -1136,7 +1263,7 @@ fn shade(input: ShadeInput) -> vec4f {
             L = normalize(-uLights.lights[i].dirType.xyz);
             radiance = uLights.lights[i].colorIntensity.xyz * uLights.lights[i].colorIntensity.w;
             if (i == dirShadowIdx) {
-                radiance = radiance * ComputeSunShadow(input.worldPos, input.viewDepth);
+                radiance = radiance * ComputeSunShadow(input.worldPos, Ngeo, L, input.viewDepth, ShadowKernelRotation(input.position));
             }
             // 2-5 Step C: cloud shadows. Evaluate them independently for every directional light using that light's own L,
             // so sun and moon can each cast their own cloud shadow.
@@ -1168,7 +1295,7 @@ fn shade(input: ShadeInput) -> vec4f {
             // 1-5: spotlight shadows apply only to the light selected by params0.w
             // (contract across all four backends: one spotlight shadow map in slot 3).
             if (i == spotShadowIdx && lightType > 0.5) {
-                radiance = radiance * ComputeSpotShadow(input.worldPos);
+                radiance = radiance * ComputeSpotShadow(input.worldPos, ShadowKernelRotation(input.position));
             }
         }
 

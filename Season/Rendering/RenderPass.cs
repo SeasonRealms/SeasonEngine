@@ -249,7 +249,10 @@ public static class FrameSchedule
             _computeFrameStart[i].Record(g);
 
         // Shadow (before Scene, depth-only; activated after 1-5 registration)
-        if (ShadowMap != null && RenderShadow != null)
+        // Clause 12: the reuse test runs first because it has to walk the caster tree to fingerprint it, and a positive
+        // result must bypass BeginPass rather than the pass body - the pass clears the atlas on entry, so entering it at
+        // all destroys the very contents being reused.
+        if (ShadowMap != null && RenderShadow != null && !CascadedShadow.EvaluateReuse(app))
         {
             g.BeginPass(new PassDesc
             {

@@ -303,6 +303,18 @@ public abstract class Control : BaseControl, IControl
     }
 
     /// <summary>
+    /// 1-5 clause 12: a value that changes whenever this control's rendered geometry deforms without its world bounds
+    /// moving, and stays constant otherwise. Zero by default, which is correct for every rigid caster: a rigid object is
+    /// fully described to the shadow-reuse digest by its world bounding box.
+    ///
+    /// Skinned and morphed models override it, because their bounds cannot serve. Animated bounds are the conservative box,
+    /// raw times AnimatedBoundsScale, computed once at load time, so a character can raise an arm through a whole clip while
+    /// its box never moves - a digest built from bounds alone would happily conclude nothing changed and freeze the shadow
+    /// mid-stride. The animation clock is what actually distinguishes those poses, so that is what gets folded in.
+    /// </summary>
+    protected virtual int ShadowPoseKey => 0;
+
+    /// <summary>
     /// 2-4: Entry point for GI proxy collection (contract clause 4). Empty by default.
     /// 3D controls that produce proxies (Model/Mesh3D) override this and call <c>GiProxies.TryAdd</c>.
     /// Its gating mirrors DrawShadow by reusing CastShadows, see boundary 3 in the GiProxies class header,
