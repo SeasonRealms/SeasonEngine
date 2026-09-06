@@ -42,6 +42,11 @@ namespace Season.Platforms.Windows.DirectX;
 /// from half-resolution GTAO output r) is scaled by AoIntensity (fifth b0
 /// constant) and selected automatically by Device from FrameSchedule.AoTexture
 /// (see the RenderQuality 2-2 contract section).
+/// 2-3 clause 17 adds an RCAS variant alongside the FXAA one: the same uber output,
+/// resolved with FSR1 sharpening instead of edge blending when the TAA tier owns the
+/// Post slot. It reuses the FXAA variant's texel-size constants and takes its lobe
+/// scale from the seventh b0 constant, which used to be packing padding, so the
+/// RootSignature is unchanged (see the RenderQuality 2-3 contract section).
 /// </summary>
 internal static unsafe class BlitPipeline
 {
@@ -55,6 +60,7 @@ internal static unsafe class BlitPipeline
     internal static ID3D12PipelineState* UberPipelineState;
     internal static ID3D12PipelineState* UberBloomPipelineState;
     internal static ID3D12PipelineState* FxaaPipelineState;
+    internal static ID3D12PipelineState* RcasPipelineState;
     internal static ID3D12PipelineState* TonemapAoPipelineState;
     internal static ID3D12PipelineState* TonemapAoLinearPipelineState;
     internal static ID3D12PipelineState* TonemapBloomAoPipelineState;
@@ -75,6 +81,7 @@ internal static unsafe class BlitPipeline
         UberPipelineState = CreatePipelineState("PSMainUber");
         UberBloomPipelineState = CreatePipelineState("PSMainUberBloom");
         FxaaPipelineState = CreatePipelineState("PSMainFxaa");
+        RcasPipelineState = CreatePipelineState("PSMainRcas");
         TonemapAoPipelineState = CreatePipelineState("PSMainTonemapAo");
         TonemapAoLinearPipelineState = CreatePipelineState("PSMainTonemapAoLinear");
         TonemapBloomAoPipelineState = CreatePipelineState("PSMainTonemapBloomAo");
@@ -132,8 +139,8 @@ internal static unsafe class BlitPipeline
         };
 
         // Parameter 1: b0 root constants
-        // 0=exposure 1=bloom 2-3=texelSize 4=ao 5=outlineWidth 6-7=padding
-        // (outlinePad, for HLSL packing alignment; color is already carried per
+        // 0=exposure 1=bloom 2-3=texelSize 4=ao 5=outlineWidth 6=sharpness 7=padding
+        // (blitPad, for HLSL packing alignment; the outline color is carried per
         // pixel by the mask, so there is no constant color slot and slots 8-11
         // are no longer uploaded)
         rootParameters[1] = new RootParameter
@@ -248,7 +255,8 @@ cbuffer TonemapParams : register(b0)
     float texelSizeY;
     float aoIntensity;    // 2-2 Step B: AO occlusion intensity (RenderQuality.AoIntensity, referenced only by AO variants)
     float outlineWidth;   // Outline2D width in pixels
-    float2 outlinePad;    // HLSL packing: float4 values may not cross 16-byte register boundaries (color is carried per pixel by the mask, so there is no constant color slot)
+    float sharpness;      // 2-3 clause 17: RCAS lobe scale (RenderQuality.TaaSharpness, referenced only by the RCAS variant)
+    float blitPad;        // HLSL packing: float4 values may not cross 16-byte register boundaries (the outline color is carried per pixel by the mask, so there is no constant color slot)
 };
 
 struct PSInput
@@ -468,6 +476,69 @@ float4 PSMainFxaa(PSInput input) : SV_TARGET
     }
 
     return float4(result.rgb, 1.0);
+}
+
+// RCAS variant (2-3 clause 17, used by FinalBlit): FSR1 RCAS, ported from
+// FsrRcasF in ffx_fsr1.h. Source is the same LDR uber output the FXAA variant
+// reads, and that is a hard requirement rather than convenience: the limiter
+// below measures headroom against display white as a literal 1.0, which only
+// holds once the uber pass has tonemapped and gamma encoded. Run against
+// scene-referred HDR the (1 - mx4) term goes negative and the filter inverts.
+float4 PSMainRcas(PSInput input) : SV_TARGET
+{
+    // FSR1's FSR_RCAS_LIMIT. 0.25 is the lobe at which the 4-tap ring would start
+    // to ring; 1/16 is the slack FSR1 keeps below it.
+    const float RCAS_LIMIT = 0.25 - 1.0 / 16.0;
+
+    // Guard for the two neighbourhoods where FSR1's reciprocals divide by zero:
+    // an all-black ring (mx4 = 0) and an all-white one (mn4 = 1, which also zeroes
+    // the second numerator into 0/0). It goes in the denominators only, which
+    // yields 0 for both - the same no-sharpening answer FSR1 already gives for
+    // every other ring with mn4 = 0 or mx4 = 1, so this is the faithful one-sided
+    // limit rather than an invented case. Adding it to the numerators instead
+    // would make a black ring report hitMin = 1 and amplify an isolated bright
+    // pixel 4x. Away from those two points it only perturbs rings darker than
+    // 1e-4, which is far below one 8-bit code value of the target.
+    const float RCAS_EPS = 1.0 / 32768.0;
+
+    float2 rcpFrame = float2(texelSizeX, texelSizeY);
+    float2 uv = input.uv;
+
+    // Cross neighbourhood, point sampled at 1:1 (the same texel-load-through-uv
+    // the FXAA variant relies on).
+    //     b
+    //   d e f
+    //     h
+    float3 e = sceneColor.Sample(pointSampler, uv).rgb;
+    float3 b = sceneColor.Sample(pointSampler, uv + float2( 0.0, -1.0) * rcpFrame).rgb;
+    float3 d = sceneColor.Sample(pointSampler, uv + float2(-1.0,  0.0) * rcpFrame).rgb;
+    float3 f = sceneColor.Sample(pointSampler, uv + float2( 1.0,  0.0) * rcpFrame).rgb;
+    float3 h = sceneColor.Sample(pointSampler, uv + float2( 0.0,  1.0) * rcpFrame).rgb;
+
+    // The ring only, deliberately excluding the centre: the question the limiter
+    // asks is how far e may be pushed away from its neighbours, so letting e into
+    // the extents would license its own displacement.
+    float3 mn4 = min(min(b, d), min(f, h));
+    float3 mx4 = max(max(b, d), max(f, h));
+
+    // Headroom towards black and towards white expressed in units of the lobe
+    // weight; both are non-positive after the max, and the tightest of the three
+    // channels decides, so no channel can be pushed out of range.
+    float3 hitMin = mn4 / (4.0 * mx4 + RCAS_EPS);
+    float3 hitMax = (1.0 - mx4) / (4.0 * mn4 - 4.0 - RCAS_EPS);
+    float3 lobeRgb = max(-hitMin, hitMax);
+    float lobe = max(-RCAS_LIMIT, min(max(lobeRgb.r, max(lobeRgb.g, lobeRgb.b)), 0.0)) * sharpness;
+
+    // FSR_RCAS_DENOISE is deliberately not ported rather than overlooked: it is
+    // FSR1's opt-in for noisy input, and this input is a temporally converged TAA
+    // resolve. The divide needs no guard because lobe is clamped into
+    // [-RCAS_LIMIT, 0], which keeps 4 * lobe + 1 inside [0.25, 1].
+    float3 result = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
+
+    // RCAS is not bounded by construction; FSR1 leans on the UNORM render target
+    // to clamp it. The backbuffer does clamp, but saturating here states the
+    // dependency instead of inheriting it from a format.
+    return float4(saturate(result), 1.0);
 }
 
 float4 PSMainOutlineComposite(PSInput input) : SV_TARGET
@@ -712,6 +783,26 @@ float4 PSMainOutlineComposite(PSInput input) : SV_TARGET
         cmdList->SetGraphicsRootDescriptorTable(0, srcSrv);
         cmdList->SetGraphicsRoot32BitConstant(1, BitConverter.SingleToUInt32Bits(texelSizeX), 2);
         cmdList->SetGraphicsRoot32BitConstant(1, BitConverter.SingleToUInt32Bits(texelSizeY), 3);
+        cmdList->DrawInstanced(3, 1, 0, 0);
+    }
+
+    /// <summary>
+    /// 2-3 clause 17: present with RCAS inside FinalBlit. Source is the same LDR
+    /// PostColor output as DrawFxaa (alpha luma is simply left unread here), and
+    /// the preconditions are the same as Draw. Sharpness is uploaded every frame
+    /// because RenderQuality.TaaSharpness is a runtime knob.
+    /// </summary>
+    internal static void DrawRcas(GpuDescriptorHandle srcSrv, float texelSizeX, float texelSizeY, float sharpness)
+    {
+        var cmdList = Device.GraphicsCommandList;
+
+        cmdList->SetGraphicsRootSignature(RootSignature);
+        cmdList->SetPipelineState(RcasPipelineState);
+        cmdList->IASetPrimitiveTopology(D3DPrimitiveTopology.D3DPrimitiveTopologyTrianglelist);
+        cmdList->SetGraphicsRootDescriptorTable(0, srcSrv);
+        cmdList->SetGraphicsRoot32BitConstant(1, BitConverter.SingleToUInt32Bits(texelSizeX), 2);
+        cmdList->SetGraphicsRoot32BitConstant(1, BitConverter.SingleToUInt32Bits(texelSizeY), 3);
+        cmdList->SetGraphicsRoot32BitConstant(1, BitConverter.SingleToUInt32Bits(sharpness), 6);
         cmdList->DrawInstanced(3, 1, 0, 0);
     }
 

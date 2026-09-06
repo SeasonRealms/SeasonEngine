@@ -134,8 +134,15 @@ public static class WebApp
             // PostColor (LDR, same format and size as the backbuffer) and RenderPost
             // (uber: tonemap+bloom composition with luma written into alpha) are registered as a pair, after
             // which FrameSchedule automatically inserts the Post pass and FinalBlit degrades into FXAA present.
-            // Outside the FXAA tier, both stay null so the chain leaves no residue. Mirrors LinuxApp.
-            if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
+            // 2-3 clause 17: the TAA tier takes the same slot when TaaSharpness is above zero, because a
+            // display-referred sharpener has nowhere else to run - the compute resolve happens in linear HDR,
+            // and RCAS measures its headroom against display white. FinalBlit then degenerates into RCAS instead
+            // of FXAA; RenderPostPass forwards SceneColorOverride, and the Post pass runs after the AfterScene
+            // phase, so it reads the resolve output of the current frame rather than SceneColor.
+            // In tiers that ask for neither, both stay null so the chain leaves no residue. Mirrors LinuxApp.
+            if ((RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
+                    || (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa
+                        && RenderQuality.Current.TaaSharpness > 0f))
                 && Season.Rendering.FrameSchedule.SceneColor != null)
             {
                 Season.Rendering.FrameSchedule.PostColor = _graphics.CreateRenderTarget(new Season.Rendering.RenderTargetDesc

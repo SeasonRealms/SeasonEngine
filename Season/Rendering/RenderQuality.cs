@@ -25,6 +25,28 @@ public enum AaMode
     Taa,
 }
 
+/// <summary>
+/// Which filter FinalBlit applies when its source is <see cref="FrameSchedule.PostColor"/>, i.e. when the Post pass
+/// already finished the HDR-&gt;LDR composite and the remaining work is a full-screen filter in display-referred space.
+///
+/// This is derived from <see cref="AaMode"/> at the blit entry rather than stored alongside PostColor on purpose:
+/// the AA tier is what decided to create PostColor in the first place, so a second copy of the same decision could
+/// only ever disagree with it. Backends therefore map the tier here instead of reading a registered field.
+/// </summary>
+public enum PostResolve
+{
+    /// <summary>Straight presentation of the composited LDR image. This is the fallback when a tier registers the Post
+    /// slot without asking for a filter; it is not currently reachable, and exists so that such a tier presents a
+    /// correct image rather than an accidental FXAA or RCAS pass.</summary>
+    Copy,
+
+    /// <summary>2-1 clause 4: FXAA 3.11 on the composited image, reusing the luma the uber pass baked into alpha.</summary>
+    Fxaa,
+
+    /// <summary>2-3 clause 17: FSR1 RCAS sharpening on the composited image, scaled by RenderQuality.TaaSharpness.</summary>
+    Rcas,
+}
+
 /// <summary>Ambient occlusion mode (2-2 contract clause 1: mutually exclusive and fixed at initialization). See the RenderQuality class header for fallback rules.
 /// No classic SSAO tier is kept in advance: quality scaling changes parameters (direction count / step count) rather than the algorithm; more modes can be added later if needed.</summary>
 public enum AoMode
@@ -132,7 +154,8 @@ public enum TextureMipPolicy
 /// - 2-3 motion vectors + TAA: velocity is an independent tier, SceneVelocity is explicit, jitter is injected from a single Camera3D path,
 ///   history data rides existing constant buffers, transparent geometry does not write velocity, and TAA uses ping-pong history with controlled degradation.
 ///   Clause 16 resamples reprojected history through a renormalized 5-tap Catmull-Rom filter instead of one bilinear fetch, because the per-frame
-///   softening of a single fetch compounds across the whole feedback window rather than being paid once.
+///   softening of a single fetch compounds across the whole feedback window rather than being paid once. Clause 17 then borrows the Post slot that
+///   2-1 built for FXAA and resolves with FSR1 RCAS, which is the only place a display-referred sharpener can legally run in this engine.
 /// - 1-7 cubemap + IBL: TextureCube is a minimal cross-platform type, SH9 irradiance/radiance ride the lighting UBO, diffuse picks either SH9 or constant ambient,
 ///   and the entire path falls back cleanly to the old ambient-only baseline.
 /// - 2-4 DDGI + SDF: GI uses box/sphere proxies, accepts one-frame latency, stores all runtime parameters in the existing lighting UBO tail,
@@ -236,6 +259,12 @@ public class RenderQuality
 
     /// <summary>Default value for TaaStaticFeedback (overrideable in the app constructor and captured by Init()).</summary>
     public static float DefaultTaaStaticFeedback = 0.97f;
+
+    /// <summary>Default value for TaaSharpness (overrideable in the app constructor and captured by Init()).
+    /// One stop below FSR1's maximum (exp2(-1)), chosen because clause 16 already removed the resampling loss that
+    /// used to be the main reason a resolved frame looked soft; what is left for clause 17 to hide is the jitter
+    /// footprint itself, which does not need an aggressive lobe.</summary>
+    public static float DefaultTaaSharpness = 0.5f;
 
     /// <summary>Default value for GlobalIllumination (overrideable in the app constructor and captured by Init()).</summary>
     public static GiMode DefaultGlobalIllumination = GiMode.Off;
@@ -449,6 +478,28 @@ public class RenderQuality
 
     /// <summary>2-3 contract clause 10: TAA neighborhood variance-clipping range. Runtime knob.</summary>
     public float TaaVarianceClipGamma { get; set; } = DefaultTaaVarianceClipGamma;
+
+    /// <summary>2-3 contract clause 17: RCAS lobe attenuation for the post-tonemap sharpening pass, in [0, 1],
+    /// where 1 matches FSR1's maximum sharpness (its "stops" parameter maps here as exp2(-stops), so 0.5 is one stop
+    /// and 0.25 is two). Runtime knob for the strength, but <b>not</b> for whether the pass exists: a value above zero
+    /// at initialization is what makes the TAA tier register PostColor and RenderPost, and that decision is fixed for
+    /// the process. Lowering it to 0 later leaves the extra Post pass in place and merely zeroes the lobe, which makes
+    /// the filter an identity - the same shape as BloomIntensity, which disables bloom visually without freeing anything.
+    /// Only effective under AaMode.Taa; the Fxaa tier owns the same slot and resolves with FXAA instead.</summary>
+    public float TaaSharpness { get; set; } = DefaultTaaSharpness;
+
+    /// <summary>Which filter FinalBlit must apply when its source is <see cref="FrameSchedule.PostColor"/>, derived from
+    /// the AA tier that registered the slot. Shared by all four backends rather than reimplemented in each, since the
+    /// mapping is a property of the contract and not of any one API. Safe to call at blit time because the AA tier is
+    /// finalized during initialization and fixed for the process, so this cannot disagree with the tier that decided to
+    /// create PostColor. Reachable only when PostColor exists; the Off/Msaa4x arms are unreachable in practice and return
+    /// Copy so that a future tier registering the slot presents a correct image instead of an accidental filter.</summary>
+    public static PostResolve PostResolveFilter() => Current.AntiAliasing switch
+    {
+        AaMode.Fxaa => PostResolve.Fxaa,
+        AaMode.Taa => PostResolve.Rcas,
+        _ => PostResolve.Copy,
+    };
 
     /// <summary>2-4 contract clause 1: global-illumination tier. Mutually exclusive, fixed at initialization, and downgraded to Off when unsupported.</summary>
     public GiMode GlobalIllumination { get; set; } = DefaultGlobalIllumination;

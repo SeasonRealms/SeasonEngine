@@ -1733,9 +1733,10 @@ window.seasonWebGPU = (() => {
     //   (Step A uses pure pow(1/2.2) encoding, pixel-for-pixel equivalent to the LDR baseline),
     //   while targets still always bake _format for backbuffer rendering.
     // - 2-1 adds:
-    //   tonemap+bloom (when FXAA is off and bloom is available),
+    //   tonemap+bloom (when no resolve is requested and bloom is available),
     //   uber (Post pass composition, consumed by renderPost),
     //   and FXAA (PostColor -> backbuffer, with luma read from alpha).
+    // - 2-3 clause 17 adds RCAS, the second resolve variant, taken when the TAA tier owns the Post slot.
     // All pipelines carry depthStencil with write disabled and compare always:
     // FinalBlit/Post reuse the depth24plus attachment shape,
     // isomorphic to the Scene pass, so beginPass does not need per-pass attachment branching.
@@ -1750,6 +1751,8 @@ window.seasonWebGPU = (() => {
     let _blitPipelineUber = null;
     let _blitPipelineUberBloom = null;
     let _blitPipelineFxaa = null;
+    // 2-3 clause 17: RCAS resolve, the TAA tier's counterpart to the FXAA variant
+    let _blitPipelineRcas = null;
     // 2-2 Step C: 6 AO variants
     // tonemap +/- bloom x point/linear + uber +/- bloom, aligned with DX 2-2 Step B
     let _blitPipelineTonemapAo = null;
@@ -1767,6 +1770,8 @@ window.seasonWebGPU = (() => {
     // Tonemap parameter uniform
     // (1-4 Step B + 2-1 extended semantics):
     // 16B vec4f (x=exposure, y=bloomIntensity, zw=texelSize).
+    // 2-3 clause 17: the RCAS variant reads x as sharpness instead, since an LDR resolve source has no exposure
+    // to apply, which is why the FXAA path already writes a zero there.
     // FinalBlit variants share _blitExposureBuffer
     // and write it at most once per frame.
     // Post-pass uber uses a separate _postParamsBuffer:
@@ -1870,6 +1875,17 @@ window.seasonWebGPU = (() => {
             layout: 'auto',
             vertex: { module, entryPoint: 'vs_linear' },
             fragment: { module, entryPoint: 'fs_fxaa', targets: [{ format: _format }] },
+            primitive: { topology: 'triangle-list' },
+            depthStencil,
+        });
+        // 2-3 clause 17: RCAS resolve.
+        // Same vs_linear because the cross neighborhood is addressed through uv,
+        // but fs_rcas statically references only bindings 0/2/4,
+        // so its auto layout is narrower than the FXAA one and its bind group must omit the linear sampler.
+        _blitPipelineRcas = _device.createRenderPipeline({
+            layout: 'auto',
+            vertex: { module, entryPoint: 'vs_linear' },
+            fragment: { module, entryPoint: 'fs_rcas', targets: [{ format: _format }] },
             primitive: { topology: 'triangle-list' },
             depthStencil,
         });
@@ -1982,12 +1998,14 @@ window.seasonWebGPU = (() => {
     // This is a wrapper layer:
     // after the main blit finishes, it optionally appends the outline composite,
     // mirroring DX where composite happens only inside BlitToBackbuffer,
-    // covering both fxaa and non-fxaa branches.
+    // covering both the resolve and non-resolve branches.
     // renderPost does not participate.
-    function blitToBackbuffer(name, exposure, bloomName, bloomIntensity, fxaa, aoName, aoIntensity, sceneOverrideName, outlineMaskName, outlineWidth) {
+    // 2-3 clause 17: resolve replaced the old boolean fxaa flag and mirrors Season.Rendering.PostResolve
+    // (0 = copy, 1 = FXAA, 2 = RCAS); sharpness is read only by the RCAS branch.
+    function blitToBackbuffer(name, exposure, bloomName, bloomIntensity, resolve, sharpness, aoName, aoIntensity, sceneOverrideName, outlineMaskName, outlineWidth) {
         const rt = _renderTargets[name];
         if (!rt || !_passEncoder || rt.depthOnly) return;
-        _blitToBackbufferMain(rt, exposure, bloomName, bloomIntensity, fxaa, aoName, aoIntensity, sceneOverrideName);
+        _blitToBackbufferMain(rt, exposure, bloomName, bloomIntensity, resolve, sharpness, aoName, aoIntensity, sceneOverrideName);
         if (outlineMaskName) _drawOutlineComposite(outlineMaskName, outlineWidth);
     }
 
@@ -2021,26 +2039,41 @@ window.seasonWebGPU = (() => {
         _passEncoder.draw(3);
     }
 
-    function _blitToBackbufferMain(rt, exposure, bloomName, bloomIntensity, fxaa, aoName, aoIntensity, sceneOverrideName) {
-        if (fxaa) {
-            // 2-1: PostColor (LDR, luma stored in alpha) -> FXAA variant.
-            // texelSize is supplied through params.zw.
-            // When FXAA is enabled, uber parameters use _postParamsBuffer,
+    function _blitToBackbufferMain(rt, exposure, bloomName, bloomIntensity, resolve, sharpness, aoName, aoIntensity, sceneOverrideName) {
+        if (resolve === 1 || resolve === 2) {
+            // 2-1 / 2-3 clause 17: PostColor (LDR, luma stored in alpha) -> the resolve variant belonging to the tier
+            // that registered the Post slot.
+            // texelSize is supplied through params.zw for both, and RCAS additionally reads params.x, the slot FXAA
+            // leaves zeroed because an LDR source has no exposure.
+            // While a resolve runs, uber parameters use _postParamsBuffer,
             // and this buffer is written only once in the frame, so no parameter overlap occurs.
-            _BLIT_EXPOSURE_SCRATCH[0] = 0; _BLIT_EXPOSURE_SCRATCH[1] = 0;
+            const rcas = resolve === 2;
+            _BLIT_EXPOSURE_SCRATCH[0] = rcas ? sharpness : 0; _BLIT_EXPOSURE_SCRATCH[1] = 0;
             _BLIT_EXPOSURE_SCRATCH[2] = 1 / rt.width; _BLIT_EXPOSURE_SCRATCH[3] = 1 / rt.height;
             _device.queue.writeBuffer(_blitExposureBuffer, 0, _BLIT_EXPOSURE_SCRATCH);
-            const bindGroup = _getVariantBindGroup(rt, 'fxaa', _blitPipelineFxaa, null, [
-                { binding: 0, resource: rt.colorView },
-                { binding: 1, resource: _blitSampler },
-                { binding: 2, resource: { buffer: _blitExposureBuffer } },
-                { binding: 4, resource: _blitPointSampler },
-            ]);
-            _passEncoder.setPipeline(_blitPipelineFxaa);
+            // The two auto layouts differ: fs_rcas never references the linear sampler at binding 1,
+            // so including it would fail bind-group validation. Separate cache keys keep the entry lists apart.
+            const pipeline = rcas ? _blitPipelineRcas : _blitPipelineFxaa;
+            const entries = rcas
+                ? [
+                    { binding: 0, resource: rt.colorView },
+                    { binding: 2, resource: { buffer: _blitExposureBuffer } },
+                    { binding: 4, resource: _blitPointSampler },
+                ]
+                : [
+                    { binding: 0, resource: rt.colorView },
+                    { binding: 1, resource: _blitSampler },
+                    { binding: 2, resource: { buffer: _blitExposureBuffer } },
+                    { binding: 4, resource: _blitPointSampler },
+                ];
+            const bindGroup = _getVariantBindGroup(rt, rcas ? 'rcas' : 'fxaa', pipeline, null, entries);
+            _passEncoder.setPipeline(pipeline);
             _passEncoder.setBindGroup(0, bindGroup);
             _passEncoder.draw(3);
             return;
         }
+        // resolve === 0 (copy) falls through: PostColor is BackbufferCompatible and matches the backbuffer size,
+        // so the selection below lands on the plain point variant, a straight texel copy.
         // 2-3 clause 12:
         // when the scene source is overridden by TAA resolve,
         // binding 0 switches to _textureViews[override].
@@ -2076,7 +2109,7 @@ window.seasonWebGPU = (() => {
             _device.queue.writeBuffer(_blitExposureBuffer, 0, _BLIT_EXPOSURE_SCRATCH);
         }
         // 2-1: switch to tonemap+bloom variants when the bloom texture is ready
-        // on the direct path with FXAA off.
+        // on the direct path, i.e. when no resolve was requested.
         // If not ready, fall back to plain tonemap.
         // 2-2: when the AO texture is ready, switch further to AO variants
         // that multiply AO before ACES and then add bloom.

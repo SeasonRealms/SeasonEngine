@@ -1943,9 +1943,10 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     /// tonemap+bloom variant (bloom added in pre-ACES linear space). Bloom is
     /// valid only in the HDR chain (tonemap); otherwise this falls back cleanly
     /// to existing variants.
-    /// 2-1 Step C: when fxaa=true (source is the LDR PostColor from the post
-    /// uber output, with luma in alpha), switch to the FXAA variant for screen
-    /// presentation. Texel size is uploaded every frame, so resize needs no
+    /// 2-1 Step C: when resolve is not Copy (source is the LDR PostColor from the
+    /// post uber output, with luma in alpha), switch to the matching resolve
+    /// variant for screen presentation - Fxaa for the 2-1 tier, Rcas for 2-3
+    /// clause 17. Texel size is uploaded every frame, so resize needs no
     /// rebuild. This path is mutually exclusive with tonemap/bloom because the
     /// composition already finished in Post.
     /// 2-2 Step B: when aoTex is non-null and ready, switch to the AO variant
@@ -1959,15 +1960,21 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     /// size mismatch. srcRT is still transitioned to sample state idempotently to
     /// keep state tracking consistent.
     /// </summary>
-    internal static void BlitToBackbuffer(RenderTarget src, DXTexture bloomTex = null, bool fxaa = false, DXTexture aoTex = null,
+    internal static void BlitToBackbuffer(RenderTarget src, DXTexture bloomTex = null,
+        Season.Rendering.PostResolve resolve = Season.Rendering.PostResolve.Copy, DXTexture aoTex = null,
         DXTexture sceneTex = null, RenderTarget outlineMask = null, float outlineWidth = 0f)
     {
         var srcRT = (DXRenderTarget)src;
         srcRT.TransitionTo(GraphicsCommandList, ResourceStates.PixelShaderResource);
 
-        if (fxaa)
+        if (resolve == Season.Rendering.PostResolve.Fxaa)
         {
             BlitPipeline.DrawFxaa(srcRT.GpuSrvHandle, 1f / srcRT.Width, 1f / srcRT.Height);
+        }
+        else if (resolve == Season.Rendering.PostResolve.Rcas)
+        {
+            BlitPipeline.DrawRcas(srcRT.GpuSrvHandle, 1f / srcRT.Width, 1f / srcRT.Height,
+                RenderQuality.Current.TaaSharpness);
         }
         else
         {

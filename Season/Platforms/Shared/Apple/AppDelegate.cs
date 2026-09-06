@@ -478,7 +478,15 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         // register the FXAA Post pair, PostColor plus RenderPost, mirrored with WindowsApp.
         // Uber composition moves into the Post pass, and FinalBlit degenerates into FXAA resolve,
         // see the contract-1 revision in RenderQuality 1-4.
-        if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
+        // 2-3 clause 17: the TAA tier takes the same slot when TaaSharpness is above zero, because a
+        // display-referred sharpener has nowhere else to run - the compute resolve happens in linear HDR,
+        // and RCAS measures its headroom against display white. FinalBlit then degenerates into RCAS instead
+        // of FXAA; RenderPostPass forwards SceneColorOverride, and the Post pass runs after the AfterScene
+        // phase, so it reads the resolve output of the current frame rather than SceneColor.
+        // In tiers that ask for neither, both remain null, leaving no residue in the pipeline.
+        if ((RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
+                || (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa
+                    && RenderQuality.Current.TaaSharpness > 0f))
             && Season.Rendering.FrameSchedule.SceneColor != null)
         {
             Season.Rendering.FrameSchedule.PostColor = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc

@@ -2669,7 +2669,7 @@ internal unsafe class Graphics : IGraphics
     /// <summary>2-3 contract clause 12:
     /// the scene source is resolved and forwarded through FrameSchedule.SceneColorOverride
     /// (the resolve output under the TAA tier).
-    /// Under the FXAA tier this entry point has already degenerated into an FXAA resolve
+    /// Whenever the Post slot is active this entry point has already degenerated into a resolve
     /// because composition is finished inside Post,
     /// so scene override only takes effect in RenderPostPass.
     /// Phase 4: when Outline2D is active, also forward the mask RT
@@ -2677,12 +2677,13 @@ internal unsafe class Graphics : IGraphics
     public void BlitToBackbuffer(Season.Rendering.RenderTarget src)
     {
         // 2-1 Step D: when the source is the LDR PostColor produced by the post uber pass
-        // (luma stored in alpha), present through the FXAA variant.
+        // (luma stored in alpha), present through the resolve variant of the tier that owns the slot
+        // (FXAA for 2-1, RCAS for clause 17 of 2-3).
         // This is mutually exclusive with tonemap/bloom because composition already finished in Post,
         // mirroring Windows/Graphics.cs.
         if (ReferenceEquals(src, Season.Rendering.FrameSchedule.PostColor))
         {
-            Vulkan.Device.BlitToBackbuffer(src, null, fxaa: true,
+            Vulkan.Device.BlitToBackbuffer(src, null, RenderQuality.PostResolveFilter(),
                 outlineMask: _outline2DFrameActive ? _outlineMaskTarget : null,
                 outlineWidth: _outline2DFrameWidth);
             return;

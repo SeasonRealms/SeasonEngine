@@ -1091,22 +1091,28 @@ internal unsafe static class Device
     /// When the source is an HDR RT, Rgba16Float, it automatically switches to the tonemap variant, step B of 1-4, exposure push constant plus ACES plus gamma.
     /// In step D of 2-1, when bloomTex is non-null and ready, and tonemap is required, it switches to the tonemap-plus-bloom variant.
     /// Dispatch has already transitioned it into sampling state, so this path still uses zero barriers.
-    /// When fxaa=true, where the source is the LDR PostColor output of the Post uber pass and luma is stored in alpha,
-    /// it switches to the FXAA present path instead, with texel size pushed every frame and no resize-time rebuild needed.
+    /// When resolve is not Copy, where the source is the LDR PostColor output of the Post uber pass and luma is stored in alpha,
+    /// it switches to the matching resolve present path instead, FXAA for the 2-1 tier and RCAS for clause 17 of 2-3,
+    /// with texel size pushed every frame and no resize-time rebuild needed.
     /// This is mutually exclusive with tonemap and bloom because composition already finished in Post.
     /// Under contract clause 12 of 2-3, when sceneTex is non-null and ready, the TAA resolve output becomes the scene source instead.
     /// Variant selection is still decided from srcRT description.
     /// That storage texture matches SceneColor in size and rgba16float format, and TaaEffect already self-bypasses instead of publishing on size mismatch.
     /// This mirrors DX Device.BlitToBackbuffer.
     /// </summary>
-    internal static void BlitToBackbuffer(Season.Rendering.RenderTarget source, Texture? bloomTex = null, bool fxaa = false, Texture? aoTex = null,
+    internal static void BlitToBackbuffer(Season.Rendering.RenderTarget source, Texture? bloomTex = null,
+        Season.Rendering.PostResolve resolve = Season.Rendering.PostResolve.Copy, Texture? aoTex = null,
         Texture? sceneTex = null, VKRenderTarget? outlineMask = null, float outlineWidth = 0f)
     {
         var rt = (VKRenderTarget)source;
 
-        if (fxaa)
+        if (resolve != Season.Rendering.PostResolve.Copy)
         {
-            BlitPipeline.RecordFxaa(GraphicsCommandBuffer, rt.SampleDescriptorSet, 1f / rt.Width, 1f / rt.Height);
+            if (resolve == Season.Rendering.PostResolve.Rcas)
+                BlitPipeline.RecordRcas(GraphicsCommandBuffer, rt.SampleDescriptorSet, 1f / rt.Width, 1f / rt.Height,
+                    RenderQuality.Current.TaaSharpness);
+            else
+                BlitPipeline.RecordFxaa(GraphicsCommandBuffer, rt.SampleDescriptorSet, 1f / rt.Width, 1f / rt.Height);
             if (outlineMask != null)
                 BlitPipeline.RecordOutlineComposite(GraphicsCommandBuffer, outlineMask.SampleDescriptorSet,
                     1f / outlineMask.Width, 1f / outlineMask.Height, outlineWidth);

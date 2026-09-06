@@ -2846,19 +2846,19 @@ internal unsafe class Graphics : IGraphics
     /// (the compute texture registry). Resolve it by name here and hand it to the static Device
     /// for composition; if it is unregistered or not ready, the Device falls back to the existing
     /// variant with no residue.
-    /// 2-1 Step C: when the source is PostColor (the FXAA-tier Post uber pass has already
-    /// completed composition), switch to the FXAA variant for presentation and skip bloom lookup.
+    /// 2-1 Step C: when the source is PostColor (the Post uber pass has already completed
+    /// composition), switch to the resolve variant for that tier and skip bloom lookup.
     /// 2-2 Step B: AO output is forwarded the same way through FrameSchedule.AoTexture
     /// (null = no AO, with no residue).
     /// 2-3 Contract clause 12: scene source is forwarded the same way through
-    /// FrameSchedule.SceneColorOverride (the TAA tier uses the resolve output). In the FXAA tier,
-    /// this entry point has already degenerated into FXAA resolve because composition finished in
-    /// Post, so overrides only take effect in RenderPostPass.</summary>
+    /// FrameSchedule.SceneColorOverride (the TAA tier uses the resolve output). Whenever the Post
+    /// slot is active this entry point has already degenerated into resolve because composition
+    /// finished in Post, so overrides only take effect in RenderPostPass.</summary>
     public void BlitToBackbuffer(Season.Rendering.RenderTarget src)
     {
         if (ReferenceEquals(src, Season.Rendering.FrameSchedule.PostColor))
         {
-            DirectX.Device.BlitToBackbuffer(src, null, fxaa: true,
+            DirectX.Device.BlitToBackbuffer(src, null, RenderQuality.PostResolveFilter(),
                 outlineMask: _outline2DFrameActive ? _outlineMaskTarget : null,
                 outlineWidth: _outline2DFrameWidth);
             return;

@@ -1283,6 +1283,8 @@ fn fs_main_outline_mask(input: VertexOutput) -> @location(0) vec4f {
     ///     and the FXAA variant used for FinalBlit resolve, textually ported from the DX reference implementation,
     ///     using binding 4 point-sampler neighborhood taps and binding 1 linear directional taps.
     ///     Parameters are unified in binding 2 vec4f (x=exposure, y=bloomIntensity, zw=texelSize).
+    ///   - 2-3 clause 17: the RCAS variant, the other FinalBlit resolve, reading x as sharpness instead of exposure
+    ///     (see the fs_rcas comment for why that reuse is safe rather than a shortcut).
     ///   - 2-2 Step C (aligned with DX 2-2 Step B): six AO variants
     ///     (tonemap±bloom × point/linear + uber±bloom), where AO occlusion is multiplied in linear space before ACES and bloom is then added
     ///     (scene × mix(1, ao, aoIntensity) + bloom × bloomIntensity, so AO darkens only the scene and not bloom).
@@ -1493,6 +1495,63 @@ fn ApplyAo(scene : vec3f, uv : vec2f) -> vec3f {
     }
 
     return vec4f(result.rgb, 1.0);
+}
+
+// ── RCAS variant (2-3 clause 17, the other FinalBlit resolve):
+// FSR1 RCAS, ported from FsrRcasF in ffx_fsr1.h and textually identical to the DX reference implementation.
+// The source is the same LDR uber output fs_fxaa reads, and that is a hard requirement rather than convenience:
+// the limiter below measures headroom against display white as a literal 1.0, which only holds once the uber pass
+// has tonemapped and gamma encoded. Run against scene-referred HDR the (1 - mx4) term goes negative and the filter inverts.
+// Parameter reuse: binding 2 x carries sharpness here instead of exposure. This block already means different things
+// per variant (zw is texelSize only for the resolve variants), and an LDR source has no exposure to apply, which is why
+// the FXAA path already writes zero into that slot. The JS RCAS branch is the only writer for this pipeline.
+// Only binding 0, 2 and 4 are referenced, so the auto layout is narrower than the FXAA one and needs its own bind group.
+@fragment fn fs_rcas(@location(0) uv : vec2f) -> @location(0) vec4f {
+    // FSR1's FSR_RCAS_LIMIT. 0.25 is the lobe at which the 4-tap ring would start to ring;
+    // 1/16 is the slack FSR1 keeps below it.
+    let RCAS_LIMIT = 0.25 - 1.0 / 16.0;
+
+    // Guard for the two neighbourhoods where FSR1's reciprocals divide by zero: an all-black ring (mx4 = 0)
+    // and an all-white one (mn4 = 1, which also zeroes the second numerator into 0/0). It goes in the denominators
+    // only, which yields 0 for both - the same no-sharpening answer FSR1 already gives for every other ring with
+    // mn4 = 0 or mx4 = 1, so this is the faithful one-sided limit rather than an invented case. Adding it to the
+    // numerators instead would make a black ring report hitMin = 1 and amplify an isolated bright pixel 4x.
+    // Away from those two points it only perturbs rings darker than 1e-4, far below one 8-bit code value of the target.
+    let RCAS_EPS = 1.0 / 32768.0;
+
+    let rcpFrame = tonemapParams.zw;
+
+    // Cross neighbourhood, point sampled at 1:1 (the same texel-load-through-uv fs_fxaa relies on;
+    // textureSampleLevel at mip 0 for the same reason it uses it).
+    //     b
+    //   d e f
+    //     h
+    let e = textureSampleLevel(srcTex, pointSampler, uv, 0.0).rgb;
+    let b = textureSampleLevel(srcTex, pointSampler, uv + vec2f( 0.0, -1.0) * rcpFrame, 0.0).rgb;
+    let d = textureSampleLevel(srcTex, pointSampler, uv + vec2f(-1.0,  0.0) * rcpFrame, 0.0).rgb;
+    let f = textureSampleLevel(srcTex, pointSampler, uv + vec2f( 1.0,  0.0) * rcpFrame, 0.0).rgb;
+    let h = textureSampleLevel(srcTex, pointSampler, uv + vec2f( 0.0,  1.0) * rcpFrame, 0.0).rgb;
+
+    // The ring only, deliberately excluding the centre: the question the limiter asks is how far e may be pushed
+    // away from its neighbours, so letting e into the extents would license its own displacement.
+    let mn4 = min(min(b, d), min(f, h));
+    let mx4 = max(max(b, d), max(f, h));
+
+    // Headroom towards black and towards white expressed in units of the lobe weight; both are non-positive after
+    // the max, and the tightest of the three channels decides, so no channel can be pushed out of range.
+    let hitMin = mn4 / (4.0 * mx4 + RCAS_EPS);
+    let hitMax = (1.0 - mx4) / (4.0 * mn4 - 4.0 - RCAS_EPS);
+    let lobeRgb = max(-hitMin, hitMax);
+    let lobe = max(-RCAS_LIMIT, min(max(lobeRgb.r, max(lobeRgb.g, lobeRgb.b)), 0.0)) * tonemapParams.x;
+
+    // FSR_RCAS_DENOISE is deliberately not ported rather than overlooked: it is FSR1's opt-in for noisy input,
+    // and this input is a temporally converged TAA resolve. The divide needs no guard because lobe is clamped into
+    // [-RCAS_LIMIT, 0], which keeps 4 * lobe + 1 inside [0.25, 1].
+    let result = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
+
+    // RCAS is not bounded by construction; FSR1 leans on the UNORM render target to clamp it. The backbuffer does
+    // clamp, but clamping here states the dependency instead of inheriting it from a format.
+    return vec4f(clamp(result, vec3f(0.0), vec3f(1.0)), 1.0);
 }
 
 // ── Outline-composite variant (Phase 4, used by FinalBlit, textually ported from DX PSMainOutlineComposite):

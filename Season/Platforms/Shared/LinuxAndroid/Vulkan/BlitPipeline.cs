@@ -30,6 +30,9 @@ namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 ///   so AO darkens only the scene and not bloom.
 ///   The AO texture lives on set=2, reusing the third set layout and always sampled linearly from the half-resolution GTAO r-channel output,
 ///   scaled by AoIntensity, the fifth push-constant component, expanding the block to 20 bytes.
+/// Clause 17 of 2-3 adds an RCAS variant alongside the FXAA one: the same uber output, resolved with FSR1 sharpening
+///   instead of edge blending when the TAA tier owns the Post slot. It reuses the FXAA texel-size components and takes
+///   its lobe scale from the seventh push-constant component, expanding the block to 28 bytes.
 ///
 /// PSOs are baked against Display.RenderPass, the backbuffer render pass, which includes a depth attachment even though this pipeline disables both depth test and depth write.
 /// The FinalBlit pass reuses the backbuffer render pass and framebuffer directly, with no need for a separate color-only render pass.
@@ -77,6 +80,8 @@ internal static unsafe class BlitPipeline
 
     static VkPipeline _pipelineFxaa;
 
+    static VkPipeline _pipelineRcas;
+
     static VkPipeline _pipelineTonemapAoPoint;
 
     static VkPipeline _pipelineTonemapAoLinear;
@@ -111,6 +116,7 @@ internal static unsafe class BlitPipeline
         _pipelineUber = CreatePipelineState(FragmentUberGlsl, "blit_uber.frag");
         _pipelineUberBloom = CreatePipelineState(FragmentUberBloomGlsl, "blit_uber_bloom.frag");
         _pipelineFxaa = CreatePipelineState(FragmentFxaaGlsl, "blit_fxaa.frag");
+        _pipelineRcas = CreatePipelineState(FragmentRcasGlsl, "blit_rcas.frag");
         _pipelineTonemapAoPoint = CreatePipelineState(FragmentTonemapAoPointGlsl, "blit_tonemap_ao_point.frag");
         _pipelineTonemapAoLinear = CreatePipelineState(FragmentTonemapAoLinearGlsl, "blit_tonemap_ao_linear.frag");
         _pipelineTonemapBloomAoPoint = CreatePipelineState(FragmentTonemapBloomAoPointGlsl, "blit_tonemap_bloom_ao_point.frag");
@@ -290,6 +296,18 @@ internal static unsafe class BlitPipeline
         Device.Vk.CmdDraw(cmd, 3, 1, 0, 0);
     }
 
+    /// <summary>Clause 17 of 2-3: present RCAS inside FinalBlit, with the same LDR PostColor source RecordFxaa reads,
+    /// alpha luma simply left unread. Sharpness is pushed every frame because RenderQuality.TaaSharpness is a runtime knob.
+    /// Mirrors DX BlitPipeline.DrawRcas.</summary>
+    public static void RecordRcas(CommandBuffer cmd, DescriptorSet sourceSet, float texelSizeX, float texelSizeY,
+        float sharpness)
+    {
+        Device.Vk.CmdBindPipeline(cmd, PipelineBindPoint.Graphics, _pipelineRcas);
+        Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 0, 1, in sourceSet, 0, null);
+        PushParams(cmd, 0f, 0f, texelSizeX, texelSizeY, 0f, 0f, sharpness);
+        Device.Vk.CmdDraw(cmd, 3, 1, 0, 0);
+    }
+
     /// <summary>Phase 4: Outline2D composition, appended after scene blit inside the same backbuffer pass.
     /// The mask is bound on set=0 using point sampling, where pixels inside the mask keep alpha at 1 and RGB as the outline color of the owning group, allowing multiple colors in the same frame.
     /// Step equals texel times max(width, 1.0), and the RGB of the sample with the largest alpha among the 8 neighbors becomes the outline color.
@@ -304,13 +322,13 @@ internal static unsafe class BlitPipeline
         Device.Vk.CmdDraw(cmd, 3, 1, 0, 0);
     }
 
-    /// <summary>Push the full 24-byte constant block, mirroring the six constants of DX b0.
+    /// <summary>Push the full 28-byte constant block, mirroring the seven constants of DX b0.
     /// Variants that declare the block must receive the full push to satisfy validation layers.</summary>
     static void PushParams(CommandBuffer cmd, float exposure, float bloomIntensity, float texelSizeX, float texelSizeY,
-        float aoIntensity, float outlineWidth = 0f)
+        float aoIntensity, float outlineWidth = 0f, float sharpness = 0f)
     {
-        var p = stackalloc float[6] { exposure, bloomIntensity, texelSizeX, texelSizeY, aoIntensity, outlineWidth };
-        Device.Vk.CmdPushConstants(cmd, PipelineLayout, ShaderStageFlags.FragmentBit, 0, 6 * sizeof(float), p);
+        var p = stackalloc float[7] { exposure, bloomIntensity, texelSizeX, texelSizeY, aoIntensity, outlineWidth, sharpness };
+        Device.Vk.CmdPushConstants(cmd, PipelineLayout, ShaderStageFlags.FragmentBit, 0, 7 * sizeof(float), p);
     }
 
     static Sampler CreateSampler(Filter filter)
@@ -379,14 +397,14 @@ internal static unsafe class BlitPipeline
         // set 2 = AO texture for step C of 2-2.
         // All three use the same layout, and only the variants that statically reference them bind them, which is valid, mirroring the three t0/t1/t2 tables in the DX root signature.
         var setLayouts = stackalloc DescriptorSetLayout[3] { SetLayout, SetLayout, SetLayout };
-        // The 24-byte push constant block contains exposure, BloomIntensity, texelSizeX/Y, AoIntensity, and outlineWidth, mirroring the six constants of DX b0.
-        // It is consumed by tonemap, bloom, ao, uber, FXAA, and composite variants.
+        // The 28-byte push constant block contains exposure, BloomIntensity, texelSizeX/Y, AoIntensity, outlineWidth, and sharpness, mirroring the seven constants of DX b0.
+        // It is consumed by tonemap, bloom, ao, uber, FXAA, RCAS, and composite variants.
         // Ordinary variants declare nothing and receive no push, and the shared layout range remains harmless to them.
         var pushRange = new PushConstantRange
         {
             StageFlags = ShaderStageFlags.FragmentBit,
             Offset = 0,
-            Size = 6 * sizeof(float)
+            Size = 7 * sizeof(float)
         };
         var info = new PipelineLayoutCreateInfo
         {
@@ -600,17 +618,18 @@ void main()
 ";
 
     // Shared push-constant block:
-    // expanded to 16 bytes in step D of 2-1 and to 20 bytes in step C of 2-2, mirroring the five constants of DX b0.
+    // expanded to 16 bytes in step D of 2-1, to 20 bytes in step C of 2-2, and to 28 bytes in clause 17 of 2-3, mirroring the seven constants of DX b0.
     // Tonemap variants read exposure, bloom variants additionally read bloomIntensity,
-    // FXAA variants read texelSizeX/Y, and AO variants additionally read aoIntensity.
+    // FXAA and RCAS variants read texelSizeX/Y, AO variants additionally read aoIntensity, and the RCAS variant additionally reads sharpness.
     const string PushParamsGlsl = @"
 layout(push_constant) uniform BlitParams {
     float exposure;       // Linear exposure multiplier, Device.HdrExposure.
     float bloomIntensity; // 2-1: bloom composition factor, RenderQuality.BloomIntensity, referenced only by bloom and uber variants.
-    float texelSizeX;     // Step D of 2-1: FXAA source-texture texel size, referenced only by FXAA variants.
+    float texelSizeX;     // Step D of 2-1: FXAA source-texture texel size, also used by the RCAS variant of 2-3.
     float texelSizeY;
     float aoIntensity;    // Step C of 2-2: AO occlusion strength, RenderQuality.AoIntensity, referenced only by AO variants.
     float outlineWidth;   // Phase 4: outline-composite step size in pixels, referenced only by composite variants.
+    float sharpness;      // Clause 17 of 2-3: RCAS lobe scale, RenderQuality.TaaSharpness, referenced only by the RCAS variant.
 };
 ";
 
@@ -973,6 +992,69 @@ void main()
     }
 
     outColor = vec4(result.rgb, 1.0);
+}
+";
+
+    // RCAS variant, clause 17 of 2-3: FSR1 RCAS, ported from FsrRcasF in ffx_fsr1.h and kept line-for-line
+    // identical to the DX PSMainRcas reference. Source is the same LDR uber output the FXAA variant reads,
+    // and that is a hard requirement rather than convenience: the limiter measures headroom against display
+    // white as a literal 1.0, which only holds once the uber pass has tonemapped and gamma encoded.
+    // Run against scene-referred HDR the (1.0 - mx4) term goes negative and the filter inverts.
+    // Sampling uses binding 0, the nearest sampler, so uv offsets are texel loads at 1:1, matching FXAA precedent.
+    static readonly string FragmentRcasGlsl = @"#version 460
+
+layout(binding = 0) uniform sampler2D srcTex;
+
+layout(location = 0) in vec2 vUv;
+
+layout(location = 0) out vec4 outColor;
+" + PushParamsGlsl + @"
+void main()
+{
+    // FSR1's FSR_RCAS_LIMIT. 0.25 is the lobe at which the 4-tap ring would start to ring;
+    // 1/16 is the slack FSR1 keeps below it.
+    const float RCAS_LIMIT = 0.25 - 1.0 / 16.0;
+
+    // Guard for the two neighbourhoods where FSR1's reciprocals divide by zero:
+    // an all-black ring, mx4 = 0, and an all-white one, mn4 = 1, which also zeroes the second numerator into 0/0.
+    // It goes in the denominators only, which yields 0 for both, the same no-sharpening answer FSR1 already gives
+    // for every other ring with mn4 = 0 or mx4 = 1, so this is the faithful one-sided limit rather than an invented case.
+    // Adding it to the numerators instead would make a black ring report hitMin = 1 and amplify an isolated bright pixel 4x.
+    const float RCAS_EPS = 1.0 / 32768.0;
+
+    vec2 rcpFrame = vec2(texelSizeX, texelSizeY);
+    vec2 uv = vUv;
+
+    // Cross neighbourhood:
+    //     b
+    //   d e f
+    //     h
+    vec3 e = texture(srcTex, uv).rgb;
+    vec3 b = texture(srcTex, uv + vec2( 0.0, -1.0) * rcpFrame).rgb;
+    vec3 d = texture(srcTex, uv + vec2(-1.0,  0.0) * rcpFrame).rgb;
+    vec3 f = texture(srcTex, uv + vec2( 1.0,  0.0) * rcpFrame).rgb;
+    vec3 h = texture(srcTex, uv + vec2( 0.0,  1.0) * rcpFrame).rgb;
+
+    // The ring only, deliberately excluding the centre: the question the limiter asks is how far e may be pushed
+    // away from its neighbours, so letting e into the extents would license its own displacement.
+    vec3 mn4 = min(min(b, d), min(f, h));
+    vec3 mx4 = max(max(b, d), max(f, h));
+
+    // Headroom towards black and towards white expressed in units of the lobe weight; both are non-positive
+    // after the max, and the tightest of the three channels decides, so no channel can be pushed out of range.
+    vec3 hitMin = mn4 / (4.0 * mx4 + RCAS_EPS);
+    vec3 hitMax = (1.0 - mx4) / (4.0 * mn4 - 4.0 - RCAS_EPS);
+    vec3 lobeRgb = max(-hitMin, hitMax);
+    float lobe = max(-RCAS_LIMIT, min(max(lobeRgb.r, max(lobeRgb.g, lobeRgb.b)), 0.0)) * sharpness;
+
+    // FSR_RCAS_DENOISE is deliberately not ported rather than overlooked: it is FSR1's opt-in for noisy input,
+    // and this input is a temporally converged TAA resolve. The divide needs no guard because lobe is clamped
+    // into [-RCAS_LIMIT, 0], which keeps 4.0 * lobe + 1.0 inside [0.25, 1].
+    vec3 result = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
+
+    // RCAS is not bounded by construction; FSR1 leans on the UNORM render target to clamp it.
+    // The backbuffer does clamp, but clamping here states the dependency instead of inheriting it from a format.
+    outColor = vec4(clamp(result, vec3(0.0), vec3(1.0)), 1.0);
 }
 ";
 }

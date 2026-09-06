@@ -1117,10 +1117,11 @@ internal unsafe class Graphics : IGraphics
 
     /// <summary>Step D of 2-3, contract clause 12:
     /// this entry point is the last HDR-to-LDR composition point before presentation, and the scene source may be overridden by SceneColorOverride, the TAA resolve output.
-    /// Under the FXAA tier this entry has already degenerated into FXAA resolve because composition moved into Post,
+    /// Whenever the Post slot is active this entry has already degenerated into a resolve because composition moved into Post,
     /// and the override becomes effective in RenderPostPass instead.
-    /// Taa and Fxaa are mutually exclusive, so only one path can be active.
-    /// In phase 4, Outline2D composition runs immediately after scene blit or FXAA in both branches, mirrored with DX and VK.</summary>
+    /// Clause 17 of 2-3 makes the TAA tier claim that slot too, so which resolve runs is decided by RenderQuality.PostResolveFilter
+    /// rather than assumed to be FXAA.
+    /// In phase 4, Outline2D composition runs immediately after scene blit or the resolve in both branches, mirrored with DX and VK.</summary>
     public void BlitToBackbuffer(Season.Rendering.RenderTarget src)
     {
         if (src is not MTLRenderTarget rt) return;
@@ -1128,11 +1129,24 @@ internal unsafe class Graphics : IGraphics
         if (enc == null) return;
         // Step D of 2-1:
         // when the source is PostColor, where the uber pass already closed tonemap plus bloom and luma is stored in alpha,
-        // run the FXAA resolve path.
+        // run the resolve path for the tier that owns the slot.
         // Otherwise keep the direct tonemap plus optional bloom presentation path, mirrored with Windows/Graphics.cs.
         if (ReferenceEquals(src, Season.Rendering.FrameSchedule.PostColor))
         {
-            BlitPipeline.DrawFxaa(enc, rt);
+            switch (RenderQuality.PostResolveFilter())
+            {
+                case Season.Rendering.PostResolve.Rcas:
+                    BlitPipeline.DrawRcas(enc, rt);
+                    break;
+                case Season.Rendering.PostResolve.Fxaa:
+                    BlitPipeline.DrawFxaa(enc, rt);
+                    break;
+                default:
+                    // Copy: PostColor is BackbufferCompatible and matches the backbuffer size, so Draw resolves to the
+                    // point variant, a straight texel copy, matching what the DX and VK Copy arms present.
+                    BlitPipeline.Draw(enc, rt);
+                    break;
+            }
             if (_outline2DFrameActive && _outlineMaskTarget != null)
                 BlitPipeline.DrawOutlineComposite(enc, _outlineMaskTarget, _outline2DFrameWidth);
             return;

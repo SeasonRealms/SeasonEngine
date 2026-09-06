@@ -500,9 +500,10 @@ public static class WindowsApp
             // (both input and output are rgba16float), so it depends on the HDR offscreen path.
             // If unavailable, fall back to Fxaa here, and let the next block continue validating
             // Fxaa's own HDR dependency.
-            // Note: the Taa tier does not create PostColor (only the Fxaa tier does below), so
-            // composition still happens in FinalBlit, where TaaEffect output is injected through
-            // SceneColorOverride (clause 12).
+            // Note: whether the Taa tier creates PostColor depends on TaaSharpness (clause 17).
+            // With sharpening off, composition still happens in FinalBlit, where TaaEffect output
+            // is injected through SceneColorOverride (clause 12); with it on, the Post slot below
+            // moves composition upstream and SceneColorOverride is consumed there instead.
             // Registration failure of TaaEffect itself does not trigger fallback here because it
             // has its own bypass path (TaaActive/SceneColorOverride remain false/null), so the
             // image falls back to non-TAA SceneColor without jitter (clauses 14/15).
@@ -621,8 +622,15 @@ public static class WindowsApp
         // Once PostColor (LDR, same format and size as the backbuffer) and RenderPost
         // (uber pass: tonemap + bloom composition, luma written into alpha) are registered as a pair,
         // FrameSchedule inserts the Post pass automatically and FinalBlit degenerates into FXAA presentation.
-        // In non-FXAA tiers both remain null, leaving no residue in the pipeline.
-        if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
+        // 2-3 clause 17: the TAA tier takes the same slot when TaaSharpness is above zero, because a
+        // display-referred sharpener has nowhere else to run - the compute resolve happens in linear HDR,
+        // and RCAS measures its headroom against display white. FinalBlit then degenerates into RCAS instead
+        // of FXAA; RenderPostPass forwards SceneColorOverride, and the Post pass runs after the AfterScene
+        // phase, so it reads the resolve output of the current frame rather than SceneColor.
+        // In tiers that ask for neither, both remain null, leaving no residue in the pipeline.
+        if ((RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
+                || (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa
+                    && RenderQuality.Current.TaaSharpness > 0f))
             && Season.Rendering.FrameSchedule.SceneColor != null)
         {
             Season.Rendering.FrameSchedule.PostColor = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc

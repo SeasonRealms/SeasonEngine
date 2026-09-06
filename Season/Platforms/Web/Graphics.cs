@@ -652,15 +652,20 @@ internal class Graphics : IGraphics
     {
         if (!_initialized) return;
         // 2-1 Step D: when the source is the LDR PostColor produced by the post uber pass
-        // (luma stored in alpha), switch to the FXAA variant for presentation. This is mutually exclusive
-        // with tonemap/bloom because composition has already completed in Post, matching Windows/Graphics.cs.
+        // (luma stored in alpha), switch to the resolve variant of the tier that registered the slot. This is
+        // mutually exclusive with tonemap/bloom because composition has already completed in Post, matching
+        // Windows/Graphics.cs.
+        // 2-3 clause 17: which resolve runs comes from RenderQuality.PostResolveFilter, so the TAA tier gets RCAS
+        // where the FXAA tier gets FXAA, and sharpness rides along for the RCAS variant only.
         // 2-3: along this path, the HDR→LDR composition point already happened inside the post uber pass
         // (where the override was consumed), so no override is applied here.
         // Phase 4: when Outline2D is active, also pass through the mask RT and the frame-level max width so
         // the JS blit path can do the final on-screen composition.
         if (ReferenceEquals(src, Season.Rendering.FrameSchedule.PostColor))
         {
-            WebGPUInterop.BlitToBackbuffer(((WGPURenderTarget)src).Name, 0f, null, 0f, fxaa: true, null, 0f, null,
+            WebGPUInterop.BlitToBackbuffer(((WGPURenderTarget)src).Name, 0f, null, 0f,
+                resolve: (int)RenderQuality.PostResolveFilter(),
+                sharpness: RenderQuality.Current.TaaSharpness, null, 0f, null,
                 _outline2DFrameActive ? _outlineMaskTarget?.Name : null, _outline2DFrameWidth);
             return;
         }
@@ -670,14 +675,15 @@ internal class Graphics : IGraphics
         // source is LDR and the tonemap variant does not apply.
         // 2-2 Step C: the AO chain output is also passed by name (JS switches to the AO variant only when
         // the source is HDR and the resource resolves; otherwise it falls back automatically).
-        // 2-3 Clause 12: without the FXAA tier, this is the last HDR→LDR composition point before present,
-        // so the scene source switches to the override here.
+        // 2-3 Clause 12: with no tier owning the Post slot, this is the last HDR→LDR composition point before
+        // present, so the scene source switches to the override here.
         WebGPUInterop.BlitToBackbuffer(
             ((WGPURenderTarget)src).Name,
             RenderQuality.Current.HdrExposure,
             Season.Rendering.FrameSchedule.BloomTexture,
             RenderQuality.Current.BloomIntensity,
-            fxaa: false,
+            resolve: (int)Season.Rendering.PostResolve.Copy,
+            sharpness: 0f,
             Season.Rendering.FrameSchedule.AoTexture,
             RenderQuality.Current.AoIntensity,
             ResolveSceneOverrideName(),
@@ -685,11 +691,11 @@ internal class Graphics : IGraphics
             _outline2DFrameWidth);
     }
 
-    /// <summary>2-1 Step D: contents of the Post pass (FrameSchedule.RenderPost callback; the FXAA tier and
-    /// PostColor are registered together): the uber pass composites tonemap(+bloom) into LDR PostColor and
-    /// packs luma into alpha. After composition moved here, FinalBlit degraded into FXAA resolve; see the
+    /// <summary>2-1 Step D: contents of the Post pass (FrameSchedule.RenderPost callback; the tier that owns the Post
+    /// slot and PostColor are registered together): the uber pass composites tonemap(+bloom) into LDR PostColor and
+    /// packs luma into alpha. After composition moved here, FinalBlit degraded into a resolve; see the
     /// RenderQuality 1-4 Contract 1 revision (mirrors Windows/Graphics.cs).
-    /// 2-3 Clause 12: under the FXAA tier, this becomes the last HDR→LDR composition point before present,
+    /// 2-3 Clause 12: whenever that slot is active, this becomes the last HDR→LDR composition point before present,
     /// so the scene source also resolves through the override here.</summary>
     internal void RenderPostPass(Season.Basic.IGraphics g, Season.Rendering.RenderTarget sceneColor)
     {

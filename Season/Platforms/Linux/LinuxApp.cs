@@ -283,9 +283,16 @@ public static class LinuxApp
         // while writing luma into alpha.
         // Once both are registered, FrameSchedule inserts the Post pass automatically,
         // and FinalBlit degenerates into the FXAA present pass.
-        // Under non-FXAA tiers both remain null, leaving no residual path,
+        // Clause 17 of 2-3: the TAA tier takes the same slot when TaaSharpness is above zero, because a
+        // display-referred sharpener has nowhere else to run - the compute resolve happens in linear HDR,
+        // and RCAS measures its headroom against display white. FinalBlit then degenerates into RCAS instead
+        // of FXAA; RenderPostPass forwards SceneColorOverride, and the Post pass runs after the AfterScene
+        // phase, so it reads the resolve output of the current frame rather than SceneColor.
+        // Under tiers that ask for neither, both remain null, leaving no residual path,
         // mirroring WindowsApp.
-        if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
+        if ((RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
+                || (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa
+                    && RenderQuality.Current.TaaSharpness > 0f))
             && Season.Rendering.FrameSchedule.SceneColor != null)
         {
             Season.Rendering.FrameSchedule.PostColor = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc

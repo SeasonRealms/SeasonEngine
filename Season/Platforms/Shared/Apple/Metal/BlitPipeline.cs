@@ -130,13 +130,17 @@ fragment float4 blit_fs_linear_tonemap(BlitVSOut vsOut [[stage_in]],
 // The parameter block is 16 bytes and matches the layout of VK push constants and DX root constants.
 // It is delivered through SetFragmentBytes at buffer 0.
 // Step C of 2-2 expands it to 20 bytes by appending aoIntensity, without affecting float2 alignment.
+// Clause 17 of 2-3 appends sharpness plus an explicit trailing pad, so the block is 32 bytes and the C# push length
+// equals sizeof(BlitParams) exactly rather than stopping short of the struct MSL lays out.
 struct BlitParams
 {
     float exposure;       // Linear exposure multiplier from Device.HdrExposure.
     float bloomIntensity; // Bloom composition coefficient from RenderQuality.BloomIntensity, used only by bloom and uber variants.
-    float2 texelSize;     // Source-texture texel size for FXAA, used only by FXAA variants.
+    float2 texelSize;     // Source-texture texel size for FXAA, also used by the RCAS variant of 2-3.
     float aoIntensity;    // Step C of 2-2: AO occlusion intensity from RenderQuality.AoIntensity, used only by AO variants.
     float outlineWidth;   // Phase 4: outline width in screen pixels for Outline2D composition, used only by outline_composite.
+    float sharpness;      // Clause 17 of 2-3: RCAS lobe scale from RenderQuality.TaaSharpness, used only by blit_fs_rcas.
+    float blitPad;        // Trailing pad: float2 alignment rounds the struct up to 32 bytes, and the push must cover all of it.
 };
 
 // Tonemap plus bloom:
@@ -344,6 +348,63 @@ fragment float4 blit_fs_fxaa(BlitVSOut vsOut [[stage_in]],
     return float4(result.rgb, 1.0);
 }
 
+// ---- Clause 17 of 2-3: RCAS variant used by FinalBlit ----
+// FSR1 RCAS, ported from FsrRcasF in ffx_fsr1.h and kept line-for-line identical to the DX PSMainRcas reference.
+// Source is the same LDR uber output blit_fs_fxaa reads, and that is a hard requirement rather than convenience:
+// the limiter measures headroom against display white as a literal 1.0, which only holds once the uber pass has
+// tonemapped and gamma encoded. Run against scene-referred HDR the (1.0 - mx4) term goes negative and the filter inverts.
+// Only sampler 0, point, is used, so uv offsets are texel loads at 1:1, matching the FXAA precedent.
+fragment float4 blit_fs_rcas(BlitVSOut vsOut [[stage_in]],
+                             constant BlitParams& params [[buffer(0)]],
+                             texture2d<float> srcTex [[texture(0)]],
+                             sampler pointSampler [[sampler(0)]])
+{
+    // FSR1's FSR_RCAS_LIMIT. 0.25 is the lobe at which the 4-tap ring would start to ring;
+    // 1/16 is the slack FSR1 keeps below it.
+    const float RCAS_LIMIT = 0.25 - 1.0 / 16.0;
+
+    // Guard for the two neighborhoods where FSR1's reciprocals divide by zero:
+    // an all-black ring, mx4 = 0, and an all-white one, mn4 = 1, which also zeroes the second numerator into 0/0.
+    // It goes in the denominators only, which yields 0 for both, the same no-sharpening answer FSR1 already gives
+    // for every other ring with mn4 = 0 or mx4 = 1, so this is the faithful one-sided limit rather than an invented case.
+    // Adding it to the numerators instead would make a black ring report hitMin = 1 and amplify an isolated bright pixel 4x.
+    const float RCAS_EPS = 1.0 / 32768.0;
+
+    float2 rcpFrame = params.texelSize;
+    float2 uv = vsOut.uv;
+
+    // Cross neighborhood:
+    //     b
+    //   d e f
+    //     h
+    float3 e = srcTex.sample(pointSampler, uv).rgb;
+    float3 b = srcTex.sample(pointSampler, uv + float2( 0.0, -1.0) * rcpFrame).rgb;
+    float3 d = srcTex.sample(pointSampler, uv + float2(-1.0,  0.0) * rcpFrame).rgb;
+    float3 f = srcTex.sample(pointSampler, uv + float2( 1.0,  0.0) * rcpFrame).rgb;
+    float3 h = srcTex.sample(pointSampler, uv + float2( 0.0,  1.0) * rcpFrame).rgb;
+
+    // The ring only, deliberately excluding the center: the question the limiter asks is how far e may be pushed
+    // away from its neighbors, so letting e into the extents would license its own displacement.
+    float3 mn4 = min(min(b, d), min(f, h));
+    float3 mx4 = max(max(b, d), max(f, h));
+
+    // Headroom towards black and towards white expressed in units of the lobe weight; both are non-positive
+    // after the max, and the tightest of the three channels decides, so no channel can be pushed out of range.
+    float3 hitMin = mn4 / (4.0 * mx4 + RCAS_EPS);
+    float3 hitMax = (1.0 - mx4) / (4.0 * mn4 - 4.0 - RCAS_EPS);
+    float3 lobeRgb = max(-hitMin, hitMax);
+    float lobe = max(-RCAS_LIMIT, min(max(lobeRgb.r, max(lobeRgb.g, lobeRgb.b)), 0.0)) * params.sharpness;
+
+    // FSR_RCAS_DENOISE is deliberately not ported rather than overlooked: it is FSR1's opt-in for noisy input,
+    // and this input is a temporally converged TAA resolve. The divide needs no guard because lobe is clamped
+    // into [-RCAS_LIMIT, 0], which keeps 4.0 * lobe + 1.0 inside [0.25, 1].
+    float3 result = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
+
+    // RCAS is not bounded by construction; FSR1 leans on the UNORM render target to clamp it.
+    // The backbuffer does clamp, but saturating here states the dependency instead of inheriting it from a format.
+    return float4(saturate(result), 1.0);
+}
+
 // ---- Phase 4: Outline2D mask composition variant, mirroring DX PSMainOutlineComposite ----
 // The mask in texture(0), sampled with point filtering, stores outline pixels as masked = (outlineColor.rgb, 1)
 // and cleared pixels as (0, 0, 0, 0).
@@ -394,6 +455,7 @@ fragment float4 blit_fs_outline_composite(BlitVSOut vsOut [[stage_in]],
     static IMTLRenderPipelineState? _psoUber;
     static IMTLRenderPipelineState? _psoUberBloom;
     static IMTLRenderPipelineState? _psoFxaa;
+    static IMTLRenderPipelineState? _psoRcas;
     static IMTLRenderPipelineState? _psoTonemapAo;
     static IMTLRenderPipelineState? _psoTonemapAoLinear;
     static IMTLRenderPipelineState? _psoTonemapBloomAo;
@@ -457,6 +519,7 @@ fragment float4 blit_fs_outline_composite(BlitVSOut vsOut [[stage_in]],
         _psoUber = CreatePso(library, "blit_vs", "blit_fs_uber", "Season-Post-Uber");
         _psoUberBloom = CreatePso(library, "blit_vs_linear", "blit_fs_uber_bloom", "Season-Post-UberBloom");
         _psoFxaa = CreatePso(library, "blit_vs_linear", "blit_fs_fxaa", "Season-FinalBlit-Fxaa");
+        _psoRcas = CreatePso(library, "blit_vs_linear", "blit_fs_rcas", "Season-FinalBlit-Rcas");
         // Step C of 2-2:
         // all AO variants use the linear vertex shader because AO upsampling requires uv.
         // The point path still performs an identity read through vsOut.pos with no behavioral difference.
@@ -503,13 +566,14 @@ fragment float4 blit_fs_outline_composite(BlitVSOut vsOut [[stage_in]],
             ?? throw new Exception("CreateSamplerState [FinalBlit point] failed");
     }
 
-    /// <summary>Pushes the 24-byte BlitParams block through buffer 0 with the same layout as VK push constants and DX root constants.
+    /// <summary>Pushes the 32-byte BlitParams block through buffer 0 with the same layout as VK push constants and DX root constants.
     /// Sending it every Draw guarantees that runtime parameter changes take effect immediately, per contract clause 5.
-    /// Phase 4 appends outlineWidth at the end.</summary>
-    static unsafe void SetParams(IMTLRenderCommandEncoder enc, float exposure, float bloomIntensity, float texelSizeX, float texelSizeY, float aoIntensity = 0f, float outlineWidth = 0f)
+    /// Phase 4 appends outlineWidth, and clause 17 of 2-3 appends sharpness plus the trailing pad that float2 alignment
+    /// already reserves inside the struct, so the pushed length matches sizeof(BlitParams) rather than falling short of it.</summary>
+    static unsafe void SetParams(IMTLRenderCommandEncoder enc, float exposure, float bloomIntensity, float texelSizeX, float texelSizeY, float aoIntensity = 0f, float outlineWidth = 0f, float sharpness = 0f)
     {
-        float* p = stackalloc float[6] { exposure, bloomIntensity, texelSizeX, texelSizeY, aoIntensity, outlineWidth };
-        enc.SetFragmentBytes((IntPtr)p, 6 * sizeof(float), 0);
+        float* p = stackalloc float[8] { exposure, bloomIntensity, texelSizeX, texelSizeY, aoIntensity, outlineWidth, sharpness, 0f };
+        enc.SetFragmentBytes((IntPtr)p, 8 * sizeof(float), 0);
     }
 
     /// <summary>Draws the full-screen triangle on the current pass encoder and presents the source color.
@@ -589,8 +653,8 @@ fragment float4 blit_fs_outline_composite(BlitVSOut vsOut [[stage_in]],
     /// Source and destination sizes always match because both use MatchBackbufferSize, so point reads stay valid.
     /// Step C of 2-2 switches to the uber AO variant when aoTex is ready.
     /// Contract clause 12 of 2-3 applies the same sceneTex override to the scene source.
-    /// Taa and Fxaa are currently mutually exclusive in practice, so they do not coexist,
-    /// but this path is kept to mirror DX and VK RenderPostUber one to one.</summary>
+    /// Clause 17 of 2-3 makes this path live under the TAA tier as well, which was previously only mirrored for parity
+    /// with the DX and VK RenderPostUber entries.</summary>
     public static void DrawUber(IMTLRenderCommandEncoder enc, MTLRenderTarget src, Texture? bloomTex = null, Texture? aoTex = null,
         Texture? sceneTex = null)
     {
@@ -635,6 +699,23 @@ fragment float4 blit_fs_outline_composite(BlitVSOut vsOut [[stage_in]],
         enc.SetFragmentSamplerState(_pointSampler!, 0);
         enc.SetFragmentSamplerState(_linearSampler!, 1);
         SetParams(enc, 0f, 0f, 1f / src.Width, 1f / src.Height);
+        enc.DrawPrimitives(MTLPrimitiveType.Triangle, 0, 3);
+    }
+
+    /// <summary>Clause 17 of 2-3 performs FinalBlit RCAS resolve, using the same PostColor source as DrawFxaa with the
+    /// alpha luma simply left unread. texelSize is the inverse source RT size and only sampler 0, point, is bound.
+    /// Sharpness is pushed every frame because RenderQuality.TaaSharpness is a runtime knob.</summary>
+    public static void DrawRcas(IMTLRenderCommandEncoder enc, MTLRenderTarget src)
+    {
+        if (src.ColorTexture == null) return;
+        EnsureInitialized();
+
+        enc.SetRenderPipelineState(_psoRcas!);
+        enc.SetDepthStencilState(_depthState!);
+        enc.SetCullMode(MTLCullMode.None);
+        enc.SetFragmentTexture(src.ColorTexture, 0);
+        enc.SetFragmentSamplerState(_pointSampler!, 0);
+        SetParams(enc, 0f, 0f, 1f / src.Width, 1f / src.Height, 0f, 0f, RenderQuality.Current.TaaSharpness);
         enc.DrawPrimitives(MTLPrimitiveType.Triangle, 0, 3);
     }
 

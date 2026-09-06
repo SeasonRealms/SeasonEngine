@@ -12,9 +12,9 @@ public enum RenderPassId
 {
     Shadow,     // Enabled in 1-5 (depth-only)
     Scene,      // Main scene (all content for now; outputs linear HDR RT in 1-4 HDR mode, see RenderQuality)
-    Post,       // Optional post-process slot (active in 2-1 FXAA mode: tonemap(+bloom) uber composite outputs LDR PostColor)
+    Post,       // Optional post-process slot (2-1 clause 4 / 2-3 clause 17: the tonemap(+bloom+AO) uber composite outputs LDR PostColor)
     OutlineMask, // Windows DX only: Outline2D object mask pass
-    FinalBlit,  // Off-screen -> backbuffer (enabled in Step 2; HDR sources use the tonemap(+bloom) variant, and degrade to LDR resolve when Post is active (FXAA/copy), see RenderQuality 1-4 contract revision 1)
+    FinalBlit,  // Off-screen -> backbuffer (enabled in Step 2; HDR sources use the tonemap(+bloom) variant, and degrade to an LDR resolve when Post is active - see PostResolve and the RenderQuality 1-4 contract revision 1)
     Overlay,    // UI/debug overlay after final presentation; does not participate in global post-processing
 }
 
@@ -142,12 +142,18 @@ public static class FrameSchedule
     /// <summary>Shadow pass draw content (depth-only draw); registered by 1-5 CSM.</summary>
     public static Action<IGraphics>? RenderShadow;
 
-    /// <summary>Output target of the Post pass (the input is always SceneColor, so this depends on SceneColor being non-null). In 2-1 FXAA mode it is
-    /// registered by the backend during initialization (LDR BackbufferCompatible, uber composite output, luma baked into alpha); see RenderQuality 2-1 contract clause 4.</summary>
+    /// <summary>Output target of the Post pass (the input is always SceneColor, so this depends on SceneColor being non-null).
+    /// Registered by the backend during initialization as an LDR BackbufferCompatible target holding the finished uber composite
+    /// with luma baked into alpha. Two tiers register it and they are mutually exclusive: 2-1 clause 4 (FXAA) and 2-3 clause 17
+    /// (TAA with TaaSharpness above zero). In both cases the reason is the same - moving the HDR-&gt;LDR composite upstream of
+    /// FinalBlit is what gives a full-screen filter something display-referred to read, which neither FXAA nor RCAS can do
+    /// against scene-referred HDR. Which filter FinalBlit then applies is decided by <see cref="PostResolve"/>.</summary>
     public static RenderTarget? PostColor;
 
     /// <summary>Post pass draw content (fullscreen post-processing, with SceneColor as input; sampling-state transitions of the input are handled by backend binding APIs);
-    /// in 2-1 FXAA mode this is the backend uber composite (tonemap+bloom), registered together with PostColor.</summary>
+    /// this is the backend uber composite (tonemap + bloom + AO), registered together with PostColor by whichever tier owns the slot.
+    /// It resolves <see cref="SceneColorOverride"/> itself, so the TAA tier reaches it correctly: the Post pass runs after the
+    /// AfterScene phase, by which point TaaEffect.Record has already published the current frame's resolve output.</summary>
     public static Action<IGraphics, RenderTarget>? RenderPost;
 
     /// <summary>2-1 Step B: backend texture-dictionary registration name of the bloom-chain output texture (null = no bloom, so FinalBlit uses the existing variant with zero leftovers).
@@ -163,7 +169,8 @@ public static class FrameSchedule
 
     /// <summary>2-3 contract clause 12: downstream scene-source override (backend texture-dictionary registration name, same shape as BloomTexture).
     /// When non-null, the scene source for both bloom input and the final HDR->LDR composite point before presentation
-    /// (FinalBlit without FXAA, Post uber in FXAA mode) is always replaced with this texture; SceneColor RT itself remains the render target of the Scene pass
+    /// is always replaced with this texture, wherever that point currently lives: FinalBlit when the Post slot is unused, or the Post uber pass when a tier
+    /// registered it (2-1 clause 4 FXAA, 2-3 clause 17 sharpening). SceneColor RT itself remains the render target of the Scene pass
     /// (so Execute in this class does not need to change either pass scheduling or blitSource selection, and the override is resolved by name at the backend composite entry).
     /// Written every frame by TaaEffect (the ping-pong writer for the current frame, see clause 11), and set to null when bypassed or disposed;
     /// null = the whole chain falls back to SceneColor, with zero leftovers.</summary>

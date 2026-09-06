@@ -67,7 +67,10 @@ internal static partial class WebGPUInterop
     /// <summary>2-1 Step D expansion: pass exposure/bloomIntensity with the blit
     /// (HDR sources writeBuffer them into the params uniform, while LDR sources ignore them).
     /// When bloomName is not null and resolves on the JS side, switch to the tonemap+bloom variant.
-    /// fxaa=true selects the FXAA variant (PostColor→backbuffer), which is mutually exclusive with tonemap/bloom.
+    /// resolve mirrors <see cref="Season.Rendering.PostResolve"/> as an int (0 = copy, 1 = FXAA, 2 = RCAS) and selects the
+    /// FinalBlit resolve variant for a PostColor source, which is mutually exclusive with tonemap/bloom.
+    /// 2-3 clause 17: sharpness is the RCAS lobe scale and is read only by that variant; the JS side puts it in the
+    /// params slot the FXAA variant leaves zeroed, since a display-referred source has no exposure to apply.
     /// 2-2 Step C: when aoName is not null and resolves on the JS side, switch to the AO variant
     /// (HDR sources only, with aoIntensity using a dedicated AO params uniform).
     /// 2-3 Contract Clause 12: when sceneOverrideName is not null and resolves on the JS side,
@@ -78,7 +81,7 @@ internal static partial class WebGPUInterop
     /// after the main blit (8-neighborhood expansion with alpha-blend overlay, mirroring DX BlitToBackbuffer).
     /// outlineWidth is in pixels and is clamped to 1 when below 1.</summary>
     [JSImport("globalThis.seasonWebGPU.blitToBackbuffer")]
-    internal static partial void BlitToBackbuffer(string name, float exposure, string? bloomName, float bloomIntensity, bool fxaa, string? aoName, float aoIntensity, string? sceneOverrideName, string? outlineMaskName, float outlineWidth);
+    internal static partial void BlitToBackbuffer(string name, float exposure, string? bloomName, float bloomIntensity, int resolve, float sharpness, string? aoName, float aoIntensity, string? sceneOverrideName, string? outlineMaskName, float outlineWidth);
 
     /// <summary>2-1 Step D: uber composition inside the Post pass
     /// (SceneColor exposure×bloom accumulation → ACES+gamma → LDR, with luma written into alpha),
