@@ -19,14 +19,6 @@ internal class Logo : Panel
             {
                 if (App.Instance.Mode is Mode.Play)
                 {
-                    if (CelestialLighting.DayNightSpeed == 0f)
-                    {
-                        CelestialLighting.DayNightSpeed = 0.05f;
-                    }
-                    else
-                    {
-                        CelestialLighting.DayNightSpeed = 0f;
-                    }
                     //// 开始
                     //await DeviceServices.Recorder.Start(new RecordSessionOptions { FramesPerSecond = 30 });
 

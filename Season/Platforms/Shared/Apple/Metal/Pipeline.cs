@@ -90,7 +90,7 @@ internal static class Pipeline
     public static IMTLFunction ShadowVertexFunction = null!;
 
     /// <summary>Shadow comparison sampler for 1-5, bound as sampler(1), using CompareFunction=LessEqual plus linear filtering.
-    /// Hardware 2x2 bilinear comparison is combined with the shader 3x3 PCF grid, matching the visual behavior of DX SampleCmpLevelZero and VK sampler2DShadow.
+    /// Hardware 2x2 bilinear comparison is combined with the shader's clause 14 rotated sample disk, matching the visual behavior of DX SampleCmpLevelZero and VK sampler2DShadow.
     /// ClampToEdge prevents leakage across quadrant boundaries.</summary>
     public static IMTLSamplerState ShadowSampler = null!;
 
@@ -1342,6 +1342,19 @@ inline float3 SampleProbeIrradiance(constant SceneLights& lights, texture2d<floa
     float3 base = floor(gc);
     float3 f = gc - base;
 
+    // 2-4 clause 9: fade back to fallback outside the probe volume. gc is in probe-index units, so trilinear
+    // interpolation is only defined over [0, dims-1]; past that the clamp below collapses all eight corners onto a
+    // single boundary probe, which hands a distant surface one near-camera probe's irradiance as if it were its own.
+    // That reads as a whole surface lit uniformly by an unrelated probe, wobbling with that probe's amortized R2 ray
+    // rotation and hysteresis rather than with anything in the scene, and it is the only lighting a face turned away
+    // from every light has. The grid is camera-centred and re-snapped every frame in Ddgi.Record, so this covers
+    // everything past GiVolumeSize/2, not just distant scenery. Fading across the one spacing beyond the last probe
+    // keeps the edge from popping as the volume slides with the camera - within that band the clamped probe is still
+    // the nearest one, no further away than an interior interpolation reaches - and past it the result is exactly the
+    // pre-DDGI 1-7/1-2 diffuse term.
+    float3 outside = max(max(-gc, gc - (dims - 1.0)), float3(0.0));
+    float boundsFade = saturate(1.0 - max(max(outside.x, outside.y), outside.z));
+
     float3 sum = float3(0.0);
     float wsum = 0.0;
     float wraw = 0.0;
@@ -1389,7 +1402,7 @@ inline float3 SampleProbeIrradiance(constant SceneLights& lights, texture2d<floa
     // When all 8 neighbors are invalid, including the initial zero atlas before the first update,
     // the path naturally falls back to pure fallback with a continuous transition and no threshold pop or flicker.
     float3 probeIrr = wsum > 1e-6 ? sum / wsum : float3(0.0);
-    float vfrac = saturate(wsum / max(wraw, 1e-6));
+    float vfrac = saturate(wsum / max(wraw, 1e-6)) * boundsFade;
     return mix(fallback, probeIrr * lights.giParams1.w, vfrac);
 }
 #endif
@@ -1854,18 +1867,39 @@ inline float ComputeSunShadow(constant SceneLights& lights, depth2d<float> shado
         // Only xy moves. Displacing z would push stored depth away from the light again, which is the peter-panning this
         // clause exists to avoid buying. The length guard costs nothing real: the projected normal only collapses when the
         // surface faces the light dead on, and that is precisely where the foreshortening would have zeroed the offset too.
+        //
+        // The texel count applied is not shadowParams1.z alone but the larger of it and the reach of clause 14's disk, which is
+        // the disk radius in texels plus the half texel the hardware 2x2 comparison filter widens every tap by. The two knobs
+        // are one calibration: an offset shorter than the disk leaves the disk's outer taps sampling the receiver's own depth on
+        // grazing surfaces, and that reads as the whole face losing a fraction of its taps - a uniform darkening rather than
+        // speckle - with the fraction changing every frame because clause 14 rotates the disk per frame. Taking the max makes
+        // that an invariant of the code instead of a note asking whoever retunes the radius to remember the offset.
+        // shadowParams1.z remains the floor, so it still decides the single-tap case where the radius is zero, and raising it
+        // past the disk's reach still works and still buys nothing but peter-panning.
         if (lights.shadowParams1.z > 0.0) {
             float2 ndcN = (lights.cascadeViewProj[slot] * float4(geoNormal, 0.0)).xy;
             float ndcLen = length(ndcN);
             if (ndcLen > 1e-8) {
                 float ndl = dot(geoNormal, lightDir);
                 float sinTheta = sqrt(saturate(1.0 - ndl * ndl));
-                ndc.xy += (ndcN / ndcLen) * (sinTheta * lights.shadowParams1.z * 4.0 * lights.shadowParams0.z);
+                float offsetTexels = max(lights.shadowParams1.z, abs(lights.shadowParams0.w) + 0.5);
+                ndc.xy += (ndcN / ndcLen) * (sinTheta * offsetTexels * 4.0 * lights.shadowParams0.z);
             }
         }
 
         float visibility = SampleShadowTile(shadowAtlas, shadowSampler, lights.shadowParams0.z, slot, ndc, shadowRot, lights.shadowParams0.w);
-        result = mix(1.0, visibility, lights.shadowParams1.y);
+
+        // Taper the contribution out across the last tenth of shadow range rather than ending the range at a comparison. At the
+        // boundary the branch above admits one pixel and rejects its neighbour, so the two differ by the full shadow strength
+        // across a single pixel; TAA's jitter then walks individual pixels back and forth over it every frame, which turns a
+        // static boundary into a flickering one wherever geometry straddles it - and geometry at the edge of shadow range is
+        // usually large and distant, so a whole face flickers together. The taper reaches exactly 0 at the boundary, where the
+        // mix yields 1.0, which is what the rejected side already returns, so the two sides now meet continuously and the
+        // branch is left as the pure optimization it was meant to be. Read from cascadeSplits inside the branch rather than
+        // hoisted above it, because cascadeCount is only known to be at least one here.
+        float shadowFar = lights.cascadeSplits[cascadeCount - 1];
+        float fade = saturate((shadowFar - viewDepth) / max(shadowFar * 0.1, 1e-6));
+        result = mix(1.0, visibility, lights.shadowParams1.y * fade);
     }
     return result;
 }

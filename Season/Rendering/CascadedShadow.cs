@@ -24,7 +24,9 @@ namespace Season.Rendering;
 /// - Light-direction quantization: snap the sun direction onto a fixed angular grid before deriving anything from it, because the
 ///   snapping grid above is the light basis and would otherwise rotate along with the sun, leaving snapping quantizing into a
 ///   moving frame of reference. Together these two make the cascade matrix bitwise stable rather than merely similar;
-/// - Move the light-space eye back by radius + zPad so caster geometry outside the slice but on the light side, such as room walls, still fits into the depth range;
+/// - Move the light-space eye back along the light so caster geometry outside the slice but on the light side, such as room walls,
+///   still fits into the depth range. The distance is derived from <see cref="RenderQuality.ShadowCasterHeight"/> and the sun's
+///   elevation rather than being a fixed multiple of the radius, so the depth range is not mostly empty space;
 /// - Matrix conventions stay aligned with the engine: LH + [0,1] depth + row vectors via the System.Numerics Create*LeftHanded family.
 ///
 /// Atlas quadrant convention (contract clause 2): slot i uses tile origin = ((i%2)·half, (i/2)·half), where half = atlas/2.
@@ -223,6 +225,46 @@ public static class CascadedShadow
     /// rung while still tracking a genuine speed change within a few frames.</summary>
     const float DeltaOutlierRatio = 3f;
 
+    /// <summary>The smoothed per-frame delta below which the measurement is treated as unusable rather than as a slow light,
+    /// pinning the ladder to rung 0 instead of letting it run to the fine end.
+    ///
+    /// The delta is recovered with acos(dot(dir, prevDir)), and acos loses almost all of its precision as the dot approaches
+    /// one: near dot = 1-e the result is about sqrt(2e), so a float's last bit of dot - e around 1e-7 - already spreads into
+    /// roughly 4.5e-4 rad, which is 0.026 deg. Anything the estimator reports below that is the arccosine's own quantization,
+    /// not the light, and it is reported *smaller* than the truth because the dot saturates at exactly one.
+    ///
+    /// Believing it costs real stability. A stopped or near-stopped sun drives the estimate to zero and the ladder to its
+    /// finest rung, which the clause-11 documentation calls free precision on the grounds that a direction which does not
+    /// change is stable at any step. That reasoning holds for the direction and fails for the grid: a finer step packs the
+    /// angular cell boundaries eight times more densely, so the sun does not have to move to be near one, and any residual
+    /// jitter in it then crosses cells that a coarser grid would have absorbed. Rung 0 is the honest answer when the
+    /// measurement has run out of resolution - it is the step the base was calibrated for.</summary>
+    const float DeltaNoiseFloorDegrees = 0.026f;
+
+    /// <summary>Floor on sin(elevation) when converting a caster height into the light-side depth margin, so a sun at or below
+    /// the horizon asks for a bounded margin instead of dividing by zero. 0.05 is about 2.9 deg of elevation, past which the
+    /// margin the geometry asks for exceeds a cascade radius anyway and the cap takes over.</summary>
+    const float MinElevationSine = 0.05f;
+
+    /// <summary>The band of |sunDir.Y| over which the light basis' reference axis is carried from world up to world forward.
+    ///
+    /// The axis exists only to disambiguate roll about the light, and any axis not parallel to sunDir does that job, so the
+    /// choice is free everywhere except within a few degrees of vertical. What is not free is switching between two choices at
+    /// a threshold: world up and world forward are 90 deg apart, so a hard swap rotates the entire light basis by 90 deg in
+    /// one frame, which relocates every texel of the cascade and every angular cell boundary with it. Clause 9's whole premise
+    /// is that the basis is reproducible frame to frame, and one frame of a quarter turn discards it - a sun tracking through
+    /// the threshold would do it twice a day, and a sun parked near it would do it whenever the quantized direction jittered
+    /// across.
+    ///
+    /// Interpolating the axis across a band instead makes the basis a continuous function of the direction, so no frame ever
+    /// pays more than the direction actually moved. The band ends at the old threshold and starts far enough below it that the
+    /// blended axis is nowhere near parallel to the sun: at the midpoint the sun's vertical component is 0.945, bounding its
+    /// forward component to 0.327 against a reference axis whose two components are equal, so the cross product stays well
+    /// conditioned throughout. Below the band the result is exactly world up, bit for bit, which is what the sun spends almost
+    /// all of its day at.</summary>
+    const float UpBlendStart = 0.90f;
+    const float UpBlendEnd = 0.99f;
+
     /// <summary>
     /// 1-5 clause 12: FNV-1a digest of the caster set as it stood during this frame's fingerprint walk, folding every
     /// enabled caster's world bounds, instance transforms and animation pose in traversal order. Together with
@@ -308,7 +350,8 @@ public static class CascadedShadow
     /// Skipping submission therefore leaves atlas contents bit-identical. This is not a quality tradeoff: A/B results must match pixel for pixel.
     ///
     /// The usual concern that "objects outside the slice but on the light side can still cast shadows into it" does not apply here.
-    /// <see cref="ComputeSun"/> already moves the box back by zPad along the light direction; any caster farther on the light side has already been clipped by the orthographic near plane for the current setup,
+    /// <see cref="ComputeSun"/> already moves the box back along the light direction by the margin a caster of
+    /// <see cref="RenderQuality.ShadowCasterHeight"/> needs at the current elevation; any caster farther on the light side has already been clipped by the orthographic near plane for the current setup,
     /// so its shadow is already absent today and this culling introduces no new loss.
     ///
     /// Empty boxes with extents=0, typically while resources are still loading, do not participate in culling, following 1-3 clause 6 to avoid false rejection.
@@ -708,7 +751,13 @@ public static class CascadedShadow
         float tanHalfFov = MathF.Tan(camera.FovY * 0.5f);
         float aspect = camera.Aspect > 0f ? camera.Aspect : 1f;
         float tileRes = RenderQuality.Current.ShadowAtlasSize * 0.5f;
-        var lightUp = MathF.Abs(sunDir.Y) > 0.99f ? Vector3.UnitZ : Vector3.UnitY;
+        // Clause 9: the reference axis has to be a continuous function of the quantized direction, not a two-way choice at a
+        // threshold, or the basis takes a 90 degree step whenever the sun crosses it. See UpBlendStart for why that step is
+        // more expensive than the degenerate case it was avoiding. Below the band this is exactly Vector3.UnitY.
+        float verticality = MathF.Abs(sunDir.Y);
+        float upTilt = Math.Clamp((verticality - UpBlendStart) / (UpBlendEnd - UpBlendStart), 0f, 1f);
+        var lightUp = Vector3.Lerp(Vector3.UnitY, Vector3.UnitZ, upTilt);
+        lightUp = Vector3.Normalize(lightUp);
 
         Span<Vector3> corners = stackalloc Vector3[8];
         float sliceNear = near;
@@ -741,9 +790,23 @@ public static class CascadedShadow
                 radius = MathF.Max(radius, Vector3.Distance(corners[i], sphereCenter));
             radius = MathF.Ceiling(radius * 16f) / 16f;
 
-            // Light-space view: move the eye back along -sunDir by radius + zPad so light-side casters outside the slice still fit in range.
-            float zPad = radius;
-            var eye = sphereCenter - sunDir * (radius + zPad);
+            // Light-space view: move the eye back along -sunDir far enough that casters standing between the slice and the sun
+            // are still in front of the near plane. Only the light side needs the margin - nothing behind the slice can cast
+            // into it - and the margin a caster of height h needs, measured along the light, is h/sin(elevation), the distance
+            // from its top down to the ground it shadows. The old code spent a full radius on each side unconditionally, giving
+            // a depth range of four radii where the light side alone needs one margin, and those wasted bits came out of the
+            // same mantissa the stored depths use, which is what acne resolution is made of. Capped at one radius so this can
+            // only ever reclaim precision the old formula wasted, never remove coverage it had; quantized to the same 1/16 grid
+            // as the radius so a drifting elevation cannot make the matrix change every frame and undo clause 9 - sunDir is
+            // already quantized above, so this is quantization of an already-quantized input.
+            float casterHeight = RenderQuality.Current.ShadowCasterHeight;
+            // Inverted comparison so a NaN from a malformed settings file collapses the margin rather than poisoning the matrix.
+            if (!(casterHeight > 0f))
+                casterHeight = 0f;
+            float lightPad = MathF.Min(casterHeight / MathF.Max(verticality, MinElevationSine), radius);
+            lightPad = MathF.Ceiling(lightPad * 16f) / 16f;
+
+            var eye = sphereCenter - sunDir * (radius + lightPad);
             var view = Matrix4x4.CreateLookAtLeftHanded(eye, sphereCenter, lightUp);
 
             // Texel snapping: align the translation terms of the view matrix, which are the light-space offsets, to the texel
@@ -757,7 +820,8 @@ public static class CascadedShadow
             view.M42 = MathF.Floor(view.M42 / texelSize) * texelSize;
             view.M43 = MathF.Floor(view.M43 / texelSize) * texelSize;
 
-            var proj = Matrix4x4.CreateOrthographicLeftHanded(radius * 2f, radius * 2f, 0f, (radius + zPad) * 2f);
+            // Far plane just past the back of the sphere: eye-to-sphere-far is (radius + lightPad) + radius.
+            var proj = Matrix4x4.CreateOrthographicLeftHanded(radius * 2f, radius * 2f, 0f, radius * 2f + lightPad);
             CascadeViewProj[c] = view * proj;
 
             sliceNear = sliceFar;
@@ -850,8 +914,12 @@ public static class CascadedShadow
     /// whole value here is being bit-identical across frames and backends. Multiplying and dividing by an exact power of two
     /// is exact by construction and leaves no room for a library's rounding to differ.
     ///
-    /// A motionless light lands on the bottom rung, which is the correct answer rather than a degenerate one: a direction that
-    /// does not change is already perfectly stable at any step, so the finest available grid is free precision.
+    /// A motionless light does not land on the bottom rung, though an earlier version of this claimed it should. The argument
+    /// was that a direction which never changes is stable at any step, so the finest grid is free precision - true of the
+    /// direction, false of the grid, because the finest rung also packs the cell boundaries eight times more densely and a
+    /// parked sun is then eight times more likely to be sitting on one, where the smallest residual jitter crosses it. The
+    /// measurement cannot tell a stopped sun from a slow one either, since acos runs out of precision first; see
+    /// <see cref="DeltaNoiseFloorDegrees"/>. Below that floor the ladder holds rung 0.
     /// </summary>
     static float UpdateAngularStep(Vector3 rawDir)
     {
@@ -908,9 +976,22 @@ public static class CascadedShadow
         // exact is the rung the estimate asks for as a real number; want is the nearest reachable one. Keeping both is what
         // lets the band be measured from the rung actually held instead of from the rounded answer, which is where the
         // hysteresis lives: rounding compares against a boundary, this compares against a position.
-        float ideal = _smoothedDeltaDegrees * target;
-        float exact = ideal > 0f ? MathF.Log2(ideal / baseStep) : -StepLadderRange;
-        int want = Math.Clamp((int)MathF.Round(exact), -StepLadderRange, StepLadderRange);
+        float exact;
+        int want;
+        if (_smoothedDeltaDegrees < DeltaNoiseFloorDegrees)
+        {
+            // The estimate has fallen below what acos can resolve, so it is no longer a measurement of the light. Hold rung 0
+            // rather than following it down the ladder. exact is set to 0 as well, not just want: the hysteresis band is
+            // measured from exact, so leaving it at the noisy value would keep re-arming a move away from the rung being held.
+            exact = 0f;
+            want = 0;
+        }
+        else
+        {
+            float ideal = _smoothedDeltaDegrees * target;
+            exact = ideal > 0f ? MathF.Log2(ideal / baseStep) : -StepLadderRange;
+            want = Math.Clamp((int)MathF.Round(exact), -StepLadderRange, StepLadderRange);
+        }
 
         if (!_rungValid)
         {

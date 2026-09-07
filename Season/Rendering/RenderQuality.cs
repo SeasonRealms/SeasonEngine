@@ -228,10 +228,27 @@ public class RenderQuality
     public static bool DefaultShadowAtlasReuse = false;
 
     /// <summary>Default value for ShadowNormalOffset (overrideable in the app constructor and captured by Init()).
-    /// Expressed in shadow-map texels, so it keeps meaning when the atlas is resized. 1.5 covers the 3x3 PCF footprint's
-    /// outer ring, which is the actual distance a receiver can be misjudged by, and is low enough not to visibly detach
-    /// contact shadows on the near cascade.</summary>
+    /// Expressed in shadow-map texels, so it keeps meaning when the atlas is resized.
+    ///
+    /// 1.5 is the value that covered the 3x3 PCF grid this clause was originally written against. Clause 14 replaced that
+    /// grid with an eight-tap Vogel disk of radius <see cref="RenderQuality.ShadowSoftnessTexels"/>, whose outermost tap sits
+    /// at about 0.95 of the radius and is itself widened by half a texel by the hardware 2x2 comparison filter, so the real
+    /// reach is radius*0.95 + 0.5 texels - 2.4 at the default radius of 2, well past 1.5. An offset short of the disk's reach
+    /// leaves the outer taps landing on the receiver's own depth on grazing surfaces, which reads as the whole face darkening
+    /// by a fraction of the tap count rather than as speckle, and the fraction changes every frame because clause 14 rotates
+    /// the disk per frame.
+    ///
+    /// The shader therefore no longer trusts this number on its own: it takes max(this, diskReach) so the disk is always
+    /// covered, and this value only decides how much offset is applied *beyond* the disk. It is kept at 1.5 because that is
+    /// still the right answer for the case the disk does not drive - <see cref="RenderQuality.ShadowSoftnessTexels"/> at 0,
+    /// where the lookup is a single tap - and because raising it past the disk reach buys nothing but peter-panning.</summary>
     public static float DefaultShadowNormalOffset = 1.5f;
+
+    /// <summary>Default value for ShadowCasterHeight (overrideable in the app constructor and captured by Init()).
+    /// 20 metres: taller than the sample scene's mountains once they are sunk, and taller than the room, so no caster in it is
+    /// clipped out of the light-side depth margin. See <see cref="RenderQuality.ShadowCasterHeight"/> for what happens when it
+    /// is set too low, and why being generous here costs only depth precision rather than correctness.</summary>
+    public static float DefaultShadowCasterHeight = 20f;
 
     /// <summary>Default value for ShadowSoftnessTexels (overrideable in the app constructor and captured by Init()).
     /// 2 texels puts the outermost of the eight taps at about 1.9 texels, which with the hardware 2x2 comparison filter on
@@ -288,7 +305,7 @@ public class RenderQuality
     public static float DefaultJitterScale = 1.0f;
 
     /// <summary>Default value for JitterPhaseCount (overrideable in the app constructor and captured by Init()).</summary>
-    public static int DefaultJitterPhaseCount = 8;
+    public static int DefaultJitterPhaseCount = 7; //8;
 
     /// <summary>Default value for TaaFeedback (overrideable in the app constructor and captured by Init()).</summary>
     public static float DefaultTaaFeedback = 0.9f;
@@ -316,7 +333,7 @@ public class RenderQuality
     ///
     /// Changing it at runtime through <see cref="TaaSharpness"/> only scales the lobe and can never create or remove
     /// the pass, so a process that started at zero cannot gain sharpening later. See that property for the full rule.</summary>
-    public static float DefaultTaaSharpness = 0f;
+    public static float DefaultTaaSharpness = 0.5f; //0f;
 
     /// <summary>Default value for GlobalIllumination (overrideable in the app constructor and captured by Init()).</summary>
     public static GiMode DefaultGlobalIllumination = GiMode.Off;
@@ -554,8 +571,30 @@ public class RenderQuality
     /// depth and a single texel count cannot describe the offset there; the spot keeps the depth biases alone.
     ///
     /// Runtime-tunable, and intended for the control panel: it and the two depth biases are one tuning group, best adjusted
-    /// together while watching a grazing-lit surface for acne and a contact edge for detachment.</summary>
+    /// together while watching a grazing-lit surface for acne and a contact edge for detachment.
+    ///
+    /// This is a floor rather than the whole story. The shader raises it to the clause 14 disk's own reach whenever that is
+    /// larger, because an offset shorter than the footprint being sampled cannot do the job it exists for: the outer taps come
+    /// down on the receiver instead of past it. That coupling used to live only in the prose of this summary and of
+    /// <see cref="ShadowSoftnessTexels"/>, which meant a change to either silently invalidated the other's calibration - and
+    /// did, when clause 14 widened the footprint and this number stayed where the 3x3 grid had put it. It is now an invariant
+    /// the shader enforces, so lowering this below the disk reach is a no-op instead of a regression.</summary>
     public float ShadowNormalOffset { get; set; } = DefaultShadowNormalOffset;
+
+    /// <summary>1-5 clause 9: the tallest shadow caster the scene contains, in world units, used to size the light-side depth
+    /// margin of each cascade's orthographic projection. Runtime-tunable.
+    ///
+    /// What it replaces: the margin used to be one cascade radius on each side of the bounding sphere unconditionally, giving a
+    /// depth range of four radii. Only the light-side half of that margin can ever hold a caster - nothing behind the slice can
+    /// cast into it - and one radius is far more than a real caster needs, so most of the range was spent on empty space while
+    /// the stored depths it had to share bits with were the ones acne depends on. The margin a caster of height h actually
+    /// needs, measured along the light, is h/sin(elevation): the distance from its top to the ground it shadows.
+    ///
+    /// Setting it too high costs depth precision, gradually, and nothing else. Setting it too low clips the tops of casters out
+    /// of the near plane, which removes their shadows entirely rather than degrading them, so the margin is additionally capped
+    /// at one radius - the value that was in use before - and never grows past it. That makes this knob monotone: it can only
+    /// recover precision the old formula wasted, never take coverage the old formula had.</summary>
+    public float ShadowCasterHeight { get; set; } = DefaultShadowCasterHeight;
 
     /// <summary>1-5 clause 14: radius of the rotated PCF disk, in shadow-map texels, uploaded to ShadowParams0.W.
     ///
@@ -575,8 +614,10 @@ public class RenderQuality
     /// crawl along the edge under camera motion. Note also that the quadrant is shrunk by this radius plus half a texel to
     /// keep taps inside their own tile, so a very large radius starts clamping taps at the tile border.
     ///
-    /// Runtime-tunable, and one tuning group with <see cref="ShadowNormalOffset"/>: the offset is expressed in terms of the
-    /// footprint this radius defines, so changing one invalidates the other's calibration.</summary>
+    /// Runtime-tunable, and one tuning group with <see cref="ShadowNormalOffset"/>, though no longer a fragile one: the offset
+    /// has to reach at least as far as the outermost tap of the disk this radius defines, and the shader now takes the larger of
+    /// the two rather than trusting whoever retuned this to also retune the offset. Raising this therefore carries the offset up
+    /// with it automatically; the offset only decides how much displacement is applied beyond the disk.</summary>
     public float ShadowSoftnessTexels { get; set; } = DefaultShadowSoftnessTexels;
 
     /// <summary>1-5 clause 15: contact hardening. When on, the PCF disk radius is chosen per pixel from how far the occluder
@@ -639,7 +680,13 @@ public class RenderQuality
     /// <summary>2-2 contract clause 1: ambient-occlusion tier. Mutually exclusive, fixed at initialization, and downgraded to Off when unsupported.</summary>
     public AoMode AmbientOcclusion { get; set; } = DefaultAmbientOcclusion;
 
-    /// <summary>2-2: AO sampling radius in world space, uploaded to gtaoMain parameters. Runtime knob.</summary>
+    /// <summary>2-2: AO sampling radius in world space, uploaded to gtaoMain parameters. Runtime knob.
+    ///
+    /// This doubles as the reach of the effect, because gtaoMain fades AO out where the projected radius covers fewer than
+    /// 4 half-resolution texels and is fully off below 2. The projected size is radius / (2 * z * tanHalfFovY) * halfHeight,
+    /// so at the default 0.5 with a 65-degree vertical FOV and 1080p output the fade spans roughly z = 53 m to 106 m, and it
+    /// moves further out on higher-resolution output. Raising this to reach distant geometry also widens contact shadows on
+    /// nearby surfaces; one world radius cannot separate the two.</summary>
     public float AoRadius { get; set; } = DefaultAoRadius;
 
     /// <summary>2-2 contract clause 5: AO composite strength applied before ACES. 0 visually disables AO without rebuilding resources.</summary>
@@ -699,7 +746,13 @@ public class RenderQuality
     /// <summary>2-4 clause 4: proxy SDF volume resolution. Fixed at initialization.</summary>
     public int GiSdfResolution { get; set; } = DefaultGiSdfResolution;
 
-    /// <summary>2-4 clause 4: world-space horizontal size jointly covered by the SDF volume and probe grid. Fixed at initialization.</summary>
+    /// <summary>2-4 clause 4: world-space horizontal size jointly covered by the SDF volume and probe grid. Fixed at initialization.
+    ///
+    /// This is a hard reach, not a soft quality dial: the grid is re-snapped to the camera every frame in Ddgi.Record, so it
+    /// describes a box of this width centred on the viewer, and clause 9's probe sampling fades back to the 1-7/1-2 diffuse
+    /// term one probe spacing past the last probe. Anything farther than half this value gets no DDGI at all, whatever its
+    /// screen size. Raising it to cover distant scenery is the wrong lever, because the probe count is fixed by
+    /// GiProbeGridX/Y/Z and spacing = GiVolumeSize / GiProbeGridX, so a wider box only spreads the same probes thinner.</summary>
     public float GiVolumeSize { get; set; } = DefaultGiVolumeSize;
 
     /// <summary>2-4 clauses 7/11: probe-grid X resolution. Fixed at initialization.</summary>

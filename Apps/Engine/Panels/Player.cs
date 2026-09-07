@@ -66,10 +66,13 @@ internal class Player : Panel
             modelSettled = true;
         }
 
+        // Ready is set by the load queue before the shared-model continuation injects
+        // Asset, and PlayAnimation silently no-ops while Asset is null. Retry every frame
+        // until the switch actually lands, and only then consume the first-time flag.
         if (model.Ready && modelFirst)
         {
-            model.PlayAnimation("Idle-loop");
-            modelFirst = false;
+            if (model.PlayAnimation("Idle-loop") != null)
+                modelFirst = false;
         }
 
         if (model.Update(time))

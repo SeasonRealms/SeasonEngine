@@ -156,6 +156,31 @@ public static class DayNightCycle
     }
 
     /// <summary>
+    /// Clock hour that phase 0 stands for. The phase convention pins the fractional part to the solar arc rather than to a
+    /// wall clock - .00 is sunrise, .25 noon, .50 sunset - so naming a time of day requires one anchor, and sunrise is the
+    /// only one the convention actually fixes. This model is an equinox simplification with a 12-hour day, so sunrise at 6
+    /// makes noon land on 12 and midnight on 0 with no further correction.
+    /// </summary>
+    public const float SunriseHour = 6f;
+
+    /// <summary>
+    /// Phase for a given clock hour, in [0,1). The result is a fractional phase only: it carries no day count, so a caller
+    /// setting a time of day is expected to add the accumulated day part back rather than replace the whole phase, which
+    /// would rewind the lunar cycle along with the clock.
+    /// </summary>
+    /// <param name="hour">Clock hour, where 0 and 24 are the same instant. Values outside 0~24 wrap rather than fail.</param>
+    public static float PhaseFromHour(float hour) => Wrap01((hour - SunriseHour) / 24f);
+
+    /// <summary>Clock hour for a given phase, in [0,24). Inverse of <see cref="PhaseFromHour"/>; the day count is discarded.</summary>
+    /// <param name="phase">Accumulated day count, same convention as <see cref="Evaluate"/>.</param>
+    public static float HourFromPhase(float phase)
+    {
+        // Wrap01 bounds the input to [0,24), so the anchor can push it at most to 30 and a single subtraction is enough.
+        float hour = Wrap01(phase) * 24f + SunriseHour;
+        return hour >= 24f ? hour - 24f : hour;
+    }
+
+    /// <summary>
     /// Skybox tinting. Brightness follows sun and moon elevation along the same arcs used by direct lighting, while color temperature emerges naturally from the weighted combination.
     /// tint = daySkyTint × sun elevation + nightSkyTint × moon elevation × nightBrightness, since moonlight is much dimmer than sunlight.
     /// The two terms are **added**, not chosen exclusively. Since Step C removed sun/moon exclusivity, the moon may also be visible during the day.

@@ -90,9 +90,7 @@ public abstract class BaseApp : Panel
         }
     }
 
-    public static bool LogLoad = true;
-
-    public static LogType LogTypes = LogType.None | LogType.Load | LogType.Error | LogType.Backend;
+    public static LogType LogTypes = LogType.None | LogType.Error | LogType.Backend;
 
     public string Status { get; set; }
 
@@ -258,6 +256,7 @@ public abstract class BaseApp : Panel
                     Maximized = true
                 },
                 RenderQuality = new RenderQuality(),
+                World = new WorldSettings(),
                 Products = new List<string>
                 {
                     //"create", "play"
@@ -270,16 +269,6 @@ public abstract class BaseApp : Panel
                 Settings.Language = "Chinese";
             }
 
-            SaveSettings();
-        }
-
-        // Step 6: Older Settings.json files saved before this feature do not contain the RenderQuality field,
-        // so it becomes null after deserialization. Backfill defaults once here (capturing any Default* overrides
-        // applied during app construction) and persist them; after that, all runtime changes are saved through
-        // Settings.RenderQuality + RequestSaveSettings.
-        if (Settings.RenderQuality == null)
-        {
-            Settings.RenderQuality = new RenderQuality();
             SaveSettings();
         }
     }
@@ -468,8 +457,9 @@ public abstract class BaseApp : Panel
             var file = StorageService.SubPath(StorageService.DirectoryBase, settingsFile);
             var state = Settings?.WindowState;
             var rq = Settings?.RenderQuality;
+            var world = Settings?.World;
 
-            AddLog(LogType.None, $"{DateTime.UtcNow} [Settings][Save] file={file} state=({state?.X},{state?.Y},{state?.Width},{state?.Height}) max={state?.Maximized} full={state?.FullScreen} rq=gi:{rq?.GlobalIllumination} sdf:{rq?.GiSdfResolution} grid:{rq?.GiProbeGridX}x{rq?.GiProbeGridY}x{rq?.GiProbeGridZ} rays:{rq?.GiRaysPerProbe} div:{rq?.GiProbeUpdateDivisor}");
+            AddLog(LogType.None, $"{DateTime.UtcNow} [Settings][Save] file={file} state=({state?.X},{state?.Y},{state?.Width},{state?.Height}) max={state?.Maximized} full={state?.FullScreen} rq=gi:{rq?.GlobalIllumination} sdf:{rq?.GiSdfResolution} grid:{rq?.GiProbeGridX}x{rq?.GiProbeGridY}x{rq?.GiProbeGridZ} rays:{rq?.GiRaysPerProbe} div:{rq?.GiProbeUpdateDivisor} world=dns:{world?.DayNightSpeed} sh:{world?.StartHour}");
 
             StorageService.SaveText(StorageService.DirectoryBase, settingsFile, json);
 
@@ -478,8 +468,9 @@ public abstract class BaseApp : Panel
                 var verifySettings = Season.Utils.JsonUtils.Deserialize<Settings>(verifyJson);
                 var verifyState = verifySettings?.WindowState;
                 var verifyRq = verifySettings?.RenderQuality;
+                var verifyWorld = verifySettings?.World;
 
-                AddLog(LogType.None, $"{DateTime.UtcNow} [Settings][SaveVerify] file={file} state=({verifyState?.X},{verifyState?.Y},{verifyState?.Width},{verifyState?.Height}) max={verifyState?.Maximized} full={verifyState?.FullScreen} rq=gi:{verifyRq?.GlobalIllumination} sdf:{verifyRq?.GiSdfResolution} grid:{verifyRq?.GiProbeGridX}x{verifyRq?.GiProbeGridY}x{verifyRq?.GiProbeGridZ} rays:{verifyRq?.GiRaysPerProbe} div:{verifyRq?.GiProbeUpdateDivisor}");
+                AddLog(LogType.None, $"{DateTime.UtcNow} [Settings][SaveVerify] file={file} state=({verifyState?.X},{verifyState?.Y},{verifyState?.Width},{verifyState?.Height}) max={verifyState?.Maximized} full={verifyState?.FullScreen} rq=gi:{verifyRq?.GlobalIllumination} sdf:{verifyRq?.GiSdfResolution} grid:{verifyRq?.GiProbeGridX}x{verifyRq?.GiProbeGridY}x{verifyRq?.GiProbeGridZ} rays:{verifyRq?.GiRaysPerProbe} div:{verifyRq?.GiProbeUpdateDivisor} world=dns:{verifyWorld?.DayNightSpeed} sh:{verifyWorld?.StartHour}");
             }
             else
             {
@@ -701,6 +692,13 @@ public class Settings
     /// together when BaseApp.Init() performs backfilling. Runtime render consumers (DDGI and others)
     /// always read this field through DdgiEffect.GiSettings, while null falls back to the static Default* sources.</summary>
     public RenderQuality RenderQuality { get; set; }
+
+    /// <summary>World-simulation settings persisted in Settings.json and editable at runtime: how the world behaves over
+    /// time, as opposed to how it is rendered. Kept apart from <see cref="RenderQuality"/> because that one is a tier
+    /// that backends lock before graphics initialization, while everything here is meant to change while running.
+    /// Filled in by BaseApp.Init() the same way, and read at runtime through <see cref="WorldSettings.Current"/>,
+    /// which falls back to the static Default* sources while this is still null.</summary>
+    public WorldSettings World { get; set; }
 
     public string User { get; set; }
 

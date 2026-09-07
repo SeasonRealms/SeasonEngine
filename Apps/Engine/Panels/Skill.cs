@@ -41,7 +41,11 @@ internal class Skill : Panel
         {
             Type = ShapeType.Circle,
             // Long-jump skill: starts only when the current animation is not already LongJump.
-            OnClick = StartLongJump
+            OnClick = () =>
+            {
+                //App.Instance.player?.model.PlayAnimation("Idle-loop");
+                StartLongJump();
+            }
         };
         AddControl(skill);
 

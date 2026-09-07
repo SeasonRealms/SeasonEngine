@@ -122,7 +122,7 @@ internal class Direction : Panel
         var app = App.Instance;
 
         // Locked during a long jump: facing is already frozen to the takeoff direction and movement is handled by UpdateLongJump.
-        if (app.player.jumping)
+        if (app.player != null && app.player.jumping)
             return;
 
         var model = app.player.model;

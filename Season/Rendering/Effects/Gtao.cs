@@ -14,7 +14,10 @@ namespace Season.Rendering.Effects;
 ///    neighbors, picking the smaller-|Delta z| side to avoid depth-cliff artifacts),
 ///    performs horizon-based 2-slice x dual-side x 4-step integration
 ///    (GTAO slice integral in XeGTAO form), and rotates the starting angle with IGN
-///    spatial noise (pure ALU, no noise texture).
+///    spatial noise (pure ALU, no noise texture). The result fades to unoccluded where the
+///    projected radius covers fewer than 4 half-resolution texels and is fully off below 2,
+///    because under that the four taps only resample depth quantization that the jittered
+///    projection shifts every frame, and the composite runs after the temporal resolve.
 /// 2. gtaoBlur x2: the X and Y passes share one kernel, with direction passed in Params:
 ///    raw -> blurx -> ao. Uses a depth-aware separable Gaussian blur (9 taps, normalized
 ///    linear depth in the g channel as the bilateral weight, preserving edges without light leaks).
@@ -357,7 +360,17 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                 visibility += projNLen * a;
             }
 
-            float ao = saturate(visibility * 0.5);
+            // Fade out where the search collapses into too few texels. Taps sit at t = 1/4 .. 1 of radiusUv and DepthAt
+            // truncates to integers, so the innermost tap only leaves the centre texel once radiusUv spans 2 texels, and
+            // all four land on distinct texels only from 4 texels up. Below that the taps re-read what the centre already
+            // read, and what differs between frames is then not occlusion but where the jittered projection placed the
+            // depth samples; the clause 5 composite runs after the temporal resolve, so that difference reaches the screen
+            // unfiltered. Fading to unoccluded across [2, 4] texels keeps AO wherever it is resolved and drops it where it
+            // is only depth quantization. This is a texel count, so on higher-resolution output it engages at greater
+            // distance, where the same world radius genuinely does cover more samples.
+            float texelRadius = radiusUv * dst.y;
+            float rangeFade = saturate((texelRadius - 2.0) * 0.5);
+            float ao = lerp(1.0, saturate(visibility * 0.5), rangeFade);
             float zNorm = saturate((z - uNear) / (uFar - uNear));
             result = float4(ao, zNorm, 0.0, 1.0);
         }
@@ -497,7 +510,17 @@ void main()
                 visibility += projNLen * a;
             }
 
-            float ao = clamp(visibility * 0.5, 0.0, 1.0);
+            // Fade out where the search collapses into too few texels. Taps sit at t = 1/4 .. 1 of radiusUv and DepthAt
+            // truncates to integers, so the innermost tap only leaves the centre texel once radiusUv spans 2 texels, and
+            // all four land on distinct texels only from 4 texels up. Below that the taps re-read what the centre already
+            // read, and what differs between frames is then not occlusion but where the jittered projection placed the
+            // depth samples; the clause 5 composite runs after the temporal resolve, so that difference reaches the screen
+            // unfiltered. Fading to unoccluded across [2, 4] texels keeps AO wherever it is resolved and drops it where it
+            // is only depth quantization. This is a texel count, so on higher-resolution output it engages at greater
+            // distance, where the same world radius genuinely does cover more samples.
+            float texelRadius = radiusUv * dst.y;
+            float rangeFade = clamp((texelRadius - 2.0) * 0.5, 0.0, 1.0);
+            float ao = mix(1.0, clamp(visibility * 0.5, 0.0, 1.0), rangeFade);
             float zNorm = clamp((z - uNear) / (uFar - uNear), 0.0, 1.0);
             result = vec4(ao, zNorm, 0.0, 1.0);
         }
@@ -637,7 +660,17 @@ kernel void CSMain(
                 visibility += projNLen * a;
             }
 
-            float ao = saturate(visibility * 0.5);
+            // Fade out where the search collapses into too few texels. Taps sit at t = 1/4 .. 1 of radiusUv and DepthAt
+            // truncates to integers, so the innermost tap only leaves the centre texel once radiusUv spans 2 texels, and
+            // all four land on distinct texels only from 4 texels up. Below that the taps re-read what the centre already
+            // read, and what differs between frames is then not occlusion but where the jittered projection placed the
+            // depth samples; the clause 5 composite runs after the temporal resolve, so that difference reaches the screen
+            // unfiltered. Fading to unoccluded across [2, 4] texels keeps AO wherever it is resolved and drops it where it
+            // is only depth quantization. This is a texel count, so on higher-resolution output it engages at greater
+            // distance, where the same world radius genuinely does cover more samples.
+            float texelRadius = radiusUv * dst.y;
+            float rangeFade = saturate((texelRadius - 2.0) * 0.5);
+            float ao = mix(1.0, saturate(visibility * 0.5), rangeFade);
             float zNorm = saturate((z - params.uNear) / (params.uFar - params.uNear));
             result = float4(ao, zNorm, 0.0, 1.0);
         }
@@ -777,7 +810,17 @@ fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
                 visibility = visibility + projNLen * a;
             }
 
-            let ao = saturate(visibility * 0.5);
+            // Fade out where the search collapses into too few texels. Taps sit at t = 1/4 .. 1 of radiusUv and DepthAt
+            // truncates to integers, so the innermost tap only leaves the centre texel once radiusUv spans 2 texels, and
+            // all four land on distinct texels only from 4 texels up. Below that the taps re-read what the centre already
+            // read, and what differs between frames is then not occlusion but where the jittered projection placed the
+            // depth samples; the clause 5 composite runs after the temporal resolve, so that difference reaches the screen
+            // unfiltered. Fading to unoccluded across [2, 4] texels keeps AO wherever it is resolved and drops it where it
+            // is only depth quantization. This is a texel count, so on higher-resolution output it engages at greater
+            // distance, where the same world radius genuinely does cover more samples.
+            let texelRadius = radiusUv * dst.y;
+            let rangeFade = saturate((texelRadius - 2.0) * 0.5);
+            let ao = mix(1.0, saturate(visibility * 0.5), rangeFade);
             let zNorm = saturate((z - params.uNear) / (params.uFar - params.uNear));
             result = vec4<f32>(ao, zNorm, 0.0, 1.0);
         }

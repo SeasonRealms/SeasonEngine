@@ -102,6 +102,8 @@ internal class App : BaseApp
     // driven near the end of App.Update.
     internal OcclusionFade fade;
 
+    //internal DebugPanel debugPanel;
+
     List<INativeImageDecoder> nativeImageDatas;
     int nativeImageDatasIndex = 0;
 
@@ -494,6 +496,9 @@ internal class App : BaseApp
         direction = new Direction();
         AddPanel(direction);
 
+        //debugPanel = new DebugPanel();
+        //AddPanel(debugPanel);
+
         // Hover picking highlight: when the pointer lands on a target's screen projection,
         // pulse Alpha over time and draw a white translucent bounds box.
         // Targets are opt-in only; background ground, walls, and the skybox are excluded.
@@ -501,7 +506,10 @@ internal class App : BaseApp
         // InstancedTargets registers instanced controls, with hit testing at single-instance granularity for per-instance bounds and property editing.
         picker = new ObjectPicker();
         picker.Targets.Add(ground.grass);
-        picker.Targets.Add(player.model);
+        if (player != null)
+        {
+            picker.Targets.Add(player.model);
+        }
         picker.Targets.Add(ball.model);
         picker.Targets.Add(ball.bee);
         picker.Targets.Add(streetLight.lightsPunctualLamp);
@@ -509,7 +517,10 @@ internal class App : BaseApp
         picker.Targets.Add(room.bottle);
         picker.Targets.Add(room.busterDrone);
         picker.Targets.Add(sphere.sphereRow);
-        picker.InstancedTargets.Add(robots.robotField);
+        if (robots != null)
+        {
+            picker.InstancedTargets.Add(robots.robotField);
+        }
         picker.InstancedTargets.Add(birds.seagullsModel);
         AddPanel(picker);
 
@@ -537,7 +548,10 @@ internal class App : BaseApp
 
             collider.Obstacles.Add(part);
         }
-        collider.InstancedObstacles.Add(robots.robotField);
+        if (robots != null)
+        {
+            collider.InstancedObstacles.Add(robots.robotField);
+        }
 
         // Occlusion-fade registration: start from every movement obstacle such as walls, the house, lamp posts, and the sphere row,
         // then add the roof and ceiling because they may block the camera view even though they do not block movement.
@@ -873,6 +887,8 @@ internal class App : BaseApp
         // Run occlusion fading at the end so both camera and player positions have reached their final values for this frame,
         // keeping ray tests consistent with the rendered image.
         fade?.Update(time);
+
+        //debugPanel?.Update(time);
 
         return false;
     }
