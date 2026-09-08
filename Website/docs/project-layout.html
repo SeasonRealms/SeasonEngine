@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - Project layout and assets
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it on every page.
+  - The right-hand table of contents is generated from the h2 and h3 elements
+    inside [data-toc-source]. Adding a section needs no other change.
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Project layout and assets &mdash; SeasonEngine</title>
+    <meta name="description" content="Where models, textures, fonts and shaders live, how Resources/Raw maps onto every platform, and how StorageService resolves a path at runtime." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/docs/project-layout.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Project layout and assets &mdash; SeasonEngine" />
+    <meta property="og:description" content="Where models, textures, fonts and shaders live, how Resources/Raw maps onto every platform, and how StorageService resolves a path at runtime." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/docs/project-layout.html" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../features/">Features</a>
+                <a href="../docs/" aria-current="page">Docs</a>
+                <a href="../samples/">Samples</a>
+                <a href="../download/">Download</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <div class="se-doc">
+                <aside class="se-sidebar">
+                    <div class="se-sidebar__group">
+                        <h4>Start here</h4>
+                        <ul>
+                            <li><a href="index.html">Getting started</a></li>
+                            <li><a href="requirements.html">Requirements</a></li>
+                            <li><a href="project-layout.html" aria-current="page">Project layout</a></li>
+                            <li><a href="platforms.html">Platform entry points</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Building a scene</h4>
+                        <ul>
+                            <li><a href="app-and-panels.html">Apps and panels</a></li>
+                            <li><a href="placement.html">Placement and camera</a></li>
+                            <li><a href="models.html">Models and animation</a></li>
+                            <li><a href="instancing.html">Instancing</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>2D and text</h4>
+                        <ul>
+                            <li><a href="controls-2d.html">2D controls</a></li>
+                            <li><a href="text.html">Text and fonts</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Rendering</h4>
+                        <ul>
+                            <li><a href="lighting.html">Lighting and sky</a></li>
+                            <li><a href="quality.html">Render quality</a></li>
+                            <li><a href="compute-effects.html">Compute effects</a></li>
+                        </ul>
+                    </div>
+                </aside>
+
+                <div class="se-doc__main" data-toc-source>
+                    <p class="se-crumbs"><a href="../index.html">Home</a> / <a href="../docs/">Docs</a> / Project layout</p>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Project layout and assets</h1>
+                        <p class="se-lede">
+                            Assets live in <code class="se-inline">Resources/Raw/</code> and are addressed by their path
+                            below it. A file at <code class="se-inline">Resources/Raw/Assets/island.glb</code> is loaded
+                            as <code class="se-inline">"Assets/island.glb"</code> on all six platforms, with no
+                            per-platform path handling in your code.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The shape of an application</h2>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>Hello/
+  Hello.csproj
+  GlobalUsings.cs
+  App.cs
+  Panels/
+    Scene.cs
+  Platforms/
+    Windows/     App.xaml, App.xaml.cs, Package.appxmanifest
+    Linux/       Linux.cs
+    Android/     MainActivity.cs, AndroidManifest.xml
+    iOS/         Program.cs, Info.plist
+    MacCatalyst/ Program.cs, Info.plist
+  Resources/
+    AppIcon/     appicon.svg
+    Splash/      splash.svg
+    Raw/
+      Assets/    island.glb, robot.glb, NotoSansMono-VariableFont.ttf, ...</code></pre>
+                        </div>
+
+                        <p>
+                            Everything outside <code class="se-inline">Platforms/</code> is shared. The web build is a
+                            separate Blazor WebAssembly project that references the same
+                            <code class="se-inline">App</code> class, because a browser host has a different project SDK
+                            rather than a different source file &mdash; see
+                            <a href="requirements.html">requirements</a> for the three-project shape.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The two item groups that make assets work</h2>
+                        <p>
+                            Mobile and Windows read assets through the MAUI asset system; Windows and Linux desktop
+                            builds also want them next to the executable. Both groups declare the same
+                            <code class="se-inline">LogicalName</code>/<code class="se-inline">Link</code> pattern, which
+                            is what keeps the lookup path identical everywhere.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>&lt;ItemGroup&gt;
+  &lt;MauiAsset Include="Resources\Raw\**"
+             LogicalName="%(RecursiveDir)%(Filename)%(Extension)" /&gt;
+&lt;/ItemGroup&gt;
+
+&lt;ItemGroup Condition="'$(IsWindows)' == 'true' or '$(IsLinux)' == 'true'"&gt;
+  &lt;Content Include="Resources\Raw\**"
+           CopyToOutputDirectory="PreserveNewest"
+           Link="%(RecursiveDir)%(Filename)%(Extension)" /&gt;
+&lt;/ItemGroup&gt;</code></pre>
+                        </div>
+
+                        <div class="se-callout se-callout--warn">
+                            <span class="se-callout__title">If a model loads on Windows but not on Android</span>
+                            <p>
+                                Check these two groups first. A missing
+                                <code class="se-inline">MauiAsset</code> entry produces exactly that symptom: the desktop
+                                build finds the file on disk through the <code class="se-inline">Content</code> copy while
+                                the packaged build has nothing to open. Loading is asynchronous and a missing asset leaves
+                                the control not <code class="se-inline">Ready</code> rather than throwing, so the failure
+                                looks like an invisible object rather than an exception.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Keeping Linux sources out of the MAUI builds</h2>
+                        <p>
+                            The Linux target is plain <code class="se-inline">net10.0</code>, so its entry point must not
+                            be compiled into the MAUI target frameworks. The sample projects do that with two small
+                            targets rather than with <code class="se-inline">#if</code> blocks:
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>&lt;Target Name="IncludeLinuxFilesForLinuxTarget" BeforeTargets="BeforeCompile"
+        Condition="'$(IsLinux)' == 'true'"&gt;
+  &lt;ItemGroup&gt;
+    &lt;Compile Include="Platforms\Linux\**\*.cs" /&gt;
+  &lt;/ItemGroup&gt;
+&lt;/Target&gt;
+
+&lt;Target Name="ExcludeLinuxFilesForNonLinuxTargets" AfterTargets="BeforeCompile"
+        Condition="'$(IsLinux)' != 'true'"&gt;
+  &lt;ItemGroup&gt;
+    &lt;Compile Remove="Platforms\Linux\**\*.cs" /&gt;
+  &lt;/ItemGroup&gt;
+&lt;/Target&gt;</code></pre>
+                        </div>
+
+                        <p class="se-muted">
+                            The <code class="se-inline">IsWindows</code>, <code class="se-inline">IsLinux</code>,
+                            <code class="se-inline">IsAndroid</code> and friends used in these conditions are ordinary
+                            MSBuild properties derived from <code class="se-inline">TargetFramework</code> at the top of
+                            the project file. Copying them along with the targets is the least error-prone way to start.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Global usings</h2>
+                        <p>
+                            Applications normally declare their namespaces once, which is why sample code carries almost
+                            no <code class="se-inline">using</code> lines and why the snippets on this site do not repeat
+                            them:
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>global using System.Numerics;
+
+global using Season.Basic;
+global using Season.Utils;
+global using Season.Storage;
+global using Season.Models;
+global using Season.Controls;
+global using Season.Panels;
+global using Season.Rendering;</code></pre>
+                        </div>
+
+                        <div class="se-table-wrap" style="margin-top:22px;">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Namespace</th><th>What lives there</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>Season.Basic</code></td><td><code>BaseApp</code>, <code>DeviceServices</code>, <code>Graphics</code>, <code>Colors</code>, <code>Platform</code>.</td></tr>
+                                    <tr><td><code>Season.Controls</code></td><td><code>Model</code>, <code>Mesh3D</code>, <code>InstancedModel</code>, <code>Sprite2D</code>, <code>Sprite3D</code>, <code>Shape</code>, <code>Texts</code>, and the <code>MeshInstanceTransform</code> you derive instance types from.</td></tr>
+                                    <tr><td><code>Season.Panels</code></td><td><code>Panel</code> and the ready-made panels: <code>FrameButton</code>, <code>Input</code>, <code>Picker</code>, <code>ObjectPicker</code>.</td></tr>
+                                    <tr><td><code>Season.Rendering</code></td><td><code>RenderQuality</code>, <code>FrameSchedule</code>, <code>Atmosphere</code>, <code>WorldSettings</code>, <code>SceneLighting</code>.</td></tr>
+                                    <tr><td><code>Season.Models</code></td><td>glTF loading and animation: <code>GltfAsset</code>, <code>GLTFAnimationPlayer</code>, <code>ModelAnimationInfo</code>, <code>PickMesh</code>.</td></tr>
+                                    <tr><td><code>Season.Storage</code></td><td><code>StorageService</code> and the settings persistence used by the quality screen.</td></tr>
+                                    <tr><td><code>Season.Fonts</code></td><td><code>Font</code>. Not usually a global using, since you touch it once at startup.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                    <div class="se-pagenav">
+                        <a href="requirements.html">&larr; Requirements</a>
+                        <a href="platforms.html">Platform entry points &rarr;</a>
+                    </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="../features/">Features</a></li>
+                        <li><a href="../docs/">Documentation</a></li>
+                        <li><a href="../samples/">Samples</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../why/">Why SeasonEngine</a></li>
+                        <li><a href="../compare/">How it compares</a></li>
+                        <li><a href="../ai/">The local AI layer</a></li>
+                        <li><a href="../download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms &mdash; SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/site.js"></script>
+</body>
+</html>

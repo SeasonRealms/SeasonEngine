@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - Render quality and settings
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it on every page.
+  - The right-hand table of contents is generated from the h2 and h3 elements
+    inside [data-toc-source]. Adding a section needs no other change.
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Render quality and settings &mdash; SeasonEngine</title>
+    <meta name="description" content="The difference between RenderQuality defaults read at construction and the instance properties you can move every frame, plus a reference of the knobs worth touching first." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/docs/quality.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Render quality and settings &mdash; SeasonEngine" />
+    <meta property="og:description" content="The difference between RenderQuality defaults read at construction and the instance properties you can move every frame, plus a reference of the knobs worth touching first." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/docs/quality.html" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../features/">Features</a>
+                <a href="../docs/" aria-current="page">Docs</a>
+                <a href="../samples/">Samples</a>
+                <a href="../download/">Download</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <div class="se-doc">
+                <aside class="se-sidebar">
+                    <div class="se-sidebar__group">
+                        <h4>Start here</h4>
+                        <ul>
+                            <li><a href="index.html">Getting started</a></li>
+                            <li><a href="requirements.html">Requirements</a></li>
+                            <li><a href="project-layout.html">Project layout</a></li>
+                            <li><a href="platforms.html">Platform entry points</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Building a scene</h4>
+                        <ul>
+                            <li><a href="app-and-panels.html">Apps and panels</a></li>
+                            <li><a href="placement.html">Placement and camera</a></li>
+                            <li><a href="models.html">Models and animation</a></li>
+                            <li><a href="instancing.html">Instancing</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>2D and text</h4>
+                        <ul>
+                            <li><a href="controls-2d.html">2D controls</a></li>
+                            <li><a href="text.html">Text and fonts</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Rendering</h4>
+                        <ul>
+                            <li><a href="lighting.html">Lighting and sky</a></li>
+                            <li><a href="quality.html" aria-current="page">Render quality</a></li>
+                            <li><a href="compute-effects.html">Compute effects</a></li>
+                        </ul>
+                    </div>
+                </aside>
+
+                <div class="se-doc__main" data-toc-source>
+                    <p class="se-crumbs"><a href="../index.html">Home</a> / <a href="../docs/">Docs</a> / Render quality</p>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Render quality</h1>
+                        <p class="se-lede">
+                            <code class="se-inline">RenderQuality</code> has two faces, and mixing them up is the most
+                            common early mistake with this engine. Static
+                            <code class="se-inline">Default*</code> fields are defaults you set before anything starts;
+                            <code class="se-inline">RenderQuality.Current</code> is the live instance you can write every
+                            frame.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The two faces</h2>
+
+                        <div class="se-grid se-grid--2">
+                            <div>
+                                <p><strong>Initialization</strong> &mdash; static
+                                <code class="se-inline">Default*</code> fields, set in the app constructor. These bake
+                                shader variants and size allocations.</p>
+                                <div class="se-code">
+<pre><code>public App()
+{
+    RenderQuality.DefaultGlobalIllumination = GiMode.Ddgi;
+    RenderQuality.DefaultAerialIntensity = 12f;
+    RenderQuality.DefaultShadowAtlasSize = 4096;
+}</code></pre>
+                                </div>
+                            </div>
+                            <div>
+                                <p><strong>Runtime</strong> &mdash;
+                                <code class="se-inline">RenderQuality.Current</code>, the live instance, safe to write from
+                                a settings screen or every frame.</p>
+                                <div class="se-code">
+<pre><code>var q = RenderQuality.Current;
+
+q.HdrExposure = 1.2f;
+q.ShadowDistance = 220f;
+q.AoIntensity = 0.8f;</code></pre>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="se-callout se-callout--contract">
+                            <span class="se-callout__title">Every member says which one it is</span>
+                            <p>
+                                <code class="se-inline">Season/Rendering/RenderQuality.cs</code> documents each member with
+                                a note on whether it is read once before graphics initialization or read every frame. Tier
+                                values &mdash; anything that decides a pipeline-state object, a render-target format or a
+                                buffer size &mdash; are locked before the frame loop starts and writing them later does
+                                nothing. Unsupported features are treated by a backend as an effective false rather than an
+                                error.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Where <code>Current</code> actually comes from</h2>
+                        <p>
+                            <code class="se-inline">Current</code> returns
+                            <code class="se-inline">BaseApp.Settings.RenderQuality</code> &mdash; the same object that is
+                            serialised into the settings file &mdash; falling back to a fresh instance when there is no app
+                            yet. <code class="se-inline">BaseApp.Init()</code> snapshots the
+                            <code class="se-inline">Default*</code> fields into it for new or empty settings.
+                        </p>
+
+                        <div class="se-callout se-callout--warn">
+                            <span class="se-callout__title">Defaults do not reach an existing install</span>
+                            <p>
+                                Because quality rides inside persisted settings, changing a
+                                <code class="se-inline">Default*</code> value affects a machine that has never run your
+                                application and no other. If you change a default and nothing happens on your development
+                                machine, that is why &mdash; delete the settings file, or set the value on
+                                <code class="se-inline">Current</code> as well. Anything you write to
+                                <code class="se-inline">Current</code> survives a restart, whether you meant it to or not.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The knobs worth knowing first</h2>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Member</th><th>Default</th><th>Read</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>HdrSceneColor</code></td><td>true</td><td>Initialization &mdash; decides the scene-colour format.</td></tr>
+                                    <tr><td><code>HdrExposure</code></td><td>1.0</td><td>Runtime.</td></tr>
+                                    <tr><td><code>AntiAliasing</code></td><td><code>AaMode.Taa</code></td><td>Initialization &mdash; also decides whether a post target exists at all.</td></tr>
+                                    <tr><td><code>AmbientOcclusion</code></td><td><code>AoMode.Gtao</code></td><td>Initialization.</td></tr>
+                                    <tr><td><code>AoRadius</code>, <code>AoIntensity</code></td><td>0.5, 1.0</td><td>Runtime.</td></tr>
+                                    <tr><td><code>GlobalIllumination</code></td><td><code>GiMode.Off</code></td><td>Initialization &mdash; DDGI allocates probe and SDF volumes.</td></tr>
+                                    <tr><td><code>GiIntensity</code></td><td>0.4</td><td>Runtime.</td></tr>
+                                    <tr><td><code>BloomEnabled</code></td><td>true</td><td>Initialization; threshold, knee and intensity are runtime.</td></tr>
+                                    <tr><td><code>ShadowsEnabled</code></td><td>true</td><td>Runtime &mdash; off skips the pass.</td></tr>
+                                    <tr><td><code>ShadowAtlasSize</code></td><td>2048</td><td>Initialization.</td></tr>
+                                    <tr><td><code>ShadowDistance</code></td><td>40</td><td>Runtime.</td></tr>
+                                    <tr><td><code>Sky</code></td><td><code>SkyMode.Procedural</code></td><td>Initialization.</td></tr>
+                                    <tr><td><code>AerialIntensity</code></td><td>1.0</td><td>Runtime. See below.</td></tr>
+                                    <tr><td><code>TaaSharpness</code></td><td>0.5</td><td>Runtime; above zero buys an extra RCAS resolve pass.</td></tr>
+                                    <tr><td><code>KhrLightIntensityScale</code></td><td>0.05</td><td>Runtime &mdash; brings photometric glTF light values into engine range.</td></tr>
+                                    <tr><td><code>AnimatedBoundsScale</code></td><td>1.5</td><td>Runtime &mdash; how far skinned bounds are inflated for culling.</td></tr>
+                                    <tr><td><code>TextureMaxAnisotropy</code></td><td>16</td><td>Runtime; clamped to what the backend supports.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            That is a selection, not the list. The file has roughly seventy members and each one carries its
+                            own note, which is a more reliable reference than any table on a website.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">One knob explained properly</h2>
+                        <p>
+                            <code class="se-inline">AerialIntensity</code> is a good example of why the numbers in this API
+                            need their reasoning attached.
+                        </p>
+
+                        <div class="se-callout se-callout--contract">
+                            <span class="se-callout__title">It is a lerp weight, not a multiplier</span>
+                            <p>
+                                0 bypasses aerial perspective, 1 is the physical result, and above 1 extrapolates for
+                                emphasis. The engine default is 1. The reference application uses 12, because its world is
+                                only a few hundred metres across while real aerial perspective is a kilometre-scale effect
+                                &mdash; at 1 the distant mountains gain roughly two units of blue out of 255, which nobody
+                                can see. A kilometre-scale scene should move back towards 1 or 2, and a scene with no
+                                distance at all can turn it off.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Building a settings screen</h2>
+                        <p>
+                            The Settings panel in the reference application is the working example: it binds controls
+                            directly to <code class="se-inline">RenderQuality.Current</code>, writes on change, and lets the
+                            normal settings save carry the values to disk.
+                        </p>
+                        <p class="se-muted">
+                            The one rule to encode in the UI is the split above. Runtime values can be sliders. Tier values
+                            need either a restart prompt or no control at all &mdash; a slider that silently does nothing
+                            until next launch is worse than an absent one.
+                        </p>
+                        <p class="se-muted">
+                            <code class="se-inline">WorldSettings</code> has deliberately the same shape, for the same
+                            reason: static defaults, persisted instance properties,
+                            <code class="se-inline">Current</code> as the read. See
+                            <a href="lighting.html">Lighting and sky</a>.
+                        </p>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                    <div class="se-pagenav">
+                        <a href="lighting.html">&larr; Lighting and sky</a>
+                        <a href="compute-effects.html">Compute effects &rarr;</a>
+                    </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="../features/">Features</a></li>
+                        <li><a href="../docs/">Documentation</a></li>
+                        <li><a href="../samples/">Samples</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../why/">Why SeasonEngine</a></li>
+                        <li><a href="../compare/">How it compares</a></li>
+                        <li><a href="../ai/">The local AI layer</a></li>
+                        <li><a href="../download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms &mdash; SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/site.js"></script>
+</body>
+</html>

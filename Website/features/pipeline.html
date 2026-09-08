@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - The render pipeline
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it on every page.
+  - The right-hand table of contents is generated from the h2 and h3 elements
+    inside [data-toc-source]. Adding a section needs no other change.
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>The render pipeline &mdash; SeasonEngine</title>
+    <meta name="description" content="SeasonEngine has no frame graph. The order of a frame is written down once in RenderPass.cs and every backend follows it: two compute phases around six named passes, with an explicit per-pass state contract." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/features/pipeline.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="The render pipeline &mdash; SeasonEngine" />
+    <meta property="og:description" content="SeasonEngine has no frame graph. The order of a frame is written down once in RenderPass.cs and every backend follows it: two compute phases around six named passes, with an explicit per-pass state contract." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/features/pipeline.html" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../features/" aria-current="page">Features</a>
+                <a href="../docs/">Docs</a>
+                <a href="../samples/">Samples</a>
+                <a href="../download/">Download</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <div class="se-doc">
+                <aside class="se-sidebar">
+                    <div class="se-sidebar__group">
+                        <h4>Overview</h4>
+                        <ul>
+                            <li><a href="index.html">Feature tour</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>The frame</h4>
+                        <ul>
+                            <li><a href="pipeline.html" aria-current="page">Render pipeline</a></li>
+                            <li><a href="materials.html">Materials and PBR</a></li>
+                            <li><a href="lighting.html">Lighting and shadows</a></li>
+                            <li><a href="global-illumination.html">Global illumination</a></li>
+                            <li><a href="sky.html">Sky and atmosphere</a></li>
+                            <li><a href="post-processing.html">Post-processing</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Scene content</h4>
+                        <ul>
+                            <li><a href="models.html">Models and animation</a></li>
+                            <li><a href="ui.html">2D, text and UI</a></li>
+                            <li><a href="picking.html">Picking and editing</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Portability</h4>
+                        <ul>
+                            <li><a href="platforms.html">Cross-platform</a></li>
+                        </ul>
+                    </div>
+                </aside>
+
+                <div class="se-doc__main" data-toc-source>
+                    <p class="se-crumbs"><a href="../index.html">Home</a> / <a href="../features/">Features</a> / Render pipeline</p>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">The render pipeline</h1>
+                        <p class="se-lede">
+                            There is no frame graph and no pass scheduler. The order of a frame is written down once, in
+                            <code class="se-inline">Rendering/RenderPass.cs</code>, and every backend follows it. That
+                            costs some scheduling generality; it buys a pipeline you can read in an afternoon and
+                            compare pixel for pixel across four graphics APIs.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">A frame, in order</h2>
+
+                        <div class="se-pipeline">
+                            <span class="se-pipeline__step se-pipeline__step--accent">FrameStart Compute</span>
+                            <span class="se-pipeline__arrow">&rarr;</span>
+                            <span class="se-pipeline__step">Shadow</span>
+                            <span class="se-pipeline__arrow">&rarr;</span>
+                            <span class="se-pipeline__step">Scene</span>
+                            <span class="se-pipeline__arrow">&rarr;</span>
+                            <span class="se-pipeline__step se-pipeline__step--accent">AfterScene Compute</span>
+                            <span class="se-pipeline__arrow">&rarr;</span>
+                            <span class="se-pipeline__step">Post</span>
+                            <span class="se-pipeline__arrow">&rarr;</span>
+                            <span class="se-pipeline__step">FinalBlit</span>
+                            <span class="se-pipeline__arrow">&rarr;</span>
+                            <span class="se-pipeline__step">Overlay</span>
+                        </div>
+
+                        <div class="se-table-wrap" style="margin-top:22px;">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Phase</th><th>What runs there</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>FrameStart Compute</td><td>Sky and atmosphere LUTs, cloud noise, SDF voxelisation, DDGI probe tracing &mdash; anything the scene pass will sample.</td></tr>
+                                    <tr><td>Shadow</td><td>Cascaded sun shadows plus one punctual slot, rendered into a single depth atlas.</td></tr>
+                                    <tr><td>Scene</td><td>Opaque and transparent geometry, sky, 3D sprites. Writes scene colour, depth and motion vectors.</td></tr>
+                                    <tr><td>AfterScene Compute</td><td>GTAO, TAA resolve, bloom downsample chain, debug view generation.</td></tr>
+                                    <tr><td>Post</td><td>Tonemap and composite of the post chain into the final colour target.</td></tr>
+                                    <tr><td>FinalBlit</td><td>Resolve to the swapchain, including design-resolution scaling.</td></tr>
+                                    <tr><td>Overlay</td><td>2D sprites, shapes and MSDF text, drawn after everything else in screen space.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            One pass is missing from that strip because it is conditional:
+                            <code class="se-inline">OutlineMask</code> sits between the AfterScene compute phase and
+                            Post, and it renders the objects that asked for a screen-space outline into a mask that the
+                            composite step then dilates. All four backends implement it, and it costs nothing on frames
+                            where nothing requested an outline &mdash; the backend early-outs before allocating the mask
+                            target.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The pass identifiers</h2>
+                        <p>
+                            Passes are named by an enum rather than by string, which means a backend that forgets one
+                            fails to compile rather than failing to draw.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>public enum RenderPassId
+{
+    Shadow,
+    Scene,
+    Post,
+    OutlineMask,
+    FinalBlit,
+    Overlay
+}</code></pre>
+                        </div>
+
+                        <p class="se-muted">
+                            The two compute phases are not pass identifiers. They are points in the schedule where
+                            registered compute work is dispatched, described further down.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The per-pass state contract</h2>
+                        <p>
+                            Each pass is described by a <code class="se-inline">PassDesc</code> carrying its colour,
+                            depth and velocity targets. The value of a fixed schedule is not the schedule itself &mdash;
+                            it is that the rules around each pass can be stated in three lines and then relied on.
+                        </p>
+
+                        <div class="se-callout se-callout--contract">
+                            <span class="se-callout__title">Contract</span>
+                            <p>
+                                Resource states are transitioned <em>at</em> pass boundaries, never inside a pass body.
+                                No bindings survive from one pass to the next; every pass rebinds what it needs.
+                                Viewport and scissor are set by the pass framework, and the Shadow pass is the one
+                                place that overrides the viewport itself, because it renders four tiles into one
+                                atlas.
+                            </p>
+                        </div>
+
+                        <p class="se-muted">
+                            That contract is why the four backends stay comparable. A Vulkan barrier, a D3D12 resource
+                            transition and a Metal encoder boundary all land in the same place, so a divergence between
+                            two backends is a bug in one pass rather than a difference in scheduling philosophy.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">FrameSchedule: the slots everyone shares</h2>
+                        <p>
+                            Passes do not look each other up. They read and write a small set of static slots on
+                            <code class="se-inline">FrameSchedule</code>, which is the whole of the inter-pass
+                            communication surface.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Slot</th><th>Type</th><th>Meaning</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>SceneColor</code></td><td><code>RenderTarget?</code></td><td>HDR scene colour written by the Scene pass.</td></tr>
+                                    <tr><td><code>SceneDepth</code></td><td><code>RenderTarget?</code></td><td>Scene depth, read by GTAO, TAA and the debug views.</td></tr>
+                                    <tr><td><code>SceneVelocity</code></td><td><code>RenderTarget?</code></td><td>Motion vectors; null when motion vectors are off.</td></tr>
+                                    <tr><td><code>ShadowMap</code></td><td><code>RenderTarget?</code></td><td>The shared cascade atlas.</td></tr>
+                                    <tr><td><code>PostColor</code></td><td><code>RenderTarget?</code></td><td>Target the Post pass composites into.</td></tr>
+                                    <tr><td><code>RenderShadow</code></td><td><code>Action&lt;IGraphics&gt;?</code></td><td>Callback the Shadow pass invokes to draw casters.</td></tr>
+                                    <tr><td><code>RenderPost</code></td><td><code>Action&lt;IGraphics, RenderTarget&gt;?</code></td><td>Callback the Post pass invokes to composite.</td></tr>
+                                    <tr><td><code>BloomTexture</code></td><td><code>string?</code></td><td>Name of the bloom result, or null when bloom is off.</td></tr>
+                                    <tr><td><code>AoTexture</code></td><td><code>string?</code></td><td>Name of the AO result, or null.</td></tr>
+                                    <tr><td><code>SceneColorOverride</code></td><td><code>string?</code></td><td>Lets an effect substitute its own output for scene colour.</td></tr>
+                                    <tr><td><code>SkyViewTexture</code></td><td><code>string?</code></td><td>Sky-view LUT published by the atmosphere effect.</td></tr>
+                                    <tr><td><code>CloudNoiseTexture</code></td><td><code>string?</code></td><td>Cloud noise volume name.</td></tr>
+                                    <tr><td><code>AerialLutTexture</code></td><td><code>string?</code></td><td>Aerial-perspective LUT name.</td></tr>
+                                    <tr><td><code>TaaActive</code></td><td><code>bool</code></td><td>True when TAA is resolving, so the camera applies jitter.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            The <code class="se-inline">string?</code> slots are deliberate. An effect publishes a
+                            texture under a <code class="se-inline">compute://</code> name and writes that name into the
+                            slot; a consumer that finds null simply takes its unlit path. Switching off an effect and
+                            failing to initialise it therefore produce the same, correct, frame.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The two compute phases</h2>
+                        <p>
+                            Compute work is not hard-wired into the schedule. Effects register themselves against a
+                            phase, and the phase decides only whether they see the scene or precede it.
+                        </p>
+
+                        <div class="se-codepair">
+                            <div class="se-code">
+                                <button class="se-code__copy" type="button">Copy</button>
+<pre><code>public enum ComputePhase
+{
+    FrameStart,
+    AfterScene
+}</code></pre>
+                            </div>
+                            <div class="se-code">
+                                <button class="se-code__copy" type="button">Copy</button>
+<pre><code>// Returns false when the backend cannot
+// run compute, or Initialize failed.
+// Either way nothing is left behind.
+bool ok = FrameSchedule.RegisterCompute(
+    graphics, new MyEffect());</code></pre>
+                            </div>
+                        </div>
+
+                        <p class="se-callout se-callout--contract">
+                            <strong>Contract.</strong> A compute effect registers itself into one of the two compute
+                            phases and must leave no residue when a backend cannot run it. That is why the same scene
+                            code produces a correct frame with GI, AO and TAA all switched off.
+                        </p>
+
+                        <p>
+                            <a href="post-processing.html">Post-processing and compute effects</a> walks the effects
+                            that ship in the box; <a href="../docs/compute-effects.html">Writing a compute effect</a> is
+                            the how-to.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">What a fixed schedule costs you</h2>
+                        <p>
+                            Worth stating plainly, because it is the central design trade of the renderer.
+                        </p>
+                        <ul class="se-list">
+                            <li>
+                                <strong>You cannot add a pass from application code.</strong> Adding one means editing
+                                the enum and every backend. Compute effects exist precisely so that most extensions
+                                do not need a new pass.
+                            </li>
+                            <li>
+                                <strong>There is no automatic barrier placement or lifetime analysis.</strong> Targets
+                                are allocated for the frame, not aliased by a resource allocator.
+                            </li>
+                            <li>
+                                <strong>No G-buffer, no deferred path.</strong> Shading is forward, organised as
+                                opaque, transparent and fade groups with cull variants. Many lights per pixel is not
+                                what this renderer is built for &mdash; the punctual budget is eight per frame.
+                            </li>
+                            <li>
+                                <strong>In exchange:</strong> the whole frame is one readable file, four backends can
+                                be diffed against each other, and a wrong pixel has a small number of possible
+                                causes.
+                            </li>
+                        </ul>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                    <div class="se-pagenav">
+                        <a href="index.html">&larr; Feature tour</a>
+                        <a href="materials.html">Materials and PBR &rarr;</a>
+                    </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="../features/">Features</a></li>
+                        <li><a href="../docs/">Documentation</a></li>
+                        <li><a href="../samples/">Samples</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../why/">Why SeasonEngine</a></li>
+                        <li><a href="../compare/">How it compares</a></li>
+                        <li><a href="../ai/">The local AI layer</a></li>
+                        <li><a href="../download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms &mdash; SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/site.js"></script>
+</body>
+</html>

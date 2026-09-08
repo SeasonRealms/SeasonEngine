@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - The local AI layer
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it on every page.
+  - The right-hand table of contents is generated from the h2 and h3 elements
+    inside [data-toc-source]. Adding a section needs no other change.
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>The local AI layer &mdash; SeasonEngine</title>
+    <meta name="description" content="Text, image, speech and vision models running on the user's own device, packaged so that a C# application does not have to solve CUDA versioning to ship." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/ai/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="The local AI layer &mdash; SeasonEngine" />
+    <meta property="og:description" content="Text, image, speech and vision models running on the user's own device, packaged so that a C# application does not have to solve CUDA versioning to ship." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/ai/" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../features/">Features</a>
+                <a href="../docs/">Docs</a>
+                <a href="../samples/">Samples</a>
+                <a href="../download/">Download</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <div class="se-doc se-doc--wide">
+
+                <div class="se-doc__main" data-toc-source>
+                    <p class="se-crumbs"><a href="../index.html">Home</a> / Local AI</p>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">The local AI layer</h1>
+                        <p class="se-lede">
+                            Text, image, speech and vision models running on the user's own device, inside a C#
+                            application, with the native dependency problem already solved. It sits beside the engine,
+                            not inside the renderer &mdash; and it is the last thing on this site for a reason.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Where this sits, and why it is last</h2>
+                        <p>
+                            If you came here to evaluate a renderer, you can stop reading now and lose nothing. The
+                            engine does not depend on any of this. The web build does not contain any of it. Nothing in
+                            <a href="../features/">Features</a> or <a href="../docs/">Getting started</a> requires a
+                            model file, a GPU runtime or a purchase.
+                        </p>
+                        <div class="se-callout se-callout--contract">
+                            <span class="se-callout__title">The engine is MIT; this layer is not</span>
+                            <p>
+                                The foundational inference libraries &mdash; <code class="se-inline">SeasonONNX</code>,
+                                <code class="se-inline">SeasonGGML</code>, <code class="se-inline">SeasonTTS</code>,
+                                <code class="se-inline">SeasonVision</code> and <code class="se-inline">SeasonAudio</code>
+                                &mdash; are MIT, like the engine. <code class="se-inline">SeasonAI</code>, the layer that
+                                turns them into task-oriented panels, is the commercial part, and
+                                <strong>it is not in this repository.</strong> What you can read here is the seam:
+                                <code class="se-inline">Apps/Engine/Panels/SeasonAI/</code> holds the open-source
+                                <code class="se-inline">AIButton</code>, <code class="se-inline">AIPanel</code> and
+                                <code class="se-inline">AINotice</code> that the closed layer plugs into.
+                            </p>
+                        </div>
+                        <p class="se-muted">
+                            That arrangement is deliberate and stated up front because the alternative &mdash; an
+                            engine page that quietly pivots into a paid feature &mdash; reads as an advertisement
+                            wearing an open-source badge. If the split bothers you, the engine without it is complete
+                            and permissively licensed, and that is not a consolation prize.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">What the contribution actually is</h2>
+                        <p>
+                            Not another inference backend. Not a better model. The claim is narrower and more boring:
+                            <strong>making dependency-heavy local models practical inside a shipping desktop
+                            application.</strong> One API over both ONNX Runtime and GGML, native runtimes whose
+                            versions are known to agree with each other, and CUDA / cuDNN binaries packaged into the
+                            build instead of an install guide handed to the user.
+                        </p>
+                        <p>
+                            <span class="se-pill">Text</span><span class="se-pill">Translate</span><span class="se-pill">Image</span>
+                            <span class="se-pill">Video</span><span class="se-pill">Music</span><span class="se-pill">TTS</span>
+                            <span class="se-pill">STT</span><span class="se-pill">Vision</span>
+                        </p>
+                        <p class="se-muted">
+                            Eight modalities, one application, no Python environment. That is the whole pitch.
+                            <a href="models.html">Models and runtimes &rarr;</a> covers which formats and execution
+                            providers are behind each one.
+                        </p>
+                        <div class="se-shot">
+                            <img src="../assets/img/shot-ai.jpg" alt="Image generation running inside the SeasonEngine application" loading="lazy" />
+                            <span class="se-shot__tag">Image generation, running locally inside <code>Apps/Engine</code></span>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The honest gap</h2>
+                        <div class="se-callout se-callout--warn">
+                            <span class="se-callout__title">Generated output cannot become an engine asset yet</span>
+                            <p>
+                                Eight generation capabilities ship. <strong>None of their output can currently be bound
+                                to anything in the scene.</strong> Results are displayed inside the AI panels and stop
+                                there. There is no path from a generated image to a material texture, no generated-asset
+                                folder with a stable layout, and no way to send a selected object's texture back into
+                                image-to-image as a reference.
+                            </p>
+                            <p>
+                                Which means that today, functionally, this is a local generation utility that happens to
+                                be bolted to a renderer. Closing that gap is the highest-return item on the
+                                <a href="roadmap.html">AI roadmap</a>, and it is also the only defensible answer to the
+                                obvious question below.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">"Why not just use ComfyUI, which is free?"</h2>
+                        <p>
+                            It is a fair question and it deserves a real answer rather than a feature table. For
+                            generating an image, ComfyUI is free, excellent, and has a larger node ecosystem than this
+                            will ever have. So do A1111, Forge, Fooocus, LM Studio, Ollama and Jan in their respective
+                            lanes. Every headline capability here has a free, actively developed alternative.
+                        </p>
+                        <p>
+                            The difference is the audience and the location. This is aimed at a developer who wants
+                            generation to happen <em>inside their own C# project</em> &mdash; reachable from an API,
+                            surfaced through UI panels they can configure, in source they can modify. Not a separate
+                            application to alt-tab into and copy files out of.
+                        </p>
+                        <div class="se-table-wrap">
+                            <table>
+                                <thead>
+                                    <tr><th>If you want to&hellip;</th><th>Use</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>Generate the best possible image, with full control over the graph</td><td>ComfyUI. Genuinely.</td></tr>
+                                    <tr><td>Chat with a local model</td><td>LM Studio or Ollama</td></tr>
+                                    <tr><td>Call local inference from C# without shipping a Python environment</td><td>The MIT libraries below the AI layer</td></tr>
+                                    <tr><td>Ship an application where generation is a feature your users see</td><td>This, once the asset path in the roadmap exists</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <p class="se-muted">
+                            The eventual argument &mdash; the one that no standalone tool can answer &mdash; is that
+                            ComfyUI cannot select an object in your scene. That argument is not available yet, because
+                            the asset path described above does not exist. It is listed as a plan, not as a feature.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">How it reaches the application</h2>
+                        <p>
+                            The bridge is small enough to describe in a paragraph. The reference application hosts
+                            <code class="se-inline">Season.AI.Panels.AIButton</code>, which opens
+                            <code class="se-inline">Season.AI.Panels.AIPanel</code>. That panel owns a
+                            <code class="se-inline">Texts</code> entry per modality &mdash; text, translate, image,
+                            video, music, stt, tts, vision &mdash; and swaps a
+                            <code class="se-inline">currentPanel</code> underneath. When a capability is not unlocked,
+                            <code class="se-inline">AINotice</code> takes over and presents the tiers.
+                        </p>
+                        <pre><code>Apps/Engine/Engine.csproj
+
+  &lt;Compile Remove="Panels\SeasonAI\**" /&gt;          // excluded from the open build
+  &lt;ProjectReference Include="..\..\..\SeasonAI\SeasonAI.csproj" /&gt;</code></pre>
+                        <p class="se-muted">
+                            The <code class="se-inline">Compile Remove</code> is how one source tree serves both builds:
+                            the panel sources are present and readable, but the open build compiles them out of the
+                            application and takes them from the commercial project instead. The consequence is spelled
+                            out on <a href="../samples/engine.html">the reference application page</a> &mdash; that
+                            unconditional project reference is why <code class="se-inline">Apps/Engine</code> does not
+                            build from a clean clone.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Tiers, as the shipped code describes them</h2>
+                        <p>
+                            <code class="se-inline">AINotice</code> is open source, so the tier structure is not a
+                            marketing claim &mdash; you can read the three entries it constructs:
+                        </p>
+                        <div class="se-table-wrap">
+                            <table>
+                                <thead>
+                                    <tr><th>Tier</th><th>As described in <code>AINotice.cs</code></th><th>Status</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>Base Models</td><td>"Limited backend support" &mdash; free</td><td><span class="se-badge se-badge--shipped">In the free build</span></td></tr>
+                                    <tr><td>All Models</td><td>"CUDA support" &mdash; premium</td><td><span class="se-badge se-badge--partial">Store add-on, not yet published</span></td></tr>
+                                    <tr><td>Source Code</td><td>"Current &amp; future updates" &mdash; premium</td><td><span class="se-badge se-badge--partial">Not yet available</span></td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <p>
+                            The free tier is base models on CPU and DirectML. What a purchase adds is the larger model
+                            set plus CUDA, which is a speed and quality upgrade rather than a new capability &mdash; and
+                            <strong>CUDA only helps NVIDIA hardware.</strong> Saying so here rather than in the
+                            small print is the only sane way to sell it.
+                        </p>
+                        <p class="se-muted">
+                            No prices are quoted on this site yet, because neither add-on has been submitted and
+                            announcing a number before that is how you end up publicly cutting it. There will be no
+                            subscription: inference runs on the user's own electricity, so there is nothing recurring
+                            to charge for. The base application stays free.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Where to go next</h2>
+                        <div class="se-grid se-grid--3">
+                            <a class="se-linkcard" href="models.html">
+                                <h3>Models and runtimes</h3>
+                                <p>ONNX Runtime and GGML side by side, how CPU, DirectML and CUDA are selected, and what the packaged native dependencies actually weigh.</p>
+                                <span class="se-linkcard__meta">Next page</span>
+                            </a>
+                            <a class="se-linkcard" href="roadmap.html">
+                                <h3>Where it is going</h3>
+                                <p>Generated output into the scene, cloud models with your own key, runtime C# compilation, and why 3D generation is further away than it looks.</p>
+                                <span class="se-linkcard__meta">Plans, marked as plans</span>
+                            </a>
+                            <a class="se-linkcard" href="../why/">
+                                <h3>Back to the engine</h3>
+                                <p>The part of this project that is MIT, complete, and does not need any of the above to be useful.</p>
+                                <span class="se-linkcard__meta">Why SeasonEngine</span>
+                            </a>
+                        </div>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                    <div class="se-pagenav">
+                        <span></span>
+                        <a href="models.html">Models and runtimes &rarr;</a>
+                    </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="../features/">Features</a></li>
+                        <li><a href="../docs/">Documentation</a></li>
+                        <li><a href="../samples/">Samples</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../why/">Why SeasonEngine</a></li>
+                        <li><a href="../compare/">How it compares</a></li>
+                        <li><a href="../ai/">The local AI layer</a></li>
+                        <li><a href="../download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms &mdash; SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/site.js"></script>
+</body>
+</html>

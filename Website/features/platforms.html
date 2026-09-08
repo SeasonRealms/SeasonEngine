@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - Cross-platform by isolation
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it on every page.
+  - The right-hand table of contents is generated from the h2 and h3 elements
+    inside [data-toc-source]. Adding a section needs no other change.
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cross-platform by isolation &mdash; SeasonEngine</title>
+    <meta name="description" content="Four graphics backends behind one IGraphics interface, thirteen device services behind interfaces, and a scene layer that compiles unchanged on Windows, Linux, Android, iOS, macOS and the browser." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/features/platforms.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Cross-platform by isolation &mdash; SeasonEngine" />
+    <meta property="og:description" content="Four graphics backends behind one IGraphics interface, thirteen device services behind interfaces, and a scene layer that compiles unchanged on Windows, Linux, Android, iOS, macOS and the browser." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/features/platforms.html" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../features/" aria-current="page">Features</a>
+                <a href="../docs/">Docs</a>
+                <a href="../samples/">Samples</a>
+                <a href="../download/">Download</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <div class="se-doc">
+                <aside class="se-sidebar">
+                    <div class="se-sidebar__group">
+                        <h4>Overview</h4>
+                        <ul>
+                            <li><a href="index.html">Feature tour</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>The frame</h4>
+                        <ul>
+                            <li><a href="pipeline.html">Render pipeline</a></li>
+                            <li><a href="materials.html">Materials and PBR</a></li>
+                            <li><a href="lighting.html">Lighting and shadows</a></li>
+                            <li><a href="global-illumination.html">Global illumination</a></li>
+                            <li><a href="sky.html">Sky and atmosphere</a></li>
+                            <li><a href="post-processing.html">Post-processing</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Scene content</h4>
+                        <ul>
+                            <li><a href="models.html">Models and animation</a></li>
+                            <li><a href="ui.html">2D, text and UI</a></li>
+                            <li><a href="picking.html">Picking and editing</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Portability</h4>
+                        <ul>
+                            <li><a href="platforms.html" aria-current="page">Cross-platform</a></li>
+                        </ul>
+                    </div>
+                </aside>
+
+                <div class="se-doc__main" data-toc-source>
+                    <p class="se-crumbs"><a href="../index.html">Home</a> / <a href="../features/">Features</a> / Cross-platform</p>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Cross-platform by isolation</h1>
+                        <p class="se-lede">
+                            Six targets, four graphics APIs, one app-facing model. There is no OpenGL or WebGL fallback
+                            path: each platform gets the current API for that platform, with its own hand-written shader
+                            set. Everything that genuinely differs is pushed behind one static service object, so your
+                            scene code never contains a platform conditional.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The targets</h2>
+
+                        <div class="se-strip">
+                            <img src="../assets/img/windows.svg" alt="Windows" />
+                            <img src="../assets/img/linux.svg" alt="Linux" />
+                            <img src="../assets/img/macos.svg" alt="macOS" />
+                            <img src="../assets/img/ios.svg" alt="iOS" />
+                            <img src="../assets/img/android.svg" alt="Android" />
+                            <img src="../assets/img/dx12ultimate.png" alt="Direct3D 12" />
+                            <img src="../assets/img/vulkan.svg" alt="Vulkan" style="height:42px;" />
+                            <img src="../assets/img/metal-256x256_2x.png" alt="Metal" />
+                            <img src="../assets/img/wgpu.svg" alt="WebGPU" />
+                        </div>
+
+                        <div class="se-table-wrap" style="margin-top:22px;">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Platform</th><th>Target framework</th><th>Entry point</th><th>Backend</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>Windows</td><td><code>net10.0-windows10.0.19041.0</code></td><td><code>WindowsApp.Run(app)</code></td><td>Direct3D 12</td></tr>
+                                    <tr><td>Linux</td><td><code>net10.0</code></td><td><code>LinuxApp.Run(app)</code></td><td>Vulkan</td></tr>
+                                    <tr><td>Android</td><td><code>net10.0-android</code></td><td><code>AndroidApp.Run(app)</code></td><td>Vulkan</td></tr>
+                                    <tr><td>iOS</td><td><code>net10.0-ios</code></td><td><code>iOSApp.Run(app)</code></td><td>Metal</td></tr>
+                                    <tr><td>Mac Catalyst</td><td><code>net10.0-maccatalyst</code></td><td><code>MacCatalystApp.Run(app)</code></td><td>Metal</td></tr>
+                                    <tr><td>Web</td><td><code>net10.0-browser</code></td><td><code>WebApp.Run(app, jsRuntime, httpClient, ...)</code></td><td>WebGPU</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            The Windows target is added conditionally, only when the build host is Windows, so a Linux or
+                            macOS machine can build the other five without installing a Windows SDK. Android, iOS and Mac
+                            Catalyst use the MAUI hosting layer for their application shell; Linux and Web do not.
+                        </p>
+
+                        <p>
+                            <strong>Vulkan is shared between Linux and Android.</strong> They live in the same
+                            <code class="se-inline">Platforms/Shared/LinuxAndroid</code> backend, and iOS and Mac Catalyst
+                            share <code class="se-inline">Platforms/Shared/Apple</code>. Four graphics implementations,
+                            six platforms: the sharing is at the API level, which is the only level where sharing is
+                            honest.
+                        </p>
+
+                        <div class="se-callout se-callout--contract">
+                            <span class="se-callout__title">Shaders are written four times, on purpose</span>
+                            <p>
+                                HLSL for Direct3D&nbsp;12, GLSL compiled to SPIR-V for Vulkan, Metal Shading Language for
+                                Apple, WGSL for WebGPU. No cross-compiler, no shader abstraction layer, no runtime
+                                translation. The cost is that a lighting change is four edits; the benefit is that when
+                                one backend looks wrong you are reading the shader that actually runs, and a backend can
+                                use a feature the others do not have without inventing a lowest common denominator.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Device services</h2>
+                        <p>
+                            <code class="se-inline">DeviceServices</code> is a static set of interfaces, initialised once
+                            by the platform entry point before your app runs. Everything platform-specific is reached
+                            through it, which is why the engine source contains no
+                            <code class="se-inline">#if ANDROID</code> in scene-facing code.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Service</th><th>Interface</th><th>Covers</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>Core</code></td><td><code>IDeviceCore</code></td><td>Platform and channel, orientation, resource loading, dark mode, permissions.</td></tr>
+                                    <tr><td><code>Media</code></td><td><code>IMediaPlayer</code></td><td>Music and sound playback with separate volumes.</td></tr>
+                                    <tr><td><code>Video</code></td><td><code>IVideoPlayerService</code></td><td>Video frames pushed into the engine as RGBA8. Hardware accelerated on Windows.</td></tr>
+                                    <tr><td><code>Dialog</code></td><td><code>IDialogService</code></td><td>Native message boxes and the native keyboard.</td></tr>
+                                    <tr><td><code>File</code></td><td><code>IFileService</code></td><td>Pickers and platform file access.</td></tr>
+                                    <tr><td><code>Image</code></td><td><code>IImageService</code></td><td>Native image decode and encode.</td></tr>
+                                    <tr><td><code>Gallery</code></td><td><code>IGalleryService</code></td><td>Reading from and saving to the system photo library.</td></tr>
+                                    <tr><td><code>Record</code></td><td><code>IRecordService</code></td><td>Microphone capture.</td></tr>
+                                    <tr><td><code>Recorder</code></td><td><code>IMediaRecorder</code></td><td>Recording the app's own rendered output. Null where unimplemented.</td></tr>
+                                    <tr><td><code>Download</code></td><td><code>IDownloadService</code></td><td>Background downloads with progress.</td></tr>
+                                    <tr><td><code>Store</code></td><td><code>IStoreService</code></td><td>In-app purchase and licence checks.</td></tr>
+                                    <tr><td><code>Ads</code></td><td><code>IAds</code></td><td>Ad integration, opt-in.</td></tr>
+                                    <tr><td><code>WindowsFeatures</code></td><td><code>IWindowsFeatures</code></td><td>Windows-only extras, isolated behind one interface rather than sprinkled through the engine.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <div class="se-callout se-callout--warn">
+                            <span class="se-callout__title">Coverage is not uniform, and it is not faked</span>
+                            <p>
+                                Where a platform has no implementation, the service is null or a documented no-op. It does
+                                not silently return a plausible-looking value. Callers null-check
+                                &mdash; <code class="se-inline">DeviceServices.Recorder</code> is the one you will hit
+                                first &mdash; and in exchange you never ship a feature that appeared to work in
+                                development and does nothing on a user's device.
+                            </p>
+                        </div>
+
+                        <p><strong>Two concrete examples of the asymmetry.</strong> Screen capture splits cleanly:
+                        <code class="se-inline">CaptureSelf</code>, which reads back the engine's own backbuffer as
+                        RGBA8, works everywhere because it goes through the graphics API.
+                        <code class="se-inline">CaptureWindow</code>, which grabs the whole screen, is desktop only
+                        &mdash; mobile and Web sandboxes do not permit it, and the method returns null rather than a
+                        black image. Resource loading splits too: every platform has a synchronous
+                        <code class="se-inline">LoadFile</code>, but Web overrides the async path with an HTTP download,
+                        because Blazor WebAssembly has no synchronous I/O and a task there must never be waited on
+                        synchronously.</p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">What a platform entry point does</h2>
+                        <p>
+                            Your application is a <code class="se-inline">BaseApp</code> subclass with panels in it, and
+                            it is the same class on all six targets. Each platform head is a small project whose whole
+                            job is to create the window or canvas, construct the platform service implementations, and
+                            hand your app to the loop.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>// Windows head
+WindowsApp.Run(new MyApp());
+
+// Web head, inside a Blazor component
+await WebApp.Run(new MyApp(), JS, Http, canvasId: "season-canvas");</code></pre>
+                        </div>
+
+                        <p class="se-muted">
+                            The Web head takes more arguments because the browser gives it less: a JavaScript runtime for
+                            interop, an <code class="se-inline">HttpClient</code> because assets arrive over the network,
+                            and the id of the canvas to render into. Everything above that line is identical.
+                        </p>
+
+                        <p>
+                            <strong>WebGPU is real, not emulated.</strong> The GPU objects live in JavaScript in
+                            <code class="se-inline">seasonWebGPU.js</code> and the C# layer forwards through
+                            <code class="se-inline">[JSImport]</code>. Shaders are WGSL, compiled by the browser, and the
+                            JS side carries no shader source of its own. Compute effects run in the browser; global
+                            illumination, TAA and the atmosphere model are the same code path as on the desktop.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Storage, settings and localisation</h2>
+                        <p>
+                            <code class="se-inline">StorageService</code> resolves one settings and file location per
+                            platform from a single <code class="se-inline">DirectoryBase</code> name, so an app declares
+                            where its data lives once and gets the right answer on every target.
+                            <code class="se-inline">Database</code> is the local persistence layer, and
+                            <code class="se-inline">Localization</code> backs the
+                            <code class="se-inline">Texts.Translate</code> flag &mdash; which is why text is translated
+                            before layout rather than after, and a longer German string reflows correctly instead of
+                            overflowing its box.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Known gaps</h2>
+                        <ul class="se-list">
+                            <li>
+                                <span class="se-badge se-badge--absent">Absent</span>
+                                <strong>No console platforms.</strong> No PlayStation, Xbox or Switch backend, and no
+                                path to one that does not involve an NDA.
+                            </li>
+                            <li>
+                                <span class="se-badge se-badge--absent">Absent</span>
+                                <strong>No native macOS window.</strong> Desktop macOS is reached through Mac Catalyst,
+                                not a first-class AppKit head.
+                            </li>
+                            <li>
+                                <span class="se-badge se-badge--partial">Partial</span>
+                                <strong>Service coverage varies by platform.</strong> Recording, store and ads are the
+                                thinnest. The table above is honest about which ones can be null; check before you
+                                design a feature around one.
+                            </li>
+                            <li>
+                                <span class="se-badge se-badge--absent">Absent</span>
+                                <strong>No shader cross-compilation.</strong> Adding a lighting term means editing four
+                                shader sets. This is a deliberate trade, but it is a real cost and it scales with the
+                                number of backends.
+                            </li>
+                        </ul>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                    <div class="se-pagenav">
+                        <a href="picking.html">&larr; Picking and editing</a>
+                        <a href="../docs/">Getting started &rarr;</a>
+                    </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="../features/">Features</a></li>
+                        <li><a href="../docs/">Documentation</a></li>
+                        <li><a href="../samples/">Samples</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../why/">Why SeasonEngine</a></li>
+                        <li><a href="../compare/">How it compares</a></li>
+                        <li><a href="../ai/">The local AI layer</a></li>
+                        <li><a href="../download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms &mdash; SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/site.js"></script>
+</body>
+</html>

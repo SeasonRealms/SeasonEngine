@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - Materials and PBR
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it on every page.
+  - The right-hand table of contents is generated from the h2 and h3 elements
+    inside [data-toc-source]. Adding a section needs no other change.
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Materials and PBR &mdash; SeasonEngine</title>
+    <meta name="description" content="One metallic-roughness shading model taken straight from glTF, with per-texture overrides, HDR scene colour and an environment map that can supply diffuse or diffuse-plus-specular ambient light." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/features/materials.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Materials and PBR &mdash; SeasonEngine" />
+    <meta property="og:description" content="One metallic-roughness shading model taken straight from glTF, with per-texture overrides, HDR scene colour and an environment map that can supply diffuse or diffuse-plus-specular ambient light." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/features/materials.html" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../features/" aria-current="page">Features</a>
+                <a href="../docs/">Docs</a>
+                <a href="../samples/">Samples</a>
+                <a href="../download/">Download</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <div class="se-doc">
+                <aside class="se-sidebar">
+                    <div class="se-sidebar__group">
+                        <h4>Overview</h4>
+                        <ul>
+                            <li><a href="index.html">Feature tour</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>The frame</h4>
+                        <ul>
+                            <li><a href="pipeline.html">Render pipeline</a></li>
+                            <li><a href="materials.html" aria-current="page">Materials and PBR</a></li>
+                            <li><a href="lighting.html">Lighting and shadows</a></li>
+                            <li><a href="global-illumination.html">Global illumination</a></li>
+                            <li><a href="sky.html">Sky and atmosphere</a></li>
+                            <li><a href="post-processing.html">Post-processing</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Scene content</h4>
+                        <ul>
+                            <li><a href="models.html">Models and animation</a></li>
+                            <li><a href="ui.html">2D, text and UI</a></li>
+                            <li><a href="picking.html">Picking and editing</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Portability</h4>
+                        <ul>
+                            <li><a href="platforms.html">Cross-platform</a></li>
+                        </ul>
+                    </div>
+                </aside>
+
+                <div class="se-doc__main" data-toc-source>
+                    <p class="se-crumbs"><a href="../index.html">Home</a> / <a href="../features/">Features</a> / Materials and PBR</p>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Materials and PBR</h1>
+                        <p class="se-lede">
+                            Materials come from glTF and stay in glTF's model: metallic-roughness, with normal,
+                            occlusion and emissive maps. There is no material editor and no shader graph &mdash; the
+                            surface you authored in Blender is the surface the engine renders.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">One shading model</h2>
+                        <p>
+                            Every opaque and transparent surface goes through the same metallic-roughness BRDF. That is
+                            a deliberate narrowing: no material permutation matrix, no shader variants to warm up, and
+                            an asset that looks right in a glTF viewer looks right here.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Input</th><th>Handling</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>Base colour + factor</td><td>sRGB texture, multiplied by the per-material factor and per-instance colour.</td></tr>
+                                    <tr><td>Metallic / roughness</td><td>Packed glTF channels, sampled directly; no remap layer.</td></tr>
+                                    <tr><td>Normal map</td><td>Tangent-space, with optional Toksvig normal-variance mips to tame specular aliasing.</td></tr>
+                                    <tr><td>Occlusion</td><td>Applied to indirect diffuse only, so it does not double-count with GTAO.</td></tr>
+                                    <tr><td>Emissive</td><td>Added after lighting, unaffected by shadows and AO.</td></tr>
+                                    <tr><td>Alpha</td><td>Opaque, mask and blend modes; blended geometry is drawn after opaque in the same pass.</td></tr>
+                                    <tr><td>Unlit</td><td><code>Model.Unlit</code> bypasses lighting entirely &mdash; useful for debug markers and UI-in-world.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Overriding what the file said</h2>
+                        <p>
+                            An imported material is a starting point, not a contract. Every map and factor has an
+                            override on <code class="se-inline">Model</code>, so a shared asset can be recoloured or
+                            re-textured per instance without touching the GLB.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Property</th><th>Type</th><th>Replaces</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>MaterialColor</code></td><td><code>Vector4?</code></td><td>Whole-model colour multiplier, applied on top of the base colour factor.</td></tr>
+                                    <tr><td><code>BaseColorOverride</code></td><td><code>TextureUpdateSource</code></td><td>The base colour map.</td></tr>
+                                    <tr><td><code>NormalOverride</code></td><td><code>TextureUpdateSource</code></td><td>The normal map.</td></tr>
+                                    <tr><td><code>MetallicRoughnessOverride</code></td><td><code>TextureUpdateSource</code></td><td>The packed metallic-roughness map.</td></tr>
+                                    <tr><td><code>OcclusionOverride</code></td><td><code>TextureUpdateSource</code></td><td>The ambient occlusion map.</td></tr>
+                                    <tr><td><code>EmissiveTextureOverride</code></td><td><code>TextureUpdateSource</code></td><td>The emissive map.</td></tr>
+                                    <tr><td><code>MetallicOverride</code></td><td><code>float?</code></td><td>The metallic factor.</td></tr>
+                                    <tr><td><code>RoughnessOverride</code></td><td><code>float?</code></td><td>The roughness factor.</td></tr>
+                                    <tr><td><code>EmissiveFactorOverride</code></td><td><code>Vector4?</code></td><td>The emissive factor.</td></tr>
+                                    <tr><td><code>Unlit</code></td><td><code>bool</code></td><td>Skips lighting for the whole model.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            Overrides are nullable or empty by default, which means "use whatever the file says". A
+                            texture override takes a <code class="se-inline">TextureUpdateSource</code>, so the
+                            replacement can be a file, a decoded buffer, or a texture another effect produced.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Texture sampling defaults</h2>
+                        <p>
+                            Sampling quality is a project-wide decision rather than a per-material one, so it lives on
+                            <code class="se-inline">RenderQuality</code>.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Setting</th><th>Default</th><th>Effect</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>TextureMipmaps</code></td><td>on</td><td>Generates the mip chain at upload.</td></tr>
+                                    <tr><td><code>TextureMipMinSize</code></td><td>64</td><td>Stops generating mips below this edge length.</td></tr>
+                                    <tr><td><code>TextureMaxAnisotropy</code></td><td>16</td><td>Anisotropic filter taps, clamped to what the device reports.</td></tr>
+                                    <tr><td><code>TextureNormalVariance</code></td><td>on</td><td>Toksvig-style roughness widening in normal-map mips.</td></tr>
+                                    <tr><td><code>TextureLodBias</code></td><td>-0.5</td><td>Slight sharpening bias; TAA absorbs the extra aliasing.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            The negative LOD bias and normal-variance mips are paired on purpose. Biasing towards
+                            sharper mips reintroduces specular sparkle, and widening roughness where the normal map is
+                            busy is what pays for it. Turn one off and you probably want to turn the other off too.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">HDR and exposure</h2>
+                        <p>
+                            Scene colour is HDR by default. Lighting accumulates in linear space at floating-point
+                            precision, and the Post pass applies exposure and tonemapping on the way to the
+                            swapchain &mdash; which is what lets bloom threshold against real radiance values instead of
+                            clipped ones.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Setting</th><th>Default</th><th>Notes</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>HdrSceneColor</code></td><td>on</td><td>Off falls back to an 8-bit scene target; bloom and TAA quality drop with it.</td></tr>
+                                    <tr><td><code>HdrExposure</code></td><td>1.0</td><td>Linear multiplier applied before the tonemap curve.</td></tr>
+                                    <tr><td><code>KhrLightIntensityScale</code></td><td>0.05</td><td>Scales punctual lights imported from glTF, whose photometric units are far larger than the engine's.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            <code class="se-inline">KhrLightIntensityScale</code> exists because
+                            <code class="se-inline">KHR_lights_punctual</code> specifies intensity in candela and lux,
+                            and a light exported at those magnitudes will blow out a scene lit in engine units. A model
+                            can further scale its own imported lights with
+                            <code class="se-inline">Model.LightIntensityScale</code>.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Ambient from an environment map</h2>
+                        <p>
+                            Constant ambient is the default and the cheapest option. When a scene deserves better,
+                            <code class="se-inline">EnvironmentMap</code> loads six cube faces and projects them into
+                            spherical harmonics for diffuse ambient, optionally keeping the radiance cube for specular.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Mode</th><th>What is applied</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>Off</code></td><td>Constant ambient from <code>SceneLighting.Ambient</code> only.</td></tr>
+                                    <tr><td><code>Diffuse</code></td><td>Nine-coefficient irradiance SH replaces the constant ambient term.</td></tr>
+                                    <tr><td><code>DiffuseSpecular</code></td><td>As above, plus the radiance cube for specular ambient.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            Cube faces load as <code class="se-inline">Rgba8Unorm</code> or
+                            <code class="se-inline">Rgba16Float</code>;
+                            <code class="se-inline">SkyIntensity</code> and
+                            <code class="se-inline">DiffuseIntensity</code> scale the two contributions independently,
+                            which is the usual way to keep an HDRI from over-lighting a scene that also has a sun.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Known gaps</h2>
+                        <ul class="se-list">
+                            <li>
+                                <span class="se-badge se-badge--absent">Absent</span>
+                                <strong>Texture compression.</strong> Textures upload uncompressed today. This is a
+                                named roadmap item, not an oversight &mdash; see <a href="../roadmap/">Track A</a>.
+                            </li>
+                            <li>
+                                <span class="se-badge se-badge--absent">Absent</span>
+                                <strong>Clearcoat, sheen, transmission and the other glTF material extensions.</strong>
+                                The core metallic-roughness set is what is implemented.
+                            </li>
+                            <li>
+                                <span class="se-badge se-badge--absent">Absent</span>
+                                <strong>Custom shaders per material.</strong> Extending the shading model means editing
+                                the shared shader, not authoring a new one from application code.
+                            </li>
+                        </ul>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                    <div class="se-pagenav">
+                        <a href="pipeline.html">&larr; The render pipeline</a>
+                        <a href="lighting.html">Lighting and shadows &rarr;</a>
+                    </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="../features/">Features</a></li>
+                        <li><a href="../docs/">Documentation</a></li>
+                        <li><a href="../samples/">Samples</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../why/">Why SeasonEngine</a></li>
+                        <li><a href="../compare/">How it compares</a></li>
+                        <li><a href="../ai/">The local AI layer</a></li>
+                        <li><a href="../download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms &mdash; SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/site.js"></script>
+</body>
+</html>

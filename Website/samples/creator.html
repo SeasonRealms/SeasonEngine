@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - Samples/Creator — the 2D application
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it on every page.
+  - The right-hand table of contents is generated from the h2 and h3 elements
+    inside [data-toc-source]. Adding a section needs no other change.
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Samples/Creator — the 2D application &mdash; SeasonEngine</title>
+    <meta name="description" content="A smaller application built entirely from panels, text, shapes and sprites, useful as a starting point for tools and 2D projects." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/samples/creator.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Samples/Creator — the 2D application &mdash; SeasonEngine" />
+    <meta property="og:description" content="A smaller application built entirely from panels, text, shapes and sprites, useful as a starting point for tools and 2D projects." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/samples/creator.html" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../features/">Features</a>
+                <a href="../docs/">Docs</a>
+                <a href="../samples/" aria-current="page">Samples</a>
+                <a href="../download/">Download</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <div class="se-doc se-doc--wide">
+
+                <div class="se-doc__main" data-toc-source>
+                    <p class="se-crumbs"><a href="../index.html">Home</a> / <a href="../samples/">Samples</a> / Samples/Creator</p>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Samples/Creator</h1>
+                        <p class="se-lede">
+                            A 2D application with no 3D pass at all: one line in the constructor turns the renderer into an
+                            overlay compositor, and the rest is panels, text, shapes and sprites. It is the smallest useful
+                            starting point for a tool, and it builds from a fresh clone.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The whole configuration</h2>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>internal App()
+{
+    Title = "Creator";
+    RenderDomain = RenderDomain.Overlay;   // no 3D pass, no depth, no post
+    StorageService.DirectoryBase = "Creator";
+    BackgroundColor = Season.Basic.Colors.White;
+    BasicResolution = new Vector2(1280, 720);
+}</code></pre>
+                        </div>
+
+                        <div class="se-callout se-callout--contract">
+                            <span class="se-callout__title">What <code>RenderDomain.Overlay</code> buys</span>
+                            <p>
+                                The scene passes are skipped entirely &mdash; no depth buffer, no shadow atlas, no
+                                post-processing chain, no compute effects. A 2D application therefore does not pay for the
+                                renderer it is not using, and it starts instantly. This is the setting to reach for when you
+                                are building a tool, a launcher or a 2D game; see
+                                <a href="../docs/controls-2d.html">2D controls</a>.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Four fonts, loaded off the main thread</h2>
+                        <p>
+                            <code class="se-inline">Create()</code> starts a background task that builds four MSDF atlases
+                            before setting a <code class="se-inline">FontsCreated</code> flag. Nothing waits on it; panels
+                            render as soon as their font exists.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>var fontInstance = await Season.Fonts.Font.CreateAsync(font.File, font.Size);
+Season.Fonts.Font.Instance.Add(fontInstance);</code></pre>
+                        </div>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Font</th><th>Why it is there</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>NotoSansMono</td><td>Latin and the monospaced content in the composer.</td></tr>
+                                    <tr><td>NotoSansSC, NotoSansTC</td><td>Simplified and traditional Chinese. Loaded separately rather than merged.</td></tr>
+                                    <tr><td>Twemoji</td><td>Colour emoji, from the COLR build of the Twemoji set.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            Each <code class="se-inline">CreateAsync</code> call is wrapped in a
+                            <code class="se-inline">try</code> that logs and continues, so a missing or corrupt font file
+                            costs you that font rather than the application. Worth copying.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The panels</h2>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Panel</th><th>What it is</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>Left</code></td><td>The sidebar: a search field, shortcuts and a scrolling list.</td></tr>
+                                    <tr><td><code>Page</code></td><td>The content area, switching between the Chat, Folder, Task and Setting panels.</td></tr>
+                                    <tr><td><code>Top</code></td><td>The title bar, 105 pixels tall, positioned against the content area rather than the window.</td></tr>
+                                    <tr><td><code>Bar</code></td><td>The bottom bar used in portrait layouts, with the same four destinations as the sidebar.</td></tr>
+                                    <tr><td><code>Commands</code></td><td>The command strip: collapse the sidebar, capture the screen, create, choose a folder, open settings.</td></tr>
+                                    <tr><td><code>Chat</code>, <code>Composer</code></td><td>A scrolling list and the editor beneath it.</td></tr>
+                                    <tr><td><code>Folder</code>, <code>Task</code>, <code>Setting</code></td><td>The other three content panels.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            Controls in use: <code class="se-inline">Texts</code>,
+                            <code class="se-inline">Sprite2D</code> and <code class="se-inline">Shape</code> for everything
+                            drawn, plus the ready-made <code class="se-inline">Input</code>,
+                            <code class="se-inline">MovePanel</code> and
+                            <code class="se-inline">SimplePicker</code> panels from
+                            <code class="se-inline">Season.Panels</code> for text entry, scrolling and list selection. No 3D
+                            control appears anywhere.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Layout is code, and this is what that looks like</h2>
+                        <p>
+                            There is no layout system, so responsiveness is an <code class="se-inline">if</code>. Landscape
+                            gets the sidebar and hides the bottom bar; portrait does the reverse. Both branches then assign
+                            sizes directly.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>if (App.Instance.ExtendResolution.X &gt;= App.Instance.ExtendResolution.Y)
+    Animation = Animation.HorizontalLeft;   // sidebar layout
+else
+    Animation = Animation.Vertical;         // bottom-bar layout
+
+// ... then, in the sidebar branch:
+Page.PosX = (int)Left.Width;
+Page.Width = (int)App.Instance.ExtendResolution.X - Page.PosX;
+Page.InnerHeight = (int)(App.Instance.ExtendResolution.Y - (Top.Height ?? 0));</code></pre>
+                        </div>
+
+                        <p>
+                            The sidebar slide is written out by hand as well: an
+                            <code class="se-inline">Animation</code> enum with
+                            <code class="se-inline">LeftFadeIn</code> and
+                            <code class="se-inline">LeftFadeOut</code> states, an accumulator, and a
+                            <code class="se-inline">Page.PosX</code> interpolated over
+                            <code class="se-inline">AnimationTime = 0.5f</code>. Eleven lines, no tween library, and the state
+                            machine is visible in one place.
+                        </p>
+
+                        <div class="se-callout se-callout--contract">
+                            <span class="se-callout__title">Update order is hit-test priority</span>
+                            <p>
+                                <code class="se-inline">Commands</code> is updated first, and its return value short-circuits
+                                the rest of <code class="se-inline">Update</code>. A click consumed by the command strip never
+                                reaches the panels behind it &mdash; that is the whole mechanism, and it is why the topmost
+                                thing is updated first.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">What it is honestly for</h2>
+                        <p>
+                            This is an application demo, not a game. It shows the control layer, the panel composition model,
+                            asynchronous font loading, hand-written responsive layout and persisted settings &mdash; which is
+                            most of what a desktop tool needs and none of what a game needs.
+                        </p>
+                        <p class="se-muted">
+                            It also builds and runs from a fresh clone, which
+                            <a href="engine.html"><code class="se-inline">Apps/Engine</code></a> currently does not. If you
+                            want to see the engine start up on your machine in the next five minutes, start here.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>dotnet run --project Samples/Creator -f net10.0-windows10.0.19041.0
+dotnet run --project Samples/Creator -f net10.0            # Linux</code></pre>
+                        </div>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                    <div class="se-pagenav">
+                        <a href="engine.html">&larr; The reference application</a>
+                        <a href="../download/">Download &rarr;</a>
+                    </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="../features/">Features</a></li>
+                        <li><a href="../docs/">Documentation</a></li>
+                        <li><a href="../samples/">Samples</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../why/">Why SeasonEngine</a></li>
+                        <li><a href="../compare/">How it compares</a></li>
+                        <li><a href="../ai/">The local AI layer</a></li>
+                        <li><a href="../download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms &mdash; SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/site.js"></script>
+</body>
+</html>

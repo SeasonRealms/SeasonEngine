@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - Apps/Engine — the reference application
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it on every page.
+  - The right-hand table of contents is generated from the h2 and h3 elements
+    inside [data-toc-source]. Adding a section needs no other change.
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Apps/Engine — the reference application &mdash; SeasonEngine</title>
+    <meta name="description" content="The 3D application that exercises every rendering feature: scene panels, the object picker, quality settings, debug views and the local AI panels." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/samples/engine.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Apps/Engine — the reference application &mdash; SeasonEngine" />
+    <meta property="og:description" content="The 3D application that exercises every rendering feature: scene panels, the object picker, quality settings, debug views and the local AI panels." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/samples/engine.html" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../features/">Features</a>
+                <a href="../docs/">Docs</a>
+                <a href="../samples/" aria-current="page">Samples</a>
+                <a href="../download/">Download</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <div class="se-doc se-doc--wide">
+
+                <div class="se-doc__main" data-toc-source>
+                    <p class="se-crumbs"><a href="../index.html">Home</a> / <a href="../samples/">Samples</a> / Apps/Engine</p>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Apps/Engine</h1>
+                        <p class="se-lede">
+                            An island at 1920&times;1080, with every rendering feature switched on and every knob exposed.
+                            This is the application the screenshots come from and the application most of these guides were
+                            written by reading.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">How it configures itself</h2>
+                        <p>
+                            The entire initialization is a constructor. Two quality defaults are overridden and the camera is
+                            set; everything else is engine default.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>internal App()
+{
+    Title = "SeasonEngine";
+    StorageService.DirectoryBase = "SeasonEngine";
+    BackgroundColor = Season.Basic.Colors.White;
+    BasicResolution = new Vector2(1920, 1080);
+
+    RenderQuality.DefaultGlobalIllumination = GiMode.Ddgi;
+    RenderQuality.DefaultAerialIntensity = 12f;
+
+    ResetCamera();
+}</code></pre>
+                        </div>
+
+                        <p class="se-muted">
+                            Both overrides carry a paragraph of reasoning in the source. The aerial intensity of 12 is the one
+                            worth reading: it is a lerp weight rather than a multiplier, the physical value is 1, and at 1 the
+                            distant mountains gain about two units of blue out of 255 in a world only a few hundred metres
+                            across. There is a measurement in the comment, taken with the day-night phase frozen.
+                        </p>
+
+                        <div class="se-callout se-callout--contract">
+                            <span class="se-callout__title">Why the far plane is 1300</span>
+                            <p>
+                                <code class="se-inline">Camera.Far = 1300f</code> is not a round number chosen for comfort.
+                                Two things have to fit inside it: the skybox has a half extent of 450 metres, so the longest
+                                ray toward a corner is about 779 metres, and the sea is 1400 metres square, so the farthest
+                                clamped camera position sits about 1240 metres from the most distant sea corner. A smaller
+                                far plane cuts a strip out of the skybox top or reveals a seam at the bottom. The field of
+                                view is <code class="se-inline">MathF.PI * 13 / 36f</code> &mdash; 65 degrees.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Four modes</h2>
+                        <p>
+                            An <code class="se-inline">enum Mode { Show, Play, Edit, Debug }</code> decides which panels are
+                            visible. It defaults to <code class="se-inline">Play</code>, and the update loop reads it every
+                            frame rather than rebuilding anything.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Mode</th><th>What it shows</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>Show</code></td><td>The scene with the UI out of the way &mdash; what the screenshots use.</td></tr>
+                                    <tr><td><code>Play</code></td><td>Direction pad, skill button, settings, AI button. The default.</td></tr>
+                                    <tr><td><code>Edit</code></td><td>The object picker and the painting palette, for placing assets.</td></tr>
+                                    <tr><td><code>Debug</code></td><td>The <code>Views</code> panel: compute outputs on screen as sprites.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <div class="se-grid se-grid--2">
+                            <div class="se-shot">
+                                <img src="../assets/img/shot-picker.jpg" alt="Edit mode with an object selected and outlined by the picker" />
+                                <span class="se-shot__tag">Edit</span>
+                            </div>
+                            <div class="se-shot">
+                                <img src="../assets/img/shot-debug.jpg" alt="Debug mode with several compute output textures displayed as sprites" />
+                                <span class="se-shot__tag">Debug</span>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The scene, panel by panel</h2>
+                        <p>
+                            <code class="se-inline">Create()</code> adds panels in load order. Each one is a self-contained
+                            class in <code class="se-inline">Apps/Engine/Panels</code>, and each is a worked example of one
+                            engine feature.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Panel</th><th>What it does</th><th>Feature it demonstrates</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>CelestialLighting</code></td><td>Drives sun and moon, ambient, weather and the SH ambient update.</td><td>Day-night cycle, <code>SceneLighting</code></td></tr>
+                                    <tr><td><code>Sky</code></td><td>Skybox and procedural sky selection.</td><td><code>SkyMode</code>, atmosphere</td></tr>
+                                    <tr><td><code>Ground</code>, <code>Sea</code></td><td>Grass and road, and a procedural sea surface.</td><td>Custom meshes, materials</td></tr>
+                                    <tr><td><code>Rocks</code></td><td>Fifteen rock variants pulled out of one glb, scattered along the east coast, some half-buried.</td><td><code>InstancedMesh3D</code>, background loading</td></tr>
+                                    <tr><td><code>Mountains</code></td><td>A ring of background mountains from four variants, with an east-west gap left open so sunrise and sunset are visible.</td><td>Instancing at range</td></tr>
+                                    <tr><td><code>Robots</code></td><td>Ten robots in two columns playing different clips, with speech bubbles above them.</td><td><code>InstancedModel</code> animation, MSDF text</td></tr>
+                                    <tr><td><code>Birds</code></td><td>Twenty seagulls with straight and circling behaviours, flock separation, obstacle avoidance and a pitch-and-roll pose solver.</td><td>Instanced animation driven by simulation</td></tr>
+                                    <tr><td><code>Player</code>, <code>Direction</code>, <code>Skill</code></td><td>A character, a direction pad with world and character movement modes, and a long jump with a parabolic arc and collision.</td><td>Model animation, input, camera rigs</td></tr>
+                                    <tr><td><code>House</code>, <code>Room</code>, <code>StreetLight</code>, <code>Ball</code>, <code>Sphere</code></td><td>Individual props and an interior.</td><td>glTF loading, punctual lights, PBR</td></tr>
+                                    <tr><td><code>Painting</code></td><td>A bottom toolbar that previews a glb, anchors it to the cursor and places it in the scene on click.</td><td>Screen-to-world placement</td></tr>
+                                    <tr><td><code>Setting</code>, <code>SettingPanel</code></td><td>A button and the runtime settings screen behind it.</td><td><code>RenderQuality.Current</code>, <code>WorldSettings</code></td></tr>
+                                    <tr><td><code>Views</code></td><td>Debug-mode sprites bound to compute output textures by name.</td><td><code>ComputeEffect</code> outputs</td></tr>
+                                    <tr><td><code>Logo</code>, <code>AIButton</code></td><td>Branding, and the entry point to the AI panels.</td><td>Overlay controls</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            <code class="se-inline">Apps/Engine/Management</code> holds the two behaviours that are not
+                            panels: <code class="se-inline">PlayerCollider</code> and
+                            <code class="se-inline">OcclusionFade</code>, which fades geometry that comes between the camera
+                            and the player. <code class="se-inline">Rocks</code> and
+                            <code class="se-inline">Mountains</code> load through the engine's
+                            <code class="se-inline">RequestLoad</code> queue rather than blocking the first frame.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Ten compute effects, in order</h2>
+                        <p>
+                            <code class="se-inline">RegisterEffects()</code> runs first in
+                            <code class="se-inline">Create()</code>. Registration order is execution order within a phase, so
+                            this list is also the frame.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>PlasmaEffect          // FrameStart  - compute baseline smoke test
+SceneColorCopyEffect  // AfterScene  - downsampled scene colour
+TaaEffect             // AfterScene  - must precede bloom
+BloomEffect           // AfterScene
+DepthViewEffect       // AfterScene  - debug view
+GtaoEffect            // AfterScene  - publishes FrameSchedule.AoTexture
+VelocityViewEffect    // AfterScene  - debug view
+Sdf3DViewEffect       // FrameStart  - slices a 3D volume for display
+DdgiEffect            // AfterScene  - probe and SDF volumes
+SkyAtmosphereEffect   // FrameStart  - sky, cloud noise and aerial LUTs</code></pre>
+                        </div>
+
+                        <p class="se-muted">
+                            Every one of these is registered with an <code class="se-inline">if</code> around the return
+                            value, and the debug control that would display its output is only added when registration
+                            succeeded. That is the pattern to copy: on a backend without the shader source, the effect is
+                            simply absent and nothing else changes. See
+                            <a href="../docs/compute-effects.html">Compute effects</a>.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The settings screen</h2>
+                        <p>
+                            <code class="se-inline">SettingPanel</code> is the largest class in the application and the most
+                            useful one to read if you are building your own settings UI. It binds directly to
+                            <code class="se-inline">RenderQuality.Current</code> and
+                            <code class="se-inline">WorldSettings.Current</code> and writes on change.
+                        </p>
+                        <p>
+                            Exposed at runtime: mode, movement mode, field of view, day-night speed and start hour, movement
+                            step, anti-aliasing mode, DDGI on and off, cascaded shadow parameters, GTAO, and the shadow
+                            normal offset. Values that cannot change after startup are not given sliders &mdash; which is the
+                            rule worth copying, since a control that silently does nothing until next launch is worse than an
+                            absent one.
+                        </p>
+                        <p class="se-muted">
+                            Because <code class="se-inline">RenderQuality.Current</code> lives inside persisted settings,
+                            everything changed here survives a restart. See
+                            <a href="../docs/quality.html">Render quality</a>.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Picking and editing</h2>
+                        <p>
+                            The <code class="se-inline">ObjectPicker</code> panel is configured with two lists &mdash;
+                            <code class="se-inline">Targets</code> for individual controls and
+                            <code class="se-inline">InstancedTargets</code> for instanced ones &mdash; and handles the ray
+                            cast, the outline and the transform readout itself. Combined with
+                            <code class="se-inline">Painting</code>, that is the whole in-app editing loop: click to select,
+                            read the numbers, place a new asset where the cursor is.
+                        </p>
+                        <p class="se-muted">
+                            This is the answer to not having an editor. It is not an editor &mdash; but it turns "guess a
+                            coordinate, rebuild, look" into "click the thing, read its coordinate". See
+                            <a href="../features/picking.html">Picking, highlighting and editing</a>.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Building it, honestly</h2>
+
+                        <div class="se-callout se-callout--warn">
+                            <span class="se-callout__title">This project does not build from a clean clone</span>
+                            <p>
+                                <code class="se-inline">Engine.csproj</code> carries an unconditional
+                                <code class="se-inline">&lt;ProjectReference Include="..\..\..\SeasonAI\SeasonAI.csproj" /&gt;</code>,
+                                and the AI project is not in this repository. Its own reference to
+                                <code class="se-inline">Season.csproj</code> is commented out, so the engine arrives
+                                transitively through that reference &mdash; which means removing the AI reference is not a
+                                one-line change. There is also a post-build target that copies ONNX Runtime binaries from a
+                                sibling <code class="se-inline">cudacudnn-runtime</code> directory on Windows.
+                            </p>
+                        </div>
+
+                        <p>
+                            To run something today: <a href="creator.html">Samples/Creator</a> builds from a fresh clone with
+                            no external dependency, or take the packaged Windows build from
+                            <a href="../download/">Download</a>. To build this one, restore the
+                            <code class="se-inline">Season.csproj</code> reference and delete the AI reference along with the
+                            <code class="se-inline">AIButton</code> and <code class="se-inline">AIPanel</code> usage in
+                            <code class="se-inline">Create()</code> &mdash; the panels themselves are already excluded from
+                            compilation by a <code class="se-inline">Compile Remove</code>.
+                        </p>
+
+                        <p class="se-muted">
+                            Packaging on Windows is MSIX with <code class="se-inline">SelfContained</code> and
+                            <code class="se-inline">WindowsAppSDKSelfContained</code> both true, which is why the Store build
+                            is large and why it does not need a runtime installed. Target frameworks are
+                            <code class="se-inline">net10.0</code>,
+                            <code class="se-inline">net10.0-android</code>,
+                            <code class="se-inline">net10.0-ios</code>,
+                            <code class="se-inline">net10.0-maccatalyst</code> and, on a Windows host,
+                            <code class="se-inline">net10.0-windows10.0.19041.0</code>.
+                        </p>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                    <div class="se-pagenav">
+                        <a href="index.html">&larr; Samples</a>
+                        <a href="creator.html">The 2D application &rarr;</a>
+                    </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="../features/">Features</a></li>
+                        <li><a href="../docs/">Documentation</a></li>
+                        <li><a href="../samples/">Samples</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../why/">Why SeasonEngine</a></li>
+                        <li><a href="../compare/">How it compares</a></li>
+                        <li><a href="../ai/">The local AI layer</a></li>
+                        <li><a href="../download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms &mdash; SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/site.js"></script>
+</body>
+</html>

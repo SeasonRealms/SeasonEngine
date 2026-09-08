@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - Samples
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it on every page.
+  - The right-hand table of contents is generated from the h2 and h3 elements
+    inside [data-toc-source]. Adding a section needs no other change.
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Samples &mdash; SeasonEngine</title>
+    <meta name="description" content="Two applications ship with the source: a 3D reference application that exercises the whole renderer, and a 2D application that shows the control and panel layer on its own." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/samples/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Samples &mdash; SeasonEngine" />
+    <meta property="og:description" content="Two applications ship with the source: a 3D reference application that exercises the whole renderer, and a 2D application that shows the control and panel layer on its own." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/samples/" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../features/">Features</a>
+                <a href="../docs/">Docs</a>
+                <a href="../samples/" aria-current="page">Samples</a>
+                <a href="../download/">Download</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <div class="se-doc se-doc--wide">
+
+                <div class="se-doc__main" data-toc-source>
+                    <p class="se-crumbs"><a href="../index.html">Home</a> / Samples</p>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Samples</h1>
+                        <p class="se-lede">
+                            Two applications ship with the source. One exercises the whole renderer, one shows the 2D control
+                            layer on its own. Both are real applications you can run, not snippets.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Read this first</h2>
+                        <div class="se-callout se-callout--warn">
+                            <span class="se-callout__title">Neither of these is a game</span>
+                            <p>
+                                <code class="se-inline">Apps/Engine</code> is a rendering reference: an island you can walk
+                                around while every pass, knob and debug view is exposed. <code class="se-inline">Samples/Creator</code>
+                                is an application demo built from panels and text. There is no complete game sample &mdash; no
+                                score, no win condition, no state machine &mdash; and that is the most-requested missing piece
+                                on this site. It is known, it is on the list, and until it exists these two are what there is.
+                            </p>
+                        </div>
+                        <p class="se-muted">
+                            What they are good for is different from what a game sample would be good for. If you want to know
+                            how a feature is meant to be used, the reference application uses all of them, and its comments
+                            explain the numbers. Most of the guides in <a href="../docs/">Getting started</a> were written by
+                            reading it.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The two applications</h2>
+                        <div class="se-grid se-grid--2">
+                            <a class="se-linkcard" href="engine.html">
+                                <h3>Apps/Engine</h3>
+                                <p>A 1920&times;1080 3D application: island, sea, mountains, day-night cycle, animated crowds, DDGI, object picking, a settings panel and ten registered compute effects.</p>
+                                <span class="se-linkcard__meta">Windows &middot; Linux &middot; Android &middot; iOS &middot; macOS</span>
+                            </a>
+                            <a class="se-linkcard" href="creator.html">
+                                <h3>Samples/Creator</h3>
+                                <p>A 1280&times;720 2D application that sets <code>RenderDomain.Overlay</code> and skips the 3D passes entirely. Panels, text, shapes, sprites and the ready-made input controls.</p>
+                                <span class="se-linkcard__meta">Overlay only &middot; no 3D pass</span>
+                            </a>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">What the reference application looks like</h2>
+
+                        <div class="se-grid se-grid--2">
+                            <div class="se-shot">
+                                <img src="../assets/img/shot-gi.jpg" alt="The island scene with dynamic diffuse global illumination enabled" />
+                                <span class="se-shot__tag">DDGI</span>
+                            </div>
+                            <div class="se-shot">
+                                <img src="../assets/img/shot-sky.jpg" alt="The same scene at a low sun angle, showing atmospheric scattering" />
+                                <span class="se-shot__tag">Sky and sun</span>
+                            </div>
+                            <div class="se-shot">
+                                <img src="../assets/img/shot-picker.jpg" alt="The object picker with a selected object outlined and its transform shown" />
+                                <span class="se-shot__tag">Object picker</span>
+                            </div>
+                            <div class="se-shot">
+                                <img src="../assets/img/shot-debug.jpg" alt="Debug mode with depth, velocity, ambient occlusion and probe views on screen" />
+                                <span class="se-shot__tag">Debug views</span>
+                            </div>
+                        </div>
+
+                        <p class="se-muted">
+                            All four are the same running application in different modes. The debug views are ordinary
+                            <code class="se-inline">Sprite2D</code> controls pointed at compute output textures by name
+                            &mdash; see <a href="../docs/compute-effects.html">Compute effects</a>.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Running them</h2>
+                        <p>
+                            Clone the repository, open <code class="se-inline">Season.slnx</code>, and pick a target
+                            framework. On Windows both applications build against
+                            <code class="se-inline">net10.0-windows10.0.19041.0</code>; on Linux the plain
+                            <code class="se-inline">net10.0</code> target is the Vulkan one.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>git clone https://github.com/SeasonRealms/SeasonEngine
+cd SeasonEngine
+
+# Windows
+dotnet run --project Apps/Engine -f net10.0-windows10.0.19041.0
+
+# Linux
+dotnet run --project Apps/Engine -f net10.0</code></pre>
+                        </div>
+
+                        <div class="se-callout se-callout--warn">
+                            <span class="se-callout__title">One caveat on a clean clone</span>
+                            <p>
+                                <code class="se-inline">Apps/Engine</code> references the AI project, which lives outside
+                                this repository. A clean clone therefore does not restore that reference. Details and the
+                                workaround are on <a href="engine.html">the reference application page</a> and in
+                                <a href="../ai/">The local AI layer</a>. <code class="se-inline">Samples/Creator</code> has no
+                                such dependency and builds from a fresh clone.
+                            </p>
+                        </div>
+
+                        <p class="se-muted">
+                            Requirements per platform are on <a href="../docs/requirements.html">Requirements</a>, and there
+                            is a packaged Windows build on <a href="../download/">Download</a> if you would rather look before
+                            you build.
+                        </p>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                    <div class="se-pagenav">
+                        <span></span>
+                        <a href="engine.html">The reference application &rarr;</a>
+                    </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="../features/">Features</a></li>
+                        <li><a href="../docs/">Documentation</a></li>
+                        <li><a href="../samples/">Samples</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../why/">Why SeasonEngine</a></li>
+                        <li><a href="../compare/">How it compares</a></li>
+                        <li><a href="../ai/">The local AI layer</a></li>
+                        <li><a href="../download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms &mdash; SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/site.js"></script>
+</body>
+</html>
