@@ -42,18 +42,13 @@
 		<DefaultLanguage>en-us</DefaultLanguage>
 
 		<GenerateAppInstallerFile>False</GenerateAppInstallerFile>
+		<GenerateTestArtifacts>True</GenerateTestArtifacts>
+		<GenerateTemporaryStoreCertificate>True</GenerateTemporaryStoreCertificate>
 
 		<AppxPackageSigningEnabled>False</AppxPackageSigningEnabled>
-
 		<AppxPackageSigningTimestampDigestAlgorithm>SHA256</AppxPackageSigningTimestampDigestAlgorithm>
-
 		<AppxAutoIncrementPackageRevision>True</AppxAutoIncrementPackageRevision>
-
 		<AppxSymbolPackageEnabled>True</AppxSymbolPackageEnabled>
-
-		<GenerateTestArtifacts>False</GenerateTestArtifacts>
-
-		<GenerateTemporaryStoreCertificate>True</GenerateTemporaryStoreCertificate>
 
 		<HoursBetweenUpdateChecks>0</HoursBetweenUpdateChecks>
 	</PropertyGroup>
@@ -63,7 +58,7 @@
 		<RuntimeIdentifiers Condition="'$(IsIOS)' == 'true' And '$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</RuntimeIdentifiers>
 		<RuntimeIdentifiers Condition="'$(IsMacCatalyst)' == 'true'">maccatalyst-arm64;maccatalyst-x64</RuntimeIdentifiers>
 	</PropertyGroup>
-	
+
 	<PropertyGroup Condition="'$(IsWindows)' == 'true'">
 		<GenerateAppInstallerFile>False</GenerateAppInstallerFile>
 		<AppxPackageSigningEnabled>False</AppxPackageSigningEnabled>
@@ -76,7 +71,7 @@
 	</PropertyGroup>
 
 	<PropertyGroup Condition="'$(TargetFramework)'=='net10.0-ios'">
-	  <ProvisioningType>automatic</ProvisioningType>
+		<ProvisioningType>automatic</ProvisioningType>
 	</PropertyGroup>
 
 	<ItemGroup>
@@ -84,12 +79,28 @@
 		<MauiSplashScreen Include="Resources\Splash\splash.svg" Color="white" BaseSize="128,128" />
 		<MauiAsset Include="Resources\Raw\**" LogicalName="%(RecursiveDir)%(Filename)%(Extension)" />
 
+		<!-- SeasonAI Panels -->
+		<!--<Compile Remove="Panels\SeasonAI\**" />
+		<EmbeddedResource Remove="Panels\SeasonAI\**" />
+		<MauiCss Remove="Panels\SeasonAI\**" />
+		<MauiXaml Remove="Panels\SeasonAI\**" />
+		<None Remove="Panels\SeasonAI\**" />
+		<ProjectReference Include="..\..\..\SeasonAI\SeasonAI.csproj" />-->
+
+		<!-- Own Panels -->
 		<ProjectReference Include="..\..\Season\Season.csproj" />
-		<!--<ProjectReference Include="..\..\SeasonAI\SeasonAI.csproj" />-->
-		<!--<PackageReference Include="SeasonEngine" Version="0.0.2" />-->
 
 	</ItemGroup>
-	
+
+	<!--<ItemGroup Condition="'$(IsWindows)' == 'true'">
+		<Content Include="..\..\..\cudacudnn-runtime\win-x64\native\*.dll">
+			<Link>%(Filename)%(Extension)</Link>
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+			<Visible>false</Visible>
+		</Content>
+	</ItemGroup>-->
+
 	<ItemGroup Condition="'$(IsWindows)' == 'true' or '$(IsLinux)' == 'true'">
 		<Content Include="Resources\Raw\**" CopyToOutputDirectory="PreserveNewest" Link="%(RecursiveDir)%(Filename)%(Extension)" />
 	</ItemGroup>
@@ -106,16 +117,8 @@
 		</ItemGroup>
 	</Target>
 
-	<!-- cudacudnn-runtime -->
-	<!--<Target Name="ReplaceWindowsAppSdkOnnxRuntime" AfterTargets="CopyFilesToOutputDirectory" Condition="'$(IsWindows)' == 'true'">
-		<ItemGroup>
-			<_SelfBuiltOrtDlls Include="..\..\..\cudacudnn-runtime\win-x64\native\*.dll" />
-		</ItemGroup>
-		<Copy SourceFiles="@(_SelfBuiltOrtDlls)" DestinationFolder="$(OutDir)" OverwriteReadOnlyFiles="true" SkipUnchangedFiles="false" />
-	</Target>-->
-
 	<ItemGroup>
-	  <Content Update="Resources\Raw\Assets\NotoSansMono-VariableFont.ttf" Link="Assets\NotoSansMono-VariableFont.ttf" />
+		<Content Update="Resources\Raw\Assets\NotoSansMono-VariableFont.ttf" Link="Assets\NotoSansMono-VariableFont.ttf" />
 	</ItemGroup>
 
 </Project>
