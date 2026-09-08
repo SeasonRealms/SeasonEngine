@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - 404.
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it in: index.html, 404.html,
+    features/index.html, docs/index.html, roadmap/index.html
+  - This page is special: GitHub Pages serves it for a missing URL at ANY
+    depth, so plain relative paths would resolve against the wrong folder.
+    The script below inserts a <base> element first, and every path on this
+    page is then written relative to the site root.
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Page not found — SeasonEngine</title>
+    <meta name="description" content="That page does not exist. Head for the feature tour, the documentation or the roadmap instead." />
+    <meta name="robots" content="noindex" />
+    <script>
+        // Must run before any relative URL is parsed. On a GitHub project page
+        // the first path segment is the repository name and is part of the site
+        // root; on a custom domain the site root is "/".
+        (function () {
+            var base = '/';
+            try {
+                if (location.hostname.indexOf('github.io') !== -1) {
+                    var seg = location.pathname.match(/^\/[^\/]+\//);
+                    if (seg) base = seg[0];
+                }
+            } catch (e) { }
+            var el = document.createElement('base');
+            el.setAttribute('href', base);
+            document.head.appendChild(el);
+        })();
+    </script>
+    <link rel="icon" href="favicon.ico" />
+    <link rel="stylesheet" href="assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="index.html">
+                <img src="assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="index.html">Home</a>
+                <a href="features/">Features</a>
+                <a href="docs/">Docs</a>
+                <a href="samples/">Samples</a>
+                <a href="download/">Download</a>
+                <a href="roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+
+            <section class="se-card">
+                <h1 class="se-mt0">404 &mdash; nothing here</h1>
+                <p class="se-lede">
+                    The address you asked for does not exist on this site. It may have moved while the
+                    documentation was being reorganised, or the link that brought you here may be a typo.
+                </p>
+                <p>
+                    The site is small enough that everything is one hop away:
+                </p>
+
+                <div class="se-grid se-grid--3" style="margin-top:22px;">
+                    <a class="se-linkcard" href="index.html">
+                        <h3>Home</h3>
+                        <p>What the engine is, what it renders, and how to run it.</p>
+                    </a>
+                    <a class="se-linkcard" href="features/">
+                        <h3>Feature tour</h3>
+                        <p>The render pipeline, lighting, AI layer, and the capability matrix.</p>
+                    </a>
+                    <a class="se-linkcard" href="docs/">
+                        <h3>Getting started</h3>
+                        <p>Install, first application, project layout, platform entry points.</p>
+                    </a>
+                    <a class="se-linkcard" href="roadmap/">
+                        <h3>Roadmap</h3>
+                        <p>The audited baseline, plus what is planned and in which order.</p>
+                    </a>
+                    <a class="se-linkcard" href="https://github.com/SeasonRealms/SeasonEngine">
+                        <h3>Source on GitHub</h3>
+                        <p>The whole engine, MIT licensed. Search it if a page went missing.</p>
+                    </a>
+                    <a class="se-linkcard" href="https://github.com/SeasonRealms/SeasonEngine/issues">
+                        <h3>Report a broken link</h3>
+                        <p>If a page linked you here, an issue is the fastest way to get it fixed.</p>
+                    </a>
+                </div>
+            </section>
+
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="features/">Features</a></li>
+                        <li><a href="docs/">Documentation</a></li>
+                        <li><a href="samples/">Samples</a></li>
+                        <li><a href="roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="why/">Why SeasonEngine</a></li>
+                        <li><a href="compare/">How it compares</a></li>
+                        <li><a href="ai/">The local AI layer</a></li>
+                        <li><a href="download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms — SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="assets/js/site.js"></script>
+</body>
+</html>

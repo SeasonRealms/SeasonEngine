@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - Lighting, sky and world settings
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it on every page.
+  - The right-hand table of contents is generated from the h2 and h3 elements
+    inside [data-toc-source]. Adding a section needs no other change.
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lighting, sky and world settings &mdash; SeasonEngine</title>
+    <meta name="description" content="Adding lights to SceneLighting, the eight-light GPU budget and how priority resolves it, driving the day and night cycle, and choosing a cloud preset." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/docs/lighting.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Lighting, sky and world settings &mdash; SeasonEngine" />
+    <meta property="og:description" content="Adding lights to SceneLighting, the eight-light GPU budget and how priority resolves it, driving the day and night cycle, and choosing a cloud preset." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/docs/lighting.html" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../features/">Features</a>
+                <a href="../docs/" aria-current="page">Docs</a>
+                <a href="../samples/">Samples</a>
+                <a href="../download/">Download</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <div class="se-doc">
+                <aside class="se-sidebar">
+                    <div class="se-sidebar__group">
+                        <h4>Start here</h4>
+                        <ul>
+                            <li><a href="index.html">Getting started</a></li>
+                            <li><a href="requirements.html">Requirements</a></li>
+                            <li><a href="project-layout.html">Project layout</a></li>
+                            <li><a href="platforms.html">Platform entry points</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Building a scene</h4>
+                        <ul>
+                            <li><a href="app-and-panels.html">Apps and panels</a></li>
+                            <li><a href="placement.html">Placement and camera</a></li>
+                            <li><a href="models.html">Models and animation</a></li>
+                            <li><a href="instancing.html">Instancing</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>2D and text</h4>
+                        <ul>
+                            <li><a href="controls-2d.html">2D controls</a></li>
+                            <li><a href="text.html">Text and fonts</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Rendering</h4>
+                        <ul>
+                            <li><a href="lighting.html" aria-current="page">Lighting and sky</a></li>
+                            <li><a href="quality.html">Render quality</a></li>
+                            <li><a href="compute-effects.html">Compute effects</a></li>
+                        </ul>
+                    </div>
+                </aside>
+
+                <div class="se-doc__main" data-toc-source>
+                    <p class="se-crumbs"><a href="../index.html">Home</a> / <a href="../docs/">Docs</a> / Lighting and sky</p>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Lighting and sky</h1>
+                        <p class="se-lede">
+                            Lighting is a list you add to and a sky you configure. Both are assembled once per frame into a
+                            single buffer that every pass reads, so shadows, ambient occlusion, global illumination and the
+                            sky itself cannot disagree about where the sun is.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Adding a light</h2>
+                        <p>
+                            <code class="se-inline">BaseApp.Lighting</code> is a
+                            <code class="se-inline">SceneLighting</code> instance: a list of
+                            <code class="se-inline">LightSource</code> objects plus a constant ambient term. Add lights when
+                            objects appear and remove them when objects leave &mdash; there is no per-frame rebuild to do.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>Lighting.Ambient = new Vector4(0.12f, 0.13f, 0.16f, 1f);
+
+Lighting.Add(new LightSource
+{
+    Kind = LightKind.Spot,
+    Name = "porch",
+    Position = new Vector3(24f, 6f, 7.5f),
+    Direction = Vector3.Normalize(new Vector3(0f, -1f, -0.4f)),
+    Color = new Vector4(1f, 0.86f, 0.66f, 1f),
+    Intensity = 40f,
+    Range = 24f,
+    InnerConeAngle = 0.25f,      // radians
+    OuterConeAngle = 0.55f,
+    CastShadows = true,
+    Priority = 10
+});</code></pre>
+                        </div>
+
+                        <p class="se-muted">
+                            <code class="se-inline">Kind</code> is
+                            <code class="se-inline">Directional</code>, <code class="se-inline">Point</code> or
+                            <code class="se-inline">Spot</code>. <code class="se-inline">IsOpen</code> defaults to true, so
+                            switching a light off keeps it in the list and out of the bake &mdash; cheaper and less
+                            error-prone than removing and re-adding it.
+                        </p>
+
+                        <div class="se-callout se-callout--warn">
+                            <span class="se-callout__title">Eight lights, and the ninth is simply absent</span>
+                            <p>
+                                <code class="se-inline">SceneLightParams.MaxLights</code> is 8 and that is a hard GPU
+                                limit: the uniform buffer has eight slots. When a scene has more, the bake sorts by
+                                <code class="se-inline">Priority</code> and takes the first eight, breaking ties by
+                                distance to the camera. Nothing warns, throws or dims. If a light matters, give it a high
+                                priority.
+                            </p>
+                        </div>
+
+                        <p class="se-muted">
+                            Only one punctual light gets a shadow map per frame, whatever
+                            <code class="se-inline">CastShadows</code> says on the rest. A glTF file carrying its own
+                            <code class="se-inline">KHR_lights_punctual</code> lights appends them itself, so an imported
+                            interior can consume the whole budget &mdash; see
+                            <a href="models.html">Models and animation</a>.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Shadows you will actually touch</h2>
+                        <p>
+                            Three sun cascades and one punctual slot share one square depth atlas. There are fourteen
+                            shadow knobs on <code class="se-inline">RenderQuality</code>; in practice you adjust two.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>var q = RenderQuality.Current;
+
+q.ShadowDistance = 220f;      // how far the sun casts; default 40
+q.ShadowSoftnessTexels = 2f;  // Vogel-disk radius, in shadow texels</code></pre>
+                        </div>
+
+                        <div class="se-callout se-callout--contract">
+                            <span class="se-callout__title">Resolution follows distance, not the other way round</span>
+                            <p>
+                                Raising <code class="se-inline">ShadowDistance</code> spreads the same atlas over a larger
+                                world, so shadow texels grow and contact points soften. If shadows go mushy after you
+                                extend the distance, raise
+                                <code class="se-inline">ShadowAtlasSize</code> &mdash; but that one is an initialization
+                                value, so it belongs in the app constructor, not in a settings screen slider.
+                            </p>
+                        </div>
+
+                        <p class="se-muted">
+                            Acne and peter-panning are handled by
+                            <code class="se-inline">ShadowNormalOffset</code> (default 1.5 texels) rather than by pushing
+                            depth away from the light, which is why the depth biases can stay small. The full table lives in
+                            <a href="../features/lighting.html">Lighting and shadows</a>.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The sky is a light source</h2>
+                        <p>
+                            With the procedural sky on, the sun and moon directions come from the atmosphere model rather
+                            than from a light you place. <code class="se-inline">Atmosphere</code> is a static class of
+                            physical parameters; the ones worth knowing first are the celestial bodies.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Member</th><th>Default</th><th>Meaning</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>SunDirection</code>, <code>MoonDirection</code></td><td>Up, down</td><td>Driven by the day-night cycle when one is running.</td></tr>
+                                    <tr><td><code>SunIrradiance</code></td><td>12</td><td>Sun strength reaching the ground.</td></tr>
+                                    <tr><td><code>MoonIrradiance</code></td><td>0.6</td><td>Moon strength. Deliberately not zero, so night is navigable.</td></tr>
+                                    <tr><td><code>NightAirglow</code></td><td>0.004</td><td>Faint emission that keeps a moonless night from being pure black.</td></tr>
+                                    <tr><td><code>StarRadiance</code></td><td>0.15</td><td>Star brightness; <code>StarRotation</code> and <code>StarPoleAxis</code> orient the field.</td></tr>
+                                    <tr><td><code>Clouds</code></td><td><code>SkyState.Clear</code></td><td>Cloud layer set. See below.</td></tr>
+                                    <tr><td><code>ViewAltitudeKm</code></td><td>0.2</td><td>Where the camera sits in the atmosphere, which changes the horizon.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            Rayleigh and Mie coefficients, ground and atmosphere radii and ozone parameters are all there
+                            too, set to Earth values. They are the reason a sunset looks like a sunset without any authored
+                            gradient, and they are also the reason you should change them one at a time.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Weather, as an interpolation</h2>
+                        <p>
+                            Clouds are a <code class="se-inline">SkyState</code>: a set of layers with coverage, altitude,
+                            thickness and albedo. Four presets exist, and the useful move is not picking one but blending
+                            between two.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>// A preset.
+Atmosphere.Clouds = SkyState.Overcast;
+
+// Or a weather curve: t moves the sky continuously from fair to stormy.
+Atmosphere.Clouds = SkyState.Lerp(SkyState.Fair, SkyState.Storm, t);</code></pre>
+                        </div>
+
+                        <p class="se-muted">
+                            The default is <code class="se-inline">SkyState.Clear</code>, which has zero layers, so an
+                            application that never mentions clouds pays nothing for them. Wind offsets per layer live in
+                            <code class="se-inline">Atmosphere.CloudWindOffsetKm</code>, which is how a layer drifts
+                            without the noise field being regenerated.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Time of day</h2>
+                        <p>
+                            <code class="se-inline">WorldSettings</code> owns the clock and
+                            <code class="se-inline">DayNightCycle</code> does the conversions. Speed and start hour follow
+                            the same two-faced shape as render quality: static
+                            <code class="se-inline">Default*</code> fields for the app constructor, instance properties that
+                            round-trip through settings, and <code class="se-inline">Current</code> as the runtime read.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>// In the app constructor. At the default speed of 0.01 a day takes 100 seconds.
+WorldSettings.DefaultDayNightSpeed = 0.004f;
+WorldSettings.DefaultStartHour = 5.5f;
+
+// Anywhere afterwards:
+float phase = DayNightCycle.PhaseFromHour(18f);   // dusk
+float hour  = DayNightCycle.HourFromPhase(phase);</code></pre>
+                        </div>
+
+                        <p class="se-muted">
+                            The model is an equinox simplification with a twelve-hour day, so
+                            <code class="se-inline">SunriseHour</code> is 6, noon lands on 12 and midnight on 0 with no
+                            correction. The moon runs on its own <code class="se-inline">SynodicDays</code> cycle of 29.53,
+                            so it waxes and wanes across in-game months rather than repeating daily.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">What to read next</h2>
+                        <p>
+                            <a href="quality.html">Render quality</a> covers the rest of the knobs, including the
+                            distinction between values read once at startup and values you can write every frame &mdash;
+                            which is the single most common early mistake with this API.
+                        </p>
+                        <p class="se-muted">
+                            For the reasoning behind the pipeline itself, see
+                            <a href="../features/lighting.html">Lighting and shadows</a>,
+                            <a href="../features/sky.html">Sky, atmosphere and weather</a> and
+                            <a href="../features/global-illumination.html">Global illumination and AO</a>.
+                        </p>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                    <div class="se-pagenav">
+                        <a href="text.html">&larr; Text and fonts</a>
+                        <a href="quality.html">Render quality &rarr;</a>
+                    </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="../features/">Features</a></li>
+                        <li><a href="../docs/">Documentation</a></li>
+                        <li><a href="../samples/">Samples</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../why/">Why SeasonEngine</a></li>
+                        <li><a href="../compare/">How it compares</a></li>
+                        <li><a href="../ai/">The local AI layer</a></li>
+                        <li><a href="../download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms &mdash; SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/site.js"></script>
+</body>
+</html>

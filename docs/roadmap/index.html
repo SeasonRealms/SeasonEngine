@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - roadmap.
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it in: index.html, 404.html,
+    features/index.html, docs/index.html, roadmap/index.html
+  - This page is a public summary of Roadmap.md in the repository root. When
+    Roadmap.md changes, update the baseline tables and the phase view here.
+    Release-engineering and commercial items from Roadmap.md are deliberately
+    NOT reproduced here.
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Roadmap — SeasonEngine</title>
+    <meta name="description" content="The audited baseline of what SeasonEngine implements today, and the five tracks of planned work: rendering, host and worlds, AI, foundations and XR." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/roadmap/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Roadmap — SeasonEngine" />
+    <meta property="og:description" content="Audited against the source, not against prior documentation. Shipped, partial and absent, all three." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/roadmap/" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../features/">Features</a>
+                <a href="../docs/">Docs</a>
+                <a href="../samples/">Samples</a>
+                <a href="../download/">Download</a>
+                <a href="index.html" aria-current="page">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <div class="se-doc se-doc--wide">
+
+                <div class="se-doc__main" data-toc-source>
+
+                    <p class="se-crumbs"><a href="../index.html">Home</a> / Roadmap</p>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Roadmap</h1>
+                        <p class="se-lede">
+                            Audited against the source rather than against prior documentation. The absent rows are
+                            here for the same reason as the shipped ones: you should be able to decide against this
+                            engine using its own documentation, and find out on day one rather than in week three.
+                        </p>
+                        <p>
+                            The full working document lives in the repository as
+                            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Roadmap.md">Roadmap.md</a>,
+                            with the dependency reasoning behind every ordering decision. This page is the public
+                            summary of it.
+                        </p>
+
+                        <div class="se-grid se-grid--3" style="margin-top:22px;">
+                            <div>
+                                <p><span class="se-badge se-badge--shipped">Shipped</span></p>
+                                <p class="se-muted">Implemented and exercised by a running application.</p>
+                            </div>
+                            <div>
+                                <p><span class="se-badge se-badge--partial">Partial</span></p>
+                                <p class="se-muted">Exists but incomplete, or implemented on some backends only.</p>
+                            </div>
+                            <div>
+                                <p><span class="se-badge se-badge--absent">Absent</span></p>
+                                <p class="se-muted">No code exists. Not "planned soon" — nothing there today.</p>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- baseline: rendering ------------------------------------------ -->
+                    <section class="se-card">
+                        <h2 class="se-mt0">Baseline: rendering</h2>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Capability</th><th>Status</th><th>Evidence</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>Fixed pass schedule, FrameStart Compute through Overlay</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Rendering/RenderPass.cs</code></td></tr>
+                                    <tr><td>Compute effect registration with graceful backend degradation</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Rendering/Compute.cs</code></td></tr>
+                                    <tr><td>Four backends, each with its own shader implementation</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>three shader compilers plus WGSL</td></tr>
+                                    <tr><td>Bloom, GTAO, TAA, depth view</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Rendering/Effects/</code>, four backends</td></tr>
+                                    <tr><td>DDGI: SDF volume, probe irradiance atlas, Chebyshev occlusion</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Effects/Ddgi.cs</code></td></tr>
+                                    <tr><td>Sky atmosphere, day/night cycle, procedural cloud noise</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Effects/SkyAtmosphere.cs</code>, <code>DayNightCycle.cs</code></td></tr>
+                                    <tr><td>Cascaded shadow maps, 3 cascades + 1 punctual in 4 atlas slots</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Rendering/CascadedShadow.cs</code></td></tr>
+                                    <tr><td>Velocity buffer</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>RenderPass.cs</code>, consumed by TAA</td></tr>
+                                    <tr><td>CPU frustum culling, per-instance broad phase, shadow culling</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Rendering/Frustum.cs</code>, on by default</td></tr>
+                                    <tr><td>GPU instancing with per-instance skinning and morph targets</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Controls/InstancedModel.cs</code></td></tr>
+                                    <tr><td>Per-instance surface picking and highlight modes</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Panels/ObjectPicker.cs</code>, <code>Rendering/Highlight.cs</code></td></tr>
+                                    <tr><td>glTF loading and animation playback</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Models/GltfAsset.cs</code>, <code>GLTFAnimationPlayer.cs</code></td></tr>
+                                    <tr><td>MSDF text rendering</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Season/Fonts/</code>, all backends</td></tr>
+                                    <tr><td>Scene normal buffer</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>GTAO derives normals from depth</td></tr>
+                                    <tr><td>Indirect draw and dispatch</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>no indirect path on any backend</td></tr>
+                                    <tr><td>Texture compression: BC, ASTC, ETC2, KTX2</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>no compressed-format path</td></tr>
+                                    <tr><td>Occlusion culling, Hi-Z</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>&mdash;</td></tr>
+                                    <tr><td>GPU particles</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>&mdash;</td></tr>
+                                    <tr><td>Screen-space reflections</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>DDGI covers indirect diffuse only</td></tr>
+                                    <tr><td>Decals</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>&mdash;</td></tr>
+                                    <tr><td>Volumetric fog, light shafts</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>atmospheric scattering exists, local volumetrics do not</td></tr>
+                                    <tr><td>Water system</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>the sample's sea is scene content, not an engine system</td></tr>
+                                    <tr><td>Terrain, heightmaps, tessellation</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>&mdash;</td></tr>
+                                    <tr><td>Mesh or terrain LOD, impostors</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>&mdash;</td></tr>
+                                    <tr><td>Motion blur</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>velocity buffer exists, only the resolve is missing</td></tr>
+                                    <tr><td>VR / XR of any kind</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>no OpenXR, no stereo, no HMD tracking</td></tr>
+                                    <tr><td>glTF export</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>import only</td></tr>
+                                    <tr><td>Mesh processing: decimation, UV repair, normal repair</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>&mdash;</td></tr>
+                                    <tr><td>Material instances and variants, batch merging by material</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>materials come from glTF import</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-callout se-callout--contract">
+                            <strong>One fact that sets the cost of several items above.</strong> The pipeline is
+                            <strong>forward rendering</strong> — pipeline states are organised as Opaque / Transparent /
+                            Fade with cull variants, with a storable depth target and a velocity target. There is no
+                            G-buffer. That is why reflections and decals are gated on adding a normal target, and why
+                            deferred decals are not simply "next up".
+                        </p>
+                    </section>
+
+                    <!-- baseline: host ---------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0">Baseline: host and world editing</h2>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Capability</th><th>Status</th><th>Evidence</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>Show / Play / Edit / Debug modes</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Apps/Engine/App.cs</code></td></tr>
+                                    <tr><td>Object selection, per-instance picking, highlight</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Panels/ObjectPicker.cs</code></td></tr>
+                                    <tr><td>Drag versus click discrimination, object dragging</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>20 px threshold in <code>ObjectPicker.cs</code></td></tr>
+                                    <tr><td>Player collision, occluder fade</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Management/PlayerCollider.cs</code>, <code>OcclusionFade.cs</code></td></tr>
+                                    <tr><td>Debug views for intermediate buffers</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>depth, velocity, SDF, GI probes</td></tr>
+                                    <tr><td>Island scene with dynamic behaviour</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>hardcoded in <code>App.Create()</code></td></tr>
+                                    <tr><td>Property editing: position, size</td><td><span class="se-badge se-badge--partial">Partial</span></td><td>fixed fields, no generic property grid</td></tr>
+                                    <tr><td>Scene serialization, save, load</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>no serializer, no scene format, no world file</td></tr>
+                                    <tr><td>Empty, sceneless startup</td><td><span class="se-badge se-badge--absent">Absent</span></td><td><code>Create()</code> builds the island unconditionally</td></tr>
+                                    <tr><td>Scene hierarchy inspection</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>&mdash;</td></tr>
+                                    <tr><td>Asset library or catalogue</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>model paths are hardcoded per scene class</td></tr>
+                                    <tr><td>Undo / redo</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>&mdash;</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+
+                    <!-- baseline: AI + foundations ---------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0">Baseline: AI and foundations</h2>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Capability</th><th>Status</th><th>Evidence</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>Text generation and translation</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>llama.cpp / GGUF</td></tr>
+                                    <tr><td>Image generation and editing</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>SD1.5, SDXL, SD3.5, Qwen-Image-Edit, Flux.2-Klein and more</td></tr>
+                                    <tr><td>Video generation</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>&mdash;</td></tr>
+                                    <tr><td>Music generation</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>StableAudio</td></tr>
+                                    <tr><td>Speech to text</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>Whisper / GGUF</td></tr>
+                                    <tr><td>Text to speech, dual ONNX and GGML backends</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>including voice cloning</td></tr>
+                                    <tr><td>Vision and OCR</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>&mdash;</td></tr>
+                                    <tr><td>Model acquisition</td><td><span class="se-badge se-badge--partial">Partial</span></td><td>panels link to the source repository; the app does not download weights</td></tr>
+                                    <tr><td>Generated output flowing back in as an engine asset</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>results stop inside the AI panels</td></tr>
+                                    <tr><td>Any network client</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>everything runs locally today</td></tr>
+                                    <tr><td>3D generation, auto-rigging, animation synthesis</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>&mdash;</td></tr>
+                                    <tr><td>Unit tests</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>&mdash;</td></tr>
+                                    <tr><td>Benchmark scenes with recorded numbers</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>the central performance claim is unmeasured</td></tr>
+                                    <tr><td>Screenshot / image-diff regression</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>&mdash;</td></tr>
+                                    <tr><td>Frame allocation budget or GC measurement</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>&mdash;</td></tr>
+                                    <tr><td>Feature-by-backend support matrix in docs</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>planned as generated, not hand-maintained</td></tr>
+                                    <tr><td>Asset import caching</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>glTF is re-parsed on every run</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            The foundations block is deliberately unflattering. The project's central claim is that
+                            architectural minimalism recovers what a managed runtime costs — and that claim currently
+                            has no measurement behind it. Fixing that is Track D, and it is not scheduled late.
+                        </p>
+                    </section>
+
+                    <!-- tracks ------------------------------------------------------ -->
+                    <section class="se-card">
+                        <h2 class="se-mt0">How the work is grouped</h2>
+                        <p>
+                            Work is grouped into tracks that map to the questions the project actually faces. Ordering
+                            <em>inside</em> each track is by dependency, not by appeal — several attractive features sit
+                            late because their prerequisites are infrastructure work across four backends.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Track</th><th>Question it answers</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><strong>A. Rendering</strong></td><td>Is the renderer genuinely next-gen?</td></tr>
+                                    <tr><td><strong>B. Host &amp; worlds</strong></td><td>Can someone see what the engine does without reading the source?</td></tr>
+                                    <tr><td><strong>C. AI</strong></td><td>Is the paid layer worth money, and does it help make games?</td></tr>
+                                    <tr><td><strong>D. Foundations</strong></td><td>Can any of the above be proven, maintained, or shipped?</td></tr>
+                                    <tr><td><strong>E. VR / XR</strong></td><td>Can the renderer reach platforms where single-view assumptions stop applying?</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+
+                    <!-- track A ----------------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0">Track A — Rendering</h2>
+                        <p>
+                            Three of the items are not features at all but infrastructure the others sit on. They are
+                            unglamorous and none of them produce a screenshot, which is exactly why they are named
+                            explicitly instead of being discovered halfway through building particles.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>#</th><th>Item</th><th>Blocked by</th><th>Cost</th><th>Visible?</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>1</td><td>A1 Motion blur</td><td>&mdash;</td><td>Low</td><td><span class="se-yes">Yes</span></td></tr>
+                                    <tr><td>2</td><td>A0.3 Texture compression</td><td>&mdash;</td><td>Medium</td><td><span class="se-no">No</span></td></tr>
+                                    <tr><td>3</td><td>A0.2 Scene normal target</td><td>&mdash;</td><td>Low&ndash;Medium</td><td><span class="se-no">No</span></td></tr>
+                                    <tr><td>4</td><td>A0.4 Per-view matrix split</td><td>&mdash;</td><td>Medium, four backends</td><td><span class="se-no">No</span></td></tr>
+                                    <tr><td>5</td><td>A2 Screen-space reflections</td><td>A0.2</td><td>Medium</td><td><span class="se-yes">Yes</span></td></tr>
+                                    <tr><td>6</td><td>A3 Volumetric fog and light shafts</td><td>&mdash;</td><td>Medium</td><td><span class="se-yes">Yes</span></td></tr>
+                                    <tr><td>7</td><td>A0.1 Indirect draw and dispatch</td><td>&mdash;</td><td>High</td><td><span class="se-no">No</span></td></tr>
+                                    <tr><td>8</td><td>A6 GPU particles</td><td>A0.1</td><td>Medium</td><td><span class="se-yes">Yes</span></td></tr>
+                                    <tr><td>9</td><td>A7 GPU-driven culling</td><td>A0.1, D1</td><td>High</td><td><span class="se-no">No</span></td></tr>
+                                    <tr><td>10</td><td>A4 Dynamic water</td><td>A2</td><td>Medium</td><td><span class="se-yes">Yes</span></td></tr>
+                                    <tr><td>11</td><td>A5 Decals</td><td>A0.2</td><td>Medium</td><td><span class="se-yes">Yes</span></td></tr>
+                                    <tr><td>12</td><td>A8 Mesh LOD</td><td>mesh processing</td><td>Medium</td><td><span class="se-no">No</span></td></tr>
+                                    <tr><td>13</td><td>A9 Terrain and terrain LOD</td><td>A0.1, A7, A8</td><td>Very high</td><td><span class="se-yes">Yes</span></td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p style="margin-top:22px;"><strong>Why the order looks like that.</strong></p>
+                        <ul class="se-list">
+                            <li><strong>Motion blur is first</strong> because it is nearly free: the velocity buffer already exists and TAA already consumes it. What is missing is one resolve kernel.</li>
+                            <li><strong>Texture compression is not a visual feature.</strong> It is package size, web viability and the largest single frame-time win available on the integrated GPUs most evaluators will run this on. Runtime decode to uncompressed is an explicit anti-goal.</li>
+                            <li><strong>SSR waits for the normal target</strong> because marching against depth-derived normals and adding the buffer afterwards means writing the resolve twice. On miss, SSR will fall back to the DDGI irradiance atlas — engines without a GI volume have to ship a separate reflection probe system to avoid black misses.</li>
+                            <li><strong>GPU culling waits for a benchmark</strong>, not just for indirect draw. CPU frustum culling already ships and is on by default; without a recorded baseline there is no way to show the GPU path is faster. At ten thousand entities in a managed engine, the bottleneck is more likely per-entity <code class="se-inline">Update</code> cost than draw submission — and if so, A7 is the wrong fix.</li>
+                        </ul>
+                    </section>
+
+                    <!-- track B ----------------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0">Track B — Host and shareable worlds</h2>
+                        <p class="se-lede">
+                            An editor is a demonstration surface, not the workflow. It exists so the renderer can be
+                            seen. It does not exist to become the way the engine is used.
+                        </p>
+
+                        <ul class="se-list">
+                            <li><strong>B0 — decouple the shell from the scene.</strong> Today <code class="se-inline">Create()</code> builds the whole island unconditionally. "Run with no world loaded" and "create a new world" are the same capability, and everything else in this track needs it first.</li>
+                            <li><strong>B1 — world serialization.</strong> The design rule comes before the format.</li>
+                            <li><strong>B2 — editing affordances.</strong> Placement, then gizmos, then a property editor over construction parameters only, then hierarchy inspection, then undo.</li>
+                            <li><strong>B3 — asset catalogue</strong>, with licence attribution as a required column, because bundled assets travel with shared worlds.</li>
+                            <li><strong>B4 — a second reference world: mass unit scheduling.</strong> Tens of thousands of independently updated, individually animated units, instrumented from the start. It doubles as the benchmark A7 requires.</li>
+                        </ul>
+
+                        <p class="se-callout se-callout--contract">
+                            <strong>The anti-fragmentation contract.</strong> A serialized world record is a C# type
+                            name plus construction parameters. It is never a bag of properties with attached behaviour
+                            fragments. Layout is data; behaviour is code; the boundary is the type name. That single
+                            constraint is what keeps this from becoming an inspector-assembled component model.
+                        </p>
+
+                        <div class="se-table-wrap" style="margin-top:20px;">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>World tier</th><th>Contents</th><th>Shareable as a file?</th><th>Who can open it</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><strong>Static world</strong></td><td>Built-in types only, plus bundled assets</td><td><span class="se-yes">Yes</span></td><td>Anyone with the app</td></tr>
+                                    <tr><td><strong>Code-bearing world</strong></td><td>References project-defined types</td><td><span class="se-no">No</span> — share the C# project</td><td>Anyone with the source</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            That distinction has to be explicit in the format and visible in the UI, or the project
+                            inherits the exact dependency problem it is trying to avoid: a shared world that silently
+                            fails to load because a type is missing.
+                        </p>
+                    </section>
+
+                    <!-- track C ----------------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0">Track C — AI</h2>
+
+                        <ul class="se-list">
+                            <li><strong>C1 — generated output into the engine.</strong> Eight generation capabilities ship and none of their output can become an engine asset. Generated image to material texture, to 2D sprite, generated audio to a playable source, a stable generated-assets folder — and the reverse direction: pick an object, send its current texture to image-to-image as the reference. Small work, and the highest return on effort in the whole roadmap.</li>
+                            <li><strong>C2 — cloud models plus runtime C# generation</strong>, desktop only. An HTTP client with streaming and user-supplied keys, plus Roslyn compiling C# at runtime. The architecture is already shaped to receive the result: a behaviour is a <code class="se-inline">Panel</code> or <code class="se-inline">Control</code> subclass, so a generated class only has to be instantiated and added — no serialization format to satisfy, no component model to register with.</li>
+                            <li><strong>C3 — 3D asset generation</strong>, static props only. The generation model is the small part; mesh decimation, UV unwrapping, normal repair and a glTF <em>exporter</em> are the work, and none of that exists today.</li>
+                            <li><strong>C4 — automatic rigging.</strong> Research, not a commitment. It will not appear on a store listing before output quality is verified against real characters.</li>
+                        </ul>
+
+                        <p class="se-callout">
+                            <strong>C2 comes before C3</strong>, which inverts the intuitive order. C2 is an HTTP client
+                            plus a Roslyn host; C3 is a mesh pipeline plus an exporter plus a model. C2's quality is
+                            supplied by frontier models and improves for free; C3's is capped by what local 3D models
+                            produce today, which is not yet drop-it-in-a-game quality. And C2 exploits something this
+                            engine has and its competitors do not — behaviour as a single compilable C# class.
+                        </p>
+
+                        <p class="se-muted">
+                            Runtime C# compilation is unavailable under full AOT, which rules out iOS and WebAssembly.
+                            That constraint is stated rather than worked around: the feature is desktop-only by nature.
+                        </p>
+                    </section>
+
+                    <!-- track D ----------------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0">Track D — Foundations</h2>
+                        <p>
+                            Every item here is either a prerequisite for proving a claim in another track, or a
+                            prerequisite for the project surviving contact with contributors.
+                        </p>
+
+                        <ul class="se-list">
+                            <li><strong>D1 — benchmarks and image-diff regression.</strong> Fixed camera paths, fixed frame counts, recorded frame time, draw count and allocation. Plus headless reference-image comparison per backend: for a project whose pitch is <em>the renderer is real</em>, a silent visual regression is the most expensive possible bug, and the failures this codebase actually accumulates — per-frame buffer cross-talk, uncleared atlas memory, struct layout drift, shader divergence between four APIs — are exactly the kind a compile check never catches.</li>
+                            <li><strong>D2 — frame allocation budget.</strong> Pure C# engines are dismissed on exactly one axis, GC pauses, and that will appear in the first community thread. The answer cannot be prose. "Zero bytes allocated per frame at ten thousand animated instances" ends the argument in one line; nothing else does.</li>
+                            <li><strong>D3 — asset pipeline</strong>, absorbing texture compression, LOD generation, mesh decimation and import caching. The runtime must keep loading plain glTF and plain PNG directly: the pipeline is an optimisation, never an entry requirement.</li>
+                            <li><strong>D4 — documentation and a sample ladder.</strong> A minimal <code class="se-inline">BaseApp</code> under 50 lines, one-concept samples, and a written walkthrough for adding a compute effect — currently the most contributor-friendly extension point in the engine, and discoverable only by reading <code class="se-inline">Ddgi.cs</code>.</li>
+                            <li><strong>D5 — platform honesty.</strong> No fallback paths. Features declare requirements, unsupported features are visibly disabled with a stated reason, and the backend matrix is generated from the same source.</li>
+                        </ul>
+                    </section>
+
+                    <!-- track E ----------------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0">Track E — VR / XR</h2>
+                        <p>
+                            The renderer is single-view by construction: one camera per frame, matrices bundled per
+                            object, static render-target singletons, window-vsync frame pacing, pointer-only input and
+                            screen-space UI. Every one of those is an assumption VR breaks. So this track is
+                            deliberately last — it is a new platform claim, not a feature on the existing one.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Item</th><th>Content</th><th>Depends on</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><strong>E0</strong></td><td>OpenXR runtime binding: session lifecycle, swapchain import sharing the existing device and queue, action sets, <code>xrWaitFrame</code> pacing</td><td>desktop maturity</td></tr>
+                                    <tr><td><strong>E1</strong></td><td>Dual-view rendering: two eye passes or a multiview broadcast, per-eye matrix constants</td><td>A0.4</td></tr>
+                                    <tr><td><strong>E2</strong></td><td>Per-eye render state. DDGI and cascaded shadows stay shared — they are world and light space, which is this architecture's VR advantage</td><td>E1</td></tr>
+                                    <tr><td><strong>E3</strong></td><td>XR input: 6DoF poses, action-based buttons, haptics, ray picking on top of the existing unprojection</td><td>E0</td></tr>
+                                    <tr><td><strong>E4</strong></td><td>VR UI: world-anchored panel quads or composition layers</td><td>E0</td></tr>
+                                    <tr><td><strong>E5</strong></td><td>Quest: OpenXR loader under the Android host, plus an XR quality preset through the existing <code>RenderQuality</code> ladder</td><td>E2, E3</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            A0.4 — the per-view matrix split — sits early in Track A precisely so the hardest refactor
+                            is paid for long before this track starts, and while the scene pass is already open for the
+                            normal target.
+                        </p>
+                    </section>
+
+                    <!-- phases ------------------------------------------------------ -->
+                    <section class="se-card">
+                        <h2 class="se-mt0">Phase view</h2>
+                        <p class="se-muted">Dates are intent, not commitment.</p>
+
+                        <div class="se-grid se-grid--2" style="margin-top:18px;">
+                            <div>
+                                <h3>Phase 0 — Ship something <span class="se-pill">2026 H2</span></h3>
+                                <ul class="se-list">
+                                    <li>Release engineering in full</li>
+                                    <li>A1 motion blur — the one cheap visual win</li>
+                                    <li>C1 generated output into the engine</li>
+                                    <li>D1 benchmark harness, even minimally</li>
+                                </ul>
+                                <p class="se-muted">Outcome: the funnel exists, and the paid tier has a reason to be bought.</p>
+                            </div>
+                            <div>
+                                <h3>Phase 1 — Demonstrability <span class="se-pill">2027 H1</span></h3>
+                                <ul class="se-list">
+                                    <li>B0 shell/scene decoupling, then B1 world serialization</li>
+                                    <li>A0.2 normal target and A0.4 per-view split, then A2 SSR</li>
+                                    <li>A0.3 texture compression</li>
+                                    <li>D4 sample ladder, D2 allocation budget as a measured contract</li>
+                                </ul>
+                                <p class="se-muted">Outcome: someone can create and save a world, and the performance claim has a number attached.</p>
+                            </div>
+                            <div>
+                                <h3>Phase 2 — Scale <span class="se-pill">2027 H2</span></h3>
+                                <ul class="se-list">
+                                    <li>A0.1 indirect draw on the desktop backends</li>
+                                    <li>A6 GPU particles, A7 GPU-driven culling</li>
+                                    <li>B4 mass-unit reference world</li>
+                                    <li>A3 volumetrics</li>
+                                </ul>
+                                <p class="se-muted">Outcome: the strategy-scale claim is demonstrated rather than asserted.</p>
+                            </div>
+                            <div>
+                                <h3>Phase 3 — Creation <span class="se-pill">2028 H1</span></h3>
+                                <ul class="se-list">
+                                    <li>C2 cloud models plus Roslyn runtime C#, desktop only</li>
+                                    <li>B2 editing affordances, B3 asset catalogue</li>
+                                    <li>A4 water, A5 decals</li>
+                                    <li>D3 asset pipeline consolidated</li>
+                                </ul>
+                                <p class="se-muted">Outcome: natural-language world creation, on a world format designed for it.</p>
+                            </div>
+                        </div>
+
+                        <p style="margin-top:24px;"><strong>Phase 4 and beyond.</strong> A8 mesh LOD and A9 terrain;
+                        C3 static prop generation; C4 auto-rigging if quality justifies it; Track E starting as a
+                        Windows and Direct3D 12 pilot, then Quest; Mac and mobile store presence. Console technical
+                        adaptation is acknowledged and scheduled nowhere — it is gated on SDK access, which is gated on
+                        the engine's standing rather than on engineering effort.</p>
+                    </section>
+
+                    <!-- non-goals --------------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0">Non-goals</h2>
+                        <p>
+                            A roadmap without these is a wish list. Each of the following is a decision, not an
+                            omission.
+                        </p>
+
+                        <ul class="se-list">
+                            <li>Competing on feature count with editor-centric engines.</li>
+                            <li>Visual scripting, node graphs, or inspector-assembled behaviour, in any form.</li>
+                            <li>A generalised frame graph before the fixed schedule is genuinely limiting.</li>
+                            <li>Runtime texture compression, or any decode-to-uncompressed path.</li>
+                            <li>A centralised template or asset marketplace.</li>
+                            <li>Rebuilding around ECS for trend alignment. If bulk entity updates prove to be the bottleneck, the answer is a targeted data-oriented path for bulk entities, not a paradigm change across the engine.</li>
+                            <li>Fallback rendering paths. Capability reporting instead.</li>
+                            <li>Any XR runtime besides OpenXR — the same rule that killed OpenGL fallbacks.</li>
+                            <li>Console certification or store policy as engine work. Porting the engine is the vendor's side of the line; certifying a shipped game is the developer's.</li>
+                        </ul>
+                    </section>
+
+                    <!-- success ----------------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0">How to tell whether this is working</h2>
+                        <ul class="se-list">
+                            <li>The renderer claim is <strong>provable</strong>: benchmark numbers and reference images are published, not described.</li>
+                            <li>The GC objection is <strong>answerable in one number</strong>.</li>
+                            <li>Someone can evaluate the engine in ten minutes without reading engine source.</li>
+                            <li>Generated assets end up in scenes, not in a folder.</li>
+                            <li>Adding a world type does not require writing editor code.</li>
+                            <li><code class="se-inline">Season/</code> stays smaller and clearer than the feature list would suggest.</li>
+                            <li>One implementation per domain still holds — no OpenGL fallback appears, no second animation format, no second text renderer.</li>
+                        </ul>
+
+                        <p style="margin-top:20px;">
+                            Disagreements about ordering are welcome and useful.
+                            <a href="https://github.com/SeasonRealms/SeasonEngine/issues">Open an issue</a> — the
+                            reasoning in
+                            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Roadmap.md">Roadmap.md</a>
+                            is written down so it can be argued with.
+                        </p>
+
+                        <div class="se-pagenav" style="margin-top:26px;">
+                            <a href="../features/">&larr; Feature tour</a>
+                            <a href="../docs/">Getting started &rarr;</a>
+                        </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="../features/">Features</a></li>
+                        <li><a href="../docs/">Documentation</a></li>
+                        <li><a href="../samples/">Samples</a></li>
+                        <li><a href="index.html">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../why/">Why SeasonEngine</a></li>
+                        <li><a href="../compare/">How it compares</a></li>
+                        <li><a href="../ai/">The local AI layer</a></li>
+                        <li><a href="../download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms — SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/site.js"></script>
+</body>
+</html>

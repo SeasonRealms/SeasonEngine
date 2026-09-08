@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - 2D controls reference
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it on every page.
+  - The right-hand table of contents is generated from the h2 and h3 elements
+    inside [data-toc-source]. Adding a section needs no other change.
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>2D controls reference &mdash; SeasonEngine</title>
+    <meta name="description" content="Sprite2D, Sprite3D and Shape, the layer and order rules that decide what draws on top, and the panels the engine ships for buttons, inputs, pickers and image views." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/docs/controls-2d.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="2D controls reference &mdash; SeasonEngine" />
+    <meta property="og:description" content="Sprite2D, Sprite3D and Shape, the layer and order rules that decide what draws on top, and the panels the engine ships for buttons, inputs, pickers and image views." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/docs/controls-2d.html" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../features/">Features</a>
+                <a href="../docs/" aria-current="page">Docs</a>
+                <a href="../samples/">Samples</a>
+                <a href="../download/">Download</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <div class="se-doc">
+                <aside class="se-sidebar">
+                    <div class="se-sidebar__group">
+                        <h4>Start here</h4>
+                        <ul>
+                            <li><a href="index.html">Getting started</a></li>
+                            <li><a href="requirements.html">Requirements</a></li>
+                            <li><a href="project-layout.html">Project layout</a></li>
+                            <li><a href="platforms.html">Platform entry points</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Building a scene</h4>
+                        <ul>
+                            <li><a href="app-and-panels.html">Apps and panels</a></li>
+                            <li><a href="placement.html">Placement and camera</a></li>
+                            <li><a href="models.html">Models and animation</a></li>
+                            <li><a href="instancing.html">Instancing</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>2D and text</h4>
+                        <ul>
+                            <li><a href="controls-2d.html" aria-current="page">2D controls</a></li>
+                            <li><a href="text.html">Text and fonts</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Rendering</h4>
+                        <ul>
+                            <li><a href="lighting.html">Lighting and sky</a></li>
+                            <li><a href="quality.html">Render quality</a></li>
+                            <li><a href="compute-effects.html">Compute effects</a></li>
+                        </ul>
+                    </div>
+                </aside>
+
+                <div class="se-doc__main" data-toc-source>
+                    <p class="se-crumbs"><a href="../index.html">Home</a> / <a href="../docs/">Docs</a> / 2D controls</p>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">2D controls</h1>
+                        <p class="se-lede">
+                            Sprites, shapes and text are controls in the same panel tree as 3D models, drawn in the Overlay
+                            phase of the same frame. There is no second framework to learn, and no UI event system &mdash;
+                            a button is a control with a delegate on it.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Where you position things</h2>
+                        <p>
+                            You lay out against <code class="se-inline">DesignResolution</code>, 1280&times;720 by default.
+                            <code class="se-inline">BasicResolution</code> is the box you actually write coordinates in,
+                            and what it equals depends on the platform.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Property</th><th>Desktop and web</th><th>Phones and tablets</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>BasicResolution</code></td><td>Equals <code>DeviceResolution</code> &mdash; you are laying out in real pixels.</td><td>Equals <code>DesignResolution</code> &mdash; the design box is preserved and scaled.</td></tr>
+                                    <tr><td><code>Scale</code></td><td>1.</td><td>The smaller of the two axis ratios, so the whole design box stays visible.</td></tr>
+                                    <tr><td><code>ExtendResolution</code></td><td>Equals <code>DeviceResolution</code>.</td><td>The design box grown along the longer axis, covering the extra space a tall phone has.</td></tr>
+                                    <tr><td><code>DeviceResolution</code></td><td colspan="2">Always the true swapchain size in pixels.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p>
+                            The practical rule: anchor anything that must stay reachable to
+                            <code class="se-inline">BasicResolution</code>, and stretch backgrounds and edge decoration to
+                            <code class="se-inline">ExtendResolution</code>. That gives you a layout with no letterboxing
+                            on a 20:9 phone without maintaining a second design.
+                        </p>
+
+                        <p class="se-muted">
+                            A resize recomputes <code class="se-inline">Scale</code> and
+                            <code class="se-inline">ExtendResolution</code> only.
+                            <code class="se-inline">BasicResolution</code> is deliberately left alone, so dragging a window
+                            edge does not reflow a mobile layout.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The five types</h2>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Control</th><th>For</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>Sprite2D</code></td><td>Screen-space images, including live compute outputs addressed by texture name.</td></tr>
+                                    <tr><td><code>Sprite3D</code></td><td>World-anchored billboards: markers, emotes, floating icons.</td></tr>
+                                    <tr><td><code>Shape</code></td><td>Dots, rectangles, circles, rounded rectangles and frames for panel chrome.</td></tr>
+                                    <tr><td><code>Texts</code></td><td>MSDF text. See <a href="text.html">Text and fonts</a>.</td></tr>
+                                    <tr><td><code>Texture</code></td><td>The engine-side texture handle, for custom uploads and shared references.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>icon = new Sprite2D
+{
+    Name = "Assets/Setting.png",
+    Color = Colors.White,
+    PosX = 20, PosY = 20, Width = 48,
+    OnClick = () =&gt; settingPanel.Alpha = 1f
+};
+AddControl(icon);
+
+divider = new Shape
+{
+    ShapeType = ShapeType.Square,
+    Color = Colors.DarkGray,
+    PosX = 20, PosY = 80, Width = 240, Height = 1
+};
+AddControl(divider);</code></pre>
+                        </div>
+
+                        <p>
+                            <strong>Sprites.</strong> <code class="se-inline">SpriteBase</code> carries what both sprite
+                            types need: a <code class="se-inline">Color</code> tint,
+                            <code class="se-inline">Ext</code> for the file extension,
+                            <code class="se-inline">OriginWidth</code> and
+                            <code class="se-inline">OriginHeight</code> for the source pixel size, and
+                            <code class="se-inline">SourceX/Y/Width/Height</code> for drawing one cell out of a sheet.
+                            <code class="se-inline">Clock</code> advances a sheet frame,
+                            <code class="se-inline">FlipX</code> and <code class="se-inline">FlipY</code> mirror it, and
+                            <code class="se-inline">TextureOverride</code> takes a one-shot upload &mdash; a path or
+                            already-decoded RGBA8 pixels &mdash; which the next update consumes and clears.
+                        </p>
+
+                        <p>
+                            <strong>Shapes.</strong> <code class="se-inline">ShapeType</code> is
+                            <code class="se-inline">Dot</code>, <code class="se-inline">Square</code>,
+                            <code class="se-inline">Circle</code>, <code class="se-inline">RoundRect</code>,
+                            <code class="se-inline">RectFrame</code>, <code class="se-inline">Gradual</code> or
+                            <code class="se-inline">GradualCircle</code>, with
+                            <code class="se-inline">Border</code> for frame thickness. Curves are analytically
+                            antialiased rather than scaled bitmaps, so a circle is crisp at any size.
+                        </p>
+
+                        <p>
+                            <strong>Billboards.</strong> <code class="se-inline">Sprite3D.Mode</code> chooses how it faces
+                            the camera: <code class="se-inline">Spherical</code> always faces you,
+                            <code class="se-inline">Cylindrical</code> turns only around world Y so a nameplate stays
+                            upright, and <code class="se-inline">None</code> hands orientation to the quaternion
+                            <code class="se-inline">Rotation</code>.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Interaction</h2>
+                        <p>
+                            Every control has <code class="se-inline">OnClick</code> and
+                            <code class="se-inline">OnTouch</code>, and both fire from inside the control's own
+                            <code class="se-inline">Update</code>. That has a consequence worth stating plainly: a control
+                            you forget to update never receives a click, even though it draws perfectly.
+                        </p>
+
+                        <div class="se-callout se-callout--contract">
+                            <span class="se-callout__title">A click is consumed by the first control that takes it</span>
+                            <p>
+                                <code class="se-inline">Update</code> returns true when it invoked
+                                <code class="se-inline">OnClick</code>, and it clears the pending release so nothing behind
+                                receives the same click. Update order is therefore hit-test priority: update your topmost
+                                panel first, and use the return value to stop walking the rest.
+                            </p>
+                        </div>
+
+                        <p class="se-muted">
+                            <code class="se-inline">MouseOver</code> is maintained for you and is part of the gate, along
+                            with <code class="se-inline">Enable</code>, <code class="se-inline">Ready</code> and
+                            <code class="se-inline">Alpha &gt; 0</code>. There is no bubbling model, no focus system and no
+                            command pattern.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Draw order, and the two domains</h2>
+                        <p>
+                            Controls and panels implementing <code class="se-inline">IRenderOrder</code> sort by
+                            <code class="se-inline">Layer</code>, then <code class="se-inline">Order</code>, then insertion
+                            index &mdash; a stable total order, so a rebuilt list does not shuffle.
+                        </p>
+                        <p>
+                            <code class="se-inline">RenderDomain</code> decides <em>when</em> in the frame a control is
+                            drawn, independently of where it sits in the tree.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th><code>RenderDomain</code></th><th>Meaning</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>Inherit</code></td><td>Follow the parent. The default, and almost always right.</td></tr>
+                                    <tr><td><code>Scene</code></td><td>Draw with the 3D scene, before post-processing. Tonemapped, bloomed, TAA-resolved.</td></tr>
+                                    <tr><td><code>Overlay</code></td><td>Draw after everything. Untouched by post-processing, which is why UI stays crisp.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            Putting a diegetic screen inside the world in <code class="se-inline">Scene</code> is exactly
+                            right. Putting a HUD there is how you accidentally make your text ghost under TAA.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">A 2D-only application</h2>
+                        <p>
+                            Set the domain on the app itself and the 3D passes cost you nothing:
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>RenderDomain = RenderDomain.Overlay;</code></pre>
+                        </div>
+
+                        <p class="se-muted">
+                            That is what <code class="se-inline">Samples/Creator</code> does &mdash; same controls, same
+                            panel model, none of the scene cost. Domain resolution is inherited down the tree, so one line
+                            on the app covers every panel under it.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Panels you do not have to write</h2>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Panel</th><th>What you get</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>BoardPanel</code></td><td>A framed board with a settable <code>FrameColor</code>. The background for most overlays.</td></tr>
+                                    <tr><td><code>FrameButton</code></td><td>Text button with separate normal and hover colours for ground and text.</td></tr>
+                                    <tr><td><code>Input</code></td><td>Text field with description, alignment, abbreviation and an optional clear button.</td></tr>
+                                    <tr><td><code>MovePanel</code></td><td>Scrolling and sliding container with configurable padding, size and motion type.</td></tr>
+                                    <tr><td><code>Picker</code>, <code>SimplePicker</code></td><td>Single or multi-select lists over a <code>List&lt;EData&gt;</code>, with hover colours and <code>OnSelect</code>.</td></tr>
+                                    <tr><td><code>ImageView</code>, <code>FullView</code></td><td>Thumbnail with an optional clear affordance, and its expanded form.</td></tr>
+                                    <tr><td><code>ObjectPicker</code></td><td>Not a widget &mdash; the 3D pick and edit panel. See <a href="../features/picking.html">Picking and editing</a>.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <div class="se-callout se-callout--warn">
+                            <span class="se-callout__title">There is no layout system</span>
+                            <p>
+                                No flexbox, no constraints, no anchors, no docking. Positions are numbers you compute,
+                                which is fine for a HUD and tedious for a settings screen with forty rows. Text entry also
+                                delegates to the platform: <code class="se-inline">Input</code> raises the native keyboard
+                                through <code class="se-inline">DeviceServices.Dialog.ShowKeyboard</code>, so editing looks
+                                like the operating system rather than like your application.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                    <div class="se-pagenav">
+                        <a href="instancing.html">&larr; Instancing</a>
+                        <a href="text.html">Text and fonts &rarr;</a>
+                    </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="../features/">Features</a></li>
+                        <li><a href="../docs/">Documentation</a></li>
+                        <li><a href="../samples/">Samples</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../why/">Why SeasonEngine</a></li>
+                        <li><a href="../compare/">How it compares</a></li>
+                        <li><a href="../ai/">The local AI layer</a></li>
+                        <li><a href="../download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms &mdash; SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/site.js"></script>
+</body>
+</html>

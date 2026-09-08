@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - Where the AI layer is going
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it on every page.
+  - The right-hand table of contents is generated from the h2 and h3 elements
+    inside [data-toc-source]. Adding a section needs no other change.
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Where the AI layer is going &mdash; SeasonEngine</title>
+    <meta name="description" content="The planned path from separate AI panels to AI that participates in the scene: asset generation, natural-language scene edits and on-device agents." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/ai/roadmap.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Where the AI layer is going &mdash; SeasonEngine" />
+    <meta property="og:description" content="The planned path from separate AI panels to AI that participates in the scene: asset generation, natural-language scene edits and on-device agents." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/ai/roadmap.html" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../features/">Features</a>
+                <a href="../docs/">Docs</a>
+                <a href="../samples/">Samples</a>
+                <a href="../download/">Download</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <div class="se-doc se-doc--wide">
+
+                <div class="se-doc__main" data-toc-source>
+                    <p class="se-crumbs"><a href="../index.html">Home</a> / <a href="../ai/">Local AI</a> / Roadmap</p>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Where the AI layer is going</h1>
+                        <p class="se-lede">
+                            Four items, in the order they should happen, with the reasoning for the ordering included
+                            because it is the part most likely to be wrong. Everything on this page is a plan. None of
+                            it is shipped, and nothing here should factor into a purchase decision today.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The question this track has to answer</h2>
+                        <p>
+                            The engine roadmap asks whether the renderer is genuinely next-generation. This track asks
+                            something less comfortable: <strong>is the paid layer worth money, and does it help make
+                            games?</strong> Eight generation modalities already ship, so the answer does not depend on
+                            adding a ninth. It depends entirely on the first item below.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">1. Generated output into the engine</h2>
+                        <p>
+                            <span class="se-badge se-badge--absent">Absent</span>
+                            &nbsp;<span class="se-muted">Highest return on effort in the entire roadmap</span>
+                        </p>
+                        <p>
+                            The most under-valued gap in the repository. Eight capabilities generate output; none of that
+                            output can become an engine asset. Meanwhile the paid tier's whole premise is that developers
+                            want generated assets <em>in their game</em>. The scope is small &mdash; that is what makes
+                            the gap embarrassing rather than difficult:
+                        </p>
+                        <div class="se-table-wrap">
+                            <table>
+                                <thead>
+                                    <tr><th>Item</th><th>What it means</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>Image &rarr; material texture</td><td>Applied to the material of a picked object, from the panel that generated it</td></tr>
+                                    <tr><td>Image &rarr; sprite</td><td>Straight into the 2D overlay layer</td></tr>
+                                    <tr><td>Music &rarr; audio source</td><td>Playable from the scene rather than from a panel</td></tr>
+                                    <tr><td>A generated-assets folder</td><td>Stable on-disk layout so a project can reference outputs directly</td></tr>
+                                    <tr><td><strong>The reverse direction</strong></td><td>Pick an object, send its current texture into image-to-image as the reference</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <div class="se-callout se-callout--contract">
+                            <span class="se-callout__title">The last row is the whole argument</span>
+                            <p>
+                                Sending a selected object's texture back into generation is the difference between
+                                "an AI panel" and "AI in the engine". It is also the only answer to <em>why buy this
+                                instead of using ComfyUI, which is free</em> that survives contact with a sceptic:
+                                ComfyUI cannot select an object in your scene. Until this exists, that answer is not
+                                available, and the site should not pretend otherwise.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">2. Cloud models and runtime C# compilation</h2>
+                        <p>
+                            <span class="se-badge se-badge--absent">Absent</span>
+                            &nbsp;<span class="se-muted">Desktop only, by nature</span>
+                        </p>
+                        <p>
+                            Two capabilities that are more interesting together than apart.
+                        </p>
+                        <p>
+                            <strong>Cloud model access.</strong> An HTTP client &mdash; the repository has none at all
+                            &mdash; plus streaming response parsing, storage for a user-supplied API key, and
+                            cancellation. A few hundred lines rather than a pipeline. Commercially it has one attractive
+                            property: <strong>the user brings their own key</strong>, so inference cost never lands on
+                            the vendor, and there is no subsidised-token trap to grow out of.
+                        </p>
+                        <p>
+                            <strong>Runtime C# compilation.</strong> This is where a pure-C# architecture pays a
+                            dividend that is not available to the engines it gets compared against. Roslyn compiles C#
+                            at runtime, and the object model is already shaped to receive the result: a behaviour is a
+                            <code class="se-inline">Panel</code> or <code class="se-inline">Control</code> subclass, so
+                            a generated class only has to be instantiated and added. No serialisation format to satisfy,
+                            no component model to register with, no editor metadata to emit.
+                        </p>
+                        <pre><code>// what a language model would have to produce
+class Windmill : Panel
+{
+    Model blades;
+
+    public override void Create()
+    {
+        blades = new Model { Name = "Assets/windmill.glb" };
+        AddControl(blades);
+        base.Create();
+    }
+
+    public override bool Update(float time, float? alpha = null, ...)
+    {
+        blades.Rotation += time * 0.4f;
+        return base.Update(time, alpha: alpha, ...);
+    }
+}</code></pre>
+                        <p class="se-muted">
+                            That is the entire integration surface. An engine whose behaviour is assembled from
+                            inspector-configured components has to emit scene files, component references and metadata
+                            to achieve the same thing; here the generated artefact is just source.
+                        </p>
+                        <div class="se-callout se-callout--warn">
+                            <span class="se-callout__title">Three constraints, stated before anyone builds on it</span>
+                            <p>
+                                Roslyn runtime compilation is <strong>unavailable under full AOT</strong>, which rules
+                                out iOS and WebAssembly &mdash; this feature is desktop-only by nature. Dynamic
+                                compilation inside an MSIX package needs verifying early rather than at submission time.
+                                And generated code executes with full application trust, so the consent and security
+                                story has to be designed in rather than retrofitted.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">3. 3D asset generation</h2>
+                        <p>
+                            <span class="se-badge se-badge--absent">Absent</span>
+                            &nbsp;<span class="se-muted">Static props only &mdash; and further away than it looks</span>
+                        </p>
+                        <p>
+                            This is the most requested item and the most misjudged. The generation model is the
+                            <em>small</em> part. Four things have to exist, and only the first is about AI:
+                        </p>
+                        <div class="se-table-wrap">
+                            <table>
+                                <thead>
+                                    <tr><th>#</th><th>Work</th><th>Current state</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>1</td><td>A local image-to-3D or text-to-3D model</td><td>Real, and the easiest step</td></tr>
+                                    <tr><td>2</td><td>Mesh post-processing &mdash; decimation, UV unwrapping, normal repair</td><td><span class="se-badge se-badge--absent">No mesh processing code exists</span></td></tr>
+                                    <tr><td>3</td><td>glTF <em>export</em></td><td><span class="se-badge se-badge--absent">Import only</span></td></tr>
+                                    <tr><td>4</td><td>Something actually usable in a scene</td><td>Only reachable after 2 and 3</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <p>
+                            Generated meshes arrive with poor topology, unconstrained triangle counts and no usable UV
+                            layout. That is a mesh pipeline, not a feature. It does converge usefully with mesh LOD on
+                            the engine roadmap &mdash; both need a decimator, so it gets built once &mdash; but the
+                            honest scope is <strong>static prop generation</strong>, clearly labelled, with no rigging
+                            attached to the same deliverable.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">4. Automatic rigging</h2>
+                        <p>
+                            <span class="se-badge se-badge--absent">Research, not a commitment</span>
+                        </p>
+                        <p>
+                            Skeleton inference and skin-weight prediction are substantially less mature than mesh
+                            generation, and they are sensitive to exactly the topology quality that generated meshes
+                            lack. Auto-rigged output usually needs manual correction &mdash; which is the worst possible
+                            property for something sold as a feature, because the buyer discovers the manual work after
+                            paying. It stays in research and off any store listing until output quality has been
+                            verified against real characters.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Why 2 comes before 3</h2>
+                        <p>
+                            The intuitive ordering puts 3D generation near-term and cloud reasoning far off. That
+                            ordering is inverted here deliberately, and since it is the one substantive disagreement in
+                            the planning documents, the reasoning belongs in public:
+                        </p>
+                        <ul class="se-list">
+                            <li><strong>Effort asymmetry.</strong> Item 2 is an HTTP client plus a Roslyn host. Item 3 is a mesh processing pipeline plus a glTF exporter plus a model &mdash; several times the work.</li>
+                            <li><strong>Output-quality risk.</strong> Item 2's quality is supplied by frontier models and improves for free. Item 3's quality is capped by what local 3D models produce today, which is not yet drop-it-in-a-game quality. Selling that as a headline feature invites refunds.</li>
+                            <li><strong>Architectural leverage.</strong> Item 2 exploits a property this engine has and its competitors do not &mdash; behaviour as a single compilable C# class. Item 3 exploits nothing specific to this project; any engine can import a mesh.</li>
+                            <li><strong>Convergence.</strong> Runtime compilation and the planned world format are the same insight approached from two directions. Built near each other they produce one coherent design; built years apart they produce two that have to be reconciled.</li>
+                        </ul>
+                        <p class="se-muted">
+                            The counter-argument is real and worth acknowledging: 3D assets are the harder bottleneck
+                            for a solo developer, and therefore the thing people would more readily pay for. That is why
+                            item 3 stays on the roadmap rather than being cut. It is an argument about eventual value,
+                            not about sequence.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">What is deliberately not planned</h2>
+                        <div class="se-grid se-grid--2">
+                            <div>
+                                <p><strong>Subscriptions.</strong> The value is not recurring and the inference cost is the user's own electricity. There is nothing to meter.</p>
+                                <p><strong>A paid base application.</strong> The free build with optional add-ons is doing real work: someone arriving from the repository can install and judge it at zero friction.</p>
+                            </div>
+                            <div>
+                                <p><strong>Model hosting.</strong> Weights stay with their publishers. This project is not going to become a redistributor of other people's licences.</p>
+                                <p><strong>Cloud inference on the vendor's account.</strong> If cloud models arrive, the key is yours. Anything else eventually forces a price rise or a shutdown.</p>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Read the rest of it</h2>
+                        <p>
+                            This page is one of five tracks. The engine roadmap covers rendering, the application host
+                            and world format, foundations &mdash; tests, benchmarks, image-diff regression, all of which
+                            are currently absent &mdash; and a later VR track. It is also markedly more candid than a
+                            roadmap normally is, including about this one.
+                        </p>
+                        <div class="se-btnrow">
+                            <a class="se-btn" href="../roadmap/">Engine roadmap</a>
+                            <a class="se-btn se-btn--ghost" href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Roadmap.md" rel="noopener">Roadmap.md on GitHub</a>
+                        </div>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                    <div class="se-pagenav">
+                        <a href="models.html">&larr; Models and runtimes</a>
+                        <a href="../roadmap/">Engine roadmap &rarr;</a>
+                    </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="../features/">Features</a></li>
+                        <li><a href="../docs/">Documentation</a></li>
+                        <li><a href="../samples/">Samples</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../why/">Why SeasonEngine</a></li>
+                        <li><a href="../compare/">How it compares</a></li>
+                        <li><a href="../ai/">The local AI layer</a></li>
+                        <li><a href="../download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms &mdash; SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/site.js"></script>
+</body>
+</html>

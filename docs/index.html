@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - home page.
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it in: index.html, 404.html,
+    features/index.html, docs/index.html, roadmap/index.html
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SeasonEngine — a cross-platform C# graphics engine</title>
+    <meta name="description" content="SeasonEngine is a cross-platform C# graphics engine and application framework: PBR, glTF animation, cascaded shadows, DDGI, GTAO, TAA and a procedural sky, running on Direct3D 12, Vulkan, Metal and WebGPU from one API." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="SeasonEngine — a cross-platform C# graphics engine" />
+    <meta property="og:description" content="A next-gen renderer in pure C#. No editor, no fallback paths. MIT licensed." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="favicon.ico" />
+    <link rel="stylesheet" href="assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="index.html">
+                <img src="assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="index.html" aria-current="page">Home</a>
+                <a href="features/">Features</a>
+                <a href="docs/">Docs</a>
+                <a href="samples/">Samples</a>
+                <a href="download/">Download</a>
+                <a href="roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+
+            <!-- hero -->
+            <section class="se-card">
+                <div class="se-hero">
+                    <div class="se-hero__text">
+                        <h1 class="se-hero__title">A Graphics Engine Built for Understanding</h1>
+                        <p class="se-lede">
+                            SeasonEngine is a cross-platform C# graphics engine and application framework for
+                            real-time 2D and 3D apps. PBR materials, glTF animation, cascaded shadows and global
+                            illumination are the baseline — not an upgrade path.
+                        </p>
+
+                        <div class="se-btnrow">
+                            <a class="se-btn se-btn--primary" href="docs/">
+                                <img src="assets/img/Star.png" alt="" /> Get started
+                            </a>
+                            <a class="se-btn se-btn--ghost" href="download/">Download</a>
+                            <a class="se-btn se-btn--ghost" href="https://github.com/SeasonRealms/SeasonEngine">
+                                <img src="assets/img/Github.png" alt="" /> GitHub
+                            </a>
+                        </div>
+
+                        <p class="se-muted" style="margin-top:16px;">
+                            New here? <a href="why/">Why this exists</a> &middot;
+                            <a href="compare/">how it compares to MonoGame, Godot and Stride</a> &middot;
+                            <a href="samples/">the two sample applications</a>.
+                        </p>
+
+                        <p class="se-muted" style="margin-top:18px;">Run the reference application:</p>
+                        <div class="se-store">
+                            <a class="se-store__item" href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">
+                                <img src="assets/img/WindowsStore.png" alt="Microsoft Store" />
+                                Windows
+                            </a>
+                            <span class="se-store__item se-store__item--muted" title="Not published yet">
+                                <img src="assets/img/AppStore.png" alt="" />
+                                Planned
+                            </span>
+                            <span class="se-store__item se-store__item--muted" title="Not published yet">
+                                <img src="assets/img/PlayStore.webp" alt="" />
+                                Planned
+                            </span>
+                        </div>
+                    </div>
+                    <div class="se-hero__art">
+                        <img src="assets/img/Right.png" alt="SeasonEngine rendering" />
+                    </div>
+                </div>
+            </section>
+
+            <!-- positioning -->
+            <section class="se-card">
+                <h2 class="se-mt0">A next-gen renderer in pure C#. No editor, no fallback paths.</h2>
+                <p>
+                    The engine is code-first and editor-free by design. There is no scene editor to learn and no
+                    project format to adopt: you declare <code class="se-inline">Sprite2D</code>,
+                    <code class="se-inline">Model</code> and <code class="se-inline">InstancedModel</code> in ordinary
+                    C#, and <code class="se-inline">AddControl</code> / <code class="se-inline">AddPanel</code> define
+                    load order and layering for 2D and 3D alike.
+                </p>
+
+                <div class="se-grid se-grid--3" style="margin-top:22px;">
+                    <div>
+                        <h3>Integration is the product</h3>
+                        <p class="se-muted">
+                            Bindings stop at the API boundary. PBR, glTF skinning, shadows, DDGI, GTAO, TAA, a dynamic
+                            day/night sky, MSDF text and 2D sprites are assembled here so they work together, on four
+                            graphics APIs, from one API surface.
+                        </p>
+                    </div>
+                    <div>
+                        <h3>One implementation per domain</h3>
+                        <p class="se-muted">
+                            Animation is glTF, only. Text is MSDF, only. One graphics API per platform — no OpenGL or
+                            WebGL fallback. Platform divergence is confined to
+                            <code class="se-inline">DeviceServices</code>.
+                        </p>
+                    </div>
+                    <div>
+                        <h3>Declarative bulk instancing</h3>
+                        <p class="se-muted">
+                            Declaring one <code class="se-inline">InstancedModel</code> binds many objects at once,
+                            with per-instance skinning and morph targets. Ordinary C#, no second paradigm to adopt,
+                            and you never write a <code class="se-inline">Draw</code> call.
+                        </p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- feature tiles -->
+            <section class="se-card">
+                <div class="se-grid se-grid--4">
+                    <div class="se-feature">
+                        <img class="se-feature__icon" src="assets/img/PBR.png" alt="" />
+                        <h3>Full PBR</h3>
+                        <p>Metallic-roughness materials, normal, occlusion and emissive maps, imported straight from glTF.</p>
+                    </div>
+                    <div class="se-feature">
+                        <img class="se-feature__icon" src="assets/img/Raytracing.png" alt="" />
+                        <h3>DDGI global illumination</h3>
+                        <p>SDF-voxelised dynamic GI with a probe irradiance atlas and Chebyshev occlusion.</p>
+                    </div>
+                    <div class="se-feature">
+                        <img class="se-feature__icon" src="assets/img/AI.png" alt="" />
+                        <h3>Local AI layer</h3>
+                        <p>ONNX and GGML backends behind one API: text, image, video, music, speech and vision.</p>
+                    </div>
+                    <div class="se-feature">
+                        <img class="se-feature__icon" src="assets/img/dx12ultimate.png" alt="" />
+                        <h3>Four backends</h3>
+                        <p>Direct3D 12, Vulkan, Metal and WebGPU, each with its own hand-written shader set.</p>
+                    </div>
+                    <div class="se-feature">
+                        <h3>glTF 2.0 animation</h3>
+                        <p>Skinning, morph targets, animation clips and per-instance bone palettes — the one animation format.</p>
+                    </div>
+                    <div class="se-feature">
+                        <h3>Cascaded shadows</h3>
+                        <p>Three sun cascades plus a punctual slot in one atlas, with per-cascade light-space culling.</p>
+                    </div>
+                    <div class="se-feature">
+                        <h3>Procedural sky</h3>
+                        <p>LUT-based atmospheric scattering, day/night cycle, aerial perspective and procedural clouds.</p>
+                    </div>
+                    <div class="se-feature">
+                        <h3>MSDF text</h3>
+                        <p>Resolution-independent glyph atlases, laid out and instanced by the engine on every backend.</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- code and result -->
+            <section class="se-card">
+                <h2 class="se-mt0">Code beside its result</h2>
+                <p class="se-lede">A panel, two models and a quality switch. No draw calls, no render-pass wiring.</p>
+
+                <div class="se-codepair" style="margin-top:20px;">
+                    <div>
+<pre class="se-code"><code class="language-csharp">using Season.Basic;
+using Season.Controls;
+using Season.Panels;
+using Season.Rendering;
+
+internal class Island : Panel
+{
+    internal Island()
+    {
+        AddControl(new Model
+        {
+            Name = "Assets/island.glb",
+            PosY = 0f,
+            Width = 60f, Height = 12f, Depth = 60f
+        });
+
+        AddControl(new Model
+        {
+            Name = "Assets/robot.glb",
+            Highlight = { Style = HighlightStyle.Wireframe },
+            PosX = 6f, PosY = 1f, PosZ = 4f,
+            Rotation = MathF.PI / 2f
+        });
+    }
+}
+
+internal class IslandApp : BaseApp
+{
+    internal IslandApp()
+    {
+        Title = "Island";
+        BasicResolution = new Vector2(1920f, 1080f);
+        RenderQuality.DefaultGlobalIllumination = GiMode.Ddgi;
+    }
+
+    public override void Create()
+    {
+        base.Create();
+        AddPanel(new Island());
+    }
+}</code></pre>
+                    </div>
+                    <figure class="se-shot">
+                        <img src="assets/img/shot-gi.jpg" alt="Interior lit by dynamic global illumination" />
+                        <span class="se-shot__tag">DDGI · GTAO · TAA · Direct3D 12</span>
+                        <figcaption>
+                            Lighting, shadows and indirect bounce come from the pipeline defaults — the scene code above
+                            never mentions them.
+                        </figcaption>
+                    </figure>
+                </div>
+            </section>
+
+            <!-- platforms and backends -->
+            <section class="se-card">
+                <h2 class="se-mt0">Cross-platform by isolation, not abstraction</h2>
+                <p>
+                    The app-facing model is shared. Each platform keeps its own renderer and its own shaders, and
+                    platform-specific capabilities live behind <code class="se-inline">DeviceServices</code>.
+                </p>
+
+                <div class="se-grid se-grid--2" style="margin-top:8px;">
+                    <div>
+                        <h3>Platforms</h3>
+                        <div class="se-strip">
+                            <img src="assets/img/windows.svg" alt="Windows" />
+                            <img src="assets/img/linux.svg" alt="Linux" />
+                            <img src="assets/img/macos.svg" alt="macOS" />
+                            <img src="assets/img/ios.svg" alt="iOS" />
+                            <img src="assets/img/android.svg" alt="Android" />
+                        </div>
+                    </div>
+                    <div>
+                        <h3>Backends</h3>
+                        <div class="se-strip">
+                            <img src="assets/img/dx12ultimate.png" alt="Direct3D 12" />
+                            <img src="assets/img/metal-256x256_2x.png" alt="Metal" />
+                            <img src="assets/img/vulkan.svg" alt="Vulkan" style="height:42px;" />
+                            <img src="assets/img/wgpu.svg" alt="WebGPU" />
+                        </div>
+                    </div>
+                </div>
+
+                <div class="se-table-wrap" style="margin-top:24px;">
+                    <table class="se-table">
+                        <thead>
+                            <tr><th>Platform</th><th>Target</th><th>Entry point</th><th>Backend</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Windows</td><td><code>net10.0-windows10.0.19041.0</code></td><td><code>WindowsApp.Run(app)</code></td><td>Direct3D 12</td></tr>
+                            <tr><td>Linux</td><td><code>net10.0</code></td><td><code>LinuxApp.Run(app)</code></td><td>Vulkan</td></tr>
+                            <tr><td>Android</td><td><code>net10.0-android</code></td><td><code>AndroidApp.Run(app)</code></td><td>Vulkan</td></tr>
+                            <tr><td>iOS</td><td><code>net10.0-ios</code></td><td><code>iOSApp.Run(app)</code></td><td>Metal</td></tr>
+                            <tr><td>Mac Catalyst</td><td><code>net10.0-maccatalyst</code></td><td><code>MacCatalystApp.Run(app)</code></td><td>Metal</td></tr>
+                            <tr><td>Web</td><td><code>net10.0-browser</code></td><td><code>WebApp.Run(app, ...)</code></td><td>WebGPU path</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- pipeline -->
+            <section class="se-card">
+                <h2 class="se-mt0">A fixed pass schedule, not a frame graph</h2>
+                <p>
+                    The frame shape is visible in engine code. It gives up some scheduling generality and buys a
+                    pipeline you can read, debug and align across four backends.
+                </p>
+
+                <div class="se-pipeline">
+                    <span class="se-pipeline__step se-pipeline__step--accent">FrameStart Compute</span>
+                    <span class="se-pipeline__arrow">&rarr;</span>
+                    <span class="se-pipeline__step">Shadow</span>
+                    <span class="se-pipeline__arrow">&rarr;</span>
+                    <span class="se-pipeline__step">Scene</span>
+                    <span class="se-pipeline__arrow">&rarr;</span>
+                    <span class="se-pipeline__step se-pipeline__step--accent">AfterScene Compute</span>
+                    <span class="se-pipeline__arrow">&rarr;</span>
+                    <span class="se-pipeline__step">Post</span>
+                    <span class="se-pipeline__arrow">&rarr;</span>
+                    <span class="se-pipeline__step">FinalBlit</span>
+                    <span class="se-pipeline__arrow">&rarr;</span>
+                    <span class="se-pipeline__step">Overlay</span>
+                </div>
+
+                <p class="se-muted" style="margin-top:14px;">
+                    Compute effects register into the two compute phases and leave no residue when a backend cannot
+                    run them, so bloom, GTAO, TAA, DDGI and the sky LUTs extend the pipeline without touching the
+                    scene model.
+                </p>
+
+<pre class="se-code"><code class="language-text">BaseApp
+  -> Panel tree
+     -> Controls (Sprite2D, Texts, Shape, Mesh3D, Model, InstancedModel, ...)
+        -> IGraphics backend
+           -> Direct3D 12 / Vulkan / Metal / WebGPU</code></pre>
+            </section>
+
+            <!-- capability snapshot -->
+            <section class="se-card">
+                <h2 class="se-mt0">What is actually implemented</h2>
+                <p class="se-lede">
+                    Audited against the source, not against marketing copy. The absent rows are listed for the same
+                    reason as the shipped ones.
+                </p>
+
+                <div class="se-table-wrap" style="margin-top:16px;">
+                    <table class="se-table">
+                        <thead>
+                            <tr><th>Capability</th><th>Status</th><th>Where it lives</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Fixed pass schedule with compute phases</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Rendering/RenderPass.cs</code></td></tr>
+                            <tr><td>Bloom, GTAO, TAA, depth debug views</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Rendering/Effects/</code></td></tr>
+                            <tr><td>DDGI dynamic global illumination</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Effects/Ddgi.cs</code></td></tr>
+                            <tr><td>Sky atmosphere, day/night cycle, clouds</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Effects/SkyAtmosphere.cs</code></td></tr>
+                            <tr><td>Cascaded shadow maps (3 + 1 punctual)</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Rendering/CascadedShadow.cs</code></td></tr>
+                            <tr><td>GPU instancing with skinning and morph targets</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Controls/InstancedModel.cs</code></td></tr>
+                            <tr><td>Per-instance picking and highlight modes</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td><code>Panels/ObjectPicker.cs</code></td></tr>
+                            <tr><td>Property editing in the reference app</td><td><span class="se-badge se-badge--partial">Partial</span></td><td>fixed fields, no property grid</td></tr>
+                            <tr><td>Scene serialization, save and load</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>no scene format yet</td></tr>
+                            <tr><td>Indirect draw, texture compression, occlusion culling</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>planned in Track A</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <p><a href="roadmap/">Read the full audited baseline and roadmap &rarr;</a></p>
+            </section>
+
+            <!-- gallery -->
+            <section class="se-card">
+                <h2 class="se-mt0">The reference application</h2>
+                <p class="se-lede">
+                    <code class="se-inline">Apps/Engine</code> is not a minimal demo. It is the app used to validate
+                    the renderer when every system runs at once — and it doubles as the regression target.
+                </p>
+
+                <div class="se-grid se-grid--3" style="margin-top:20px;">
+                    <figure class="se-shot">
+                        <img src="assets/img/shot-sky.jpg" alt="Procedural sky over the island scene" />
+                        <span class="se-shot__tag">Sky atmosphere</span>
+                        <figcaption>Physically based scattering, not a skybox texture.</figcaption>
+                    </figure>
+                    <figure class="se-shot">
+                        <img src="assets/img/shot-debug.jpg" alt="Debug mode showing intermediate render targets" />
+                        <span class="se-shot__tag">Debug mode</span>
+                        <figcaption>Depth, velocity, AO, GI probes and post stages, live.</figcaption>
+                    </figure>
+                    <figure class="se-shot">
+                        <img src="assets/img/shot-picker.jpg" alt="Object picking and highlight in the island scene" />
+                        <span class="se-shot__tag">Picking · Highlight</span>
+                        <figcaption>Per-instance surface picking with wireframe and outline styles.</figcaption>
+                    </figure>
+                </div>
+            </section>
+
+            <!-- AI -->
+            <section class="se-card" id="ai">
+                <h2 class="se-mt0">The AI layer</h2>
+                <p>
+                    Local inference is a separate stack that sits beside the engine, not inside the renderer. Its
+                    contribution is not another backend — it is making dependency-heavy local models practical inside
+                    a real application: one API over both <strong>ONNX Runtime</strong> and <strong>GGML</strong>,
+                    version-consistent native runtimes, and packaged CUDA / cuDNN dependencies instead of a manual
+                    install guide.
+                </p>
+
+                <div class="se-grid se-grid--2" style="margin-top:10px;">
+                    <div>
+                        <h3>Libraries today</h3>
+                        <p class="se-muted" style="margin-bottom:10px;">Text and translation, image generation and editing, video, music, text-to-speech with voice cloning, speech-to-text, vision and OCR.</p>
+                        <span class="se-pill">Text</span><span class="se-pill">Translate</span><span class="se-pill">Image</span>
+                        <span class="se-pill">Video</span><span class="se-pill">Music</span><span class="se-pill">TTS</span>
+                        <span class="se-pill">STT</span><span class="se-pill">Vision</span>
+                        <p class="se-muted" style="margin-top:12px;">
+                            Backend selection covers CPU, DirectML and CUDA. Model weights are never bundled: each
+                            panel links to its source repository.
+                        </p>
+                    </div>
+                    <div>
+                        <h3>Where it is going</h3>
+                        <ul class="se-list se-muted">
+                            <li>Generated assets flowing back into the scene as engine resources.</li>
+                            <li>Optional external cloud APIs alongside the local backends.</li>
+                            <li>C# code generation, so an agent can assemble a graphics application from a prompt.</li>
+                        </ul>
+                        <p class="se-muted">
+                            The engine core and the foundational AI libraries are MIT. <code class="se-inline">SeasonAI</code>,
+                            the productised application layer, is the commercial part — that split is what funds the
+                            open work.
+                        </p>
+                    </div>
+                </div>
+
+                <figure class="se-shot" style="margin-top:20px;max-width:760px;">
+                    <img src="assets/img/shot-ai.jpg" alt="Local image generation inside the reference application" />
+                    <figcaption>Local image generation running in the same application as the renderer.</figcaption>
+                </figure>
+
+                <p style="margin-top:18px;">
+                    <a href="ai/">The local AI layer in full &rarr;</a>
+                    <span class="se-muted">&nbsp;&mdash; including the runtimes behind each capability, and the gap that
+                    still separates a generated image from an engine asset.</span>
+                </p>
+            </section>
+
+            <!-- get started -->
+            <section class="se-card">
+                <h2 class="se-mt0">Get started</h2>
+                <div class="se-grid se-grid--2">
+                    <div>
+                        <h3>Add the library</h3>
+<pre class="se-code"><code class="language-bash">dotnet add package SeasonEngine</code></pre>
+                        <p class="se-muted">Or reference the project directly from a clone of the repository.</p>
+<pre class="se-code"><code class="language-xml">&lt;ProjectReference Include="..\Season\Season.csproj" /&gt;</code></pre>
+                    </div>
+                    <div>
+                        <h3>Run the reference app</h3>
+<pre class="se-code"><code class="language-bash">git clone https://github.com/SeasonRealms/SeasonEngine.git
+cd SeasonEngine
+dotnet run --project Apps/Engine/Engine.csproj -f net10.0-windows10.0.19041.0</code></pre>
+                        <p class="se-muted">
+                            On Linux use <code class="se-inline">-f net10.0</code>. Requirements and per-platform
+                            notes are in the <a href="docs/">getting started guide</a>.
+                        </p>
+                    </div>
+                </div>
+            </section>
+
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="features/">Features</a></li>
+                        <li><a href="docs/">Documentation</a></li>
+                        <li><a href="samples/">Samples</a></li>
+                        <li><a href="roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="why/">Why SeasonEngine</a></li>
+                        <li><a href="compare/">How it compares</a></li>
+                        <li><a href="ai/">The local AI layer</a></li>
+                        <li><a href="download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms — SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="assets/js/site.js"></script>
+</body>
+</html>

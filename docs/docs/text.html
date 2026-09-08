@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - Text and fonts
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it on every page.
+  - The right-hand table of contents is generated from the h2 and h3 elements
+    inside [data-toc-source]. Adding a section needs no other change.
+-->
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Text and fonts &mdash; SeasonEngine</title>
+    <meta name="description" content="Registering a TrueType font, drawing MSDF text that stays sharp at any scale, and the wrapping, line-height and colour controls on the Texts control." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/docs/text.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Text and fonts &mdash; SeasonEngine" />
+    <meta property="og:description" content="Registering a TrueType font, drawing MSDF text that stays sharp at any scale, and the wrapping, line-height and colour controls on the Texts control." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/docs/text.html" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../features/">Features</a>
+                <a href="../docs/" aria-current="page">Docs</a>
+                <a href="../samples/">Samples</a>
+                <a href="../download/">Download</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <div class="se-doc">
+                <aside class="se-sidebar">
+                    <div class="se-sidebar__group">
+                        <h4>Start here</h4>
+                        <ul>
+                            <li><a href="index.html">Getting started</a></li>
+                            <li><a href="requirements.html">Requirements</a></li>
+                            <li><a href="project-layout.html">Project layout</a></li>
+                            <li><a href="platforms.html">Platform entry points</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Building a scene</h4>
+                        <ul>
+                            <li><a href="app-and-panels.html">Apps and panels</a></li>
+                            <li><a href="placement.html">Placement and camera</a></li>
+                            <li><a href="models.html">Models and animation</a></li>
+                            <li><a href="instancing.html">Instancing</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>2D and text</h4>
+                        <ul>
+                            <li><a href="controls-2d.html">2D controls</a></li>
+                            <li><a href="text.html" aria-current="page">Text and fonts</a></li>
+                        </ul>
+                    </div>
+                    <div class="se-sidebar__group">
+                        <h4>Rendering</h4>
+                        <ul>
+                            <li><a href="lighting.html">Lighting and sky</a></li>
+                            <li><a href="quality.html">Render quality</a></li>
+                            <li><a href="compute-effects.html">Compute effects</a></li>
+                        </ul>
+                    </div>
+                </aside>
+
+                <div class="se-doc__main" data-toc-source>
+                    <p class="se-crumbs"><a href="../index.html">Home</a> / <a href="../docs/">Docs</a> / Text and fonts</p>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Text and fonts</h1>
+                        <p class="se-lede">
+                            There is one glyph pipeline on every backend, and it is MSDF. Glyphs are rasterised into
+                            multi-channel signed distance fields at a fixed pixel range of 4 and packed into the engine's
+                            own atlas, so <code class="se-inline">Scale</code> is a free parameter rather than a quality
+                            setting and no per-size atlas is ever rebuilt.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Loading a font</h2>
+                        <p>
+                            Fonts are registered once during startup. Several can be resident at the same time, and glyph
+                            metrics are cached per font and code point.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>var font = await Season.Fonts.Font.CreateAsync("Fonts/NotoSans-Regular.ttf", 48f);</code></pre>
+                        </div>
+
+                        <p class="se-muted">
+                            The <code class="se-inline">size</code> argument is the rasterisation size, which affects atlas
+                            footprint and the smallest legible detail &mdash; not the size text renders at. That is
+                            <code class="se-inline">Scale</code> on the control, and it is independent.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Drawing text</h2>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>title = new Texts
+{
+    Content = "Settings",
+    Color = Colors.DarkRed,
+    Scale = Vector2.One * 1.2f,
+    OnClick = () =&gt; settingPanel.Alpha = 1f
+};
+AddControl(title);
+
+body = new Texts
+{
+    Content = longParagraph,
+    WidthRequest = 360,          // wrapping box; null means one line
+    LineHeight = 34
+};
+AddControl(body);</code></pre>
+                        </div>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Member</th><th>Notes</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>Content</code></td><td>The string. Assigning it triggers layout. <code>ContentOrigin</code> keeps the untranslated original.</td></tr>
+                                    <tr><td><code>Translate</code></td><td>True by default: the string goes through localisation before layout. Set it false for names, numbers and log lines.</td></tr>
+                                    <tr><td><code>Scale</code></td><td>A <code>Vector2</code>, so text can be stretched on one axis. Costs nothing in sharpness.</td></tr>
+                                    <tr><td><code>LineHeight</code></td><td>Line advance in design units. 40 by default.</td></tr>
+                                    <tr><td><code>WidthRequest</code>, <code>HeightRequest</code></td><td>The wrapping box. Leave both null and the text is a single line.</td></tr>
+                                    <tr><td><code>WordsSpace</code>, <code>EmptySpace</code></td><td>Extra tracking, and the width of a space in Latin runs. <code>EmptySpace</code> is 10 by default.</td></tr>
+                                    <tr><td><code>OriginWidth</code>, <code>OriginHeight</code></td><td>Read back the measured size after layout, for positioning something next to it.</td></tr>
+                                    <tr><td><code>TextsType</code></td><td><code>Immediately</code> or <code>FadeIn</code>, for text that appears rather than pops.</td></tr>
+                                    <tr><td><code>Append(string)</code></td><td>Appends a fragment and lays out only the tail. See below.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <div class="se-callout se-callout--warn">
+                            <span class="se-callout__title"><code>Translate</code> is on by default</span>
+                            <p>
+                                Every <code class="se-inline">Content</code> assignment is looked up before layout. That is
+                                what you want for UI labels and emphatically not what you want for a player's name or a
+                                file path, so set <code class="se-inline">Translate = false</code> on those controls before
+                                assigning content.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Inline colour</h2>
+                        <p>
+                            A small span markup is understood inside <code class="se-inline">Content</code>, which is
+                            enough to highlight one word without splitting a paragraph into three controls.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>log.Content = "Build &lt;span style='color:Red;font-weight:bold;'&gt;failed&lt;/span&gt; in 2.4s";</code></pre>
+                        </div>
+
+                        <p class="se-muted">
+                            That is the whole markup surface. There is no rich text document model, no stylesheet and no
+                            data binding &mdash; deliberately, because the moment a text control accepts a document you own
+                            a layout engine.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Streaming text</h2>
+                        <p>
+                            <code class="se-inline">Append</code> exists because token streams exist. It lays out only the
+                            new tail against a checkpoint of the layout state at the start of the current line, so an
+                            incremental append matches a full relayout pixel for pixel &mdash; including whole-word
+                            lookahead, which is the part a naive tail append gets wrong.
+                        </p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>// A model streams tokens; the paragraph is not rebuilt sixty times a second.
+await foreach (var token in stream)
+    answer.Append(token);</code></pre>
+                        </div>
+
+                        <div class="se-callout se-callout--warn">
+                            <span class="se-callout__title">Span markup disables incremental append</span>
+                            <p>
+                                A colour scope can straddle a chunk boundary and span indices are absolute within the whole
+                                string, so the tail cannot be parsed on its own. Once span markup has appeared in
+                                <code class="se-inline">Content</code>, appends fall back to full relayout until the next
+                                whole-content assignment. Streaming and inline colour are each supported; combined, you pay
+                                for the colour.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Line breaking</h2>
+                        <p>
+                            Breaking is script-aware rather than character-count based. CJK breaks between characters,
+                            including the punctuation that lives outside the main unified block and must not begin a line;
+                            Latin breaks on whole words, with lookahead to measure the word before committing to the line.
+                        </p>
+                        <p class="se-muted">
+                            Both rules run in the same pass, so a mixed CJK and Latin paragraph wraps correctly without
+                            you selecting a mode. What the engine does not do is hyphenation, bidirectional text or complex
+                            shaping for Indic and Arabic scripts.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Text and post-processing</h2>
+                        <p>
+                            Overlay text is composited after tone mapping, with inverse-ACES compensation applied so the
+                            colour you asked for is the colour on screen rather than the tonemapped version of it. That is
+                            also why a HUD left in <code class="se-inline">RenderDomain.Scene</code> looks wrong: it gets
+                            graded, bloomed and TAA-resolved along with the world, and thin glyph edges are exactly what
+                            temporal accumulation smears.
+                        </p>
+                        <p class="se-muted">
+                            See <a href="controls-2d.html">2D controls</a> for the domain table, and
+                            <a href="../features/ui.html">2D, text and UI</a> for the wider feature picture including the
+                            known gaps.
+                        </p>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                    <div class="se-pagenav">
+                        <a href="controls-2d.html">&larr; 2D controls</a>
+                        <a href="lighting.html">Lighting and sky &rarr;</a>
+                    </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="../features/">Features</a></li>
+                        <li><a href="../docs/">Documentation</a></li>
+                        <li><a href="../samples/">Samples</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../why/">Why SeasonEngine</a></li>
+                        <li><a href="../compare/">How it compares</a></li>
+                        <li><a href="../ai/">The local AI layer</a></li>
+                        <li><a href="../download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms &mdash; SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/site.js"></script>
+</body>
+</html>
