@@ -12,7 +12,7 @@
     Release-engineering and commercial items from Roadmap.md are deliberately
     NOT reproduced here.
 -->
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -31,7 +31,7 @@
         (function () {
             try {
                 var t = localStorage.getItem('se-theme');
-                if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                if (!t) t = 'dark';
                 document.documentElement.setAttribute('data-theme', t);
             } catch (e) { }
         })();
@@ -45,7 +45,7 @@
             <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
             <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
             <button class="se-theme" type="button" title="Toggle light and dark theme">
-                <img src="../assets/img/Sun.png" alt="Light theme" width="26" height="26" />
+                <img src="../assets/img/Moon.png" alt="Dark theme" width="26" height="26" />
             </button>
         </div>
     </div>

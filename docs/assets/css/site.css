@@ -12,6 +12,10 @@
 /* --- tokens --------------------------------------------------------------- */
 
 :root {
+    /* Keeps native scrollbars, form controls and the caret in step with the
+       theme. Dark is the site default, so the dark block below overrides this. */
+    color-scheme: light;
+
     --brand: #3e90ee;
     --brand-strong: #2f7cd6;
     --brand-soft: rgba(62, 144, 238, .12);
@@ -46,6 +50,8 @@
 }
 
 [data-theme="dark"] {
+    color-scheme: dark;
+
     --banner-bg: #0b1116;
     --page-bg: #0f1720;
     --surface: #182229;

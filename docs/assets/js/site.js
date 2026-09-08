@@ -14,8 +14,10 @@
 
     /* --- 1. theme --------------------------------------------------------- */
 
+    /* Dark is the site default. The fallback here only matters if the inline
+       boot script in <head> failed to run, so it must agree with it. */
     function currentTheme() {
-        return document.documentElement.getAttribute('data-theme') || 'light';
+        return document.documentElement.getAttribute('data-theme') || 'dark';
     }
 
     function applyTheme(theme) {
