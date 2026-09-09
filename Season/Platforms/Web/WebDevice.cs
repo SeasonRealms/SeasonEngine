@@ -86,7 +86,30 @@ internal class WebDeviceCore : IDeviceCore
 
     public async Task<bool> RequestPermissionAsync(string[] permissions)
     {
-        return await Task.FromResult(true);
+        // Browsers gate microphone access behind getUserMedia consent, not a
+        // per-app toggle we can flip. Probe the real permission state instead of
+        // pretending every request is granted: granted and prompt map to true
+        // (prompt lets the subsequent getUserMedia surface the browser consent
+        // UI), denied maps to false. Everything else stays as-is.
+        var needsMicrophone = permissions is not null && permissions.Any(p =>
+            p is not null && (p.Contains("RECORD_AUDIO", StringComparison.OrdinalIgnoreCase)
+                || p.Contains("MICROPHONE", StringComparison.OrdinalIgnoreCase)));
+
+        if (!needsMicrophone)
+        {
+            return true;
+        }
+
+        // WebAudioInterop is browser-only; the Web platform sources also compile
+        // into the net10.0 TFM, so gate the call behind a runtime platform check.
+        if (!OperatingSystem.IsBrowser())
+        {
+            return false;
+        }
+
+        var status = await WebAudioInterop.QueryPermission();
+
+        return status is 0 or 1;
     }
 }
 

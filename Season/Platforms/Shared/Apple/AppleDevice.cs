@@ -144,15 +144,41 @@ internal class AppleDeviceCore : IDeviceCore
 
     public async Task<bool> RequestPermissionAsync(string[] permissions)
     {
-        var status = PHPhotoLibrary.AuthorizationStatus;
+        // Microphone requests go through AVAudioSession consent (one system prompt
+        // per app install); photo requests keep the existing Photos flow. Everything
+        // else is treated as granted, matching the other platforms.
+        var needsMicrophone = permissions is not null && permissions.Any(p =>
+            p is not null && (p.Contains("RECORD_AUDIO", StringComparison.OrdinalIgnoreCase)
+                || p.Contains("MICROPHONE", StringComparison.OrdinalIgnoreCase)));
 
-        bool authotization = status == PHAuthorizationStatus.Authorized;
-
-        if (!authotization)
+        if (!needsMicrophone)
         {
-            authotization = await PHPhotoLibrary.RequestAuthorizationAsync() == PHAuthorizationStatus.Authorized;
+            var status = PHPhotoLibrary.AuthorizationStatus;
+
+            bool authotization = status == PHAuthorizationStatus.Authorized;
+
+            if (!authotization)
+            {
+                authotization = await PHPhotoLibrary.RequestAuthorizationAsync() == PHAuthorizationStatus.Authorized;
+            }
+            return authotization;
         }
-        return authotization;
+
+        var session = AVAudioSession.SharedInstance();
+
+        if (session.RecordPermission is AVAudioSessionRecordPermission.Granted)
+        {
+            return true;
+        }
+
+        var tcs = new TaskCompletionSource<bool>();
+
+        session.RequestRecordPermission((granted) =>
+        {
+            tcs.TrySetResult(granted);
+        });
+
+        return await tcs.Task;
     }
 }
 
@@ -1035,116 +1061,131 @@ internal class AppleRecordService : RecordService, IRecordService
 {
     //Record (Record Permission)
 
-    //AVAudioRecorder recorder;
+    AVAudioRecorder recorder = null;
 
-    //TaskCompletionSource<byte[]> tcsRecord = null;
+    TaskCompletionSource<byte[]> tcsRecord = null;
 
     public async Task<bool> StartRecord()
     {
         bool success = false;
 
-        //var tcs = new TaskCompletionSource<bool>();
+        var permissions = new string[]
+        {
+            "RECORD_AUDIO"
+        };
 
-        //var session = AVAudioSession.SharedInstance();
+        var hasPermission = await DeviceServices.Core.RequestPermissionAsync(permissions);
 
-        //session.RequestRecordPermission((granted) =>
-        //{
-        //    if (granted)
-        //    {
-        //        if (session.SetCategory(AVAudioSession.CategoryRecord, out NSError error))
-        //        {
-        //            if (session.SetActive(true, out error))
-        //            {
-        //                var fileName = $"Record-{DateTime.Now.ToSeasonDateTimeTicks()}.wav";
+        if (!hasPermission)
+        {
+            return false;
+        }
 
-        //                var audioFile = Path.Combine(Path.GetTempPath(), fileName);
+        try
+        {
+            var session = AVAudioSession.SharedInstance();
 
-        //                var audioFilePath = NSUrl.FromFilename(audioFile);
+            if (session.SetCategory(AVAudioSession.CategoryRecord, out NSError categoryError))
+            {
+                if (session.SetActive(true, out NSError activeError))
+                {
+                    var fileName = $"Record-{DateTime.Now:yyyyMMddHHmmssfff}.wav";
 
-        //                var audioSettings = new AudioSettings
-        //                {
-        //                    SampleRate = 16000, //44100,
-        //                    NumberChannels = 1,
-        //                    AudioQuality = AVAudioQuality.High,
-        //                    Format = AudioToolbox.AudioFormatType.LinearPCM  //.MPEG4AAC,
-        //                };
+                    var audioFile = Path.Combine(Path.GetTempPath(), fileName);
 
-        //                recorder = AVAudioRecorder.Create(audioFilePath, audioSettings, out error);
+                    var audioFilePath = NSUrl.FromFilename(audioFile);
 
-        //                if (error == null)
-        //                {
-        //                    if (recorder.PrepareToRecord())
-        //                    {
-        //                        recorder.FinishedRecording += (s, e) =>
-        //                        {
-        //                            var bytes = System.IO.File.ReadAllBytes(audioFile);
+                    var audioSettings = new AudioSettings
+                    {
+                        SampleRate = 16000,
+                        NumberChannels = 1,
+                        AudioQuality = AVAudioQuality.High,
+                        Format = AudioToolbox.AudioFormatType.LinearPCM,
+                        LinearPcmBitDepth = 16
+                    };
 
-        //                            tcsRecord.TrySetResult(bytes);
-        //                        };
+                    recorder = AVAudioRecorder.Create(audioFilePath, audioSettings, out NSError createError);
 
-        //                        if (recorder.Record())
-        //                        {
-        //                            tcs.TrySetResult(true);
-        //                        }
-        //                        else
-        //                        {
+                    if (createError == null && recorder != null)
+                    {
+                        tcsRecord = new TaskCompletionSource<byte[]>();
 
-        //                        }
-        //                    }
-        //                    else
-        //                    {
+                        recorder.FinishedRecording += (s, e) =>
+                        {
+                            try
+                            {
+                                var bytes = e.Status ? System.IO.File.ReadAllBytes(audioFile) : null;
 
-        //                    }
-        //                }
-        //                else
-        //                {
-        //                    //error.LocalizedDescription
-        //                }
+                                tcsRecord.TrySetResult(bytes);
+                            }
+                            catch
+                            {
+                                tcsRecord.TrySetResult(null);
+                            }
+                        };
 
-        //                recorder.Dispose();
+                        if (recorder.PrepareToRecord() && recorder.Record())
+                        {
+                            success = true;
+                        }
+                        else
+                        {
+                            recorder.Dispose();
 
-        //                recorder = null;
-        //            }
-        //            else
-        //            {
+                            recorder = null;
 
-        //            }
-        //        }
-        //        else
-        //        {
-        //            //error.LocalizedDescription
-        //        }
-        //    }
-        //    else
-        //    {
-        //        //Need permission
-        //    }
+                            tcsRecord = null;
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] StartRecord failed: {ex}");
+        }
 
-        //    tcs.TrySetResult(false);
-        //});
-
-        //return await tcs.Task;
+        if (!success)
+        {
+            try { AVAudioSession.SharedInstance().SetActive(false, out _); }
+            catch { }
+        }
 
         return success;
     }
 
     public async Task<byte[]> StopRecord()
     {
-        //tcsRecord = new TaskCompletionSource<byte[]>();
+        var rec = recorder;
 
-        //recorder.Stop();
+        var tcs = tcsRecord;
 
-        //recorder.Dispose();
+        recorder = null;
 
-        //recorder = null;
+        tcsRecord = null;
 
-        //var bytes = await tcsRecord.Task;
+        if (rec == null || tcs == null)
+        {
+            return null;
+        }
 
-        //tcsRecord = null;
+        try
+        {
+            rec.Stop();
 
-        //return bytes;
+            rec.Dispose();
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] StopRecord stop failed: {ex.Message}");
+        }
 
-        return null;
+        try { AVAudioSession.SharedInstance().SetActive(false, out _); }
+        catch { }
+
+        var bytes = await tcs.Task;
+
+        return bytes;
     }
 
     public Task<INativeImageDecoder?> CaptureScreen()

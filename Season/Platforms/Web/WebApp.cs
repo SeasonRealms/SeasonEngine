@@ -57,7 +57,7 @@ public static class WebApp
                 video: new WebVideoPlayerService(_jsRuntime),
                 file: new WebFileService(),
                 gallery: null,
-                record: null,
+                record: new WebRecordService(),
                 download: null,
                 store: new WebStoreService(),
                 ads: null,

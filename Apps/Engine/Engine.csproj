@@ -78,43 +78,6 @@
 		<MauiIcon Include="Resources\AppIcon\appicon.svg" Color="#ffffff" />
 		<MauiSplashScreen Include="Resources\Splash\splash.svg" Color="white" BaseSize="128,128" />
 		<MauiAsset Include="Resources\Raw\**" LogicalName="%(RecursiveDir)%(Filename)%(Extension)" />
-
-		<!-- SeasonAI Panels -->
-		<Compile Remove="Panels\SeasonAI\**" />
-		<EmbeddedResource Remove="Panels\SeasonAI\**" />
-		<MauiCss Remove="Panels\SeasonAI\**" />
-		<MauiXaml Remove="Panels\SeasonAI\**" />
-		<None Remove="Panels\SeasonAI\**" />
-		<None Remove="%24placeholder%24.altform-lightunplated_targetsize-16.png" />
-		<None Remove="%24placeholder%24.altform-lightunplated_targetsize-24.png" />
-		<None Remove="%24placeholder%24.altform-lightunplated_targetsize-256.png" />
-		<None Remove="%24placeholder%24.altform-lightunplated_targetsize-32.png" />
-		<None Remove="%24placeholder%24.altform-lightunplated_targetsize-48.png" />
-		<None Remove="%24placeholder%24.altform-unplated_targetsize-16.png" />
-		<None Remove="%24placeholder%24.altform-unplated_targetsize-24.png" />
-		<None Remove="%24placeholder%24.altform-unplated_targetsize-256.png" />
-		<None Remove="%24placeholder%24.altform-unplated_targetsize-32.png" />
-		<None Remove="%24placeholder%24.altform-unplated_targetsize-48.png" />
-		<None Remove="%24placeholder%24.scale-100.png" />
-		<None Remove="%24placeholder%24.scale-125.png" />
-		<None Remove="%24placeholder%24.scale-150.png" />
-		<None Remove="%24placeholder%24.scale-200.png" />
-		<None Remove="%24placeholder%24.scale-400.png" />
-		<None Remove="%24placeholder%24.targetsize-16.png" />
-		<None Remove="%24placeholder%24.targetsize-24.png" />
-		<None Remove="%24placeholder%24.targetsize-256.png" />
-		<None Remove="%24placeholder%24.targetsize-32.png" />
-		<None Remove="%24placeholder%24.targetsize-48.png" />
-		<None Remove="SmallTile.scale-100.png" />
-		<None Remove="SmallTile.scale-125.png" />
-		<None Remove="SmallTile.scale-150.png" />
-		<None Remove="SmallTile.scale-200.png" />
-		<None Remove="SmallTile.scale-400.png" />
-		<None Remove="SplashScreen.scale-100.png" />
-		<None Remove="SplashScreen.scale-125.png" />
-		<None Remove="SplashScreen.scale-150.png" />
-		<None Remove="SplashScreen.scale-200.png" />
-		<None Remove="SplashScreen.scale-400.png" />
 		<Content Include="$placeholder$.altform-lightunplated_targetsize-16.png">
 		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 		</Content>
@@ -205,10 +168,17 @@
 		<Content Include="SplashScreen.scale-400.png">
 		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 		</Content>
-		<ProjectReference Include="..\..\..\SeasonAI\SeasonAI.csproj" />
+
+		<!-- SeasonAI Panels -->
+		<!--<Compile Remove="Panels\SeasonAI\**" />
+		<EmbeddedResource Remove="Panels\SeasonAI\**" />
+		<MauiCss Remove="Panels\SeasonAI\**" />
+		<MauiXaml Remove="Panels\SeasonAI\**" />
+		<None Remove="Panels\SeasonAI\**" />
+		<ProjectReference Include="..\..\..\SeasonAI\SeasonAI.csproj" />-->
 
 		<!-- Own Panels -->
-		<!--<ProjectReference Include="..\..\Season\Season.csproj" />-->
+		<ProjectReference Include="..\..\Season\Season.csproj" />
 
 	</ItemGroup>
 

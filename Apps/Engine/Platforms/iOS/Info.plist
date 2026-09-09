@@ -28,6 +28,8 @@
 	</array>
 	<key>GADApplicationIdentifier</key>
 	<string></string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>SeasonEngine access to the microphone is required to record your voice input.</string>
 	<key>GADIsAdManagerApp</key>
 	<false/>
 	<key>SKAdNetworkItems</key>
