@@ -13,6 +13,9 @@ public static class iOSApp
 {
     public static void Run(BaseApp app)
     {
+        var keyboard = new AppleKeyboardService();
+        AppDelegate.Keyboard = keyboard;
+
         DeviceServices.Initialize(
             baseApp: app,
             core: new iOSDeviceCore(),
@@ -26,7 +29,8 @@ public static class iOSApp
             download: new AppleDownloadService(),
             store: new AppleStoreService(),
             ads: null, //new iOSAds(),
-            windowsFeatures: null
+            windowsFeatures: null,
+            keyboard: keyboard
         );
 
         UIApplication.Main(null, null, typeof(AppDelegate));

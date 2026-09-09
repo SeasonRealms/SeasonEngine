@@ -40,7 +40,14 @@ public static class DeviceServices
 
     public static IWindowsFeatures WindowsFeatures { get; private set; }
 
-    public static void Initialize(BaseApp baseApp, IDeviceCore core, IMediaPlayer media, IVideoPlayerService video, IDialogService dialog, IFileService file, IImageService image, IGalleryService gallery, IRecordService record, IDownloadService download, IStoreService store, IAds ads, IWindowsFeatures windowsFeatures, IMediaRecorder recorder = null)
+    /// <summary>
+    /// Keyboard input service. Null on platforms without an implementation yet;
+    /// callers must null-check, and the engine-side <see cref="Storage.KeyboardService"/>
+    /// already treats null as "no keys pressed".
+    /// </summary>
+    public static IKeyboardService Keyboard { get; private set; }
+
+    public static void Initialize(BaseApp baseApp, IDeviceCore core, IMediaPlayer media, IVideoPlayerService video, IDialogService dialog, IFileService file, IImageService image, IGalleryService gallery, IRecordService record, IDownloadService download, IStoreService store, IAds ads, IWindowsFeatures windowsFeatures, IKeyboardService keyboard = null, IMediaRecorder recorder = null)
     {
         BaseApp = baseApp;
 
@@ -69,6 +76,8 @@ public static class DeviceServices
         Ads = ads;
 
         WindowsFeatures = windowsFeatures;
+
+        Keyboard = keyboard;
 
         BaseApp.Init();
     }
@@ -100,6 +109,52 @@ public interface IDeviceCore
     bool IsDarkMode();
 
     Task<bool> RequestPermissionAsync(string[] permissions);
+}
+
+/// <summary>
+/// Cross-platform keyboard input service. A platform implementation only reports the
+/// physical facts per key (current down state and monotonic press/release counters);
+/// frame-level semantics such as "pressed this frame" and hold duration are derived
+/// by the engine-side <see cref="Storage.KeyboardService"/> pump, so short press and
+/// long press behave identically on every platform.
+/// </summary>
+public interface IKeyboardService
+{
+    /// <summary>Physical down state for the key, maintained by platform keyboard events.</summary>
+    bool IsDown(Key key);
+
+    /// <summary>
+    /// Monotonic counter of physical presses, auto-repeat excluded. The frame pump diffs
+    /// this counter per frame to derive the "pressed this frame" edge, so a tap that both
+    /// presses and releases between two frames is never lost.
+    /// </summary>
+    uint PressedCount(Key key);
+
+    /// <summary>Monotonic counter of physical releases.</summary>
+    uint ReleasedCount(Key key);
+
+    /// <summary>
+    /// Optional per-frame refresh, called by the engine-side KeyboardService pump before
+    /// it queries IsDown/PressedCount/ReleasedCount. Event-driven services (Windows, Linux)
+    /// keep the default no-op; pull-based services (Web) override it to fetch their state.
+    /// </summary>
+    void Update() { }
+}
+
+/// <summary>
+/// Platform-neutral key identity. Concrete mappings, e.g. Windows virtual-key codes,
+/// live in each platform implementation.
+/// </summary>
+public enum Key
+{
+    None = 0,
+    A, B, C, D, E, F, G, H, I, J, K, L, M,
+    N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
+    D0, D1, D2, D3, D4, D5, D6, D7, D8, D9,
+    Space, Enter, Escape, Tab, Backspace,
+    Left, Right, Up, Down,
+    LeftShift, RightShift, LeftCtrl, RightCtrl, LeftAlt, RightAlt,
+    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12
 }
 
 public interface IMediaPlayer

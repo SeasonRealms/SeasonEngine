@@ -160,6 +160,13 @@ internal class Skill : Panel
     {
         var result = base.Update(time, alpha: alpha, posX: posX, posY: posY, posZ: posZ, width: width, height: height, depth: depth);
 
+        // Space mirrors the skill button: an edge press starts one long jump.
+        // The edge semantics deduplicate naturally, so holding Space does not re-trigger.
+        if (Season.Storage.KeyboardService.IsPressed(Season.Basic.Key.Space))
+        {
+            StartLongJump();
+        }
+
         UpdateLongJump(time);
 
         int size = 60;

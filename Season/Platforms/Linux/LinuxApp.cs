@@ -20,6 +20,9 @@ public static class LinuxApp
 
     static bool _resized;
 
+    // Keyboard service instance created in Run and consumed by the RunLoop event switch.
+    static LinuxKeyboardService _keyboard;
+
     public static unsafe void Run(BaseApp app)
     {
         // Global exception capture as the last line of defense for async void,
@@ -47,6 +50,8 @@ public static class LinuxApp
 
         try
         {
+        _keyboard = new LinuxKeyboardService();
+
         DeviceServices.Initialize(
             baseApp: app,
             core: new LinuxDeviceCore(),
@@ -60,7 +65,8 @@ public static class LinuxApp
             download: new LinuxDownloadService(),
             store: new LinuxStoreService(),
             ads: null,
-            windowsFeatures: null
+            windowsFeatures: null,
+            keyboard: _keyboard
         );
 
         Gtk.Application.Init();
@@ -422,6 +428,18 @@ public static class LinuxApp
                     case SDL_EventType.SDL_EVENT_WINDOW_FOCUS_LOST:
 
                         // DeviceServices.Media.Pause();
+
+                        // Keys released while the window is inactive never arrive, so clear
+                        // every held key to prevent stuck keys when focus returns.
+                        _keyboard.ResetKeys();
+
+                        break;
+
+                    case SDL_EventType.SDL_EVENT_KEY_DOWN:
+                    case SDL_EventType.SDL_EVENT_KEY_UP:
+
+                        _keyboard.OnKeyEvent(ev.key);
+
                         break;
 
                     case SDL_EventType.SDL_EVENT_MOUSE_BUTTON_DOWN:

@@ -554,6 +554,66 @@ window.seasonWebGPU = (() => {
 
         _canvas.addEventListener('gesturestart', (e) => e.preventDefault());
         _canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        _attachKeyboardHandlers();
+    }
+
+    // ── Keyboard input: window-level physical-key capture ──
+    // event.code is the physical key (layout independent), matching the Windows
+    // VirtualKey and Linux SDL_Scancode semantics. Order must match
+    // WebKeyboardService.MappedKeys exactly; keyboardSnapshot returns
+    // [down(0/1)×N, pressed×N, released×N] in this order.
+    const KEY_CODES = [
+        'KeyA', 'KeyB', 'KeyC', 'KeyD', 'KeyE', 'KeyF', 'KeyG', 'KeyH', 'KeyI',
+        'KeyJ', 'KeyK', 'KeyL', 'KeyM', 'KeyN', 'KeyO', 'KeyP', 'KeyQ', 'KeyR',
+        'KeyS', 'KeyT', 'KeyU', 'KeyV', 'KeyW', 'KeyX', 'KeyY', 'KeyZ',
+        'Digit0', 'Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6', 'Digit7', 'Digit8', 'Digit9',
+        'Space', 'Enter', 'Escape', 'Tab', 'Backspace',
+        'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown',
+        'ShiftLeft', 'ShiftRight', 'ControlLeft', 'ControlRight', 'AltLeft', 'AltRight',
+        'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12',
+    ];
+    const _keyStates = new Map(); // code -> { down, pressed, released }
+
+    function _keyState(code) {
+        let s = _keyStates.get(code);
+        if (!s) { s = { down: false, pressed: 0, released: 0 }; _keyStates.set(code, s); }
+        return s;
+    }
+
+    function _attachKeyboardHandlers() {
+        window.addEventListener('keydown', (e) => {
+            if (e.isComposing || !KEY_CODES.includes(e.code)) return;
+            const s = _keyState(e.code);
+            // Auto-repeat keydown (e.repeat) is deduplicated by the down state, so the
+            // press counter only advances on a physical press.
+            if (!s.down) { s.down = true; s.pressed++; }
+            e.preventDefault();
+        });
+        window.addEventListener('keyup', (e) => {
+            const s = _keyStates.get(e.code);
+            if (s && s.down) { s.down = false; s.released++; }
+        });
+        window.addEventListener('blur', () => {
+            // Keys released while the page is unfocused never arrive; clear them all.
+            for (const s of _keyStates.values()) {
+                if (s.down) { s.down = false; s.released++; }
+            }
+        });
+    }
+
+    function keyboardSnapshot() {
+        const n = KEY_CODES.length;
+        const out = new Array(n * 3).fill(0);
+        for (let i = 0; i < n; i++) {
+            const s = _keyStates.get(KEY_CODES[i]);
+            if (s) {
+                out[i] = s.down ? 1 : 0;
+                out[n + i] = s.pressed;
+                out[2 * n + i] = s.released;
+            }
+        }
+        return out;
     }
 
     function pollInput() {
@@ -3832,6 +3892,7 @@ window.seasonWebGPU = (() => {
         requestFrame,
         pollInput,
         pollInputPacked,
+        keyboardSnapshot,
         drawMesh3DBatch,
         updateStaticMeshVertices,
         updateTexturePixels,

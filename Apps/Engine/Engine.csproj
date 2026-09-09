@@ -80,26 +80,26 @@
 		<MauiAsset Include="Resources\Raw\**" LogicalName="%(RecursiveDir)%(Filename)%(Extension)" />
 
 		<!-- SeasonAI Panels -->
-		<!--<Compile Remove="Panels\SeasonAI\**" />
+		<Compile Remove="Panels\SeasonAI\**" />
 		<EmbeddedResource Remove="Panels\SeasonAI\**" />
 		<MauiCss Remove="Panels\SeasonAI\**" />
 		<MauiXaml Remove="Panels\SeasonAI\**" />
 		<None Remove="Panels\SeasonAI\**" />
-		<ProjectReference Include="..\..\..\SeasonAI\SeasonAI.csproj" />-->
+		<ProjectReference Include="..\..\..\SeasonAI\SeasonAI.csproj" />
 
 		<!-- Own Panels -->
-		<ProjectReference Include="..\..\Season\Season.csproj" />
+		<!--<ProjectReference Include="..\..\Season\Season.csproj" />-->
 
 	</ItemGroup>
 
-	<!--<ItemGroup Condition="'$(IsWindows)' == 'true'">
+	<ItemGroup Condition="'$(IsWindows)' == 'true'">
 		<Content Include="..\..\..\cudacudnn-runtime\win-x64\native\*.dll">
 			<Link>%(Filename)%(Extension)</Link>
 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 			<CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
 			<Visible>false</Visible>
 		</Content>
-	</ItemGroup>-->
+	</ItemGroup>
 
 	<ItemGroup Condition="'$(IsWindows)' == 'true' or '$(IsLinux)' == 'true'">
 		<Content Include="Resources\Raw\**" CopyToOutputDirectory="PreserveNewest" Link="%(RecursiveDir)%(Filename)%(Extension)" />

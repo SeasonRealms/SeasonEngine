@@ -54,6 +54,8 @@ public static class WindowsApp
     {
         _closing = false;
 
+        var keyboard = new WindowsKeyboardService();
+
         DeviceServices.Initialize(
             baseApp: app,
             core: new WindowsDeviceCore(),
@@ -68,6 +70,7 @@ public static class WindowsApp
             store: new WindowsStoreService(),
             ads: null,
             windowsFeatures: new WindowsFeatures(),
+            keyboard: keyboard,
             recorder: new WindowsMediaRecorder());
 
         var birate = VideoEncodingHelper.EstimateBitrate(832, 480, 16, 90);
@@ -98,6 +101,13 @@ public static class WindowsApp
                 }
 
                 DeviceServices.BaseApp.IsActive = isActive;
+            }
+
+            // Keys released while the window is inactive never raise KeyUp, so clear
+            // the held state on deactivation to prevent stuck keys.
+            if (!isActive)
+            {
+                keyboard.ResetKeys();
             }
         };
 
@@ -149,6 +159,7 @@ public static class WindowsApp
                 return;
 
             _closing = true;
+            keyboard.Detach();
             SaveWindowState(immediate: true, source: "Closing");
         };
 
@@ -197,6 +208,17 @@ public static class WindowsApp
 
             ApplyWindowState(app, "PostActivateReplay");
         });
+
+        // The keyboard service needs the window's ContentIsland, which only exists once
+        // the XAML content has loaded into the visual tree. UIElement.XamlRoot is still
+        // null in the post-Activate dispatcher callback, so attach from Loaded instead.
+        // The top-level HWND never receives WM_KEYDOWN because keyboard focus lives on
+        // the island's own child HWND, making the island keyboard source the only
+        // reliable channel for key input.
+        swapChainPanel.Loaded += (s, e) =>
+        {
+            keyboard.Attach(Window);
+        };
 
         swapChainPanel.PointerPressed += (s, e) =>
         {

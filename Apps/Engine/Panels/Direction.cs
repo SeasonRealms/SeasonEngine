@@ -191,6 +191,27 @@ internal class Direction : Panel
             model.PlayAnimation("Run-loop");
     }
 
+    // Keyboard movement mirroring the four arrow buttons: W/A/S/D map to front/left/back/right.
+    // A short press steps 0.1m exactly like a button tap, while holding a key moves continuously
+    // at RunSpeed scaled by frame time. Every direction reuses MovePlayer, so collision,
+    // floor settle, camera follow and Run/Idle switching stay identical to touch input.
+    void UpdateKeyboardInput(float time)
+    {
+        float step = RunSpeed * time;
+
+        if (KeyboardService.IsPressed(Key.W)) MovePlayer(0f, 0.1f, YawFront);
+        else if (KeyboardService.IsDown(Key.W)) MovePlayer(0f, step, YawFront);
+
+        if (KeyboardService.IsPressed(Key.S)) MovePlayer(0f, -0.1f, YawBack);
+        else if (KeyboardService.IsDown(Key.S)) MovePlayer(0f, -step, YawBack);
+
+        if (KeyboardService.IsPressed(Key.A)) MovePlayer(-0.1f, 0f, YawLeft);
+        else if (KeyboardService.IsDown(Key.A)) MovePlayer(-step, 0f, YawLeft);
+
+        if (KeyboardService.IsPressed(Key.D)) MovePlayer(0.1f, 0f, YawRight);
+        else if (KeyboardService.IsDown(Key.D)) MovePlayer(step, 0f, YawRight);
+    }
+
     // Stop detection: when time since the most recent direction-key input exceeds StopDelay,
     // the character is considered stopped and switches to Idle-loop if needed.
     // This runs every frame from Update, and resets its sentinel after switching so the next direction-key input starts timing again.
@@ -218,6 +239,8 @@ internal class Direction : Panel
         var result = base.Update(time, alpha: alpha, posX: posX, posY: posY, posZ: posZ, width: width, height: height, depth: depth);
 
         CheckPlayerStopped();
+
+        UpdateKeyboardInput(time);
 
         int size = 60;
 

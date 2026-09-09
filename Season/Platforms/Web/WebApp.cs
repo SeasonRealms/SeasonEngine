@@ -61,7 +61,8 @@ public static class WebApp
                 download: null,
                 store: new WebStoreService(),
                 ads: null,
-                windowsFeatures: null
+                windowsFeatures: null,
+                keyboard: new WebKeyboardService()
             );
             
             // Finalize the HDR tier (1-4 Step A, mirroring WindowsApp/LinuxApp): the HDR chain depends on

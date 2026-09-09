@@ -13,6 +13,9 @@ public static class MacCatalystApp
 {
     public static void Run(BaseApp app)
     {
+        var keyboard = new AppleKeyboardService();
+        AppDelegate.Keyboard = keyboard;
+
         DeviceServices.Initialize(
             baseApp: app,
             core: new MacCatalystDeviceCore(),
@@ -26,7 +29,8 @@ public static class MacCatalystApp
             download: new AppleDownloadService(),
             store: new AppleStoreService(),
             ads: null,
-            windowsFeatures: null
+            windowsFeatures: null,
+            keyboard: keyboard
         );
 
         UIApplication.Main(null, null, typeof(AppDelegate));

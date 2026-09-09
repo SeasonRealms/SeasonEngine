@@ -59,6 +59,12 @@ public static class AndroidApp
 
     static IntPtr _currentNativeWindow;
 
+    // Keyboard service instance created in Run and consumed by SurfaceViewVulkan key events.
+    static AndroidKeyboardService? _keyboard;
+
+    /// <summary>Keyboard service bridge for the surface view; non-null after Run.</summary>
+    internal static AndroidKeyboardService? Keyboard => _keyboard;
+
     /// <summary>
     /// Injects DeviceServices instances, equivalent to WindowsApp.Run and LinuxApp.Run.
     /// It does not take over UI creation. The UI is created by <see cref="BaseActivity"/>
@@ -66,6 +72,8 @@ public static class AndroidApp
     /// </summary>
     public static void Run(BaseApp app)
     {
+        _keyboard = new AndroidKeyboardService();
+
         DeviceServices.Initialize(
             baseApp: app,
             core: new AndroidDeviceCore(),
@@ -79,7 +87,8 @@ public static class AndroidApp
             download: new AndroidDownloadService(),
             store: new AndroidStoreService(),
             ads: new AndroidAds(),
-            windowsFeatures: null
+            windowsFeatures: null,
+            keyboard: _keyboard
         );
     }
 
@@ -660,6 +669,9 @@ public class SurfaceViewVulkan : SurfaceView, ISurfaceHolderCallback, View.IOnTo
     {
         if (holder.Surface is null) return;
 
+        // Take the focus so hardware key events are routed to this view (OnKeyDown/OnKeyUp).
+        RequestFocus();
+
         // ANativeWindow_fromSurface increments the reference count,
         // and it must be paired with ANativeWindow_release during SurfaceDestroyed.
         var nativeWindow = AndroidRuntime.ANativeWindow_fromSurface(JNIEnv.Handle, holder.Surface.Handle);
@@ -785,5 +797,36 @@ public class SurfaceViewVulkan : SurfaceView, ISurfaceHolderCallback, View.IOnTo
     public void SurfaceDestroyed(ISurfaceHolder holder)
     {
         AndroidApp.OnSurfaceLost();
+    }
+
+    public override bool OnKeyDown(Keycode keyCode, KeyEvent e)
+    {
+        // Consume every recognized game key so the system does not also act on it.
+        // Unrecognized keys return false and fall through to the default handling.
+        var handled = AndroidApp.Keyboard?.OnKeyEvent(keyCode, down: true) ?? false;
+        return handled || base.OnKeyDown(keyCode, e);
+    }
+
+    public override bool OnKeyUp(Keycode keyCode, KeyEvent e)
+    {
+        var handled = AndroidApp.Keyboard?.OnKeyEvent(keyCode, down: false) ?? false;
+        return handled || base.OnKeyUp(keyCode, e);
+    }
+
+    public override void OnWindowFocusChanged(bool hasWindowFocus)
+    {
+        base.OnWindowFocusChanged(hasWindowFocus);
+
+        if (hasWindowFocus)
+        {
+            // Regain the view focus so hardware key events keep flowing to OnKeyDown.
+            RequestFocus();
+        }
+        else
+        {
+            // Keys released while the window is unfocused never arrive; clear them all
+            // to prevent stuck keys when the app returns to the foreground.
+            AndroidApp.Keyboard?.ResetKeys();
+        }
     }
 }

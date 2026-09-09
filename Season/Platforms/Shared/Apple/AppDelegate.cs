@@ -29,6 +29,9 @@ namespace Season.Platforms.Shared.Apple;
 [Foundation.Register("AppDelegate")]
 public class AppDelegate : UIApplicationDelegate
 {
+    /// <summary>Keyboard service instance injected by iOSApp.Run or MacCatalystApp.Run before UIApplication.Main, then consumed by MetalViewController press events.</summary>
+    public static AppleKeyboardService Keyboard { get; set; } = null!;
+
     public override bool FinishedLaunching(UIKit.UIApplication application, Foundation.NSDictionary launchOptions)
     {
         Runtime.MarshalManagedException += (_, e) => e.ExceptionMode = MarshalManagedExceptionMode.UnwindNativeCode;
@@ -201,6 +204,58 @@ public class MetalViewController : UIViewController
     public override void ViewWillTransitionToSize(CGSize toSize, IUIViewControllerTransitionCoordinator coordinator)
     {
         base.ViewWillTransitionToSize(toSize, coordinator);
+    }
+
+    public override bool CanBecomeFirstResponder => true;
+
+    public override void ViewDidAppear(bool animated)
+    {
+        base.ViewDidAppear(animated);
+
+        // Take the responder chain so the hardware keyboard's key presses are
+        // delivered to PressesBegan/PressesChanged/PressesEnded.
+        BecomeFirstResponder();
+    }
+
+    public override void PressesBegan(NSSet<UIPress> presses, UIPressesEvent evt)
+    {
+        base.PressesBegan(presses, evt);
+
+        foreach (var press in presses.ToArray<UIPress>())
+        {
+            AppDelegate.Keyboard.OnPress(press, down: true);
+        }
+    }
+
+    public override void PressesChanged(NSSet<UIPress> presses, UIPressesEvent evt)
+    {
+        base.PressesChanged(presses, evt);
+
+        // Key repeat can arrive through this callback as well; OnPress is
+        // idempotent for keys that are already down.
+        foreach (var press in presses.ToArray<UIPress>())
+        {
+            AppDelegate.Keyboard.OnPress(press, down: true);
+        }
+    }
+
+    public override void PressesEnded(NSSet<UIPress> presses, UIPressesEvent evt)
+    {
+        base.PressesEnded(presses, evt);
+
+        foreach (var press in presses.ToArray<UIPress>())
+        {
+            AppDelegate.Keyboard.OnPress(press, down: false);
+        }
+    }
+
+    public override void PressesCancelled(NSSet<UIPress> presses, UIPressesEvent evt)
+    {
+        base.PressesCancelled(presses, evt);
+
+        // The press stream was interrupted; keys released under cancellation never
+        // arrive, so clear everything to prevent stuck keys.
+        AppDelegate.Keyboard.ResetKeys();
     }
 
 #if MACCATALYST

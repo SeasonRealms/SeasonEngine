@@ -139,6 +139,14 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.pollInputPacked")]
     internal static partial double[] PollInput();
 
+    /// <summary>
+    /// Returns the full keyboard snapshot as [down(0/1)×N, pressed×N, released×N] for the fixed
+    /// N-key list; N matches the JS KEY_CODES list and WebKeyboardService.MappedKeys order.
+    /// Counters are monotonic on the JS side, so events between two frames are never lost.
+    /// </summary>
+    [JSImport("globalThis.seasonWebGPU.keyboardSnapshot")]
+    internal static partial int[] PollKeyboard();
+
     // ── Phase 3: hot byte-data paths (Span<byte> → MemoryView, zero-copy views into wasm linear memory) ──
     // MemoryView is valid only during the synchronous call.
     // Each JS consumer has been verified to consume it immediately through writeBuffer

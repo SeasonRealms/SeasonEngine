@@ -209,10 +209,29 @@ public struct SDL_Event
 {
     [FieldOffset(0)] public SDL_EventType type;
     [FieldOffset(0)] public SDL_WindowEvent window;
+    [FieldOffset(0)] public SDL_KeyboardEvent key;
     [FieldOffset(0)] public SDL_MouseMotionEvent motion;
     [FieldOffset(0)] public SDL_MouseButtonEvent button;
     [FieldOffset(0)] public SDL_MouseWheelEvent wheel;
     [FieldOffset(0)] public SDL_TouchFingerEvent tfinger;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct SDL_KeyboardEvent
+{
+    // Field order, offsets, and padding must match SDL3/SDL_events.h exactly:
+    // scancode is Sint16 and gets 2 padding bytes before the Uint32 key field.
+    public SDL_EventType type;
+    public uint reserved;
+    public ulong timestamp;
+    public uint windowID;
+    public uint which;
+    public short scancode;
+    public uint key;
+    public ushort mod;
+    public ushort location;
+    public byte repeat;
+    public byte down;
 }
 
 [StructLayout(LayoutKind.Sequential)]

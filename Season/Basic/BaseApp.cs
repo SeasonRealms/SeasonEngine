@@ -542,6 +542,8 @@ public abstract class BaseApp : Panel
 
         TouchService.Update(time, Scale);
 
+        KeyboardService.Update(time);
+
         return base.Update(time, alpha: alpha, posX: posX, posY: posY, width: width, height: height);
     }
 
