@@ -113,25 +113,6 @@ internal class WebDeviceCore : IDeviceCore
     }
 }
 
-internal class WebMediaPlayer : IMediaPlayer
-{
-    public bool IsPlaying
-    {
-        get
-        {
-            return false;
-        }
-    }
-
-    public void PlayMedia(string type, string id, string vol) { }
-
-    public void SetVolume(int music, int sound) { }
-
-    public void Pause() { }
-
-    public void Resume() { }
-}
-
 internal class WebDialogService : IDialogService
 {
     public async Task<string> ShowMessage(string title, string desc, string[] buttons, string text)

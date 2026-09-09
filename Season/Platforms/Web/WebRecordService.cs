@@ -8,7 +8,7 @@ using System.Runtime.Versioning;
 namespace Season.Platforms.Web;
 
 /// <summary>
-/// Direct [JSImport] bindings to seasonAudioRecorder.js.
+/// Direct [JSImport] bindings to seasonMedia.js.
 /// The JS side returns Promises; [JSImport] maps them to Task directly
 /// (same pattern as WebGPUInterop.RequestFrame). Task&lt;byte[]&gt; returns are not
 /// supported by the JSImport source generator, so the PCM payload is staged in
@@ -37,7 +37,7 @@ internal static partial class WebAudioInterop
 
 /// <summary>
 /// Web-platform microphone recording service.
-/// Capture runs in seasonAudioRecorder.js through an AudioWorklet that forwards
+/// Capture runs in seasonMedia.js through an AudioWorklet that forwards
 /// 16 kHz mono Float32 blocks; stop() concatenates them into Int16 PCM. The C#
 /// side only prepends the RIFF header, so the byte[] returned from StopRecord is
 /// a full WAV identical in layout to the Android/Windows output

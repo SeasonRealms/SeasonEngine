@@ -352,22 +352,22 @@ internal class App : BaseApp
 
         RegisterEffects();
 
+        var musics = new string[] { @"Musics/Cozy.wav", @"Musics/Forest.wav", @"Musics/Sweel.wav" };
+        var music = musics[new Random().Next(0, 3)];
+        string path = null;
+
         if (DeviceServices.Core.Platform is Season.Basic.Platform.Web)
         {
-
+            path = music;
         }
         else
         {
-            var musics = new string[] { @"Musics/Cozy.wav", @"Musics/Forest.wav", @"Musics/Sweel.wav" };
-
-            var music = musics[new Random().Next(0, 3)];
-
             StorageService.CopyToLocal(music);
 
-            var path = StorageService.SubPath(StorageService.DirectoryBase, music);
-
-            DeviceServices.Media.PlayMedia("Music", path, "60");
+            path = StorageService.SubPath(StorageService.DirectoryBase, music);
         }
+
+        DeviceServices.Media.PlayMedia("Music", path, "60");
 
         celestial = new CelestialLighting();
         celestial.Load();
