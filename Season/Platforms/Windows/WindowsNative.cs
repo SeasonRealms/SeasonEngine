@@ -60,9 +60,6 @@ internal static class WindowsNative
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 
-    [DllImport("winmm.dll", EntryPoint = "mciSendString", CharSet = CharSet.Auto)]
-    internal static extern int mciSendString(string lpstrCommand, string lpstrReturnString, int uReturnLength, IntPtr HwndCallback);
-
     [DllImport("winmm.dll", EntryPoint = "PlaySound")]
     internal static extern int PlaySound(string lpxzName, int hModul, int dwFlags);
 }

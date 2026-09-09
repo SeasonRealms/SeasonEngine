@@ -47,7 +47,7 @@
 
 		<AppxPackageSigningEnabled>False</AppxPackageSigningEnabled>
 		<AppxPackageSigningTimestampDigestAlgorithm>SHA256</AppxPackageSigningTimestampDigestAlgorithm>
-		<AppxAutoIncrementPackageRevision>True</AppxAutoIncrementPackageRevision>
+		<AppxAutoIncrementPackageRevision>False</AppxAutoIncrementPackageRevision>
 		<AppxSymbolPackageEnabled>True</AppxSymbolPackageEnabled>
 
 		<HoursBetweenUpdateChecks>0</HoursBetweenUpdateChecks>
@@ -85,6 +85,126 @@
 		<MauiCss Remove="Panels\SeasonAI\**" />
 		<MauiXaml Remove="Panels\SeasonAI\**" />
 		<None Remove="Panels\SeasonAI\**" />
+		<None Remove="%24placeholder%24.altform-lightunplated_targetsize-16.png" />
+		<None Remove="%24placeholder%24.altform-lightunplated_targetsize-24.png" />
+		<None Remove="%24placeholder%24.altform-lightunplated_targetsize-256.png" />
+		<None Remove="%24placeholder%24.altform-lightunplated_targetsize-32.png" />
+		<None Remove="%24placeholder%24.altform-lightunplated_targetsize-48.png" />
+		<None Remove="%24placeholder%24.altform-unplated_targetsize-16.png" />
+		<None Remove="%24placeholder%24.altform-unplated_targetsize-24.png" />
+		<None Remove="%24placeholder%24.altform-unplated_targetsize-256.png" />
+		<None Remove="%24placeholder%24.altform-unplated_targetsize-32.png" />
+		<None Remove="%24placeholder%24.altform-unplated_targetsize-48.png" />
+		<None Remove="%24placeholder%24.scale-100.png" />
+		<None Remove="%24placeholder%24.scale-125.png" />
+		<None Remove="%24placeholder%24.scale-150.png" />
+		<None Remove="%24placeholder%24.scale-200.png" />
+		<None Remove="%24placeholder%24.scale-400.png" />
+		<None Remove="%24placeholder%24.targetsize-16.png" />
+		<None Remove="%24placeholder%24.targetsize-24.png" />
+		<None Remove="%24placeholder%24.targetsize-256.png" />
+		<None Remove="%24placeholder%24.targetsize-32.png" />
+		<None Remove="%24placeholder%24.targetsize-48.png" />
+		<None Remove="SmallTile.scale-100.png" />
+		<None Remove="SmallTile.scale-125.png" />
+		<None Remove="SmallTile.scale-150.png" />
+		<None Remove="SmallTile.scale-200.png" />
+		<None Remove="SmallTile.scale-400.png" />
+		<None Remove="SplashScreen.scale-100.png" />
+		<None Remove="SplashScreen.scale-125.png" />
+		<None Remove="SplashScreen.scale-150.png" />
+		<None Remove="SplashScreen.scale-200.png" />
+		<None Remove="SplashScreen.scale-400.png" />
+		<Content Include="$placeholder$.altform-lightunplated_targetsize-16.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.altform-lightunplated_targetsize-24.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.altform-lightunplated_targetsize-256.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.altform-lightunplated_targetsize-32.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.altform-lightunplated_targetsize-48.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.altform-unplated_targetsize-16.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.altform-unplated_targetsize-24.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.altform-unplated_targetsize-256.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.altform-unplated_targetsize-32.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.altform-unplated_targetsize-48.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.scale-100.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.scale-125.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.scale-150.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.scale-200.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.scale-400.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.targetsize-16.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.targetsize-24.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.targetsize-256.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.targetsize-32.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="$placeholder$.targetsize-48.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="SmallTile.scale-100.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="SmallTile.scale-125.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="SmallTile.scale-150.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="SmallTile.scale-200.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="SmallTile.scale-400.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="SplashScreen.scale-100.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="SplashScreen.scale-125.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="SplashScreen.scale-150.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="SplashScreen.scale-200.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="SplashScreen.scale-400.png">
+		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
 		<ProjectReference Include="..\..\..\SeasonAI\SeasonAI.csproj" />
 
 		<!-- Own Panels -->
@@ -93,7 +213,7 @@
 	</ItemGroup>
 
 	<ItemGroup Condition="'$(IsWindows)' == 'true'">
-		<Content Include="..\..\..\cudacudnn-runtime\win-x64\native\*.dll">
+		<Content Include="..\..\..\SeasonAIs\cudacudnn-runtime\win-x64\native\*.dll">
 			<Link>%(Filename)%(Extension)</Link>
 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 			<CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>

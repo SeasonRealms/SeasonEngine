@@ -9,9 +9,15 @@ using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using Windows.Devices.Enumeration;
+using Windows.Media.Audio;
+using Windows.Media.Capture;
 using Windows.Media.Core;
+using Windows.Media.MediaProperties;
 using Windows.Media.Playback;
+using Windows.Media.Render;
 using Windows.Services.Store;
+using Windows.Storage;
 using Windows.Storage.Pickers;
 using Windows.UI.ViewManagement;
 
@@ -166,9 +172,27 @@ internal class WindowsDeviceCore : IDeviceCore
 
     public async Task<bool> RequestPermissionAsync(string[] permissions)
     {
-        // Windows permissions are usually handled via app manifest or at runtime by the system.
-        // For simplicity, we assume permissions are granted.
-        return await Task.FromResult(true);
+        // Windows capture permissions are gated by the package manifest capability plus
+        // the per-app privacy toggle; there is no runtime consent prompt to drive. Probe
+        // the real status instead of pretending every request is granted: a microphone
+        // request maps DeniedByUser/DeniedBySystem to false so callers can route the
+        // user to Settings > Privacy > Microphone. Everything else stays manifest-gated.
+        var needsMicrophone = permissions is not null && permissions.Any(p =>
+            p is not null && (p.Contains("RECORD_AUDIO", StringComparison.OrdinalIgnoreCase)
+                || p.Contains("MICROPHONE", StringComparison.OrdinalIgnoreCase)));
+
+        if (!needsMicrophone)
+        {
+            return true;
+        }
+
+        var status = DeviceAccessInformation.CreateFromDeviceClass(DeviceClass.AudioCapture).CurrentStatus;
+        // Unspecified also covers unpackaged/dev runs where no per-app privacy entry
+        // exists yet; the actual gate still surfaces AccessDenied at capture time.
+        var granted = status is DeviceAccessStatus.Allowed or DeviceAccessStatus.Unspecified;
+
+        DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Permission] microphone probe status={status} granted={granted}");
+        return granted;
     }
 }
 
@@ -813,88 +837,182 @@ internal class WindowsRecordService : RecordService, IRecordService
 
     const int SM_CXSCREEN = 0;
     const int SM_CYSCREEN = 1;
+
+    // ── AudioGraph session (Windows.Media.Audio) ──
+    // Replaces the legacy MCI waveaudio path (mciSendString): MCI is a pre-package
+    // desktop API with no microphone-capability/privacy integration, so it fails
+    // silently under an MSIX/Store identity. AudioGraph is the WinRT capture
+    // pipeline: node creation reports explicit statuses (AccessDenied,
+    // DeviceNotAvailable, ...), the graph resamples to the pinned encoding, and
+    // the container is finalized by the graph itself (correct RIFF header). The
+    // temp WAV lives in the StorageService LocalAppData tree (package-redirected
+    // and always writable under MSIX) — never ApplicationData.Current, which has
+    // UI-thread affinity in WinUI 3 — and is deleted after being read back.
+    // Output contract stays: 16 kHz / mono / 16-bit PCM WAV as byte[] at StopRecord,
+    // identical to AndroidRecordService so STT consumers see no difference.
+    const uint SampleRate = 16000;
+    const uint Channels = 1;
+    const uint BitsPerSample = 16;
+
+    AudioGraph? _graph;
+    AudioDeviceInputNode? _inputNode;
+    AudioFileOutputNode? _fileOutputNode;
+    StorageFile? _recordFile;
+
     public async Task<bool> StartRecord()
     {
-        bool StartRecordCore()
+        if (_graph != null)
         {
-            bool success = false;
+            //_graph.Stop();
+            //_graph.Dispose();
+            return false;
+        }
 
-            WindowsNative.mciSendString("stop WaveDump", "", 0, IntPtr.Zero);
+        try
+        {
+            DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] StartRecord begin thread={Environment.CurrentManagedThreadId} ui={WindowsApp.Window?.DispatcherQueue.HasThreadAccess}");
 
-            try
+            var settings = new AudioGraphSettings(AudioRenderCategory.Speech)
             {
-                var ls_mciRetV = "";
+                EncodingProperties = AudioEncodingProperties.CreatePcm(SampleRate, Channels, BitsPerSample)
+            };
 
-                WindowsNative.mciSendString("open new type waveaudio alias WaveDump", ls_mciRetV, 0, IntPtr.Zero);
-                WindowsNative.mciSendString("set WaveDump time format ms bitspersample 16 channels 1 samplespersec 16000 bytespersec 88200 alignment 2", ls_mciRetV, 0, IntPtr.Zero);
-
-                var lu_errcode = WindowsNative.mciSendString("record WaveDump", ls_mciRetV, 0, IntPtr.Zero);
-                success = lu_errcode == 0;
-            }
-            catch (Exception ex)
+            var createResult = await AudioGraph.CreateAsync(settings);
+            if (createResult.Status != AudioGraphCreationStatus.Success)
             {
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] AudioGraph create failed: {createResult.Status}");
+                return false;
             }
+            _graph = createResult.Graph;
 
-            return success;
+            var inputResult = await _graph.CreateDeviceInputNodeAsync(MediaCategory.Speech);
+            if (inputResult.Status != AudioDeviceNodeCreationStatus.Success)
+            {
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] microphone open failed: {inputResult.Status}"
+                    + (inputResult.Status == AudioDeviceNodeCreationStatus.AccessDenied
+                        ? " - check Windows Settings > Privacy > Microphone and the package microphone capability"
+                        : ""));
+                await CleanupSessionAsync();
+                return false;
+            }
+            _inputNode = inputResult.DeviceInputNode;
+
+            // ApplicationData.Current carries UI-thread affinity in WinUI 3 and throws
+            // InvalidOperationException when called off the UI thread — and recording may
+            // be driven from a background STT worker. Use the same LocalAppData base as
+            // StorageService (package-redirected, always writable under MSIX) and obtain
+            // the StorageFile through the path-based API, which is thread-agile.
+            var tempDirectory = System.IO.Path.Combine(
+                StorageService.Path(StorageService.DirectoryBase ?? "SeasonEngine"), "Temp");
+            Directory.CreateDirectory(tempDirectory);
+
+            var recordFolder = await StorageFolder.GetFolderFromPathAsync(tempDirectory);
+            _recordFile = await recordFolder.CreateFileAsync(
+                $"Record-{DateTime.Now:yyyyMMddHHmmss}.wav", CreationCollisionOption.GenerateUniqueName);
+
+            var profile = MediaEncodingProfile.CreateWav(AudioEncodingQuality.Low);
+            profile.Audio = AudioEncodingProperties.CreatePcm(SampleRate, Channels, BitsPerSample);
+
+            var fileResult = await _graph.CreateFileOutputNodeAsync(_recordFile, profile);
+            if (fileResult.Status != AudioFileNodeCreationStatus.Success)
+            {
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] WAV output node failed: {fileResult.Status}");
+                await CleanupSessionAsync();
+                return false;
+            }
+            _fileOutputNode = fileResult.FileOutputNode;
+
+            _inputNode.AddOutgoingConnection(_fileOutputNode);
+
+            _graph.Start();
+
+            DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] started {SampleRate}Hz/{Channels}ch/{BitsPerSample}bit");
+            return true;
         }
-
-        var dispatcherQueue = WindowsApp.Window?.DispatcherQueue;
-        if (dispatcherQueue == null || dispatcherQueue.HasThreadAccess)
+        catch (Exception ex)
         {
-            return StartRecordCore();
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] StartRecord failed: {ex}");
+            await CleanupSessionAsync();
+            return false;
         }
-
-        var tcs = new TaskCompletionSource<bool>();
-        if (!dispatcherQueue.TryEnqueue(() => tcs.TrySetResult(StartRecordCore())))
-        {
-            return StartRecordCore();
-        }
-
-        return await tcs.Task;
     }
 
     public async Task<byte[]> StopRecord()
     {
-        byte[] StopRecordCore()
+        var graph = _graph;
+        if (graph == null) return null;
+
+        var inputNode = _inputNode;
+        var outputNode = _fileOutputNode;
+        var recordFile = _recordFile;
+
+        // Detach first so a concurrent Start/Stop cannot observe a half-stopped session.
+        _graph = null;
+        _inputNode = null;
+        _fileOutputNode = null;
+        _recordFile = null;
+
+        try
         {
-            byte[] bytes = null;
+            graph.Stop();
 
-            try
+            if (outputNode != null)
             {
-                WindowsNative.mciSendString("stop WaveDump", "", 0, IntPtr.Zero);
-            }
-            catch (Exception ex)
-            {
-            }
-
-            if (!StorageService.DirectoryExist(StorageService.DirectoryBase, "Temp"))
-            {
-                StorageService.DirectoryCreate(StorageService.DirectoryBase, "Temp");
+                // FinalizeAsync drains every queued sample and closes the container:
+                // the RIFF length fields are patched only when this completes.
+                await outputNode.FinalizeAsync();
             }
 
-            var file = Path.Combine("Temp", $"{DateTime.Now.ToDateTimeTicks()}.wav");
-            var ps_SoundLocation = StorageService.SubPath(StorageService.DirectoryBase, file);
+            if (recordFile == null) return null;
 
-            WindowsNative.mciSendString("save WaveDump " + ps_SoundLocation, "", 0, IntPtr.Zero);
-            WindowsNative.mciSendString("close WaveDump", "", 0, IntPtr.Zero);
-
-            StorageService.TryGetBytes(StorageService.DirectoryBase, file, out bytes, out string errMsg);
-            return bytes;
+            using (var stream = await recordFile.OpenStreamForReadAsync())
+            using (var memory = new MemoryStream())
+            {
+                await stream.CopyToAsync(memory);
+                if (memory.Length == 0) return null;
+                return memory.ToArray();
+            }
         }
-
-        var dispatcherQueue = WindowsApp.Window?.DispatcherQueue;
-        if (dispatcherQueue == null || dispatcherQueue.HasThreadAccess)
+        catch (Exception ex)
         {
-            return StopRecordCore();
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] StopRecord failed: {ex}");
+            return null;
         }
-
-        var tcs = new TaskCompletionSource<byte[]>();
-        if (!dispatcherQueue.TryEnqueue(() => tcs.TrySetResult(StopRecordCore())))
+        finally
         {
-            return StopRecordCore();
-        }
+            inputNode?.Dispose();
+            //outputNode?.Dispose();
+            graph.Dispose();
 
-        return await tcs.Task;
+            if (recordFile != null)
+            {
+                try { await recordFile.DeleteAsync(); }
+                catch (Exception ex) { DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] temp cleanup failed: {ex.Message}"); }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Error-path teardown for StartRecord: releases the graph (which releases the
+    /// microphone) and deletes the half-written temp file, if any.
+    /// </summary>
+    async Task CleanupSessionAsync()
+    {
+        var file = _recordFile;
+        _recordFile = null;
+
+        _inputNode?.Dispose();
+        _inputNode = null;
+        _fileOutputNode?.Dispose();
+        _fileOutputNode = null;
+        _graph?.Dispose();
+        _graph = null;
+
+        if (file != null)
+        {
+            try { await file.DeleteAsync(); }
+            catch (Exception ex) { }
+        }
     }
 
     public Task<INativeImageDecoder?> CaptureScreen()
