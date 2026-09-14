@@ -182,14 +182,14 @@
 
 	</ItemGroup>
 
-	<ItemGroup Condition="'$(IsWindows)' == 'true'">
-		<Content Include="..\..\..\SeasonAIs\cudacudnn-runtime\win-x64\native\*.dll">
+	<!--<ItemGroup Condition="'$(IsWindows)' == 'true'">
+		<Content Include="..\..\..\cudacudnn-runtime\win-x64\native\*.dll">
 			<Link>%(Filename)%(Extension)</Link>
 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 			<CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
 			<Visible>false</Visible>
 		</Content>
-	</ItemGroup>
+	</ItemGroup>-->
 
 	<ItemGroup Condition="'$(IsWindows)' == 'true' or '$(IsLinux)' == 'true'">
 		<Content Include="Resources\Raw\**" CopyToOutputDirectory="PreserveNewest" Link="%(RecursiveDir)%(Filename)%(Extension)" />
