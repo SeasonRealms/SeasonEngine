@@ -101,6 +101,16 @@ internal class LinuxMediaPlayer : IMediaPlayer
 
     System.Diagnostics.Process musicPlayer = null;
 
+    // Raw source path last handed to the music channel by PlayMedia. The sound channel
+    // runs as an untracked short-lived process, so IsPlayingFile resolves music only.
+    string CurrentMusicFile = null;
+
+    public bool IsPlayingFile(string fileName)
+    {
+        // mplayer runs as a child process; HasExited tells whether it is still playing.
+        return musicPlayer != null && !musicPlayer.HasExited && MediaPlayerFiles.IsSame(CurrentMusicFile, fileName);
+    }
+
     public void PlayMedia(string type, string id, string vol)
     {
         new Task(() =>
@@ -116,6 +126,8 @@ internal class LinuxMediaPlayer : IMediaPlayer
                 startInfo.CreateNoWindow = true;
                 startInfo.RedirectStandardOutput = true;
                 startInfo.RedirectStandardError = true;
+
+                CurrentMusicFile = id;
 
                 musicPlayer = System.Diagnostics.Process.Start(startInfo);
 
@@ -612,6 +624,12 @@ internal class LinuxRecordService : RecordService, IRecordService
         var tcs = new TaskCompletionSource<INativeImageDecoder?>();
         BaseApp.CaptureAppTcs = tcs;
         return tcs.Task;
+    }
+
+    public byte[] DecodeToWavPcm16(string path)
+    {
+        // No media decoder is wired up on Linux yet; FFmpeg or GStreamer would be the implementation.
+        throw new NotImplementedException($"DecodeToWavPcm16 is not implemented on Linux: {path}");
     }
 }
 

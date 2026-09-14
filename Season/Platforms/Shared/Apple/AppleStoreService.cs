@@ -13,7 +13,13 @@ internal class AppleStoreService : IStoreService
 
     public async Task<(List<Product>, string)> Query()
     {
-        throw new PlatformNotSupportedException();
+        // Apple has no bulk product-enumeration API: SKProductsRequest requires explicit product
+        // IDs, which live in the higher-level SeasonAI/Foundation layer and are empty on
+        // iOS/MacCatalyst. Return an empty result gracefully instead of throwing, so async callers
+        // (e.g. the AINotice query lambda) degrade cleanly rather than aborting the process.
+        await Task.CompletedTask;
+
+        return (new List<Product>(), "");
     }
 
     public async Task<Product> Query(string storeId)

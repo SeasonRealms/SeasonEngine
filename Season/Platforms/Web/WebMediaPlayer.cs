@@ -72,6 +72,39 @@ internal sealed class WebMediaPlayer : IMediaPlayer
         }
     }
 
+    // Raw id last handed to each channel by PlayMedia, kept so IsPlayingFile can tell
+    // which file the browser audio elements are currently running.
+    string CurrentMusicFile = null;
+
+    string CurrentSoundFile = null;
+
+    public bool IsPlayingFile(string fileName)
+    {
+        if (!OperatingSystem.IsBrowser())
+        {
+            return false;
+        }
+
+        try
+        {
+            // The JS isPlaying() reports whether either channel is active; combine it with
+            // the per-channel file we last loaded to answer for a specific track.
+            if (!WebAudioPlayerInterop.IsPlaying())
+            {
+                return false;
+            }
+
+            return MediaPlayerFiles.IsSame(CurrentMusicFile, fileName)
+                || MediaPlayerFiles.IsSame(CurrentSoundFile, fileName);
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [WebMediaPlayer] IsPlayingFile error: {ex.Message}");
+
+            return false;
+        }
+    }
+
     public void PlayMedia(string type, string id, string vol)
     {
         if (!OperatingSystem.IsBrowser())
@@ -81,6 +114,15 @@ internal sealed class WebMediaPlayer : IMediaPlayer
 
         try
         {
+            if (type is "Music")
+            {
+                CurrentMusicFile = id;
+            }
+            else
+            {
+                CurrentSoundFile = id;
+            }
+
             var kind = type is "Music" ? "music" : "sound";
 
             var url = WebApp.ResolveAssetPath(ResolveMediaId(id));

@@ -16,6 +16,7 @@ using Windows.Media.Core;
 using Windows.Media.MediaProperties;
 using Windows.Media.Playback;
 using Windows.Media.Render;
+using Windows.Media.Transcoding;
 using Windows.Services.Store;
 using Windows.Storage;
 using Windows.Storage.Pickers;
@@ -215,6 +216,23 @@ internal class WindowsMediaPlayer : IMediaPlayer
 
     MediaPlayer SoundPlayer = null;
 
+    // Raw source path last handed to each channel by PlayMedia, kept so IsPlayingFile
+    // can tell which file a player is currently running.
+    string CurrentMusicFile = null;
+
+    string CurrentSoundFile = null;
+
+    public bool IsPlayingFile(string fileName)
+    {
+        if (MusicPlayer?.CurrentState is MediaPlayerState.Playing && MediaPlayerFiles.IsSame(CurrentMusicFile, fileName)
+            || SoundPlayer?.CurrentState is MediaPlayerState.Playing && MediaPlayerFiles.IsSame(CurrentSoundFile, fileName))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
     public void PlayMedia(string type, string id, string vol)
     {
         //Microsoft.Maui.ApplicationModel.MainThread.BeginInvokeOnMainThread(() =>
@@ -230,6 +248,15 @@ internal class WindowsMediaPlayer : IMediaPlayer
                 //{
                 //    SoundPlayer.Pause();
                 //};
+            }
+
+            if (type is "Music")
+            {
+                CurrentMusicFile = id;
+            }
+            else
+            {
+                CurrentSoundFile = id;
             }
 
             var mediaPlayer = type is "Music" ? MusicPlayer : SoundPlayer;
@@ -1065,6 +1092,81 @@ internal class WindowsRecordService : RecordService, IRecordService
         var tcs = new TaskCompletionSource<INativeImageDecoder?>();
         BaseApp.CaptureAppTcs = tcs;
         return tcs.Task;
+    }
+
+    /// <summary>
+    /// Decodes the audio of a media file (.m4a/.mp3/.wma, and the audio track of an .mp4/.m4v) into a
+    /// complete WAV: 16 kHz mono 16-bit PCM behind the canonical RIFF header, i.e. the very output
+    /// contract StartRecord/StopRecord has and the only layout the STT front ends parse. MediaTranscoder
+    /// is the Media Foundation wrapper that demuxes, decodes, resamples and mixes in one pass, and the
+    /// WAV profile is audio only, so the picture of a movie file is dropped. Video-only or otherwise
+    /// undecodable input reports CanTranscode=false instead of producing silence.
+    /// Blocking, so callers run it on a background thread.
+    /// </summary>
+    public byte[] DecodeToWavPcm16(string path)
+    {
+        return DecodeToWavPcm16Async(path).GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Transcodes <paramref name="path"/> into a temp .wav, reads the bytes back and deletes the temp
+    /// file again — the same lifecycle StopRecord uses for the recording it hands out.
+    /// </summary>
+    static async Task<byte[]> DecodeToWavPcm16Async(string path)
+    {
+        if (!System.IO.File.Exists(path))
+        {
+            throw new InvalidDataException($"The audio file does not exist: {path}");
+        }
+
+        var sourceFile = await StorageFile.GetFileFromPathAsync(path);
+
+        // Same LocalAppData base as StartRecord: package-redirected, always writable under MSIX, and
+        // obtained through the path-based StorageFile API, which is thread-agile.
+        var tempDirectory = System.IO.Path.Combine(
+            StorageService.Path(StorageService.DirectoryBase ?? "SeasonEngine"), "Temp");
+        Directory.CreateDirectory(tempDirectory);
+
+        var tempFolder = await StorageFolder.GetFolderFromPathAsync(tempDirectory);
+        var wavFile = await tempFolder.CreateFileAsync(
+            $"Decode-{DateTime.Now:yyyyMMddHHmmssfff}.wav", CreationCollisionOption.GenerateUniqueName);
+
+        try
+        {
+            // CreateWav carries no video stream, which is what drops the picture of an .m4v/.mp4.
+            var profile = MediaEncodingProfile.CreateWav(AudioEncodingQuality.Low);
+            profile.Audio = AudioEncodingProperties.CreatePcm(SampleRate, Channels, BitsPerSample);
+
+            var prepare = await new MediaTranscoder().PrepareFileTranscodeAsync(sourceFile, wavFile, profile);
+
+            if (!prepare.CanTranscode)
+            {
+                throw new InvalidDataException($"Media Foundation cannot decode '{System.IO.Path.GetFileName(path)}': {prepare.FailureReason}");
+            }
+
+            await prepare.TranscodeAsync();
+
+            using var stream = await wavFile.OpenStreamForReadAsync();
+            using var memory = new MemoryStream();
+
+            await stream.CopyToAsync(memory);
+
+            var bytes = memory.ToArray();
+
+            if (bytes.Length == 0)
+            {
+                throw new InvalidDataException($"The decoded WAV does not contain any audio: {path}");
+            }
+
+            DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] decoded '{System.IO.Path.GetFileName(path)}' into {bytes.Length} WAV bytes at {SampleRate}Hz/{Channels}ch/{BitsPerSample}bit");
+
+            return bytes;
+        }
+        finally
+        {
+            try { await wavFile.DeleteAsync(); }
+            catch (Exception ex) { DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] temp cleanup failed: {ex.Message}"); }
+        }
     }
 }
 

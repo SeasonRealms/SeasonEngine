@@ -161,6 +161,8 @@ public interface IMediaPlayer
 {
     bool IsPlaying { get; }
 
+    public bool IsPlayingFile(string fileName);
+
     void PlayMedia(string type, string id, string vol);
 
     void SetVolume(int music, int sound);
@@ -168,6 +170,34 @@ public interface IMediaPlayer
     void Pause();
 
     void Resume();
+}
+
+/// <summary>
+/// Media-file matching helper shared by the per-platform <see cref="IMediaPlayer"/>
+/// implementations so every platform resolves IsPlayingFile the same way.
+/// </summary>
+internal static class MediaPlayerFiles
+{
+    /// <summary>
+    /// Returns true when the path a player last loaded (<paramref name="currentFile"/>) refers
+    /// to the file the caller asks about (<paramref name="fileName"/>). Compared first by full
+    /// path, then falling back to the file-name component ignoring case, so callers may pass
+    /// either a full path or just a file name.
+    /// </summary>
+    public static bool IsSame(string currentFile, string fileName)
+    {
+        if (string.IsNullOrEmpty(currentFile) || string.IsNullOrEmpty(fileName))
+        {
+            return false;
+        }
+
+        if (string.Equals(currentFile, fileName, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return string.Equals(Path.GetFileName(currentFile), Path.GetFileName(fileName), StringComparison.OrdinalIgnoreCase);
+    }
 }
 
 public interface IDialogService
@@ -361,6 +391,16 @@ public interface IRecordService
     /// Supported on all platforms through their respective graphics APIs.
     /// </summary>
     Task<INativeImageDecoder?> CaptureApp();
+
+    /// <summary>
+    /// Decodes the audio of a media file (an .m4a/.m4v/.mp4/.mp3 recording, for example) into a
+    /// complete WAV: 16 kHz, mono, 16-bit little-endian PCM behind the canonical 44-byte RIFF header,
+    /// the very layout <see cref="IRecordService.StopRecord"/> returns and the only one the STT
+    /// front ends parse. Implemented through AVFoundation on Mac Catalyst/iOS and through Media
+    /// Foundation on Windows; the remaining platforms throw <see cref="NotImplementedException"/>.
+    /// Blocking, so callers run it on a background thread.
+    /// </summary>
+    byte[] DecodeToWavPcm16(string path);
 }
 
 /// <summary>

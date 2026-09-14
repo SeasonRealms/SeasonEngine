@@ -134,4 +134,11 @@ internal sealed class WebRecordService : RecordService, IRecordService
         BaseApp.CaptureAppTcs = tcs;
         return tcs.Task;
     }
+
+    public byte[] DecodeToWavPcm16(string path)
+    {
+        // AudioContext.decodeAudioData behind a seasonMedia.js entry point would be the browser
+        // implementation; not wired up yet.
+        throw new NotImplementedException($"DecodeToWavPcm16 is not implemented on the Web: {path}");
+    }
 }

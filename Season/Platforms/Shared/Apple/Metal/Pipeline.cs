@@ -332,7 +332,7 @@ internal static class Pipeline
             // Step 6:
             // same rule as above, preferring Settings.RenderQuality and sharing the same gate as DdgiEffect.
             + ((Season.Basic.DeviceServices.BaseApp?.Settings?.RenderQuality?.GlobalIllumination ?? RenderQuality.DefaultGlobalIllumination) == Season.Rendering.GiMode.Ddgi ? "#define DDGI_ENABLED 1\n" : "#define DDGI_ENABLED 0\n")
-            + "#define SHADOW_PASS 0\n#define VELOCITY_OUTPUT 0\n#define OUTLINE_MASK 1\n" + MetalShaderSource;
+            + "#define SHADOW_PASS 0\n#define VELOCITY_OUTPUT 0\n#define OUTLINE_MASK 1\n" + lodBiasDefine + MetalShaderSource;
         OutlineMaskLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, maskMsl);
         OutlineMaskVertexFunction = OutlineMaskLibrary.CreateFunction("vertex_main")
             ?? throw new Exception("MSL function 'vertex_main' (outline mask) not found");

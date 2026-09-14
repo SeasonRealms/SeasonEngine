@@ -198,6 +198,23 @@ internal class AndroidMediaPlayer : IMediaPlayer
 
     MediaPlayer SoundPlayer = null;
 
+    // Raw source path last handed to each channel by PlayMedia, kept so IsPlayingFile
+    // can tell which file a player is currently running.
+    string CurrentMusicFile = null;
+
+    string CurrentSoundFile = null;
+
+    public bool IsPlayingFile(string fileName)
+    {
+        if (MusicPlayer != null && MusicPlayer.IsPlaying && MediaPlayerFiles.IsSame(CurrentMusicFile, fileName)
+            || SoundPlayer != null && SoundPlayer.IsPlaying && MediaPlayerFiles.IsSame(CurrentSoundFile, fileName))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
     public void PlayMedia(string type, string id, string vol)
     {
         if (MusicPlayer == null || SoundPlayer == null)
@@ -205,6 +222,15 @@ internal class AndroidMediaPlayer : IMediaPlayer
             MusicPlayer = new MediaPlayer();
 
             SoundPlayer = new MediaPlayer();
+        }
+
+        if (type is "Music")
+        {
+            CurrentMusicFile = id;
+        }
+        else
+        {
+            CurrentSoundFile = id;
         }
 
         var mediaPlayer = type is "Music" ? MusicPlayer : SoundPlayer;
@@ -999,6 +1025,12 @@ internal class AndroidRecordService : RecordService, IRecordService
         var tcs = new TaskCompletionSource<INativeImageDecoder?>();
         BaseApp.CaptureAppTcs = tcs;
         return tcs.Task;
+    }
+
+    public byte[] DecodeToWavPcm16(string path)
+    {
+        // MediaExtractor + MediaCodec would be the Android implementation; not wired up yet.
+        throw new NotImplementedException($"DecodeToWavPcm16 is not implemented on Android: {path}");
     }
 }
 
