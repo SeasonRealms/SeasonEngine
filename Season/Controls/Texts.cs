@@ -150,14 +150,14 @@ public class Texts : Control, IRenderOrder
     {
         get
         {
-            ////if (!Translate || BaseApp.Instance.Words is null || BaseApp.Instance.Words.Lan is null or "" || content.IsNullOrWhiteSpace())
-            //if (!Translate || BaseApp.Instance.Words is null || BaseApp.Instance.Settings.Language is null or "" || content.IsNullOrWhiteSpace())
-            //{
-            //}
-            //else
-            //{
-            //    return WordsUtils.Translate(content);
-            //}
+            if (!Translate || DeviceServices.BaseApp.Words is null || DeviceServices.BaseApp.Settings.Language is null or "" || content.IsNullOrWhiteSpace())
+            {
+
+            }
+            else
+            {
+                return Localization.Translate(content);
+            }
 
             return content;
         }
@@ -166,7 +166,9 @@ public class Texts : Control, IRenderOrder
             if (content != value)
             {
                 content = value;
+
                 contentHasSpanMarkup = value != null && value.Contains(SpanMarkupPrefix, StringComparison.Ordinal);
+
                 MarkContentDirty();
             }
         }
@@ -344,9 +346,11 @@ public class Texts : Control, IRenderOrder
             {
                 var codePoint = char.ConvertToUtf32(source, index);
 
-                index += char.IsSurrogatePair(source, index) ? 2 : 1;
+                var consumed = char.IsSurrogatePair(source, index) ? 2 : 1;
 
-                var tex = BuildTex(codePoint, textSpan, ref index, ref span, ref spanColor, ref spanTarget);
+                var tex = BuildTex(codePoint, textSpan, ref index, ref consumed, ref span, ref spanColor, ref spanTarget);
+
+                index += consumed;
 
                 if (tex.HasValue)
                 {
@@ -455,7 +459,7 @@ public class Texts : Control, IRenderOrder
         return true;
     }
 
-    public Tex? BuildTex(int codePoint, char[] textSpan, ref int index, ref bool span, ref Season.Basic.Color? spanColor, ref int spanTarget)
+    public Tex? BuildTex(int codePoint, char[] textSpan, ref int index, ref int consumed, ref bool span, ref Season.Basic.Color? spanColor, ref int spanTarget)
     {
         Tex tex;
 
@@ -488,7 +492,12 @@ public class Texts : Control, IRenderOrder
         }
         else
         {
-            var currentIndex = index; // - charsConsumed;
+            var currentIndex = index;
+
+            if (index > 80)
+            {
+
+            }
 
             //if (index < textSpan.Length && textSpan[currentIndex] == '<' && index + spanStart.Length < textSpan.Length && content.Substring(index - charsConsumed, spanStart.Length) == spanStart)
             if (index < textSpan.Length && textSpan[currentIndex] == '<' && index + spanStart.Length < textSpan.Length && source.Substring(index, spanStart.Length) == spanStart)
@@ -525,10 +534,10 @@ public class Texts : Control, IRenderOrder
                             }
                         }
 
-                        index = spanMiddleIndex + spanMiddle.Length;
+                        index = spanMiddleIndex + spanMiddle.Length - consumed;
 
                         span = true;
-                        spanTarget = spanEndIndex; // + spanEnd.Length;
+                        spanTarget = spanEndIndex - consumed; // + spanEnd.Length;
 
                         //continue;
 
@@ -1594,9 +1603,16 @@ public class Texts : Control, IRenderOrder
         {
             if (Ready)
             {
-                lock (SyncRoot)
+                if (PosX == 0 && PosY == 0)
                 {
-                    Graphics.Instance.DrawTexts(this);
+
+                }
+                else
+                {
+                    lock (SyncRoot)
+                    {
+                        Graphics.Instance.DrawTexts(this);
+                    }
                 }
 
                 result = true;

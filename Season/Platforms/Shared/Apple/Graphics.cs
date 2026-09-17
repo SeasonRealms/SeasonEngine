@@ -321,7 +321,7 @@ internal unsafe class Graphics : IGraphics
                     {
                         var source = sprite.TextureOverride;
                         sprite.TextureOverride = default;
-                        ReplaceSpriteTexture(mtlSprite, source);
+                        ReplaceSpriteTexture(sprite.Name, mtlSprite, source);
                     }
 
                     if (sprite.Changed)
@@ -361,7 +361,7 @@ internal unsafe class Graphics : IGraphics
     }
 
     /// <summary>Replace the single texture used by a Sprite.</summary>
-    void ReplaceSpriteTexture(MTLSpriteQuad mtlSprite, TextureUpdateSource source)
+    void ReplaceSpriteTexture(string name, MTLSpriteQuad mtlSprite, TextureUpdateSource source)
     {
         var decoder = ResolveDecoder(source);
         if (decoder == null) return;
@@ -379,6 +379,25 @@ internal unsafe class Graphics : IGraphics
         {
             var newTex = MTLTexture.CreateFromDecoder(decoder);
             ExecuteUpload();
+
+            // Hand the dictionary registration over to the replacement texture, otherwise DisposeSprite2D /
+            // DisposeSprite3D keeps releasing the old one while the new one is reachable from nowhere and leaks.
+            // Only a texture this sprite solely owns (RefCount 1) can be retired; a shared one keeps its entry
+            // for its other holders. Metal command buffers retain their encoded resources until execution
+            // completes, so direct Release is safe.
+            if (oldTex.RefCount == 1 && !name.IsNullOrWhiteSpace())
+            {
+                lock (DictionaryMtlTexture)
+                {
+                    if (DictionaryMtlTexture.TryGetValue(name, out var registered) && registered == oldTex)
+                    {
+                        newTex.Name = name;
+                        DictionaryMtlTexture[name] = newTex;
+                        oldTex.Release();
+                    }
+                }
+            }
+
             mtlSprite.AlbedoTexture = newTex;
         }
 
@@ -1722,7 +1741,7 @@ internal unsafe class Graphics : IGraphics
                 {
                     var source = sprite.TextureOverride;
                     sprite.TextureOverride = default;
-                    ReplaceSpriteTexture(mtlSprite3D, source);
+                    ReplaceSpriteTexture(sprite.Name, mtlSprite3D, source);
                 }
 
                 mtlSprite3D.Update(
@@ -2450,7 +2469,7 @@ internal unsafe class Graphics : IGraphics
         {
             var source = shape.TextureOverride;
             shape.TextureOverride = default;
-            ReplaceSpriteTexture(mtlSprite, source);
+            ReplaceSpriteTexture(shape.Name, mtlSprite, source);
         }
 
         if (shape.Changed)

@@ -17,6 +17,7 @@ namespace Season.Platforms.Linux;
 internal sealed class LinuxVideoPlayerService : IVideoPlayerService
 {
     Process? _ffmpeg;
+    string? _filePath;
     Thread? _readThread;
     volatile bool _isPlaying, _disposed;
     int _width, _height;
@@ -31,6 +32,8 @@ internal sealed class LinuxVideoPlayerService : IVideoPlayerService
 
     public void Play(string filePath)
     {
+        _filePath = filePath;
+
         Stop();
         try
         {
@@ -207,6 +210,26 @@ internal sealed class LinuxVideoPlayerService : IVideoPlayerService
             _isPlaying = false;
             PlaybackEnded?.Invoke();
         }
+    }
+
+    public void Replay()
+    {
+        if (_filePath == null) return;
+        var path = _filePath;
+
+        // Stop the current run, then wait for the pipe reader to fully exit so
+        // its exit path cannot reset the fresh playback state. Skipped when
+        // Replay is re-entered from the reader thread itself (e.g. a caller
+        // looping from the PlaybackEnded event).
+        var old = _readThread;
+        Stop();
+        if (old != null && old != Thread.CurrentThread)
+        {
+            old.Join(2000);
+        }
+        _readThread = null;
+
+        Play(path);
     }
 
     public void Stop()

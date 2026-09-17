@@ -861,7 +861,7 @@ internal unsafe class Graphics : IGraphics
                     {
                         var source = sprite.TextureOverride;
                         sprite.TextureOverride = default; // Clear first.
-                        ReplaceSpriteTexture(dxSprite, source);
+                        ReplaceSpriteTexture(sprite.Name, dxSprite, source);
                     }
 
                     if (sprite.Changed)
@@ -902,7 +902,7 @@ internal unsafe class Graphics : IGraphics
     }
 
     /// <summary>Replaces the single texture of a Sprite.</summary>
-    void ReplaceSpriteTexture(DXSpriteQuad dxSprite, TextureUpdateSource source)
+    void ReplaceSpriteTexture(string name, DXSpriteQuad dxSprite, TextureUpdateSource source)
     {
         var decoder = ResolveDecoder(source);
         if (decoder == null) return;
@@ -921,6 +921,29 @@ internal unsafe class Graphics : IGraphics
             // Recreate path: size changed or the texture is shared.
             var newTex = DXTexture.CreateFromDecoder(decoder);
             ExecuteUpload();
+
+            // DisposeSprite2D / DisposeSprite3D release whatever this name's dictionary
+            // holds, so the registration has to move to the replacement. Without the
+            // hand-over the new texture is reachable from nowhere (never freed) and the
+            // old one stays resident under this name until the sprite dies - replacing
+            // a 160px poster with 688px video frames used to leak the video texture on
+            // every close of the notice. Only a texture this sprite solely owns
+            // (RefCount 1 = the entry + this sprite) can be retired here; a shared one
+            // keeps its entry for its other holders.
+            if (oldTex.RefCount == 1 && !name.IsNullOrWhiteSpace())
+            {
+                ulong retireFence = DirectX.Device.GetCurrentRetireFenceValue();
+                lock (DictionaryDXTexture)
+                {
+                    if (DictionaryDXTexture.TryGetValue(name, out var registered) && registered == oldTex)
+                    {
+                        newTex.Name = name;
+                        DictionaryDXTexture[name] = newTex;
+                        EnqueueDeferredRelease(retireFence, oldTex.Release);
+                    }
+                }
+            }
+
             dxSprite.DXTexture = newTex;
         }
 
@@ -1467,7 +1490,11 @@ internal unsafe class Graphics : IGraphics
         {
             var cmdList = DirectX.Device.GraphicsCommandList;
             int fi = (int)DirectX.Device.FrameIndex;
-            if (!state.CanDraw || state.GlyphBuffer == null || state.GlyphSrv.Ptr == 0 || state.InstanceBufferViews == null || fi >= state.InstanceBufferViews.Length)
+            // InstanceBuffers[fi] == null means ReleaseInstanceBuffersDeferred already queued that
+            // VB for deferred release (a rebuild raced this draw); the matching view still holds the
+            // stale GPU address, so recording it would submit a dangling VB to the GPU.
+            if (!state.CanDraw || state.GlyphBuffer == null || state.GlyphSrv.Ptr == 0 || state.InstanceBufferViews == null || state.InstanceBuffers == null
+                || fi >= state.InstanceBufferViews.Length || fi >= state.InstanceBuffers.Length || state.InstanceBuffers[fi] == null)
                 return;
 
             // Ensure the atlas texture is ready.
@@ -1973,7 +2000,7 @@ internal unsafe class Graphics : IGraphics
                 {
                     var source = sprite.TextureOverride;
                     sprite.TextureOverride = default; // Clear first.
-                    ReplaceSpriteTexture(dxSprite3D, source);
+                    ReplaceSpriteTexture(sprite.Name, dxSprite3D, source);
                 }
 
                 dxSprite3D.Update(
@@ -2725,7 +2752,7 @@ internal unsafe class Graphics : IGraphics
         {
             var source = shape.TextureOverride;
             shape.TextureOverride = default;
-            ReplaceSpriteTexture(dxSprite, source);
+            ReplaceSpriteTexture(shape.Name, dxSprite, source);
         }
 
         if (shape.Changed)

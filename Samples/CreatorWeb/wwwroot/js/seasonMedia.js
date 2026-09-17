@@ -342,7 +342,7 @@ registerProcessor('season-pcm-worklet', SeasonPcmWorklet);
 // Video decoding and audio playback are handled natively by the browser, with
 // no extra dependencies required. Frame data is transferred to the C# side
 // through Base64 encoding. Called through IJSRuntime
-// (SeasonVideoPlayer.init / SeasonVideoPlayer.stop).
+// (SeasonVideoPlayer.init / SeasonVideoPlayer.replay / SeasonVideoPlayer.stop).
 // ---------------------------------------------------------------------------
 window.SeasonVideoPlayer = (function () {
     var _video = null;
@@ -351,6 +351,7 @@ window.SeasonVideoPlayer = (function () {
     var _dotnet = null;
     var _rafId = 0;
     var _usingVfc = false;
+    var _pumping = false;
 
     function init(url, dotnetRef) {
         stop();
@@ -396,22 +397,41 @@ window.SeasonVideoPlayer = (function () {
         });
     }
 
-    function requestFrame() {
-        if (!_video || _video.paused || _video.ended) return;
+    // Frame pump: keeps pulling frames while the video is playing.
+    // _pumping guards against starting a second parallel callback chain and is
+    // cleared whenever the chain stops (pause / ended / stop()).
+    function pump() {
+        if (!_video || _video.paused || _video.ended) {
+            _pumping = false;
+            return;
+        }
 
         if (_video.requestVideoFrameCallback) {
             _usingVfc = true;
             _video.requestVideoFrameCallback(function () {
                 captureFrame();
-                requestFrame();
+                pump();
             });
         } else {
             // Fallback: use requestAnimationFrame
             _rafId = requestAnimationFrame(function () {
                 captureFrame();
-                requestFrame();
+                pump();
             });
         }
+    }
+
+    // Starts the frame pump. Safe to call repeatedly: a running chain is kept,
+    // and a chain stopped by 'ended' is restarted. Used by init and replay.
+    function requestFrame() {
+        if (!_video || _video.paused || _video.ended) {
+            _pumping = false;
+            return;
+        }
+        if (_pumping) return;
+
+        _pumping = true;
+        pump();
     }
 
     function captureFrame() {
@@ -458,10 +478,33 @@ window.SeasonVideoPlayer = (function () {
         _canvas = null;
         _ctx = null;
         _usingVfc = false;
+        _pumping = false;
+    }
+
+    // Restarts the current video from the beginning, keeping the same
+    // <video> element and dotnet reference. Returns false when nothing is loaded.
+    function replay() {
+        if (!_video) return false;
+
+        // Rewind to the start. Assigning currentTime clears the ended state,
+        // so this works both mid-playback and after 'ended'.
+        try {
+            _video.currentTime = 0;
+        } catch (e) {
+            console.error('[SeasonVideoPlayer] replay seek failed:', e);
+            return false;
+        }
+
+        _video.play().catch(function (e) {
+            console.error('[SeasonVideoPlayer] replay play failed:', e);
+        });
+        requestFrame();
+        return true;
     }
 
     return {
         init: init,
+        replay: replay,
         stop: stop
     };
 })();

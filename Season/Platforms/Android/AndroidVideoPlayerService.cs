@@ -19,6 +19,7 @@ namespace Season.Platforms.Android;
 internal sealed class AndroidVideoPlayerService : IVideoPlayerService
 {
     MediaPlayer? _player;
+    string? _filePath;
     MediaCodec? _codec;
     MediaExtractor? _extractor;
     Thread? _decodeThread;
@@ -33,6 +34,8 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
 
     public void Play(string filePath)
     {
+        _filePath = filePath;
+
         Stop();
         try
         {
@@ -241,6 +244,26 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
             }
         }
         return rgba;
+    }
+
+    public void Replay()
+    {
+        if (_filePath == null) return;
+        var path = _filePath;
+
+        // Stop the current run, then wait for the decode thread to fully exit
+        // before rebuilding the codec/extractor, so it cannot touch the fresh
+        // instances. Skipped when Replay is re-entered from the decode thread
+        // itself (e.g. a caller looping from the PlaybackEnded event).
+        var old = _decodeThread;
+        Stop();
+        if (old != null && old != Thread.CurrentThread)
+        {
+            old.Join(2000);
+        }
+        _decodeThread = null;
+
+        Play(path);
     }
 
     public void Stop()

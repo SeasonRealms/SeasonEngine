@@ -60,6 +60,7 @@ public static class ColorsHelper
 public static class Colors
 {
     public static string[] AllNames = null;
+
     public static Color[] AllColors = null;
 
     public static void Init()
@@ -168,6 +169,11 @@ public static class Colors
 
     public static Color? FromName(string name)
     {
+        if (AllNames is null)
+        {
+            Init();
+        }
+
         if (name.StartsWith("#"))
         {
             name = name.Substring(1);

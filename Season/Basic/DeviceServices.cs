@@ -420,6 +420,12 @@ public interface IVideoPlayerService : IDisposable
     /// <summary>Start playing the specified file. Playback begins pushing frames after the asynchronous setup completes.</summary>
     void Play(string filePath);
 
+    /// <summary>
+    /// Restart playback of the current file from the beginning, keeping the same file loaded.
+    /// Intended for repeat-playback scenarios; a no-op when no file has been played yet.
+    /// </summary>
+    void Replay();
+
     /// <summary>Stop playback and release resources.</summary>
     void Stop();
 

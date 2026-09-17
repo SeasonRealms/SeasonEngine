@@ -319,7 +319,7 @@ internal unsafe class Graphics : IGraphics
                     {
                         var source = sprite.TextureOverride;
                         sprite.TextureOverride = default;
-                        ReplaceSpriteTexture(vkSprite, source);
+                        ReplaceSpriteTexture(sprite.Name, vkSprite, source);
                     }
 
                     if (sprite.Changed)
@@ -352,7 +352,7 @@ internal unsafe class Graphics : IGraphics
         using (stream) return ImageUtils.GetImageFromStream(stream, null);
     }
 
-    void ReplaceSpriteTexture(VKSpriteQuad vkSprite, TextureUpdateSource source)
+    void ReplaceSpriteTexture(string name, VKSpriteQuad vkSprite, TextureUpdateSource source)
     {
         var decoder = ResolveDecoder(source);
         if (decoder == null) return;
@@ -370,6 +370,24 @@ internal unsafe class Graphics : IGraphics
         {
             var newTex = VkTexture.CreateFromDecoder(decoder);
             ExecuteUpload();
+
+            // Hand the dictionary registration over to the replacement texture, otherwise DisposeSprite2D /
+            // DisposeSprite3D keeps releasing the old one while the new one is reachable from nowhere and leaks.
+            // Only a texture this sprite solely owns (RefCount 1) can be retired; a shared one keeps its entry
+            // for its other holders. Direct Release matches the existing DisposeSprite2D / DisposeSprite3D pattern.
+            if (oldTex.RefCount == 1 && !name.IsNullOrWhiteSpace())
+            {
+                lock (DictionaryVKTexture)
+                {
+                    if (DictionaryVKTexture.TryGetValue(name, out var registered) && registered == oldTex)
+                    {
+                        newTex.Name = name;
+                        DictionaryVKTexture[name] = newTex;
+                        oldTex.Release();
+                    }
+                }
+            }
+
             vkSprite.VKTexture = newTex;
         }
         decoder.Dispose();
@@ -1753,7 +1771,7 @@ internal unsafe class Graphics : IGraphics
                 {
                     var source = sprite.TextureOverride;
                     sprite.TextureOverride = default;
-                    ReplaceSpriteTexture(vkSprite3D, source);
+                    ReplaceSpriteTexture(sprite.Name, vkSprite3D, source);
                 }
 
                 vkSprite3D.Update(
@@ -2515,7 +2533,7 @@ internal unsafe class Graphics : IGraphics
         {
             var source = shape.TextureOverride;
             shape.TextureOverride = default;
-            ReplaceSpriteTexture(vkSprite, source);
+            ReplaceSpriteTexture(shape.Name, vkSprite, source);
         }
 
         if (shape.Changed)

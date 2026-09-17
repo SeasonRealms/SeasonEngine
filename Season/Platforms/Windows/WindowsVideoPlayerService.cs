@@ -19,6 +19,7 @@ namespace Season.Platforms.Windows;
 internal sealed class WindowsVideoPlayerService : IVideoPlayerService
 {
     MediaPlayer? _player;
+    string? _filePath;
     CanvasRenderTarget? _renderTarget;
     int _width, _height;
     bool _isPlaying;
@@ -38,6 +39,7 @@ internal sealed class WindowsVideoPlayerService : IVideoPlayerService
     public async void Play(string filePath)
     {
         filePath = filePath.Replace("/", "\\");
+        _filePath = filePath;
 
         Stop();
 
@@ -88,6 +90,30 @@ internal sealed class WindowsVideoPlayerService : IVideoPlayerService
         catch (Exception ex)
         {
             Debug.WriteLine($"[VideoPlayer] Play error: {ex.Message}");
+        }
+    }
+
+    public void Replay()
+    {
+        if (_player == null)
+        {
+            // Stop() released the player; restart from the file last played.
+            if (_filePath != null) Play(_filePath);
+            return;
+        }
+
+        try
+        {
+            // Rewind the session and resume; the frame pipeline stays attached,
+            // so frames keep flowing from the start of the video.
+            _player.PlaybackSession.Position = TimeSpan.Zero;
+            _player.Play();
+            _isPlaying = true;
+            Debug.WriteLine("[VideoPlayer] Replayed");
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[VideoPlayer] Replay error: {ex.Message}");
         }
     }
 

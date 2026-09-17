@@ -19,6 +19,7 @@ namespace Season.Platforms.Shared.Apple;
 internal sealed class AppleVideoPlayerService : IVideoPlayerService
 {
     AVPlayer? _player;
+    string? _filePath;
     AVPlayerItem? _playerItem;
     AVPlayerItemVideoOutput? _videoOutput;
     NSTimer? _timer;
@@ -33,6 +34,8 @@ internal sealed class AppleVideoPlayerService : IVideoPlayerService
 
     public void Play(string filePath)
     {
+        _filePath = filePath;
+
         Stop();
         try
         {
@@ -152,6 +155,37 @@ internal sealed class AppleVideoPlayerService : IVideoPlayerService
         {
             System.Diagnostics.Debug.WriteLine(
                 $"[AppleVideo] Frame error: {ex.Message}");
+        }
+    }
+
+    public void Replay()
+    {
+        if (_player == null)
+        {
+            // Stop() released the player; restart from the file last played.
+            if (_filePath != null) Play(_filePath);
+            return;
+        }
+
+        try
+        {
+            // ActionAtItemEnd.None leaves the item parked at the end of playback,
+            // so seek back to zero and resume. The capture timer is re-created
+            // in case the previous run stopped it.
+            _player.Seek(CMTime.Zero);
+            _player.Play();
+            _isPlaying = true;
+
+            _timer ??= NSTimer.CreateRepeatingScheduledTimer(
+                TimeSpan.FromMilliseconds(16),
+                CaptureFrame);
+
+            System.Diagnostics.Debug.WriteLine("[AppleVideo] Replayed");
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[AppleVideo] Replay error: {ex.Message}");
         }
     }
 

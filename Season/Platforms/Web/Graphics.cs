@@ -1035,7 +1035,7 @@ internal class Graphics : IGraphics
             {
                 var source = sprite.TextureOverride;
                 sprite.TextureOverride = default;
-                ReplaceSpriteTexture(wgpuSprite, source);
+                ReplaceSpriteTexture(sprite.Name, wgpuSprite, source);
             }
 
             // ── Changed gate: precompute NDC on layout changes to avoid repeating the same JS interop work every frame ──
@@ -1080,7 +1080,7 @@ internal class Graphics : IGraphics
     }
 
     /// <summary>Replace the Sprite's single texture. The Web backend always creates an independent texture to avoid incorrect sharing heuristics.</summary>
-    void ReplaceSpriteTexture(WGPUSprite2D wgpuSprite, TextureUpdateSource source)
+    void ReplaceSpriteTexture(string name, WGPUSprite2D wgpuSprite, TextureUpdateSource source)
     {
         var decoder = ResolveDecoder(source);
         if (decoder == null) return;
@@ -1089,9 +1089,15 @@ internal class Graphics : IGraphics
         int w = decoder.Width, h = decoder.Height;
         decoder.Dispose();
 
-        string newName = $"sprTex_{Guid.NewGuid():N}";
+        // Stable per-sprite key instead of one GUID per frame: createTextureFromPixels with forceNew=false
+        // reuses the existing GPUTexture when the size matches (updateTexturePixels in place, zero allocation)
+        // and only destroys plus recreates it on a size change. A fresh GUID for every video frame used to
+        // accumulate one JS-side GPUTexture per frame, because the Web backend has no destroy channel; a
+        // looping video notice leaked the whole buffer into JS memory that way. The C# WGPUTexture is only
+        // metadata, so replacing it per update is fine - the previous instance is collected.
+        string newName = !name.IsNullOrWhiteSpace() ? $"{name}#texoverride" : "sprTex_texoverride";
         _jsRuntime.InvokeVoid("seasonWebGPU.createTextureFromPixels",
-            newName, rgba, w, h, /*forceNew=*/true);
+            newName, rgba, w, h, /*forceNew=*/false);
 
         wgpuSprite.WGPUTexture = WGPUTexture.CreateFromPixels(newName, (uint)w, (uint)h);
     }

@@ -138,9 +138,6 @@ public class FullView : Panel
         AddControl(ground);
     }
 
-    public void SetImage(Sprite2D image, float imagePosX, float imagePosY)
-        => SetImage(image, image.Name, imagePosX, imagePosY);
-
     /// <summary>
     /// Overload with an explicit texture name.
     /// The source image Name may only be a placeholder key, such as "Dot" for generated output.

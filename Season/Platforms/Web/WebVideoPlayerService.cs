@@ -92,6 +92,24 @@ internal sealed class WebVideoPlayerService : IVideoPlayerService
             $"[WebVideo] Error: {message}");
     }
 
+    public void Replay()
+    {
+        try
+        {
+            // The JS side rewinds the hidden <video> element and restarts its frame pump,
+            // keeping the same element and dotnet reference. Returns false when nothing is loaded.
+            if (_js.Invoke<bool>("SeasonVideoPlayer.replay"))
+            {
+                _isPlaying = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[WebVideo] Replay: {ex.Message}");
+        }
+    }
+
     public void Stop()
     {
         _isPlaying = false;
