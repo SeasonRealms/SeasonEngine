@@ -33,7 +33,7 @@
         Square150x150Logo="$placeholder$.png"
         Square44x44Logo="$placeholder$.png"
         BackgroundColor="transparent">
-        <uap:DefaultTile Wide310x150Logo="$placeholder$.png" Square310x310Logo="$placeholder$.png"  Square71x71Logo="SmallTile.png"/>
+        <uap:DefaultTile Wide310x150Logo="$placeholder$.png" Square310x310Logo="$placeholder$.png"  Square71x71Logo="$placeholder$.png"/>
         <uap:SplashScreen Image="$placeholder$.png" />
         <uap:InitialRotationPreference>
           <uap:Rotation Preference="landscape"/></uap:InitialRotationPreference>

@@ -93,4 +93,21 @@
 		</ItemGroup>
 	</Target>
 
+	<Target Name="_PurgeResizetizerStampsAfterClean" AfterTargets="_CleanResizetizer">
+		<ItemGroup>
+			<_StaleResizetizerStamp Include="$(_ResizetizerIntermediateOutputPath)maui*.stamp" />
+		</ItemGroup>
+		<Delete Files="@(_StaleResizetizerStamp)" />
+	</Target>
+
+	<Target Name="_InvalidateStaleMauiSplashStamp" BeforeTargets="ProcessMauiSplashScreens"
+	        Condition="'@(MauiSplashScreen->Count())' != '0' and Exists('$(_MauiSplashStampFile)') and !Exists('$(_MauiIntermediateSplashScreen)') ">
+		<Delete Files="$(_MauiSplashStampFile)" />
+	</Target>
+
+	<Target Name="_InvalidateStaleMauiFontStamp" BeforeTargets="ProcessMauiFonts"
+	        Condition="'@(MauiFont->Count())' != '0' and Exists('$(_MauiFontStampFile)') and !Exists('$(_MauiIntermediateFonts)') ">
+		<Delete Files="$(_MauiFontStampFile)" />
+	</Target>
+
 </Project>

@@ -78,96 +78,6 @@
 		<MauiIcon Include="Resources\AppIcon\appicon.svg" Color="#ffffff" />
 		<MauiSplashScreen Include="Resources\Splash\splash.svg" Color="white" BaseSize="128,128" />
 		<MauiAsset Include="Resources\Raw\**" LogicalName="%(RecursiveDir)%(Filename)%(Extension)" />
-		<Content Include="$placeholder$.altform-lightunplated_targetsize-16.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.altform-lightunplated_targetsize-24.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.altform-lightunplated_targetsize-256.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.altform-lightunplated_targetsize-32.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.altform-lightunplated_targetsize-48.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.altform-unplated_targetsize-16.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.altform-unplated_targetsize-24.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.altform-unplated_targetsize-256.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.altform-unplated_targetsize-32.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.altform-unplated_targetsize-48.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.scale-100.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.scale-125.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.scale-150.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.scale-200.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.scale-400.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.targetsize-16.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.targetsize-24.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.targetsize-256.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.targetsize-32.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="$placeholder$.targetsize-48.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="SmallTile.scale-100.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="SmallTile.scale-125.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="SmallTile.scale-150.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="SmallTile.scale-200.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="SmallTile.scale-400.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="SplashScreen.scale-100.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="SplashScreen.scale-125.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="SplashScreen.scale-150.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="SplashScreen.scale-200.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
-		<Content Include="SplashScreen.scale-400.png">
-		  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-		</Content>
 
 		<!-- SeasonAI Panels -->
 		<!--<Compile Remove="Panels\SeasonAI\**" />
@@ -210,5 +120,22 @@
 	<ItemGroup>
 		<Content Update="Resources\Raw\Assets\NotoSansMono-VariableFont.ttf" Link="Assets\NotoSansMono-VariableFont.ttf" />
 	</ItemGroup>
+
+	<Target Name="_PurgeResizetizerStampsAfterClean" AfterTargets="_CleanResizetizer">
+		<ItemGroup>
+			<_StaleResizetizerStamp Include="$(_ResizetizerIntermediateOutputPath)maui*.stamp" />
+		</ItemGroup>
+		<Delete Files="@(_StaleResizetizerStamp)" />
+	</Target>
+
+	<Target Name="_InvalidateStaleMauiSplashStamp" BeforeTargets="ProcessMauiSplashScreens"
+	        Condition="'@(MauiSplashScreen->Count())' != '0' and Exists('$(_MauiSplashStampFile)') and !Exists('$(_MauiIntermediateSplashScreen)') ">
+		<Delete Files="$(_MauiSplashStampFile)" />
+	</Target>
+
+	<Target Name="_InvalidateStaleMauiFontStamp" BeforeTargets="ProcessMauiFonts"
+	        Condition="'@(MauiFont->Count())' != '0' and Exists('$(_MauiFontStampFile)') and !Exists('$(_MauiIntermediateFonts)') ">
+		<Delete Files="$(_MauiFontStampFile)" />
+	</Target>
 
 </Project>
