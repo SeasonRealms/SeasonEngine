@@ -277,11 +277,44 @@ internal class WindowsFeatures : IWindowsFeatures
 
     public void OpenTaskbarSettings()
     {
-        Process.Start(new ProcessStartInfo
-        {
-            FileName = "ms-settings:taskbar",
-            UseShellExecute = true
-        });
+        OpenSettings("ms-settings:taskbar");
+    }
+
+    public void OpenMicrophoneSettings()
+    {
+        OpenSettings("ms-settings:privacy-microphone");
+    }
+
+    public void OpenSoundSettings()
+    {
+        OpenSettings("ms-settings:sound");
+    }
+
+    /// <summary>
+    /// Open an ms-settings: deep link with Process.Start(UseShellExecute = true),
+    /// the shell hand-off the working ControlPanel path uses. It is synchronous and
+    /// thread-agnostic, unlike Windows.System.Launcher.LaunchUriAsync, whose UI-thread
+    /// affinity makes it throw when awaited from the dialog callback / worker context
+    /// this is invoked on; that throw would skip a fallback placed after it and, with
+    /// Release logging gated behind #if DEBUG, the click would silently do nothing.
+    /// Microsoft.Maui's Launcher.TryOpenAsync is avoided too: its Windows implementation
+    /// first asks QueryUriSupportAsync, which does not report ms-settings pages as
+    /// Available, so it never reaches the launch.
+    /// </summary>
+    static void OpenSettings(string page)
+    {
+        //try
+        //{
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = page,
+                UseShellExecute = true
+            });
+        //}
+        //catch (Exception ex)
+        //{
+        //    DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [WindowsFeatures] open settings {page} failed: {ex}");
+        //}
     }
 
     public async Task<bool> IsAutoStartEnabled(string taskId)
@@ -326,7 +359,7 @@ internal class WindowsFeatures : IWindowsFeatures
                 }
                 else if (startupTask.State is StartupTaskState.DisabledByUser)
                 {
-                    await Launcher.TryOpenAsync(new Uri("ms-settings:startupapps"));
+                    OpenSettings("ms-settings:startupapps");
 
                     result = null;
                 }

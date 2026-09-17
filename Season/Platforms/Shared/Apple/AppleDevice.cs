@@ -1248,6 +1248,8 @@ internal class AppleRecordService : RecordService, IRecordService
 
     public async Task<bool> StartRecord()
     {
+        LastFailure = RecordFailure.None;
+
         var permissions = new string[]
         {
             "RECORD_AUDIO"
@@ -1258,6 +1260,8 @@ internal class AppleRecordService : RecordService, IRecordService
         if (!hasPermission)
         {
             Log(LogType.Error, "StartRecord aborted, microphone permission not granted");
+
+            LastFailure = RecordFailure.Permission;
 
             return false;
         }
@@ -1322,6 +1326,8 @@ internal class AppleRecordService : RecordService, IRecordService
             {
                 Log(LogType.Error, $"no input device ({inputDevice}): CoreAudio exposes no microphone to this Mac, connect a USB, Bluetooth or 3.5mm microphone and select it under System Settings > Sound > Input");
 
+                LastFailure = RecordFailure.Device;
+
                 return false;
             }
 
@@ -1345,11 +1351,15 @@ internal class AppleRecordService : RecordService, IRecordService
 
             Log(LogType.Error, "StartRecord failed for every capture path, check System Settings > Privacy & Security > Microphone (an app launched from a terminal or IDE inherits that parent's microphone status) and System Settings > Sound > Input for a selected device");
 
+            LastFailure = RecordFailure.Unknown;
+
             return false;
         }
         catch (Exception ex)
         {
             Log(LogType.Error, $"StartRecord failed: {ex}");
+
+            LastFailure = RecordFailure.Unknown;
 
             return false;
         }

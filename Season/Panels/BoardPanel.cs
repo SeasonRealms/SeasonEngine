@@ -6,7 +6,10 @@ namespace Season.Panels;
 
 public class BoardPanel : Panel
 {
+    public Season.Basic.Color BoardColor = new Season.Basic.Color(200, 200, 200, 255);
+
     public Season.Basic.Color FrameColor = Season.Basic.Colors.White;
+
     Shape board;
 
     Shape lineLeft, lineTop, lineRight, lineDown;
@@ -18,36 +21,35 @@ public class BoardPanel : Panel
 
         board = new Shape()
         {
-            Type = ShapeType.Dot,
-            Color = new Season.Basic.Color(200, 200, 200, 255)
+            Type = ShapeType.Dot
         };
         AddControl(board);
 
         lineLeft = new Shape()
         {
             Type = ShapeType.Dot,
-            Color = Season.Basic.Colors.DarkRed
+            Color = FrameColor
         };
         AddControl(lineLeft);
 
         lineTop = new Shape()
         {
             Type = ShapeType.Dot,
-            Color = Season.Basic.Colors.DarkRed
+            Color = FrameColor
         };
         AddControl(lineTop);
 
         lineRight = new Shape()
         {
             Type = ShapeType.Dot,
-            Color = Season.Basic.Colors.DarkRed
+            Color = FrameColor
         };
         AddControl(lineRight);
 
         lineDown = new Shape()
         {
             Type = ShapeType.Dot,
-            Color = Season.Basic.Colors.DarkRed
+            Color = FrameColor
         };
         AddControl(lineDown);
     }
@@ -56,6 +58,7 @@ public class BoardPanel : Panel
     {
         var result = base.Update(time, alpha: alpha, posX: posX, posY: posY, posZ: posZ, width: width, height: height, depth: depth);
 
+        board.Color = BoardColor;
         board.Update(time, alpha: Alpha, posX: PosX, posY: PosY, width: Width, height: Height);
 
         if (TouchService.Enable && TouchService.IsReleased && !board.MouseOver)

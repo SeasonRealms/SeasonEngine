@@ -892,6 +892,8 @@ internal class AndroidRecordService : RecordService, IRecordService
 
     public async Task<bool> StartRecord()
     {
+        LastFailure = RecordFailure.None;
+
         bool success = false;
 
         var permissions = new string[]
@@ -930,6 +932,10 @@ internal class AndroidRecordService : RecordService, IRecordService
             }).Start();
 
             success = true;
+        }
+        else
+        {
+            LastFailure = RecordFailure.Permission;
         }
 
         return success;

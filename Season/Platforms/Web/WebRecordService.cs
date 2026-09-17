@@ -50,6 +50,8 @@ internal sealed class WebRecordService : RecordService, IRecordService
 
     public async Task<bool> StartRecord()
     {
+        LastFailure = RecordFailure.None;
+
         if (_recording) return false;
 
         var permissions = new string[]
@@ -59,11 +61,24 @@ internal sealed class WebRecordService : RecordService, IRecordService
 
         var hasPermission = await DeviceServices.Core.RequestPermissionAsync(permissions);
 
-        if (!hasPermission) return false;
+        if (!hasPermission)
+        {
+            LastFailure = RecordFailure.Permission;
+
+            return false;
+        }
 
         var started = await WebAudioInterop.Start();
 
         _recording = started;
+
+        if (!started)
+        {
+            // getUserMedia also fails when there is no input device or the device is
+            // unreadable (NotFoundError/NotReadableError); permission was probed above,
+            // so a start failure maps to the device bucket rather than the permission one.
+            LastFailure = RecordFailure.Device;
+        }
 
         return started;
     }

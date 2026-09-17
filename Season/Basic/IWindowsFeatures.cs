@@ -14,6 +14,19 @@ public interface IWindowsFeatures
 
     void OpenTaskbarSettings();
 
+    /// <summary>
+    /// Open the per-app microphone privacy page (Settings > Privacy and security > Microphone)
+    /// so the user can enable microphone access for this app and the global "Let apps
+    /// access your microphone" switch when it is off.
+    /// </summary>
+    void OpenMicrophoneSettings();
+
+    /// <summary>
+    /// Open the sound input page (Settings > System > Sound > Input), the remedy when no
+    /// input device is available: none connected or none selected.
+    /// </summary>
+    void OpenSoundSettings();
+
     void SetBlockingKeys(bool block);
 
     string ExtractIcon(string file);

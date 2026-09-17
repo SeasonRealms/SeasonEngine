@@ -369,9 +369,38 @@ public enum MediaAssetType
     Image, Video, File, Unknown
 }
 
+/// <summary>
+/// Why the last <see cref="IRecordService.StartRecord"/> call failed.
+/// StartRecord only reports a bool, but its two real causes need different remedies:
+/// a permission problem points at the Privacy settings page while a missing device
+/// points at Sound settings. Naming only the permission sends the user to the privacy
+/// page on a machine that has no input device at all (Mac mini and Mac Studio have no
+/// built-in microphone).
+/// </summary>
+public enum RecordFailure
+{
+    /// <summary>No failure recorded; the last attempt either succeeded or never ran.</summary>
+    None,
+
+    /// <summary>Microphone permission was denied, by the user or by platform policy.</summary>
+    Permission,
+
+    /// <summary>No usable input device is available: none connected, none selected, or the device cannot be opened.</summary>
+    Device,
+
+    /// <summary>The recorder failed for a reason that fits neither of the above.</summary>
+    Unknown
+}
+
 public interface IRecordService
 {
     Task<bool> StartRecord();
+
+    /// <summary>
+    /// Why the last <see cref="StartRecord"/> attempt failed, or <see cref="RecordFailure.None"/>
+    /// when it succeeded or never ran. The UI maps this to a specific remedy.
+    /// </summary>
+    RecordFailure LastFailure { get; }
 
     Task<byte[]> StopRecord();
 
@@ -441,6 +470,9 @@ public interface IVideoPlayerService : IDisposable
 
 public abstract class RecordService
 {
+    /// <inheritdoc cref="IRecordService.LastFailure"/>
+    public RecordFailure LastFailure { get; protected set; } = RecordFailure.None;
+
     public async Task<TaskFile> TakePhoto()
     {
         return null;

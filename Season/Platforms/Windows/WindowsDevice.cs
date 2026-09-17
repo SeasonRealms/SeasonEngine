@@ -315,34 +315,60 @@ internal class WindowsMediaPlayer : IMediaPlayer
 
 internal class WindowsDialogService : IDialogService
 {
+    static readonly SemaphoreSlim _dialogLock = new SemaphoreSlim(1, 1);
+
     public async Task<string> ShowMessage(string title, string desc, string[] buttons, string text)
     {
+        await _dialogLock.WaitAsync();
+
+        if (buttons is null || buttons.Length <= 1)
+        {
+            buttons = new string[] { "OK", "Cancel" };
+        }
+
         var tcs = new TaskCompletionSource<string>();
 
-        WindowsApp.Window.DispatcherQueue.TryEnqueue(async () =>
+        if (!WindowsApp.Window.DispatcherQueue.TryEnqueue(async () =>
         {
-            var dialog = new Microsoft.UI.Xaml.Controls.ContentDialog()
+            try
             {
-                Content = new Microsoft.UI.Xaml.Controls.TextBlock()
-            };
-            dialog.Title = title;
-            dialog.XamlRoot = WindowsApp.Window.Content.XamlRoot;
-            dialog.PrimaryButtonText = buttons[0];
-            //dialog.CloseButtonText = buttons[1];
-            dialog.Style = Microsoft.UI.Xaml.Application.Current.Resources["DefaultContentDialogStyle"] as Microsoft.UI.Xaml.Style;
+                var dialog = new Microsoft.UI.Xaml.Controls.ContentDialog()
+                {
+                    Content = new Microsoft.UI.Xaml.Controls.TextBlock()
+                };
+                dialog.Title = title;
+                dialog.XamlRoot = WindowsApp.Window.Content.XamlRoot;
+                dialog.PrimaryButtonText = buttons[0];
+                dialog.CloseButtonText = buttons.Length > 1 && !string.IsNullOrEmpty(buttons[1]) ? buttons[1] : null;
+                dialog.Style = Microsoft.UI.Xaml.Application.Current.Resources["DefaultContentDialogStyle"] as Microsoft.UI.Xaml.Style;
 
-            var edit = dialog.Content as Microsoft.UI.Xaml.Controls.TextBlock;
-            edit.Text = text;
+                var edit = dialog.Content as Microsoft.UI.Xaml.Controls.TextBlock;
+                edit.Text = text;
 
-            var result = await dialog.ShowAsync();
+                var result = await dialog.ShowAsync();
 
+                // Cross-platform contract (matches the Android/Linux/Web dialog services):
+                // the primary button returns the caller's text, every other dismissal null.
+                tcs.TrySetResult(result is Microsoft.UI.Xaml.Controls.ContentDialogResult.Primary ? text : null);
+            }
+            catch (Exception ex)
+            {
+                tcs.TrySetException(ex);
+            }
+            finally
+            {
+                _dialogLock.Release();
+            }
+        }))
+        {
+            // TryEnqueue reports false when the dispatcher is shutting down; complete the
+            // task instead of leaving the caller awaiting forever.
+            _dialogLock.Release();
             tcs.TrySetResult(null);
-        });
+        }
 
         return await tcs.Task;
     }
-
-    static readonly SemaphoreSlim _dialogLock = new SemaphoreSlim(1, 1);
 
     public async Task<string> ShowKeyboard(string title, string desc, string[] buttons, string text)
     {
@@ -355,7 +381,7 @@ internal class WindowsDialogService : IDialogService
 
         var tcs = new TaskCompletionSource<string>();
 
-        WindowsApp.Window.DispatcherQueue.TryEnqueue(async () =>
+        if (!WindowsApp.Window.DispatcherQueue.TryEnqueue(async () =>
         {
             try
             {
@@ -398,7 +424,13 @@ internal class WindowsDialogService : IDialogService
             {
                 _dialogLock.Release();
             }
-        });
+        }))
+        {
+            // TryEnqueue returns false when the dispatcher is shutting down; only then
+            // complete the task, instead of leaving the caller awaiting forever.
+            _dialogLock.Release();
+            tcs.TrySetResult(null);
+        }
 
         return await tcs.Task;
     }
@@ -888,6 +920,8 @@ internal class WindowsRecordService : RecordService, IRecordService
 
     public async Task<bool> StartRecord()
     {
+        LastFailure = RecordFailure.None;
+
         if (_graph != null)
         {
             //_graph.Stop();
@@ -899,6 +933,17 @@ internal class WindowsRecordService : RecordService, IRecordService
         {
             DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] StartRecord begin thread={Environment.CurrentManagedThreadId} ui={WindowsApp.Window?.DispatcherQueue.HasThreadAccess}");
 
+            // The packaged build is gated by the per-app privacy toggle and has no runtime
+            // consent prompt, so probe it up front and let the UI offer the right remedy.
+            // Unspecified still passes: unpackaged dev runs have no per-app entry and the
+            // real gate surfaces at CreateDeviceInputNodeAsync.
+            if (!await DeviceServices.Core.RequestPermissionAsync(new[] { "MICROPHONE" }))
+            {
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] StartRecord aborted, microphone permission not granted");
+                LastFailure = RecordFailure.Permission;
+                return false;
+            }
+
             var settings = new AudioGraphSettings(AudioRenderCategory.Speech)
             {
                 EncodingProperties = AudioEncodingProperties.CreatePcm(SampleRate, Channels, BitsPerSample)
@@ -908,6 +953,7 @@ internal class WindowsRecordService : RecordService, IRecordService
             if (createResult.Status != AudioGraphCreationStatus.Success)
             {
                 DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] AudioGraph create failed: {createResult.Status}");
+                LastFailure = createResult.Status is AudioGraphCreationStatus.DeviceNotAvailable ? RecordFailure.Device : RecordFailure.Unknown;
                 return false;
             }
             _graph = createResult.Graph;
@@ -919,6 +965,12 @@ internal class WindowsRecordService : RecordService, IRecordService
                     + (inputResult.Status == AudioDeviceNodeCreationStatus.AccessDenied
                         ? " - check Windows Settings > Privacy > Microphone and the package microphone capability"
                         : ""));
+                LastFailure = inputResult.Status switch
+                {
+                    AudioDeviceNodeCreationStatus.AccessDenied => RecordFailure.Permission,
+                    AudioDeviceNodeCreationStatus.DeviceNotAvailable => RecordFailure.Device,
+                    _ => RecordFailure.Unknown
+                };
                 await CleanupSessionAsync();
                 return false;
             }
@@ -944,6 +996,7 @@ internal class WindowsRecordService : RecordService, IRecordService
             if (fileResult.Status != AudioFileNodeCreationStatus.Success)
             {
                 DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] WAV output node failed: {fileResult.Status}");
+                LastFailure = RecordFailure.Unknown;
                 await CleanupSessionAsync();
                 return false;
             }
@@ -959,6 +1012,7 @@ internal class WindowsRecordService : RecordService, IRecordService
         catch (Exception ex)
         {
             DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] StartRecord failed: {ex}");
+            LastFailure = RecordFailure.Unknown;
             await CleanupSessionAsync();
             return false;
         }
