@@ -1,0 +1,722 @@
+/* ==========================================================================
+   SeasonStudio website - design system
+
+   Hand-written static site. No build step, no framework, no CDN. This file is
+   a sibling of the SeasonEngine site's assets/css/site.css: it deliberately
+   keeps the same se-* class names so both sites share one layout skeleton,
+   and changes only the design tokens plus a handful of st-* components.
+
+   Conventions:
+   - This whole studio/ folder is self-contained so it can be copied verbatim
+     to produce a localized mirror. Nothing here reaches outside studio/.
+   - Studio root pages (index.html, 404.html) reference assets as  assets/...
+     Pages one folder deep (tools/, guide/, models/, roadmap/) use ../assets/...
+   - Every page is self-contained: copy the closest existing page and edit the
+     content. Header and footer markup is duplicated on purpose.
+   ========================================================================== */
+
+/* --- tokens --------------------------------------------------------------- */
+
+:root {
+    /* Keeps native scrollbars, form controls and the caret in step with the
+       theme. Dark is the site default, so the dark block below overrides this. */
+    color-scheme: light;
+
+    /* Watercolour paper. The palette is sampled from the app's own artwork:
+       leaf green and the red leaf from the logo, amber from the fireflies. */
+    --brand: #6aa03c;
+    --brand-strong: #557f2e;
+    --brand-soft: rgba(106, 160, 60, .12);
+
+    --amber: #dfa42c;
+    --clay: #c4553a;
+
+    --banner-bg: #efe8d5;
+    --page-bg: #f5f0e2;
+    --surface: #fffdf7;
+    --surface-2: #f6efdd;
+    --border: #e5dcc4;
+    --text: #3b4a3c;
+    --text-gray: #7b8570;
+    --link: #4f7f2a;
+    --code-bg: #f7f2e2;
+    --code-text: #4a5344;
+    --shadow: 0 4px 12px rgba(70, 60, 30, .10);
+    --shadow-lift: 0 10px 26px rgba(70, 60, 30, .16);
+    --shell-overlay: linear-gradient(rgba(245, 240, 226, .86), rgba(245, 240, 226, .95));
+
+    /* The hero plate and the video melt into each other through these two.
+       --film-center is the warm middle of the artwork, --film-edge its cool
+       watercolour rim; the video's feather ring fades out to --film-edge. */
+    --film-center: #fbf3d8;
+    --film-mid: #e6e5cd;
+    --film-edge: #ccd8d9;
+
+    --ok: #4a8a3d;
+    --warn: #c4842a;
+    --off: #93927f;
+
+    --radius: 14px;
+    --radius-sm: 8px;
+    --maxw: 1160px;
+
+    --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+
+    --tok-comment: #94997f;
+    --tok-string: #a86a24;
+    --tok-keyword: #4f7f2a;
+    --tok-number: #8a6bbd;
+    --tok-type: #2e7f6d;
+
+    /* Paper grain, generated in place so the folder carries no texture file. */
+    --paper-noise: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23n)' opacity='.30'/%3E%3C/svg%3E");
+}
+
+[data-theme="dark"] {
+    color-scheme: dark;
+
+    /* Night forest: the same paper, read by lamplight. */
+    --brand: #8cc25a;
+    --brand-strong: #76ab47;
+    --brand-soft: rgba(140, 194, 90, .14);
+
+    --amber: #e6b455;
+    --clay: #d6714f;
+
+    --banner-bg: #0d1211;
+    --page-bg: #121816;
+    --surface: #1b221d;
+    --surface-2: #161d18;
+    --border: #2c352d;
+    --text: #ecebdf;
+    --text-gray: #a6ab98;
+    --link: #a7d477;
+    --code-bg: #141a16;
+    --code-text: #dcdcc9;
+    --shadow: 0 4px 14px rgba(0, 0, 0, .5);
+    --shadow-lift: 0 12px 30px rgba(0, 0, 0, .6);
+    --shell-overlay: linear-gradient(rgba(18, 24, 22, .88), rgba(18, 24, 22, .96));
+
+    --film-center: #2f3a34;
+    --film-mid: #1e2622;
+    --film-edge: #141b1a;
+
+    --ok: #7fbf5f;
+    --warn: #dfa94a;
+    --off: #8a8b7a;
+
+    --tok-comment: #8b9080;
+    --tok-string: #d9a874;
+    --tok-keyword: #a7d477;
+    --tok-number: #c3aae8;
+    --tok-type: #6fd3bd;
+
+    --paper-noise: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23n)' opacity='.16'/%3E%3C/svg%3E");
+}
+
+/* --- base ---------------------------------------------------------------- */
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; scroll-padding-top: 110px; }
+
+body {
+    margin: 0;
+    background-color: var(--page-bg);
+    color: var(--text);
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 16.5px;
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+img { max-width: 100%; }
+
+h1, h2, h3, h4 { line-height: 1.28; color: var(--text); }
+
+/* Headings carry the literary half of the design: a serif face that every
+   target platform already has, so there is still no web font to download. */
+h1, h2 { font-family: var(--font-display); font-weight: 600; letter-spacing: -.01em; }
+h1 { font-size: 37px; margin: 0 0 14px; }
+h2 { font-size: 27px; margin: 36px 0 12px; }
+h3 { font-size: 19px; margin: 26px 0 8px; }
+
+p { margin: 0 0 15px; max-width: 68ch; }
+
+hr.se-hr { border: 0; border-top: 1px solid var(--border); margin: 34px 0; }
+
+.se-container { width: 100%; max-width: var(--maxw); margin: 0 auto; padding: 0 20px; }
+
+.se-muted { color: var(--text-gray); }
+.se-lede { font-family: var(--font-display); font-size: 19.5px; line-height: 1.65; color: var(--text-gray); max-width: 62ch; }
+.se-center { text-align: center; }
+.se-nowrap { white-space: nowrap; }
+.se-mt0 { margin-top: 0; }
+
+/* --- top bar + navigation ------------------------------------------------ */
+
+.se-topbar {
+    background-color: var(--banner-bg);
+    border-bottom: 1px solid var(--border);
+    font-size: 14px;
+}
+
+.se-topbar .se-container {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 18px;
+    height: 36px;
+}
+
+.se-topbar a { color: var(--text-gray); }
+
+.se-theme {
+    width: 26px;
+    height: 26px;
+    cursor: pointer;
+    border: 0;
+    background: transparent;
+    padding: 0;
+    line-height: 0;
+}
+
+.se-nav {
+    position: sticky;
+    top: 0;
+    z-index: 40;
+    background-color: var(--surface);
+    border-bottom: 1px solid var(--border);
+    box-shadow: 0 1px 6px rgba(0, 0, 0, .04);
+}
+
+.se-nav .se-container {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    min-height: 62px;
+}
+
+.se-nav__brand { display: flex; align-items: center; gap: 10px; margin-right: 12px; }
+.se-nav__brand img { width: 38px; height: 40px; }
+.se-nav__brand span { font-family: var(--font-display); font-weight: 600; font-size: 21px; color: var(--text); }
+.se-nav__brand:hover { text-decoration: none; }
+
+.se-nav__links { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+
+.se-nav__links a {
+    display: inline-block;
+    padding: 8px 12px;
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-weight: 500;
+}
+
+.se-nav__links a:hover { background-color: var(--brand-soft); text-decoration: none; }
+.se-nav__links a[aria-current="page"] { color: var(--brand); font-weight: 700; }
+
+.se-nav__spacer { flex: 1 1 auto; }
+
+.se-nav__toggle {
+    display: none;
+    margin-left: auto;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text);
+    border-radius: var(--radius-sm);
+    padding: 6px 10px;
+    font-size: 18px;
+    cursor: pointer;
+}
+
+/* --- page shell --------------------------------------------------------- */
+
+.se-shell {
+    background-image: var(--paper-noise);
+    background-repeat: repeat;
+    padding: 34px 0 54px;
+    min-height: 70vh;
+}
+
+/* --- cards -------------------------------------------------------------- */
+
+.se-card {
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 32px;
+    margin-bottom: 26px;
+}
+
+.se-card--tight { padding: 22px; }
+.se-card--plain { box-shadow: none; }
+
+.se-card__title { margin: 0 0 6px; font-size: 22px; font-weight: 700; }
+
+/* --- hero --------------------------------------------------------------- */
+
+.se-hero { display: flex; flex-wrap: wrap; gap: 34px; align-items: center; }
+.se-hero__text { flex: 1 1 400px; min-width: 300px; }
+.se-hero__art { flex: 0 1 440px; min-width: 260px; }
+
+.se-hero__title { font-size: 40px; font-weight: 600; margin: 0 0 10px; }
+
+/* The hero card is a painted plate rather than a panel: its background is the
+   artwork's own colour field, so the video sitting on it has no visible edge.
+   Replacing --paper-wash with a hand-extended still of the video is the only
+   change needed to swap the gradient for real paint. */
+.st-plate {
+    --paper-wash: none;
+    background-image:
+        var(--paper-wash),
+        radial-gradient(125% 105% at 74% 40%,
+            var(--film-center) 0%, var(--film-mid) 42%, var(--film-edge) 72%, var(--film-edge) 100%),
+        var(--paper-noise);
+    background-repeat: no-repeat, no-repeat, repeat;
+    background-size: cover, cover, auto;
+    background-position: center, center, center;
+    border-color: var(--film-edge);
+}
+
+/* --- the film block ----------------------------------------------------- */
+
+.st-film { position: relative; border-radius: var(--radius); overflow: hidden; line-height: 0; }
+
+.st-film video, .st-film img {
+    display: block;
+    width: 100%;
+    height: auto;
+    border-radius: var(--radius);
+}
+
+/* Feather ring: transparent in the middle, the plate's rim colour at the
+   edges. One overlay serves both themes because --film-edge is themed, and
+   the video itself is never dimmed - washes lose their light if you do. */
+.st-film::after {
+    content: "";
+    position: absolute;
+    inset: -1px;
+    pointer-events: none;
+    background: radial-gradient(closest-side at 50% 48%,
+        rgba(0, 0, 0, 0) 56%, var(--film-edge) 100%);
+}
+
+.st-film__poster { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+    .st-film video { display: none; }
+    .st-film__poster { display: block; }
+}
+
+/* --- buttons ------------------------------------------------------------ */
+
+.se-btnrow { display: flex; flex-wrap: wrap; gap: 14px; margin: 24px 0 8px; }
+
+.se-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 11px 22px;
+    border-radius: 999px;
+    font-weight: 700;
+    font-size: 16px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: transform .2s ease, box-shadow .2s ease, background-color .2s ease;
+}
+
+.se-btn img { width: 24px; height: 24px; }
+.se-btn:hover { text-decoration: none; transform: translateY(-2px); box-shadow: var(--shadow-lift); }
+
+.se-btn--primary { background-color: var(--brand); color: #fff; }
+.se-btn--primary:hover { background-color: var(--brand-strong); color: #fff; }
+.se-btn--ghost { background-color: var(--surface); color: var(--text); border-color: var(--border); }
+
+/* --- store badges ------------------------------------------------------- */
+
+.se-store { display: flex; flex-wrap: wrap; gap: 26px; margin-top: 16px; }
+.se-store__item { text-align: center; color: var(--text-gray); font-size: 13.5px; width: 104px; }
+.se-store__item img { height: 58px; width: auto; display: block; margin: 0 auto 4px; }
+.se-store__item--soon { opacity: .72; cursor: default; }
+.se-store__item--muted { opacity: .4; cursor: default; }
+
+/* --- grids and feature tiles -------------------------------------------- */
+
+.se-grid { display: grid; gap: 26px; }
+.se-grid--2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+.se-grid--3 { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.se-grid--4 { grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); }
+
+.se-feature h3 { margin: 0 0 6px; font-size: 19px; }
+.se-feature p { color: var(--text-gray); font-size: 15px; margin: 0; }
+.se-feature__mark {
+    display: inline-block;
+    font-family: var(--font-display);
+    font-size: 13px;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--brand);
+    margin-bottom: 2px;
+}
+
+.se-linkcard {
+    display: block;
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 22px;
+    color: var(--text);
+    transition: transform .2s ease, box-shadow .2s ease;
+}
+.se-linkcard:hover { text-decoration: none; transform: translateY(-4px); box-shadow: var(--shadow-lift); }
+.se-linkcard h3 { margin: 0 0 6px; font-size: 18px; color: var(--brand); }
+.se-linkcard p { margin: 0; color: var(--text-gray); font-size: 15px; }
+.se-linkcard__meta { display: block; margin-top: 10px; font-size: 13px; color: var(--text-gray); }
+
+/* --- badges and pills --------------------------------------------------- */
+
+.se-badge {
+    display: inline-block;
+    padding: 1px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .02em;
+    white-space: nowrap;
+    border: 1px solid transparent;
+}
+
+/* Ready / Early / Experimental / Planned. The engine site's shipped-partial-
+   absent names are kept as aliases so shared markup does not have to change. */
+.se-badge--shipped, .se-badge--ready { color: var(--ok); border-color: var(--ok); background: rgba(74, 138, 61, .12); }
+.se-badge--partial, .se-badge--early { color: var(--warn); border-color: var(--warn); background: rgba(196, 132, 42, .14); }
+.se-badge--exp { color: var(--clay); border-color: var(--clay); background: rgba(196, 85, 58, .13); }
+.se-badge--absent, .se-badge--planned { color: var(--off); border-color: var(--off); background: rgba(147, 146, 127, .14); }
+
+.se-pill {
+    display: inline-block;
+    padding: 3px 12px;
+    margin: 0 6px 6px 0;
+    border-radius: 999px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--text-gray);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+/* Pills double as a jump list at the top of long pages. */
+a.se-pill:hover { background: var(--brand-soft); border-color: var(--brand); color: var(--brand); text-decoration: none; }
+
+/* A maturity badge sitting inside a heading should read as an aside, not as
+   part of the title, so it keeps the body font and does not scale with h2. */
+h2 > .se-badge, h3 > .se-badge {
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", Arial, sans-serif;
+    vertical-align: middle;
+    margin-left: 8px;
+    position: relative;
+    top: -2px;
+}
+
+/* --- the run strip (prompt to file) ------------------------------------- */
+
+.se-pipeline { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0 4px; }
+
+.se-pipeline__step {
+    padding: 7px 14px;
+    border-radius: 999px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.se-pipeline__step--accent { background: var(--brand-soft); border-color: var(--brand); color: var(--brand); }
+.se-pipeline__step--gate { background: rgba(196, 85, 58, .12); border-color: var(--clay); color: var(--clay); }
+.se-pipeline__arrow { color: var(--text-gray); font-weight: 700; }
+
+/* --- seasons divider ---------------------------------------------------- */
+
+.st-seasons {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    margin: 26px 0 4px;
+    font-family: var(--font-display);
+    font-size: 12px;
+    letter-spacing: .26em;
+    text-transform: uppercase;
+    color: var(--text-gray);
+}
+
+.st-seasons::before, .st-seasons::after {
+    content: "";
+    flex: 1 1 auto;
+    height: 1px;
+    background: linear-gradient(to right, transparent, var(--border), transparent);
+}
+
+/* --- pull quote --------------------------------------------------------- */
+
+.st-quote {
+    font-family: var(--font-display);
+    font-size: 21px;
+    font-style: italic;
+    line-height: 1.6;
+    color: var(--text);
+    border-left: 3px solid var(--brand);
+    padding: 2px 0 2px 20px;
+    margin: 22px 0;
+    max-width: 56ch;
+}
+
+.st-quote span { display: block; font-size: 14px; font-style: normal; color: var(--text-gray); margin-top: 8px; letter-spacing: .04em; }
+
+/* --- logo strips -------------------------------------------------------- */
+
+.se-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 28px; margin-top: 14px; }
+.se-strip img { height: 58px; width: auto; }
+.se-strip--sm img { height: 44px; }
+
+/* --- code and prompt cards ---------------------------------------------- */
+
+.se-code {
+    position: relative;
+    background-color: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 16px 18px;
+    margin: 0 0 16px;
+    overflow-x: auto;
+    font-size: 14px;
+    line-height: 1.65;
+}
+
+.se-code code {
+    font-family: Consolas, "SF Mono", Menlo, "Courier New", monospace;
+    color: var(--code-text);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+code.se-inline {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-family: Consolas, "SF Mono", Menlo, monospace;
+    font-size: .92em;
+    color: var(--code-text);
+}
+
+.se-code__copy {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-gray);
+    border-radius: 999px;
+    font-size: 12px;
+    padding: 2px 11px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity .15s ease;
+}
+
+.se-code:hover .se-code__copy,
+.st-prompt:hover .se-code__copy,
+.se-code__copy:focus { opacity: 1; }
+
+.tok-comment { color: var(--tok-comment); font-style: italic; }
+.tok-string { color: var(--tok-string); }
+.tok-keyword { color: var(--tok-keyword); }
+.tok-number { color: var(--tok-number); }
+.tok-type { color: var(--tok-type); }
+
+/* A prompt is not code, so it gets its own card: a label column and a value
+   column, still copyable through the same button studio.js attaches. */
+.st-prompt {
+    position: relative;
+    background-color: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 16px 18px;
+    margin: 0 0 16px;
+}
+
+.st-prompt dl {
+    display: grid;
+    grid-template-columns: 96px minmax(0, 1fr);
+    gap: 4px 14px;
+    margin: 0;
+    font-size: 14.5px;
+}
+.st-prompt dt {
+    font-family: var(--font-display);
+    font-size: 12.5px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--text-gray);
+    padding-top: 3px;
+}
+.st-prompt dd { margin: 0; color: var(--text); }
+.st-prompt dd code { font-family: Consolas, "SF Mono", Menlo, monospace; font-size: 13.5px; color: var(--code-text); }
+
+/* --- code + result pair ------------------------------------------------- */
+
+.se-codepair { display: grid; gap: 26px; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); align-items: start; }
+.se-codepair .se-code { margin-bottom: 0; }
+
+/* --- screenshots -------------------------------------------------------- */
+
+.se-shot { margin: 0; position: relative; }
+.se-shot img { display: block; width: 100%; border-radius: var(--radius-sm); border: 1px solid var(--border); }
+.se-shot figcaption { margin-top: 9px; font-size: 14px; color: var(--text-gray); }
+.se-shot figcaption strong { color: var(--text); font-weight: 600; }
+
+.se-shot__tag {
+    position: absolute;
+    left: 10px;
+    top: 10px;
+    background: rgba(24, 28, 22, .62);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 999px;
+    letter-spacing: .02em;
+}
+
+/* --- tables ------------------------------------------------------------- */
+
+.se-table-wrap { overflow-x: auto; margin-bottom: 18px; }
+
+.se-table { width: 100%; border-collapse: collapse; font-size: 15px; }
+.se-table th, .se-table td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.se-table th { background: var(--surface-2); font-weight: 700; white-space: nowrap; }
+.se-table tbody tr:hover { background: var(--brand-soft); }
+.se-table code { font-family: Consolas, "SF Mono", Menlo, monospace; font-size: .9em; }
+.se-table--center td:not(:first-child), .se-table--center th:not(:first-child) { text-align: center; }
+.se-table p { max-width: none; margin: 0; }
+
+.se-yes { color: var(--ok); font-weight: 700; }
+.se-no { color: var(--off); font-weight: 700; }
+
+/* --- callouts ----------------------------------------------------------- */
+
+.se-callout {
+    border-left: 4px solid var(--brand);
+    background: var(--surface-2);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    padding: 15px 18px;
+    margin: 0 0 18px;
+    font-size: 15px;
+}
+
+.se-callout p { margin-bottom: 8px; }
+.se-callout p:last-child { margin-bottom: 0; }
+.se-callout__title { font-weight: 700; display: block; margin-bottom: 4px; }
+.se-callout--warn { border-left-color: var(--warn); }
+.se-callout--contract { border-left-color: var(--ok); }
+.se-callout--care { border-left-color: var(--clay); }
+
+/* --- lists -------------------------------------------------------------- */
+
+.se-list { padding-left: 22px; margin: 0 0 16px; max-width: 68ch; }
+.se-list li { margin-bottom: 8px; }
+.se-list--plain { list-style: none; padding-left: 0; }
+
+/* --- doc layout --------------------------------------------------------- */
+
+.se-doc { display: grid; grid-template-columns: minmax(0, 1fr) 210px; gap: 30px; align-items: start; }
+.se-doc--wide { grid-template-columns: minmax(0, 1fr) 210px; }
+.se-doc--plain { grid-template-columns: minmax(0, 1fr); }
+
+.se-toc {
+    position: sticky;
+    top: 82px;
+    font-size: 14.5px;
+    max-height: calc(100vh - 110px);
+    overflow-y: auto;
+}
+
+.se-toc h4 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-gray); }
+.se-toc ul { list-style: none; margin: 0; padding: 0; }
+.se-toc a { display: block; padding: 3px 0 3px 10px; border-left: 2px solid var(--border); color: var(--text-gray); }
+.se-toc a:hover { color: var(--text); text-decoration: none; }
+.se-toc a.is-active { color: var(--brand); border-left-color: var(--brand); font-weight: 600; }
+.se-toc li.is-h3 a { padding-left: 22px; font-size: 13.5px; }
+
+.se-doc__main { min-width: 0; }
+.se-doc__main > .se-card { margin-bottom: 26px; }
+
+.se-crumbs { font-size: 14px; color: var(--text-gray); margin-bottom: 14px; }
+.se-crumbs a { color: var(--text-gray); }
+
+.se-pagenav { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 14px; }
+.se-pagenav a { font-weight: 600; }
+
+/* --- footer ------------------------------------------------------------- */
+
+.se-footer {
+    background-color: var(--surface);
+    border-top: 1px solid var(--border);
+    padding: 32px 0 26px;
+    color: var(--text-gray);
+    font-size: 15px;
+}
+
+.se-footer__cols { display: grid; gap: 26px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-bottom: 22px; }
+.se-footer h4 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--text); }
+.se-footer ul { list-style: none; margin: 0; padding: 0; }
+.se-footer li { margin-bottom: 5px; }
+.se-footer a { color: var(--text-gray); }
+.se-footer a:hover { color: var(--brand); }
+.se-footer p { max-width: none; }
+.se-footer__bottom { border-top: 1px solid var(--border); padding-top: 16px; font-size: 14px; display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; }
+
+/* --- responsive --------------------------------------------------------- */
+
+@media (max-width: 1080px) {
+    .se-doc, .se-doc--wide { grid-template-columns: minmax(0, 1fr); }
+    .se-toc { display: none; }
+}
+
+@media (max-width: 860px) {
+    h1, .se-hero__title { font-size: 30px; }
+    h2 { font-size: 23px; }
+
+    .se-nav__toggle { display: inline-block; }
+
+    .se-nav__links {
+        display: none;
+        order: 3;
+        flex-basis: 100%;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0;
+        padding-bottom: 12px;
+    }
+
+    .se-nav__links.is-open { display: flex; }
+    .se-nav__links a { padding: 10px 12px; border-radius: 0; border-bottom: 1px solid var(--border); }
+    .se-nav__spacer { display: none; }
+
+    .se-card { padding: 22px; }
+    .se-shell { padding-top: 24px; }
+
+    /* The artwork is the argument on this site, so it stays on small screens
+       - unlike the engine site, which hides its hero image here. */
+    .se-hero { gap: 24px; }
+    .se-hero__art { flex: 1 1 100%; order: -1; }
+
+    .st-prompt dl { grid-template-columns: minmax(0, 1fr); gap: 0 0; }
+    .st-prompt dt { padding-top: 10px; }
+}

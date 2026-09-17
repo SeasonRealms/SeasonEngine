@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<!--
+  SeasonStudio website - guide.
+
+  Pages one folder deep use  ../assets/...
+  Header and footer markup is duplicated on every page on purpose.
+-->
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Guide — SeasonStudio</title>
+    <meta name="description" content="Your first ten minutes in SeasonStudio: the window, adding models, writing prompts, saving results, content safety, privacy, and what to do when something goes wrong." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/studio/guide/" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="Guide — SeasonStudio" />
+    <meta property="og:description" content="Short, practical, and written for people who would rather be making something." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/studio/guide/" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/studio/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/studio.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('st-theme');
+                if (!t) t = 'dark';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="#privacy">Privacy</a>
+            <a href="../models/#licenses">Model licenses</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Moon.png" alt="Dark theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Logo.png" alt="SeasonStudio" width="38" height="40" />
+                <span>SeasonStudio</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../tools/">Tools</a>
+                <a href="index.html" aria-current="page">Guide</a>
+                <a href="../models/">Models</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="../index.html#get-it">Get it</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+
+            <p class="se-crumbs"><a href="../index.html">Home</a> &rsaquo; Guide</p>
+
+            <div class="se-doc se-doc--wide">
+                <div class="se-doc__main" data-toc-source>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">A short guide</h1>
+                        <p class="se-lede">
+                            SeasonStudio is meant to be learned by using it, not by reading about it. This page
+                            exists for the handful of things worth knowing before you start, and the handful more
+                            worth knowing when something surprises you.
+                        </p>
+                        <p class="se-muted">
+                            Nothing here takes longer to read than the model you are waiting on takes to load.
+                        </p>
+                    </section>
+
+                    <!-- FIRST RUN ------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="first-run">Your first ten minutes</h2>
+                        <p>
+                            The app opens with a small language model already inside, so there is something to do
+                            immediately. A suggested order:
+                        </p>
+
+                        <ul class="se-list">
+                            <li>
+                                <strong>Open Text and ask it something.</strong> No download, no setup. This tells
+                                you how the window works and roughly how fast your machine is.
+                            </li>
+                            <li>
+                                <strong>Open Translate and paste a paragraph.</strong> The most immediately
+                                dependable tool in the app, and a good sanity check that inference is using the
+                                backend you expect.
+                            </li>
+                            <li>
+                                <strong>Open Image and type one sentence.</strong> The panel will tell you which
+                                model file it needs. Start with a light model at 512&#215;512 to see the whole loop
+                                end to end before committing to a large download.
+                            </li>
+                            <li>
+                                <strong>Look at the results panel.</strong> Everything from every tool lands in the
+                                same place, and it is the fastest route to "save that one".
+                            </li>
+                        </ul>
+
+                        <div class="se-callout">
+                            <p>
+                                Resist the temptation to download the biggest model first. A fast model teaches you
+                                the app; a slow one teaches you to wait.
+                            </p>
+                        </div>
+                    </section>
+
+                    <!-- THE WINDOW ------------------------------------------ -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="window">Finding your way around</h2>
+                        <p>
+                            One window, three regions, and they never move. The tool list runs down the left, the
+                            controls for the current tool sit in the middle, and results collect on the right.
+                        </p>
+
+                        <div class="se-grid se-grid--2" style="margin-top:20px;">
+                            <div>
+                                <h3>The tool list</h3>
+                                <p class="se-muted">
+                                    Eight entries — Text, Translate, Image, Video, Music, STT, TTS and Vision.
+                                    Switching tools does not throw away what you had; you can go back to a panel and
+                                    find your settings where you left them.
+                                </p>
+                                <h3>Premium</h3>
+                                <p class="se-muted">
+                                    Bottom left. One screen, one price, a Restore action for a purchase you already
+                                    made. It unlocks all models and the hardware acceleration backends; there is no
+                                    subscription and nothing recurring.
+                                </p>
+                            </div>
+                            <div>
+                                <h3>The controls</h3>
+                                <p class="se-muted">
+                                    Model, prompt, and the two or three numbers that matter for this tool. Panels
+                                    deliberately expose less than a node-graph app would — the aim is a decision you
+                                    can make in seconds.
+                                </p>
+                                <h3>The results panel</h3>
+                                <p class="se-muted">
+                                    Every output from every tool, newest first, with a full-size view a click away.
+                                    Save what you want; the rest costs you nothing but a little disk cache.
+                                </p>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- MODELS ---------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="models">Adding models</h2>
+                        <p>
+                            This is the one piece of housekeeping the studio asks of you, and it works in the least
+                            demanding way we could find: a run tells you what it is missing, and nothing else.
+                        </p>
+
+                        <h3>Two ways in</h3>
+                        <ul class="se-list">
+                            <li>
+                                <strong>Let the run fetch it.</strong> Choose a model, press go, and if the file is
+                                not on disk the app names it and offers to download it. Only that file — the studio
+                                never pre-provisions a model zoo you did not ask for.
+                            </li>
+                            <li>
+                                <strong>Import what you already have.</strong> If you have a folder of GGUF or ONNX
+                                files from other local tools, point the studio at it. Nothing is copied or converted
+                                behind your back and nothing touches the network.
+                            </li>
+                        </ul>
+
+                        <h3>Building a shelf that suits you</h3>
+                        <p class="se-muted">
+                            Two image models beat five: one fast one for exploring, one heavy one for finishing.
+                            The same logic applies everywhere — a small transcription model for voice memos and a
+                            large one for interviews will serve you better than one compromise in the middle.
+                        </p>
+
+                        <h3>A note on file sizes</h3>
+                        <p class="se-muted">
+                            Image models run from a couple of gigabytes to twenty; video models are larger still.
+                            Check <a href="../models/#hardware">hardware expectations</a> before starting a download
+                            you will not be able to run.
+                        </p>
+                    </section>
+
+                    <!-- PROMPTING ------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="prompting">Writing prompts</h2>
+                        <p>
+                            There is no secret syntax and no magic word list. Prompting well is mostly about being
+                            specific in the right places and quiet in the others.
+                        </p>
+
+                        <blockquote class="st-quote">
+                            Name the subject, then the light, then the medium. Everything else is decoration.
+                            <span>&mdash; the shortest useful prompting advice we know</span>
+                        </blockquote>
+
+                        <h3>Four habits that pay for themselves</h3>
+                        <ul class="se-list">
+                            <li>
+                                <strong>Lead with the subject, not the style.</strong> "A wizard reading under a
+                                mushroom" first; "watercolour storybook illustration" after. Models weight the front
+                                of a prompt more heavily.
+                            </li>
+                            <li>
+                                <strong>Describe light explicitly.</strong> Soft rim light, overcast noon, single
+                                candle. It changes an image more than any adjective about quality.
+                            </li>
+                            <li>
+                                <strong>Change one thing at a time.</strong> When a result is nearly right, edit one
+                                clause and keep the seed. Rewriting the whole prompt throws away what worked.
+                            </li>
+                            <li>
+                                <strong>Use the negative field sparingly.</strong> Two or three genuine problems —
+                                text, watermark, harsh contrast — beat a paragraph of borrowed boilerplate.
+                            </li>
+                        </ul>
+
+                        <h3>Let one tool write for another</h3>
+                        <p class="se-muted">
+                            The Text panel is a good prompt editor. Describe the picture you want in ordinary
+                            sentences, ask for it as a compact image prompt, and paste the result into Image. This is
+                            also the direction the app itself is heading — see
+                            <a href="../roadmap/#horizon-1">the roadmap</a>.
+                        </p>
+                    </section>
+
+                    <!-- RESULTS --------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="results">Results, and where they go</h2>
+                        <p>
+                            Output is ordinary files in ordinary formats — PNG for images, MP4 for video, WAV for
+                            audio, plain text for text. There is no project format and no library database that has
+                            to be exported from.
+                        </p>
+
+                        <h3>Watch and abandon</h3>
+                        <p class="se-muted">
+                            Image generation draws a live preview while it samples. If the composition is wrong at
+                            step five it will still be wrong at step thirty — stop it, change one clause, run again.
+                            This single habit will save you more time than any hardware upgrade.
+                        </p>
+
+                        <h3>Keep the settings with the result</h3>
+                        <p class="se-muted">
+                            When something works, note the model, seed and steps somewhere before you move on.
+                            Persisting that automatically, so a run can be reopened and re-run later, is the first
+                            thing on <a href="../roadmap/#horizon-1">the roadmap</a> — until then, a text file
+                            beside the image does the job.
+                        </p>
+                    </section>
+
+                    <!-- SAFETY ---------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="safety">Content safety</h2>
+                        <p>
+                            Two gates sit around every run, and both of them run on your machine like everything
+                            else in the app.
+                        </p>
+
+                        <div class="se-pipeline" style="margin:18px 0;">
+                            <span class="se-pipeline__step se-pipeline__step--accent">Prompt</span>
+                            <span class="se-pipeline__arrow">&rarr;</span>
+                            <span class="se-pipeline__step se-pipeline__step--gate">Prompt gate</span>
+                            <span class="se-pipeline__arrow">&rarr;</span>
+                            <span class="se-pipeline__step">Generation</span>
+                            <span class="se-pipeline__arrow">&rarr;</span>
+                            <span class="se-pipeline__step se-pipeline__step--gate">Output gate</span>
+                            <span class="se-pipeline__arrow">&rarr;</span>
+                            <span class="se-pipeline__step se-pipeline__step--accent">Shown and saved</span>
+                        </div>
+
+                        <ul class="se-list">
+                            <li>
+                                <strong>The prompt gate</strong> reads what you typed before any model is loaded and
+                                before anything is downloaded. A refusal here costs you nothing but the sentence.
+                            </li>
+                            <li>
+                                <strong>The output gate</strong> classifies every generated image, live preview frame
+                                and video frame before it can be displayed or written to disk. Anything over the
+                                threshold is replaced with a neutral placeholder — the frame never reaches the screen
+                                and never reaches your folder.
+                            </li>
+                        </ul>
+
+                        <p class="se-muted">
+                            Both gates use a small classifier bundled with the app. Like the rest of the studio,
+                            they work with the network switched off, and they report nothing anywhere.
+                        </p>
+                    </section>
+
+                    <!-- PRIVACY --------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="privacy">Privacy, stated plainly</h2>
+
+                        <div class="se-callout se-callout--contract">
+                            <p>
+                                There is no account, no server component, and no analytics or crash-reporting SDK.
+                                Your prompts, imported files and generated results never leave your machine.
+                            </p>
+                        </div>
+
+                        <h3>What the app does over the network</h3>
+                        <p class="se-muted">
+                            One thing: downloading a model file you explicitly asked for. That is the entire list.
+                            Import your models from disk instead and the app has no reason to open a connection at
+                            all — you can verify this by running it offline, which is a perfectly normal way to use
+                            it.
+                        </p>
+
+                        <h3>What is stored, and where</h3>
+                        <p class="se-muted">
+                            Models sit where you put them. Results and cached previews sit in the app's own folder on
+                            your disk. Settings are a local file. Deleting the app takes all of it with you.
+                        </p>
+
+                        <h3>Store purchases</h3>
+                        <p class="se-muted">
+                            The Premium unlock is handled entirely by the Microsoft Store or the Mac App Store, which
+                            means we never see a payment detail. Restoring a purchase on a new machine goes through
+                            the same store mechanism.
+                        </p>
+                    </section>
+
+                    <!-- TROUBLESHOOTING ------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="troubleshooting">When something goes wrong</h2>
+
+                        <div class="se-table-wrap" style="margin-top:16px;">
+                            <table class="se-table">
+                                <thead>
+                                    <tr>
+                                        <th>What you see</th>
+                                        <th>What it usually means</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td>Generation is far slower than you expected</td>
+                                        <td>
+                                            The run has fallen back to CPU. Check the backend selection, confirm the
+                                            Premium unlock if you are relying on an accelerated backend, and try a
+                                            smaller model or a smaller output size.
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td>A run stops or the app runs out of memory</td>
+                                        <td>
+                                            The model does not fit. Drop the resolution, use a more heavily quantised
+                                            model, close other applications, or move down one tier in
+                                            <a href="../models/#hardware">hardware expectations</a>.
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td>A model will not load</td>
+                                        <td>
+                                            Usually an incomplete download or a missing companion file — image models
+                                            need a matching VAE, video models need their text encoder. Re-fetch the
+                                            file and check the pair.
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td>Your prompt was refused</td>
+                                        <td>
+                                            The prompt gate declined it before any work started. Rephrase and run
+                                            again; nothing was downloaded and nothing was recorded.
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td>A result came back as a grey placeholder</td>
+                                        <td>
+                                            The output gate replaced a frame that scored over the safety threshold.
+                                            Adjusting the prompt is usually enough.
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td>Images are blurry or washed out</td>
+                                        <td>
+                                            Steps too low, guidance too high, or a size the model was not trained
+                                            for. Return to the model's native resolution first, then adjust one
+                                            number at a time.
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td>A transcription is full of mistakes</td>
+                                        <td>
+                                            Audio quality dominates here. Try a larger Whisper-family model, and if
+                                            the recording has overlapping speakers expect to edit.
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                        <div class="se-pagenav">
+                            <a href="../tools/">&larr; The eight tools</a>
+                            <a href="../models/">Models, maturity and hardware &rarr;</a>
+                        </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Discover</h4>
+                    <ul>
+                        <li><a href="../tools/">The eight tools</a></li>
+                        <li><a href="../tools/#image">Image</a></li>
+                        <li><a href="../tools/#music">Music</a></li>
+                        <li><a href="../tools/#vision">Vision</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Use it</h4>
+                    <ul>
+                        <li><a href="#first-run">Your first ten minutes</a></li>
+                        <li><a href="#models">Adding models</a></li>
+                        <li><a href="#prompting">Writing prompts</a></li>
+                        <li><a href="#troubleshooting">When something goes wrong</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../models/#maturity">Maturity by modality</a></li>
+                        <li><a href="../models/#hardware">Hardware expectations</a></li>
+                        <li><a href="../models/#licenses">Model licences</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Elsewhere</h4>
+                    <ul>
+                        <li><a href="../../index.html">SeasonEngine</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a></li>
+                        <li><a href="#privacy">Privacy</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms. SeasonStudio is the sister application of <a href="../../index.html">SeasonEngine</a>.</span>
+                <span>Imported models remain under their own licences.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/studio.js"></script>
+</body>
+</html>

@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<!--
+  SeasonStudio website - roadmap.
+
+  Pages one folder deep use  ../assets/...
+  Header and footer markup is duplicated on every page on purpose.
+
+  Editing rule for this page: items move up a horizon or get cut, they never
+  acquire dates. Anything with a promised date belongs in a release note.
+-->
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Roadmap — SeasonStudio</title>
+    <meta name="description" content="Where SeasonStudio is going: repeatable workflows, prompt assistance, light editing, a local agent that carries out whole creative tasks, 3D generation, animation binding, and an optional cloud bridge." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/studio/roadmap/" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="Roadmap — SeasonStudio" />
+    <meta property="og:description" content="From eight tools to a design suite, one horizon at a time." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/studio/roadmap/" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/studio/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/studio.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('st-theme');
+                if (!t) t = 'dark';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="../guide/#privacy">Privacy</a>
+            <a href="../models/#licenses">Model licenses</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Moon.png" alt="Dark theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Logo.png" alt="SeasonStudio" width="38" height="40" />
+                <span>SeasonStudio</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../tools/">Tools</a>
+                <a href="../guide/">Guide</a>
+                <a href="../models/">Models</a>
+                <a href="index.html" aria-current="page">Roadmap</a>
+                <a href="../index.html#get-it">Get it</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+
+            <p class="se-crumbs"><a href="../index.html">Home</a> &rsaquo; Roadmap</p>
+
+            <div class="se-doc se-doc--wide">
+                <div class="se-doc__main" data-toc-source>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Where this is going</h1>
+                        <p class="se-lede">
+                            SeasonStudio today is eight generators sharing a window. The direction of travel is a
+                            studio that remembers what you did, helps you say what you want, and can carry out a
+                            whole piece of work rather than one step of it.
+                        </p>
+
+                        <div class="se-callout">
+                            <span class="se-callout__title">How to read this page</span>
+                            <p>
+                                Four horizons, ordered by confidence rather than by date. Horizon 0 is in your hands
+                                now. Horizon 1 is what we are building. Horizon 2 is where we intend to go. Horizon 3
+                                is honest speculation. Nothing here carries a delivery date, because a roadmap with
+                                dates is a marketing document.
+                            </p>
+                        </div>
+
+                        <div style="margin-top:14px;">
+                            <a class="se-pill" href="#horizon-0">Horizon 0 &middot; Shipped</a>
+                            <a class="se-pill" href="#horizon-1">Horizon 1 &middot; Next</a>
+                            <a class="se-pill" href="#horizon-2">Horizon 2 &middot; Then</a>
+                            <a class="se-pill" href="#horizon-3">Horizon 3 &middot; Later</a>
+                            <a class="se-pill" href="#not-planned">Not planned</a>
+                        </div>
+                    </section>
+
+                    <!-- HORIZON 0 ------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="horizon-0">Horizon 0 &middot; Shipped <span class="se-badge se-badge--ready">In the app</span></h2>
+                        <p>
+                            The ground the rest of this page stands on. Eight modalities, two local inference
+                            stacks, two content safety gates, and no account anywhere.
+                        </p>
+
+                        <div class="se-grid se-grid--2" style="margin-top:20px;">
+                            <div>
+                                <h3>Eight tools in one shell</h3>
+                                <p class="se-muted">
+                                    Text, translation, image, video, music, transcription, speech and vision, sharing
+                                    one layout, one results panel and one set of habits.
+                                </p>
+                                <h3>Entirely on device</h3>
+                                <p class="se-muted">
+                                    llama.cpp, stable-diffusion.cpp, GGML and ONNX Runtime, with CUDA, DirectML,
+                                    Vulkan, Metal and CoreML where the hardware offers them.
+                                </p>
+                            </div>
+                            <div>
+                                <h3>Only what this run needs</h3>
+                                <p class="se-muted">
+                                    A run names the single file it is missing. No pre-provisioning, no model zoo you
+                                    did not ask for.
+                                </p>
+                                <h3>Windows and macOS</h3>
+                                <p class="se-muted">
+                                    One codebase, built on the same SeasonEngine foundation as its sister
+                                    application, shipping through both desktop stores.
+                                </p>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- HORIZON 1 ------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="horizon-1">Horizon 1 &middot; Next <span class="se-badge se-badge--early">In progress</span></h2>
+                        <p class="se-lede" style="font-size:18px;">
+                            Making a good afternoon repeatable.
+                        </p>
+                        <p>
+                            The gap we hear about most is not a missing modality — it is that a lucky result is hard
+                            to get back to. This horizon is about memory, guidance and the small editing moves that
+                            currently send you to another application.
+                        </p>
+
+                        <h3>Workflows you can reopen</h3>
+                        <p class="se-muted">
+                            Every run saved locally with its model, prompt, seed and settings, so a result can be
+                            reopened, adjusted and re-run weeks later. Today the studio shows you only what the
+                            current run needs; the intent is a history you can walk back through, entirely on your
+                            own disk. This is the single most requested thing, and the first thing we are building.
+                        </p>
+
+                        <h3>A model manager inside the app</h3>
+                        <p class="se-muted">
+                            One place to see what is on your shelf, how much space it takes, which panel it belongs
+                            to and what its licence permits — instead of reasoning about a folder of large files.
+                        </p>
+
+                        <h3>Prompt assistance</h3>
+                        <p class="se-muted">
+                            Describe what you want in ordinary sentences and let the local language model turn it
+                            into a prompt shaped for the model you actually chose. The Text panel can already do this
+                            by hand; the point is to make it part of the panel you are standing in.
+                        </p>
+
+                        <h3>Light image and audio editing</h3>
+                        <p class="se-muted">
+                            Crop, straighten, adjust levels, trim a clip, fade an edge. Not a photo editor and not a
+                            sequencer — just enough that a finished result does not need a round trip through another
+                            application before you can use it.
+                        </p>
+
+                        <h3>Presets and batches</h3>
+                        <p class="se-muted">
+                            Save a configuration you like as a named preset, and run a prompt across several seeds or
+                            several sizes in one go, so exploring costs one decision instead of ten.
+                        </p>
+                    </section>
+
+                    <!-- HORIZON 2 ------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="horizon-2">Horizon 2 &middot; Then <span class="se-badge se-badge--planned">Planned</span></h2>
+                        <p class="se-lede" style="font-size:18px;">
+                            One sentence, a whole piece of work.
+                        </p>
+                        <p>
+                            Today you drive eight tools. In this horizon the studio can drive them for you: you
+                            describe the outcome, and a local agent plans the steps, moves material between panels,
+                            and comes back with something whole for you to judge.
+                        </p>
+
+                        <h3>A local agent that carries out a task</h3>
+                        <p class="se-muted">
+                            "Make me a thirty-second opener for a storybook video: three illustrations in one style,
+                            a narrated line over each, and an ambient bed underneath." The agent decomposes that,
+                            picks models, runs the panels in order, and presents the result with every step visible
+                            and re-runnable. Running on your machine, on your shelf, with nothing dispatched
+                            anywhere.
+                        </p>
+
+                        <h3>Material that flows between tools</h3>
+                        <p class="se-muted">
+                            A transcript straight into Text, a caption from Vision straight into Image, a finished
+                            still straight into Video, a script straight into speech. Today that is copy and paste;
+                            it should be one action.
+                        </p>
+
+                        <h3>A project shelf, not just a model shelf</h3>
+                        <p class="se-muted">
+                            Characters, palettes, reference images, voices and recurring style notes, kept per project
+                            and reusable across every panel — so a series looks like a series without you re-typing
+                            its identity each time.
+                        </p>
+
+                        <h3>3D generation</h3>
+                        <p class="se-muted">
+                            Mesh from a prompt or from a reference image, exported in formats the rest of your
+                            pipeline already reads. This is the point where the sister engine becomes more than a
+                            shared foundation: SeasonEngine renders glTF natively, so a generated asset has somewhere
+                            to go the moment it exists.
+                        </p>
+
+                        <h3>Storyboards and sequences</h3>
+                        <p class="se-muted">
+                            Panels in order, with consistent characters and a shared palette, so image generation can
+                            serve narrative work rather than single frames.
+                        </p>
+                    </section>
+
+                    <!-- HORIZON 3 ------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="horizon-3">Horizon 3 &middot; Later <span class="se-badge se-badge--planned">Exploring</span></h2>
+                        <p class="se-lede" style="font-size:18px;">
+                            A design suite, if the field keeps moving.
+                        </p>
+                        <p>
+                            Everything below depends on models that either do not exist yet or do not yet fit on a
+                            desktop. We list it because it is the direction we are steering, not because it is
+                            promised.
+                        </p>
+
+                        <h3>Animation binding</h3>
+                        <p class="se-muted">
+                            Rigging and motion for a generated mesh: a skeleton inferred automatically, weights
+                            fitted, and a clip driven from a description or a reference. Together with 3D generation
+                            this is the longest-standing item on our own list, and the one that would most change
+                            what the studio is for.
+                        </p>
+
+                        <h3>An optional cloud bridge</h3>
+                        <p class="se-muted">
+                            Some work needs a model that will never fit on a laptop. If we add the ability to send a
+                            single run to a hosted API, it will be opt-in per run, off by default, clearly marked
+                            while it is happening, and never a requirement for anything the app does today. Local
+                            first is not a phase we are passing through — it is the product.
+                        </p>
+
+                        <h3>iOS and Android</h3>
+                        <p class="se-muted">
+                            The codebase already targets mobile; the constraint is that phone-class hardware suits
+                            some of these panels and not others. A mobile release would start from the tools that
+                            genuinely work there rather than pretending the whole studio fits.
+                        </p>
+
+                        <h3>Export paths and extension points</h3>
+                        <p class="se-muted">
+                            Cleaner hand-offs to the tools designers already use, and a way to add your own step to a
+                            workflow. Shape to be determined by what people are actually doing with the app.
+                        </p>
+
+                        <h3>A straight line to the engine</h3>
+                        <p class="se-muted">
+                            Generated assets — textures, meshes, animations, audio — dropping into a SeasonEngine
+                            project without a conversion step. Two applications, one foundation, and the sister
+                            relationship finally doing some work.
+                        </p>
+                    </section>
+
+                    <!-- NOT PLANNED ----------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="not-planned">Not planned</h2>
+                        <p>
+                            A roadmap is more useful when it also says what will not happen. These are decisions, not
+                            omissions.
+                        </p>
+
+                        <ul class="se-list">
+                            <li><strong>A subscription.</strong> Premium is a one-time unlock and will stay one.</li>
+                            <li><strong>An account system.</strong> There is nothing to sign into, and nothing worth adding one for.</li>
+                            <li><strong>Telemetry or analytics.</strong> Not now, not behind a toggle, not "anonymised".</li>
+                            <li><strong>A mandatory cloud path.</strong> If a hosted option ever appears it will be optional, per run, and off by default.</li>
+                            <li><strong>Uploading your work anywhere.</strong> No gallery, no community feed, no sync service.</li>
+                            <li><strong>Training on your data.</strong> We never receive it, so the question does not arise.</li>
+                            <li><strong>A node-graph interface.</strong> Excellent tools already exist for that audience. This one is for people who want the shortest path from a sentence to a file.</li>
+                        </ul>
+
+                        <blockquote class="st-quote">
+                            The studio should get better at understanding you, not better at collecting you.
+                            <span>&mdash; the line we check new features against</span>
+                        </blockquote>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                        <div class="se-pagenav">
+                            <a href="../models/">&larr; Models, maturity and hardware</a>
+                            <a href="../index.html#get-it">Get SeasonStudio &rarr;</a>
+                        </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Discover</h4>
+                    <ul>
+                        <li><a href="../tools/">The eight tools</a></li>
+                        <li><a href="../tools/#image">Image</a></li>
+                        <li><a href="../tools/#music">Music</a></li>
+                        <li><a href="../tools/#vision">Vision</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Use it</h4>
+                    <ul>
+                        <li><a href="../guide/#first-run">Your first ten minutes</a></li>
+                        <li><a href="../guide/#models">Adding models</a></li>
+                        <li><a href="../guide/#prompting">Writing prompts</a></li>
+                        <li><a href="../guide/#troubleshooting">When something goes wrong</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../models/#maturity">Maturity by modality</a></li>
+                        <li><a href="../models/#hardware">Hardware expectations</a></li>
+                        <li><a href="../models/#licenses">Model licences</a></li>
+                        <li><a href="index.html">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Elsewhere</h4>
+                    <ul>
+                        <li><a href="../../index.html">SeasonEngine</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a></li>
+                        <li><a href="../guide/#privacy">Privacy</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms. SeasonStudio is the sister application of <a href="../../index.html">SeasonEngine</a>.</span>
+                <span>Imported models remain under their own licences.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/studio.js"></script>
+</body>
+</html>

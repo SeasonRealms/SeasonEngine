@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<!--
+  SeasonStudio website - models, maturity and hardware.
+
+  Pages one folder deep use  ../assets/...
+  Header and footer markup is duplicated on every page on purpose.
+
+  The hardware tiers on this page are estimates written ahead of a broad
+  measurement pass. Replace the table under #hardware with measured numbers
+  before the store listings go live, and drop the "estimates" callout with it.
+-->
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Models, maturity and hardware — SeasonStudio</title>
+    <meta name="description" content="Which model families SeasonStudio can load, how mature each modality really is on device today, what your machine needs, and where every model's licence stands." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/studio/models/" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="Models, maturity and hardware — SeasonStudio" />
+    <meta property="og:description" content="An honest reading of what on-device generation can and cannot do yet." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/studio/models/" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/studio/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/studio.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('st-theme');
+                if (!t) t = 'dark';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="../guide/#privacy">Privacy</a>
+            <a href="#licenses">Model licenses</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Moon.png" alt="Dark theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Logo.png" alt="SeasonStudio" width="38" height="40" />
+                <span>SeasonStudio</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../tools/">Tools</a>
+                <a href="../guide/">Guide</a>
+                <a href="index.html" aria-current="page">Models</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="../index.html#get-it">Get it</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+
+            <p class="se-crumbs"><a href="../index.html">Home</a> &rsaquo; Models</p>
+
+            <div class="se-doc se-doc--wide">
+                <div class="se-doc__main" data-toc-source>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Models, maturity and hardware</h1>
+                        <p class="se-lede">
+                            This is the page for the awkward questions. What actually runs well on device today?
+                            What will my laptop do? Can I sell what comes out of it? Short answers, in that order.
+                        </p>
+                        <p class="se-muted">
+                            If you only read one section, read
+                            <a href="#maturity">maturity by modality</a> — it is the difference between a good
+                            afternoon and a frustrating one.
+                        </p>
+                    </section>
+
+                    <!-- RUNTIMES -------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="runtimes">Two runtimes under eight panels</h2>
+                        <p>
+                            SeasonStudio does not invent its own inference engine. It leans on two well-travelled
+                            local stacks, and which one a panel uses determines what file format you feed it and
+                            which backends are available.
+                        </p>
+
+                        <div class="se-table-wrap" style="margin-top:16px;">
+                            <table class="se-table">
+                                <thead>
+                                    <tr>
+                                        <th>Panel</th>
+                                        <th>Runtime</th>
+                                        <th>Model format</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td>Text, Translate</td>
+                                        <td>llama.cpp / GGML</td>
+                                        <td><code>.gguf</code>, usually 4-bit quantised</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Music, Text to speech, Speech to text</td>
+                                        <td>GGML</td>
+                                        <td><code>.gguf</code></td>
+                                    </tr>
+                                    <tr>
+                                        <td>Image</td>
+                                        <td>stable-diffusion.cpp / ONNX Runtime</td>
+                                        <td>Model file plus a matching VAE</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Video</td>
+                                        <td>ONNX Runtime</td>
+                                        <td>Model files plus a shared text encoder</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Vision</td>
+                                        <td>ONNX Runtime</td>
+                                        <td><code>.onnx</code></td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <h3>Backends</h3>
+                        <p>
+                            Each runtime enumerates what your machine offers and takes the fastest option it can
+                            use. CPU always works and is always available; the accelerated backends are part of the
+                            one-time Premium unlock.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr>
+                                        <th>Platform</th>
+                                        <th>GGML backends</th>
+                                        <th>ONNX Runtime providers</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td>Windows 10 / 11, x64</td>
+                                        <td>CPU &middot; Vulkan &middot; CUDA</td>
+                                        <td>CPU &middot; DirectML &middot; CUDA</td>
+                                    </tr>
+                                    <tr>
+                                        <td>macOS, Apple silicon</td>
+                                        <td>CPU &middot; Metal</td>
+                                        <td>CPU &middot; CoreML</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <div class="se-callout">
+                            <p>
+                                CUDA is the fast path on NVIDIA hardware; DirectML covers AMD, Intel and NVIDIA
+                                alike on Windows; Metal covers Apple silicon. On a machine with none of them the
+                                app still runs — it simply asks for more patience.
+                            </p>
+                        </div>
+                    </section>
+
+                    <!-- MATURITY -------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="maturity">Maturity by modality</h2>
+                        <p>
+                            Open, locally runnable models did not all arrive at the same time or at the same
+                            quality. Text and image generation have had years of iteration; on-device music and
+                            video are much younger. Here is where we think each panel genuinely stands, and why.
+                        </p>
+
+                        <h3><span class="se-badge se-badge--ready">Ready</span> Text and translation</h3>
+                        <p class="se-muted">
+                            Quantised instruct models in the 1&#8209;to&#8209;8&#8209;billion parameter range are
+                            the most settled part of local AI. They draft, summarise and restructure reliably at
+                            paragraph and page scale. Dedicated translation models go further still: for major
+                            language pairs they hold register and terminology better than a general model of similar
+                            size. The honest limits are knowledge and reasoning depth — a small local model does not
+                            know recent events, and will produce a confident wrong answer rather than admit
+                            uncertainty.
+                        </p>
+
+                        <h3><span class="se-badge se-badge--ready">Ready</span> Image generation</h3>
+                        <p class="se-muted">
+                            This is the modality where local and hosted quality have converged most. The SDXL and
+                            SD&nbsp;3.5 lines, and the newer families alongside them, produce illustration and
+                            concept work you can put in front of a client. Prompt adherence has improved
+                            substantially, editing models let you change one thing without redrawing everything, and
+                            the sampler preview means a bad seed costs seconds rather than minutes. What remains
+                            hard: legible text inside the image, hands and crowds, and exact compositional control.
+                        </p>
+
+                        <h3><span class="se-badge se-badge--ready">Ready</span> Speech, both directions</h3>
+                        <p class="se-muted">
+                            Transcription is a solved problem for clean audio, and it is the task where running
+                            locally is most obviously worth it — recordings are the most sensitive thing most people
+                            feed a model. Synthesis has caught up quickly: current small speech models are natural
+                            enough for narration, and describing a voice in words rather than picking from a list
+                            genuinely works. The seams show over long passages, where prosody loses the thread, so
+                            work paragraph by paragraph.
+                        </p>
+
+                        <h3><span class="se-badge se-badge--ready">Ready</span> Vision</h3>
+                        <p class="se-muted">
+                            The vision stack is made of small, mature, purpose-built models rather than one
+                            ambitious one, which is exactly why it is dependable. Captioning, OCR, classification,
+                            detection and segmentation all behave predictably on ordinary photographs and load in a
+                            second. Accuracy falls off with handwriting, stylised type and heavy compression, and
+                            detection can only name classes it was trained on.
+                        </p>
+
+                        <h3><span class="se-badge se-badge--early">Early</span> Music and sound</h3>
+                        <p class="se-muted">
+                            The Stable Audio family made short-form audio generation practical on a desktop, and
+                            within its range the results are genuinely usable: effects, textures, ambient beds and
+                            loops. Beyond that range the field simply has not arrived. Long-form musical structure —
+                            a theme that develops, a chorus that returns — is not something the current generation of
+                            open models does, and vocals are out of scope. Our advice is to use it for the layer
+                            underneath rather than the tune on top.
+                        </p>
+
+                        <h3><span class="se-badge se-badge--exp">Experimental</span> Video</h3>
+                        <p class="se-muted">
+                            Local video generation is the most exciting and least dependable thing in the app. The
+                            open text-to-video and image-to-video models can produce a few seconds of coherent
+                            motion, and occasionally something lovely, but the cost is high: gigabytes of model
+                            files, minutes per render, modest resolution, and identity that drifts across frames.
+                            We ship it because it is real and improving fast, and we label it experimental because
+                            we would rather set your expectations than sell you a surprise.
+                        </p>
+
+                        <div class="se-callout se-callout--contract">
+                            <span class="se-callout__title">Why say this at all?</span>
+                            <p>
+                                Because the alternative is you discovering it on a deadline. The gap between
+                                modalities is the single most useful thing to know about on-device creative AI, and
+                                it is the thing marketing pages usually leave out.
+                            </p>
+                        </div>
+                    </section>
+
+                    <!-- HARDWARE -------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="hardware">Hardware expectations</h2>
+
+                        <div class="se-callout se-callout--warn">
+                            <span class="se-callout__title">These figures are estimates</span>
+                            <p>
+                                The tiers below are our own expectations from development machines, not results from
+                                a broad measurement pass. Treat them as a guide to which column you are in, not as a
+                                benchmark. They will be replaced with measured numbers.
+                            </p>
+                        </div>
+
+                        <p>
+                            Find your machine in one of the three tiers, then read across. The point of the table is
+                            not exact timings — it is knowing which panels to open first.
+                        </p>
+
+                        <div class="se-table-wrap" style="margin-top:16px;">
+                            <table class="se-table">
+                                <thead>
+                                    <tr>
+                                        <th>Tier</th>
+                                        <th>A machine like this</th>
+                                        <th>What to expect</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td><strong>Light</strong></td>
+                                        <td>
+                                            Thin laptop, 8&nbsp;GB RAM, integrated graphics or a base Apple silicon
+                                            machine.
+                                        </td>
+                                        <td>
+                                            Text, Translate, Speech to text, Text to speech and Vision are all
+                                            comfortable. Image works at 512&#215;512 with a light model — expect tens
+                                            of seconds per picture. Music is slow but usable for short clips. Skip
+                                            Video.
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td><strong>Comfortable</strong></td>
+                                        <td>
+                                            16&nbsp;GB RAM with an 8&nbsp;GB graphics card, or an Apple silicon Pro
+                                            machine with 16&nbsp;GB or more unified memory.
+                                        </td>
+                                        <td>
+                                            The sweet spot. Image at 1024&#215;1024 in well under a minute, larger
+                                            language and translation models, longer transcriptions, Music without
+                                            waiting around. Video becomes possible for very short clips at low
+                                            resolution.
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td><strong>Roomy</strong></td>
+                                        <td>
+                                            32&nbsp;GB RAM with a 16&nbsp;GB or larger graphics card, or an Apple
+                                            silicon Max machine.
+                                        </td>
+                                        <td>
+                                            Everything, including Video at the resolutions the models were actually
+                                            designed for. Heavy image models, batches of variations and the largest
+                                            language models all fit.
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <h3>Two things that matter more than the tier</h3>
+                        <ul class="se-list">
+                            <li>
+                                <strong>Video memory, not system memory.</strong> Image and video models want to sit
+                                on the graphics card. A machine with plenty of RAM but 4&nbsp;GB of video memory will
+                                behave like the Light tier for those two panels, however fast its processor is.
+                            </li>
+                            <li>
+                                <strong>Disk space.</strong> Models are large files. A serious image shelf is tens of
+                                gigabytes; adding video pushes that well past a hundred. The studio only fetches what
+                                a run needs, which keeps this honest, but plan the space.
+                            </li>
+                        </ul>
+                    </section>
+
+                    <!-- SHELF ----------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="shelf">What can go on the shelf</h2>
+                        <p>
+                            One compact multimodal language model is built into the app, so the Text panel and the
+                            content safety gates work out of the box with nothing downloaded. Every other model is
+                            yours to add — either fetched on demand when a run needs it, or imported from a folder
+                            you already have.
+                        </p>
+
+                        <div class="se-table-wrap" style="margin-top:16px;">
+                            <table class="se-table">
+                                <thead>
+                                    <tr>
+                                        <th>Panel</th>
+                                        <th>Families it can load</th>
+                                        <th>Rough size on disk</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td>Text</td>
+                                        <td>Compact instruct models, and larger ones in the 4&#8209;to&#8209;8&#8209;billion class</td>
+                                        <td>0.5 &ndash; 6&nbsp;GB</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Translate</td>
+                                        <td>Dedicated translation models, small and large</td>
+                                        <td>1 &ndash; 5&nbsp;GB</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Image</td>
+                                        <td>SD 1.5, SDXL, SD 3.5, newer open families, and editing models — each with a VAE</td>
+                                        <td>2 &ndash; 20&nbsp;GB each</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Video</td>
+                                        <td>Text-to-video and image-to-video models plus a shared text encoder</td>
+                                        <td>10 &ndash; 40&nbsp;GB</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Music</td>
+                                        <td>Stable Audio, in effects and music variants and two sizes</td>
+                                        <td>1 &ndash; 5&nbsp;GB</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Text to speech</td>
+                                        <td>Speech models in base, custom-voice and voice-description variants</td>
+                                        <td>0.5 &ndash; 2&nbsp;GB</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Speech to text</td>
+                                        <td>Whisper-family models across several sizes</td>
+                                        <td>0.1 &ndash; 3&nbsp;GB</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Vision</td>
+                                        <td>OCR, classification, detection, segmentation and face models</td>
+                                        <td>10 &ndash; 300&nbsp;MB each</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            The exact list of models the app offers moves as the field does. The
+                            <a href="../guide/#models">guide</a> explains how to add one you already have.
+                        </p>
+                    </section>
+
+                    <!-- LICENSES -------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="licenses">Licences, and whether you can sell the output</h2>
+                        <p>
+                            SeasonStudio is a player, not a publisher. The app's own licence covers the app; every
+                            model you load stays under the licence its authors chose, and that licence — not ours —
+                            decides what you may do with what comes out.
+                        </p>
+
+                        <div class="se-callout se-callout--care">
+                            <span class="se-callout__title">The one thing to check before commercial work</span>
+                            <p>
+                                Open model licences vary more than people expect: some are permissive, some are
+                                community licences with conditions, and a few are research-only. The app lists the
+                                licence next to every model it can load. Read it once, before the client work, not
+                                after.
+                            </p>
+                        </div>
+
+                        <h3>How the categories tend to break down</h3>
+                        <ul class="se-list">
+                            <li>
+                                <strong>Permissive (Apache&#8209;2.0, MIT and similar).</strong> Commercial use is
+                                straightforward; attribution requirements are usually light. Much of the language,
+                                translation and vision stack falls here.
+                            </li>
+                            <li>
+                                <strong>Open community licences.</strong> Commercial use is allowed but conditional —
+                                often on revenue scale or on acceptable-use terms. Several image and video families
+                                work this way.
+                            </li>
+                            <li>
+                                <strong>Research or non-commercial only.</strong> Fine for learning and personal
+                                work, not for paid output. Always worth checking before a model becomes part of
+                                your habit.
+                            </li>
+                        </ul>
+
+                        <h3>Native runtime components</h3>
+                        <p class="se-muted">
+                            The inference stacks themselves — llama.cpp, stable-diffusion.cpp, GGML and ONNX
+                            Runtime — are open source under permissive licences. On Windows, the NVIDIA CUDA and
+                            cuDNN runtime libraries are redistributed under NVIDIA's own terms and are not covered
+                            by ours. The full third-party notice list ships with the app.
+                        </p>
+
+                        <h3>Your work</h3>
+                        <p class="se-muted">
+                            We claim nothing in what you make. Nothing is uploaded, so nothing is collected, and
+                            there is no clause anywhere granting us a licence to your output. What you generate is
+                            a file on your disk.
+                        </p>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                        <div class="se-pagenav">
+                            <a href="../guide/">&larr; Guide</a>
+                            <a href="../roadmap/">Roadmap: where this is going &rarr;</a>
+                        </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Discover</h4>
+                    <ul>
+                        <li><a href="../tools/">The eight tools</a></li>
+                        <li><a href="../tools/#image">Image</a></li>
+                        <li><a href="../tools/#music">Music</a></li>
+                        <li><a href="../tools/#vision">Vision</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Use it</h4>
+                    <ul>
+                        <li><a href="../guide/#first-run">Your first ten minutes</a></li>
+                        <li><a href="../guide/#models">Adding models</a></li>
+                        <li><a href="../guide/#prompting">Writing prompts</a></li>
+                        <li><a href="../guide/#troubleshooting">When something goes wrong</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="#maturity">Maturity by modality</a></li>
+                        <li><a href="#hardware">Hardware expectations</a></li>
+                        <li><a href="#licenses">Model licences</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Elsewhere</h4>
+                    <ul>
+                        <li><a href="../../index.html">SeasonEngine</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a></li>
+                        <li><a href="../guide/#privacy">Privacy</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms. SeasonStudio is the sister application of <a href="../../index.html">SeasonEngine</a>.</span>
+                <span>Imported models remain under their own licences.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/studio.js"></script>
+</body>
+</html>

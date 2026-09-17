@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<!--
+  SeasonStudio website - home page.
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it in: index.html, 404.html,
+    tools/index.html, guide/index.html, models/index.html, roadmap/index.html
+-->
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SeasonStudio — an on-device AI creation studio</title>
+    <meta name="description" content="SeasonStudio is an all-in-one AI creation studio that runs entirely on your own machine: write, translate, generate images, video, music and speech, and read what a picture holds. No account, no upload, no queue." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/studio/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="SeasonStudio — an on-device AI creation studio" />
+    <meta property="og:description" content="Eight creative tools in one window, all running on your own machine. Nothing to sign into, nothing uploaded." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/studio/" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/studio/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="favicon.ico" />
+    <link rel="stylesheet" href="assets/css/studio.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('st-theme');
+                if (!t) t = 'dark';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="guide/#privacy">Privacy</a>
+            <a href="models/#licenses">Model licenses</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="assets/img/Moon.png" alt="Dark theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="index.html">
+                <img src="assets/img/Logo.png" alt="SeasonStudio" width="38" height="40" />
+                <span>SeasonStudio</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="index.html" aria-current="page">Home</a>
+                <a href="tools/">Tools</a>
+                <a href="guide/">Guide</a>
+                <a href="models/">Models</a>
+                <a href="roadmap/">Roadmap</a>
+                <a href="#get-it">Get it</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+
+            <!-- hero -->
+            <section class="se-card st-plate">
+                <div class="se-hero">
+                    <div class="se-hero__text">
+                        <h1 class="se-hero__title">An Local AI Studio Built for Imagining</h1>
+                        <p class="se-lede">
+                            SeasonStudio is an all-in-one creation studio that runs entirely on your own machine.
+                            Write, translate, paint, score, speak and look — eight tools in one window, with nothing
+                            to sign into and nothing sent away.
+                        </p>
+
+                        <div class="se-btnrow">
+                            <a class="se-btn se-btn--primary" href="tools/">Explore the tools</a>
+                            <a class="se-btn se-btn--ghost" href="guide/">Read the guide</a>
+                            <a class="se-btn se-btn--ghost" href="roadmap/">Roadmap</a>
+                        </div>
+
+                        <div style="padding-top: 12px;">
+                            <span class="se-pill">No account</span>
+                            <span class="se-pill">No upload</span>
+                            <span class="se-pill">No queue</span>
+                            <span class="se-pill">No subscription</span>
+                        </div>
+
+                        <p class="se-muted" style="margin-top:16px;">
+                            New here? <a href="tools/">The eight tools</a> &middot;
+                            <a href="models/#maturity">what each one is really good at yet</a> &middot;
+                            <a href="guide/#first-run">your first ten minutes</a>.
+                        </p>
+
+                        <p class="se-muted" style="margin-top:18px;">Get the app:</p>
+                        <div class="se-store">
+                            <span class="se-store__item se-store__item--soon" title="Coming soon" data-store="msstore">
+                                <img src="assets/img/WindowsStore.png" alt="Microsoft Store" />
+                                Coming soon
+                            </span>
+                            <span class="se-store__item se-store__item--soon" title="Coming soon" data-store="appstore">
+                                <img src="assets/img/AppStore.png" alt="Mac App Store" />
+                                Coming soon
+                            </span>
+                            <span class="se-store__item se-store__item--muted" title="Not planned yet">
+                                <img src="assets/img/PlayStore.webp" alt="" />
+                                Later
+                            </span>
+                        </div>
+                    </div>
+                    <div class="se-hero__art">
+                        <!-- The plate behind this block is painted in the video's own colours,
+                             and .st-film feathers the edges out to them, so the two meet
+                             without a border. See --film-* in assets/css/studio.css. -->
+                        <div class="st-film">
+                            <video src="assets/img/Film.mp4"
+                                   poster="assets/img/Film-poster.jpg"
+                                   autoplay loop muted playsinline
+                                   preload="metadata"
+                                   aria-label="A watercolour scene animated in SeasonStudio"></video>
+                            <img class="st-film__poster" src="assets/img/Film-poster.jpg" alt="A watercolour scene painted in SeasonStudio" />
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- positioning -->
+            <section class="se-card">
+                <h2 class="se-mt0">Eight tools, one window, and none of them phone home.</h2>
+                <p>
+                    Most creative AI lives behind a login and a credit counter. SeasonStudio puts the whole
+                    workshop on your desk instead: the models sit in a folder you chose, inference happens on your
+                    own CPU or GPU, and the results land as ordinary files. Work on a train, work on a plane, work
+                    on a client's confidential brief — the studio does not care, and never knows.
+                </p>
+
+                <div class="se-grid se-grid--3" style="margin-top:22px;">
+                    <div>
+                        <h3>On your machine, by design</h3>
+                        <p class="se-muted">
+                            No account, no server, no analytics. Every generation runs locally through
+                            llama.cpp, stable-diffusion.cpp, GGML and ONNX Runtime. Turn the network off and
+                            everything still works.
+                        </p>
+                    </div>
+                    <div>
+                        <h3>One window, not eight apps</h3>
+                        <p class="se-muted">
+                            Text, translation, image, video, music, speech-to-text, text-to-speech and vision
+                            share a single shell, a single results panel and a single set of shortcuts. You stop
+                            switching tools mid-thought.
+                        </p>
+                    </div>
+                    <div>
+                        <h3>Your models, your shelf</h3>
+                        <p class="se-muted">
+                            One small language model ships inside so the app is useful the moment it opens.
+                            Everything beyond it is yours to import — point the studio at a folder of GGUF or
+                            ONNX files and it picks them up.
+                        </p>
+                    </div>
+                </div>
+            </section>
+
+            <div class="st-seasons">spring &middot; summer &middot; autumn &middot; winter</div>
+
+            <!-- triptych -->
+            <section class="se-card">
+                <h2 class="se-mt0">One afternoon, three worlds</h2>
+                <p class="se-muted" style="margin-bottom:22px;">
+                    A realist matte painting, a storybook illustration and an inked comic panel — the same
+                    machine, the same window, three different models on the shelf.
+                </p>
+
+                <div class="se-grid se-grid--3">
+                    <figure class="se-shot">
+                        <img src="assets/img/shot-magic.jpg" alt="A robed figure on a mountain summit raising a staff of light" width="1024" height="1024" loading="lazy" />
+                        <span class="se-shot__tag">Image</span>
+                        <figcaption>
+                            <strong>The summoning</strong><br />
+                            Cinematic realism, generated locally at 1024&#215;1024.
+                        </figcaption>
+                    </figure>
+                    <figure class="se-shot">
+                        <img src="assets/img/shot-wizard.jpg" alt="A cartoon wizard in a glowing mushroom forest" width="1024" height="1024" loading="lazy" />
+                        <span class="se-shot__tag">Image</span>
+                        <figcaption>
+                            <strong>Mushroom hour</strong><br />
+                            Storybook palette, soft light, no reference sheet needed.
+                        </figcaption>
+                    </figure>
+                    <figure class="se-shot">
+                        <img src="assets/img/shot-warrior.jpg" alt="An inked comic panel of a young general in lacquered armour" width="512" height="512" loading="lazy" />
+                        <span class="se-shot__tag">Image</span>
+                        <figcaption>
+                            <strong>Young general</strong><br />
+                            Line art and flats, straight out of the sampler.
+                        </figcaption>
+                    </figure>
+                </div>
+
+                <p class="se-muted" style="margin-top:20px;">
+                    Prompts and model choices for these three are listed on the
+                    <a href="tools/#image">Image tool page</a>.
+                </p>
+            </section>
+
+            <!-- the eight tools -->
+            <section class="se-card">
+                <h2 class="se-mt0">The eight tools</h2>
+                <p class="se-muted" style="margin-bottom:24px;">
+                    Every panel follows the same rhythm: pick a model, describe what you want, watch it arrive,
+                    save it. <a href="tools/">Full descriptions &rarr;</a>
+                </p>
+
+                <div class="se-grid se-grid--4">
+                    <div class="se-feature">
+                        <span class="se-feature__mark">Text</span>
+                        <h3>Write and rewrite</h3>
+                        <p>Draft, summarise, restructure, or talk an idea into shape with a local language model.</p>
+                    </div>
+                    <div class="se-feature">
+                        <span class="se-feature__mark">Translate</span>
+                        <h3>Cross languages</h3>
+                        <p>Dedicated translation models rather than a general chatbot pressed into service.</p>
+                    </div>
+                    <div class="se-feature">
+                        <span class="se-feature__mark">Image</span>
+                        <h3>Paint from a sentence</h3>
+                        <p>Text to image, image to image and editing, with the sampler previewing as it goes.</p>
+                    </div>
+                    <div class="se-feature">
+                        <span class="se-feature__mark">Video</span>
+                        <h3>Move a still</h3>
+                        <p>Short clips from a prompt or from a single frame. The most demanding tool here.</p>
+                    </div>
+                    <div class="se-feature">
+                        <span class="se-feature__mark">Music</span>
+                        <h3>Score and sound</h3>
+                        <p>Stable Audio models for loops, beds and effects when you need something under a cut.</p>
+                    </div>
+                    <div class="se-feature">
+                        <span class="se-feature__mark">Speech&nbsp;to&nbsp;text</span>
+                        <h3>Transcribe</h3>
+                        <p>Turn a recording, an interview or a voice memo into text you can actually edit.</p>
+                    </div>
+                    <div class="se-feature">
+                        <span class="se-feature__mark">Text&nbsp;to&nbsp;speech</span>
+                        <h3>Give it a voice</h3>
+                        <p>Read a script aloud, describe a voice in words, or keep a voice consistent across takes.</p>
+                    </div>
+                    <div class="se-feature">
+                        <span class="se-feature__mark">Vision</span>
+                        <h3>Read a picture</h3>
+                        <p>Caption, OCR, detection and segmentation for when the input is the image.</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- a prompt beside its result -->
+            <section class="se-card">
+                <h2 class="se-mt0">A prompt beside its result</h2>
+                <p class="se-muted" style="margin-bottom:22px;">
+                    There is no node graph and no scripting layer. You type a sentence, choose how long to let the
+                    sampler think, and the picture appears in the results panel.
+                </p>
+
+                <div class="se-codepair">
+                    <div>
+                        <div class="st-prompt">
+                            <dl>
+                                <dt>Prompt</dt>
+                                <dd data-copy>a cartoon wizard reading under a glowing mushroom, watercolour storybook illustration, soft rim light, fireflies, warm cream paper</dd>
+                                <dt>Avoid</dt>
+                                <dd>harsh contrast, text, watermark</dd>
+                                <dt>Model</dt>
+                                <dd><code>SDXL_base</code></dd>
+                                <dt>Size</dt>
+                                <dd><code>1024 &#215; 1024</code></dd>
+                                <dt>Steps</dt>
+                                <dd><code>28</code>, guidance <code>6.5</code></dd>
+                                <dt>Backend</dt>
+                                <dd><code>CUDA</code> &middot; roughly 20 seconds on a desktop GPU</dd>
+                            </dl>
+                        </div>
+                        <p class="se-muted" style="font-size:14.5px;">
+                            Placeholder settings, shown to make the shape of a run concrete. Real prompts, models and
+                            timings vary with the shelf you build and the machine you build it on — see
+                            <a href="models/#hardware">hardware expectations</a>.
+                        </p>
+                    </div>
+                    <figure class="se-shot">
+                        <img src="assets/img/shot-wizard.jpg" alt="A cartoon wizard reading under a glowing mushroom" width="1024" height="1024" loading="lazy" />
+                        <figcaption>The result, written as an ordinary PNG into the folder you chose.</figcaption>
+                    </figure>
+                </div>
+            </section>
+
+            <!-- where it runs -->
+            <section class="se-card">
+                <h2 class="se-mt0">Where it runs</h2>
+                <p>
+                    Two local inference stacks sit under the eight panels. Language and audio models run through
+                    GGML and llama.cpp in GGUF form; image, video and vision models run through ONNX Runtime. Each
+                    stack takes the fastest backend your machine actually has, and falls back to plain CPU when it
+                    has to.
+                </p>
+
+                <div class="se-table-wrap" style="margin-top:18px;">
+                    <table class="se-table">
+                        <thead>
+                            <tr>
+                                <th>Platform</th>
+                                <th>Language &amp; audio (GGML)</th>
+                                <th>Image, video &amp; vision (ONNX Runtime)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Windows 10 / 11, x64</td>
+                                <td>CPU &middot; Vulkan &middot; CUDA</td>
+                                <td>CPU &middot; DirectML &middot; CUDA</td>
+                            </tr>
+                            <tr>
+                                <td>macOS, Apple silicon</td>
+                                <td>CPU &middot; Metal</td>
+                                <td>CPU &middot; CoreML</td>
+                            </tr>
+                            <tr>
+                                <td>iOS &middot; Android</td>
+                                <td colspan="2" class="se-muted">Under consideration &mdash; see the <a href="roadmap/">roadmap</a>.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="se-callout">
+                    <span class="se-callout__title">A note on honesty</span>
+                    <p>
+                        A studio that runs locally is bounded by the machine it runs on, and pretending otherwise
+                        would only waste your afternoon. The <a href="models/#hardware">hardware expectations</a>
+                        table says plainly which tools are comfortable on a thin laptop and which really want a
+                        desktop graphics card.
+                    </p>
+                </div>
+            </section>
+
+            <!-- the run -->
+            <section class="se-card">
+                <h2 class="se-mt0">From a sentence to a file</h2>
+                <p>
+                    Every tool takes the same path, so once you have learned one panel you have learned all eight.
+                    Two safety gates sit in that path: one reads your prompt before any model is loaded, and one
+                    looks at the pixels before anything is shown on screen or written to disk.
+                </p>
+
+                <div class="se-pipeline" style="margin-top:20px;">
+                    <span class="se-pipeline__step se-pipeline__step--accent">Prompt</span>
+                    <span class="se-pipeline__arrow">&rarr;</span>
+                    <span class="se-pipeline__step se-pipeline__step--gate">Prompt gate</span>
+                    <span class="se-pipeline__arrow">&rarr;</span>
+                    <span class="se-pipeline__step">Load model</span>
+                    <span class="se-pipeline__arrow">&rarr;</span>
+                    <span class="se-pipeline__step">Sampling</span>
+                    <span class="se-pipeline__arrow">&rarr;</span>
+                    <span class="se-pipeline__step se-pipeline__step--gate">Output gate</span>
+                    <span class="se-pipeline__arrow">&rarr;</span>
+                    <span class="se-pipeline__step se-pipeline__step--accent">Save</span>
+                </div>
+
+                <div class="se-grid se-grid--2" style="margin-top:26px;">
+                    <div>
+                        <h3>Only what this run needs</h3>
+                        <p class="se-muted">
+                            The studio never asks you to provision a whole model zoo up front. A run names exactly
+                            the file it is missing, and nothing else is fetched. Keeping a lean shelf is a perfectly
+                            good way to use the app.
+                        </p>
+                    </div>
+                    <div>
+                        <h3>Results you can hand over</h3>
+                        <p class="se-muted">
+                            Output is ordinary PNG, MP4, WAV and text. There is no proprietary project format
+                            standing between you and the next tool in your pipeline, whatever that tool happens
+                            to be.
+                        </p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- maturity -->
+            <section class="se-card">
+                <h2 class="se-mt0">What is ready, and what is still learning</h2>
+                <p class="se-muted" style="margin-bottom:20px;">
+                    On-device generation is not uniformly mature, and the gap between modalities is wide enough to
+                    plan around. This is our own reading of where each tool stands today.
+                </p>
+
+                <div class="se-table-wrap">
+                    <table class="se-table">
+                        <thead>
+                            <tr>
+                                <th>Tool</th>
+                                <th>Today</th>
+                                <th>What that means in practice</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Translate</td>
+                                <td><span class="se-badge se-badge--ready">Ready</span></td>
+                                <td>Dependable across major language pairs. The most predictable tool in the app.</td>
+                            </tr>
+                            <tr>
+                                <td>Image</td>
+                                <td><span class="se-badge se-badge--ready">Ready</span></td>
+                                <td>Good enough for real illustration, concept work and stylised art.</td>
+                            </tr>
+                            <tr>
+                                <td>Speech to text</td>
+                                <td><span class="se-badge se-badge--ready">Ready</span></td>
+                                <td>Clean recordings transcribe well; heavy accents and crosstalk still need a pass.</td>
+                            </tr>
+                            <tr>
+                                <td>Text to speech</td>
+                                <td><span class="se-badge se-badge--ready">Ready</span></td>
+                                <td>Natural for narration. Prosody drifts on very long scripts, so cut them up.</td>
+                            </tr>
+                            <tr>
+                                <td>Vision</td>
+                                <td><span class="se-badge se-badge--ready">Ready</span></td>
+                                <td>Captioning, OCR and detection are solid on ordinary photographs.</td>
+                            </tr>
+                            <tr>
+                                <td>Text</td>
+                                <td><span class="se-badge se-badge--ready">Ready</span></td>
+                                <td>Small local models draft and edit well. They are not a research assistant.</td>
+                            </tr>
+                            <tr>
+                                <td>Music</td>
+                                <td><span class="se-badge se-badge--early">Early</span></td>
+                                <td>Loops, beds and effects are convincing. Full arrangements are not there yet.</td>
+                            </tr>
+                            <tr>
+                                <td>Video</td>
+                                <td><span class="se-badge se-badge--exp">Experimental</span></td>
+                                <td>Short clips at modest resolution, slowly. Budget several attempts per shot.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <p class="se-muted">
+                    The reasoning behind each row, model by model, is on the
+                    <a href="models/#maturity">Models</a> page.
+                </p>
+            </section>
+
+            <!-- privacy -->
+            <section class="se-card">
+                <h2 class="se-mt0">Nothing leaves the room</h2>
+
+                <blockquote class="st-quote">
+                    The most private studio is the one with nowhere to send your work.
+                    <span>&mdash; the design brief, in one line</span>
+                </blockquote>
+
+                <div class="se-grid se-grid--2">
+                    <div>
+                        <h3>No account, no telemetry</h3>
+                        <p class="se-muted">
+                            There is no sign-in, no server component and no analytics SDK. Your prompts, imports and
+                            results stay on the file system you already own.
+                        </p>
+                        <h3>Content safety, on device</h3>
+                        <p class="se-muted">
+                            Two local gates sit around every run &mdash; one on the prompt, one on the pixels. Both
+                            run on your machine, like everything else here.
+                        </p>
+                    </div>
+                    <div>
+                        <h3>Downloads you asked for</h3>
+                        <p class="se-muted">
+                            The only network traffic is a model file you chose to fetch. Import from disk instead and
+                            the studio never opens a socket at all.
+                        </p>
+                        <h3>Licensing you can check</h3>
+                        <p class="se-muted">
+                            Every model the app can load is listed with its licence, so commercial use is a decision
+                            you get to make with the facts in front of you.
+                            <a href="models/#licenses">See the list &rarr;</a>
+                        </p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- get it -->
+            <section class="se-card" id="get-it">
+                <h2 class="se-mt0">Get it</h2>
+
+                <div class="se-grid se-grid--2">
+                    <div>
+                        <h3>Windows and macOS</h3>
+                        <p class="se-muted">
+                            SeasonStudio is arriving on the Microsoft Store and the Mac App Store. Those store pages
+                            are not live yet &mdash; this section will carry the real buttons the day they open.
+                        </p>
+                        <div class="se-store">
+                            <span class="se-store__item se-store__item--soon" title="Coming soon" data-store="msstore">
+                                <img src="assets/img/WindowsStore.png" alt="Microsoft Store" />
+                                Coming soon
+                            </span>
+                            <span class="se-store__item se-store__item--soon" title="Coming soon" data-store="appstore">
+                                <img src="assets/img/AppStore.png" alt="Mac App Store" />
+                                Coming soon
+                            </span>
+                        </div>
+                    </div>
+                    <div>
+                        <h3>Free to start, one purchase to open it up</h3>
+                        <p class="se-muted">
+                            The app installs with a small language model already inside, so you can try the whole
+                            shell before deciding anything. A single one-time Premium unlock opens all models and
+                            hardware acceleration backends &mdash; there is no subscription. Current pricing is shown
+                            in the app, behind the <strong>Premium</strong> button.
+                        </p>
+                        <p class="se-muted">
+                            Not sure it will run well on your machine? Start with
+                            <a href="models/#hardware">hardware expectations</a>.
+                        </p>
+                    </div>
+                </div>
+            </section>
+
+            <div class="st-seasons">from the makers of SeasonEngine</div>
+
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Discover</h4>
+                    <ul>
+                        <li><a href="tools/">The eight tools</a></li>
+                        <li><a href="tools/#image">Image</a></li>
+                        <li><a href="tools/#music">Music</a></li>
+                        <li><a href="tools/#vision">Vision</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Use it</h4>
+                    <ul>
+                        <li><a href="guide/#first-run">Your first ten minutes</a></li>
+                        <li><a href="guide/#models">Adding models</a></li>
+                        <li><a href="guide/#prompting">Writing prompts</a></li>
+                        <li><a href="guide/#troubleshooting">When something goes wrong</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="models/#maturity">Maturity by modality</a></li>
+                        <li><a href="models/#hardware">Hardware expectations</a></li>
+                        <li><a href="models/#licenses">Model licences</a></li>
+                        <li><a href="roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Elsewhere</h4>
+                    <ul>
+                        <li><a href="../index.html">SeasonEngine</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a></li>
+                        <li><a href="guide/#privacy">Privacy</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms. SeasonStudio is the sister application of <a href="../index.html">SeasonEngine</a>.</span>
+                <span>Imported models remain under their own licences.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="assets/js/studio.js"></script>
+</body>
+</html>

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<!--
+  SeasonStudio website - 404.
+
+  Root page: uses  assets/...
+  GitHub Pages serves this for unknown paths under the site.
+-->
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Not found — SeasonStudio</title>
+    <meta name="robots" content="noindex" />
+    <link rel="icon" href="favicon.ico" />
+    <link rel="stylesheet" href="assets/css/studio.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('st-theme');
+                if (!t) t = 'dark';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="guide/#privacy">Privacy</a>
+            <a href="models/#licenses">Model licenses</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="assets/img/Moon.png" alt="Dark theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="index.html">
+                <img src="assets/img/Logo.png" alt="SeasonStudio" width="38" height="40" />
+                <span>SeasonStudio</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="index.html">Home</a>
+                <a href="tools/">Tools</a>
+                <a href="guide/">Guide</a>
+                <a href="models/">Models</a>
+                <a href="roadmap/">Roadmap</a>
+                <a href="index.html#get-it">Get it</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <section class="se-card se-center" style="max-width:640px;margin:6vh auto 0;">
+                <div class="st-seasons" style="margin-top:0;">spring &middot; summer &middot; autumn &middot; winter</div>
+                <h1 style="font-size:64px;margin:10px 0 4px;">404</h1>
+                <p class="se-lede" style="margin:0 auto 6px;">
+                    This page wandered off into the woods.
+                </p>
+                <p class="se-muted">
+                    The address you followed does not lead anywhere in the studio. Let's get you back to
+                    somewhere useful.
+                </p>
+                <div class="se-btnrow" style="justify-content:center;">
+                    <a class="se-btn se-btn--primary" href="index.html">Back to the studio</a>
+                    <a class="se-btn se-btn--ghost" href="tools/">The eight tools</a>
+                    <a class="se-btn se-btn--ghost" href="roadmap/">Roadmap</a>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms. SeasonStudio is the sister application of <a href="../index.html">SeasonEngine</a>.</span>
+                <span>Imported models remain under their own licences.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="assets/js/studio.js"></script>
+</body>
+</html>

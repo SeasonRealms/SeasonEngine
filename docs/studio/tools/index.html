@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<!--
+  SeasonStudio website - the eight tools.
+
+  Pages one folder deep use  ../assets/...
+  Header and footer markup is duplicated on every page on purpose.
+-->
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>The eight tools — SeasonStudio</title>
+    <meta name="description" content="Text, Translate, Image, Video, Music, Speech-to-Text, Text-to-Speech and Vision: what each SeasonStudio panel does, what it needs, and what it is genuinely good at today." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/studio/tools/" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="The eight tools — SeasonStudio" />
+    <meta property="og:description" content="One window, eight creative tools, all running on your own machine." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/studio/tools/" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/studio/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/studio.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('st-theme');
+                if (!t) t = 'dark';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="../guide/#privacy">Privacy</a>
+            <a href="../models/#licenses">Model licenses</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Moon.png" alt="Dark theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Logo.png" alt="SeasonStudio" width="38" height="40" />
+                <span>SeasonStudio</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="index.html" aria-current="page">Tools</a>
+                <a href="../guide/">Guide</a>
+                <a href="../models/">Models</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="../index.html#get-it">Get it</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+
+            <p class="se-crumbs"><a href="../index.html">Home</a> &rsaquo; Tools</p>
+
+            <div class="se-doc se-doc--wide">
+                <div class="se-doc__main" data-toc-source>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Eight tools, one window</h1>
+                        <p class="se-lede">
+                            Every panel in SeasonStudio is laid out the same way: choose a model on the left,
+                            describe what you want in the middle, watch it arrive on the right. Learn one and you
+                            have learned all eight.
+                        </p>
+                        <p class="se-muted">
+                            Each section below answers the same four questions — what it is for, what it needs on
+                            your shelf, what it does well, and where it will let you down.
+                        </p>
+
+                        <div style="margin-top:14px;">
+                            <a class="se-pill" href="#text">Text</a>
+                            <a class="se-pill" href="#translate">Translate</a>
+                            <a class="se-pill" href="#image">Image</a>
+                            <a class="se-pill" href="#video">Video</a>
+                            <a class="se-pill" href="#music">Music</a>
+                            <a class="se-pill" href="#stt">Speech to text</a>
+                            <a class="se-pill" href="#tts">Text to speech</a>
+                            <a class="se-pill" href="#vision">Vision</a>
+                        </div>
+                    </section>
+
+                    <!-- TEXT ------------------------------------------------ -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="text">Text <span class="se-badge se-badge--ready">Ready</span></h2>
+                        <p>
+                            A local language model for the writing around the work: a first draft, a tighter second
+                            pass, a summary of a long brief, a list of names for a character you have not designed
+                            yet. It is the panel you will open without noticing.
+                        </p>
+
+                        <h3>On your shelf</h3>
+                        <p class="se-muted">
+                            A compact instruct model ships inside the app, so this panel works the moment you
+                            install. Larger models — an 8&#8209;billion&#8209;parameter class model, for instance —
+                            can be imported when you want more range.
+                        </p>
+
+                        <h3>Where it shines</h3>
+                        <ul class="se-list">
+                            <li>Rewriting your own rough sentences into something you would send.</li>
+                            <li>Turning a page of notes into a structured brief.</li>
+                            <li>Generating variations: ten titles, ten taglines, ten character names.</li>
+                            <li>Expanding a half-formed idea into a prompt for the Image panel.</li>
+                        </ul>
+
+                        <h3>Where it will not</h3>
+                        <p class="se-muted">
+                            A small model on a laptop is not a research assistant. It does not know today's news, it
+                            will invent a citation if you ask for one, and it reasons less reliably than the large
+                            hosted models you may be used to. Treat it as a fast, private writing partner rather
+                            than an oracle.
+                        </p>
+                    </section>
+
+                    <!-- TRANSLATE ------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="translate">Translate <span class="se-badge se-badge--ready">Ready</span></h2>
+                        <p>
+                            Purpose-built translation models rather than a general chatbot pressed into service.
+                            Paste a paragraph, pick the direction, get a translation that holds its register instead
+                            of drifting into an explanation of itself.
+                        </p>
+
+                        <h3>On your shelf</h3>
+                        <p class="se-muted">
+                            Dedicated translation models in two sizes: a light one that keeps up with typing, and a
+                            larger one for text where nuance matters. Both are single files on disk.
+                        </p>
+
+                        <h3>Where it shines</h3>
+                        <ul class="se-list">
+                            <li>Major language pairs, in both directions, at paragraph length.</li>
+                            <li>Confidential material that must not be pasted into a web form.</li>
+                            <li>Localising your own store copy, captions and UI strings.</li>
+                        </ul>
+
+                        <h3>Where it will not</h3>
+                        <p class="se-muted">
+                            Poetry, wordplay and dense idiom still want a human. Rare language pairs are weaker
+                            than the common ones. If the source text is a mess, the translation will be a faithful
+                            mess.
+                        </p>
+
+                        <div class="se-callout">
+                            <p>
+                                This is, in our own testing, the most consistently dependable tool in the app —
+                                a good place to start if you want to see what on-device inference feels like.
+                            </p>
+                        </div>
+                    </section>
+
+                    <!-- IMAGE ----------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="image">Image <span class="se-badge se-badge--ready">Ready</span></h2>
+                        <p>
+                            The centre of gravity of the studio. Text to image, image to image, and instruction-led
+                            editing, with the sampler drawing a live preview so you can abandon a bad seed early
+                            instead of waiting out the whole run.
+                        </p>
+
+                        <h3>On your shelf</h3>
+                        <p class="se-muted">
+                            The whole open image ecosystem is available: the SD 1.5 line for speed, the SDXL and
+                            SD 3.5 lines for fidelity, plus newer families and dedicated editing models. Mix a fast
+                            model for exploring with a heavy one for finishing.
+                        </p>
+
+                        <h3>Three from one afternoon</h3>
+                        <div class="se-grid se-grid--3" style="margin:18px 0 6px;">
+                            <figure class="se-shot">
+                                <img src="../assets/img/shot-magic.jpg" alt="A robed figure on a mountain summit raising a staff of light" width="1024" height="1024" loading="lazy" />
+                                <figcaption>
+                                    <strong>The summoning</strong><br />
+                                    Cinematic realism, dramatic rim light, 1024&#215;1024.
+                                </figcaption>
+                            </figure>
+                            <figure class="se-shot">
+                                <img src="../assets/img/shot-wizard.jpg" alt="A cartoon wizard in a glowing mushroom forest" width="1024" height="1024" loading="lazy" />
+                                <figcaption>
+                                    <strong>Mushroom hour</strong><br />
+                                    Storybook watercolour, warm palette, soft edges.
+                                </figcaption>
+                            </figure>
+                            <figure class="se-shot">
+                                <img src="../assets/img/shot-warrior.jpg" alt="An inked comic panel of a young general in lacquered armour" width="512" height="512" loading="lazy" />
+                                <figcaption>
+                                    <strong>Young general</strong><br />
+                                    Inked line art with flat colour, comic panel framing.
+                                </figcaption>
+                            </figure>
+                        </div>
+
+                        <div class="st-prompt">
+                            <dl>
+                                <dt>Prompt</dt>
+                                <dd data-copy>a robed figure alone on a mountain summit, raising a staff of light into a storm, cinematic realism, volumetric god rays, cold blue and gold</dd>
+                                <dt>Avoid</dt>
+                                <dd>flat lighting, extra limbs, text, watermark</dd>
+                                <dt>Steps</dt>
+                                <dd><code>30</code>, guidance <code>7.0</code>, size <code>1024 &#215; 1024</code></dd>
+                            </dl>
+                        </div>
+                        <p class="se-muted" style="font-size:14.5px;">
+                            Placeholder prompts for the three images above, written to show the shape rather than to
+                            be reproduced exactly. They will be replaced with the real settings, model by model.
+                        </p>
+
+                        <h3>Where it shines</h3>
+                        <ul class="se-list">
+                            <li>Illustration, concept art, key art and stylised character work.</li>
+                            <li>Iterating on your own sketch through image-to-image.</li>
+                            <li>Local edits: change the season, change the light, remove the thing in the corner.</li>
+                            <li>Batches of variations while you make coffee.</li>
+                        </ul>
+
+                        <h3>Where it will not</h3>
+                        <p class="se-muted">
+                            Hands, crowds and long strings of legible text remain the classic weak points. Precise
+                            compositional control — this object exactly here, at exactly this angle — is still
+                            easier to achieve by painting a rough guide and running image-to-image over it.
+                        </p>
+                    </section>
+
+                    <!-- VIDEO ----------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="video">Video <span class="se-badge se-badge--exp">Experimental</span></h2>
+                        <p>
+                            Short clips from a sentence, or motion added to a single still you already like. The
+                            most demanding panel in the studio by a wide margin, and the one where expectations
+                            need managing most carefully.
+                        </p>
+
+                        <h3>On your shelf</h3>
+                        <p class="se-muted">
+                            Text-to-video and image-to-video models, plus a separate text encoder they share. This
+                            is the largest download in the app, and the model files are measured in gigabytes rather
+                            than hundreds of megabytes.
+                        </p>
+
+                        <h3>Where it shines</h3>
+                        <ul class="se-list">
+                            <li>A few seconds of ambient motion behind a title card.</li>
+                            <li>Giving a still illustration a gentle drift — cloth, smoke, water, hair.</li>
+                            <li>Mood tests and animatics, where roughness is acceptable.</li>
+                        </ul>
+
+                        <h3>Where it will not</h3>
+                        <p class="se-muted">
+                            Clips are short, resolution is modest, and a render can take many minutes. Character
+                            identity wanders between frames, cuts are impossible, and dialogue is out of scope
+                            entirely. Plan on several attempts per usable shot.
+                        </p>
+
+                        <div class="se-callout se-callout--care">
+                            <span class="se-callout__title">Read this before you start</span>
+                            <p>
+                                We label this experimental deliberately. On-device video is at the stage image
+                                generation was at a few years ago: real, occasionally magic, and not yet something
+                                to promise a client on a deadline.
+                            </p>
+                        </div>
+                    </section>
+
+                    <!-- MUSIC ----------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="music">Music <span class="se-badge se-badge--early">Early</span></h2>
+                        <p>
+                            Sound from a description, built on the Stable Audio family: a loop, a bed, a sting, a
+                            texture. Useful precisely when you need something under a cut and do not want to spend
+                            an hour in a library.
+                        </p>
+
+                        <h3>On your shelf</h3>
+                        <p class="se-muted">
+                            Two directions from the same family — one tuned for sound effects and short textures,
+                            one for musical material — plus a larger model when you want more body.
+                        </p>
+
+                        <h3>Where it shines</h3>
+                        <ul class="se-list">
+                            <li>Sound effects and foley-adjacent textures: rain, a door, a distant market.</li>
+                            <li>Loopable ambient beds for a scene or a menu screen.</li>
+                            <li>Short stings and transitions, generated in a handful of takes.</li>
+                        </ul>
+
+                        <h3>Where it will not</h3>
+                        <p class="se-muted">
+                            Do not expect a song. Structure over a full arrangement is where the current generation
+                            of open audio models stops: verses do not develop, choruses do not return, and vocals
+                            are not on the table. Clip length is limited, and the further you push it the more the
+                            material wanders.
+                        </p>
+                    </section>
+
+                    <!-- STT ------------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="stt">Speech to text <span class="se-badge se-badge--ready">Ready</span></h2>
+                        <p>
+                            Drop in a recording and get text you can edit. An interview, a voice memo, a lecture, a
+                            client call you were allowed to record — transcribed on your own machine, which for this
+                            particular task matters more than for any other.
+                        </p>
+
+                        <h3>On your shelf</h3>
+                        <p class="se-muted">
+                            Whisper-family models in several sizes. The small ones are quick and adequate; the
+                            larger ones are noticeably better with accents and background noise.
+                        </p>
+
+                        <h3>Where it shines</h3>
+                        <ul class="se-list">
+                            <li>Clean single-speaker recordings, in many languages.</li>
+                            <li>Confidential audio that must not be uploaded to a service.</li>
+                            <li>Getting a rough transcript fast, then cleaning it in the Text panel.</li>
+                        </ul>
+
+                        <h3>Where it will not</h3>
+                        <p class="se-muted">
+                            Overlapping speakers, heavy accents, poor microphones and dense jargon all cost
+                            accuracy. Assume a proofreading pass on anything you intend to publish.
+                        </p>
+                    </section>
+
+                    <!-- TTS ------------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="tts">Text to speech <span class="se-badge se-badge--ready">Ready</span></h2>
+                        <p>
+                            Give a script a voice. Read a paragraph aloud in a stock voice, describe the voice you
+                            want in plain words, or keep one voice consistent across a series of takes.
+                        </p>
+
+                        <h3>On your shelf</h3>
+                        <p class="se-muted">
+                            Speech models in base, custom-voice and voice-description variants, in two sizes. The
+                            description variant is the interesting one: you write what the voice should sound like
+                            instead of hunting through a list.
+                        </p>
+
+                        <h3>Where it shines</h3>
+                        <ul class="se-list">
+                            <li>Narration for a walkthrough, a trailer or a prototype.</li>
+                            <li>Placeholder voice lines while a game or animation is still moving.</li>
+                            <li>Hearing your own copy read back, which catches clumsy sentences fast.</li>
+                        </ul>
+
+                        <h3>Where it will not</h3>
+                        <p class="se-muted">
+                            Prosody drifts over very long passages, so cut scripts into paragraphs. Fine emotional
+                            direction is still coarse. And an obvious point worth stating plainly: cloning a real
+                            person's voice without their consent is not a use we support.
+                        </p>
+                    </section>
+
+                    <!-- VISION ---------------------------------------------- -->
+                    <section class="se-card">
+                        <h2 class="se-mt0" id="vision">Vision <span class="se-badge se-badge--ready">Ready</span></h2>
+                        <p>
+                            The one panel that reads instead of writes. Hand it an image and ask what is in it:
+                            a caption, the text on a sign, the boxes around the objects, the outline of a subject
+                            you want to cut out.
+                        </p>
+
+                        <h3>On your shelf</h3>
+                        <p class="se-muted">
+                            A stack of compact vision models rather than one big one: OCR, classification,
+                            detection, segmentation, face landmarks and attributes. They are small, they load fast,
+                            and several of them ship as part of the app.
+                        </p>
+
+                        <h3>Where it shines</h3>
+                        <ul class="se-list">
+                            <li>Captioning a folder of images so you can search it later.</li>
+                            <li>Pulling text out of a screenshot, a scan or a photographed page.</li>
+                            <li>Finding and outlining a subject before an image-to-image pass.</li>
+                            <li>Sorting a shoot by what is actually in each frame.</li>
+                        </ul>
+
+                        <h3>Where it will not</h3>
+                        <p class="se-muted">
+                            Handwriting, stylised type and low-resolution scans push OCR accuracy down. Detection
+                            works from a fixed vocabulary of classes, so unusual subjects come back as the nearest
+                            guess. Face attributes are approximations, and we would rather you did not treat them
+                            as facts about a person.
+                        </p>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                        <div class="se-pagenav">
+                            <a href="../index.html">&larr; Home</a>
+                            <a href="../guide/">Guide: your first ten minutes &rarr;</a>
+                        </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Discover</h4>
+                    <ul>
+                        <li><a href="index.html">The eight tools</a></li>
+                        <li><a href="#image">Image</a></li>
+                        <li><a href="#music">Music</a></li>
+                        <li><a href="#vision">Vision</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Use it</h4>
+                    <ul>
+                        <li><a href="../guide/#first-run">Your first ten minutes</a></li>
+                        <li><a href="../guide/#models">Adding models</a></li>
+                        <li><a href="../guide/#prompting">Writing prompts</a></li>
+                        <li><a href="../guide/#troubleshooting">When something goes wrong</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../models/#maturity">Maturity by modality</a></li>
+                        <li><a href="../models/#hardware">Hardware expectations</a></li>
+                        <li><a href="../models/#licenses">Model licences</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Elsewhere</h4>
+                    <ul>
+                        <li><a href="../../index.html">SeasonEngine</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a></li>
+                        <li><a href="../guide/#privacy">Privacy</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms. SeasonStudio is the sister application of <a href="../../index.html">SeasonEngine</a>.</span>
+                <span>Imported models remain under their own licences.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/studio.js"></script>
+</body>
+</html>
