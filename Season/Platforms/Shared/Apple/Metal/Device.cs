@@ -259,7 +259,9 @@ internal static class Device
         }
 
         // Create a BlitCommandEncoder to execute the texture-to-buffer copy.
-        var blitEncoder = frame.CommandBuffer!.CreateBlitCommandEncoder(null)!;
+        // The native binding rejects a null descriptor,
+        // so pass a default MTLBlitPassDescriptor, matching every other blit-encoder call site in the Metal backend.
+        var blitEncoder = frame.CommandBuffer!.CreateBlitCommandEncoder(new MTLBlitPassDescriptor())!;
         blitEncoder.CopyFromTexture(
             tex, 0, 0,
             new MTLOrigin(0, 0, 0),
@@ -588,7 +590,21 @@ internal static class Device
         // insert the BlitEncoder before PresentDrawable.
         if (BaseApp.CaptureAppTcs != null)
         {
-            CaptureBackBuffer(frame);
+            // A capture failure must not escape into the MTKView Draw callback,
+            // because an unhandled exception there crashes the app on the render thread
+            // and leaves the CaptureApp await pending forever.
+            // Log the failure and complete the pending request with null instead.
+            try
+            {
+                CaptureBackBuffer(frame);
+            }
+            catch (Exception ex)
+            {
+                DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} CaptureBackBuffer {ex}");
+                var tcs = BaseApp.CaptureAppTcs;
+                BaseApp.CaptureAppTcs = null;
+                tcs?.TrySetResult(null);
+            }
         }
 
         var drawable = View.CurrentDrawable;

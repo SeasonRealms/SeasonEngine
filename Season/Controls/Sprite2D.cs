@@ -107,7 +107,7 @@ public class Sprite2D : SpriteBase, IRenderOrder
 
 		if (base.Draw())
 		{
-			if (Name.IsNullOrWhiteSpace() || Alpha == 0)
+			if (Name.IsNullOrWhiteSpace() || Alpha == 0 || PosX == 0 && PosY == 0)
 			{
 
 			}

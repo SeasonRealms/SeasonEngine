@@ -58,7 +58,7 @@ internal class AppleStoreService : IStoreService
 
             product.Title = paymentObserver.skProduct.LocalizedTitle;
 
-            product.Type = paymentObserver.skProduct.SubscriptionPeriod.ToString();
+            product.Type = paymentObserver.skProduct.SubscriptionPeriod is null ? "" : paymentObserver.skProduct.SubscriptionPeriod.ToString();
 
             product.Price = paymentObserver.skProduct.PriceLocale.CurrencySymbol + paymentObserver.skProduct.Price;
         }
@@ -245,7 +245,11 @@ class PaymentObserver : SKPaymentTransactionObserver
 
     public override void RestoreCompletedTransactionsFailedWithError(SKPaymentQueue queue, NSError error)
     {
-
+        // A failed restore (no store account signed in, network error) must complete the
+        // awaiting Query(storeId) as well; otherwise its caller never resumes and any UI
+        // gated on it (e.g. the Unlock button) stays stuck. Null stands for "nothing
+        // restored", exactly like the finished-with-no-transactions case.
+        tcsTransactions?.TrySetResult(null);
     }
 }
 

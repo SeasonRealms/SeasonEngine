@@ -74,9 +74,27 @@ public class Font
     // Expected overall speedup: 40-60%.
     // To restore quality, simply revert the parameters above to their original values.
     // ═══════════════════════════════════════════════════════════════
-    public const float PixelRange = 4f;
+    // ═══════════════════════════════════════════════════════════════
+    // Performance optimization level 4 - CJK raster-size cut (2026-09-17)
+    //   MsdfOversampleFactor: 1.5 -> 1.0 (rasterize at the display size). At the default
+    //                        FontSize 32 the raster drops from 48px to 32px, so a CJK
+    //                        glyph box shrinks from about 50x50 to about 34x34 pixels:
+    //                        per-glyph generation cost is roughly halved and each atlas
+    //                        slot takes about 46% of its previous area, which also delays
+    //                        the full-atlas reset. CJK first-load is the main win.
+    //   PixelRange:           4 -> 3   (border shrinks by 1 texel per side, another ~11% area)
+    //   Screen-space AA range = PixelRange / MsdfOversampleFactor stays comparable:
+    //                        2.67px before vs 3.0px after, so edge softness is essentially
+    //                        unchanged. Only large Scale > 1 text is slightly softer when
+    //                        upscaled from the 1:1 raster.
+    //   MinMsdfGlyphScale stays 32: it keeps every font size at or below 32px rasterized
+    //                        at 32px, which is exactly what the old 1.5 factor already
+    //                        produced for sizes below 21.3px, so small text is unchanged.
+    // To restore quality, revert these two values back to 4f and 1.5f.
+    // ═══════════════════════════════════════════════════════════════
+    public const float PixelRange = 3f;
     const float MinMsdfGlyphScale = 32f;
-    const float MsdfOversampleFactor = 1.5f;
+    const float MsdfOversampleFactor = 1f;
 
     public static bool UseNativeMsdfgenBackend = false;
 

@@ -5,6 +5,7 @@
 using Metal;
 using Season.Fonts;
 using Season.Platforms.Shared.Apple.Metal;
+using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using MTLTexture = Season.Platforms.Shared.Apple.Metal.Texture;
 
@@ -86,6 +87,12 @@ internal unsafe class Graphics : IGraphics
         public bool GlyphDirty;
         public bool CanDraw;
 
+        // Monotone lineage counter, bumped whenever the buffer arrays are replaced wholesale
+        // (the LoadTexts swap, or an Ensure*BufferCapacity grow) and carried by every snapshot.
+        // StoreTextInstanceState rejects snapshots older than the dictionary entry, so a stale
+        // write-back cannot resurrect a cleared array or drop a newer rebuild.
+        public long Generation;
+
         // -- Instance transforms, using VS buffer(2) as the per-instance stream and buffered N times per frame. --
         public IMTLBuffer[] InstanceBuffers;
         public uint InstanceFrameMask;
@@ -99,7 +106,23 @@ internal unsafe class Graphics : IGraphics
         public IMTLBuffer[] DrawParamsBuffers;
     }
 
-    Dictionary<Texts, MTLTextInstanceState> _textInstances = new();
+    readonly Dictionary<Texts, MTLTextInstanceState> _textInstances = new();
+
+    // _textInstances is accessed concurrently by the background loading thread (LoadTexts/AppendTexts),
+    // the render thread (UpdateTexts/DrawTexts), and resource teardown (DisposeTexts).
+    // Every read and write must hold this lock, mirroring the Windows/Graphics blueprint;
+    // otherwise the dictionary may be corrupted or buffers may be released while a frame still encodes them.
+    readonly object _textInstancesLock = new();
+
+    // Source of MTLTextInstanceState.Generation, advanced by every wholesale buffer-array
+    // replacement. Kept monotone so Store can compare lineages with a single less-than test.
+    long _textInstanceGeneration;
+
+    // Frame-delayed release queue for text buffers replaced by background rebuilds: the Metal
+    // counterpart of the DirectX/VK fence deferred release. The render thread snapshots a state
+    // every frame and may keep encoding that snapshot until the frame completes, so queued
+    // buffers stay alive for frameCount flushes before Dispose actually runs.
+    readonly ConcurrentQueue<(IMTLBuffer Buffer, int RemainingFrames)> _textBufferReleaseQueue = new();
 
     // -- Shared resources for Text GPU instancing --
     IMTLBuffer _textMatrixBuffer = null!;      // Identity-matrix UBO at VS buffer(1), written during Init and shared read-only afterward.
@@ -175,6 +198,15 @@ internal unsafe class Graphics : IGraphics
     public async Task<bool> LoadSprite2D(Sprite2D sprite2D)
     {
         MTLSprite2D mtlSprite2D = null!;
+
+        // The texture name is the dictionary key and the on-disk lookup for every step below,
+        // and Dictionary.TryGetValue(null) throws ArgumentNullException("key").
+        // Nameless placeholders are expected (ImageView.Image only receives a name through SetTexture),
+        // so skip them outright instead of falling into the keyed paths and logging a false error.
+        if (sprite2D.Name.IsNullOrWhiteSpace())
+        {
+            return false;
+        }
 
         lock (DictionarySprite)
         {
@@ -292,7 +324,7 @@ internal unsafe class Graphics : IGraphics
                 }
                 catch (Exception ex)
                 {
-                    DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} LoadTextureAsync {ex}");
+                    DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} LoadTextureAsync ID={sprite2D.ID} Name='{sprite2D.Name}' {ex}");
                 }
             }
         }
@@ -548,11 +580,28 @@ internal unsafe class Graphics : IGraphics
                 glyphPtr[i] = hiddenGlyph;
         }
 
-        // Replace the previous state.
-        if (_textInstances.TryGetValue(texts, out var prevState))
-            ReleaseTextInstanceResources(ref prevState);
+        // Replace the previous state under the lock so a concurrent render-thread snapshot
+        // can never observe a half-released state.
+        lock (_textInstancesLock)
+        {
+            // Texts was disposed while loading: reclaim the newly created resources instead
+            // of writing them back, otherwise they would leak outside the dictionary.
+            if (texts.IsDisposed)
+            {
+                ReleaseTextInstanceResources(ref state);
+                return false;
+            }
 
-        _textInstances[texts] = state;
+            if (_textInstances.TryGetValue(texts, out var prevState))
+                ReleaseTextInstanceResources(ref prevState);
+
+            // Start a new lineage: in-flight snapshots of the released state must not be
+            // written back after this swap (see StoreTextInstanceState).
+            state.Generation = Interlocked.Increment(ref _textInstanceGeneration);
+
+            _textInstances[texts] = state;
+        }
+
         texts.textureHoldersLoading = holders;
 
         return true;
@@ -568,7 +617,7 @@ internal unsafe class Graphics : IGraphics
             || appendTexs.Length == 0 || appendHolders.Length != appendTexs.Length)
             return Task.FromResult(false);
 
-        if (!_textInstances.TryGetValue(texts, out var state) || state.InstanceBuffers == null || state.InstanceCount <= 0)
+        if (!TryGetTextInstanceState(texts, out var state) || state.InstanceBuffers == null || state.InstanceCount <= 0)
             return Task.FromResult(false);
 
         int added = 0;
@@ -615,10 +664,10 @@ internal unsafe class Graphics : IGraphics
         state.CanDraw = false;
 
         // Do not write back after Dispose, or released resources would be resurrected into the dictionary.
-        if (texts.IsDisposed || !_textInstances.ContainsKey(texts))
+        if (texts.IsDisposed)
             return Task.FromResult(false);
 
-        _textInstances[texts] = state;
+        StoreTextInstanceState(texts, state);
         return Task.FromResult(true);
     }
 
@@ -626,16 +675,16 @@ internal unsafe class Graphics : IGraphics
     {
         if (texts?.Texs?.Length <= 0)
         {
-            if (_textInstances.TryGetValue(texts, out var emptyState))
+            if (TryGetTextInstanceState(texts, out var emptyState))
             {
                 emptyState.CanDraw = false;
-                _textInstances[texts] = emptyState;
+                StoreTextInstanceState(texts, emptyState, requireUnchangedInstanceCount: true);
             }
             return;
         }
 
         // GPU-instancing path.
-        if (_textInstances.TryGetValue(texts, out var state))
+        if (TryGetTextInstanceState(texts, out var state))
         {
             var texs = texts.Texs;
             var holders = texts.textureHolders;
@@ -643,13 +692,26 @@ internal unsafe class Graphics : IGraphics
             if (instanceCount <= 0 || state.GlyphBuffers == null || !EnsureGlyphBufferCapacity(ref state, instanceCount))
             {
                 state.CanDraw = false;
-                _textInstances[texts] = state;
+                StoreTextInstanceState(texts, state, requireUnchangedInstanceCount: true);
+                return;
+            }
+
+            // The snapshot may predate a background rebuild whose deferred release cleared
+            // the shared array slots; a null slot means the state was just replaced.
+            // Capture frame 0 once and reuse it below: a re-read of the shared slot could see
+            // null after this check, and every write must target the same still-alive buffer
+            // (the deferred queue keeps a replaced buffer alive for frameCount flushes).
+            var glyphBuffer0 = state.GlyphBuffers[0];
+            if (glyphBuffer0 == null)
+            {
+                state.CanDraw = false;
+                StoreTextInstanceState(texts, state, requireUnchangedInstanceCount: true);
                 return;
             }
 
             // Use frame 0 as the primary write buffer for glyph data,
             // then copy it to the remaining frame buffers for full-frame synchronization.
-            var glyphPtr = (MTLTextGlyphData*)state.GlyphBuffers[0].Contents;
+            var glyphPtr = (MTLTextGlyphData*)glyphBuffer0.Contents;
             bool uploadGlyphData = state.GlyphDirty || state.GlyphAtlasVersionBuilt != _glyphAtlas.Version;
 
             // Check whether layout changed.
@@ -679,7 +741,7 @@ internal unsafe class Graphics : IGraphics
             if (!uploadGlyphData && !writeInstanceData)
             {
                 state.CanDraw = true;
-                _textInstances[texts] = state;
+                StoreTextInstanceState(texts, state, requireUnchangedInstanceCount: true);
                 return;
             }
 
@@ -864,7 +926,11 @@ internal unsafe class Graphics : IGraphics
             {
                 for (int fi = 0; fi < state.InstanceBuffers.Length; fi++)
                 {
-                    var dst = (InstanceTransformData*)state.InstanceBuffers[fi].Contents;
+                    var instanceBuffer = state.InstanceBuffers[fi];
+                    if (instanceBuffer == null)
+                        continue;
+
+                    var dst = (InstanceTransformData*)instanceBuffer.Contents;
                     for (int j = 0; j < instanceCount; j++)
                         dst[j] = instanceData[j];
                     state.InstanceFrameMask |= (1u << fi);
@@ -876,14 +942,21 @@ internal unsafe class Graphics : IGraphics
                 // Multi-frame synchronization:
                 // copy glyph data into the remaining frame buffers.
                 uint glyphBytes = (uint)(instanceCount * Unsafe.SizeOf<MTLTextGlyphData>());
+                var glyphSource = glyphBuffer0;
                 for (int gfi = 1; gfi < state.GlyphBuffers.Length; gfi++)
-                    Unsafe.CopyBlock((void*)state.GlyphBuffers[gfi].Contents, (void*)state.GlyphBuffers[0].Contents, glyphBytes);
+                {
+                    var glyphTarget = state.GlyphBuffers[gfi];
+                    if (glyphTarget == null)
+                        continue;
+
+                    Unsafe.CopyBlock((void*)glyphTarget.Contents, (void*)glyphSource.Contents, glyphBytes);
+                }
 
                 state.GlyphAtlasVersionBuilt = _glyphAtlas.Version;
                 state.GlyphDirty = false;
             }
             state.CanDraw = true;
-            _textInstances[texts] = state;
+            StoreTextInstanceState(texts, state, requireUnchangedInstanceCount: true);
         }
     }
 
@@ -891,23 +964,34 @@ internal unsafe class Graphics : IGraphics
     {
         if (texts?.Texs?.Length == 0)
         {
-            if (_textInstances.TryGetValue(texts, out var emptyState))
+            if (TryGetTextInstanceState(texts, out var emptyState))
             {
                 emptyState.CanDraw = false;
-                _textInstances[texts] = emptyState;
+                StoreTextInstanceState(texts, emptyState, requireUnchangedInstanceCount: true);
             }
             return;
         }
 
         // GPU-instancing path: one instanced DrawPrimitives call.
-        if (_textInstances.TryGetValue(texts, out var state) && state.InstanceCount > 0)
+        if (TryGetTextInstanceState(texts, out var state) && state.InstanceCount > 0)
         {
             var enc = Metal.Device.GraphicsEncoder;
             int fi = Metal.Device.FrameIndex;
+
+            // Capture this frame's buffers once and use these locals for the guard AND for the
+            // encode below. The shared array slots can be cleared by a racing rebuild between
+            // any two reads (ReleaseTextBuffersDeferred), and the crash is exactly that: a slot
+            // that passed the guard read as null at SetVertexBuffer ("Parameter 'buffer'").
+            // A buffer captured non-null stays usable for this frame even if released right
+            // after, because the deferred queue keeps replaced buffers alive for frameCount flushes.
+            var glyphBuffer = state.GlyphBuffers != null && fi < state.GlyphBuffers.Length ? state.GlyphBuffers[fi] : null;
+            var instanceBuffer = state.InstanceBuffers != null && fi < state.InstanceBuffers.Length ? state.InstanceBuffers[fi] : null;
+            var drawParamsBuffer = state.DrawParamsBuffers != null && fi < state.DrawParamsBuffers.Length ? state.DrawParamsBuffers[fi] : null;
+            var atlasTexture = _glyphAtlas.AtlasTexture;
+
             if (enc == null || !state.CanDraw
-                || state.GlyphBuffers == null || fi >= state.GlyphBuffers.Length
-                || state.InstanceBuffers == null || fi >= state.InstanceBuffers.Length
-                || _glyphAtlas.AtlasTexture == null)
+                || glyphBuffer == null || instanceBuffer == null || drawParamsBuffer == null
+                || atlasTexture == null)
             {
                 return;
             }
@@ -918,33 +1002,33 @@ internal unsafe class Graphics : IGraphics
             // Write TextDrawParams, using a per-Texts, per-frame dedicated UBO to prevent same-frame cross-control overwrites.
             var drawParams = new MTLTextDrawParams
             {
-                AtlasSize = new Vector2(_glyphAtlas.AtlasTexture.Width, _glyphAtlas.AtlasTexture.Height),
+                AtlasSize = new Vector2(atlasTexture.Width, atlasTexture.Height),
                 PxRange = Season.Fonts.Font.PixelRange,
                 GlobalAlpha = Math.Clamp(texts.Alpha, 0f, 1f),
                 TextColor = texts.Color.AsVector4,
             };
-            *(MTLTextDrawParams*)state.DrawParamsBuffers[fi].Contents = drawParams;
+            *(MTLTextDrawParams*)drawParamsBuffer.Contents = drawParams;
 
             // VS slots:
             // 0=unit quad, 1=identity Matrices, 2=instance stream, 3=IdentityBone,
             // 4=text material, 5=glyph data reusing morphDeltas, 6=InstanceBone placeholder, 7=TextDrawParams.
             enc.SetVertexBuffer(_textQuadVertexBuffer, 0, 0);
             enc.SetVertexBuffer(_textMatrixBuffer, 0, 1);
-            enc.SetVertexBuffer(state.InstanceBuffers[fi], 0, 2);
+            enc.SetVertexBuffer(instanceBuffer, 0, 2);
             enc.SetVertexBuffer(MTLPrimitiveGroup.IdentityBoneBuffers[fi], 0, 3);
             enc.SetVertexBuffer(_textMaterialBuffer, 0, 4);
-            enc.SetVertexBuffer(state.GlyphBuffers[fi], 0, 5);
+            enc.SetVertexBuffer(glyphBuffer, 0, 5);
             enc.SetVertexBuffer(MTLPrimitiveGroup.IdentityInstanceBoneBuffers[fi], 0, 6);
-            enc.SetVertexBuffer(state.DrawParamsBuffers[fi], 0, 7);
+            enc.SetVertexBuffer(drawParamsBuffer, 0, 7);
 
             // FS slots:
             // 1=SceneLights, 2=text material, 3=TextDrawParams, texture(0)=atlas.
             enc.SetFragmentBuffer(MTLPrimitiveGroup.LightConstantBuffers[fi], 0, 1);
             enc.SetFragmentBuffer(_textMaterialBuffer, 0, 2);
-            enc.SetFragmentBuffer(state.DrawParamsBuffers[fi], 0, 3);
+            enc.SetFragmentBuffer(drawParamsBuffer, 0, 3);
 
             var fallback = Metal.Device.White;
-            enc.SetFragmentTexture(_glyphAtlas.AtlasTexture.Image, 0);
+            enc.SetFragmentTexture(atlasTexture.Image, 0);
             enc.SetFragmentTexture(fallback.Image, 1);
             enc.SetFragmentTexture(fallback.Image, 2);
             enc.SetFragmentTexture(fallback.Image, 3);
@@ -963,11 +1047,15 @@ internal unsafe class Graphics : IGraphics
 
     public void DisposeTexts(Texts texts)
     {
-        // Release GPU-instancing resources.
-        if (_textInstances.TryGetValue(texts, out var state))
+        // Release GPU-instancing resources under the lock so a concurrent render-thread
+        // snapshot cannot race the removal.
+        lock (_textInstancesLock)
         {
-            ReleaseTextInstanceResources(ref state);
-            _textInstances.Remove(texts);
+            if (_textInstances.TryGetValue(texts, out var state))
+            {
+                ReleaseTextInstanceResources(ref state);
+                _textInstances.Remove(texts);
+            }
         }
 
         // Release holder references.
@@ -1003,6 +1091,8 @@ internal unsafe class Graphics : IGraphics
 
     public void FlushTextAtlas()
     {
+        // Render-thread pump for the frame-delayed buffer releases enqueued by background rebuilds.
+        FlushTextBufferReleases();
         _glyphAtlas.FlushPendingUploadsOnRenderThread();
     }
 
@@ -1304,14 +1394,6 @@ internal unsafe class Graphics : IGraphics
         if (frameCount <= 0)
             return false;
 
-        // Metal command buffers retain references to encoded buffers until execution completes.
-        // Releasing the C# side reference is enough, which is equivalent to the delayed-release queue effect on VK.
-        if (state.InstanceBuffers != null)
-        {
-            foreach (var buf in state.InstanceBuffers)
-                buf?.Dispose();
-        }
-
         int capacity = Math.Max(requiredCount, Math.Max(state.InstanceCapacity * 2, 64));
 
         var seed = new InstanceTransformData[capacity];
@@ -1319,13 +1401,19 @@ internal unsafe class Graphics : IGraphics
         for (int i = 0; i < capacity; i++)
             seed[i] = hidden;
 
+        // Create the replacements first: the old buffers must stay valid while the render
+        // thread may still hold a snapshot of the previous state.
         var buffers = new IMTLBuffer[frameCount];
         for (int fi = 0; fi < frameCount; fi++)
             buffers[fi] = Metal.Device.ResourceManager.CreateVertexBuffer(seed);
 
+        var previousBuffers = state.InstanceBuffers;
         state.InstanceBuffers = buffers;
         state.InstanceCapacity = capacity;
         state.InstanceFrameMask = 0;
+        state.Generation = Interlocked.Increment(ref _textInstanceGeneration);
+
+        ReleaseTextBuffersDeferred(previousBuffers);
         return true;
     }
 
@@ -1338,42 +1426,100 @@ internal unsafe class Graphics : IGraphics
             && state.GlyphCapacity >= requiredCount)
             return true;
 
-        // Metal command buffers retain references to encoded buffers until execution completes.
-        // Releasing the C# side reference is enough, which is equivalent to the delayed-release queue effect on VK.
-        if (state.GlyphBuffers != null)
-        {
-            foreach (var buf in state.GlyphBuffers)
-                buf?.Dispose();
-        }
+        if (frameCount <= 0)
+            return false;
 
+        // Create the replacements first: the old buffers must stay valid while the render
+        // thread may still hold a snapshot of the previous state.
         nuint size = (nuint)(requiredCount * Unsafe.SizeOf<MTLTextGlyphData>());
         var buffers = new IMTLBuffer[frameCount];
         for (int fi = 0; fi < frameCount; fi++)
             buffers[fi] = Metal.Device.ResourceManager.CreateBuffer(size);
 
+        var previousBuffers = state.GlyphBuffers;
         state.GlyphBuffers = buffers;
         state.GlyphCapacity = requiredCount;
+        state.Generation = Interlocked.Increment(ref _textInstanceGeneration);
+
+        ReleaseTextBuffersDeferred(previousBuffers);
         return true;
+    }
+
+    bool TryGetTextInstanceState(Texts texts, out MTLTextInstanceState state)
+    {
+        lock (_textInstancesLock)
+            return _textInstances.TryGetValue(texts, out state);
+    }
+
+    /// <summary>Writes a snapshot back into the dictionary, rejecting snapshots that were
+    /// invalidated while their work ran: a load rebuild or a buffer-array grow bumps the
+    /// generation, and an append advances InstanceCount. Overwriting the newer entry would
+    /// resurrect cleared arrays (text stuck invisible) or drop appended glyphs.</summary>
+    void StoreTextInstanceState(Texts texts, in MTLTextInstanceState state, bool requireUnchangedInstanceCount = false)
+    {
+        lock (_textInstancesLock)
+        {
+            // Do not write back after DisposeTexts; otherwise resources already queued for
+            // release would be revived into the dictionary and leave dangling references.
+            if (!_textInstances.TryGetValue(texts, out var current))
+                return;
+
+            if (state.Generation < current.Generation)
+                return;
+
+            // UpdateTexts never changes InstanceCount, so a mismatch means an append completed
+            // after the snapshot was taken. AppendTexts itself advances the count and passes false.
+            if (requireUnchangedInstanceCount && state.InstanceCount != current.InstanceCount)
+                return;
+
+            _textInstances[texts] = state;
+        }
+    }
+
+    /// <summary>Schedules replaced text buffers for frame-delayed disposal.
+    /// Every array slot is cleared immediately: all struct copies of one Texts share the same
+    /// array instance, so a racing render-thread snapshot observes null and skips drawing
+    /// instead of encoding a released buffer, mirroring the Windows ReleaseInstanceBuffersDeferred contract.</summary>
+    void ReleaseTextBuffersDeferred(IMTLBuffer[] buffers)
+    {
+        if (buffers == null)
+            return;
+
+        int frames = Math.Max(Metal.Device.frameCount, 1);
+        for (int i = 0; i < buffers.Length; i++)
+        {
+            var buffer = buffers[i];
+            buffers[i] = null!;
+            if (buffer != null)
+                _textBufferReleaseQueue.Enqueue((buffer, frames));
+        }
+    }
+
+    /// <summary>Render-thread flush of the deferred release queue. A buffer is disposed only after
+    /// frameCount flushes, guaranteeing the render thread has re-snapshotted the dictionary and
+    /// no longer encodes the replaced buffers.</summary>
+    void FlushTextBufferReleases()
+    {
+        int count = _textBufferReleaseQueue.Count;
+        for (int i = 0; i < count; i++)
+        {
+            if (!_textBufferReleaseQueue.TryDequeue(out var entry))
+                break;
+
+            if (entry.RemainingFrames > 1)
+                _textBufferReleaseQueue.Enqueue((entry.Buffer, entry.RemainingFrames - 1));
+            else
+                entry.Buffer.Dispose();
+        }
     }
 
     void ReleaseTextInstanceResources(ref MTLTextInstanceState state)
     {
-        // Metal command buffers retain references to encoded resources until execution completes, so direct Dispose is safe.
-        if (state.InstanceBuffers != null)
-        {
-            foreach (var buf in state.InstanceBuffers)
-                buf?.Dispose();
-        }
-        if (state.DrawParamsBuffers != null)
-        {
-            foreach (var buf in state.DrawParamsBuffers)
-                buf?.Dispose();
-        }
-        if (state.GlyphBuffers != null)
-        {
-            foreach (var buf in state.GlyphBuffers)
-                buf?.Dispose();
-        }
+        // The render thread may still hold a state snapshot that references these buffers,
+        // so the actual Dispose is deferred for frameCount frames (see ReleaseTextBuffersDeferred).
+        ReleaseTextBuffersDeferred(state.InstanceBuffers);
+        ReleaseTextBuffersDeferred(state.DrawParamsBuffers);
+        ReleaseTextBuffersDeferred(state.GlyphBuffers);
 
         state.InstanceBuffers = null!;
         state.DrawParamsBuffers = null!;

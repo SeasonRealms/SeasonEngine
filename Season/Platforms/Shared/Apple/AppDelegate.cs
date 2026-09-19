@@ -34,7 +34,17 @@ public class AppDelegate : UIApplicationDelegate
 
     public override bool FinishedLaunching(UIKit.UIApplication application, Foundation.NSDictionary launchOptions)
     {
-        Runtime.MarshalManagedException += (_, e) => e.ExceptionMode = MarshalManagedExceptionMode.UnwindNativeCode;
+        Runtime.MarshalManagedException += (_, e) =>
+        {
+            // Log the managed exception with its real stack before it crosses the native boundary.
+            // Without this, escaping exceptions (async void callbacks, runloop delegates) abort the
+            // app behind a bare native xamarin_UIApplicationMain frame, hiding the throw site.
+            var log = $"{DateTime.UtcNow} [FATAL] MarshalManagedException: {e.Exception}";
+            Debug.WriteLine(log);
+            DeviceServices.BaseApp?.AddLog(LogType.Error, log);
+
+            e.ExceptionMode = MarshalManagedExceptionMode.UnwindNativeCode;
+        };
         Runtime.MarshalObjectiveCException += (_, e) => e.ExceptionMode = MarshalObjectiveCExceptionMode.UnwindManagedCode;
 
         var scene = UIKit.UIApplication.SharedApplication.ConnectedScenes
@@ -51,12 +61,6 @@ public class AppDelegate : UIApplicationDelegate
 #if MACCATALYST
         scene.Titlebar.TitleVisibility = UITitlebarTitleVisibility.Hidden;
         scene.Titlebar.Toolbar = null;
-
-        var windowState = DeviceServices.BaseApp.Settings.WindowState;
-        if (windowState.Width > 0 && windowState.Height > 0)
-        {
-            bounds = new CGRect(bounds.X, bounds.Y, windowState.Width, windowState.Height);
-        }
 #endif
 
         var uiWindow = new UIWindow(bounds);
@@ -67,14 +71,169 @@ public class AppDelegate : UIApplicationDelegate
         uiWindow.RootViewController = uiViewController;
         uiWindow.MakeKeyAndVisible();
 
+#if MACCATALYST
+        _geometryRestoreAttempts = 0;
+        _restoreTargetFrame = null;
+        RestoreWindowGeometry(scene);
+#endif
+
         return true;
     }
 
     public override void WillTerminate(UIApplication application)
     {
+#if MACCATALYST
+        // Capture the final frame, including moves that happened without a resize.
+        var windowScene = GetWindowScene();
+        if (windowScene is not null)
+        {
+            SaveWindowGeometry(windowScene);
+        }
+#endif
+
         DeviceServices.BaseApp.SaveSettings();
         DeviceServices.BaseApp.DisposeSaveSettingsRequest();
     }
+
+#if MACCATALYST
+    // ── Mac Catalyst window geometry ───────────────────────────────────────────
+    //
+    // The NSWindow is owned by the scene / macOS window server: neither the bounds
+    // passed to the UIWindow constructor nor assignments to UIWindow.Frame resize
+    // the actual window. The only supported way to resize or reposition it is
+    // -[UIWindowScene requestGeometryUpdateWithPreferences:errorHandler:] with a
+    // UIWindowSceneGeometryPreferencesMac carrying the target systemFrame
+    // (screen coordinates in points, origin at the bottom-left corner).
+    // AppKit is unavailable in Mac Catalyst processes, so NSScreen.visibleFrame
+    // cannot be queried; requesting the full screen bounds lets the window server
+    // clamp the frame to the usable area, which produces the maximized state.
+
+    /// <summary>Maximum vertical space the menu bar plus a visible dock can occupy, used to classify a frame as maximized.</summary>
+    const int MenuBarAndDockMaxSlack = 140;
+
+    /// <summary>Geometry restore attempts issued for the current launch.</summary>
+    static int _geometryRestoreAttempts;
+
+    /// <summary>
+    /// Target frame captured from settings when the restore sequence starts. All
+    /// retries reuse it so transient save events during the settle cannot re-target
+    /// the retries; null means no restore is in flight.
+    /// </summary>
+    static CGRect? _restoreTargetFrame;
+
+    internal static UIWindowScene? GetWindowScene()
+        => UIApplication.SharedApplication.ConnectedScenes
+            .ToArray().FirstOrDefault(cs => cs is UIWindowScene) as UIWindowScene;
+
+    /// <summary>
+    /// Restores the saved window geometry through requestGeometryUpdate.
+    /// Deferred onto the main queue because during FinishedLaunching the scene is
+    /// not active yet and geometry requests issued before activation are dropped.
+    /// Retries a few times because macOS applies its own initial window frame on a
+    /// later run loop — observed overwriting an early request about 50 ms after
+    /// launch — plus the documented Ventura 13.2 bug where the settled height comes
+    /// back smaller than requested. The target frame is captured once on the first
+    /// attempt; settle-time saves must not feed back into the retries, otherwise the
+    /// first save would re-target them at the default frame the system just applied.
+    /// </summary>
+    static void RestoreWindowGeometry(UIWindowScene scene)
+    {
+        CoreFoundation.DispatchQueue.MainQueue.DispatchAsync(() =>
+        {
+            var screen = scene.Screen.Bounds;
+
+            if (_restoreTargetFrame is null)
+            {
+                var windowState = DeviceServices.BaseApp.Settings.WindowState;
+
+                if (windowState.Maximized)
+                {
+                    // The full screen bounds are honored exactly, which produces the
+                    // maximized state; the menu bar overlays the top of the window.
+                    _restoreTargetFrame = new CGRect(0, 0, screen.Width, screen.Height);
+                }
+                else if (windowState.Width > 0 && windowState.Height > 0)
+                {
+                    var frame = new CGRect(windowState.X, windowState.Y, windowState.Width, windowState.Height);
+
+                    // Honor the saved frame only while it still fits the current screen.
+                    if (frame.Width <= screen.Width && frame.Height <= screen.Height)
+                    {
+                        _restoreTargetFrame = frame;
+                    }
+                }
+            }
+
+            if (_restoreTargetFrame is null)
+            {
+                // Nothing to restore; persist whatever geometry the system chose.
+                SaveWindowGeometry(scene);
+                return;
+            }
+
+            RequestGeometry(scene, _restoreTargetFrame.Value);
+
+            _geometryRestoreAttempts++;
+
+            if (_geometryRestoreAttempts < 3)
+            {
+                var when = new CoreFoundation.DispatchTime(CoreFoundation.DispatchTime.Now, 150_000_000);
+                CoreFoundation.DispatchQueue.MainQueue.DispatchAfter(when, () => RestoreWindowGeometry(scene));
+            }
+            else
+            {
+                // Final request issued; release the intent so resize saves resume.
+                _restoreTargetFrame = null;
+            }
+        });
+    }
+
+    static void RequestGeometry(UIWindowScene scene, CGRect frame)
+    {
+        var preferences = new UIWindowSceneGeometryPreferencesMac(frame);
+
+        scene.RequestGeometryUpdate(preferences, error =>
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [WindowGeometry] request frame={frame} failed err={error?.LocalizedDescription}"));
+    }
+
+    /// <summary>Persists the current window frame (points, screen coordinates) and the maximized flag derived from it.</summary>
+    internal static void SaveWindowGeometry(UIWindowScene scene)
+    {
+        var frame = scene.EffectiveGeometry.SystemFrame;
+        var screen = scene.Screen.Bounds;
+
+        // Restore in flight: the window may be mid-resize between the system's own
+        // initial frame and the re-asserted target; do not persist transient states.
+        if (_restoreTargetFrame is not null)
+        {
+            return;
+        }
+
+        if (frame.Width <= 0 || frame.Height <= 0 || screen.Width <= 0 || screen.Height <= 0)
+        {
+            return;
+        }
+
+        var windowState = DeviceServices.BaseApp.Settings.WindowState;
+
+        // A maximized window spans the full usable width and leaves no more than
+        // the menu bar plus dock uncovered vertically. The exact usable frame is
+        // not queryable from Mac Catalyst, hence the slack.
+        windowState.Maximized = frame.Width >= screen.Width - 8
+            && frame.Height >= screen.Height - MenuBarAndDockMaxSlack;
+        windowState.FullScreen = false;
+
+        if (!windowState.Maximized)
+        {
+            windowState.X = (int)frame.X;
+            windowState.Y = (int)frame.Y;
+            windowState.Width = (int)frame.Width;
+            windowState.Height = (int)frame.Height;
+        }
+
+        DeviceServices.BaseApp.RequestSaveSettings();
+    }
+#endif
 }
 
 /// <summary>
@@ -336,14 +495,17 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
     public override void DrawableSizeWillChange(MTKView view, CGSize size)
     {
 #if MACCATALYST
+        // The drawable size tracks the window content area, so this is also where
+        // window resizes are persisted. The authoritative frame is read back from
+        // the scene because drawable sizes are physical pixels while settings
+        // store points.
         if (size.Width > 0 && size.Height > 0)
         {
-            var windowState = DeviceServices.BaseApp.Settings.WindowState;
-            windowState.Width = (int)size.Width;
-            windowState.Height = (int)size.Height;
-            windowState.FullScreen = false;
-            windowState.Maximized = false;
-            DeviceServices.BaseApp.RequestSaveSettings();
+            var scene = AppDelegate.GetWindowScene();
+            if (scene is not null)
+            {
+                AppDelegate.SaveWindowGeometry(scene);
+            }
         }
 #endif
 

@@ -181,6 +181,10 @@ internal unsafe class Graphics : IGraphics
         {
             if (sprite2D.IsDisposed) return false;
 
+            // An unnamed sprite has no texture to resolve, and the name-keyed dictionary lookup
+            // below throws on a null key rather than missing. Treat it as a skipped load.
+            if (sprite2D.Name.IsNullOrWhiteSpace()) return false;
+
             if (DictionarySprite.TryGetValue((sprite2D.Name, sprite2D.ID), out vkSprite2D!))
             {
                 if (vkSprite2D == null || vkSprite2D.VKTexture == null)

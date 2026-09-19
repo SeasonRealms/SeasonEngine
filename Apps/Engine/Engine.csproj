@@ -74,6 +74,14 @@
 		<ProvisioningType>automatic</ProvisioningType>
 	</PropertyGroup>
 
+	<!-- Mac App Store distribution runs inside the App Sandbox. The entitlements file
+	     (sandbox, network client, microphone input, Downloads and user-selected file access)
+	     only takes effect when referenced here: MAUI does not wire it automatically.
+	     iOS needs no entitlements. -->
+	<PropertyGroup Condition="'$(IsMacCatalyst)' == 'true'">
+		<CodesignEntitlements>Platforms/MacCatalyst/Entitlements.plist</CodesignEntitlements>
+	</PropertyGroup>
+
 	<ItemGroup>
 		<MauiIcon Include="Resources\AppIcon\appicon.svg" Color="#ffffff" />
 		<MauiSplashScreen Include="Resources\Splash\splash.svg" Color="white" BaseSize="128,128" />

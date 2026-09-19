@@ -431,7 +431,28 @@ internal class AppleFileService : IFileService
 
     public async Task<List<TaskFile>> PickFiles(FileType fileType, string[] exts, bool multiple, bool open)
     {
+#if MACCATALYST
+        // MacCatalyst hands the picker over to the out-of-process AppKit open panel service. Under App
+        // Sandbox that service refuses to display the panel when the app is missing the User Selected File
+        // entitlement: AppKit only writes "Unable to display open panel" to the system log, UIKit keeps an
+        // invisible modal that swallows the window's input, and none of the picker callbacks ever arrives.
+        // Fail fast with a log entry instead of presenting a picker that can never show.
+        if (!HasUserSelectedFileEntitlement())
+        {
+            DeviceServices.BaseApp?.AddLog(LogType.Error,
+                $"{DateTime.UtcNow} [PickFiles] aborted: the app sandbox is missing " +
+                "'com.apple.security.files.user-selected.read-write', the AppKit open panel cannot be displayed.");
+
+            return new List<TaskFile>();
+        }
+#endif
+
         var tcs = new TaskCompletionSource<IEnumerable<NSUrl>>();
+
+        UIDocumentPickerViewController? picker = null;
+
+        // Set by the presentation completion handler: false means the modal never made it on screen.
+        var presented = false;
 
         UIApplication.SharedApplication.InvokeOnMainThread(delegate
         {
@@ -449,33 +470,45 @@ internal class AppleFileService : IFileService
                     AllowsMultipleSelection = multiple
                 };
 
+                picker = documentPicker;
+
                 pickerDelegate = new PickerDelegate
                 {
                     PickHandler = urls => tcs.TrySetResult(urls)
                 };
                 documentPicker.Delegate = pickerDelegate;
 
-                if (documentPicker.PresentationController != null)
-                {
-                    presentationControllerDelegate =
-                        new UIPresentationControllerDelegate(() => tcs.TrySetResult(null));
-                    documentPicker.PresentationController.Delegate = presentationControllerDelegate;
-                }
-
                 var parentController = Microsoft.Maui.ApplicationModel.Platform.GetCurrentUIViewController();
 
                 if (parentController is not null)
-                    parentController.PresentViewController(documentPicker, true, null);
+                {
+                    // The completion handler fires when the PRESENTATION animation finishes, not on dismissal.
+                    // It is also the first moment PresentationController exists (UIKit creates it as the
+                    // transition starts), so the adaptive-dismissal delegate can only be attached from in here:
+                    // assigning it before present is a no-op.
+                    parentController.PresentViewController(documentPicker, true, delegate
+                    {
+                        presented = true;
+
+                        presentationControllerDelegate =
+                            new UIPresentationControllerDelegate(() => tcs.TrySetResult(null));
+                        documentPicker.PresentationController?.Delegate = presentationControllerDelegate;
+                    });
+                }
                 else
+                {
                     tcs.TrySetResult(null);
+                }
             }
-            catch (System.Exception)
+            catch (System.Exception ex)
             {
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [PickFiles] {ex}");
+
                 tcs.TrySetResult(null);
             }
         });
 
-        var files = (await tcs.Task).NullToEmptyArray();
+        var files = (await WaitPickerSession(tcs, () => picker, () => presented)).NullToEmptyArray();
 
         var taskFiles = new List<TaskFile>();
 
@@ -487,7 +520,16 @@ internal class AppleFileService : IFileService
 
             if (open)
             {
-                stream = System.IO.File.OpenRead(file.Path);
+                try
+                {
+                    stream = System.IO.File.OpenRead(file.Path);
+                }
+                catch (System.Exception ex)
+                {
+                    // A failed read must not travel up through the render loop, which would take the whole
+                    // app down: report it and let the caller fall back to the path alone.
+                    DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [PickFiles] open {file.Path} failed: {ex.Message}");
+                }
             }
             else
             {
@@ -509,15 +551,222 @@ internal class AppleFileService : IFileService
         return taskFiles;
     }
 
+    /// <summary>Seconds waited after present before probing whether the picker actually made it on screen.</summary>
+    const int PickerProbeDelaySeconds = 3;
+
+    /// <summary>Seconds a picker session may stay open without any callback before it is force-dismissed.</summary>
+    const int PickerSessionTimeoutSeconds = 300;
+
+    /// <summary>
+    /// Waits for the picker callbacks while guarding against a presentation that fails silently. The short
+    /// probe catches a session that never became visible; the long stop guarantees the caller never awaits
+    /// forever. Both recovery paths dismiss the picker first — a half-presented modal keeps swallowing the
+    /// window's input — and then resolve the tcs with null, so PickFiles returns an empty list instead of
+    /// leaving the app stuck until it is force quit.
+    /// </summary>
+    static async Task<IEnumerable<NSUrl>> WaitPickerSession(TaskCompletionSource<IEnumerable<NSUrl>> tcs,
+        Func<UIDocumentPickerViewController?> picker, Func<bool> presented)
+    {
+        if (await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(PickerProbeDelaySeconds))) != tcs.Task)
+        {
+            if (!await PickerIsAlive(picker, presented))
+            {
+                DismissPickerSession(tcs, picker, "the presentation aborted and no picker became visible");
+
+                return await tcs.Task;
+            }
+        }
+
+        if (await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(PickerSessionTimeoutSeconds))) != tcs.Task)
+        {
+            DismissPickerSession(tcs, picker, $"no callback arrived within {PickerSessionTimeoutSeconds}s");
+        }
+
+        return await tcs.Task;
+    }
+
+    /// <summary>
+    /// True while the session is plausibly alive: the presentation completed, or the picker carries either a
+    /// presenting controller or a window. Anything else means UIKit never got the modal on screen.
+    /// </summary>
+    static async Task<bool> PickerIsAlive(Func<UIDocumentPickerViewController?> picker, Func<bool> presented)
+    {
+        // UIKit state must be read on the main thread; the picker callbacks that set those values run there
+        // as well, so reading them from the same thread is what makes the probe sound.
+        return await Microsoft.Maui.ApplicationModel.MainThread.InvokeOnMainThreadAsync(delegate
+        {
+            var controller = picker();
+
+            return presented()
+                || controller?.PresentingViewController is not null
+                || controller?.View?.Window is not null;
+        });
+    }
+
+    /// <summary>Dismisses a stuck picker session on the main thread and resolves the tcs with null.</summary>
+    static void DismissPickerSession(TaskCompletionSource<IEnumerable<NSUrl>> tcs,
+        Func<UIDocumentPickerViewController?> picker, string reason)
+    {
+        DeviceServices.BaseApp?.AddLog(LogType.Error,
+            $"{DateTime.UtcNow} [PickFiles] picker session recovered: {reason}; the picker was dismissed and no file was returned.");
+
+        UIApplication.SharedApplication.InvokeOnMainThread(delegate
+        {
+            // The delegate may have resolved the tcs while this block was queued: then the picker is already
+            // dismissing itself and the user's selection must win over the recovery.
+            if (!tcs.Task.IsCompleted)
+                picker()?.DismissViewController(true, null);
+
+            tcs.TrySetResult(null);
+        });
+    }
+
+    /// <summary>
+    /// Save-side counterpart of <see cref="WaitPickerSession"/>: the ExportToService panel gets the same
+    /// silent-presentation guard as the import picker. The short probe catches a session that never became
+    /// visible; the long stop guarantees the caller never awaits forever. Both recovery paths resolve the
+    /// tcs with an empty string, so SaveFile reports "not saved" instead of leaving the app stuck.
+    /// </summary>
+    static async Task<string> WaitSaveSession(TaskCompletionSource<string> tcs,
+        Func<UIDocumentPickerViewController?> picker, Func<bool> presented)
+    {
+        if (await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(PickerProbeDelaySeconds))) != tcs.Task)
+        {
+            if (!await PickerIsAlive(picker, presented))
+            {
+                DismissSaveSession(tcs, picker, "the presentation aborted and no picker became visible");
+
+                return await tcs.Task;
+            }
+        }
+
+        if (await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(PickerSessionTimeoutSeconds))) != tcs.Task)
+        {
+            DismissSaveSession(tcs, picker, $"no callback arrived within {PickerSessionTimeoutSeconds}s");
+        }
+
+        return await tcs.Task;
+    }
+
+    /// <summary>Dismisses a stuck save session on the main thread and resolves the tcs with an empty string.</summary>
+    static void DismissSaveSession(TaskCompletionSource<string> tcs,
+        Func<UIDocumentPickerViewController?> picker, string reason)
+    {
+        DeviceServices.BaseApp?.AddLog(LogType.Error,
+            $"{DateTime.UtcNow} [SaveFile] picker session recovered: {reason}; the picker was dismissed and no file was saved.");
+
+        UIApplication.SharedApplication.InvokeOnMainThread(delegate
+        {
+            // A half-presented modal keeps swallowing the window's input, so it is dismissed before the
+            // caller is released; the completed-tcs check keeps a selection or cancel that raced with this
+            // recovery winning over it.
+            if (!tcs.Task.IsCompleted)
+                picker()?.DismissViewController(true, null);
+
+            tcs.TrySetResult("");
+        });
+    }
+
+#if MACCATALYST
+    /// <summary>
+    /// True when the picker may be handed over to the AppKit open panel service: the app is either not
+    /// sandboxed at all, or its sandbox grants user-selected file access. Fails open (true) when the
+    /// entitlements cannot be read, so a broken probe never blocks an otherwise working picker.
+    /// </summary>
+    static bool HasUserSelectedFileEntitlement()
+    {
+        try
+        {
+            var task = SecTaskCreateFromSelf(IntPtr.Zero);
+
+            if (task == IntPtr.Zero)
+                return true;
+
+            try
+            {
+                if (!EntitlementBool(task, "com.apple.security.app-sandbox"))
+                    return true;
+
+                return EntitlementBool(task, "com.apple.security.files.user-selected.read-write")
+                    || EntitlementBool(task, "com.apple.security.files.user-selected.read-only");
+            }
+            finally
+            {
+                CFRelease(task);
+            }
+        }
+        catch (System.Exception)
+        {
+            return true;
+        }
+    }
+
+    /// <summary>Reads one boolean entitlement of the current process out of its code signature.</summary>
+    static bool EntitlementBool(IntPtr task, string entitlement)
+    {
+        using var key = new NSString(entitlement);
+
+        var value = SecTaskCopyValueForEntitlement(task, key.Handle, out var error);
+
+        if (error != IntPtr.Zero)
+            CFRelease(error);
+
+        if (value == IntPtr.Zero)
+            return false;
+
+        try
+        {
+            return CFGetTypeID(value) == CFBooleanGetTypeID() && CFBooleanGetValue(value) != 0;
+        }
+        finally
+        {
+            CFRelease(value);
+        }
+    }
+
+    [DllImport("/System/Library/Frameworks/Security.framework/Security", EntryPoint = "SecTaskCreateFromSelf")]
+    static extern IntPtr SecTaskCreateFromSelf(IntPtr allocator);
+
+    [DllImport("/System/Library/Frameworks/Security.framework/Security", EntryPoint = "SecTaskCopyValueForEntitlement")]
+    static extern IntPtr SecTaskCopyValueForEntitlement(IntPtr task, IntPtr entitlement, out IntPtr error);
+
+    [DllImport("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", EntryPoint = "CFRelease")]
+    static extern void CFRelease(IntPtr cf);
+
+    [DllImport("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", EntryPoint = "CFGetTypeID")]
+    static extern IntPtr CFGetTypeID(IntPtr cf);
+
+    [DllImport("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", EntryPoint = "CFBooleanGetTypeID")]
+    static extern IntPtr CFBooleanGetTypeID();
+
+    [DllImport("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", EntryPoint = "CFBooleanGetValue")]
+    static extern byte CFBooleanGetValue(IntPtr boolean);
+#endif
+
     public async Task<string> SaveFile(string fileName, Stream stream, CancellationToken cancellationToken)
     {
         fileName = Path.GetFileName(fileName);
 
         var result = "";
 
+#if MACCATALYST
+        // Same fail-fast guard as PickFiles: the ExportToService panel is handed over to the out-of-process
+        // AppKit open/save panel service, which refuses to display it under App Sandbox when the app is
+        // missing the User Selected File entitlement. No picker callback ever arrives in that case, so fail
+        // fast with a log entry instead of presenting a panel that can never show.
+        if (!HasUserSelectedFileEntitlement())
+        {
+            DeviceServices.BaseApp?.AddLog(LogType.Error,
+                $"{DateTime.UtcNow} [SaveFile] aborted: the app sandbox is missing " +
+                "'com.apple.security.files.user-selected.read-write', the AppKit save panel cannot be displayed.");
+
+            return result;
+        }
+#endif
+
         var fileUrl = Path.Combine(Path.GetTempPath(), fileName);
 
-        var streamTarget = System.IO.File.OpenWrite(fileUrl);
+        using var streamTarget = System.IO.File.OpenWrite(fileUrl);
 
         var length = (int)(stream.Length < 4096 ? stream.Length : 4096);
 
@@ -558,13 +807,21 @@ internal class AppleFileService : IFileService
             InternalDispose();
         };
 
+        // Set by the presentation completion handler: false means the modal never made it on screen.
+        var presented = false;
+
         UIApplication.SharedApplication.InvokeOnMainThread(delegate
         {
             var currentViewController = Microsoft.Maui.ApplicationModel.Platform.GetCurrentUIViewController();
 
             if (currentViewController is not null)
             {
-                currentViewController.PresentViewController(documentPickerViewController, true, null);
+                // The completion handler fires when the PRESENTATION animation finishes, not on dismissal;
+                // it is the only moment the presentation guard can know the modal made it on screen.
+                currentViewController.PresentViewController(documentPickerViewController, true, delegate
+                {
+                    presented = true;
+                });
             }
             else
             {
@@ -572,7 +829,7 @@ internal class AppleFileService : IFileService
             }
         });
 
-        var usrl = await taskCompetedSource.Task;
+        var usrl = await WaitSaveSession(taskCompetedSource, () => documentPickerViewController, () => presented);
 
         result = usrl;
 
@@ -2379,22 +2636,35 @@ internal class AppleDownloadService : IDownloadService
             directory = Path.Combine(DownloadDir, directory);
         }
 
-        if (Directory.Exists(directory))
-        {
-
-        }
-        else
-        {
-            Directory.CreateDirectory(directory);
-        }
-
         var file = Path.Combine(directory, name);
 
-        using (var fs = System.IO.File.Open(file, FileMode.Append))
+        try
         {
-            fs.Write(bytes);
+            if (Directory.Exists(directory))
+            {
 
-            fs.Close();
+            }
+            else
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            using (var fs = System.IO.File.Open(file, FileMode.Append))
+            {
+                fs.Write(bytes);
+
+                fs.Close();
+            }
+        }
+        catch (Exception ex)
+        {
+            // Never let an IO failure here tear down the app: downloads run inside the
+            // render/update loop. Under MacCatalyst App Sandbox the usual cause is the real
+            // ~/Downloads folder being blocked; com.apple.security.files.downloads.read-write
+            // must be declared in Platforms/MacCatalyst/Entitlements.plist.
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [DownloadSave] file={file} failed err={ex}");
+
+            return;
         }
 
         if (openFolder)

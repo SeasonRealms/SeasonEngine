@@ -1213,7 +1213,12 @@ public class Texts : Control, IRenderOrder
             // extend from the wrong base and the middle portion of the text could never be recovered.
             Build(Content);
 
-            builtContent = Content;
+            // Snapshot the raw content, not the translated Content: FinishLoad compares this
+            // snapshot with the raw content field to detect changes during loading. Snapshotting
+            // the translated string would make that comparison always true for translated texts,
+            // so every finished load would set ContentDirty again and the control would rebuild
+            // itself once per frame forever.
+            builtContent = content;
             empty = TexsLoading == null || TexsLoading.Length == 0;
         }
 
@@ -1371,6 +1376,13 @@ public class Texts : Control, IRenderOrder
     /// to leaving holes where appended glyphs have no holders or become misaligned.</summary>
     bool TryQueueTailAppend(string loaded)
     {
+        // Translation replaces the whole string: the glyphs currently on the GPU are the
+        // translated text, while an incremental tail would be parsed from the raw text.
+        // The appended glyphs would not align with the translated glyphs already loaded,
+        // so translated texts always fall back to a full rebuild.
+        if (Content != content)
+            return false;
+
         var current = content;
         var loadedText = loaded.NullToString();
 

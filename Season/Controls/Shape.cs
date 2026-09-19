@@ -157,7 +157,11 @@ public class Shape : SpriteBase, IRenderOrder
 
         if (base.Draw())
         {
-            if (Ready && Width > 0 && Height > 0 && Alpha > 0f)
+            if (!Ready || Alpha == 0 || Width == 0 || Height == 0 || PosX == 0 && PosY == 0)
+            {
+                
+            }
+            else
             {
                 Graphics.Instance.DrawShape(this);
 

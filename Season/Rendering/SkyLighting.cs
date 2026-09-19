@@ -351,10 +351,11 @@ public static class SkyLighting
         if (FrameSchedule.SkyViewTexture == null)
         {
             // [SkyDebug] Fallback-preset diagnostic: SkyViewTexture=null means the procedural sky is not active (no analytic sun/moon disks or starfield).
-            if (_skyDebugEarlyExitCount < 3 || _skyDebugEarlyExitCount % 600 == 0)
+            // StaticCube is the expected tier for apps that never enable the procedural sky, so log the
+            // fallback once for diagnosis and stay silent afterwards; per-frame logs are pure noise.
+            if (_skyDebugEarlyExitCount++ == 0)
                 DeviceServices.BaseApp.AddLog(LogType.Backend,
-                    $"[SkyDebug] Apply EARLY-EXIT SkyViewTexture=null -> StaticCube preset (cubemap + marker sphere, no starfield) cnt={_skyDebugEarlyExitCount}");
-            _skyDebugEarlyExitCount++;
+                    $"[SkyDebug] Apply EARLY-EXIT SkyViewTexture=null -> StaticCube preset (cubemap + marker sphere, no starfield) cnt={_skyDebugEarlyExitCount - 1}");
             return;
         }
 
