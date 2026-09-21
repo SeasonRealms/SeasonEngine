@@ -160,10 +160,20 @@ jobs:
           # flag --whole-archive triggers duplicate-symbol errors.
           # -static-libstdc++ embeds libc++ inside libglslang.so, freeing the APK
           # from shipping libc++_shared.so.
+          # -Wl,-z,max-page-size=16384 forces every PT_LOAD segment to 16 KB
+          # alignment. NDK r26's lld still defaults max-page-size to 4 KB, so
+          # without this flag the produced .so has 0x1000-aligned LOAD segments,
+          # which fails Android's 16 KB page size compatibility check
+          # ("LOAD segment not aligned") on 16 KB devices and Google Play's
+          # mandatory 16 KB requirement. The flag must be present at THIS final
+          # link step: segment alignment is decided when the static archives
+          # are linked into the shared library, not when the individual
+          # objects are compiled.
           "$CXX" -shared -fPIC -fuse-ld=lld -O2 \
             -Wl,--whole-archive $LIBS -Wl,--no-whole-archive \
             -Wl,--allow-multiple-definition \
             -static-libstdc++ \
+            -Wl,-z,max-page-size=16384 \
             -Wl,--build-id=sha1 \
             -o "$OUT/libglslang.so"
 
@@ -187,6 +197,33 @@ jobs:
           # Sanity: the very first symbol the runtime asks for.
           "$NM" -D --defined-only "$OUT/libglslang.so" | grep -q ' T glslang_initialize_process' \
             || { echo "::error::glslang_initialize_process is NOT exported"; exit 1; }
+
+      - name: Verify 16 KB page size alignment
+        run: |
+          OUT="out/${{ matrix.abi }}"
+          READELF="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          echo "==== PT_LOAD segments ===="
+          "$READELF" -l "$OUT/libglslang.so" | grep -E '^[[:space:]]*LOAD' || true
+          # Every PT_LOAD segment must satisfy p_align >= 0x4000 and
+          # (p_vaddr - p_offset) % 0x4000 == 0 -- the two conditions of the
+          # Android 16 KB page size ELF alignment check. llvm-readelf prints
+          # p_align as a trailing hex value on each LOAD line.
+          mapfile -t LOAD_LINES < <("$READELF" -l "$OUT/libglslang.so" | grep -E '^[[:space:]]*LOAD')
+          if [ "${#LOAD_LINES[@]}" -eq 0 ]; then
+            echo "::error::no PT_LOAD segments found - llvm-readelf output unexpected"
+            exit 1
+          fi
+          FAIL=0
+          for line in "${LOAD_LINES[@]}"; do
+            read -r _ off vaddr _ <<< "$line"
+            align="${line##* }"
+            if (( align < 16384 )) || (( (vaddr - off) % 16384 != 0 )); then
+              echo "::error::PT_LOAD segment is not 16 KB aligned: $line"
+              FAIL=1
+            fi
+          done
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo "All ${#LOAD_LINES[@]} PT_LOAD segments are 16 KB aligned."
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
