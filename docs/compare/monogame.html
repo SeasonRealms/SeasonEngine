@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<!--
+  SeasonEngine website - Migrating from MonoGame
+
+  Hand-written static site, no build step. Conventions:
+  - Root pages use  assets/...   Pages one folder deep use  ../assets/...
+  - Header and footer markup is duplicated on every page on purpose. When you
+    change a navigation link, update it on every page.
+  - The right-hand table of contents is generated from the h2 and h3 elements
+    inside [data-toc-source]. Adding a section needs no other change.
+-->
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Migrating from MonoGame &mdash; SeasonEngine</title>
+    <meta name="description" content="How the SeasonXNA compatibility layer carries XNA-shaped 2D sprite, image and text code onto SeasonEngine: the migration order, what replaces the Content pipeline, the D01-A tint rule, and what is deliberately unsupported." />
+    <link rel="canonical" href="https://seasonrealms.github.io/SeasonEngine/compare/monogame.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Migrating from MonoGame &mdash; SeasonEngine" />
+    <meta property="og:description" content="How the SeasonXNA compatibility layer carries XNA-shaped 2D sprite, image and text code onto SeasonEngine: the migration order, what replaces the Content pipeline, the D01-A tint rule, and what is deliberately unsupported." />
+    <meta property="og:url" content="https://seasonrealms.github.io/SeasonEngine/compare/monogame.html" />
+    <meta property="og:image" content="https://seasonrealms.github.io/SeasonEngine/assets/img/og-image.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/site.css" />
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('se-theme');
+                if (!t) t = 'dark';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+        })();
+    </script>
+</head>
+<body>
+
+    <!-- HEADER ============================================================ -->
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a>
+            <a href="https://www.nuget.org/packages/SeasonEngine">NuGet</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Moon.png" alt="Dark theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Icon.png" alt="SeasonEngine" />
+                <span>SeasonEngine</span>
+            </a>
+            <button class="se-nav__toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">&#9776;</button>
+            <div class="se-nav__links">
+                <a href="../index.html">Home</a>
+                <a href="../features/">Features</a>
+                <a href="../docs/">Docs</a>
+                <a href="../samples/">Samples</a>
+                <a href="../download/">Download</a>
+                <a href="../roadmap/">Roadmap</a>
+                <a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN ============================================================== -->
+    <div class="se-shell">
+        <div class="se-container">
+            <div class="se-doc se-doc--wide">
+
+                <div class="se-doc__main" data-toc-source>
+                    <p class="se-crumbs"><a href="../index.html">Home</a> / <a href="../compare/">How it compares</a> / Migrating from MonoGame</p>
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Migrating from MonoGame</h1>
+                        <p class="se-lede">
+                            SeasonXNA is the compatibility layer that lets XNA-shaped 2D code &mdash; sprite draws,
+                            images, MSDF text &mdash; run on SeasonEngine's renderer. This page is the migration
+                            guide: what carries over, what has to change, and what is deliberately missing.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The short answer</h2>
+                        <p>
+                            If your MonoGame code is mostly <code class="se-inline">SpriteBatch.Draw</code>,
+                            <code class="se-inline">DrawString</code>, <code class="se-inline">Texture2D</code>,
+                            <code class="se-inline">SpriteFont</code> and <code class="se-inline">Content.Load</code> calls,
+                            the shape of the drawing code survives. What does not survive is the assembly: SeasonXNA
+                            publishes 14 public types under the original <code class="se-inline">Microsoft.Xna.Framework</code>
+                            namespaces, and none of them come from MonoGame.
+                        </p>
+                        <ul class="se-list">
+                            <li>The drawing call sites keep their XNA shape: <code class="se-inline">Draw</code> has 7 overload groups, <code class="se-inline">DrawString</code> 6 and <code class="se-inline">MeasureString</code> 2, and the value types keep their familiar members.</li>
+                            <li>The host does not. There is no <code class="se-inline">Game</code> class, no <code class="se-inline">GraphicsDeviceManager</code> and no fixed timestep &mdash; your app is a normal Season <code class="se-inline">BaseApp</code>, and SeasonXNA plugs into its <code class="se-inline">Draw2D</code> callback.</li>
+                            <li>Loading does not either. <code class="se-inline">ContentManager</code> and <code class="se-inline">.xnb</code> are gone; <code class="se-inline">SeasonResources.LoadTexture</code> and <code class="se-inline">LoadFont</code> replace them, preload-only.</li>
+                        </ul>
+
+                        <div class="se-callout se-callout--contract">
+                            <span class="se-callout__title">Source level, not binary level</span>
+                            <p>
+                                Existing class libraries can be reused at source level, but not at binary level, and
+                                only for the supported subset. A compiled library that references
+                                <code class="se-inline">MonoGame.dll</code> cannot be swapped in, and SeasonXNA must
+                                not be mixed with MonoGame inside the same process. Migration means recompiling your
+                                code against SeasonXNA.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">What the compatibility layer covers</h2>
+                        <p>
+                            The entire public surface is 14 types across four namespaces. That number is checked
+                            mechanically, not by inspection &mdash; see the verification section below.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Namespace</th><th>Types</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code class="se-inline">Microsoft.Xna.Framework</code></td><td>Vector2, Rectangle, Color, Matrix</td></tr>
+                                    <tr><td><code class="se-inline">Microsoft.Xna.Framework.Graphics</code></td><td>Texture2D, SpriteFont, SpriteBatch, SpriteEffects, SpriteSortMode, BlendState, SamplerState</td></tr>
+                                    <tr><td><code class="se-inline">SeasonXNA.Hosting</code></td><td>DrawContext, FrameScope</td></tr>
+                                    <tr><td><code class="se-inline">SeasonXNA.Interop</code></td><td>SeasonResources</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <ul class="se-list">
+                            <li><code class="se-inline">Texture2D</code> and <code class="se-inline">SpriteFont</code> have no public constructors. Handles come from <code class="se-inline">SeasonResources</code> &mdash; <code class="se-inline">LoadTexture</code>, <code class="se-inline">LoadFont</code>, <code class="se-inline">BorrowTexture</code>, <code class="se-inline">BorrowFont</code>, <code class="se-inline">TakeTextureOwnership</code> &mdash; so ownership stays explicit.</li>
+                            <li><code class="se-inline">SpriteBatch</code> has a single constructor taking a <code class="se-inline">DrawContext</code>, and <code class="se-inline">Begin</code> takes only <code class="se-inline">sortMode</code>, <code class="se-inline">blendState</code>, <code class="se-inline">samplerState</code> and <code class="se-inline">transformMatrix</code>. The XNA <code class="se-inline">Effect</code>, <code class="se-inline">DepthStencilState</code> and <code class="se-inline">RasterizerState</code> parameters are not accepted-and-ignored placeholders: they do not exist.</li>
+                            <li><code class="se-inline">DrawContext</code> and <code class="se-inline">FrameScope</code> replace the frame lifecycle. Bind once per <code class="se-inline">Draw2D</code> callback with <code class="se-inline">using</code>, and never keep the scope across await, threads or frames.</li>
+                        </ul>
+
+                        <p>A host that draws one image and one line of text is this shape, in full:</p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>// XNA-shaped names at the host boundary.
+using SpriteBatch  = Microsoft.Xna.Framework.Graphics.SpriteBatch;
+using Texture2D    = Microsoft.Xna.Framework.Graphics.Texture2D;
+using SpriteFont   = Microsoft.Xna.Framework.Graphics.SpriteFont;
+using XnaColor     = Microsoft.Xna.Framework.Color;
+using XnaVector2   = Microsoft.Xna.Framework.Vector2;
+using XnaRectangle = Microsoft.Xna.Framework.Rectangle;
+
+public sealed class MyApp : BaseApp
+{
+    private readonly DrawContext _drawing = new();
+    private readonly SpriteBatch _sprites;
+    private Texture2D? _texture;
+    private SpriteFont? _font;
+
+    public MyApp() => _sprites = new SpriteBatch(_drawing);
+
+    // Loading phase: preload everything once, before the first frame.
+    public override void Create()
+    {
+        base.Create();
+        _texture = SeasonResources.LoadTexture("Content/Textures/Logo.png");
+        _font = SeasonResources.LoadFont("Content/Fonts/GameFont.ttf", 24);
+    }
+
+    // Recording phase: this callback only records commands into the native canvas.
+    public override void Draw2D(Draw2D canvas)
+    {
+        if (_texture is null || _font is null) return;
+        using var frame = _drawing.Bind(canvas);
+        try
+        {
+            _sprites.Begin();  // LinearClamp by default; required for MSDF text
+            _sprites.Draw(_texture, new XnaRectangle(24, 24, 320, 180), XnaColor.White);
+            _sprites.DrawString(_font, "Hello from SeasonXNA", new XnaVector2(24, 224), XnaColor.White);
+            _sprites.End();
+        }
+        catch
+        {
+            _drawing.CancelPendingBatches();
+            throw;
+        }
+    }
+}</code></pre>
+                        </div>
+
+                        <p>
+                            Install it with <code class="se-inline">dotnet add package SeasonXNA</code>; the
+                            SeasonEngine core restores automatically as a package dependency.
+                        </p>
+
+                        <div class="se-callout se-callout--warn">
+                            <span class="se-callout__title">Name collisions are expected</span>
+                            <p>
+                                MAUI and engine types such as <code class="se-inline">Color</code>,
+                                <code class="se-inline">Rectangle</code> and <code class="se-inline">Vector2</code>
+                                exist alongside the XNA ones. Use explicit aliases at the host boundary &mdash;
+                                <code class="se-inline">using XnaColor = Microsoft.Xna.Framework.Color;</code> &mdash;
+                                instead of changing engine-global usings.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The migration order</h2>
+                        <p>
+                            The recommended sequence is the one the compatibility layer was built against. The
+                            expensive mistakes are all ordering mistakes.
+                        </p>
+                        <ol class="se-list">
+                            <li>Keep the old MonoGame build read-only, and keep a reference build of its real visuals and interaction for comparison. Start with one page or one small scene.</li>
+                            <li>Create a Season <code class="se-inline">BaseApp</code> host with explicit <code class="se-inline">Create</code>, <code class="se-inline">Update</code> and <code class="se-inline">Draw2D</code> boundaries. Do not implement a second <code class="se-inline">Game.Run</code>.</li>
+                            <li>In the loading phase, create images and fonts through SeasonXNA, and keep your own resource table, keys and path resolution.</li>
+                            <li>Give the host one <code class="se-inline">DrawContext</code> and one <code class="se-inline">SpriteBatch</code>, and bind them only inside the <code class="se-inline">Draw2D</code> callback Season provides.</li>
+                            <li>Keep the supported XNA drawing call sites; concentrate changes in constructors, <code class="se-inline">Begin</code>, and resource and font wrappers. Do not silence the compiler with empty API stubs &mdash; unsupported types are absent on purpose, so every affected call site is found and replaced.</li>
+                            <li>Replace non-drawing platform features &mdash; input, audio, screenshots, pixel processing &mdash; with native Season services. Removing MonoGame is not deleting business code.</li>
+                            <li>Compare page by page: image, input, saves and gameplay. Passing SeasonXNA's own acceptance suite does not mean the game is migrated.</li>
+                        </ol>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">The Content pipeline is gone</h2>
+                        <p>
+                            There is no content pipeline, and there will not be an emulated one. The practical
+                            consequences for a port:
+                        </p>
+                        <ul class="se-list">
+                            <li><strong>No MGCB, no <code class="se-inline">.xnb</code>.</strong> The content builder, compiled Content artifacts and <code class="se-inline">ContentManager.Load&lt;T&gt;</code> are not supported and never will be. SeasonXNA does not read XNB files.</li>
+                            <li><strong>Assets stay in their source formats.</strong> Images are straight-alpha PNG or JPEG; fonts are TrueType or OpenType (<code class="se-inline">.ttf</code> / <code class="se-inline">.otf</code>). Text is laid out from fonts at runtime with MSDF; sprite fonts baked into XNB do not exist here.</li>
+                            <li><strong>Loading is explicit and preload-only.</strong> Call <code class="se-inline">SeasonResources.LoadTexture(path)</code> and <code class="se-inline">LoadFont(path, size)</code> in the loading phase. SeasonXNA never scans directories, never maintains a content manifest, and never loads during <code class="se-inline">Draw</code>.</li>
+                            <li><strong>Paths belong to your app.</strong> Deployment layout (Android assets, Web <code class="se-inline">wwwroot</code>, desktop content folders) and the resource table are application concerns.</li>
+                            <li><strong>The web target loads asynchronously.</strong> Use <code class="se-inline">Image2D.LoadAsync</code> and <code class="se-inline">Font.CreateAsync</code> inside the host's <code class="se-inline">preload</code> callback before the frame loop starts; the synchronous path only serves already-prepared cache entries.</li>
+                        </ul>
+                        <p>
+                            The practical order for assets: delete the MGCB build step, keep the original PNG and TTF
+                            files, port the path table, and replace every <code class="se-inline">Content.Load</code>
+                            call with a preload call.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">What is not supported</h2>
+                        <p>
+                            One design rule is stated in the code and holds everywhere: unsupported capabilities are
+                            absent at compile time or rejected at runtime. Nothing accepts a parameter and silently
+                            does nothing.
+                        </p>
+
+                        <h3>Absent at compile time</h3>
+                        <ul class="se-list">
+                            <li>Windowing, the game loop, input and audio &mdash; these stay in Season's native services and platform hosts.</li>
+                            <li><code class="se-inline">GraphicsDevice</code>, <code class="se-inline">GraphicsDeviceManager</code>, <code class="se-inline">ContentManager</code> and the rest of the non-core XNA surface &mdash; not published.</li>
+                            <li>Effects and shaders, render targets, screenshots and pixel readback &mdash; native Season APIs, not XNA-shaped ones.</li>
+                            <li>Samplers beyond <code class="se-inline">LinearClamp</code> and <code class="se-inline">PointClamp</code>, and any <code class="se-inline">BlendState</code> beyond the <code class="se-inline">AlphaBlend</code> marker &mdash; which is a marker for the D01-A tint adaptation, not a mutable GPU blend state.</li>
+                        </ul>
+
+                        <h3>Rejected at runtime</h3>
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Input</th><th>Result</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>Any <code class="se-inline">SpriteSortMode</code> other than <code class="se-inline">Deferred</code></td><td><code class="se-inline">NotSupportedException</code></td></tr>
+                                    <tr><td><code class="se-inline">DrawString</code> inside a <code class="se-inline">PointClamp</code> batch</td><td><code class="se-inline">NotSupportedException</code> &mdash; MSDF text requires <code class="se-inline">LinearClamp</code></td></tr>
+                                    <tr><td>Tint with R, G or B greater than A</td><td><code class="se-inline">NotSupportedException</code> &mdash; see the tint rule below</td></tr>
+                                    <tr><td><code class="se-inline">Matrix</code> with perspective or Z coupling</td><td><code class="se-inline">NotSupportedException</code> &mdash; planar affine only</td></tr>
+                                    <tr><td><code class="se-inline">layerDepth</code> outside [0, 1]</td><td><code class="se-inline">ArgumentOutOfRangeException</code> &mdash; Deferred does not sort by it</td></tr>
+                                    <tr><td>Non-finite position, origin, scale, rotation, depth or matrix</td><td><code class="se-inline">ArgumentOutOfRangeException</code></td></tr>
+                                    <tr><td>Negative destination rectangle size</td><td><code class="se-inline">ArgumentOutOfRangeException</code> &mdash; mirroring is done with scale and effects</td></tr>
+                                    <tr><td>Source rectangle with zero/negative size, or out of bounds</td><td><code class="se-inline">ArgumentOutOfRangeException</code></td></tr>
+                                    <tr><td>Unknown <code class="se-inline">SpriteEffects</code> bits</td><td><code class="se-inline">ArgumentOutOfRangeException</code></td></tr>
+                                    <tr><td><code class="se-inline">Draw</code> or <code class="se-inline">End</code> without <code class="se-inline">Begin</code>; <code class="se-inline">Begin</code> without <code class="se-inline">End</code></td><td><code class="se-inline">InvalidOperationException</code></td></tr>
+                                    <tr><td>Missing glyph without <code class="se-inline">DefaultCharacter</code>; control characters; invalid UTF-16</td><td><code class="se-inline">ArgumentException</code></td></tr>
+                                    <tr><td>Any use after <code class="se-inline">Dispose</code></td><td><code class="se-inline">ObjectDisposedException</code></td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            Deliberately different semantics are documented as differences, not bugs: blend output is
+                            not full XNA <code class="se-inline">AlphaBlend</code> target-alpha accumulation; text has
+                            no kerning, shaping, bidi or automatic wrapping; sampling is Clamp-only with a half-texel
+                            inset.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Straight alpha and the tint rule</h2>
+                        <p>
+                            SeasonXNA feeds Season's straight-alpha pipeline, and two rules follow. Textures must be
+                            straight alpha: SeasonXNA never detects, unpremultiplies or repairs premultiplied images.
+                            If the old project premultiplied textures at load time, delete that pass.
+                        </p>
+                        <p>Tints entering a draw must be bounded premultiplied values:</p>
+
+                        <div class="se-code">
+                            <button class="se-code__copy" type="button">Copy</button>
+<pre><code>R &lt;= A, G &lt;= A, B &lt;= A        (reject otherwise)
+A = 0  -&gt; only RGBA all-zero is accepted (straight transparent black)
+A &gt; 0  -&gt; converted to (R/A, G/A, B/A, A/255)</code></pre>
+                        </div>
+
+                        <p>
+                            <code class="se-inline">Color</code> itself remains a plain RGBA value and can represent
+                            anything, including RGB greater than A. But <code class="se-inline">new Color(255, 0, 0, 128)</code>
+                            is not a legal tint; for a semi-transparent red write
+                            <code class="se-inline">Color.Red * 0.5f</code> or
+                            <code class="se-inline">Color.FromNonPremultiplied(255, 0, 0, 128)</code>.
+                        </p>
+                        <p class="se-muted">
+                            The two forms may differ by byte quantization &mdash; intent is never guessed.
+                            <code class="se-inline">Color * float</code> scales all four channels (XNA behavior) and
+                            is not changed to alpha-only scaling.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">What has been verified</h2>
+                        <p>
+                            The layer is verified as a bounded contract, not by "the game compiles". The tool suite
+                            lives in the development workspace and is not shipped in the package; the numbers below
+                            are its recorded results.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Check</th><th>Recorded result</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>Public type and assembly surface</td><td>9 groups, 120,742 assertions: exactly 14 public types, <code class="se-inline">Draw</code> 7 / <code class="se-inline">DrawString</code> 6 / <code class="se-inline">MeasureString</code> 2 overload groups, a single <code class="se-inline">SpriteBatch</code> constructor, no public <code class="se-inline">Texture2D</code> or <code class="se-inline">SpriteFont</code> constructors, and no MonoGame references in the shipped assembly.</td></tr>
+                                    <tr><td>CPU contracts</td><td>12 groups, 655 assertions cumulative: binding, lifetimes, ownership, caches, exception recovery, draw order, the shared cross-platform scenes and the asynchronous loading contract.</td></tr>
+                                    <tr><td>Windows GPU acceptance</td><td>Real screenshots with 54 RGB checks, four groups of Chinese text (per-channel tolerance 4/255, measured maximum difference 0), resize, and five lifecycle paths.</td></tr>
+                                    <tr><td>Linux under validation</td><td>The shared Vulkan backend in WSL with the software <code class="se-inline">llvmpipe</code> driver and Khronos validation enabled: a multi-page glyph atlas (1,800 CJK glyphs across 2 pages), transient resource release, lifecycle and empty-lease checks.</td></tr>
+                                    <tr><td>Web (WebGPU)</td><td>54 RGB checks and four text comparisons (maximum difference 0) in a browser, plus device-loss and resource-count checks. The large-CJK-font stress path does not pass yet.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p>Platform status, stated with the same honesty as the rest of this site:</p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Platform</th><th>Backend</th><th>Status</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>Windows</td><td>Direct3D 12</td><td>Reference platform: CPU contracts, GPU images/text/animation, resize and all lifecycle paths pass.</td></tr>
+                                    <tr><td>Linux</td><td>Vulkan</td><td>Verified in WSL with the software <code class="se-inline">llvmpipe</code> driver and validation enabled; not a hardware-GPU performance claim.</td></tr>
+                                    <tr><td>Android</td><td>Vulkan</td><td>Host lifecycle wired and compiling; on-device verification deferred.</td></tr>
+                                    <tr><td>iOS / Mac Catalyst</td><td>Metal</td><td>Managed compilation and CPU contracts pass; no native link, MSL compilation or GPU evidence yet.</td></tr>
+                                    <tr><td>Web</td><td>WebGPU</td><td>Core images, text and lifecycle paths pass in a browser; the large-CJK-font stress path does not pass yet.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            One boundary worth repeating: screenshot-based checks validate the RGB of visible output.
+                            Original target-alpha equivalence with MonoGame is not claimed.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Where this stops</h2>
+                        <p>
+                            SeasonXNA is not a MonoGame replacement, and it does not try to be. It is a bounded
+                            compatibility layer for 2D sprite, image and text call sites &mdash; for new or actively
+                            developed code that wants Season's renderer, application shell and other layers
+                            underneath familiar XNA-shaped drawing calls.
+                        </p>
+                        <p>
+                            If the goal is a faithful port of a shipped XNA title, FNA is the tool built for exactly
+                            that purpose. If the goal is a full XNA-shaped framework with a content pipeline, effects
+                            and render targets, MonoGame remains the answer. What is here is a narrow, verified
+                            bridge &mdash; and the narrowness is the point.
+                        </p>
+
+                        <div class="se-grid se-grid--3">
+                            <a class="se-linkcard" href="https://github.com/SeasonRealms/SeasonEngine/blob/main/SeasonXNA/README.md">
+                                <h3>SeasonXNA README</h3>
+                                <p>The full contract: every type, every rule, every rejected input, and the complete verification record.</p>
+                                <span class="se-linkcard__meta">GitHub &middot; SeasonXNA/README.md</span>
+                            </a>
+                            <a class="se-linkcard" href="../docs/">
+                                <h3>Documentation</h3>
+                                <p>Season's core documentation: the application shell, rendering, controls and the AI layer.</p>
+                                <span class="se-linkcard__meta">Docs</span>
+                            </a>
+                            <a class="se-linkcard" href="../compare/">
+                                <h3>How it compares</h3>
+                                <p>Where SeasonEngine sits against MonoGame, FNA, Unity, Unreal and the rest of the C# landscape.</p>
+                                <span class="se-linkcard__meta">Compare</span>
+                            </a>
+                        </div>
+                    </section>
+
+                    <section class="se-card se-card--tight">
+                    <div class="se-pagenav">
+                        <a href="../compare/">&larr; How it compares</a>
+                        <a href="../docs/">Documentation &rarr;</a>
+                    </div>
+                    </section>
+
+                </div>
+
+                <aside class="se-toc" data-toc>
+                    <h4>On this page</h4>
+                </aside>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER ============================================================ -->
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__cols">
+                <div>
+                    <h4>Learn</h4>
+                    <ul>
+                        <li><a href="../features/">Features</a></li>
+                        <li><a href="../docs/">Documentation</a></li>
+                        <li><a href="../samples/">Samples</a></li>
+                        <li><a href="../roadmap/">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Decide</h4>
+                    <ul>
+                        <li><a href="../why/">Why SeasonEngine</a></li>
+                        <li><a href="../compare/">How it compares</a></li>
+                        <li><a href="../ai/">The local AI layer</a></li>
+                        <li><a href="../download/">Download</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Code</h4>
+                    <ul>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub repository</a></li>
+                        <li><a href="https://www.nuget.org/packages/SeasonEngine">NuGet package</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Season/README.md">Core library README</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/Apps/Engine/README.md">Engine app README</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Legal</h4>
+                    <ul>
+                        <li><a href="https://apps.microsoft.com/detail/9NHDQ4F67MHM">Microsoft Store build</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/PRIVACY.md">Privacy policy</a></li>
+                        <li><a href="https://github.com/SeasonRealms/SeasonEngine/blob/main/LICENSE">MIT License</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms &mdash; SeasonEngine is MIT licensed.</span>
+                <span>Under active development. Read the roadmap before assuming a capability exists.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="../assets/js/site.js"></script>
+</body>
+</html>

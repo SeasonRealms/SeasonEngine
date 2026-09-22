@@ -4,9 +4,10 @@ SeasonEngine is a cross-platform C# graphics engine and application framework fo
 
 **A cross-platform C# engine for people who want real-time graphics architecture to stay visible, understandable, and usable.**
 
-This repository is now organized around three top-level areas:
+This repository is now organized around four top-level areas:
 
 - `Season/` - the reusable `SeasonEngine` core library
+- `SeasonXNA/` - the MonoGame/XNA compatibility layer built on top of the core library
 - `Apps/` - official applications and reference runtimes built on top of the engine
 - `Samples/` - smaller framework examples, including the `Creator` series
 
@@ -46,6 +47,36 @@ If you want to understand the reusable engine layer, start here:
 <img src="Apps/Debug mode.jpg" width="750" alt="Debug mode" />
 
 (**Debug mode**)
+
+### `SeasonXNA/`
+
+`SeasonXNA/` is the MonoGame/XNA compatibility layer built on top of the core library.
+
+It exposes an XNA-style core of 2D drawing — `Texture2D`, `SpriteFont`, `SpriteBatch`, `Color`, `Vector2`, `Rectangle`, `Matrix` — under the original `Microsoft.Xna.Framework.*` namespaces, and forwards every recorded draw into the engine's own 2D pipeline. Compatibility apps are still normal engine apps: they start from `BaseApp` and draw from `Draw2D` through a `DrawContext`-bound `SpriteBatch`.
+
+The migration model is explicit rather than magic:
+
+- **Assets stay in their source formats.**  
+  There is no MGCB step and no `.xnb` files: images remain PNG/JPEG, fonts remain TTF/OTF, and everything loads through `SeasonResources` with explicit preloading instead of directory scanning.
+
+- **The supported surface is documented and enforced.**  
+  Unsupported overloads are absent at compile time, and rejected inputs — such as illegal tint values — fail with explicit exceptions instead of being silently approximated.
+
+- **Class libraries are reusable at source level, not binary level.**  
+  Existing XNA/MonoGame library code can be recompiled against `SeasonXNA` and keep its call sites; MonoGame assemblies cannot be mixed into the same process.
+
+- **One drawing contract across platforms.**  
+  Windows (Direct3D 12), Linux and Android (Vulkan), iOS and Mac Catalyst (Metal), and the Web path all share the same compatibility behavior.
+
+SeasonXNA ships as its own package and restores the `SeasonEngine` core as a dependency:
+
+```bash
+dotnet add package SeasonXNA
+```
+
+For migration steps and the full supported-surface reference, start here:
+
+- [SeasonXNA README](SeasonXNA/README.md)
 
 ### `Apps/`
 
@@ -96,6 +127,7 @@ The Season project is intentionally split between an open source foundation and 
 The following parts are intended to stay broadly usable as MIT-licensed building blocks:
 
 - `Season/` as the core graphics engine and application framework
+- `SeasonXNA/` as the MonoGame/XNA compatibility layer built on the core library
 - the `Apps/Engine` reference runtime used to demonstrate the engine in practice
 - foundational Season AI libraries such as `SeasonAudio`, `SeasonGGML`, `SeasonONNX`, `SeasonTTS`, `SeasonVision`, and related lower-level components
 
@@ -190,6 +222,7 @@ SeasonEngine
 │   ├── Rendering/
 │   ├── Storage/
 │   └── Utils/
+├── SeasonXNA/        MonoGame/XNA compatibility layer
 ├── Apps/
 │   ├── Engine/        Reference runtime application
 │   ├── EngineWasm/    WebAssembly-oriented engine host

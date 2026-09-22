@@ -32,15 +32,15 @@ public static class JsonUtils
     }
 
     /// <summary>
-    /// 兼容 Newtonsoft.Json 默认序列化语义的选项集（本地存档等历史数据专用）。
-    /// 相对默认选项的差异：包含 public 字段与只读成员、允许 NaN/Infinity 字面量、
-    /// 容忍注释与尾逗号、属性名匹配不区分大小写，
-    /// 并对 [DataContract] 类型仅保留 [DataMember] 成员（见 DataContractOptInResolver）。
+    /// Compatible with Newtonsoft. Johnson's default serialization semantics option set (specific to historical data such as local archives).
+    /// Differences from default options: including public fields and read-only members, allowing NaN/Infinity literals
+    /// Tolerant comments that match with trailing commas and attribute names are not case sensitive,
+    /// And only retain the [DataMember] member for the [DataContract] type (see DataMractOptAInResolver).
     /// </summary>
     public static readonly JsonSerializerOptions NewtonsoftCompatJsonSerializerOptions = CreateNewtonsoftCompatJsonSerializerOptions(false);
 
     /// <summary>
-    /// 同 NewtonsoftCompatJsonSerializerOptions，但输出带缩进（对应 Newtonsoft 的 Formatting.Indented）。
+    /// Compatible with NewtonsoftCompatJsonSerializerOptions, but outputs with indentation (corresponding to Newtonsoft's Formatting.Indented).
     /// </summary>
     public static readonly JsonSerializerOptions NewtonsoftCompatIndentedJsonSerializerOptions = CreateNewtonsoftCompatJsonSerializerOptions(true);
 
@@ -62,7 +62,7 @@ public static class JsonUtils
     }
 
     /// <summary>
-    /// 使用指定选项集序列化。
+    /// Use the specified option set for serialization.
     /// </summary>
     public static string Serialize<T>(T t, JsonSerializerOptions options)
     {
@@ -70,7 +70,7 @@ public static class JsonUtils
     }
 
     /// <summary>
-    /// 使用指定选项集反序列化。
+    /// Use the specified option set for deserialization.
     /// </summary>
     public static T Deserialize<T>(string json, JsonSerializerOptions options)
     {

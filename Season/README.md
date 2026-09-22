@@ -342,6 +342,7 @@ This package is the reusable core library.
 
 The repository also contains:
 
+- `SeasonXNA/`, which hosts the MonoGame/XNA compatibility layer built on top of this package
 - `Apps/`, which hosts official applications built on top of SeasonEngine, including the `Engine` reference runtime
 - `Samples/`, which keeps lighter framework-oriented examples such as the `Creator` series
 
@@ -351,6 +352,23 @@ Two foundational libraries are part of the engine's core rather than an add-on:
 
 - [**Silk.NET**](https://github.com/dotnet/Silk.NET) provides the low-level Direct3D 12 and Vulkan bindings used by those two `IGraphics` backends.
 - [**SharpGLTF**](https://github.com/vpenades/SharpGLTF) powers glTF model loading and animation playback — the single animation format the engine supports.
+
+## SeasonXNA Compatibility Layer
+
+`SeasonXNA` is a companion package built on top of this library. It exists for one job: bringing existing MonoGame/XNA 2D sprite, image, and text code onto the SeasonEngine runtime.
+
+- XNA-style types such as `Texture2D`, `SpriteFont`, `SpriteBatch`, `Color`, `Vector2`, `Rectangle`, and `Matrix` are exposed under their original `Microsoft.Xna.Framework` namespaces, so existing call sites and `using` statements survive the move.
+- There is no content pipeline to rebuild: no MGCB, no `.xnb`. Assets keep their source formats (PNG, JPEG, TTF/OTF) and load through `SeasonResources` with explicit preloading instead of directory scanning.
+- The supported API subset is deliberately bounded. Unsupported overloads are absent at compile time, and rejected inputs such as illegal tint values fail with explicit exceptions rather than being silently approximated.
+- Compatibility content is hosted in a normal `BaseApp` app and drawn through a `DrawContext`-bound `SpriteBatch`, so it participates in the same frame schedule as native engine content.
+
+It follows the same cross-platform model as the core library, and ships as its own package that restores this library as a dependency:
+
+```bash
+dotnet add package SeasonXNA
+```
+
+For migration steps, the exact supported surface, and the alpha and tint rules, see [SeasonXNA/README.md](../SeasonXNA/README.md).
 
 ## Requirements
 

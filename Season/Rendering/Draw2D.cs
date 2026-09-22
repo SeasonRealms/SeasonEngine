@@ -10,13 +10,13 @@ public enum Sampling2D { Linear, Point }
 [Flags]
 public enum ImageFlip2D { None = 0, Horizontal = 1, Vertical = 2 }
 
-/// <summary>已定位的 Unicode 码点及其基线原点。引擎不再对这些位置做排版。</summary>
+/// <summary>Positioned Unicode code points and their baseline origin. The engine no longer typesets these positions.</summary>
 public readonly record struct Glyph2D(int CodePoint, Vector2 Baseline);
 
 /// <summary>
-/// 即时 2D 平台扩展点。Prepare 在所有 pass 之前准备资源；Submit 仅在 Overlay 内提交。
-/// CompleteFrame 必须在成功或异常后调用，不负责 Present。未实现的平台返回 null。
-/// 除 LoadImage 外，所有方法均由帧线程调用；Dispose 在停止帧提交后执行。
+/// Instant 2D platform extension points. Prepare resources before all passes; Submit only within Overlay.
+/// CompleteFrame must be called after successful completion or exception handling, without responsible for Present. Unimplemented platforms return null.
+/// Except for LoadImage, all methods are called by the frame thread; Dispose is executed after stopping frame submission.
 /// </summary>
 public interface IImmediate2DBackend : IDisposable
 {
@@ -37,9 +37,9 @@ internal readonly record struct Draw2DCommand(
     Sampling2D Sampling = Sampling2D.Linear, ImageFlip2D Flip = ImageFlip2D.None);
 
 /// <summary>
-/// 可复用的帧命令记录器；只在帧线程使用。图片、矩形、字形严格保留提交顺序。
-/// 宿主在 BaseApp.Draw2D 中提供此对象，不创建 Control，也不直接操作平台绘制 API。
-/// 坐标以 DesignSize 为逻辑画布，居中等比适配物理输出；不再叠乘 DPI 或 BaseApp.Scale。
+/// Reusable frame command recorder; Only used in frame threads. Strictly preserve the submission order of images, rectangles, and fonts.
+/// The host provides this object in BaseApp. Draw2D without creating a Control or directly operating the platform drawing API.
+/// Coordinates are based on DesignSize as the logical canvas, centered and scaled to fit the physical output; DPI or BaseApp.Scale are no longer applied.
 /// </summary>
 public sealed class Draw2D
 {
@@ -59,22 +59,22 @@ public sealed class Draw2D
     public Matrix3x2 CanvasToOutput { get; private set; } = Matrix3x2.Identity;
     public Matrix3x2 OutputToCanvas { get; private set; } = Matrix3x2.Identity;
 
-    /// <summary>输入必须是物理像素；Windows TouchService 坐标需先乘 BaseApp.Scale 还原，不再乘 DPI。</summary>
+    /// <summary>The input must be a physical pixel; The coordinates of Windows TouchService need to be restored by multiplying BaseApp. Scale first, without multiplying DPI.</summary>
     public Vector2 ToCanvas(Vector2 outputPixels) => Vector2.Transform(outputPixels, OutputToCanvas);
     public Vector2 ToOutput(Vector2 canvasPoint) => Vector2.Transform(canvasPoint, CanvasToOutput);
 
     public void BeginFrame(Vector2 designSize, Vector2 outputSize)
     {
-        if (_recording || IsSealed) throw new InvalidOperationException("上一帧尚未完成。");
+        if (_recording || IsSealed) throw new InvalidOperationException("The previous frame is not yet completed.");
         Rect2D.ValidateSize(designSize);
         Rect2D.ValidateSize(outputSize);
         float scale = Math.Min(outputSize.X / designSize.X, outputSize.Y / designSize.Y);
         if (!float.IsFinite(scale) || scale <= 0)
-            throw new ArgumentOutOfRangeException(nameof(outputSize), "画布与输出的尺寸比超出有效范围。");
+            throw new ArgumentOutOfRangeException(nameof(outputSize), "The size ratio of canvas to output exceeds the valid range.");
         var offset = (outputSize - designSize * scale) * 0.5f;
         var transform = Matrix3x2.CreateScale(scale) * Matrix3x2.CreateTranslation(offset);
         if (!Matrix3x2.Invert(transform, out var inverse) || !IsFinite(inverse) || inverse.M11 <= 0 || inverse.M22 <= 0)
-            throw new ArgumentOutOfRangeException(nameof(outputSize), "画布变换无法求逆。");
+            throw new ArgumentOutOfRangeException(nameof(outputSize), "The canvas transform cannot be inverted.");
         _thread = Environment.CurrentManagedThreadId;
         DesignSize = designSize;
         OutputSize = outputSize;
@@ -89,16 +89,16 @@ public sealed class Draw2D
     {
         CheckRecording();
         if (_transforms.Count != 0 || _clips.Count != 0)
-            throw new InvalidOperationException("PushTransform/PushClip 必须与 Pop 配对。");
+            throw new InvalidOperationException("PushTransform/PushClip must be paired with Pop.");
         _recording = false;
         IsSealed = true;
     }
 
-    /// <summary>提交后或异常时清空命令并归还资源引用，保留容器容量。</summary>
+    /// <summary>Clear the command and return the resource reference after submission or exception, while preserving the container capacity.</summary>
     public void Clear()
     {
         if ((_recording || IsSealed) && _thread != Environment.CurrentManagedThreadId)
-            throw new InvalidOperationException("帧命令只能由所属帧线程清理。");
+            throw new InvalidOperationException("Frame commands can only be cleared by the owning frame thread.");
         _commands.Clear();
         foreach (var image in _images.Keys) image.Release();
         _images.Clear();
@@ -119,20 +119,20 @@ public sealed class Draw2D
     public void PopTransform()
     {
         CheckRecording();
-        if (_transforms.Count == 0) throw new InvalidOperationException("变换栈为空。");
+        if (_transforms.Count == 0) throw new InvalidOperationException("The transform stack is empty.");
         _transform = _transforms.Pop();
     }
 
     /// <summary>
-    /// 裁剪在推入时转换为输出像素并与父裁剪求交，不受后续变换影响。
-    /// 首版仅接受轴对齐局部坐标系；旋转/错切后可继续使用已经推入的外层裁剪。
+    /// Clips are converted to output pixels when pushed and intersected with the parent clip, unaffected by subsequent transformations.
+    /// The initial version only accepts axis-aligned local coordinate systems; after rotation/skewing, already pushed outer clips can still be used.
     /// </summary>
     public void PushClip(Rect2D rectangle)
     {
         CheckRecording();
         rectangle.Validate();
         if (Math.Abs(_transform.M12) > 0.00001f || Math.Abs(_transform.M21) > 0.00001f)
-            throw new NotSupportedException("请在旋转/错切之前推入轴对齐裁剪。");
+            throw new NotSupportedException("Please push axis-aligned clips before rotation/skewing.");
         var a = Vector2.Transform(rectangle.Position, _transform);
         var b = Vector2.Transform(new(rectangle.Right, rectangle.Bottom), _transform);
         _clips.Push(_clip);
@@ -142,7 +142,7 @@ public sealed class Draw2D
     public void PopClip()
     {
         CheckRecording();
-        if (_clips.Count == 0) throw new InvalidOperationException("裁剪栈为空。");
+        if (_clips.Count == 0) throw new InvalidOperationException("The clip stack is empty.");
         _clip = _clips.Pop();
     }
 
@@ -187,15 +187,15 @@ public sealed class Draw2D
     }
 
     /// <summary>
-    /// 基础单行绘制，以基线定位，返回前进宽度。不折行、不做 shaping/kerning，不调整行距。
-    /// 换行、制表和缺失字形显式报错；调用者应分行或使用已定位的 DrawGlyphRun。
+    /// Basic single line drawing, based on baseline positioning, returns the forward width. Do not fold lines, do not shape/kerning, and do not adjust line spacing.
+    /// Line breaks, tabulation, and missing glyph explicit errors; The caller should branch or use the located DrawGlyphRun.
     /// </summary>
     public float DrawTexts(FontFace font, int fontSize, ReadOnlySpan<char> text, Vector2 baseline, Vector4 color, float scale = 1)
     {
         CheckRecording();
         ValidateText(font, fontSize, scale, color);
         ValidatePoint(baseline);
-        // 先验证整行，避免格式错误留下半行命令。
+        // First validate the entire line to avoid leaving half-line commands with formatting errors.
         float advance = MeasureTexts(font, fontSize, text) * scale;
         float x = baseline.X;
         foreach (var rune in text.EnumerateRunes())
@@ -214,13 +214,13 @@ public sealed class Draw2D
         foreach (var rune in text.EnumerateRunes())
         {
             if (Rune.IsControl(rune) || !font.TryGetGlyphLayoutMetrics(fontSize, rune.Value, out var metrics, out _))
-                throw new ArgumentException($"不支持的单行字形 U+{rune.Value:X}；请由调用者分行或选择字体。", nameof(text));
+                throw new ArgumentException($"Unsupported single-line glyph U+{rune.Value:X}; please have the caller break lines or choose a different font.", nameof(text));
             width += metrics.AdvanceWidth;
         }
         return width;
     }
 
-    /// <summary>复制每个字形的位置到本帧；不保存调用者数组，也不重新排版。scale 只缩放字形，不缩放基线位置。</summary>
+    /// <summary>Copy the position of each glyph to the current frame; do not save the caller's array, nor reflow. scale only scales the glyphs, not the baseline position.</summary>
     public void DrawGlyphRun(FontFace font, int fontSize, ReadOnlySpan<Glyph2D> glyphs, Vector4 color, float scale = 1)
     {
         CheckRecording();
@@ -229,7 +229,7 @@ public sealed class Draw2D
         {
             ValidatePoint(glyph.Baseline);
             if (!Rune.IsValid(glyph.CodePoint) || !font.TryGetGlyphLayoutMetrics(fontSize, glyph.CodePoint, out var metrics, out _))
-                throw new ArgumentException($"字体缺少字形 U+{glyph.CodePoint:X}。", nameof(glyphs));
+                throw new ArgumentException($"Unsupported glyph U+{glyph.CodePoint:X}; please have the caller choose a different font.", nameof(glyphs));
             RecordGlyph(font, fontSize, glyph, color, scale, metrics);
         }
     }
@@ -265,6 +265,6 @@ public sealed class Draw2D
     void CheckRecording()
     {
         if (!_recording || Environment.CurrentManagedThreadId != _thread)
-            throw new InvalidOperationException("只能在当前帧的命令记录回调中绘制。");
+            throw new InvalidOperationException("Can only draw within the current frame's command recording callback.");
     }
 }

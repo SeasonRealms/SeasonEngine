@@ -8,7 +8,7 @@ using Silk.NET.DXGI;
 
 namespace Season.Platforms.Windows.DirectX;
 
-/// <summary>每次绘制的完整快照，28 DWORD；root constants 不会被同帧后续绘制覆盖。</summary>
+/// <summary>The complete snapshot drawn each time, 28 DWORs; The root constants will not be overwritten by subsequent drawing of the same frame.</summary>
 [StructLayout(LayoutKind.Sequential)]
 internal struct Draw2DConstants
 {
@@ -51,7 +51,7 @@ internal sealed unsafe class Draw2DPipeline : IDisposable
         }
         float4 PSMain(VertexOutput input) : SV_TARGET
         {
-            // 裁剪不改 viewport/scissor，完整遵守 pass 对光栅状态的所有权。
+            // Crop without changing the viewport/cursor, fully adhering to pass's ownership of the raster state.
             if (any(input.position.xy < clipRect.xy) || any(input.position.xy >= clipRect.zw)) discard;
             float2 uv = clamp(input.uv, uvClamp.xy, uvClamp.zw);
             float4 sampleColor = parameters.x > 0.5
@@ -133,7 +133,7 @@ internal sealed unsafe class Draw2DPipeline : IDisposable
         {
             vs = ShaderCompiler.CompileShaderFromSource(ShaderSource, "VSMain", "vs_5_0", 0);
             ps = ShaderCompiler.CompileShaderFromSource(ShaderSource, "PSMain", "ps_5_0", 0);
-            if (vs == null || ps == null) throw new InvalidOperationException("即时 2D shader 编译失败。");
+            if (vs == null || ps == null) throw new InvalidOperationException("Instant 2D shader compilation failed.");
             var stencil = new DepthStencilopDesc
             {
                 StencilFailOp = StencilOp.Keep, StencilDepthFailOp = StencilOp.Keep,
@@ -177,7 +177,7 @@ internal sealed unsafe class Draw2DPipeline : IDisposable
     internal void Draw(DXTexture texture, Draw2DConstants constants)
     {
         var commandList = Device.GraphicsCommandList;
-        // 绑定入口负责复制队列 fence 和资源状态，业务命令不发起屏障。
+        // The binding entry is responsible for copying the queue fence and resource status, and business commands do not initiate barriers.
         texture.EnsureReadyForRendering(commandList);
         commandList->SetGraphicsRootSignature(_root);
         commandList->SetPipelineState(_pipeline);
@@ -187,7 +187,7 @@ internal sealed unsafe class Draw2DPipeline : IDisposable
         commandList->DrawInstanced(4, 1, 0, 0);
     }
 
-    /// <summary>仅在 GPU idle 或延迟释放回调中执行。</summary>
+    /// <summary>Only executed in GPU idle or delayed release callbacks.</summary>
     public void Dispose()
     {
         if (_pipeline != null) { _pipeline->Release(); _pipeline = null; }

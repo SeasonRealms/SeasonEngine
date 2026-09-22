@@ -253,8 +253,8 @@ public static class FrameSchedule
             if (canvas.CommandCount != 0)
             {
                 if (backend == null)
-                    throw new PlatformNotSupportedException("当前平台尚未实现即时 2D 后端。");
-                // 资源准备和上传发生在所有 pass 之前，绝不在 Control.Draw 内发起上传。
+                    throw new PlatformNotSupportedException("The current platform does not implement the immediate 2D backend.");
+                // Resource preparation and upload occur before all passes and are never initiated within Control.Draw.
                 backend.Prepare(canvas);
             }
             ExecutePasses(g, app, clearColor, canvas.CommandCount == 0 ? null : backend);

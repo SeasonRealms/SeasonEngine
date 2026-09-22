@@ -23,7 +23,7 @@ internal unsafe partial class Graphics
 
     sealed class ImmediateBackend(Graphics owner) : IImmediate2DBackend
     {
-        // 光栅像素密度固定，逻辑字号只影响目标几何，不随 DPI/缩放制造新的缓存项。
+        // The pixel density of the grating is fixed, and the logical font size only affects the target geometry, without creating new cache entries with DPI/scaling.
         const int RasterSize = 64;
         readonly object _lifetime = new();
         readonly HashSet<ImageLease> _leases = new();
@@ -63,7 +63,7 @@ internal unsafe partial class Graphics
                         else
                         {
                             var decoder = DecodeImageFromPath(name)
-                                ?? throw new FileNotFoundException("无法加载即时 2D 图片。", name);
+                                ?? throw new FileNotFoundException("Unable to load real-time 2D images.", name);
                             texture = DXTexture.CreateFromDecoder(decoder);
                             texture.Name = name;
                             try { owner.ExecuteUpload(); }
@@ -83,11 +83,11 @@ internal unsafe partial class Graphics
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (!frame.IsSealed || _prepared != null)
-                throw new InvalidOperationException("只能准备一个已经封口、尚未提交的帧。");
+                throw new InvalidOperationException("Only one sealed, unsubmitted frame can be prepared at a time.");
             _prepared = frame;
             _submitted = false;
             _pipeline ??= new Draw2DPipeline();
-            // 与后台 Load/纹理更新串行，字形生成、上传均处于 pass 外。
+            //Serial with backend load/texture updates, glyph generation and upload are both outside of pass.
             BaseApp.ResizeSemaphore.Wait();
             try
             {
@@ -100,10 +100,10 @@ internal unsafe partial class Graphics
                     if (command.Kind == Draw2DKind.Glyph)
                     {
                         if (!owner._glyphAtlas.TryEnsureStableGlyph(command.Font!, RasterSize, command.CodePoint, out var entry, out texture))
-                            throw new InvalidOperationException($"字形 U+{command.CodePoint:X} 光栅化失败。");
+                            throw new InvalidOperationException($"Glyph U+{command.CodePoint:X} rasterization failed.");
                         var metrics = entry.GlyphMetrics;
                         if (!metrics.HasPlaneBounds)
-                            throw new InvalidOperationException("即时字形需要明确的 MSDF plane bounds。");
+                            throw new InvalidOperationException("Real-time glyphs require explicit MSDF plane bounds.");
                         float scale = command.FontSize / (float)RasterSize * command.GlyphScale;
                         destination = new(destination.X + metrics.PlaneLeft * scale, destination.Y - metrics.PlaneTop * scale,
                             (metrics.PlaneRight - metrics.PlaneLeft) * scale, (metrics.PlaneTop - metrics.PlaneBottom) * scale);
@@ -113,7 +113,7 @@ internal unsafe partial class Graphics
                     else if (command.Kind == Draw2DKind.Image)
                     {
                         if (command.Image is not ImageLease lease || lease.Owner != this || lease.Released)
-                            throw new InvalidOperationException("图片资源不属于当前图形设备或已经关闭。");
+                            throw new InvalidOperationException("Image resources do not belong to the current graphics device or have been released.");
                         texture = lease.Texture;
                     }
                     else
@@ -136,8 +136,8 @@ internal unsafe partial class Graphics
             var origin = Vector2.Transform(destination.Position, command.Transform);
             var axisX = Vector2.TransformNormal(new(destination.Width, 0), command.Transform);
             var axisY = Vector2.TransformNormal(new(0, destination.Height), command.Transform);
-            // WinUI 交换链沿用引擎现有的合成方式：绘制先缩入左上角，合成器再按 DPI 放大。
-            // 公共画布和输入仍使用物理像素；仅此处将几何与裁剪转换到实际渲染区域。
+            // The WinUI exchange chain follows the existing synthesis method of the engine: first shrink the drawing into the upper left corner, and then enlarge the synthesizer by DPI.
+            // The public canvas and input still use physical pixels; Only here will geometry and cropping be converted to the actual rendering area.
             var composition = DeviceServices.BaseApp?.CompositionScale ?? Vector2.One;
             var toTarget = new Vector2(
                 float.IsFinite(composition.X) && composition.X > 1e-4f ? 1 / composition.X : 1,
@@ -163,7 +163,7 @@ internal unsafe partial class Graphics
                 Clip = new(command.Clip.X * toTarget.X, command.Clip.Y * toTarget.Y,
                     command.Clip.Right * toTarget.X, command.Clip.Bottom * toTarget.Y),
                 Parameters = new(command.Sampling == Sampling2D.Point ? 1 : 0, pixelRange, invW, invH),
-                // 将过滤限制在当前帧的源区域内，防止高清图集邻帧串色。
+                // Limit the filtering to the source area of the current frame to prevent high-definition atlas frame串色.
                 UvClamp = new((source.X + insetX) * invW, (source.Y + insetY) * invH,
                     (source.Right - insetX) * invW, (source.Bottom - insetY) * invH)
             };
@@ -173,7 +173,7 @@ internal unsafe partial class Graphics
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (_prepared != frame || _submitted || !frame.IsSealed || DirectX.Device.ActivePassId != RenderPassId.Overlay)
-                throw new InvalidOperationException("即时 2D 帧只能在 Overlay 中提交一次。");
+                throw new InvalidOperationException("Real-time 2D frames can only be submitted once in the Overlay.");
             _submitted = true;
             foreach (var quad in _quads)
                 _pipeline!.Draw(quad.Texture, quad.Constants);
@@ -200,7 +200,7 @@ internal unsafe partial class Graphics
                     {
                         if (owner.DictionaryDXTexture.TryGetValue(lease.Name, out var current) && current == texture)
                             owner.DictionaryDXTexture.Remove(lease.Name);
-                        // 描述符不能立即归还；即便已提交的 Image2D 被 Dispose，GPU 仍可能读取它。
+                        // The descriptor cannot be returned immediately; Even if the submitted Image2D is disposed of, the GPU may still read it.
                         DirectX.Device.EnqueueDeferredRelease(DirectX.Device.GetCurrentRetireFenceValue(), texture.Release);
                     }
                     else texture.Release();

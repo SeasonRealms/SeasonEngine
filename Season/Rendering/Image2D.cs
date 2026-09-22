@@ -4,7 +4,7 @@
 
 namespace Season.Rendering;
 
-/// <summary>左上角原点、向右向下的矩形。尺寸为零表示空区域，不使用负尺寸表达镜像。</summary>
+/// <summary>A rectangle with the origin in the upper left corner and pointing downwards to the right. Zero size indicates an empty area, and negative size is not used to represent mirroring.</summary>
 public readonly record struct Rect2D(float X, float Y, float Width, float Height)
 {
     public Vector2 Position => new(X, Y);
@@ -18,13 +18,13 @@ public readonly record struct Rect2D(float X, float Y, float Width, float Height
     {
         if (!float.IsFinite(X) || !float.IsFinite(Y) || !float.IsFinite(Right) || !float.IsFinite(Bottom)
             || !float.IsFinite(Width) || !float.IsFinite(Height) || Width < 0 || Height < 0)
-            throw new ArgumentOutOfRangeException(nameof(Rect2D), "矩形必须有限且尺寸非负。");
+            throw new ArgumentOutOfRangeException(nameof(Rect2D), "Rectangle must be finite and have non-negative dimensions.");
     }
 
     internal static void ValidateSize(Vector2 size)
     {
         if (!float.IsFinite(size.X) || !float.IsFinite(size.Y) || size.X <= 0 || size.Y <= 0)
-            throw new ArgumentOutOfRangeException(nameof(size), "尺寸必须是有限正数。");
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be finite and positive.");
     }
 
     internal static Rect2D Intersect(Rect2D a, Rect2D b)
@@ -35,8 +35,8 @@ public readonly record struct Rect2D(float X, float Y, float Width, float Height
 }
 
 /// <summary>
-/// 不可变图片资源。设计尺寸与实际像素尺寸无关；加载同名资源复用引擎纹理缓存。
-/// Dispose 禁止新的绘制引用，已经记录的帧仍持有资源，最终由后端按 GPU fence 回收。
+/// Immutable image resource. Design size is independent of actual pixel size; loading resources with the same name reuses the engine's texture cache.
+/// Dispose prevents new drawing references, but frames that have already recorded will still hold the resource, which will be collected by the backend according to GPU fence.
 /// </summary>
 public sealed class Image2D : IDisposable
 {
@@ -59,14 +59,14 @@ public sealed class Image2D : IDisposable
         _resource = resource;
     }
 
-    /// <summary>预加载资源；不得在渲染 pass 内调用。后台加载建议使用 LoadAsync。</summary>
+    /// <summary>Preload the resource; do not call within a rendering pass. Asynchronous loading is recommended using LoadAsync.</summary>
     public static Image2D Load(string name, Vector2 designSize)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         Rect2D.ValidateSize(designSize);
-        var graphics = Season.Basic.Graphics.Instance ?? throw new InvalidOperationException("图形设备尚未初始化。");
+        var graphics = Season.Basic.Graphics.Instance ?? throw new InvalidOperationException("Graphics device not initialized.");
         return graphics.Immediate2D?.LoadImage(name, designSize)
-            ?? throw new PlatformNotSupportedException("当前平台尚未实现即时 2D 后端。");
+            ?? throw new PlatformNotSupportedException("The current platform does not implement the immediate 2D backend.");
     }
 
     public static Task<Image2D> LoadAsync(string name, Vector2 designSize)
@@ -74,11 +74,11 @@ public sealed class Image2D : IDisposable
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         Rect2D.ValidateSize(designSize);
         var backend = Season.Basic.Graphics.Instance?.Immediate2D
-            ?? throw new PlatformNotSupportedException("当前平台尚未实现即时 2D 后端。");
+            ?? throw new PlatformNotSupportedException("The current platform does not implement the immediate 2D backend.");
         return backend.LoadImageAsync(name, designSize);
     }
 
-    /// <summary>从设计坐标映射源区域，仅适用于图集布局不变的整体高清化。</summary>
+    /// <summary>Mapping the source area from design coordinates is only applicable for overall high-definition without changing the layout of the atlas.</summary>
     public ImageRegion2D FromDesignRect(Rect2D source, string? frameId = null)
     {
         source.Validate();
@@ -117,7 +117,7 @@ public sealed class Image2D : IDisposable
     }
 }
 
-/// <summary>稳定帧标识、实际像素裁剪区域与设计尺寸；重打包图集应显式提供新的像素区域。</summary>
+/// <summary>Stable frame identifier, actual pixel clipping area, and design size; when repacking atlases, new pixel areas must be explicitly provided.</summary>
 public sealed class ImageRegion2D
 {
     public Image2D Image { get; }
@@ -139,7 +139,7 @@ public sealed class ImageRegion2D
         FrameId = frameId;
     }
 
-    /// <summary>局部缩放只乘设计尺寸，不读取图片实际像素大小。</summary>
+    /// <summary>Local scaling multiplies the design size without reading the actual pixel size of the image.</summary>
     public Rect2D At(Vector2 position, float scale = 1)
     {
         if (!float.IsFinite(scale) || scale < 0) throw new ArgumentOutOfRangeException(nameof(scale));
