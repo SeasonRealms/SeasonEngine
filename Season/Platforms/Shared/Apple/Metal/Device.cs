@@ -57,7 +57,7 @@ namespace Season.Platforms.Shared.Apple.Metal;
 ///    Fixed-size render targets, such as the shadow map, do not resize.
 /// 6. Frame-level and pass-level responsibilities are separated.
 ///    BeforeRender handles in-flight throttling, backbuffer RPD acquisition, frame skipping when no drawable is available,
-///    and command-buffer allocation plus RegisterSignal.
+///    and command-buffer allocation. Completion registration occurs immediately before Commit.
 ///    Then BeginPass and EndPass repeat for N passes, followed by AfterRender,
 ///    which performs a defensive EndEncoding fallback, CaptureApp blit, Present, and Commit.
 ///    One command buffer maps to one Commit, while multiple passes are represented only by multiple encoder segments.
@@ -148,6 +148,7 @@ internal static class Device
 
     /// <summary>Semaphore for frame-concurrency throttling. BeforeRender waits on it, and CommandBuffer.AddCompletedHandler releases it.</summary>
     static SemaphoreSlim _inFlight = null!;
+    static bool _frameOpen;
 
     /// <summary>Backbuffer render-pass descriptor for the current frame, acquired in BeforeRender and used by BeginPass after configuring load and store actions from PassDesc.</summary>
     static MTLRenderPassDescriptor? _backbufferRpd;
@@ -166,6 +167,7 @@ internal static class Device
     static IMTLBuffer? _captureStagingBuffer;
     static uint _captureWidth;
     static uint _captureHeight;
+    static uint _captureBytesPerRow;
     static bool _capturePending;
 
     /// <summary>Initializes IMTLDevice and associates it with MTKView.</summary>
@@ -252,23 +254,28 @@ internal static class Device
         _captureHeight = (uint)tex.Height;
 
         // Create or reuse the staging buffer, where StorageModeShared allows CPU readback.
-        nuint totalBytes = _captureWidth * _captureHeight * 4;
+        _captureBytesPerRow = checked((_captureWidth * 4 + 255) & ~255u);
+        nuint totalBytes = checked((nuint)_captureBytesPerRow * _captureHeight);
         if (_captureStagingBuffer == null || _captureStagingBuffer.Length < totalBytes)
         {
-            _captureStagingBuffer = MtlDevice.CreateBuffer(totalBytes, MTLResourceOptions.StorageModeShared);
+            var replacement = MtlDevice.CreateBuffer(totalBytes, MTLResourceOptions.StorageModeShared)
+                ?? throw new InvalidOperationException("Cannot allocate Metal readback buffer.");
+            _captureStagingBuffer?.Dispose();
+            _captureStagingBuffer = replacement;
         }
 
         // Create a BlitCommandEncoder to execute the texture-to-buffer copy.
         // The native binding rejects a null descriptor,
         // so pass a default MTLBlitPassDescriptor, matching every other blit-encoder call site in the Metal backend.
-        var blitEncoder = frame.CommandBuffer!.CreateBlitCommandEncoder(new MTLBlitPassDescriptor())!;
+        using var blitEncoder = frame.CommandBuffer!.CreateBlitCommandEncoder(new MTLBlitPassDescriptor())
+            ?? throw new InvalidOperationException("Cannot create Metal readback encoder.");
         blitEncoder.CopyFromTexture(
             tex, 0, 0,
             new MTLOrigin(0, 0, 0),
             new MTLSize((nint)_captureWidth, (nint)_captureHeight, 1),
             _captureStagingBuffer, 0,
-            (nuint)(_captureWidth * 4),
-            (nuint)(_captureWidth * _captureHeight * 4));
+            _captureBytesPerRow,
+            totalBytes);
         blitEncoder.EndEncoding();
 
         _capturePending = true;
@@ -296,12 +303,15 @@ internal static class Device
                 byte* pSrc = (byte*)_captureStagingBuffer.Contents;
                 fixed (byte* pDst = pixels)
                 {
-                    for (int i = 0; i < w * h; i++)
+                    for (int y = 0; y < h; y++)
+                    for (int x = 0; x < w; x++)
                     {
-                        pDst[i * 4 + 0] = pSrc[i * 4 + 2]; // R ← B
-                        pDst[i * 4 + 1] = pSrc[i * 4 + 1]; // G ← G
-                        pDst[i * 4 + 2] = pSrc[i * 4 + 0]; // B ← R
-                        pDst[i * 4 + 3] = pSrc[i * 4 + 3]; // A ← A
+                        int dst = (y * w + x) * 4;
+                        nuint src = (nuint)y * _captureBytesPerRow + (nuint)x * 4;
+                        pDst[dst + 0] = pSrc[src + 2];
+                        pDst[dst + 1] = pSrc[src + 1];
+                        pDst[dst + 2] = pSrc[src + 0];
+                        pDst[dst + 3] = pSrc[src + 3];
                     }
                 }
             }
@@ -328,25 +338,29 @@ internal static class Device
     {
         // 1) Throttle frame concurrency.
         _inFlight.Wait();
-
-        // 2) Acquire the current view RPD.
-        // If the drawable is unavailable, skip this frame while keeping frame-header acquisition semantics unchanged.
-        var rpd = View.CurrentRenderPassDescriptor;
-        if (rpd == null)
+        try
         {
-            _inFlight.Release();
-            return false;
+            WaitForFrameSlot();
+            var frame = FrameContexts[FrameIndex];
+            var rpd = View.CurrentRenderPassDescriptor;
+            if (rpd == null)
+            {
+                _inFlight.Release();
+                return false;
+            }
+            _backbufferRpd = rpd;
+            var cmd = GraphicsQueue.CreateCommandBuffer();
+            frame.CommandBuffer = cmd;
+            GraphicsCommandBuffer = cmd;
+            _frameOpen = true;
+            return true;
         }
-        _backbufferRpd = rpd;
-
-        // 3) Allocate the command buffer for this frame and register both in-flight release and fence advancement.
-        var frame = FrameContexts[FrameIndex];
-        var cmd = GraphicsQueue.CreateCommandBuffer();
-        cmd.AddCompletedHandler(_ => _inFlight.Release());
-        frame.FenceValue = GraphicsQueue.RegisterSignal(cmd);
-        frame.CommandBuffer = cmd;
-        GraphicsCommandBuffer = cmd;
-        return true;
+        catch
+        {
+            _backbufferRpd = null;
+            _inFlight.Release();
+            throw;
+        }
     }
 
     /// <summary>
@@ -469,6 +483,14 @@ internal static class Device
         // Instanced text rendering overrides them later with its own per-frame buffers.
         enc.SetViewport(new MTLViewport { OriginX = 0, OriginY = 0, Width = vpWidth, Height = vpHeight, ZNear = 0.0, ZFar = 1.0 });
         enc.SetScissorRect(new MTLScissorRect { X = 0, Y = 0, Width = (nuint)vpWidth, Height = (nuint)vpHeight });
+
+        // Immediate-2D compatibility mode (Season.Rendering.Immediate2DMode):
+        // Pipeline.Init and every 3D resource bound below were skipped for the session,
+        // and the single Overlay pass of the frame renders through the self-contained Draw2DPipeline,
+        // so the main-shader fallback bindings must not be replayed here.
+        if (Season.Rendering.Immediate2DMode.Enabled)
+            return;
+
         enc.SetVertexBuffer(Pipeline.DefaultTextDrawParamsBuffer, 0, 7);
         enc.SetFragmentBuffer(Pipeline.DefaultTextDrawParamsBuffer, 0, 3);
 
@@ -567,10 +589,14 @@ internal static class Device
     internal static void EndPass()
     {
         var frame = FrameContexts[FrameIndex];
-        frame.Encoder?.EndEncoding();
-        frame.Encoder = null;
-        GraphicsEncoder = null!;
-        ActivePassId = default;
+        try { frame.Encoder?.EndEncoding(); }
+        finally
+        {
+            frame.Encoder?.Dispose();
+            frame.Encoder = null;
+            GraphicsEncoder = null!;
+            ActivePassId = default;
+        }
     }
 
     /// <summary>Ends the frame at frame scope by Present plus Commit and then advancing FrameIndex. Pass closure is already handled by EndPass.</summary>
@@ -581,9 +607,7 @@ internal static class Device
         // Defensive fallback:
         // if the pass did not close normally, force EndEncoding here.
         // In the normal path EndPass has already cleared it.
-        frame.Encoder?.EndEncoding();
-        frame.Encoder = null;
-        GraphicsEncoder = null!;
+        if (frame.Encoder != null) EndPass();
         _backbufferRpd = null;
 
         // GPU readback for CaptureApp:
@@ -612,19 +636,86 @@ internal static class Device
             frame.CommandBuffer!.PresentDrawable(drawable);
 
         var cmdBuffer = frame.CommandBuffer!;
+        cmdBuffer.AddCompletedHandler(_ => _inFlight.Release());
+        frame.FenceValue = GraphicsQueue.RegisterSignal(cmdBuffer);
         cmdBuffer.Commit();
+        _frameOpen = false;
 
         // For CaptureApp, wait for GPU completion so the staging buffer becomes readable.
         if (_capturePending)
-            cmdBuffer.WaitUntilCompleted();
+            WaitForCompletion(cmdBuffer);
 
-        frame.CommandBuffer = null;
+        // Keep the actual submitted buffer for ring-slot waits and shutdown.
         GraphicsCommandBuffer = null!;
 
         FrameIndex = (FrameIndex + 1) % frameCount;
 
         // CaptureApp readback is complete: map the data and notify the caller.
         CompleteCapture();
+    }
+
+    internal static void WaitForCompletion(IMTLCommandBuffer command)
+    {
+        command.WaitUntilCompleted();
+        if (command.Status == MTLCommandBufferStatus.Error)
+            throw new InvalidOperationException($"Metal command buffer failed: {command.Error?.LocalizedDescription}");
+    }
+
+    internal static void WaitForFrameSlot()
+    {
+        // Called before Update can write this slot's shared buffers.
+        // A completion-counter maximum is not proof that this exact submission completed.
+        var frame = FrameContexts[FrameIndex];
+        if (frame.CommandBuffer is not { } previous) return;
+        WaitForCompletion(previous);
+        previous.Dispose();
+        frame.CommandBuffer = null;
+    }
+
+    internal static void AbortFrame()
+    {
+        if (!_frameOpen) return;
+        _frameOpen = false;
+        var frame = FrameContexts[FrameIndex];
+        try { frame.Encoder?.EndEncoding(); }
+        finally
+        {
+            frame.Encoder?.Dispose();
+            frame.Encoder = null;
+            frame.CommandBuffer?.Dispose();
+            frame.CommandBuffer = null;
+            GraphicsEncoder = null!;
+            GraphicsCommandBuffer = null!;
+            _backbufferRpd = null;
+            _capturePending = false;
+            ActivePassId = default;
+            _inFlight.Release();
+        }
+    }
+
+    internal static void WaitForIdle()
+    {
+        if (_frameOpen)
+            throw new InvalidOperationException("Abort or submit the current frame before waiting for Metal idle.");
+        if (GraphicsQueue == null) return;
+        // A committed marker covers all earlier submissions, including uploads.
+        using var marker = GraphicsQueue.CreateCommandBuffer();
+        marker.Commit();
+        WaitForCompletion(marker);
+        if (FrameContexts != null)
+        {
+            foreach (var frame in FrameContexts)
+                if (frame.CommandBuffer is { } command) WaitForCompletion(command);
+            foreach (var frame in FrameContexts)
+            {
+                frame.CommandBuffer?.Dispose();
+                frame.Reset();
+            }
+        }
+        GraphicsCommandBuffer = null!;
+        _captureStagingBuffer?.Dispose();
+        _captureStagingBuffer = null;
+        _capturePending = false;
     }
 
     /// <summary>Refreshes viewport and scissor after window-size changes. Equivalent to DX and VK Device.HandleResize.
@@ -670,15 +761,20 @@ internal static class Device
 
     internal static void Shutdown()
     {
+        AbortFrame();
+        WaitForIdle();
         if (FrameContexts != null)
         {
             for (int i = 0; i < FrameContexts.Length; i++)
             {
                 var fb = FrameContexts[i].CommandBuffer;
-                fb?.WaitUntilCompleted();
+                fb?.Dispose();
+                FrameContexts[i].Reset();
             }
         }
 
+        _captureStagingBuffer?.Dispose();
+        _captureStagingBuffer = null;
         TextureUploadBatch?.Dispose();
         GraphicsQueue?.Dispose();
 

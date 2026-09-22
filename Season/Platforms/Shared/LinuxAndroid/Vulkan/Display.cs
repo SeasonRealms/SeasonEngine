@@ -4,6 +4,7 @@
 
 using Silk.NET.Vulkan;
 using Image = Silk.NET.Vulkan.Image;
+using Rect2D = Silk.NET.Vulkan.Rect2D;
 
 namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 
@@ -210,16 +211,9 @@ internal unsafe sealed class Display : IDisposable
         // leaving depth contents undefined and causing intermittent depth-test failures across the whole screen,
         // the black and white flashing seen on Android.
         // Desktop IMR GPUs serialize passes in practice, so the issue does not appear there.
-        // Preserve-mode also adds a RAW dependency for color writes from the previous backbuffer pass so loaded contents stay valid.
-        var dependency = new SubpassDependency
-        {
-            SrcSubpass = Vk.SubpassExternal,
-            DstSubpass = 0,
-            SrcStageMask = PipelineStageFlags.ColorAttachmentOutputBit | PipelineStageFlags.EarlyFragmentTestsBit | PipelineStageFlags.LateFragmentTestsBit,
-            SrcAccessMask = (preserve ? AccessFlags.ColorAttachmentWriteBit : 0) | AccessFlags.DepthStencilAttachmentWriteBit,
-            DstStageMask = PipelineStageFlags.ColorAttachmentOutputBit | PipelineStageFlags.EarlyFragmentTestsBit | PipelineStageFlags.LateFragmentTestsBit,
-            DstAccessMask = AccessFlags.ColorAttachmentWriteBit | AccessFlags.DepthStencilAttachmentWriteBit | AccessFlags.DepthStencilAttachmentReadBit
-        };
+        // Clear, Load and offscreen variants must have identical dependencies to be render-pass compatible.
+        var dependencies = stackalloc SubpassDependency[2];
+        FillColorDependencies(dependencies);
 
         var rpInfo = new RenderPassCreateInfo
         {
@@ -228,13 +222,35 @@ internal unsafe sealed class Display : IDisposable
             PAttachments = attachments,
             SubpassCount = 1,
             PSubpasses = &subpass,
-            DependencyCount = 1,
-            PDependencies = &dependency
+            DependencyCount = 2,
+            PDependencies = dependencies
         };
 
         if (_vk.CreateRenderPass(_device, in rpInfo, null, out var rp) != Result.Success)
             throw new Exception("vkCreateRenderPass failed");
         return rp;
+    }
+
+    internal static void FillColorDependencies(SubpassDependency* dependencies)
+    {
+        const PipelineStageFlags attachments = PipelineStageFlags.ColorAttachmentOutputBit |
+            PipelineStageFlags.EarlyFragmentTestsBit | PipelineStageFlags.LateFragmentTestsBit;
+        const PipelineStageFlags readers = PipelineStageFlags.FragmentShaderBit | PipelineStageFlags.ComputeShaderBit;
+        const AccessFlags attachmentAccess = AccessFlags.ColorAttachmentReadBit | AccessFlags.ColorAttachmentWriteBit |
+            AccessFlags.DepthStencilAttachmentReadBit | AccessFlags.DepthStencilAttachmentWriteBit;
+        dependencies[0] = new()
+        {
+            SrcSubpass = Vk.SubpassExternal, DstSubpass = 0,
+            SrcStageMask = attachments | readers, DstStageMask = attachments,
+            SrcAccessMask = attachmentAccess | AccessFlags.ShaderReadBit, DstAccessMask = attachmentAccess
+        };
+        dependencies[1] = new()
+        {
+            SrcSubpass = 0, DstSubpass = Vk.SubpassExternal,
+            SrcStageMask = attachments, DstStageMask = attachments | readers | PipelineStageFlags.TransferBit,
+            SrcAccessMask = attachmentAccess,
+            DstAccessMask = attachmentAccess | AccessFlags.ShaderReadBit | AccessFlags.TransferReadBit
+        };
     }
 
     void CreateFramebuffers(int width, int height, Silk.NET.Vulkan.ImageView[] swapchainImageViews)

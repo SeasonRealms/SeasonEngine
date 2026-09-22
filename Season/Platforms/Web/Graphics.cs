@@ -84,7 +84,7 @@ internal sealed class WebInstancedDiagState
 ///    full 1136-byte block, so no extra UBO is introduced. WGSL always samples through
 ///    <c>textureSampleLevel(..., 0.0)</c> to avoid uniformity / implicit-derivative restrictions.
 /// </summary>
-internal class Graphics : IGraphics
+internal partial class Graphics : IGraphics
 {
     // ── HDR SceneColor (1-4 Step A, mirrored from DX/VK Device; WebGPU has no separate Device class,
     // and this class hosts the behavior) ──
@@ -432,18 +432,20 @@ internal class Graphics : IGraphics
         _httpClient = httpClient;
         _assetBasePath = assetBasePath?.Trim().Trim('/') ?? string.Empty;
 
+        int atlasId = 0;
         _glyphAtlas = new GlyphAtlasManager<WGPUTexture>(
             2048, 2048,
             createAtlasTexture: (w, h) =>
             {
-                _jsRuntime.InvokeVoid("seasonWebGPU.createAtlasTexture", "TextAtlas", w, h);
-                return WGPUTexture.CreateFromPixels("TextAtlas", (uint)w, (uint)h);
+                string name = atlasId++ == 0 ? "TextAtlas" : $"TextAtlasStable_{atlasId}";
+                _jsRuntime.InvokeVoid("seasonWebGPU.createAtlasTexture", name, w, h);
+                return WGPUTexture.CreateFromPixels(name, (uint)w, (uint)h);
             },
             uploadFullPixels: (tex, pixels) =>
             {
                 // Full-atlas upload: the atlas itself is already tightly packed row data for a single rect
                 // (bytesPerRow = w * 4).
-                WebGPUInterop.UploadGlyphAtlasPackedRects("TextAtlas", pixels,
+                WebGPUInterop.UploadGlyphAtlasPackedRects(tex.Name, pixels,
                     new int[] { 0, 0, 2048, 2048 });
             },
             uploadSubRects: (tex, pixels, atlasW, atlasH, rects) =>
@@ -472,7 +474,7 @@ internal class Graphics : IGraphics
                         offset += rowBytes;
                     }
                 }
-                WebGPUInterop.UploadGlyphAtlasPackedRects("TextAtlas", packed, flatRects);
+                WebGPUInterop.UploadGlyphAtlasPackedRects(tex.Name, packed, flatRects);
             },
             getCurrentFrameIndex: () => _frameIndex);
     }
@@ -492,7 +494,9 @@ internal class Graphics : IGraphics
             ? WebGPUPipeline.Mesh3DShader.Replace(
                 "const HDR_CHAIN : bool = false;", "const HDR_CHAIN : bool = true;")
             : WebGPUPipeline.Mesh3DShader;
-        bool velocityOutput = RenderQuality.Current.MotionVectors;
+        // Skipped in immediate-2D mode: the Scene pass never runs, so neither the VELOCITY_OUTPUT
+        // variant nor the fs_main_mrt pipeline is baked / uploaded here.
+        bool velocityOutput = !Season.Rendering.Immediate2DMode.Enabled && RenderQuality.Current.MotionVectors;
         if (velocityOutput)
             meshShader = meshShader.Replace(
                 "const VELOCITY_OUTPUT : bool = false;", "const VELOCITY_OUTPUT : bool = true;");
@@ -922,7 +926,32 @@ internal class Graphics : IGraphics
     /// always had; only a caller that states a policy gets a separate, chained entry.
     /// </summary>
     async Task<bool> LoadTextureAsync(string name, bool deferDecodeToNextFrame = false,
-        TextureMipPolicy mipPolicy = TextureMipPolicy.None)
+        TextureMipPolicy mipPolicy = TextureMipPolicy.None, bool leaseOwned = false)
+    {
+        ObjectDisposedException.ThrowIf(_closed, this);
+        string key = MipChain.CacheKey(name, mipPolicy);
+        if (!DictionaryWGPUTexture.ContainsKey(key))
+        {
+            if (!_textureLoads.TryGetValue(key, out var pending))
+            {
+                pending = LoadTextureCoreAsync(name, deferDecodeToNextFrame, mipPolicy);
+                _textureLoads.Add(key, pending);
+            }
+            try { if (!await pending) return false; }
+            finally { if (pending.IsCompleted) _textureLoads.Remove(key); }
+        }
+        if (_closed)
+        {
+            if (DictionaryWGPUTexture.TryGetValue(key, out var late)) ReleaseTexture(late);
+            throw new ObjectDisposedException(nameof(Graphics));
+        }
+        if (!leaseOwned) DictionaryWGPUTexture[key].HostOwned = true;
+        return true;
+    }
+
+    readonly Dictionary<string, Task<bool>> _textureLoads = new();
+    async Task<bool> LoadTextureCoreAsync(string name, bool deferDecodeToNextFrame,
+        TextureMipPolicy mipPolicy)
     {
         var key = MipChain.CacheKey(name, mipPolicy);
         if (DictionaryWGPUTexture.ContainsKey(key))
@@ -968,6 +997,7 @@ internal class Graphics : IGraphics
                 Name = key,
                 Width = (uint)(result?.width ?? 0),
                 Height = (uint)(result?.height ?? 0),
+                OnReleased = ReleaseTexture,
             };
             return true;
         }
@@ -1000,7 +1030,7 @@ internal class Graphics : IGraphics
             }
         }
 
-        await LoadTextureAsync(sprite2D.Name);
+        await LoadTextureAsync(sprite2D.Name, leaseOwned: true);
 
         WGPUTexture wgpuTex = null;
         lock (DictionaryWGPUTexture)
@@ -4230,7 +4260,7 @@ internal class Graphics : IGraphics
             var tex = wgpuSprite.WGPUTexture;
             tex.Release();
             // Remove metadata from the dictionary when the ref count reaches zero.
-            if (tex.RefCount == 0 && !string.IsNullOrEmpty(tex.Name))
+            if (tex.RefCount == 0 && !tex.HostOwned && !string.IsNullOrEmpty(tex.Name))
             {
                 lock (DictionaryWGPUTexture)
                 {

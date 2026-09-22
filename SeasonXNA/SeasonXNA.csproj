@@ -1,0 +1,36 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+	  <SingleProject>true</SingleProject>
+	  <ImplicitUsings>enable</ImplicitUsings>
+	  <Nullable>enable</Nullable>
+	  <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+	  <LangVersion>preview</LangVersion>
+
+	  <PackageProjectUrl>https://github.com/SeasonRealms/SeasonEngine</PackageProjectUrl>
+	  <PackageLicenseExpression>MIT</PackageLicenseExpression>
+	  <RepositoryUrl>https://github.com/SeasonRealms/SeasonEngine</RepositoryUrl>
+	  <RepositoryType>git</RepositoryType>
+
+	  <PackageId>SeasonXNA</PackageId>
+	  <Version>0.2.0</Version>
+	  <Authors>SeasonRealms</Authors>
+	  <Description>An XNA-style core 2D drawing compatibility layer for existing MonoGame/XNA sprite, image and text code, hosted by the SeasonEngine runtime</Description>
+	  <Product>SeasonXNA</Product>
+	  <Copyright>© 2026 SeasonRealms </Copyright>
+	  <PackageReadmeFile>README.md</PackageReadmeFile>
+	  <RootNamespace>SeasonXNA</RootNamespace>
+
+	  <IncludeSymbols>true</IncludeSymbols>
+	  <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+	  <TargetFrameworks>net10.0-android;net10.0-ios;net10.0-maccatalyst;net10.0;net10.0-browser</TargetFrameworks>
+	  <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net10.0-windows10.0.19041.0</TargetFrameworks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Season\Season.csproj" />
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

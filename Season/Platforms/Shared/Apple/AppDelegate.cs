@@ -56,11 +56,14 @@ public class AppDelegate : UIApplicationDelegate
         // which makes the whole UI scale up and clips the bottom and right edges.
         // Retina pixel resolution is obtained automatically from MTKView.DrawableSize,
         // which equals bounds times contentScaleFactor.
-        var bounds = scene.Screen.Bounds;
+        var bounds = scene?.Screen.Bounds ?? UIScreen.MainScreen.Bounds;
 
 #if MACCATALYST
-        scene.Titlebar.TitleVisibility = UITitlebarTitleVisibility.Hidden;
-        scene.Titlebar.Toolbar = null;
+        if (scene?.Titlebar is { } titlebar)
+        {
+            titlebar.TitleVisibility = UITitlebarTitleVisibility.Hidden;
+            titlebar.Toolbar = null;
+        }
 #endif
 
         var uiWindow = new UIWindow(bounds);
@@ -74,7 +77,7 @@ public class AppDelegate : UIApplicationDelegate
 #if MACCATALYST
         _geometryRestoreAttempts = 0;
         _restoreTargetFrame = null;
-        RestoreWindowGeometry(scene);
+        if (scene != null) RestoreWindowGeometry(scene);
 #endif
 
         return true;
@@ -91,8 +94,19 @@ public class AppDelegate : UIApplicationDelegate
         }
 #endif
 
-        DeviceServices.BaseApp.SaveSettings();
-        DeviceServices.BaseApp.DisposeSaveSettingsRequest();
+        try { DeviceServices.BaseApp.SaveSettings(); }
+        finally { SeasonMTKViewDelegate.Current?.Stop(); }
+    }
+
+    public override void OnResignActivation(UIApplication application)
+    {
+        SeasonMTKViewDelegate.Current?.SetPaused(true);
+        Keyboard?.ResetKeys();
+    }
+
+    public override void OnActivated(UIApplication application)
+    {
+        SeasonMTKViewDelegate.Current?.SetPaused(false);
     }
 
 #if MACCATALYST
@@ -481,6 +495,11 @@ public class MetalViewController : UIViewController
 /// </summary>
 public class SeasonMTKViewDelegate : MTKViewDelegate
 {
+    internal static SeasonMTKViewDelegate? Current { get; private set; }
+    readonly HostLifetime _lifetime = new();
+    MTKView? _view;
+    Graphics? _graphics;
+    bool _paused;
     bool _initialized;
     bool _pendingResize;
     int _pendingW;
@@ -491,6 +510,50 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
 
     Stopwatch _stopwatch = Stopwatch.StartNew();
     double _previousSeconds;
+
+    public SeasonMTKViewDelegate()
+    {
+        if (Current != null)
+            throw new InvalidOperationException("Only one Metal host is supported per process.");
+        Current = this;
+    }
+
+    internal void SetPaused(bool paused)
+    {
+        _paused = paused;
+        _previousSeconds = _stopwatch.Elapsed.TotalSeconds;
+        if (_view != null) _view.Paused = paused || _lifetime.HasStarted;
+
+        // BaseApp.IsActive is the game's input gate (InputManager.Update drops every press and
+        // ScreenManager skips HandleInput while it is false). Mirror AndroidApp.Pause/Resume so
+        // activation follows app foreground/background instead of only pausing the render loop.
+        DeviceServices.BaseApp.IsActive = !paused;
+    }
+
+    internal void Stop(Exception? error = null)
+    {
+        if (_lifetime.HasStarted) return;
+        if (_view != null) _view.Paused = true;
+        _lifetime.Execute(
+            () => { if (error != null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw(); },
+            () => MtlDevice.AbortFrame(),
+            () => MtlDevice.WaitForIdle(),
+            () => DeviceServices.BaseApp.Dispose(),
+            () => _graphics?.DisposeImmediate2D(),
+            () =>
+            {
+                var capture = BaseApp.CaptureAppTcs;
+                BaseApp.CaptureAppTcs = null;
+                capture?.TrySetResult(null);
+            },
+            () => DeviceServices.BaseApp.DisposeSaveSettingsRequest());
+        try { _lifetime.Completion.GetAwaiter().GetResult(); }
+        catch (Exception failure)
+        {
+            Debug.WriteLine(failure);
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Metal host] {failure}");
+        }
+    }
 
     public override void DrawableSizeWillChange(MTKView view, CGSize size)
     {
@@ -516,11 +579,22 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
 
     public override void Draw(MTKView view)
     {
+        _view = view;
+        if (_paused || _lifetime.HasStarted)
+            return;
+        try { DrawCore(view); }
+        catch (Exception error) { Stop(error); }
+    }
+
+    void DrawCore(MTKView view)
+    {
         if (!_initialized)
         {
+            if (view.DrawableSize.Width <= 0 || view.DrawableSize.Height <= 0) return;
             InitializeMetal(view);
 
             _initialized = true;
+            _previousSeconds = _stopwatch.Elapsed.TotalSeconds;
             // The first callback runs the full bootstrap chain.
             // This frame is yielded, and the next Draw enters the regular frame sequence.
             return;
@@ -528,13 +602,12 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
 
         if (_pendingResize && _pendingW > 0 && _pendingH > 0)
         {
-            DeviceServices.BaseApp.ApplyResolution(_pendingW, _pendingH, 1f, 1f);
-
             // HandleResize returning false means ResizeSemaphore timed out because background Load is still holding the lock.
             // Resize must not be driven in that state because ResizeCompute would recreate compute-storage textures.
             // Keep _pendingResize and retry on the next frame.
             if (MtlDevice.HandleResize(_pendingW, _pendingH))
             {
+                DeviceServices.BaseApp.ApplyResolution(_pendingW, _pendingH, 1f, 1f);
                 _pendingResize = false;
 
                 DeviceServices.BaseApp?.Resize();
@@ -546,14 +619,25 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         _previousSeconds = newSeconds;
         float elapsed = (float)deltaSeconds;
 
+        MtlDevice.WaitForFrameSlot();
         // Camera and lighting UBO, written before every frame, equivalent to LinuxApp.VKPrimitiveGroup.Update.
-        MTLPrimitiveGroup.Update(
-            elapsed,
-            DeviceServices.BaseApp.CameraPos,
-            DeviceServices.BaseApp.CameraTarget,
-            DeviceServices.BaseApp.EffectiveSceneLights);
+        // Skipped in immediate-2D mode, where the lighting UBO was never created because no 3D
+        // pass consumes it.
+        if (!Season.Rendering.Immediate2DMode.Enabled)
+        {
+            MTLPrimitiveGroup.Update(
+                elapsed,
+                DeviceServices.BaseApp.CameraPos,
+                DeviceServices.BaseApp.CameraTarget,
+                DeviceServices.BaseApp.EffectiveSceneLights);
+        }
 
         DeviceServices.BaseApp.Update(elapsed);
+        if (!string.IsNullOrEmpty(DeviceServices.BaseApp.Status))
+        {
+            Stop();
+            return;
+        }
 
         var backgroundColor = DeviceServices.BaseApp.BackgroundColor;
         MtlDevice.BackgroundColor = backgroundColor;
@@ -578,9 +662,22 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
     ///   Device.Init -> CreateSwapChain -> CreateDescriptorHeapsAndViews -> Pipeline.Init ->
     ///   MTLPrimitiveGroup.InitLights -> MTLSprite2D.Init -> CreateGraphicsCommandLists ->
     ///   inject Graphics.Instance -> BaseApp.Create().
+    /// In immediate-2D mode (Season.Rendering.Immediate2DMode) everything the 3D path would need is skipped:
+    /// no Pipeline.Init, no InitLights, no offscreen target, and no shadow or AO resource.
     /// </summary>
     void InitializeMetal(MTKView view)
     {
+        // Immediate-2D compatibility mode (Season.Rendering.Immediate2DMode):
+        // the app renders exclusively through the immediate 2D backend, so everything the 3D path
+        // would need is skipped below - no PSO bake, no offscreen targets, no effect registration,
+        // and the quality tier is never adjusted. The decision is read once here and is final for
+        // the session: the mode is one-way, so the skipped resources are simply never created.
+        bool immediate2D = Season.Rendering.Immediate2DMode.Enabled;
+
+        // Freeze the decision: flipping it after this point would leave the frame schedule pointing
+        // at resources that were never created, so the setter rejects any later change.
+        Season.Rendering.Immediate2DMode.Freeze();
+
         var drawable = view.DrawableSize;
         int w = (int)drawable.Width;
         int h = (int)drawable.Height;
@@ -602,19 +699,21 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         // must be finalized before Pipeline.Init, where PSOs are baked.
         // The HDR chain depends on offscreen SceneColor with FinalBlit closing tone mapping.
         // Direct rendering forces fallback to the LDR baseline, mirrored across all backends.
-        MtlDevice.HdrSceneColor = UseOffscreenSceneColor && RenderQuality.Current.HdrSceneColor;
+        MtlDevice.HdrSceneColor = !immediate2D && UseOffscreenSceneColor && RenderQuality.Current.HdrSceneColor;
 
         // Step D of 2-1:
         // the AA tier is finalized during initialization, matching LinuxApp and AndroidApp under contract clause 5.
         // Msaa4x is D3D12-only.
         // Taa depends on the HDR offscreen chain as implemented in step D of 2-3.
         // Fxaa also depends on the HDR offscreen chain because the uber pass bakes luma.
-        if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
+        // The whole tier normalization is skipped in immediate-2D mode: no AA path exists to
+        // configure, and the values stay unused because no pass ever consults them.
+        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
         {
             RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Fxaa;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] AaMode.Msaa4x is supported only on D3D12, falling back to Fxaa");
         }
-        if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa)
+        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa)
         {
             // Contract clause 1 of 2-3:
             // selecting Taa forces the velocity infrastructure to be enabled because TAA is invalid without velocity.
@@ -634,7 +733,7 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
                 DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] Taa depends on the HDR offscreen chain, which is not enabled now, falling back to Fxaa while keeping MotionVectors enabled");
             }
         }
-        if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa && !MtlDevice.HdrSceneColor)
+        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa && !MtlDevice.HdrSceneColor)
         {
             RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] Fxaa depends on the HDR offscreen chain, which is not enabled now, falling back to Off");
@@ -644,12 +743,18 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         // The main PSO is baked against SceneColorFormat.
         // In HDR tiers that means RGBA16Float, and Scene pass is always offscreen.
         // See rule 7-2 in the Metal Device class header.
-        Pipeline.Init(MtlDevice.SceneColorFormat, MtlDevice.DepthBufferFormat);
+        // Skipped in immediate-2D mode: the main PSO family is never compiled, which is where the
+        // startup bake cost would otherwise go.
+        if (!immediate2D)
+            Pipeline.Init(MtlDevice.SceneColorFormat, MtlDevice.DepthBufferFormat);
 
         // 5) Global shared lighting UBO.
         // Both Pbr3D and SpriteQuad buffer b1 read from it,
         // so it must be initialized before Sprite2D.Init and before resource loading.
-        MTLPrimitiveGroup.InitLights();
+        // Skipped in immediate-2D mode: no 3D pass consumes it, and the matching per-frame
+        // MTLPrimitiveGroup.Update in the render loop is skipped as well.
+        if (!immediate2D)
+            MTLPrimitiveGroup.InitLights();
 
         // 6) 2D orthographic camera.
         MTLSprite2D.Init();
@@ -658,13 +763,14 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         MtlDevice.CreateGraphicsCommandLists();
 
         // 8) Inject the IGraphics implementation so BaseApp can run unchanged.
-        Season.Basic.Graphics.Instance = new Graphics();
+        _graphics = new Graphics();
+        Season.Basic.Graphics.Instance = _graphics;
 
         // 8.5) Offscreen SceneColor for step 2.
         // When non-null, FrameSchedule automatically appends a FinalBlit pass to present it, mirrored with WindowsApp.
         // Under step A of 1-4, the HDR chain switches it to Rgba16Float,
         // and FinalBlit automatically selects the tonemap variant.
-        if (UseOffscreenSceneColor)
+        if (!immediate2D && UseOffscreenSceneColor)
         {
             Season.Rendering.FrameSchedule.SceneColor = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -681,7 +787,7 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         // When non-null, Scene pass becomes a three-target pass, color, velocity, and depth.
         // When MotionVectors is disabled it stays null, leaving zero residual state in the chain, mirrored with WindowsApp.
         // It must be ready before BaseApp.Create, where the app registers VelocityViewEffect.
-        if (RenderQuality.Current.MotionVectors)
+        if (!immediate2D && RenderQuality.Current.MotionVectors)
         {
             Season.Rendering.FrameSchedule.SceneVelocity = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -720,7 +826,7 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         // It is depth-only D32Float, with fixed ShadowAtlasSize squared and no resize tracking, following contract clause 2.
         // After ShadowMap plus RenderShadow are registered as a pair,
         // FrameSchedule activates the Shadow pass before Scene, mirrored with WindowsApp.
-        if (RenderQuality.Current.ShadowsEnabled)
+        if (!immediate2D && RenderQuality.Current.ShadowsEnabled)
         {
             Season.Rendering.FrameSchedule.ShadowMap = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -741,18 +847,19 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         // and it is mutually exclusive with MSAA because depth cannot be used directly as compute input.
         // Once finalized, create SceneDepth as a full-size depth-only target,
         // used as the explicit Scene-pass DepthTarget and as compute depth input, mirrored with WindowsApp.
-        if (RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off && !MtlDevice.HdrSceneColor)
+        if (!immediate2D && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off && !MtlDevice.HdrSceneColor)
         {
             RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] AO depends on the HDR offscreen chain, which is not enabled now, falling back to Off");
         }
-        if (RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off
+        if (!immediate2D
+            && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off
             && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
         {
             RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] AO is mutually exclusive with Msaa4x because MSAA depth cannot be used as compute input, falling back to Off");
         }
-        if (RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off)
+        if (!immediate2D && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off)
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -766,7 +873,7 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         // MotionVectors requires an explicit depth target because the velocity render pass needs three attachments, color, velocity, and depth.
         // When AO is disabled, SceneDepth may still be null,
         // but MotionVectors still needs a depth attachment, so create it here, mirrored with WindowsApp, LinuxApp, and AndroidApp.
-        if (RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
+        if (!immediate2D && RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -778,6 +885,11 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
 
         // 9) Create BaseApp, the entry point for resource loading.
         DeviceServices.BaseApp.Create();
+
+        // On launch, OnActivated (with its SetPaused(false)) runs before Create, so the input
+        // gate must be armed here too; mirrors LinuxApp where ShowWindow is followed by
+        // IsActive = true for a window that starts focused.
+        DeviceServices.BaseApp.IsActive = !_paused;
     }
 
 }

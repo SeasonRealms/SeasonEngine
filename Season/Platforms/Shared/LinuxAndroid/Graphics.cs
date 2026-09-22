@@ -36,20 +36,35 @@ namespace Season.Platforms.Shared.LinuxAndroid;
 ///
 /// Dictionary and lock usage follow the DX baseline strictly, with identical behavior.
 /// </summary>
-internal unsafe class Graphics : IGraphics
+internal unsafe partial class Graphics : IGraphics
 {
     readonly GlyphAtlasManager<VkTexture> _glyphAtlas = new(
         2048, 2048,
         createAtlasTexture: (w, h) => VkTexture.CreateEmpty((uint)w, (uint)h, "TextAtlas"),
-        uploadFullPixels: (tex, pixels) => tex.UploadPixels(pixels),
+        uploadFullPixels: (tex, pixels) =>
+        {
+            WaitForAtlasReaders();
+            tex.UploadPixels(pixels);
+        },
         uploadSubRects: (tex, pixels, atlasW, atlasH, rects) =>
         {
+            WaitForAtlasReaders();
             var atlasRects = new AtlasUploadRect[rects.Length];
             for (int i = 0; i < rects.Length; i++)
                 atlasRects[i] = new AtlasUploadRect(rects[i].X, rects[i].Y, rects[i].Width, rects[i].Height);
             tex.UploadSubRects(pixels, atlasW, atlasH, atlasRects);
         },
         getCurrentFrameIndex: () => Vulkan.Device.FrameIndex);
+
+    static void WaitForAtlasReaders()
+    {
+        if (Vulkan.Device.InRenderPass)
+            throw new InvalidOperationException("Glyph atlas uploads must run outside a render pass.");
+        // Dirty stable pages may still be sampled by earlier frames on a different queue.
+        // Only uploads wait, not every warmed Prepare/Draw.
+        var submitted = Vulkan.Device.GetCurrentRetireFenceValue() - 1;
+        if (submitted != 0) Vulkan.Device.GraphicsCommandQueue.WaitForFence(submitted);
+    }
 
     Dictionary<string, VkTexture> DictionaryVKTexture = new();
 

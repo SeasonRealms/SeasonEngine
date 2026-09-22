@@ -36,7 +36,17 @@ public static class WindowsApp
 
     static bool _applyingWindowState;
 
-    static bool _closing;
+    static volatile bool _closing;
+    static HostLifetime _lifetime = new();
+
+    /// <summary>Completes after application and backend teardown, or faults with all lifecycle errors.</summary>
+    public static Task Completion => _lifetime.Completion;
+
+    /// <summary>Request orderly shutdown. Do not call Application.Exit before Completion.</summary>
+    public static void RequestExit()
+    {
+        Window?.DispatcherQueue.TryEnqueue(() => Window.Close());
+    }
 
     static bool _startupRestorePending;
 
@@ -52,7 +62,11 @@ public static class WindowsApp
 
     public static void Run(BaseApp app)
     {
+        ArgumentNullException.ThrowIfNull(app);
+        if (Window != null) throw new InvalidOperationException("WindowsApp supports one application per process.");
         _closing = false;
+        firstTime = true;
+        _lifetime = new();
 
         var keyboard = new WindowsKeyboardService();
 
@@ -108,6 +122,7 @@ public static class WindowsApp
             if (!isActive)
             {
                 keyboard.ResetKeys();
+                TouchService.isDown = false;
             }
         };
 
@@ -155,12 +170,16 @@ public static class WindowsApp
 
         AppWindow.Closing += (sender, e) =>
         {
+            // Keep the HWND alive until the render thread releases its resources.
+            e.Cancel = !_lifetime.Completion.IsCompleted;
             if (_closing)
                 return;
 
             _closing = true;
             keyboard.Detach();
             SaveWindowState(immediate: true, source: "Closing");
+            if (firstTime)
+                _lifetime.Execute(() => { }, app.Dispose);
         };
 
         Window.Closed += (sender, e) =>
@@ -222,26 +241,30 @@ public static class WindowsApp
 
         swapChainPanel.PointerPressed += (s, e) =>
         {
+            UpdatePointer(e);
+            swapChainPanel.CapturePointer(e.Pointer);
             TouchService.isDown = true;
         };
 
         swapChainPanel.PointerReleased += (s, e) =>
         {
+            UpdatePointer(e);
             TouchService.isDown = false;
+            swapChainPanel.ReleasePointerCapture(e.Pointer);
         };
 
-        swapChainPanel.PointerMoved += (s, e) =>
+        swapChainPanel.PointerCanceled += (s, e) => TouchService.isDown = false;
+        swapChainPanel.PointerCaptureLost += (s, e) => TouchService.isDown = false;
+        swapChainPanel.PointerEntered += (s, e) => UpdatePointer(e);
+        swapChainPanel.PointerMoved += (s, e) => UpdatePointer(e);
+
+        void UpdatePointer(Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
         {
-            var currentPoint = e.GetCurrentPoint(s as UIElement);
-
-            var pos = currentPoint.Position;
-
+            var pos = e.GetCurrentPoint(swapChainPanel).Position;
             var scale = DeviceServices.BaseApp.Scale > 0f ? DeviceServices.BaseApp.Scale : 1f;
-
             TouchService.PoX = (int)Math.Round(pos.X * DeviceServices.BaseApp.CompositionScale.X / scale);
-
             TouchService.PoY = (int)Math.Round(pos.Y * DeviceServices.BaseApp.CompositionScale.Y / scale);
-        };
+        }
 
         swapChainPanel.PointerWheelChanged += (s, e) =>
         {
@@ -262,6 +285,7 @@ public static class WindowsApp
 
         swapChainPanel.SizeChanged += (s, e) =>
         {
+            if (_closing) return;
             lock (swapChainPanel)
             {
                 var backBufferWidth = ConvertLogicalToPhysicalPixels(swapChainPanel.ActualWidth, swapChainPanel.CompositionScaleX);
@@ -301,6 +325,19 @@ public static class WindowsApp
         StoreContext = StoreContext.GetDefault();
 
         WinRT.Interop.InitializeWithWindow.Initialize(StoreContext, windowHandle);
+        CloseAfterCompletion();
+    }
+
+    static async void CloseAfterCompletion()
+    {
+        try { await _lifetime.Completion; }
+        catch (Exception error)
+        {
+            DeviceServices.BaseApp.Status = "Failed";
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [HostLifetime] {error}");
+            System.Diagnostics.Trace.TraceError(error.ToString());
+        }
+        Window.DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () => Window.Close());
     }
 
     static void ApplyWindowState(BaseApp app, string source = "Unknown")
@@ -375,6 +412,68 @@ public static class WindowsApp
         {
             _applyingWindowState = false;
         }
+    }
+
+    /// <summary>
+    /// Windowed mode only: resize the OS window so its client area matches the given pixel size.
+    /// The app calls this right after applying a display change (startup, resolution or presenter
+    /// switch) so the design resolution fills the client area 1:1 and no letterbox is visible.
+    /// Fullscreen is skipped (its bars are decided by the monitor aspect ratio, not the window size)
+    /// and a maximized window is restored first, because maximizing cannot coexist with an
+    /// exact-size window. Nothing is re-applied on later user resizes, so manual stretching is
+    /// never fought; the resulting bounds still flow through the normal Changed -> SaveWindowState
+    /// path, which keeps the next startup consistent without an extra restore pass.
+    /// </summary>
+    public static void ApplyWindowClientSize(int width, int height)
+    {
+        if (width <= 0 || height <= 0)
+        {
+            return;
+        }
+
+        var window = Window;
+        if (window is null)
+        {
+            return;
+        }
+
+        window.DispatcherQueue.TryEnqueue(() =>
+        {
+            if (_closing || AppWindow is null)
+            {
+                return;
+            }
+
+            // Fullscreen keeps its presenter untouched: its bars cannot be removed by a window size.
+            if (AppWindow.Presenter is not OverlappedPresenter presenter)
+            {
+                return;
+            }
+
+            if (presenter.State == OverlappedPresenterState.Minimized)
+            {
+                return;
+            }
+
+            var size = new SizeInt32(width, height);
+
+            if (presenter.State == OverlappedPresenterState.Maximized)
+            {
+                presenter.Restore();
+            }
+            else if (AppWindow.ClientSize.Width == size.Width && AppWindow.ClientSize.Height == size.Height)
+            {
+                return;
+            }
+
+            LogWindowState(
+                "Fit",
+                $"source=ApplyWindowClientSize pos=({AppWindow.Position.X},{AppWindow.Position.Y}) " +
+                $"clientBefore=({AppWindow.ClientSize.Width},{AppWindow.ClientSize.Height}) " +
+                $"target=({size.Width},{size.Height})");
+
+            AppWindow.ResizeClient(size);
+        });
     }
 
     static bool TryGetVisibleDisplayArea(RectInt32 rect, out DisplayArea displayArea)
@@ -497,7 +596,44 @@ public static class WindowsApp
 
     static async void CreateInstance(SwapChainPanel swapChainPanel)
     {
+        try { await InitializeAndRun(swapChainPanel); }
+        catch (Exception error)
+        {
+            if (!_lifetime.HasStarted)
+                _lifetime.Execute(() => System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw(),
+                    DeviceServices.BaseApp.Dispose, ShutdownBeforeFrames);
+        }
+    }
+
+    static void ShutdownBeforeFrames()
+    {
+        if (DirectX.Device.CanWaitForGpu())
+        {
+            DirectX.Device.WaitForGpu();
+            DirectX.Device.ResetAllAllocatorsForShutdown();
+        }
+        if (Season.Basic.Graphics.Instance is Graphics graphics)
+        {
+            graphics.DisposeImmediate2D();
+            // Partial initialization may not have a usable fence; never force releases here.
+            graphics.PumpDeferredReleases();
+        }
+    }
+
+    static async Task InitializeAndRun(SwapChainPanel swapChainPanel)
+    {
         Season.Basic.Graphics.Instance = new Graphics();
+
+        // Immediate-2D compatibility mode (Season.Rendering.Immediate2DMode):
+        // the app renders exclusively through the immediate 2D backend, so everything the 3D path
+        // would need is skipped below - no PSO bake, no offscreen targets, no effect registration,
+        // and the quality tier is never adjusted. The decision is read once here and is final for
+        // the session: the mode is one-way, so the skipped resources are simply never created.
+        bool immediate2D = Season.Rendering.Immediate2DMode.Enabled;
+
+        // Freeze the decision: flipping it after this point would leave the frame schedule pointing
+        // at resources that were never created, so the setter rejects any later change.
+        Season.Rendering.Immediate2DMode.Freeze();
 
         // 1-4 quality tiering (owned by shared-layer RenderQuality starting from Step C;
         // see its summary for the cross-platform contract):
@@ -505,14 +641,16 @@ public static class WindowsApp
         // Pipeline.Init (PSO baking). The HDR path depends on offscreen SceneColor
         // because tone mapping is closed in FinalBlit; direct rendering must therefore
         // fall back to the LDR baseline.
-        DirectX.Device.HdrSceneColor = UseOffscreenSceneColor && RenderQuality.Current.HdrSceneColor;
+        DirectX.Device.HdrSceneColor = !immediate2D && UseOffscreenSceneColor && RenderQuality.Current.HdrSceneColor;
 
         // 2-1 contract clause 5: finalize the AA tier during initialization
         // (mutually exclusive single-choice; fall back and log when unsupported, with zero runtime branching).
         // This must happen before CreateSwapChain because the Display MSAA sample count is derived
         // from the finalized tier. Taa/Fxaa both depend on the HDR offscreen path:
         // Taa fallback -> Fxaa, and Fxaa fallback -> Off.
-        if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa)
+        // The whole tier normalization is skipped in immediate-2D mode: no AA path exists to
+        // configure, and the values stay unused because no pass ever consults them.
+        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa)
         {
             // 2-3 contract clause 1: selecting Taa forces the velocity path to be enabled
             // because TAA is invalid without velocity.
@@ -535,7 +673,7 @@ public static class WindowsApp
                 DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] Taa requires the HDR offscreen path (currently disabled), falling back to Fxaa; MotionVectors remains enabled");
             }
         }
-        if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa && !DirectX.Device.HdrSceneColor)
+        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa && !DirectX.Device.HdrSceneColor)
         {
             RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] Fxaa requires the HDR offscreen path (currently disabled), falling back to Off");
@@ -546,7 +684,8 @@ public static class WindowsApp
         // NumRenderTargets/RTVFormats[1] are both derived from it, so it must not change at runtime.
         // It is mutually exclusive with Msaa4x because all MRT attachments must use the same
         // sample count, and multisampled color cannot be bound together with single-sampled velocity.
-        if (RenderQuality.Current.MotionVectors
+        if (!immediate2D
+            && RenderQuality.Current.MotionVectors
             && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
         {
             RenderQuality.Current.MotionVectors = false;
@@ -561,7 +700,7 @@ public static class WindowsApp
         catch (Exception ex)
         {
             DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [Init] Device.Init failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
-            return;
+            throw;
         }
         DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [Init] Device.Init done");
 
@@ -580,23 +719,28 @@ public static class WindowsApp
         catch (Exception ex)
         {
             DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [Init] CreateSwapChain failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
-            return;
+            throw;
         }
         DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [Init] CreateSwapChain done");
 
         DirectX.Device.CreateDescriptorHeapsAndViews();
 
-        DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [Init] Pipeline.Init begin");
-        try
+        // Skipped in immediate-2D mode: the main PSO family (and every fxc compile it triggers)
+        // is never baked, which is where the startup cost would otherwise go.
+        if (!immediate2D)
         {
-            Pipeline.Init();
+            DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [Init] Pipeline.Init begin");
+            try
+            {
+                Pipeline.Init();
+            }
+            catch (Exception ex)
+            {
+                DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [Init] Pipeline.Init failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
+                throw;
+            }
+            DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [Init] Pipeline.Init done");
         }
-        catch (Exception ex)
-        {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [Init] Pipeline.Init failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
-            return;
-        }
-        DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [Init] Pipeline.Init done");
 
         // Startup shader budget: Pipeline.Init plus the nested BlitPipeline.Init request far more shader
         // compilations than there are distinct sources, and every real fxc call sits in front of the first
@@ -605,16 +749,21 @@ public static class WindowsApp
 
         // Global shared lighting CB: both the Pbr3D path and DXSpriteQuad's b1 read from it,
         // so it must be initialized before DXSprite2D.Init / DeviceServices.BaseApp.Create() load resources.
-        DXPrimitiveGroup.InitLights();
+        // Skipped in immediate-2D mode: no 3D pass consumes it, and the matching per-frame
+        // DXPrimitiveGroup.Update in the render loop is skipped as well.
+        if (!immediate2D)
+            DXPrimitiveGroup.InitLights();
 
         DXSprite2D.Init();
 
+        // Per-frame command lists. In immediate-2D mode Pipeline.OpaquePipelineState is null,
+        // which FrameContext.Initialize forwards as the optional pInitialState (D3D12 allows null).
         DirectX.Device.CreateGraphicsCommandLists();
 
         // Offscreen SceneColor (Step 2): when non-null, FrameSchedule automatically appends
         // the FinalBlit pass for presentation.
         // 1-4 Step A: use RGBA16F in the HDR path (FinalBlit switches to the tone-mapping variant automatically).
-        if (UseOffscreenSceneColor)
+        if (!immediate2D && UseOffscreenSceneColor)
         {
             Season.Rendering.FrameSchedule.SceneColor = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -630,7 +779,7 @@ public static class WindowsApp
         // the Scene pass uses three targets (color + velocity + depth); when MotionVectors is off,
         // keep this null so the path leaves no residue.
         // It must be ready before BaseApp.Create (where the app registers VelocityViewEffect).
-        if (RenderQuality.Current.MotionVectors)
+        if (!immediate2D && RenderQuality.Current.MotionVectors)
         {
             Season.Rendering.FrameSchedule.SceneVelocity = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -650,7 +799,8 @@ public static class WindowsApp
         // of FXAA; RenderPostPass forwards SceneColorOverride, and the Post pass runs after the AfterScene
         // phase, so it reads the resolve output of the current frame rather than SceneColor.
         // In tiers that ask for neither, both remain null, leaving no residue in the pipeline.
-        if ((RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
+        if (!immediate2D
+            && (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
                 || (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa
                     && RenderQuality.Current.TaaSharpness > 0f))
             && Season.Rendering.FrameSchedule.SceneColor != null)
@@ -668,7 +818,7 @@ public static class WindowsApp
         // 1-5 Shadow atlas (depth-only D32Float, fixed ShadowAtlasSize^2 and not resized; contract clause 2):
         // once ShadowMap + RenderShadow are registered as a pair during initialization,
         // FrameSchedule activates the Shadow pass before Scene.
-        if (RenderQuality.Current.ShadowsEnabled)
+        if (!immediate2D && RenderQuality.Current.ShadowsEnabled)
         {
             Season.Rendering.FrameSchedule.ShadowMap = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -688,18 +838,19 @@ public static class WindowsApp
         // and is mutually exclusive with MSAA (depth cannot be used directly as compute input).
         // After finalization, create SceneDepth (full-size depth-only, explicit DepthTarget for
         // the Scene pass, and depth input for compute).
-        if (RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off && !DirectX.Device.HdrSceneColor)
+        if (!immediate2D && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off && !DirectX.Device.HdrSceneColor)
         {
             RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] AO requires the HDR offscreen path (currently disabled), falling back to Off");
         }
-        if (RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off
+        if (!immediate2D
+            && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off
             && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
         {
             RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] AO is mutually exclusive with Msaa4x (MSAA depth cannot be used as compute input), falling back to Off");
         }
-        if (RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off)
+        if (!immediate2D && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off)
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -717,7 +868,7 @@ public static class WindowsApp
         // why the dilation input was missing on exactly the validated backend.
         // SampleCount 1 is unconditionally correct here: MotionVectors and Msaa4x were already made
         // mutually exclusive above, so this branch is never reached with a multisampled scene.
-        if (RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
+        if (!immediate2D && RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -727,6 +878,16 @@ public static class WindowsApp
             });
         }
 
+        // One-shot tier report: the app ships with the desktop-class defaults (HDR + TAA tier +
+        // GTAO + shadows + bloom), so this line is what a device log needs to tell which pipeline the
+        // frame actually pays for, and whether immediate-2D mode is active.
+        DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] tier: {(int)DeviceServices.BaseApp.DeviceResolution.X}x{(int)DeviceServices.BaseApp.DeviceResolution.Y} hdr={DirectX.Device.HdrSceneColor} aa={RenderQuality.Current.AntiAliasing} mv={RenderQuality.Current.MotionVectors} ao={RenderQuality.Current.AmbientOcclusion} shadows={RenderQuality.Current.ShadowsEnabled} bloom={RenderQuality.Current.BloomEnabled} taaSharpness={RenderQuality.Current.TaaSharpness} immediate2D={immediate2D}");
+
+        // Extra line when the mode is on: this is what a device log needs to tell that the frame is
+        // Overlay-only and that the tier line right above is inert.
+        if (immediate2D)
+            DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] immediate-2D mode: the main PSO family was not compiled and no offscreen target, shadow map or post effect exists this session; every frame renders only the Overlay pass directly into the backbuffer");
+
         DeviceServices.BaseApp.Create();
 
         // Create() registers the compute effects, so this second reading covers graphics plus every kernel that
@@ -735,6 +896,9 @@ public static class WindowsApp
 
         WorkItemHandler handler = delegate
         {
+            bool gpuIdle = false;
+            _lifetime.Execute(() =>
+            {
             var synchronizationContext = new SynchronizationContext();
 
             SynchronizationContext.SetSynchronizationContext(synchronizationContext);
@@ -784,7 +948,13 @@ public static class WindowsApp
                     }
                 }
 
-                DXPrimitiveGroup.Update(elapsed, DeviceServices.BaseApp.CameraPos, DeviceServices.BaseApp.CameraTarget, DeviceServices.BaseApp.EffectiveSceneLights);
+                // Camera and lighting CBs, written before each frame.
+                // Skipped in immediate-2D mode, where the lighting CB was never created because no 3D
+                // pass consumes it.
+                if (!Season.Rendering.Immediate2DMode.Enabled)
+                {
+                    DXPrimitiveGroup.Update(elapsed, DeviceServices.BaseApp.CameraPos, DeviceServices.BaseApp.CameraTarget, DeviceServices.BaseApp.EffectiveSceneLights);
+                }
 
                 if (Season.Basic.Graphics.Instance is Graphics textFrameGraphics)
                 {
@@ -822,21 +992,26 @@ public static class WindowsApp
                 //}
             }
 
-            if (DirectX.Device.CanWaitForGpu())
+            },
+            () =>
             {
+                if (!DirectX.Device.CanWaitForGpu()) return;
                 DirectX.Device.WaitForGpu();
-            }
-
-            // Shutdown: the GPU has finished all commands, but the FrameContext command allocators
-            // may still hold references to texture resources from the previous frame's render commands.
-            // All allocators must be reset before PumpDeferredReleases, otherwise the Debug Layer
-            // will refuse Release() because the resources are still referenced.
-            DirectX.Device.ResetAllAllocatorsForShutdown();
-
-            if (Season.Basic.Graphics.Instance is Graphics shutdownGraphics)
+                // Command allocators must stop referencing textures before forced release.
+                DirectX.Device.ResetAllAllocatorsForShutdown();
+                gpuIdle = true;
+            },
+            DeviceServices.BaseApp.Dispose,
+            () =>
             {
-                shutdownGraphics.PumpDeferredReleases(force: true);
-            }
+                if (Season.Basic.Graphics.Instance is Graphics graphics)
+                    graphics.DisposeImmediate2D();
+            },
+            () =>
+            {
+                if (Season.Basic.Graphics.Instance is Graphics graphics)
+                    graphics.PumpDeferredReleases(force: gpuIdle);
+            });
         };
 
         await ThreadPool.RunAsync(handler, WorkItemPriority.High, WorkItemOptions.TimeSliced);

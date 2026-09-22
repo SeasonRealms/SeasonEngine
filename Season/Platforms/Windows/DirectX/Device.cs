@@ -428,7 +428,10 @@ internal unsafe static class Device
             // AA tier (mutually exclusive single choice, with fallback already
             // applied during WindowsApp initialization). Only the Msaa4x tier
             // creates an MSAA target; all other tiers use 1x.
-            uint msaaSampleCount = RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x ? 4u : 1u;
+            // Immediate-2D mode (Season.Rendering.Immediate2DMode) never runs the Scene pass, so the
+            // MSAA target is suppressed outright. The tier value itself stays untouched - it is inert
+            // in this mode and may be persisted in settings.
+            uint msaaSampleCount = !Season.Rendering.Immediate2DMode.Enabled && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x ? 4u : 1u;
             Display = new Display(D3dDevice, BackBufferFormat, DepthBufferFormat, msaaSampleCount);
             Display.SetClearColor(BackgroundColor);
             Display.Initialize(width, height);

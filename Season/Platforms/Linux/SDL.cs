@@ -60,6 +60,11 @@ internal static partial class SDL
     [return: MarshalAs(UnmanagedType.I1)]
     public static partial bool Vulkan_CreateSurface(IntPtr window, IntPtr instance, IntPtr allocator, out ulong surface);
 
+    /// <summary>Logical window size in window coordinates. It differs from the pixel size when the window has a high-density pixel ratio, which is why ApplyWindowClientSize converts through the ratio.</summary>
+    [LibraryImport(Library, EntryPoint = "SDL_GetWindowSize"), UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    [return: MarshalAs(UnmanagedType.I1)]
+    public static partial bool GetWindowSize(IntPtr window, out int w, out int h);
+
     [LibraryImport(Library, EntryPoint = "SDL_GetWindowSizeInPixels"), UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     [return: MarshalAs(UnmanagedType.I1)]
     public static partial bool GetWindowSizeInPixels(IntPtr window, out int w, out int h);
@@ -151,6 +156,7 @@ public enum WindowFlags : ulong
     Fullscreen = 0x0000000000000001,
     Borderless = 0x0000000000000010,
     Resizable = 0x0000000000000020,
+    Minimized = 0x0000000000000040,
     Maximized = 0x0000000000000080,
     Vulkan = 0x0000000010000000
 }

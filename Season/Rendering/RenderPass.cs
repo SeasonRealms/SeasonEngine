@@ -243,6 +243,60 @@ public static class FrameSchedule
 
     public static void Execute(IGraphics g, BaseApp app, in Vector4 clearColor)
     {
+        var canvas = app.Canvas2D;
+        var backend = g.Immediate2D;
+        try
+        {
+            canvas.BeginFrame(app.DesignResolution, backend?.OutputSize ?? app.DeviceResolution);
+            app.Draw2D(canvas);
+            canvas.EndFrame();
+            if (canvas.CommandCount != 0)
+            {
+                if (backend == null)
+                    throw new PlatformNotSupportedException("当前平台尚未实现即时 2D 后端。");
+                // 资源准备和上传发生在所有 pass 之前，绝不在 Control.Draw 内发起上传。
+                backend.Prepare(canvas);
+            }
+            ExecutePasses(g, app, clearColor, canvas.CommandCount == 0 ? null : backend);
+        }
+        finally
+        {
+            try { backend?.CompleteFrame(); }
+            finally { canvas.Clear(); }
+        }
+    }
+
+    static void ExecutePasses(IGraphics g, BaseApp app, in Vector4 clearColor, IImmediate2DBackend? immediate)
+    {
+        // Immediate-2D compatibility mode (Immediate2DMode): the platform skipped the entire 3D
+        // initialization, so the pass chain reduces to a single Overlay pass that renders the 2D
+        // canvas straight into the backbuffer. It is the first and only backbuffer pass of the
+        // frame, so BeginPass selects the clearing variant and the frame starts from the app
+        // background color. No offscreen target, effect, or compute phase exists to run here.
+        if (Immediate2DMode.Enabled)
+        {
+            g.BeginPass(new PassDesc
+            {
+                Id = RenderPassId.Overlay,
+                ColorTarget = null,
+                ClearColor = clearColor,
+                ClearColorEnable = true,
+                ClearDepthEnable = true,
+                StoreDepth = false,
+            });
+
+            try
+            {
+                app.DrawOverlay();
+                immediate?.Submit(app.Canvas2D);
+            }
+            finally
+            {
+                g.EndPass();
+            }
+            return;
+        }
+
         // FrameStart phase: dispatch before all render passes (strictest-platform contract: VK forbids dispatch inside a pass,
         // and Metal compute/render encoders are mutually exclusive; synchronization is centralized inside backend DispatchCompute)
         for (int i = 0; i < _computeFrameStart.Count; i++)
@@ -337,8 +391,14 @@ public static class FrameSchedule
             StoreDepth = false,
         });
 
-        app.DrawOverlay();
-
-        g.EndPass();
+        try
+        {
+            app.DrawOverlay();
+            immediate?.Submit(app.Canvas2D);
+        }
+        finally
+        {
+            g.EndPass();
+        }
     }
 }

@@ -6,7 +6,7 @@ namespace Season.Fonts;
 
 // Shared types, platform-independent.
 
-internal readonly record struct GlyphAtlasKey(int FontSize, int CodePoint);
+internal readonly record struct GlyphAtlasKey(int FontSize, int CodePoint, Font? Font = null);
 
 internal readonly struct GlyphAtlasEntry
 {
@@ -87,6 +87,10 @@ internal sealed class GlyphAtlasManager<TTexture> : IDisposable
     const float TotalMergeAreaGrowthLimit = 1.2f;
 
     readonly object _sync = new();
+    readonly object _stableSync = new();
+    readonly List<GlyphAtlasManager<TTexture>> _stablePages = new();
+    // Stable pages are cached by font identity and do not overwrite UVs already referenced by frames; explicit failure occurs when budget is reached.
+    const int MaxStablePages = 16;
     readonly Dictionary<GlyphAtlasKey, GlyphAtlasEntry> _entries = new();
     readonly byte[] _pixels;
     readonly int _atlasWidth;
@@ -168,8 +172,13 @@ internal sealed class GlyphAtlasManager<TTexture> : IDisposable
     /// </summary>
     /// <returns>True when the glyph is available and <c>entry</c> contains valid coordinates and metrics.</returns>
     public bool TryEnsureGlyph(int fontSize, int codePoint, out GlyphAtlasEntry entry)
+        => TryEnsureGlyphCore(null, fontSize, codePoint, true, out entry, out _);
+
+    bool TryEnsureGlyphCore(Font? explicitFont, int fontSize, int codePoint, bool allowReset,
+        out GlyphAtlasEntry entry, out bool full)
     {
-        var key = new GlyphAtlasKey(fontSize, codePoint);
+        full = false;
+        var key = new GlyphAtlasKey(fontSize, codePoint, explicitFont);
 
         lock (_sync)
         {
@@ -182,13 +191,21 @@ internal sealed class GlyphAtlasManager<TTexture> : IDisposable
         (byte[] bytes, GlyphMetrics glyphMetrics, float pixelRange, int textureWidth, int textureHeight) glyphResult = default;
         bool found = false;
 
-        foreach (var font in Season.Fonts.Font.Instance)
+        if (explicitFont != null)
         {
-            glyphResult = font.CreateMsdfGlyph(fontSize, codePoint);
-            if (glyphResult.bytes is not null)
+            glyphResult = explicitFont.CreateMsdfGlyph(fontSize, codePoint);
+            found = glyphResult.bytes != null;
+        }
+        else
+        {
+            foreach (var font in Season.Fonts.Font.Instance)
             {
-                found = true;
-                break;
+                glyphResult = font.CreateMsdfGlyph(fontSize, codePoint);
+                if (glyphResult.bytes is not null)
+                {
+                    found = true;
+                    break;
+                }
             }
         }
 
@@ -209,6 +226,12 @@ internal sealed class GlyphAtlasManager<TTexture> : IDisposable
             // Shelf packing.
             if (!TryAllocate(glyphResult.textureWidth, glyphResult.textureHeight, out int x, out int y))
             {
+                if (!allowReset)
+                {
+                    full = true;
+                    entry = default;
+                    return false;
+                }
                 ResetAtlas();
 
                 if (!TryAllocate(glyphResult.textureWidth, glyphResult.textureHeight, out x, out y))
@@ -245,7 +268,7 @@ internal sealed class GlyphAtlasManager<TTexture> : IDisposable
     /// Flushes dirty regions to the GPU on the render thread.
     /// Includes built-in per-frame throttling so multiple calls within the same frame execute only once.
     /// </summary>
-    public void FlushPendingUploadsOnRenderThread()
+    public void FlushPendingUploadsOnRenderThread(bool force = false)
     {
         // Lock-free fast path: if there is no dirty data or this frame has already flushed, return immediately.
         // This avoids the render thread blocking on lock(_sync) while consumer-side MSDF rasterization is running.
@@ -253,13 +276,13 @@ internal sealed class GlyphAtlasManager<TTexture> : IDisposable
             return;
 
         uint currentFrame = _getCurrentFrameIndex();
-        if (_lastFlushFrame == currentFrame)
+        if (!force && _lastFlushFrame == currentFrame)
             return;
 
         lock (_sync)
         {
             // Double-check: reads performed outside the lock may now be stale.
-            if (!_dirty || _lastFlushFrame == currentFrame)
+            if (!_dirty || (!force && _lastFlushFrame == currentFrame))
                 return;
 
             if (_fullAtlasDirty)
@@ -305,6 +328,75 @@ internal sealed class GlyphAtlasManager<TTexture> : IDisposable
         }
     }
 
+    /// <summary>
+    /// Explicit font stable paging entry, reusing the same packer and upload path. The single-page version semantics for regular Texts remain unchanged.
+    /// When a page is full, it expands rather than resetting the atlas, ensuring that glyphs recorded in a frame are not overwritten by subsequent glyphs.
+    /// </summary>
+    internal bool TryEnsureStableGlyph(Font font, int size, int codePoint, out GlyphAtlasEntry entry, out TTexture texture)
+    {
+        lock (_stableSync)
+        {
+            var key = new GlyphAtlasKey(size, codePoint, font);
+            foreach (var page in _stablePages)
+            {
+                if (page._entries.TryGetValue(key, out entry))
+                {
+                    texture = page.AtlasTexture;
+                    return true;
+                }
+            }
+
+            bool full = true;
+            if (_stablePages.Count > 0)
+            {
+                var last = _stablePages[^1];
+                if (last.TryEnsureGlyphCore(font, size, codePoint, false, out entry, out full))
+                {
+                    texture = last.AtlasTexture;
+                    return true;
+                }
+            }
+            if (full)
+            {
+                if (_stablePages.Count >= MaxStablePages)
+                    throw new InvalidOperationException("The real-time glyph atlas has reached the stable page budget.");
+                var page = new GlyphAtlasManager<TTexture>(_atlasWidth, _atlasHeight, _createAtlasTexture,
+                    _uploadFullPixels, _uploadSubRects, _getCurrentFrameIndex, _padding);
+                _stablePages.Add(page);
+                if (page.TryEnsureGlyphCore(font, size, codePoint, false, out entry, out full))
+                {
+                    texture = page.AtlasTexture;
+                    return true;
+                }
+                if (full) throw new InvalidOperationException("A single glyph exceeds the size of the atlas page.");
+            }
+            entry = default;
+            texture = default!;
+            return false;
+        }
+    }
+
+    /// <summary>Only called during the frame preparation phase; The cyclic FrameIndex is not a frame number and cannot be used to miss new glyph shapes that appear after multiple frames.</summary>
+    internal void FlushStablePages()
+    {
+        lock (_stableSync)
+            foreach (var page in _stablePages) page.FlushPendingUploadsOnRenderThread(force: true);
+    }
+
+    /// <summary>Texture is recycled by the platform; The caller must ensure GPU idle or use delayed release.</summary>
+    internal void DisposeStablePages(Action<TTexture> release)
+    {
+        lock (_stableSync)
+        {
+            foreach (var page in _stablePages)
+            {
+                if (page._atlasTextureCreated) release(page._atlasTexture);
+                page.Dispose();
+            }
+            _stablePages.Clear();
+        }
+    }
+
     // Private methods: shelf packing.
 
     bool TryAllocate(int glyphWidth, int glyphHeight, out int x, out int y)
@@ -312,7 +404,8 @@ internal sealed class GlyphAtlasManager<TTexture> : IDisposable
         x = 0;
         y = 0;
 
-        if (glyphWidth <= 0 || glyphHeight <= 0)
+        if (glyphWidth <= 0 || glyphHeight <= 0
+            || glyphWidth + 2 * _padding > _atlasWidth || glyphHeight + 2 * _padding > _atlasHeight)
             return false;
 
         // Line-wrap detection.

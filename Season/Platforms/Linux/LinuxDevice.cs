@@ -86,20 +86,27 @@ internal class LinuxDeviceCore : IDeviceCore
 
 internal class LinuxMediaPlayer : IMediaPlayer
 {
+    // Guards the legacy mplayer fallback state only; LinuxAudioPlayer keeps its own
+    // synchronization and the two locks never nest.
+    readonly object _legacySync = new();
+
+    System.Diagnostics.Process musicPlayer = null;
+
     public bool IsPlaying
     {
         get
         {
-            if (musicPlayer != null)
+            if (LinuxAudioPlayer.IsPlaying)
             {
                 return true;
             }
 
-            return false;
+            lock (_legacySync)
+            {
+                return LegacyMusicAlive();
+            }
         }
     }
-
-    System.Diagnostics.Process musicPlayer = null;
 
     // Raw source path last handed to the music channel by PlayMedia. The sound channel
     // runs as an untracked short-lived process, so IsPlayingFile resolves music only.
@@ -107,60 +114,154 @@ internal class LinuxMediaPlayer : IMediaPlayer
 
     public bool IsPlayingFile(string fileName)
     {
-        // mplayer runs as a child process; HasExited tells whether it is still playing.
-        return musicPlayer != null && !musicPlayer.HasExited && MediaPlayerFiles.IsSame(CurrentMusicFile, fileName);
+        fileName = NormalizePath(fileName);
+
+        if (LinuxAudioPlayer.IsPlayingFile(fileName))
+        {
+            return true;
+        }
+
+        lock (_legacySync)
+        {
+            // mplayer runs as a child process; HasExited tells whether it is still playing.
+            return LegacyMusicAlive() && MediaPlayerFiles.IsSame(CurrentMusicFile, fileName);
+        }
     }
 
     public void PlayMedia(string type, string id, string vol)
     {
+        int volume = ParseVolume(vol);
+
+        id = NormalizePath(id);
+
         new Task(() =>
+        {
+            // Preferred path: in-process decode + SDL3 output, so no external player
+            // has to be installed and volume/pause control actually works. Returns
+            // false when the SDL audio stack or the decoder cannot serve this file.
+            if (LinuxAudioPlayer.TryPlay(type, id, volume))
+            {
+                if (type is "Music")
+                {
+                    // Tear down a leftover mplayer from an earlier fallback so the two
+                    // backends never play at once.
+                    KillLegacyMusic();
+                }
+
+                return;
+            }
+
+            if (type is "Music")
+            {
+                // The child process cannot adjust the managed stream; stop managed
+                // music so the fallback is not layered on top of it.
+                LinuxAudioPlayer.StopMusic();
+            }
+
+            PlayLegacy(type, id, vol);
+        }).Start();
+    }
+
+    static int ParseVolume(string vol)
+    {
+        return int.TryParse(vol, NumberStyles.Integer, CultureInfo.InvariantCulture, out int volume)
+            ? Math.Clamp(volume, 0, 100)
+            : 100;
+    }
+
+    /// <summary>
+    /// Game code written for XNA on Windows hands over Windows-style separators
+    /// (e.g. "Sound\Move.wav"); on Linux a backslash is a regular file-name
+    /// character, so paths must be normalized before lookup and matching.
+    /// </summary>
+    static string NormalizePath(string path) => path?.Replace('\\', '/')!;
+
+    /// <summary>
+    /// Legacy mplayer child-process playback, kept as the fallback for systems where
+    /// the SDL audio stack or the managed decoders are unavailable.
+    /// </summary>
+    void PlayLegacy(string type, string id, string vol)
+    {
+        var startInfo = new System.Diagnostics.ProcessStartInfo("mplayer", new string[] { "-volume", vol, id });
+        startInfo.UseShellExecute = false;
+        startInfo.CreateNoWindow = true;
+        startInfo.RedirectStandardOutput = true;
+        startInfo.RedirectStandardError = true;
+
+        try
         {
             if (type is "Music")
             {
-                if (musicPlayer != null)
+                lock (_legacySync)
                 {
-                    musicPlayer.Kill();
+                    KillLegacyMusicLocked();
+
+                    CurrentMusicFile = id;
+
+                    musicPlayer = System.Diagnostics.Process.Start(startInfo);
                 }
-                var startInfo = new System.Diagnostics.ProcessStartInfo("mplayer", new string[] { "-volume", vol, id });
-                startInfo.UseShellExecute = false;
-                startInfo.CreateNoWindow = true;
-                startInfo.RedirectStandardOutput = true;
-                startInfo.RedirectStandardError = true;
-
-                CurrentMusicFile = id;
-
-                musicPlayer = System.Diagnostics.Process.Start(startInfo);
-
-                musicPlayer.WaitForExit();
             }
             else
             {
-                var startInfo = new System.Diagnostics.ProcessStartInfo("mplayer", new string[] { "-volume", vol, id });
-                startInfo.UseShellExecute = false;
-                startInfo.CreateNoWindow = true;
-                startInfo.RedirectStandardOutput = true;
-                startInfo.RedirectStandardError = true;
-
-                var soundPlayer = System.Diagnostics.Process.Start(startInfo);
-
-                soundPlayer.WaitForExit();
+                System.Diagnostics.Process.Start(startInfo);
             }
-        }).Start();
+        }
+        catch (Exception ex)
+        {
+            // Thrown when mplayer is not installed; log it instead of surfacing an
+            // unobserved task exception.
+            DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [LinuxMediaPlayer] mplayer fallback failed: {ex.Message}");
+        }
+    }
+
+    bool LegacyMusicAlive()
+    {
+        try
+        {
+            return musicPlayer != null && !musicPlayer.HasExited;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    void KillLegacyMusic()
+    {
+        lock (_legacySync)
+        {
+            KillLegacyMusicLocked();
+        }
+    }
+
+    void KillLegacyMusicLocked()
+    {
+        try
+        {
+            if (musicPlayer != null && !musicPlayer.HasExited)
+            {
+                musicPlayer.Kill();
+            }
+        }
+        catch (Exception)
+        {
+            // The process may have exited between the check and the kill.
+        }
     }
 
     public void SetVolume(int music, int sound)
     {
-
+        LinuxAudioPlayer.SetVolume(music, sound);
     }
 
     public void Pause()
     {
-
+        LinuxAudioPlayer.Pause();
     }
 
     public void Resume()
     {
-
+        LinuxAudioPlayer.Resume();
     }
 }
 

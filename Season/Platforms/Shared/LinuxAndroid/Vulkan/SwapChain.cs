@@ -41,6 +41,7 @@ internal unsafe sealed class SwapChain : IDisposable
     public Extent2D Extent { get; private set; }
 
     public PresentModeKHR PresentMode { get; private set; }
+    internal bool SupportsReadback { get; private set; }
 
     public Image[] Images { get; private set; } = [];
 
@@ -89,6 +90,7 @@ internal unsafe sealed class SwapChain : IDisposable
     {
         // 1) Query surface capabilities.
         _surfaceExt.GetPhysicalDeviceSurfaceCapabilities(_physical, _surface, out var caps);
+        SupportsReadback = (caps.SupportedUsageFlags & ImageUsageFlags.TransferSrcBit) != 0;
 
         // 2) Choose the surface format, preferring BackBufferFormat plus SrgbNonlinear.
         var (chosenFormat, chosenSpace) = ChooseSurfaceFormat(BackBufferFormat);
@@ -117,7 +119,8 @@ internal unsafe sealed class SwapChain : IDisposable
             ImageColorSpace = ColorSpace,
             ImageExtent = Extent,
             ImageArrayLayers = 1,
-            ImageUsage = ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.TransferDstBit,
+            ImageUsage = ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.TransferDstBit |
+                (caps.SupportedUsageFlags & ImageUsageFlags.TransferSrcBit),
             // Force Identity so the compositor handles screen rotation.
             // If caps.CurrentTransform were used instead, for example Rotate90,
             // the engine would have to multiply the projection matrix by a rotation matrix in shader code,
@@ -215,17 +218,23 @@ internal unsafe sealed class SwapChain : IDisposable
         fixed (SurfaceFormatKHR* p = formats)
             _surfaceExt.GetPhysicalDeviceSurfaceFormats(_physical, _surface, ref count, p);
 
+        if (formats.Length == 1 && formats[0].Format == Format.Undefined &&
+            formats[0].ColorSpace == ColorSpaceKHR.SpaceSrgbNonlinearKhr)
+            return (preferred, formats[0].ColorSpace);
+
         // Preferred: match preferred plus SrgbNonlinear.
         for (int i = 0; i < count; i++)
             if (formats[i].Format == preferred && formats[i].ColorSpace == ColorSpaceKHR.SpaceSrgbNonlinearKhr)
                 return (formats[i].Format, formats[i].ColorSpace);
 
-        // Second choice: any Srgb suffix.
+        // Mobile surfaces commonly expose RGBA rather than BGRA. Keep the UNORM
+        // attachment contract instead of selecting an sRGB attachment by list order.
         for (int i = 0; i < count; i++)
-            if (formats[i].ColorSpace == ColorSpaceKHR.SpaceSrgbNonlinearKhr)
+            if ((formats[i].Format == Format.R8G8B8A8Unorm || formats[i].Format == Format.B8G8R8A8Unorm) &&
+                formats[i].ColorSpace == ColorSpaceKHR.SpaceSrgbNonlinearKhr)
                 return (formats[i].Format, formats[i].ColorSpace);
 
-        return (formats[0].Format, formats[0].ColorSpace);
+        throw new NotSupportedException("Season requires an RGBA8/BGRA8 UNORM surface with sRGB nonlinear presentation.");
     }
 
     PresentModeKHR ChoosePresentMode()

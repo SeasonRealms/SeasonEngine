@@ -32,8 +32,8 @@ internal class LinuxImageService : IImageService
             _ => throw new NotSupportedException($"Unsupported format: {imageFormat}")
         };
 
-        string[]? keys = null;
-        string[]? values = null;
+        string[] keys = [];
+        string[] values = [];
         if (imageFormat == Basic.ImageFormat.Jpeg)
         {
             keys = new[] { "quality" };
@@ -46,6 +46,9 @@ internal class LinuxImageService : IImageService
         var src = image.PixelSpan;
         int srcStride = image.Stride;
         int dstStride = pixbuf.Rowstride;
+        int rowBytes = checked(image.Width * 4);
+        if (srcStride < rowBytes || src.Length < (long)(image.Height - 1) * srcStride + rowBytes)
+            throw new ArgumentException("SaveImage requires complete RGBA8 rows.", nameof(image));
         fixed (byte* srcPtr = src)
         {
             byte* dstPtr = (byte*)pixbuf.Pixels;
@@ -54,8 +57,8 @@ internal class LinuxImageService : IImageService
                 System.Buffer.MemoryCopy(
                     srcPtr + y * srcStride,
                     dstPtr + y * dstStride,
-                    srcStride,
-                    srcStride);
+                    dstStride,
+                    rowBytes);
             }
         }
 

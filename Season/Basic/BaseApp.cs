@@ -24,6 +24,15 @@ public abstract class BaseApp : Panel
 
     public Vector2 DesignResolution { get; set; } = new Vector2(1280, 720);
 
+    /// <summary>Instant 2D logic canvas and input inverse transformation; Its commands are managed uniformly by the frame scheduler.</summary>
+    public Draw2D Canvas2D { get; } = new();
+
+    /// <summary>
+    /// It is called once after each frame update, and only commands are recorded. Image resources should be preloaded, and text should be located based on the baseline provided by the caller.
+    /// Commands are executed as a complete layer at the end of the Overlay, not participating in control tree sorting; do not call BeginFrame/EndFrame here.
+    /// </summary>
+    public virtual void Draw2D(Draw2D canvas) { }
+
     public Vector2 BasicResolution { get; set; } = new Vector2(1280, 720);
 
     public Vector2 ExtendResolution { get; set; } = new Vector2(1280, 720);

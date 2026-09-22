@@ -12,6 +12,9 @@ public class Graphics
 
 public interface IGraphics
 {
+    /// <summary>Native real-time 2D backend; Null clearly indicates that the current platform does not support it.</summary>
+    IImmediate2DBackend? Immediate2D => null;
+
     void Init();
 
     Task<bool> LoadSprite2D(Sprite2D sprite);

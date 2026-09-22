@@ -411,7 +411,7 @@ internal class AppleImageService : IImageService
 
         return new CGImage(
             width, height, 8, 32, stride,
-            cs, CGImageAlphaInfo.PremultipliedLast,
+            cs, CGImageAlphaInfo.Last,
             provider, null, false, CGColorRenderingIntent.Default);
     }
 
@@ -466,6 +466,7 @@ internal sealed class iOSImageDecoder : INativeImageDecoder
 
             ctx.DrawImage(new CGRect(0, 0, Width, Height), cg);
         }
+        AppleRgba.Unpremultiply(_pixels);
     }
 
     [DebuggerBrowsable(DebuggerBrowsableState.Never)]

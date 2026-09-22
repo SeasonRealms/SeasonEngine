@@ -280,6 +280,16 @@ internal class AppleMediaPlayer : IMediaPlayer
             CurrentSoundFile = id;
         }
 
+        // Callers follow the Windows convention: resource names may embed backslashes
+        // (e.g. "Sound\Move.wav", a literal file-name character on Apple systems) and paths
+        // are assembled from AppContext.BaseDirectory, which on Mac Catalyst is the
+        // MonoBundle directory while assets live in the sibling Resources directory.
+        // Normalize separators and resolve through the platform core — the same reroot
+        // LoadFile/LoadFileExists use — so AVPlayer never points at a nonexistent file and
+        // stays silent. Android's SetMediaSource performs the equivalent normalization for
+        // APK assets; the Web player resolves through WebApp.ResolveAssetPath.
+        id = DeviceServices.Core.LoadFilePath(id.Replace('\\', '/')) ?? id;
+
         id = new NSString(id).CreateStringByAddingPercentEscapes(NSStringEncoding.UTF8);
 
         var url = AVAsset.FromUrl(new NSUrl("file://" + id));

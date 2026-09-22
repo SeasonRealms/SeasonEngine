@@ -24,7 +24,7 @@ namespace Season.Platforms.Shared.Apple;
 ///
 /// Dictionary and lock usage follows the shared blueprint exactly, preserving identical behavior.
 /// </summary>
-internal unsafe class Graphics : IGraphics
+internal unsafe partial class Graphics : IGraphics
 {
     readonly GlyphAtlasManager<MTLTexture> _glyphAtlas = new(
         2048, 2048,

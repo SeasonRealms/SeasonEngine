@@ -88,7 +88,8 @@ internal sealed class Texture : IDisposable
         _mipPolicy = mipPolicy;
 
         Image = Device.ResourceManager.CreateTexture2D((int)Width, (int)Height, Format, MipLevels);
-        Device.TextureUploadBatch.AddTextureUpload(this);
+        try { Device.TextureUploadBatch.AddTextureUpload(this); }
+        catch { Dispose(); throw; }
     }
 
     internal Texture(INativeImageDecoder imageResult, TextureMipPolicy mipPolicy = TextureMipPolicy.None)
@@ -116,7 +117,7 @@ internal sealed class Texture : IDisposable
             imageResult = ImageUtils.GetImageFromStream(stream, null);
         }
 
-        ProcessImageResult(imageResult, mipPolicy);
+        using (imageResult) ProcessImageResult(imageResult, mipPolicy);
     }
 
     internal static Texture GetOrCreate(string name, SharpGLTF.Schema2.Image? image,
@@ -176,8 +177,8 @@ internal sealed class Texture : IDisposable
             System.Runtime.InteropServices.Marshal.Copy(pixels, 0, staging.Contents, stagingSize);
 
             // Blit copy
-            var cmd = Device.GraphicsQueue.CreateCommandBuffer();
-            var blit = cmd.CreateBlitCommandEncoder(new MTLBlitPassDescriptor())
+            using var cmd = Device.GraphicsQueue.CreateCommandBuffer();
+            using var blit = cmd.CreateBlitCommandEncoder(new MTLBlitPassDescriptor())
                 ?? throw new Exception("CreateBlitCommandEncoder failed");
 
             // One CopyFromBuffer per subresource; this degenerates to the pre-2-6 single copy when MipLevels is 1.
@@ -200,7 +201,7 @@ internal sealed class Texture : IDisposable
 
             blit.EndEncoding();
             cmd.Commit();
-            cmd.WaitUntilCompleted();
+            Device.WaitForCompletion(cmd);
         }
         finally
         {
@@ -217,7 +218,8 @@ internal sealed class Texture : IDisposable
         }
 
         var key = string.IsNullOrEmpty(_cacheKey) ? Name : _cacheKey;
-        if (!string.IsNullOrEmpty(key))
+        if (!string.IsNullOrEmpty(key) &&
+            Device.DictionaryTexture.TryGetValue(key, out var current) && ReferenceEquals(current, this))
             Device.DictionaryTexture.Remove(key);
     }
 
@@ -308,8 +310,8 @@ internal sealed class Texture : IDisposable
             // Copy the full atlas pixel buffer into the staging buffer.
             System.Runtime.InteropServices.Marshal.Copy(rgbaPixels, 0, staging.Contents, expectedSize);
 
-            var cmd = Device.GraphicsQueue.CreateCommandBuffer();
-            var blit = cmd.CreateBlitCommandEncoder(new MTLBlitPassDescriptor())
+            using var cmd = Device.GraphicsQueue.CreateCommandBuffer();
+            using var blit = cmd.CreateBlitCommandEncoder(new MTLBlitPassDescriptor())
                 ?? throw new Exception("CreateBlitCommandEncoder failed");
 
             nuint bytesPerRow = (nuint)(sourceWidth * 4);
@@ -333,7 +335,7 @@ internal sealed class Texture : IDisposable
 
             blit.EndEncoding();
             cmd.Commit();
-            cmd.WaitUntilCompleted();
+            Device.WaitForCompletion(cmd);
         }
         finally
         {

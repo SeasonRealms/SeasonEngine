@@ -7,7 +7,7 @@ using Silk.NET.Direct3D12;
 
 namespace Season.Platforms.Windows;
 
-internal unsafe class Graphics : IGraphics
+internal unsafe partial class Graphics : IGraphics
 {
     // ── Text GPU Instancing: lightweight ITextureHolder (no GPU resources) ──
     internal sealed class TextGlyphHolder : ITextureHolder

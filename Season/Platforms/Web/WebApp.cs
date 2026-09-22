@@ -25,6 +25,18 @@ public static class WebApp
     static HttpClient _httpClient;
     static string _assetBasePath = string.Empty;
     static readonly TimeSpan _controlLoadBudgetPerFrame = TimeSpan.FromMilliseconds(3);
+    static bool _hostActive;
+    static TaskCompletionSource _stopSignal = new();
+
+    /// <summary>
+    /// Diagnostic sink for the browser console. DeviceServices.BaseApp.AddLog only keeps an
+    /// in-memory list, so a crash after startup is otherwise invisible in devtools. All hosts
+    /// (game pages) benefit; keep the output low-volume — lifecycle milestones and fatal errors only.
+    /// </summary>
+    internal static void LogToConsole(string message)
+    {
+        try { _jsRuntime?.InvokeVoid("console.log", message); } catch { }
+    }
 
     /// <summary>
     /// Step 2 switch: render Scene into offscreen SceneColor and then present through FinalBlit.
@@ -40,8 +52,15 @@ public static class WebApp
     /// <summary>
     /// Called from a Blazor component with the current JSRuntime and canvas element ID.
     /// </summary>
-    public static async Task Run(BaseApp app, IJSRuntime jsRuntime, HttpClient httpClient, string canvasId = "season-canvas", string? assetBasePath = null)
+    public static async Task Run(BaseApp app, IJSRuntime jsRuntime, HttpClient httpClient, string canvasId = "season-canvas", string? assetBasePath = null,
+        Func<Task>? preload = null)
     {
+        if (_hostActive) throw new InvalidOperationException("A Web host is already running.");
+        _hostActive = true;
+        _running = true;
+        _stopSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        _graphics = null!;
+        var errors = new List<Exception>();
         try
         {
             _jsRuntime = (IJSInProcessRuntime)jsRuntime;
@@ -64,24 +83,44 @@ public static class WebApp
                 windowsFeatures: null,
                 keyboard: new WebKeyboardService()
             );
+
+            // Immediate-2D compatibility mode (Season.Rendering.Immediate2DMode):
+            // the app renders exclusively through the immediate 2D backend, so everything the 3D path
+            // would need is skipped below - no offscreen targets, no effect registration, and the
+            // quality tier is never adjusted. The decision is read once here and is final for the
+            // session: the mode is one-way, so the skipped resources are simply never created.
+            // Unlike DX/VK there is no C#-side PSO bake to skip on this platform; JS initialize still
+            // runs because it also owns the device, canvas, glyph upload path and the Overlay family
+            // the immediate path submits through.
+            bool immediate2D = Season.Rendering.Immediate2DMode.Enabled;
+
+            // Freeze the decision: flipping it after this point would leave the frame schedule pointing
+            // at resources that were never created, so the setter rejects any later change.
+            Season.Rendering.Immediate2DMode.Freeze();
+
+            // One-shot mode report: the web console session needs to tell which path the frame takes
+            // (the tier values finalized below stay inert in this mode).
+            LogToConsole($"[WebApp] immediate2D={immediate2D}");
             
             // Finalize the HDR tier (1-4 Step A, mirroring WindowsApp/LinuxApp): the HDR chain depends on
             // offscreen SceneColor, so direct backbuffer rendering must fall back to LDR.
             // This must be decided before InitializeAsync because WebGPU injects WGSL variants and bakes the
             // main pipeline inside JS initialize, earlier than on the other platforms.
-            Graphics.HdrSceneColor = UseOffscreenSceneColor && RenderQuality.Current.HdrSceneColor;
+            Graphics.HdrSceneColor = !immediate2D && UseOffscreenSceneColor && RenderQuality.Current.HdrSceneColor;
 
             // 2-1 Contract Clause 5: finalize the AA tier at initialization time
             // (single-choice and mutually exclusive; fall back with a log when unsupported, with zero runtime branching).
             // Msaa4x is a legacy D3D12 tier and becomes Fxaa here because this backend has no MSAA offscreen chain.
             // Fxaa depends on the HDR offscreen chain because the Post uber pass is the tonemap convergence point.
             // If that is unavailable, fall back to Off. Mirrors LinuxApp.
-            if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
+            // The whole tier normalization is skipped in immediate-2D mode: no AA path exists to
+            // configure, and the values stay unused because no pass ever consults them.
+            if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
             {
                 RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Fxaa;
                 DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] AaMode.Msaa4x is supported only on D3D12; falling back to Fxaa");
             }
-            if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa)
+            if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa)
             {
                 // 2-3 Contract Clause 1: selecting Taa forces the velocity infrastructure to be enabled,
                 // because TAA is invalid without velocity.
@@ -101,7 +140,7 @@ public static class WebApp
                     DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] Taa depends on the HDR offscreen chain (currently disabled); falling back to Fxaa while keeping MotionVectors enabled");
                 }
             }
-            if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa && !Graphics.HdrSceneColor)
+            if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa && !Graphics.HdrSceneColor)
             {
                 RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Off;
                 DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] Fxaa depends on the HDR offscreen chain (currently disabled); falling back to Off");
@@ -116,7 +155,7 @@ public static class WebApp
             Season.Basic.Graphics.Instance = _graphics;
 
             // Offscreen SceneColor (Step 2): when non-null, FrameSchedule automatically appends a FinalBlit pass for presentation.
-            if (UseOffscreenSceneColor)
+            if (!immediate2D && UseOffscreenSceneColor)
             {
                 Season.Rendering.FrameSchedule.SceneColor = _graphics.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
                 {
@@ -141,7 +180,8 @@ public static class WebApp
             // of FXAA; RenderPostPass forwards SceneColorOverride, and the Post pass runs after the AfterScene
             // phase, so it reads the resolve output of the current frame rather than SceneColor.
             // In tiers that ask for neither, both stay null so the chain leaves no residue. Mirrors LinuxApp.
-            if ((RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
+            if (!immediate2D
+                && (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
                     || (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa
                         && RenderQuality.Current.TaaSharpness > 0f))
                 && Season.Rendering.FrameSchedule.SceneColor != null)
@@ -160,7 +200,7 @@ public static class WebApp
             // ShadowMap + RenderShadow are registered as a pair to activate the Shadow pass
             // in FrameSchedule.Execute before Scene.
             // The atlas name is also registered on the JS side so binding 11 of the main-pass bind group can resolve it.
-            if (RenderQuality.Current.ShadowsEnabled)
+            if (!immediate2D && RenderQuality.Current.ShadowsEnabled)
             {
                 var shadowRt = _graphics.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
                 {
@@ -181,18 +221,19 @@ public static class WebApp
             // Once finalized, create SceneDepth as a full-size depth-only target.
             // MatchBackbufferSize maps to JS formatKind 3 = depth24plus so the dual-target Scene pass can rebind it.
             // Mirrors WindowsApp.
-            if (RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off && !Graphics.HdrSceneColor)
+            if (!immediate2D && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off && !Graphics.HdrSceneColor)
             {
                 RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
                 DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] AO depends on the HDR offscreen chain (currently disabled); falling back to Off");
             }
-            if (RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off
+            if (!immediate2D
+                && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off
                 && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
             {
                 RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
                 DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] AO is incompatible with Msaa4x (MSAA depth cannot be used as compute input); falling back to Off");
             }
-            if (RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off)
+            if (!immediate2D && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off)
             {
                 Season.Rendering.FrameSchedule.SceneDepth = _graphics.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
                 {
@@ -209,7 +250,7 @@ public static class WebApp
             // When MotionVectors is disabled, keep it null so PassDesc.VelocityTarget also becomes null and the
             // chain leaves no residue. Mirrors WindowsApp/LinuxApp.
             // This must be ready before BaseApp.Create, where the app registers VelocityViewEffect.
-            if (RenderQuality.Current.MotionVectors)
+            if (!immediate2D && RenderQuality.Current.MotionVectors)
             {
                 Season.Rendering.FrameSchedule.SceneVelocity = _graphics.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
                 {
@@ -224,7 +265,7 @@ public static class WebApp
             // (clause 10). Mirrors WindowsApp/LinuxApp/AndroidApp/AppDelegate. SampleCount 1 needs no guard
             // here for a different reason than on D3D12: this backend has no MSAA offscreen chain at all and
             // rewrote Msaa4x to Fxaa during tier finalization, so a multisampled scene is unreachable.
-            if (RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
+            if (!immediate2D && RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
             {
                 Season.Rendering.FrameSchedule.SceneDepth = _graphics.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
                 {
@@ -252,16 +293,42 @@ public static class WebApp
 
             DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [WebApp.Run] ApplyResolution => DeviceResolution={app.DeviceResolution}, Scale={app.Scale}");
 
-            DeviceServices.BaseApp.Create();
-
-            _running = true;
-
-            await StartRenderLoop();
+            if (preload != null)
+            {
+                LogToConsole("[WebApp] preload start");
+                await preload();
+                LogToConsole("[WebApp] preload done");
+            }
+            if (_running)
+            {
+                LogToConsole("[WebApp] BaseApp.Create + StartRenderLoop");
+                DeviceServices.BaseApp.Create();
+                await StartRenderLoop();
+                LogToConsole("[WebApp] render loop exited");
+            }
         }
         catch (Exception ex)
         {
+            LogToConsole($"[WebApp] Fatal error: {ex}");
             DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [WebApp] Fatal error: {ex}");
+            errors.Add(ex);
         }
+        finally
+        {
+            _running = false;
+            LogToConsole("[WebApp] disposing");
+            try
+            {
+                try { app.Dispose(); } catch (Exception ex) { errors.Add(ex); }
+                try { if (_graphics != null) await _graphics.DisposeImmediateAsync(); }
+                catch (Exception ex) { errors.Add(ex); }
+                try { app.DisposeSaveSettingsRequest(); } catch (Exception ex) { errors.Add(ex); }
+            }
+            finally { _hostActive = false; }
+            LogToConsole("[WebApp] disposed");
+        }
+        if (errors.Count == 1) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(errors[0]).Throw();
+        if (errors.Count > 1) throw new AggregateException(errors);
     }
 
     /// <summary>
@@ -272,6 +339,7 @@ public static class WebApp
     /// </summary>
     static async Task StartRenderLoop()
     {
+        LogToConsole("[WebApp] StartRenderLoop entered");
         var stopWatch = System.Diagnostics.Stopwatch.StartNew();
         double previousSeconds = 0;
         double excludedTailSeconds = 0;
@@ -288,13 +356,15 @@ public static class WebApp
             // Wait for the next vsync through rAF. [JSImport] marshals Task<double> directly from a JS Promise without a JSON layer.
             try
             {
-                await WebGPUInterop.RequestFrame();
+                var nextFrame = WebGPUInterop.RequestFrame();
+                if (await Task.WhenAny(nextFrame, _stopSignal.Task) == _stopSignal.Task) break;
+                await nextFrame;
+                if (!_running) break;
             }
             catch (Exception ex)
             {
                 DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [WebApp] requestFrame error: {ex}");
-                await Task.Delay(16);
-                continue;
+                throw;
             }
 
             try
@@ -329,10 +399,16 @@ public static class WebApp
                 // Update the 3D camera (same semantics as DXPrimitiveGroup.Update, and it must run before BaseApp.Update).
                 // 1-2: switch to passing EffectiveSceneLights
                 // (dual-track UseSceneLights ? SceneLights : FromLegacy, with zero required changes for old apps).
-                Graphics.UpdateCamera3D(app.CameraPos, app.CameraTarget, app.EffectiveSceneLights);
+                // Skipped in immediate-2D mode, where the 3D camera/lighting UBO is never consumed because
+                // the pass chain reduces to the Overlay pass only.
+                if (!Season.Rendering.Immediate2DMode.Enabled)
+                {
+                    Graphics.UpdateCamera3D(app.CameraPos, app.CameraTarget, app.EffectiveSceneLights);
+                }
 
                 // Update logic
                 app.Update(elapsed);
+                if (app.Status != null) break;
 
                 // Begin frame: clear the frame using BaseApp's current background color.
                 var backgroundColor = app.BackgroundColor;
@@ -371,6 +447,7 @@ public static class WebApp
             catch (Exception ex)
             {
                 DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [WebApp] Render loop error: {ex}");
+                throw;
             }
         }
     }
@@ -381,6 +458,7 @@ public static class WebApp
     public static void Stop()
     {
         _running = false;
+        _stopSignal.TrySetResult();
     }
 
     static string NormalizeAssetBasePath(string? assetBasePath)

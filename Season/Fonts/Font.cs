@@ -110,6 +110,9 @@ public class Font
     public FontMetrics FontMetrics;
     readonly string _fileName;
     readonly byte[] _fontBytes;
+    // Metrics belong to font instances and cannot share the results of different fonts using global font size/code point keys.
+    readonly System.Collections.Concurrent.ConcurrentDictionary<(int FontSize, int CodePoint), GlyphMetrics> _layoutMetrics = new();
+    readonly object _rasterizeSync = new();
 
     // ═══════════════════════════════════════════════════════════════
     // Performance optimization level 2 - Shape cache + simplified coloring (2026-07-12)
@@ -166,7 +169,7 @@ public class Font
     {
     }
 
-    Font(string fileName, byte[] fontBytes, float size)
+    internal Font(string fileName, byte[] fontBytes, float size)
     {
         _fileName = fileName;
         _fontBytes = fontBytes;
@@ -212,7 +215,7 @@ public class Font
             return false;
 
         var cacheKey = (fontSize, codePoint);
-        if (DictionaryFontGlyphLayoutMetrics.TryGetValue(cacheKey, out glyphMetrics))
+        if (_layoutMetrics.TryGetValue(cacheKey, out glyphMetrics))
             return true;
 
         try
@@ -242,7 +245,7 @@ public class Font
             glyphMetrics.X1 = x1;
             glyphMetrics.Y1 = y1;
 
-            DictionaryFontGlyphLayoutMetrics[cacheKey] = glyphMetrics;
+            _layoutMetrics[cacheKey] = glyphMetrics;
             return glyphMetrics.AdvanceWidth > 0f || glyphMetrics.Width > 0 || glyphMetrics.Height > 0;
         }
         catch
@@ -253,6 +256,13 @@ public class Font
     }
 
     public (byte[] colorBuffer, GlyphMetrics glyphMetrics, float pixelRange, int textureWidth, int textureHeight) CreateMsdfGlyph(int fontSize, int codePoint)
+    {
+        // The backend loading of the control and the instant frame may request the same font simultaneously; Shape cache and rasterizer cannot be modified concurrently.
+        lock (_rasterizeSync)
+            return CreateMsdfGlyphCore(fontSize, codePoint);
+    }
+
+    (byte[] colorBuffer, GlyphMetrics glyphMetrics, float pixelRange, int textureWidth, int textureHeight) CreateMsdfGlyphCore(int fontSize, int codePoint)
     {
         const float angleThreshold = 3f;
         const int effectAmount = 1;

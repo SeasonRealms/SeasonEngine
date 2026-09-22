@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 // https://github.com/SeasonRealms/SeasonEngine
 
+/*
+
 using Android.Gms.Ads;
 using Android.Gms.Ads.AdManager;
 using Android.Gms.Ads.Interstitial;
@@ -608,3 +610,4 @@ public abstract class RewardedInterstitialAdLoadCallback : global::Android.Gms.A
 
     }
 }
+*/

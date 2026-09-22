@@ -690,6 +690,7 @@ window.seasonWebGPU = (() => {
     // The parameter is declared so the positional slot is visible rather than silently dropped, which is what let the
     // trailing maxAnisotropy argument be added safely behind it.
     async function initialize(canvasId, shaderSource, blitShaderSource, hdrSceneColor, shadowDepthBias, shadowSlopeBias, velocityOutput, overlayShaderSource, maxAnisotropy = 1) {
+        if (_device) throw new Error('Reload the page before starting a second WebGPU host');
         _mesh3DShader = shaderSource;
         _blitShaderWGSL = blitShaderSource;
         // 1-5 contract 4:
@@ -756,6 +757,7 @@ window.seasonWebGPU = (() => {
             device: _device,
             format: _format,
             alphaMode: 'premultiplied',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
         });
 
         // 2-6 clause 5: mipmapFilter defaults to 'nearest' in WebGPU, which would snap between levels at the LOD
@@ -947,9 +949,10 @@ window.seasonWebGPU = (() => {
         if (_textures[name]) return _getTextureResult(name, true);
         try {
             const response = await fetch(imageUrl);
+            if (!response.ok) throw new Error(`HTTP ${response.status}: ${imageUrl}`);
             const blob = await response.blob();
             if (deferDecodeToNextFrame) await _waitNextAnimationFrame();
-            const bitmap = await createImageBitmap(blob);
+            const bitmap = await createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
             const result = _createTextureFromExternalSource(name, bitmap, bitmap.width, bitmap.height);
             bitmap.close();
             return result;
@@ -2330,6 +2333,7 @@ window.seasonWebGPU = (() => {
     // Clear color is supplied by beginPass.
     // Parameters remain here only for compatibility with the C# IGraphics.BeginFrame signature.
     function beginFrame(clearR, clearG, clearB, clearA) {
+        if (_immediateClosed || _instancedDiag.deviceLost) throw new Error('WebGPU host closed or device lost');
         if (!_context || !_device) return;
         if (_debugLog) _fpsFrameStartMs = performance.now();
 
@@ -3797,8 +3801,36 @@ window.seasonWebGPU = (() => {
         // Defensive handling for an unmatched EndPass
         // normal paths should already have closed the pass via endPass
         if (_passEncoder) { _passEncoder.end(); _passEncoder = null; }
+        let readback = null;
+        const capture = _nextCapture;
+        _nextCapture = null;
+        if (capture) {
+            const width = _canvas.width, height = _canvas.height;
+            const stride = Math.ceil(width * 4 / 256) * 256;
+            readback = _device.createBuffer({ size: stride * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+            _commandEncoder.copyTextureToBuffer({ texture: _context.getCurrentTexture() },
+                { buffer: readback, bytesPerRow: stride, rowsPerImage: height }, [width, height]);
+            capture.width = width; capture.height = height; capture.stride = stride;
+        }
         _device.queue.submit([_commandEncoder.finish()]);
+        if (readback) {
+            readback.mapAsync(GPUMapMode.READ).then(() => {
+                const raw = new Uint8Array(readback.getMappedRange());
+                const pixels = new Uint8Array(capture.width * capture.height * 4);
+                for (let y = 0; y < capture.height; y++)
+                    pixels.set(raw.subarray(y * capture.stride, y * capture.stride + capture.width * 4), y * capture.width * 4);
+                if (_format.startsWith('bgra')) {
+                    for (let i = 0; i < pixels.length; i += 4) [pixels[i], pixels[i + 2]] = [pixels[i + 2], pixels[i]];
+                }
+                readback.unmap(); readback.destroy();
+                // Explicit base64 avoids JSON arrays with millions of numeric elements.
+                let binary = '';
+                for (let i = 0; i < pixels.length; i += 8192) binary += String.fromCharCode(...pixels.subarray(i, i + 8192));
+                capture.resolve({ width: capture.width, height: capture.height, base64: btoa(binary) });
+            }).catch(error => { readback.destroy(); capture.reject(error); });
+        }
         _commandEncoder = null; _frameStarted = false;
+        _retireImmediateResources();
 
         if (_debugLog) {
             const now = performance.now(), frameMs = now - _fpsFrameStartMs;
@@ -3813,6 +3845,11 @@ window.seasonWebGPU = (() => {
 
     function resizeCanvas(width, height) {
         if (_canvas) { _canvas.width = width; _canvas.height = height; }
+    }
+
+    function requestCanvasResize(width, height) {
+        if (!(width > 0 && height > 0)) throw new Error('Invalid canvas size');
+        _resizeWidth = width; _resizeHeight = height; _needsResize = true;
     }
 
     function getCanvasSize() {
@@ -3843,7 +3880,131 @@ window.seasonWebGPU = (() => {
     function setDebugLog(enabled) { _debugLog = !!enabled; }
     function getInstancedDiagState() { return { ..._instancedDiag }; }
 
+    let _immediatePipeline, _immediateLayout, _immediateLinear, _immediatePoint;
+    let _nextCapture;
+    function captureNextFrame() {
+        if (_nextCapture) throw new Error('A capture is already pending');
+        return new Promise((resolve, reject) => { _nextCapture = { resolve, reject }; });
+    }
+    let _immediateDraws = [], _immediateGarbage = [];
+    let _immediateClosed = false;
+    let _immediateLiveBuffers = 0, _immediatePendingRetire = 0;
+    function initializeImmediate(source) {
+        if (_immediateClosed || _instancedDiag.deviceLost) throw new Error('Immediate device is closed/lost');
+        if (_immediatePipeline) return;
+        // D01-A writes target alpha independently; it is not a premultiplied page-compositing contract.
+        _context.configure({ device: _device, format: _format, alphaMode: 'opaque',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+        const module = _device.createShaderModule({ code: source, label: 'Season immediate 2D' });
+        _immediateLayout = _device.createBindGroupLayout({ entries: [
+            { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 112 } },
+            { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+            { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+            { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        ] });
+        _immediateLinear = _device.createSampler({ minFilter: 'linear', magFilter: 'linear' });
+        _immediatePoint = _device.createSampler({ minFilter: 'nearest', magFilter: 'nearest' });
+        _immediatePipeline = _device.createRenderPipeline({
+            layout: _device.createPipelineLayout({ bindGroupLayouts: [_immediateLayout] }),
+            vertex: { module, entryPoint: 'vs' },
+            fragment: { module, entryPoint: 'fs', targets: [{ format: _format, blend: {
+                color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                alpha: { srcFactor: 'one', dstFactor: 'zero', operation: 'add' }
+            } }] },
+            primitive: { topology: 'triangle-strip', cullMode: 'none' },
+            depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'always' }
+        });
+    }
+
+    function prepareImmediate(names, parameters) {
+        if (_passEncoder || !_frameStarted || _immediateClosed || _instancedDiag.deviceLost)
+            throw new Error('Immediate Prepare requires an active frame outside passes');
+        if (parameters.length !== names.length * 28) throw new Error('Invalid immediate parameter payload');
+        _immediateDraws = [];
+        if (!names.length) return;
+        const alignment = _device.limits.minUniformBufferOffsetAlignment;
+        const stride = Math.ceil(112 / alignment) * alignment;
+        const data = new Float32Array(names.length * stride / 4);
+        for (let i = 0; i < names.length; i++) data.set(parameters.slice(i * 28, i * 28 + 28), i * stride / 4);
+        const buffer = _device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        _immediateLiveBuffers++;
+        _immediateGarbage.push(() => { buffer.destroy(); _immediateLiveBuffers--; });
+        _device.queue.writeBuffer(buffer, 0, data);
+        const groups = new Map();
+        for (let i = 0; i < names.length; i++) {
+            const view = _textureViews[names[i]];
+            if (!view) throw new Error(`Immediate texture missing: ${names[i]}`);
+            let group = groups.get(view);
+            if (!group) {
+                group = _device.createBindGroup({ layout: _immediateLayout, entries: [
+                    { binding: 0, resource: { buffer, offset: 0, size: 112 } },
+                    { binding: 1, resource: view },
+                    { binding: 2, resource: _immediateLinear },
+                    { binding: 3, resource: _immediatePoint }
+                ] });
+                groups.set(view, group);
+            }
+            _immediateDraws.push({ group, offset: i * stride });
+        }
+    }
+
+    function submitImmediate() {
+        if (!_passEncoder || !_passOverlay || _immediateClosed) throw new Error('Immediate Submit requires Overlay');
+        _passEncoder.setPipeline(_immediatePipeline);
+        for (const draw of _immediateDraws) {
+            _passEncoder.setBindGroup(0, draw.group, [draw.offset]);
+            _passEncoder.draw(4);
+        }
+        _immediateDraws = [];
+    }
+
+    function retireTexture(name) {
+        const texture = _textures[name];
+        if (!texture) return;
+        // Remove the name now, but keep the captured object alive through encoding and submission.
+        delete _textures[name]; delete _textureViews[name]; delete _textureMeta[name];
+        _immediateGarbage.push(() => texture.destroy());
+        if (!_frameStarted) _retireImmediateResources();
+    }
+
+    function _retireImmediateResources() {
+        if (!_immediateGarbage.length) return;
+        const resources = _immediateGarbage.splice(0);
+        _immediatePendingRetire++;
+        const release = () => {
+            for (const dispose of resources) dispose();
+            _immediatePendingRetire--;
+        };
+        _device.queue.onSubmittedWorkDone().then(release, release);
+    }
+
+    function abortFrame() {
+        if (_nextCapture) { _nextCapture.reject(new Error('Frame aborted')); _nextCapture = null; }
+        if (_passEncoder) { _passEncoder.end(); _passEncoder = null; }
+        _commandEncoder = null; _frameStarted = false; _immediateDraws = [];
+        _retireImmediateResources();
+    }
+
+    async function closeImmediate() {
+        _immediateClosed = true;
+        abortFrame();
+        await _device.queue.onSubmittedWorkDone().catch(() => {});
+        _immediatePipeline = _immediateLayout = _immediateLinear = _immediatePoint = null;
+        // Legacy named atlas is host-owned; stable pages were already retired by C#.
+        retireTexture('TextAtlas');
+        await _device.queue.onSubmittedWorkDone().catch(() => {});
+    }
+
+    function getImmediateDiagnostics() {
+        return { closed: _immediateClosed, liveBuffers: _immediateLiveBuffers,
+            pendingRetire: _immediatePendingRetire, textures: Object.keys(_textures),
+            deviceLost: _instancedDiag.deviceLost, error: _instancedDiag.uncapturedError };
+    }
+
     return {
+        requestCanvasResize,
+        captureNextFrame,
+        initializeImmediate, prepareImmediate, submitImmediate, retireTexture, abortFrame, closeImmediate, getImmediateDiagnostics,
         initialize,
         loadTexture,
         uploadGlyphTexture,

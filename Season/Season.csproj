@@ -1,19 +1,20 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
-		<PackageId>SeasonEngine</PackageId>
-		<Version>0.2.0</Version>
-		<Authors>SeasonRealms</Authors>
-		<Description>A cross-platform C# graphics engine and application framework for building real-time 2D and 3D apps with a unified API</Description>
-		<Product>SeasonEngine</Product>
-		<Copyright>Copyright © 2026</Copyright>
-		<PackageReadmeFile>README.md</PackageReadmeFile>
-
 		<PackageProjectUrl>https://github.com/SeasonRealms/SeasonEngine</PackageProjectUrl>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
 		<RepositoryUrl>https://github.com/SeasonRealms/SeasonEngine</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		
+		<PackageId>SeasonEngine</PackageId>
+		<Version>0.2.0</Version>
+		<Authors>SeasonRealms</Authors>
+		<Description>A cross-platform C# graphics engine and application framework for building real-time 2D and 3D apps with a unified API</Description>
+		<Product>SeasonEngine</Product>
+		<Copyright>© 2026 SeasonRealms </Copyright>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<RootNamespace>Season</RootNamespace>
 
 		<IncludeSymbols>true</IncludeSymbols>
 		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
@@ -23,28 +24,27 @@
 		<Nullable>enable</Nullable>
 		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
 		<LangVersion>preview</LangVersion>
+		<DefaultLanguage>en-us</DefaultLanguage>
 
 		<TargetFrameworks>net10.0-android;net10.0-ios;net10.0-maccatalyst;net10.0;net10.0-browser</TargetFrameworks>
 		<TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net10.0-windows10.0.19041.0</TargetFrameworks>
 
-		<IsAndroid Condition="$(TargetFramework.Contains('android'))">true</IsAndroid>
-		<IsIOS Condition="$(TargetFramework.Contains('ios'))">true</IsIOS>
-		<IsMacCatalyst Condition="$(TargetFramework.Contains('maccatalyst'))">true</IsMacCatalyst>
 		<IsWindows Condition="$(TargetFramework.Contains('windows'))">true</IsWindows>
-
 		<IsLinux Condition="'$(TargetFramework)' == 'net10.0'">true</IsLinux>
+		<IsMacCatalyst Condition="$(TargetFramework.Contains('maccatalyst'))">true</IsMacCatalyst>
+		<IsIOS Condition="$(TargetFramework.Contains('ios'))">true</IsIOS>
+		<IsAndroid Condition="$(TargetFramework.Contains('android'))">true</IsAndroid>
 		<IsBrowser Condition="$(TargetFramework.Contains('browser'))">true</IsBrowser>
-		
 		<IsApple Condition="'$(IsIOS)' == 'true' or '$(IsMacCatalyst)' == 'true'">true</IsApple>
 		<IsUnixLike Condition="'$(IsAndroid)' == 'true' or '$(IsLinux)' == 'true'">true</IsUnixLike>
 
 		<UseMaui Condition="'$(IsBrowser)' != 'true' And '$(TargetFramework)' != 'net10.0'">true</UseMaui>
 
-		<SupportedOSPlatformVersion Condition="'$(IsIOS)' == 'true'">15.0</SupportedOSPlatformVersion>
-		<SupportedOSPlatformVersion Condition="'$(IsMacCatalyst)' == 'true'">15.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="'$(IsIOS)' == 'true'">17.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="'$(IsMacCatalyst)' == 'true'">17.0</SupportedOSPlatformVersion>
 		<SupportedOSPlatformVersion Condition="'$(IsAndroid)' == 'true'">33.0</SupportedOSPlatformVersion>
-		<SupportedOSPlatformVersion Condition="'$(IsWindows)' == 'true'">10.0.17763.0</SupportedOSPlatformVersion>
-		<TargetPlatformMinVersion Condition="'$(IsWindows)' == 'true'">10.0.17763.0</TargetPlatformMinVersion>
+		<SupportedOSPlatformVersion Condition="'$(IsWindows)' == 'true'">10.0.19041.0</SupportedOSPlatformVersion>
+		<TargetPlatformMinVersion Condition="'$(IsWindows)' == 'true'">10.0.19041.0</TargetPlatformMinVersion>
 
 		<DefineConstants Condition="'$(IsLinux)' == 'true'">$(DefineConstants);LINUX;</DefineConstants>
 		<DefineConstants Condition="'$(IsBrowser)' == 'true'">$(DefineConstants);BROWSER;</DefineConstants>
@@ -83,6 +83,7 @@
 
 	<ItemGroup Condition="'$(IsLinux)' == 'true'">
 		<PackageReference Include="GtkSharp" Version="3.24.24.117-develop" />
+		<PackageReference Include="NLayer" Version="3.0.0" />
 		<PackageReference Include="System.Drawing.Common" Version="10.0.9" />
 		<!-- Linux native assets (libSDL3.so, libglslang.so).
 		     Both are deployed to runtimes/linux-<arch>/native/ (canonical
@@ -128,9 +129,9 @@
 		<PackageReference Include="Xamarin.Android.Google.BillingClient">
 			<Version>8.0.0</Version>
 		</PackageReference>
-		<PackageReference Include="Xamarin.GooglePlayServices.Ads.Lite">
+		<!--<PackageReference Include="Xamarin.GooglePlayServices.Ads.Lite">
 			<Version>124.0.0.3</Version>
-		</PackageReference>
+		</PackageReference>-->
 	</ItemGroup>
 	
 	<ItemGroup Condition="'$(IsMacCatalyst)' == 'true'">
@@ -216,7 +217,6 @@
 		<ItemGroup Condition="'$(IsUnixLike)' != 'true'">
 			<Compile Remove="Platforms\Shared\LinuxAndroid\**\*.cs" />
 		</ItemGroup>
-
 	</Target>
 
 	<Target Name="IncludeWebFilesForBrowserTarget" BeforeTargets="BeforeCompile" Condition="'$(IsBrowser)' == 'true' or '$(TargetFramework)' == 'net10.0'">

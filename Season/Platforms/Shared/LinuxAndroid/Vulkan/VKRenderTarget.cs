@@ -215,6 +215,7 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
             }
         };
 
+        Display.FillColorDependencies(dependencies);
         var rpInfo = new RenderPassCreateInfo
         {
             SType = StructureType.RenderPassCreateInfo,
@@ -417,6 +418,7 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
             }
         };
 
+        Display.FillColorDependencies(dependencies);
         var rpInfo = new RenderPassCreateInfo
         {
             SType = StructureType.RenderPassCreateInfo,

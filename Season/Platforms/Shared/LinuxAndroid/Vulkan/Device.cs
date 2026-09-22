@@ -7,6 +7,7 @@ using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.EXT;
 using Silk.NET.Vulkan.Extensions.KHR;
+using Rect2D = Silk.NET.Vulkan.Rect2D;
 
 namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 
@@ -92,6 +93,12 @@ internal unsafe static class Device
 
     static bool _validationEnabled;
 
+    /// <summary>
+    /// Whether the Vulkan validation layer actually activated for this instance
+    /// (a requested-but-absent layer reports false). Read-only, for diagnostics.
+    /// </summary>
+    internal static bool ValidationEnabled => _validationEnabled;
+
     // ===== Common rendering parameters, aligned with DX =====
     internal static IntPtr WindowHandle;
 
@@ -101,7 +108,9 @@ internal unsafe static class Device
 
     internal static Vector4 BackgroundColor;
 
-    internal static Format BackBufferFormat = Format.B8G8R8A8Srgb;
+    // Like D3D12, LDR colors and FinalBlit's gamma output are already display encoded.
+    // An sRGB attachment would encode them again and change legacy overlay blending.
+    internal static Format BackBufferFormat = Format.B8G8R8A8Unorm;
 
     internal static Format DepthBufferFormat = Format.D32Sfloat;
 
@@ -440,6 +449,13 @@ internal unsafe static class Device
         Vk.GetPhysicalDeviceProperties(picked, out var pickedProps);
         SupportsSamplerAnisotropy = pickedFeatures.SamplerAnisotropy;
         MaxSamplerAnisotropy = SupportsSamplerAnisotropy ? pickedProps.Limits.MaxSamplerAnisotropy : 1f;
+        if (!pickedFeatures.IndependentBlend)
+        {
+            RenderQuality.Current.MotionVectors = false;
+            if (RenderQuality.Current.AntiAliasing == AaMode.Taa)
+                RenderQuality.Current.AntiAliasing = HdrSceneColor ? AaMode.Fxaa : AaMode.Off;
+            DeviceServices.BaseApp?.AddLog(LogType.Backend, "Vulkan independentBlend unavailable; velocity/TAA disabled.");
+        }
 
         FindQueueFamilies(picked);
     }
@@ -547,9 +563,11 @@ internal unsafe static class Device
         // unconditionally, which happens to work on every desktop and virtually every Android driver, but enabling an
         // unsupported feature makes vkCreateDevice fail outright - a hard startup failure in exchange for a filtering
         // refinement is the wrong trade, so the sampler degrades to isotropic instead.
+        Vk.GetPhysicalDeviceFeatures(PhysicalDevice, out var supportedFeatures);
         var features = new PhysicalDeviceFeatures
         {
-            SamplerAnisotropy = SupportsSamplerAnisotropy
+            SamplerAnisotropy = SupportsSamplerAnisotropy,
+            IndependentBlend = supportedFeatures.IndependentBlend
         };
 
         // Vulkan 1.2 feature:
@@ -751,20 +769,27 @@ internal unsafe static class Device
     /// </summary>
     internal static void CaptureBackBuffer()
     {
+        if (!SwapChain.SupportsReadback)
+        {
+            BaseApp.CaptureAppTcs?.TrySetException(new NotSupportedException("Surface does not support transfer-source readback."));
+            BaseApp.CaptureAppTcs = null;
+            return;
+        }
         var backbuffer = SwapChain.Images[SwapChain.CurrentImageIndex];
         if (backbuffer.Handle == 0) return;
 
         _captureWidth = SwapChain.Extent.Width;
         _captureHeight = SwapChain.Extent.Height;
 
-        // Create or reuse the staging buffer, using HostVisible plus HostCached for efficient CPU readback.
-        if (_captureStagingBuffer.Buffer.Handle == 0)
+        ulong totalBytes = (ulong)_captureWidth * _captureHeight * 4;
+        if (_captureStagingBuffer.Buffer.Handle == 0 || _captureStagingBuffer.Size < totalBytes)
         {
-            ulong totalBytes = _captureWidth * _captureHeight * 4;
+            if (_captureStagingBuffer.Buffer.Handle != 0)
+                ResourceManager.DestroyBuffer(_captureStagingBuffer);
             _captureStagingBuffer = ResourceManager.CreateBuffer(
                 totalBytes,
                 BufferUsageFlags.TransferDstBit,
-                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCachedBit);
+                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit);
         }
 
         // 1) Pipeline barrier：PresentSrcKHR → TransferSrcOptimal
@@ -867,23 +892,22 @@ internal unsafe static class Device
             Vk.DeviceWaitIdle(LogicalDevice);
 
             void* mappedData;
-            if (Vk.MapMemory(LogicalDevice, _captureStagingBuffer.Memory, 0, _captureStagingBuffer.Size, 0, &mappedData) != Result.Success)
-                return;
+            CheckResult(Vk.MapMemory(LogicalDevice, _captureStagingBuffer.Memory, 0, _captureStagingBuffer.Size, 0, &mappedData));
 
             int w = (int)_captureWidth;
             int h = (int)_captureHeight;
             byte[] pixels = new byte[w * h * 4];
 
-            // The Vulkan backbuffer format is B8G8R8A8Srgb, so readback data arrives in B, G, R, A byte order.
-            // NativeImageData expects RGBA8, so swap B and R here.
+            // Surface format can be BGRA on Linux or RGBA on Android.
+            bool bgra = BackBufferFormat is Format.B8G8R8A8Unorm or Format.B8G8R8A8Srgb;
             fixed (byte* pDst = pixels)
             {
                 byte* pSrc = (byte*)mappedData;
                 for (int i = 0; i < w * h; i++)
                 {
-                    pDst[i * 4 + 0] = pSrc[i * 4 + 2]; // R ← B
+                    pDst[i * 4 + 0] = pSrc[i * 4 + (bgra ? 2 : 0)];
                     pDst[i * 4 + 1] = pSrc[i * 4 + 1]; // G ← G
-                    pDst[i * 4 + 2] = pSrc[i * 4 + 0]; // B ← R
+                    pDst[i * 4 + 2] = pSrc[i * 4 + (bgra ? 0 : 2)];
                     pDst[i * 4 + 3] = pSrc[i * 4 + 3]; // A ← A
                 }
             }
@@ -1727,7 +1751,7 @@ internal unsafe static class Device
     {
         if (LogicalDevice.Handle != 0)
         {
-            Vk.DeviceWaitIdle(LogicalDevice);
+            CheckResult(Vk.DeviceWaitIdle(LogicalDevice));
             PumpDeferredReleases(force: true);
         }
 
@@ -1757,7 +1781,7 @@ internal unsafe static class Device
         WindowHandle = window;
 
         if (LogicalDevice.Handle != 0)
-            Vk.DeviceWaitIdle(LogicalDevice);
+            CheckResult(Vk.DeviceWaitIdle(LogicalDevice));
 
         // 1) Recreate VkSurfaceKHR. The old surface has already been destroyed in ReleaseSurfaceAndSwapChain.
         CreateSurface(createSurface);
@@ -1777,6 +1801,8 @@ internal unsafe static class Device
             preferredFrameCount: frameCount,
             preferredFormat: BackBufferFormat);
         SwapChain.Create(width, height, GraphicsQueueFamily, PresentQueueFamily);
+        if (SwapChain.BackBufferFormat != BackBufferFormat)
+            throw new NotSupportedException("Recreated surface changed its format; a full graphics device rebuild is required.");
         // Do not update frameCount.
         // FrameContexts, _fenceValues, and all per-frame N-buffered resources,
         // including Text and Sprite instance buffers,

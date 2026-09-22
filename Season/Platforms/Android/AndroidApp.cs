@@ -42,6 +42,10 @@ public static class AndroidApp
     static volatile bool _running;
 
     static volatile bool _initialized;
+    static volatile bool _paused;
+    static int _closed;
+    static bool _graphicsReady;
+    static readonly HostLifetime _lifetime = new();
 
     /// <summary>Used by MainActivity to determine whether initialization is happening for the first time, so Activity recreation during rotation can skip creating a new App instance.</summary>
     public static bool IsInitialized => _initialized;
@@ -72,6 +76,7 @@ public static class AndroidApp
     /// </summary>
     public static void Run(BaseApp app)
     {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _closed) != 0, typeof(AndroidApp));
         _keyboard = new AndroidKeyboardService();
 
         DeviceServices.Initialize(
@@ -86,7 +91,7 @@ public static class AndroidApp
             record: new AndroidRecordService(),
             download: new AndroidDownloadService(),
             store: new AndroidStoreService(),
-            ads: new AndroidAds(),
+            ads: null, //new AndroidAds(),
             windowsFeatures: null,
             keyboard: _keyboard
         );
@@ -126,10 +131,15 @@ public static class AndroidApp
             // Soft restart: rebuild VkSurfaceKHR, the SwapChain, and Display attachments
             // with the new ANativeWindow, then restart the render thread.
             // Reuse the existing Instance, Device, Pipeline, and uploaded textures.
-            VkDevice.RecreateSurfaceAndSwapChain(
-                nativeWindow,
-                instHandle => CreateAndroidSurface(instHandle, nativeWindow),
-                width, height);
+            BaseApp.ResizeSemaphore.Wait();
+            try
+            {
+                VkDevice.RecreateSurfaceAndSwapChain(
+                    nativeWindow,
+                    instHandle => CreateAndroidSurface(instHandle, nativeWindow),
+                    width, height);
+            }
+            finally { BaseApp.ResizeSemaphore.Release(); }
 
             System.Diagnostics.Debug.WriteLine($"[Season] After RecreateSurfaceAndSwapChain: SwapChain.Extent=({VkDevice.SwapChain.Extent.Width}x{VkDevice.SwapChain.Extent.Height})");
 
@@ -156,6 +166,12 @@ public static class AndroidApp
     /// <summary>SurfaceCreated callback: only cache the nativeWindow and do not bootstrap Vulkan immediately, because the final size is provided by SurfaceChanged.</summary>
     internal static void OnNativeWindowReady(IntPtr nativeWindow)
     {
+        if (Volatile.Read(ref _closed) != 0)
+        {
+            AndroidRuntime.ANativeWindow_release(nativeWindow);
+            return;
+        }
+        if (_currentNativeWindow != IntPtr.Zero) OnSurfaceLost();
         _currentNativeWindow = nativeWindow;
     }
 
@@ -167,7 +183,9 @@ public static class AndroidApp
         if (_currentNativeWindow == IntPtr.Zero) return;
         if (width <= 0 || height <= 0) return;
 
-        OnSurfaceAvailable(_currentNativeWindow, width, height);
+        if (Volatile.Read(ref _closed) != 0) return;
+        try { OnSurfaceAvailable(_currentNativeWindow, width, height); }
+        catch (Exception error) { Shutdown(error); MainActivity.Finish(); }
     }
 
     /// <summary>SurfaceDestroyed covers Activity pause, screen rotation, and moving to the background.
@@ -175,22 +193,84 @@ public static class AndroidApp
     /// and lets the next SurfaceCreated rebuild them through the soft-restart path.</summary>
     internal static void OnSurfaceLost()
     {
-        if (_running)
-        {
-            _running = false;
-            _renderThread?.Join();
-            _renderThread = null;
-        }
+        StopRenderLoop();
 
-        if (_initialized && _surfaceAlive)
+        BaseApp.ResizeSemaphore.Wait();
+        try
         {
-            VkDevice.ReleaseSurfaceAndSwapChain();
+            if (VkDevice.Surface.Handle != 0) VkDevice.ReleaseSurfaceAndSwapChain();
             _surfaceAlive = false;
         }
+        finally { BaseApp.ResizeSemaphore.Release(); }
 
         // The previous ANativeWindow became invalid together with SurfaceDestroyed.
         // Clear it to avoid accidental SurfaceChanged handling before the next SurfaceCreated.
-        _currentNativeWindow = IntPtr.Zero;
+        if (_currentNativeWindow != IntPtr.Zero)
+        {
+            AndroidRuntime.ANativeWindow_release(_currentNativeWindow);
+            _currentNativeWindow = IntPtr.Zero;
+        }
+    }
+
+    static void StopRenderLoop()
+    {
+        _running = false;
+        var thread = _renderThread;
+        if (thread != null && thread != Thread.CurrentThread) thread.Join();
+        _renderThread = null;
+    }
+
+    internal static void Pause()
+    {
+        // Mirror the LinuxApp focus handling: BaseApp.IsActive is the input gate
+        // (InputManager.Update and ScreenManager.HandleInput return early while it is false),
+        // so deactivate it in the background to drop stuck holds and stray presses.
+        DeviceServices.BaseApp.IsActive = false;
+        _paused = true;
+        StopRenderLoop();
+    }
+
+    internal static void Resume()
+    {
+        // Re-arm the input gate when coming back to the foreground.
+        // On first launch OnResume precedes SurfaceChanged, so the gate is already active before frame 1.
+        DeviceServices.BaseApp.IsActive = true;
+        _paused = false;
+        if (_initialized && _surfaceAlive) StartRenderLoop();
+    }
+
+    // Called on the Activity thread, never synchronously from the render thread.
+    internal static unsafe void Shutdown(Exception? error = null)
+    {
+        if (Interlocked.Exchange(ref _closed, 1) != 0) return;
+        StopRenderLoop();
+        bool idle = false;
+        _lifetime.Execute(() => { if (error != null) throw error; },
+            () =>
+            {
+                if (VkDevice.LogicalDevice.Handle == 0) return;
+                VkDevice.CheckResult(VkDevice.Vk.DeviceWaitIdle(VkDevice.LogicalDevice));
+                if (VkDevice.FrameContexts != null)
+                    foreach (var frame in VkDevice.FrameContexts)
+                        if (frame != null && frame.CommandPool.Handle != 0)
+                            VkDevice.CheckResult(VkDevice.Vk.ResetCommandPool(VkDevice.LogicalDevice, frame.CommandPool, 0));
+                VkDevice.InRenderPass = false;
+                idle = true;
+            },
+            () => DeviceServices.BaseApp.Dispose(),
+            () =>
+            {
+                if (_graphicsReady && Season.Basic.Graphics.Instance is Shared.LinuxAndroid.Graphics graphics)
+                    graphics.DisposeImmediate2D();
+            },
+            () => { if (idle) VkDevice.PumpDeferredReleases(force: true); },
+            OnSurfaceLost,
+            () => DeviceServices.BaseApp.DisposeSaveSettingsRequest());
+        try { _lifetime.Completion.GetAwaiter().GetResult(); }
+        catch (Exception failure)
+        {
+            global::Android.Util.Log.Error("Season", failure.ToString());
+        }
     }
 
     /// <summary>
@@ -227,16 +307,30 @@ public static class AndroidApp
     /// Device.Init → CreateSwapChain → CreateDescriptorHeapsAndViews → Pipeline.Init →
     /// VKPrimitiveGroup.InitLights → VKSprite2D.Init → CreateGraphicsCommandLists →
     /// Inject Graphics.Instance and then call BaseApp.Create().
+    /// Under <see cref="Season.Rendering.Immediate2DMode"/> the 3D-only steps
+    /// (Pipeline.Init, InitLights, and every offscreen target) are skipped instead of compiled or
+    /// created, and the frame schedule reduces to the Overlay pass; the rest of the chain is unchanged.
     /// </summary>
     static unsafe void InitializeVulkan(IntPtr window, int width, int height)
     {
+        // Immediate-2D compatibility mode (Season.Rendering.Immediate2DMode):
+        // the app renders exclusively through the immediate 2D backend, so everything the 3D path
+        // would need is skipped below - no PSO bake, no offscreen targets, no effect registration,
+        // and the quality tier is never adjusted. The decision is read once here and is final for
+        // the session: the mode is one-way, so the skipped resources are simply never created.
+        bool immediate2D = Season.Rendering.Immediate2DMode.Enabled;
+
+        // Freeze the decision: flipping it after this point would leave the frame schedule pointing
+        // at resources that were never created, so the setter rejects any later change.
+        Season.Rendering.Immediate2DMode.Freeze();
+
         // Render-quality tier setup 1-4, mirroring WindowsApp and LinuxApp.
         // The cross-platform contract is documented in the RenderQuality summary.
         // This must be finalized before Pipeline.Init, where the main PSO is baked
         // from RenderPass-derived formats.
         // The HDR path depends on offscreen SceneColor because FinalBlit performs tone mapping at the end.
         // Direct rendering therefore falls back to the LDR baseline.
-        VkDevice.HdrSceneColor = UseOffscreenSceneColor && RenderQuality.Current.HdrSceneColor;
+        VkDevice.HdrSceneColor = !immediate2D && UseOffscreenSceneColor && RenderQuality.Current.HdrSceneColor;
 
         // Anti-aliasing contract 2-1 clause 5:
         // finalize the AA tier during initialization, where options are mutually exclusive.
@@ -245,12 +339,14 @@ public static class AndroidApp
         // Taa and Fxaa both depend on the HDR offscreen path,
         // where the post uber pass finishes with tone mapping.
         // Fallback order is Taa -> Fxaa -> Off, mirroring WindowsApp and LinuxApp.
-        if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
+        // The whole tier normalization is skipped in immediate-2D mode: no AA path exists to
+        // configure, and the values stay unused because no pass ever consults them.
+        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
         {
             RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Fxaa;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] AaMode.Msaa4x is only supported on D3D12, falling back to Fxaa");
         }
-        if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa)
+        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa)
         {
             // Contract 2-3 clause 1: selecting Taa forces motion-vector infrastructure to be enabled,
             // because TAA is invalid without velocity.
@@ -269,7 +365,7 @@ public static class AndroidApp
                 DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] Taa depends on the HDR offscreen path, which is currently disabled, falling back to Fxaa; MotionVectors remains enabled");
             }
         }
-        if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa && !VkDevice.HdrSceneColor)
+        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa && !VkDevice.HdrSceneColor)
         {
             RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] Fxaa depends on the HDR offscreen path, which is currently disabled, falling back to Off");
@@ -279,9 +375,18 @@ public static class AndroidApp
         var androidExts = new[] { "VK_KHR_surface", "VK_KHR_android_surface" };
 
         // 2) Bootstrap the Vulkan Instance, Surface, Device, and queues.
+        // Validation is a development-only tool: when the layer is present it validates every call on
+        // the hot path and floods logcat, so the request follows the build configuration instead of
+        // being hardcoded on. Whether the layer actually activated is decided inside VkDevice.Init by
+        // CheckValidationLayerSupport and reported in the tier log below.
+#if DEBUG
+        const bool requestValidation = true;
+#else
+        const bool requestValidation = false;
+#endif
         VkDevice.Init(
             window: window,
-            debug: true,
+            debug: requestValidation,
             surfaceExtensions: androidExts,
             createSurface: instHandle => CreateAndroidSurface(instHandle, window));
 
@@ -292,10 +397,16 @@ public static class AndroidApp
         VkDevice.CreateDescriptorHeapsAndViews();
 
         // 5) Initialize the three Pipeline variants, which depend on the RenderPass.
-        VkPipeline.Init(VkDevice.Display.RenderPass);
+        // Skipped in immediate-2D mode: the main PSO family is never compiled, which is where the
+        // startup bake cost would otherwise go.
+        if (!immediate2D)
+            VkPipeline.Init(VkDevice.Display.RenderPass);
 
         // 6) Initialize the globally shared lighting UBO before Sprite2D.Init and resource loading.
-        VKPrimitiveGroup.InitLights();
+        // Skipped in immediate-2D mode: no 3D pass consumes it, and the matching per-frame
+        // VKPrimitiveGroup.Update in the render loop is skipped as well.
+        if (!immediate2D)
+            VKPrimitiveGroup.InitLights();
 
         // 7) Set up the 2D orthographic camera.
         VKSprite2D.Init();
@@ -305,13 +416,14 @@ public static class AndroidApp
 
         // 9) Inject the IGraphics implementation so BaseApp can run unchanged.
         Season.Basic.Graphics.Instance = new Season.Platforms.Shared.LinuxAndroid.Graphics();
+        _graphicsReady = true;
 
         // 10) Offscreen SceneColor for step 2:
         // when not null, FrameSchedule automatically appends the FinalBlit pass to present on screen,
         // mirroring WindowsApp.
         // In render-quality step 1-4 stage A, the HDR path switches to RGBA16F
         // and FinalBlit automatically uses the tone-mapping variant.
-        if (UseOffscreenSceneColor)
+        if (!immediate2D && UseOffscreenSceneColor)
         {
             Season.Rendering.FrameSchedule.SceneColor = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -328,7 +440,7 @@ public static class AndroidApp
         // When non-null, the Scene pass becomes a three-target pass with color, velocity, and depth.
         // When MotionVectors is disabled it stays null, leaving no residual path, mirroring WindowsApp.
         // It must be ready before BaseApp.Create, where the app registers VelocityViewEffect.
-        if (RenderQuality.Current.MotionVectors)
+        if (!immediate2D && RenderQuality.Current.MotionVectors)
         {
             Season.Rendering.FrameSchedule.SceneVelocity = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -373,7 +485,7 @@ public static class AndroidApp
         // FrameSchedule activates the Shadow pass before Scene.
         // The shadow PSO is baked against the depth-only RenderPass,
         // so it must be delayed until the shadow render target exists and can provide its RenderPass.
-        if (RenderQuality.Current.ShadowsEnabled)
+        if (!immediate2D && RenderQuality.Current.ShadowsEnabled)
         {
             var shadowRT = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -397,18 +509,19 @@ public static class AndroidApp
         // and it is incompatible with MSAA because MSAA depth cannot be used directly as compute input.
         // Once finalized, create SceneDepth as a full-size depth-only target,
         // used explicitly as the Scene pass depth target and compute depth input, mirroring WindowsApp.
-        if (RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off && !VkDevice.HdrSceneColor)
+        if (!immediate2D && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off && !VkDevice.HdrSceneColor)
         {
             RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] AO depends on the HDR offscreen path, which is currently disabled, falling back to Off");
         }
-        if (RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off
+        if (!immediate2D
+            && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off
             && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
         {
             RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] AO is incompatible with Msaa4x because MSAA depth cannot be used as compute input, falling back to Off");
         }
-        if (RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off)
+        if (!immediate2D && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off)
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -423,7 +536,7 @@ public static class AndroidApp
         // three attachments: color, velocity, and depth.
         // When AO is disabled, SceneDepth may be null, but MotionVectors still needs a depth attachment,
         // so fill it in here.
-        if (RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
+        if (!immediate2D && RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -433,12 +546,35 @@ public static class AndroidApp
             });
         }
 
+        // One-shot tier report: the app ships with the desktop-class defaults (HDR + TAA tier +
+        // GTAO + shadows + bloom), so this line is what a device log needs to tell which pipeline the
+        // frame actually pays for, and whether the validation layer activated.
+        Diag($"[RenderQuality] tier: {width}x{height} validation={(VkDevice.ValidationEnabled ? "on" : "off")} hdr={VkDevice.HdrSceneColor} aa={RenderQuality.Current.AntiAliasing} mv={RenderQuality.Current.MotionVectors} ao={RenderQuality.Current.AmbientOcclusion} shadows={RenderQuality.Current.ShadowsEnabled} bloom={RenderQuality.Current.BloomEnabled} taaSharpness={RenderQuality.Current.TaaSharpness} immediate2D={immediate2D}");
+
+        // Extra line when the mode is on: this is what a device log needs to tell that the frame is
+        // Overlay-only and that the tier line right above is inert.
+        if (immediate2D)
+            Diag("[RenderQuality] immediate-2D mode: the main PSO family was not compiled and no offscreen target, shadow map or post effect exists this session; every frame renders only the Overlay pass directly into the backbuffer");
+
         DeviceServices.BaseApp.ApplyResolution(width, height, 1f, 1f);
         DeviceServices.BaseApp.Create();
     }
 
+    /// <summary>
+    /// Diagnostic output for this platform module: logcat (Debug.WriteLine) plus the in-memory
+    /// AddLog channel in one call. The in-memory channel has no on-device consumer, so logcat is
+    /// what actually makes these lines visible in a Debug deployment.
+    /// </summary>
+    static void Diag(string message)
+    {
+        System.Diagnostics.Debug.WriteLine(message);
+
+        DeviceServices.BaseApp?.AddLog(LogType.Backend, $"{System.DateTime.UtcNow} {message}");
+    }
+
     static void StartRenderLoop()
     {
+        if (_paused || Volatile.Read(ref _closed) != 0 || _renderThread?.IsAlive == true) return;
         _running = true;
         _renderThread = new Thread(RenderLoopBody)
         {
@@ -455,6 +591,12 @@ public static class AndroidApp
         double previousSeconds = 0;
         int frameCounter = 0;
 
+        // Performance diagnostics: frame-rate windows over the first 30 seconds, enough for a device
+        // log to say whether the loop settles near vsync or is stuck in the low teens, without
+        // touching the render tier.
+        double lastPerfReportSeconds = 0;
+        int lastPerfReportFrame = 0;
+
         try
         {
         while (_running)
@@ -467,6 +609,21 @@ public static class AndroidApp
             // Diagnostic log: print the first few frames to help locate crash positions.
             if (frameCounter <= 5)
                 System.Diagnostics.Debug.WriteLine($"[Android] Frame {frameCounter} started");
+
+            // Performance diagnostics: 5-second windows for the first 30 seconds.
+            if (newSeconds - lastPerfReportSeconds >= 5.0 && newSeconds < 35.0)
+            {
+                var windowFrames = frameCounter - lastPerfReportFrame;
+                var windowSeconds = newSeconds - lastPerfReportSeconds;
+
+                if (windowFrames > 0)
+                {
+                    Diag($"[Android] perf: {windowFrames / windowSeconds:F1} fps, {windowSeconds * 1000.0 / windowFrames:F1} ms/frame");
+                }
+
+                lastPerfReportSeconds = newSeconds;
+                lastPerfReportFrame = frameCounter;
+            }
 
             // Rebuild the SwapChain, equivalent to DX HandleResize.
             if (_resized)
@@ -493,11 +650,16 @@ public static class AndroidApp
                     // and reuses the existing Instance, Device, Pipeline, and textures.
                     if (frameCounter <= 5)
                         System.Diagnostics.Debug.WriteLine($"[Android] Frame {frameCounter}: Resize...");
-                    VkDevice.ReleaseSurfaceAndSwapChain();
-                    VkDevice.RecreateSurfaceAndSwapChain(
-                        native,
-                        instHandle => CreateAndroidSurface(instHandle, native),
-                        w, h);
+                    BaseApp.ResizeSemaphore.Wait();
+                    try
+                    {
+                        VkDevice.ReleaseSurfaceAndSwapChain();
+                        VkDevice.RecreateSurfaceAndSwapChain(
+                            native,
+                            instHandle => CreateAndroidSurface(instHandle, native),
+                            w, h);
+                    }
+                    finally { BaseApp.ResizeSemaphore.Release(); }
 
                     DeviceServices.BaseApp.ApplyResolution(w, h, 1f, 1f);
                     DeviceServices.BaseApp?.Resize();
@@ -505,17 +667,27 @@ public static class AndroidApp
             }
 
             // Camera and lighting UBOs, written before each frame.
-            if (frameCounter <= 5)
-                System.Diagnostics.Debug.WriteLine($"[Android] Frame {frameCounter}: VKPrimitiveGroup.Update...");
-            VKPrimitiveGroup.Update(
-                elapsed,
-                DeviceServices.BaseApp.CameraPos,
-                DeviceServices.BaseApp.CameraTarget,
-                DeviceServices.BaseApp.EffectiveSceneLights);
+            // Skipped in immediate-2D mode, where the lighting UBO was never created because no 3D
+            // pass consumes it.
+            if (!Season.Rendering.Immediate2DMode.Enabled)
+            {
+                if (frameCounter <= 5)
+                    System.Diagnostics.Debug.WriteLine($"[Android] Frame {frameCounter}: VKPrimitiveGroup.Update...");
+                VKPrimitiveGroup.Update(
+                    elapsed,
+                    DeviceServices.BaseApp.CameraPos,
+                    DeviceServices.BaseApp.CameraTarget,
+                    DeviceServices.BaseApp.EffectiveSceneLights);
+            }
 
             if (frameCounter <= 5)
                 System.Diagnostics.Debug.WriteLine($"[Android] Frame {frameCounter}: BaseApp.Update...");
             DeviceServices.BaseApp.Update(elapsed);
+            if (DeviceServices.BaseApp.Status != null)
+            {
+                MainActivity.RunOnUiThread(() => { Shutdown(); MainActivity.Finish(); });
+                break;
+            }
 
             var backgroundColor = DeviceServices.BaseApp.BackgroundColor;
             VkDevice.BackgroundColor = backgroundColor;
@@ -552,13 +724,16 @@ public static class AndroidApp
         }
         catch (Exception ex)
         {
+            _paused = true;
             // Render-thread exception: log it for diagnostics and do not rethrow,
             // allowing the thread to exit normally.
             // The upper OnSurfaceLost path will observe _running and perform cleanup.
             System.Diagnostics.Debug.WriteLine($"[FATAL] RenderLoopBody exception at frame {frameCounter}: {ex.GetType().Name}: {ex.Message}");
             System.Diagnostics.Debug.WriteLine(ex.StackTrace);
             DeviceServices.BaseApp?.AddLog(LogType.Error, $"{System.DateTime.UtcNow} [Android] RenderLoopBody exception at frame {frameCounter}: {ex.GetType().Name}: {ex.Message}");
+            MainActivity.RunOnUiThread(() => { Shutdown(ex); MainActivity.Finish(); });
         }
+        finally { _running = false; }
     }
 }
 
@@ -611,18 +786,24 @@ public class BaseActivity : Activity
 
     protected override void OnPause()
     {
+        if (ReferenceEquals(AndroidApp.MainActivity, this)) AndroidApp.Pause();
         base.OnPause();
     }
 
     protected override void OnResume()
     {
         base.OnResume();
+        if (ReferenceEquals(AndroidApp.MainActivity, this)) AndroidApp.Resume();
     }
 
     protected override void OnDestroy()
     {
         // Defensive path: force the render thread to stop when the Activity is destroyed.
-        AndroidApp.OnSurfaceLost();
+        if (ReferenceEquals(AndroidApp.MainActivity, this))
+        {
+            if (IsFinishing && !IsChangingConfigurations) AndroidApp.Shutdown();
+            else AndroidApp.OnSurfaceLost();
+        }
         base.OnDestroy();
     }
 
@@ -667,6 +848,7 @@ public class SurfaceViewVulkan : SurfaceView, ISurfaceHolderCallback, View.IOnTo
 
     public void SurfaceCreated(ISurfaceHolder holder)
     {
+        if (!ReferenceEquals(AndroidApp.SurfaceView, this)) return;
         if (holder.Surface is null) return;
 
         // Take the focus so hardware key events are routed to this view (OnKeyDown/OnKeyUp).
@@ -787,6 +969,7 @@ public class SurfaceViewVulkan : SurfaceView, ISurfaceHolderCallback, View.IOnTo
 
     public void SurfaceChanged(ISurfaceHolder holder, SurfaceFormat format, int width, int height)
     {
+        if (!ReferenceEquals(AndroidApp.SurfaceView, this)) return;
         System.Diagnostics.Debug.WriteLine($"[Season] SurfaceChanged: width={width} height={height}");
         // At this point width and height are guaranteed to be the final surface size
         // because layout has already completed.
@@ -796,7 +979,7 @@ public class SurfaceViewVulkan : SurfaceView, ISurfaceHolderCallback, View.IOnTo
 
     public void SurfaceDestroyed(ISurfaceHolder holder)
     {
-        AndroidApp.OnSurfaceLost();
+        if (ReferenceEquals(AndroidApp.SurfaceView, this)) AndroidApp.OnSurfaceLost();
     }
 
     public override bool OnKeyDown(Keycode keyCode, KeyEvent e)

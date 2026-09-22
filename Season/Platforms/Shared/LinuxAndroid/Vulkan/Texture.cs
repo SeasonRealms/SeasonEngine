@@ -169,7 +169,8 @@ internal unsafe class Texture : IDisposable
 
     internal Texture(INativeImageDecoder imageResult, TextureMipPolicy mipPolicy = TextureMipPolicy.None)
     {
-        ProcessImageResult(imageResult, mipPolicy);
+        try { ProcessImageResult(imageResult, mipPolicy); }
+        catch { Dispose(); throw; }
     }
 
     internal Texture(string name, SharpGLTF.Schema2.Image? image, TextureMipPolicy mipPolicy = TextureMipPolicy.None)
@@ -505,9 +506,13 @@ internal unsafe class Texture : IDisposable
             Format = Silk.NET.Vulkan.Format.R8G8B8A8Unorm,
             Name = name
         };
-        tex.CreateImageResource();
-        tex.CreateImageView();
-        return tex;
+        try
+        {
+            tex.CreateImageResource();
+            tex.CreateImageView();
+            return tex;
+        }
+        catch { tex.Dispose(); throw; }
     }
 
     /// <summary>
@@ -802,6 +807,8 @@ internal unsafe class Texture : IDisposable
             if (oldMemory.Handle != 0) vk.FreeMemory(d, oldMemory, null);
         });
 
-        Device.DictionaryTexture.Remove(string.IsNullOrEmpty(_cacheKey) ? Name : _cacheKey);
+        string key = string.IsNullOrEmpty(_cacheKey) ? Name : _cacheKey;
+        if (Device.DictionaryTexture.TryGetValue(key, out var current) && ReferenceEquals(current, this))
+            Device.DictionaryTexture.Remove(key);
     }
 }

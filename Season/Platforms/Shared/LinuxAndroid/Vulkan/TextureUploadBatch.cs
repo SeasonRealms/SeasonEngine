@@ -73,6 +73,8 @@ internal unsafe class TextureUploadBatch : IDisposable
             BufferUsageFlags.TransferSrcBit,
             MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit);
 
+        CommandBuffer cmd = default;
+        bool submitted = false;
         try
         {
             void* p;
@@ -89,13 +91,13 @@ internal unsafe class TextureUploadBatch : IDisposable
             _vk.UnmapMemory(_device, staging.Memory);
 
             // 3. Record the transfer command buffer
-            var cmd = AllocateCommandBuffer();
+            cmd = AllocateCommandBuffer();
             var beginInfo = new CommandBufferBeginInfo
             {
                 SType = StructureType.CommandBufferBeginInfo,
                 Flags = CommandBufferUsageFlags.OneTimeSubmitBit
             };
-            _vk.BeginCommandBuffer(cmd, in beginInfo);
+            Device.CheckResult(_vk.BeginCommandBuffer(cmd, in beginInfo));
 
             for (int i = 0; i < _tasks.Count; i++)
             {
@@ -138,7 +140,7 @@ internal unsafe class TextureUploadBatch : IDisposable
                 }
             }
 
-            _vk.EndCommandBuffer(cmd);
+            Device.CheckResult(_vk.EndCommandBuffer(cmd));
 
             // 4. Submit to the transfer queue and signal the timeline semaphore
             var transferCq = Device.TransferCommandQueue;
@@ -165,6 +167,7 @@ internal unsafe class TextureUploadBatch : IDisposable
 
             if (_vk.QueueSubmit(transferCq.NativeQueue, 1, in submit, default) != Result.Success)
                 throw new Exception("vkQueueSubmit (texture upload) failed");
+            submitted = true;
 
             // 5. Mark the fence value and state for each texture
             //
@@ -183,15 +186,13 @@ internal unsafe class TextureUploadBatch : IDisposable
 
             // 6. Wait for transfer completion on the CPU, then safely release the staging buffer and command buffer
             transferCq.WaitForFence(signalValue);
-
-            _vk.FreeCommandBuffers(_device, _pool, 1, in cmd);
-        }
-        catch (Exception ex)
-        {
-
+            submitted = false;
         }
         finally
         {
+            // Do not swallow upload failures or free staging storage still consumed by the transfer queue.
+            if (submitted) _vk.QueueWaitIdle(Device.TransferCommandQueue.NativeQueue);
+            if (cmd.Handle != 0) _vk.FreeCommandBuffers(_device, _pool, 1, in cmd);
             Device.ResourceManager.DestroyBuffer(staging);
             _tasks.Clear();
         }

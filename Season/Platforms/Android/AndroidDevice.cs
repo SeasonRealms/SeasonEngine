@@ -145,11 +145,30 @@ internal class AndroidDeviceCore : IDeviceCore
 
     public System.IO.Stream LoadFile(string res)
     {
-        return AndroidApp.MainActivity.BaseContext.Assets.Open(res);
+        return AndroidApp.MainActivity.BaseContext.Assets.Open(ResolveAssetPath(res));
 
         //Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
         //Environment.ProcessPath;
         //Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+    }
+
+    /// <summary>
+    /// APK assets only accept relative paths; the caller on Windows/Linux typically constructs them from the assembly directory
+    /// ```"...\Content\..." absolute path (e.g., font, texture, and audio declarations), with the backslash "\\" delimiter retained.```.
+    /// ```Here, normalization is uniformly applied: backslashes are converted to '/', and the relative path of assets starting with "Content/" is extracted from the absolute path.```.
+    /// </summary>
+    internal static string ResolveAssetPath(string res)
+    {
+        var path = res.Replace('\\', '/');
+
+        int index = path.IndexOf("/Content/", StringComparison.Ordinal);
+
+        if (index >= 0)
+        {
+            return path.Substring(index + 1);
+        }
+
+        return path;
     }
 
     public bool IsDarkMode()
@@ -237,18 +256,78 @@ internal class AndroidMediaPlayer : IMediaPlayer
 
         mediaPlayer.Reset();
 
-        mediaPlayer.SetDataSource(id);
-
-        if (vol?.Length > 0)
+        try
         {
-            var volume = float.Parse(vol) / 100;
+            SetMediaSource(mediaPlayer, id);
 
-            mediaPlayer.SetVolume(volume, volume);
+            if (vol?.Length > 0)
+            {
+                var volume = float.Parse(vol) / 100;
+
+                mediaPlayer.SetVolume(volume, volume);
+            }
+
+            mediaPlayer.Prepare();
+
+            mediaPlayer.Start();
+        }
+        catch (Exception ex)
+        {
+            // SeasonBase.PlayEffect/PlaySong silently swallows audio exceptions, which was precisely the issue on the Android side previously
+            // The reason for "silent failures and silent collapses"; logs are left here to distinguish missing assets and decoding failures.
+            mediaPlayer.Reset();
+
+            System.Diagnostics.Debug.WriteLine($"[Android] PlayMedia failed: type={type}, id={id}: {ex.GetType().Name}: {ex.Message}");
+
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Android] PlayMedia failed: type={type}, id={id}: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+
+    ///Resolve the ID provided by the game layer. Use the desktop contract to spell it into an absolute path under AppLext.BaseDirectory
+    ///(Like '.../Content/Sound \ Move. wav', where the back slash is a literal file name character), but for Android Content
+    ///The tree is located within APK assets and not in the file system, and MediaPlayer. SetDataSource (string) only recognizes real files.
+    ///Search order: First, open the normalized real file, then open it as a file descriptor using APK asset;
+    ///Finally, for compressed assets that cannot be opened according to file descriptors, they will be degraded to copying to CacheDir before playback.
+    /// </summary>
+    static void SetMediaSource(MediaPlayer mediaPlayer, string id)
+    {
+        var path = id.Replace('\\', '/');
+
+        if (System.IO.File.Exists(path))
+        {
+            mediaPlayer.SetDataSource(path);
+
+            return;
         }
 
-        mediaPlayer.Prepare();
+        var asset = AndroidDeviceCore.ResolveAssetPath(id);
 
-        mediaPlayer.Start();
+        try
+        {
+            using (var fd = AndroidApp.MainActivity.BaseContext.Assets.OpenFd(asset))
+            {
+                mediaPlayer.SetDataSource(fd.FileDescriptor, fd.StartOffset, fd.Length);
+            }
+
+            return;
+        }
+        catch (Java.IO.IOException)
+        {
+        }
+
+        var cachePath = Path.Combine(AndroidApp.MainActivity.CacheDir.AbsolutePath, asset);
+
+        System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(cachePath));
+
+        using (var source = AndroidApp.MainActivity.BaseContext.Assets.Open(asset))
+        using (var target = System.IO.File.Create(cachePath))
+        {
+            source.CopyTo(target);
+        }
+
+        mediaPlayer.SetDataSource(cachePath);
     }
 
     public void SetVolume(int music, int sound)

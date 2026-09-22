@@ -70,8 +70,8 @@ internal sealed class TextureUploadBatch : IDisposable
             }
 
             // 3. Record the blit command buffer.
-            var cmd = _queue.CreateCommandBuffer();
-            var blit = cmd.CreateBlitCommandEncoder(new MTLBlitPassDescriptor()) ?? throw new Exception("CreateBlitCommandEncoder failed");
+            using var cmd = _queue.CreateCommandBuffer();
+            using var blit = cmd.CreateBlitCommandEncoder(new MTLBlitPassDescriptor()) ?? throw new Exception("CreateBlitCommandEncoder failed");
 
             for (int i = 0; i < _tasks.Count; i++)
             {
@@ -102,7 +102,7 @@ internal sealed class TextureUploadBatch : IDisposable
             // 4. Commit, wait for completion, and mark each texture.
             ulong signal = _queue.RegisterSignal(cmd);
             cmd.Commit();
-            cmd.WaitUntilCompleted();
+            Device.WaitForCompletion(cmd);
 
             // 2-6 clause 5: dropping ImageData here is why IGraphics.RebuildNormalVarianceTextures stays a no-op on this
             // backend - re-running a normal map's chain needs the authored level-0 pixels, and D3D12 can only offer that

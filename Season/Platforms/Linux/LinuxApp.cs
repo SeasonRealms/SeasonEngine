@@ -22,8 +22,49 @@ public static class LinuxApp
 
     // Keyboard service instance created in Run and consumed by the RunLoop event switch.
     static LinuxKeyboardService _keyboard;
+    static bool _graphicsReady;
+
+    // Window handle created in RunCore, kept so the app layer can realign the client area on a
+    // display change through ApplyWindowClientSize.
+    static IntPtr _window;
 
     public static unsafe void Run(BaseApp app)
+    {
+        ArgumentNullException.ThrowIfNull(app);
+        _graphicsReady = false;
+        _resized = false;
+        bool gpuIdle = false;
+        var lifetime = new HostLifetime();
+        lifetime.Execute(() => RunCore(app),
+            () =>
+            {
+                if (VkDevice.LogicalDevice.Handle == 0) return;
+                VkDevice.CheckResult(VkDevice.Vk.DeviceWaitIdle(VkDevice.LogicalDevice));
+                // A failed Draw/Prepare may leave an unsubmitted command buffer referencing resources.
+                if (VkDevice.FrameContexts != null)
+                    foreach (var frame in VkDevice.FrameContexts)
+                        if (frame != null && frame.CommandPool.Handle != 0)
+                            VkDevice.CheckResult(VkDevice.Vk.ResetCommandPool(VkDevice.LogicalDevice, frame.CommandPool, 0));
+                VkDevice.InRenderPass = false;
+                gpuIdle = true;
+            },
+            app.Dispose,
+            () =>
+            {
+                if (_graphicsReady && Season.Basic.Graphics.Instance is Shared.LinuxAndroid.Graphics graphics)
+                    graphics.DisposeImmediate2D();
+            },
+            () =>
+            {
+                if (gpuIdle) VkDevice.PumpDeferredReleases(force: true);
+            },
+            app.DisposeSaveSettingsRequest,
+            LinuxAudioPlayer.ShutdownForExit,
+            SDL.Quit);
+        lifetime.Completion.GetAwaiter().GetResult();
+    }
+
+    static unsafe void RunCore(BaseApp app)
     {
         // Global exception capture as the last line of defense for async void,
         // thread-pool work, and failures before a native crash.
@@ -39,7 +80,19 @@ public static class LinuxApp
         TaskScheduler.UnobservedTaskException += (sender, e) =>
         {
             Console.WriteLine($"[FATAL] UnobservedTaskException: {e.Exception?.GetType().Name}: {e.Exception?.Message}");
-            Console.WriteLine(e.Exception?.StackTrace);
+            // AggregateException itself carries no stack when rethrown by the finalizer,
+            // so print the flattened inner exceptions to locate the faulting task.
+            if (e.Exception is AggregateException aggregate)
+            {
+                foreach (var inner in aggregate.Flatten().InnerExceptions)
+                {
+                    Console.WriteLine($"[FATAL]   inner {inner.GetType().Name}: {inner.Message}\n{inner.StackTrace}");
+                }
+            }
+            else
+            {
+                Console.WriteLine(e.Exception?.StackTrace);
+            }
             Console.Error.Flush();
         };
         AppDomain.CurrentDomain.ProcessExit += (sender, e) =>
@@ -103,12 +156,20 @@ public static class LinuxApp
 
         var window = SDL.CreateWindow(app.Title, (int)rect.Width, (int)rect.Height, flags);
 
+        _window = window;
+
         if (!app.Settings.WindowState.FullScreen && !app.Settings.WindowState.Maximized && app.Settings.WindowState.Width > 0 && app.Settings.WindowState.Height > 0)
         {
             SDL.SetWindowPosition(window, rect.X, rect.Y);
         }
 
         SDL.ShowWindow(window);
+
+        // Mirror WindowsApp, which sets IsActive from window activation: the input gate
+        // in InputManager.Update (SeasonBase.IsActive) drops every press while the flag
+        // is false, so a window that starts focused must start with it set. Focus events
+        // in RunLoop keep it in sync from here on.
+        app.IsActive = true;
 
         // Under X11 and Wayland, window size is confirmed asynchronously by the window manager.
         // Reading GetWindowSizeInPixels immediately after ShowWindow still returns the requested creation size.
@@ -156,13 +217,24 @@ public static class LinuxApp
     /// </summary>
     static unsafe void InitializeVulkan(IntPtr window, int width, int height)
     {
-        // Render-quality tier setup 1-4, mirroring WindowsApp.
+        // Immediate-2D compatibility mode (Season.Rendering.Immediate2DMode):
+        // the app renders exclusively through the immediate 2D backend, so everything the 3D path
+        // would need is skipped below - no PSO bake, no offscreen targets, no effect registration,
+        // and the quality tier is never adjusted. The decision is read once here and is final for
+        // the session: the mode is one-way, so the skipped resources are simply never created.
+        bool immediate2D = Season.Rendering.Immediate2DMode.Enabled;
+
+        // Freeze the decision: flipping it after this point would leave the frame schedule pointing
+        // at resources that were never created, so the setter rejects any later change.
+        Season.Rendering.Immediate2DMode.Freeze();
+
+        // Render-quality tier setup 1-4, mirroring WindowsApp and AndroidApp.
         // See the RenderQuality summary for the cross-platform contract.
         // This must be finalized before Pipeline.Init,
         // where the main PSO is baked from RenderPass-derived formats.
         // The HDR chain depends on offscreen SceneColor because FinalBlit performs tone mapping at the end,
         // so direct rendering falls back to the LDR baseline.
-        VkDevice.HdrSceneColor = UseOffscreenSceneColor && RenderQuality.Current.HdrSceneColor;
+        VkDevice.HdrSceneColor = !immediate2D && UseOffscreenSceneColor && RenderQuality.Current.HdrSceneColor;
 
         // Anti-aliasing contract 2-1 clause 5:
         // finalize the AA tier during initialization, with mutually exclusive choices.
@@ -170,13 +242,15 @@ public static class LinuxApp
         // Msaa4x is a D3D12 legacy mode and this backend has no MSAA offscreen chain, so it falls back to Fxaa.
         // Taa and Fxaa both depend on the HDR offscreen chain,
         // where the post uber pass finishes with tone mapping.
-        // Fallback order is Taa -> Fxaa -> Off, mirroring WindowsApp.
-        if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
+        // Fallback order is Taa -> Fxaa -> Off, mirroring WindowsApp and AndroidApp.
+        // The whole tier normalization is skipped in immediate-2D mode: no AA path exists to
+        // configure, and the values stay unused because no pass ever consults them.
+        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
         {
             RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Fxaa;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] AaMode.Msaa4x is only supported on D3D12, falling back to Fxaa");
         }
-        if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa)
+        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa)
         {
             // Contract 2-3 clause 1:
             // selecting Taa forces motion-vector infrastructure to be enabled,
@@ -197,7 +271,7 @@ public static class LinuxApp
                 DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] Taa depends on the HDR offscreen path, which is currently disabled, falling back to Fxaa; MotionVectors remains enabled");
             }
         }
-        if (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa && !VkDevice.HdrSceneColor)
+        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa && !VkDevice.HdrSceneColor)
         {
             RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] Fxaa depends on the HDR offscreen path, which is currently disabled, falling back to Off");
@@ -234,12 +308,18 @@ public static class LinuxApp
         VkDevice.CreateDescriptorHeapsAndViews();
 
         // 5) Initialize the three Pipeline variants, which depend on the RenderPass.
-        VkPipeline.Init(VkDevice.Display.RenderPass);
+        // Skipped in immediate-2D mode: the main PSO family is never compiled, which is where the
+        // startup bake cost would otherwise go.
+        if (!immediate2D)
+            VkPipeline.Init(VkDevice.Display.RenderPass);
 
         // 6) Initialize the globally shared lighting UBO.
         // Pbr3D and SpriteQuad b1 both read from it,
         // so it must be ready before Sprite2D.Init and resource loading.
-        VKPrimitiveGroup.InitLights();
+        // Skipped in immediate-2D mode: no 3D pass consumes it, and the matching per-frame
+        // VKPrimitiveGroup.Update in the render loop is skipped as well.
+        if (!immediate2D)
+            VKPrimitiveGroup.InitLights();
 
         // 7) Set up the 2D orthographic camera.
         VKSprite2D.Init();
@@ -249,13 +329,14 @@ public static class LinuxApp
 
         // 9) Inject the IGraphics implementation so BaseApp can run unchanged.
         Season.Basic.Graphics.Instance = new Season.Platforms.Shared.LinuxAndroid.Graphics();
+        _graphicsReady = true;
 
         // 10) Offscreen SceneColor for step 2:
         // when not null, FrameSchedule automatically appends FinalBlit to present on screen,
         // mirroring WindowsApp.
         // Under render-quality step 1-4 stage A, the HDR chain uses RGBA16F
         // and FinalBlit automatically switches to the tone-mapping variant.
-        if (UseOffscreenSceneColor)
+        if (!immediate2D && UseOffscreenSceneColor)
         {
             Season.Rendering.FrameSchedule.SceneColor = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -272,7 +353,7 @@ public static class LinuxApp
         // When non-null, the Scene pass becomes a three-target pass with color, velocity, and depth.
         // When MotionVectors is disabled it stays null, leaving no residual path, mirroring WindowsApp.
         // It must be ready before BaseApp.Create, where the app registers VelocityViewEffect.
-        if (RenderQuality.Current.MotionVectors)
+        if (!immediate2D && RenderQuality.Current.MotionVectors)
         {
             Season.Rendering.FrameSchedule.SceneVelocity = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -317,7 +398,7 @@ public static class LinuxApp
         // FrameSchedule activates the Shadow pass before Scene.
         // The shadow PSO is baked against the depth-only RenderPass,
         // so it must be delayed until the shadow render target exists and can provide its RenderPass.
-        if (RenderQuality.Current.ShadowsEnabled)
+        if (!immediate2D && RenderQuality.Current.ShadowsEnabled)
         {
             var shadowRT = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -341,18 +422,19 @@ public static class LinuxApp
         // and it is incompatible with MSAA because MSAA depth cannot be used directly as compute input.
         // Once finalized, create SceneDepth as a full-size depth-only target,
         // used explicitly as the Scene pass depth target and compute depth input, mirroring WindowsApp.
-        if (RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off && !VkDevice.HdrSceneColor)
+        if (!immediate2D && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off && !VkDevice.HdrSceneColor)
         {
             RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] AO depends on the HDR offscreen path, which is currently disabled, falling back to Off");
         }
-        if (RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off
+        if (!immediate2D
+            && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off
             && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
         {
             RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] AO is incompatible with Msaa4x because MSAA depth cannot be used as compute input, falling back to Off");
         }
-        if (RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off)
+        if (!immediate2D && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off)
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -367,7 +449,7 @@ public static class LinuxApp
         // three attachments: color, velocity, and depth.
         // When AO is disabled, SceneDepth may be null, but MotionVectors still needs a depth attachment,
         // so fill it in here.
-        if (RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
+        if (!immediate2D && RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -377,7 +459,29 @@ public static class LinuxApp
             });
         }
 
+        // One-shot tier report: the desktop-class defaults (HDR + TAA tier + GTAO + shadows + bloom)
+        // are what the frame would pay for, so this line is what a terminal session needs to tell
+        // which pipeline the frame actually pays for, and whether the validation layer activated.
+        Diag($"[RenderQuality] tier: {width}x{height} validation={(VkDevice.ValidationEnabled ? "on" : "off")} hdr={VkDevice.HdrSceneColor} aa={RenderQuality.Current.AntiAliasing} mv={RenderQuality.Current.MotionVectors} ao={RenderQuality.Current.AmbientOcclusion} shadows={RenderQuality.Current.ShadowsEnabled} bloom={RenderQuality.Current.BloomEnabled} taaSharpness={RenderQuality.Current.TaaSharpness} immediate2D={immediate2D}");
+
+        // Extra line when the mode is on: this is what a terminal session needs to tell that the
+        // frame is Overlay-only and that the tier line right above is inert.
+        if (immediate2D)
+            Diag("[RenderQuality] immediate-2D mode: the main PSO family was not compiled and no offscreen target, shadow map or post effect exists this session; every frame renders only the Overlay pass directly into the backbuffer");
+
         DeviceServices.BaseApp.Create();
+    }
+
+    /// <summary>
+    /// Diagnostic output for this platform module: stdout, which is what a terminal or a WSL
+    /// session actually shows, plus the in-memory AddLog channel in one call - mirroring
+    /// AndroidApp.Diag, where logcat plays the role stdout plays here.
+    /// </summary>
+    static void Diag(string message)
+    {
+        Console.WriteLine(message);
+
+        DeviceServices.BaseApp?.AddLog(LogType.Backend, $"{DateTime.UtcNow} {message}");
     }
 
     static unsafe void RunLoop(nint window)
@@ -390,7 +494,7 @@ public static class LinuxApp
 
         bool running = true;
 
-        while (running)
+        while (running && DeviceServices.BaseApp.Status is null)
         {
             while (SDL.PollEvent(out SDL_Event ev))
             {
@@ -422,10 +526,16 @@ public static class LinuxApp
 
                     case SDL_EventType.SDL_EVENT_WINDOW_FOCUS_GAINED:
 
+                        // Input is gated on SeasonBase.IsActive (= BaseApp.IsActive),
+                        // so the flag must follow window focus, as on Windows.
+                        DeviceServices.BaseApp.IsActive = true;
+
                         // DeviceServices.Media.Resume();
                         break;
 
                     case SDL_EventType.SDL_EVENT_WINDOW_FOCUS_LOST:
+
+                        DeviceServices.BaseApp.IsActive = false;
 
                         // DeviceServices.Media.Pause();
 
@@ -527,13 +637,19 @@ public static class LinuxApp
             }
 
             // Camera and lighting UBOs, written before each frame.
-            VKPrimitiveGroup.Update(
-                elapsed,
-                DeviceServices.BaseApp.CameraPos,
-                DeviceServices.BaseApp.CameraTarget,
-                DeviceServices.BaseApp.EffectiveSceneLights);
+            // Skipped in immediate-2D mode, where the lighting UBO was never created because no 3D
+            // pass consumes it.
+            if (!Season.Rendering.Immediate2DMode.Enabled)
+            {
+                VKPrimitiveGroup.Update(
+                    elapsed,
+                    DeviceServices.BaseApp.CameraPos,
+                    DeviceServices.BaseApp.CameraTarget,
+                    DeviceServices.BaseApp.EffectiveSceneLights);
+            }
 
             DeviceServices.BaseApp.Update(elapsed);
+            if (DeviceServices.BaseApp.Status is not null) break;
 
             var backgroundColor = DeviceServices.BaseApp.BackgroundColor;
             VkDevice.BackgroundColor = backgroundColor;
@@ -558,10 +674,80 @@ public static class LinuxApp
             VkDevice.AfterRender();
         }
 
-        // Wait for the GPU to drain before cleanup.
-        Silk.NET.Vulkan.Vk.GetApi().DeviceWaitIdle(VkDevice.LogicalDevice);
+        // HostLifetime owns cleanup on normal exit and every exception path.
+    }
 
-        SDL.Quit();
+    /// <summary>
+    /// Windowed mode only: resize the OS window so its client area matches the given pixel size.
+    /// Mirrors WindowsApp.ApplyWindowClientSize: the app calls this right after applying a
+    /// display change (startup, resolution or presenter switch, all funneling through
+    /// SeasonBase.GraphicsApplyChanges) so the design resolution fills the client area 1:1 and no
+    /// letterbox is visible. Fullscreen is skipped (its bars are decided by the monitor aspect
+    /// ratio, not the window size), a maximized window is restored first because maximizing
+    /// ignores SDL_SetWindowSize, and nothing is re-applied on later user resizes, so manual
+    /// stretching is never fought. The window manager confirms the new size asynchronously; the
+    /// RunLoop picks the change up through RESIZED / PIXEL_SIZE_CHANGED and rebuilds the SwapChain
+    /// from the real pixel size.
+    /// </summary>
+    public static void ApplyWindowClientSize(int width, int height)
+    {
+        if (width <= 0 || height <= 0)
+        {
+            return;
+        }
+
+        var window = _window;
+        if (window == IntPtr.Zero)
+        {
+            return;
+        }
+
+        var flags = SDL.GetWindowFlags(window);
+
+        // Fullscreen keeps its presenter untouched: its bars cannot be removed by a window size.
+        if ((flags & WindowFlags.Fullscreen) != 0)
+        {
+            return;
+        }
+
+        if ((flags & WindowFlags.Minimized) != 0)
+        {
+            return;
+        }
+
+        if ((flags & WindowFlags.Maximized) != 0)
+        {
+            SDL.RestoreWindow(window);
+        }
+
+        // SDL_SetWindowSize takes logical window coordinates, while the target is the client area
+        // in physical pixels (which is what the SwapChain is sized from). On a high-density
+        // display the two differ by the window's pixel-to-logical ratio; on plain X11 the ratio
+        // is 1 and this is a straight pass-through.
+        float ratioX = 1f;
+        float ratioY = 1f;
+        if (SDL.GetWindowSizeInPixels(window, out int pixelW, out int pixelH)
+            && SDL.GetWindowSize(window, out int logicalW, out int logicalH)
+            && logicalW > 0 && logicalH > 0)
+        {
+            ratioX = (float)pixelW / logicalW;
+            ratioY = (float)pixelH / logicalH;
+        }
+        if (ratioX <= 0f) ratioX = 1f;
+        if (ratioY <= 0f) ratioY = 1f;
+
+        int targetW = (int)MathF.Round(width / ratioX);
+        int targetH = (int)MathF.Round(height / ratioY);
+
+        bool hasCurrent = SDL.GetWindowSize(window, out int currentW, out int currentH);
+        if (hasCurrent && currentW == targetW && currentH == targetH)
+        {
+            return;
+        }
+
+        Diag($"[WindowState][Fit] source=ApplyWindowClientSize clientBefore=({currentW},{currentH}) target=({targetW},{targetH}) pixels=({width},{height})");
+
+        SDL.SetWindowSize(window, targetW, targetH);
     }
 
     static Rect GetInitialWindowRect(BaseApp app, int displayWidth, int displayHeight, ref WindowFlags flags)

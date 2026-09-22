@@ -11,19 +11,22 @@ internal class WGPUTexture
     public uint Height { get; set; }
 
     int _refCount;
+    internal Action<WGPUTexture>? OnReleased;
+    // Legacy name-only material owners retain resources until the Web host ends.
+    internal bool HostOwned;
     public int RefCount => _refCount;
 
     public void AddRef() => Interlocked.Increment(ref _refCount);
 
     /// <summary>
     /// Releases one reference. When the reference count reaches zero, the texture is removed from the global cache.
-    /// Web GPU resources are managed by the JS-side seasonWebGPU layer; this method only clears C#-side metadata.
+    /// The owning Graphics instance retires the JS texture after pending GPU work completes.
     /// </summary>
     public void Release()
     {
         if (Interlocked.Decrement(ref _refCount) == 0)
         {
-            // The texture is no longer referenced by any Sprite2D; the caller is responsible for removing it from DictionaryWGPUTexture.
+            OnReleased?.Invoke(this);
         }
     }
 

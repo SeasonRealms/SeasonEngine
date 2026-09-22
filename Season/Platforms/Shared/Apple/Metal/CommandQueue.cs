@@ -30,6 +30,11 @@ internal sealed class CommandQueue : IDisposable
     public IMTLCommandBuffer CreateCommandBuffer()
     {
         var cmd = NativeQueue.CommandBuffer() ?? throw new Exception("IMTLCommandQueue.CommandBuffer returned null");
+        if (!cmd.RetainedReferences)
+        {
+            cmd.Dispose();
+            throw new InvalidOperationException("Season requires Metal command buffers with retained resource references.");
+        }
         return cmd;
     }
 
