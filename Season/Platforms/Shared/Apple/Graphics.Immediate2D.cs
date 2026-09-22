@@ -4,6 +4,7 @@
 
 using Season.Platforms.Shared.Apple.Metal;
 using MtlTexture = Season.Platforms.Shared.Apple.Metal.Texture;
+using FontFace = global::Season.Fonts.Font;
 
 namespace Season.Platforms.Shared.Apple;
 
@@ -41,9 +42,11 @@ internal unsafe partial class Graphics
 
     sealed class ImmediateBackend(Graphics owner) : IImmediate2DBackend
     {
-        const int RasterSize = 64;
+        // Must match the other immediate backends so one baked raster serves every 2D display size.
+        const int RasterSize = 48;
         readonly object _lifetime = new();
         readonly HashSet<ImageLease> _leases = new();
+        readonly Dictionary<string, int> _prewarmCursors = new();
         readonly List<(MtlTexture Texture, Draw2DConstants Constants)> _quads = new(256);
         Draw2DPipeline? _pipeline;
         Draw2D? _prepared;
@@ -100,6 +103,15 @@ internal unsafe partial class Graphics
                     catch { Release(lease); throw; }
                 }
             }
+            finally { BaseApp.ResizeSemaphore.Release(); }
+        }
+
+        public int PrewarmGlyphs(FontFace font, int maxCount)
+        {
+            ArgumentNullException.ThrowIfNull(font);
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            BaseApp.ResizeSemaphore.Wait();
+            try { return GlyphPrewarm.Run(owner._glyphAtlas, RasterSize, font, maxCount, _prewarmCursors); }
             finally { BaseApp.ResizeSemaphore.Release(); }
         }
 

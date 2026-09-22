@@ -489,13 +489,23 @@ public static class WebApp
     /// equivalent to writing TouchService directly from event callbacks on Windows/Linux/Android.
     /// JS-side <c>poX/poY</c> are backing-pixel coordinates. Dividing them by <see cref="BaseApp.Scale"/>
     /// yields BasicResolution coordinates, matching the behavior of WindowsApp.PointerMoved.
+    /// The trailing snapshot element mirrors page focus into <see cref="BaseApp.IsActive"/>,
+    /// the gate the game layer checks before processing any press.
     /// </summary>
     static void PollInput(BaseApp app)
     {
         try
         {
-            // [JSImport] Packed variant: [isDown(0/1), poX, poY, poZDelta], bypassing JSON deserialization.
+            // [JSImport] Packed variant: [isDown(0/1), poX, poY, poZDelta, active(0/1)], bypassing JSON deserialization.
             var snap = WebGPUInterop.PollInput();
+
+            // Page focus -> BaseApp.IsActive: the game layer gates all input on
+            // SeasonBase.IsActive (InputManager.Update and ScreenManager.HandleInput
+            // drop every press while it is false), so a focused page must report
+            // active from the first frame - the same contract WindowsApp/LinuxApp
+            // keep from window activation events. Trailing-element-less snapshots
+            // from older JS copies keep the always-active behavior.
+            app.IsActive = snap.Length <= 4 || snap[4] != 0;
 
             float scale = app.Scale > 0f ? app.Scale : 1f;
             TouchService.PoX = (int)(snap[1] / scale);

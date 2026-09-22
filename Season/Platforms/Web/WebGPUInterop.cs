@@ -135,7 +135,9 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.applyPendingResizePacked")]
     internal static partial int[] ApplyPendingResize();
 
-    /// <summary>Returns [isDown(0/1), poX, poY, poZDelta]; JS clears poZDelta after the call.</summary>
+    /// <summary>Returns [isDown(0/1), poX, poY, poZDelta, active(0/1)]; JS clears poZDelta after the call.
+    /// The trailing active flag mirrors page focus and drives BaseApp.IsActive
+    /// (older JS copies may return only the first four elements).</summary>
     [JSImport("globalThis.seasonWebGPU.pollInputPacked")]
     internal static partial double[] PollInput();
 

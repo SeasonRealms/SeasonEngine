@@ -3,6 +3,7 @@
 // https://github.com/SeasonRealms/SeasonEngine
 
 using Microsoft.JSInterop;
+using FontFace = global::Season.Fonts.Font;
 
 namespace Season.Platforms.Web;
 
@@ -46,7 +47,10 @@ internal partial class Graphics
 
     sealed class ImmediateBackend(Graphics owner) : IImmediate2DBackend
     {
+        // Must match the other immediate backends so one baked raster serves every 2D display size.
+        const int RasterSize = 48;
         readonly HashSet<ImageLease> _leases = new();
+        readonly Dictionary<string, int> _prewarmCursors = new();
         readonly List<float> _parameters = new();
         readonly List<string> _textures = new();
         Draw2D? _prepared;
@@ -91,6 +95,13 @@ internal partial class Graphics
             return LoadImage(name, designSize);
         }
 
+        public int PrewarmGlyphs(FontFace font, int maxCount)
+        {
+            ArgumentNullException.ThrowIfNull(font);
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return GlyphPrewarm.Run(owner._glyphAtlas, RasterSize, font, maxCount, _prewarmCursors);
+        }
+
         public void Prepare(Draw2D frame)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -111,11 +122,11 @@ internal partial class Graphics
                 WGPUTexture texture;
                 if (command.Kind == Draw2DKind.Glyph)
                 {
-                    if (!owner._glyphAtlas.TryEnsureStableGlyph(command.Font!, 64, command.CodePoint, out var entry, out texture))
+                    if (!owner._glyphAtlas.TryEnsureStableGlyph(command.Font!, RasterSize, command.CodePoint, out var entry, out texture))
                         throw new InvalidOperationException($"Cannot rasterize U+{command.CodePoint:X}.");
                     var m = entry.GlyphMetrics;
                     if (!m.HasPlaneBounds) throw new InvalidOperationException("MSDF plane bounds required.");
-                    float scale = command.FontSize / 64f * command.GlyphScale;
+                    float scale = command.FontSize / (float)RasterSize * command.GlyphScale;
                     destination = new(destination.X + m.PlaneLeft * scale, destination.Y - m.PlaneTop * scale,
                         (m.PlaneRight - m.PlaneLeft) * scale, (m.PlaneTop - m.PlaneBottom) * scale);
                     source = new(entry.SourceX, entry.SourceY, entry.SourceWidth, entry.SourceHeight);

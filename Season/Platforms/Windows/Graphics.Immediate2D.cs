@@ -3,6 +3,7 @@
 // https://github.com/SeasonRealms/SeasonEngine
 
 using Season.Platforms.Windows.DirectX;
+using FontFace = global::Season.Fonts.Font;
 
 namespace Season.Platforms.Windows;
 
@@ -24,9 +25,11 @@ internal unsafe partial class Graphics
     sealed class ImmediateBackend(Graphics owner) : IImmediate2DBackend
     {
         // The pixel density of the grating is fixed, and the logical font size only affects the target geometry, without creating new cache entries with DPI/scaling.
-        const int RasterSize = 64;
+        // 48 keeps the whole 2D display range (26/28/48/50) on one shared raster while shrinking glyph boxes ~44% versus 64.
+        const int RasterSize = 48;
         readonly object _lifetime = new();
         readonly HashSet<ImageLease> _leases = new();
+        readonly Dictionary<string, int> _prewarmCursors = new();
         readonly List<(DXTexture Texture, Draw2DConstants Constants)> _quads = new(256);
         Draw2DPipeline? _pipeline;
         Draw2D? _prepared;
@@ -76,6 +79,15 @@ internal unsafe partial class Graphics
                     return new Image2D(name, designSize, lease);
                 }
             }
+            finally { BaseApp.ResizeSemaphore.Release(); }
+        }
+
+        public int PrewarmGlyphs(FontFace font, int maxCount)
+        {
+            ArgumentNullException.ThrowIfNull(font);
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            BaseApp.ResizeSemaphore.Wait();
+            try { return GlyphPrewarm.Run(owner._glyphAtlas, RasterSize, font, maxCount, _prewarmCursors); }
             finally { BaseApp.ResizeSemaphore.Release(); }
         }
 

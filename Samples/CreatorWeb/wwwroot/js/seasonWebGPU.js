@@ -448,6 +448,13 @@ window.seasonWebGPU = (() => {
     const _input = { isDown: false, poX: 0, poY: 0, poZDelta: 0 };
     let _pinchPrev = 0;
     let _isPinching = false;
+    // Page focus gate:
+    // the C# side mirrors this into BaseApp.IsActive, which the game layer
+    // (InputManager.Update) requires before any press is processed - the same
+    // contract WindowsApp/LinuxApp fulfill from window activation events.
+    // A blurred page must report inactive so a press held while switching away
+    // cannot read as stuck-down, and focus regained re-enables input.
+    let _pageActive = true;
 
     // Resize handling:
     // apply window-size changes at the beginning of the next frame
@@ -555,6 +562,23 @@ window.seasonWebGPU = (() => {
         _canvas.addEventListener('gesturestart', (e) => e.preventDefault());
         _canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
+        // Page focus tracking (see _pageActive): initial state comes from the live
+        // document, then window focus/blur and tab visibility keep it current.
+        _pageActive = document.hasFocus();
+        window.addEventListener('focus', () => { _pageActive = true; });
+        window.addEventListener('blur', () => {
+            _pageActive = false;
+            // A mouseup missed while the page was away must not be read as a
+            // held press on the next activation (matching Windows pointer-capture-lost
+            // and Linux focus-lost handling).
+            _input.isDown = false;
+            _isPinching = false;
+            _pinchPrev = 0;
+        });
+        document.addEventListener('visibilitychange', () => {
+            _pageActive = !document.hidden && document.hasFocus();
+        });
+
         _attachKeyboardHandlers();
     }
 
@@ -622,6 +646,7 @@ window.seasonWebGPU = (() => {
             poX: _input.poX,
             poY: _input.poY,
             poZDelta: _input.poZDelta,
+            active: _pageActive,
         };
         _input.poZDelta = 0;
         return snapshot;
@@ -629,10 +654,13 @@ window.seasonWebGPU = (() => {
 
     // [JSImport] variant (Phase 2):
     // return a plain numeric array and bypass JSON serialization/deserialization.
-    // Layout: [isDown(0/1), poX, poY, poZDelta].
+    // Layout: [isDown(0/1), poX, poY, poZDelta, active(0/1)].
     // After reading, poZDelta is cleared, matching pollInput semantics.
+    // The trailing active flag drives BaseApp.IsActive on the C# side; keep this
+    // in sync with WebGPUInterop.PollInput (older copies may omit it, in which
+    // case the C# reader falls back to always-active).
     function pollInputPacked() {
-        const packed = [_input.isDown ? 1 : 0, _input.poX, _input.poY, _input.poZDelta];
+        const packed = [_input.isDown ? 1 : 0, _input.poX, _input.poY, _input.poZDelta, _pageActive ? 1 : 0];
         _input.poZDelta = 0;
         return packed;
     }

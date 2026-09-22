@@ -110,6 +110,12 @@ public class Font
     public FontMetrics FontMetrics;
     readonly string _fileName;
     readonly byte[] _fontBytes;
+
+    /// <summary>
+    /// Normalized file-name identity shared by every instance loaded from the same font file.
+    /// The glyph atlas and the pre-baked glyph pack registry both key on this value.
+    /// </summary>
+    public string FileKey { get; }
     // Metrics belong to font instances and cannot share the results of different fonts using global font size/code point keys.
     readonly System.Collections.Concurrent.ConcurrentDictionary<(int FontSize, int CodePoint), GlyphMetrics> _layoutMetrics = new();
     readonly object _rasterizeSync = new();
@@ -173,6 +179,7 @@ public class Font
     {
         _fileName = fileName;
         _fontBytes = fontBytes;
+        FileKey = GlyphPackRegistry.NormalizeFileName(fileName);
 
         using (var stream = new MemoryStream(_fontBytes, writable: false))
         {
@@ -255,6 +262,13 @@ public class Font
         }
     }
 
+    /// <summary>
+    /// Rasterizer identity recorded inside pre-baked glyph packs. A pack whose fingerprint
+    /// differs from these live constants is rejected at registration time.
+    /// </summary>
+    internal static (float PixelRange, float MinMsdfGlyphScale, float MsdfOversampleFactor, bool NativeBackend) PipelineFingerprint
+        => (PixelRange, MinMsdfGlyphScale, MsdfOversampleFactor, UseNativeMsdfgenBackend);
+
     public (byte[] colorBuffer, GlyphMetrics glyphMetrics, float pixelRange, int textureWidth, int textureHeight) CreateMsdfGlyph(int fontSize, int codePoint)
     {
         // The backend loading of the control and the instant frame may request the same font simultaneously; Shape cache and rasterizer cannot be modified concurrently.
@@ -264,6 +278,11 @@ public class Font
 
     (byte[] colorBuffer, GlyphMetrics glyphMetrics, float pixelRange, int textureWidth, int textureHeight) CreateMsdfGlyphCore(int fontSize, int codePoint)
     {
+        // Pre-baked glyph pack bypass: the pack was produced by this very method (SeasonGlyphBake
+        // links this file), so a hit returns byte-identical data. A miss falls through unchanged.
+        if (GlyphPackRegistry.TryFetch(FileKey, fontSize, codePoint, out var packed))
+            return new(packed.ColorBuffer, packed.GlyphMetrics, packed.PixelRange, packed.TextureWidth, packed.TextureHeight);
+
         const float angleThreshold = 3f;
         const int effectAmount = 1;
 

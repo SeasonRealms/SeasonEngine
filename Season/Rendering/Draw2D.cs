@@ -24,6 +24,12 @@ public interface IImmediate2DBackend : IDisposable
     Image2D LoadImage(string name, Vector2 designSize);
     Task<Image2D> LoadImageAsync(string name, Vector2 designSize)
         => Task.Run(() => LoadImage(name, designSize));
+    /// <summary>
+    /// Batch-loads up to <paramref name="maxCount"/> glyphs of the font's pre-baked glyph pack into the
+    /// platform glyph atlas. Called on the frame thread (loading screens). Returns the number of glyphs
+    /// added; 0 means no pack is registered for the font or pre-warming is already complete.
+    /// </summary>
+    int PrewarmGlyphs(FontFace font, int maxCount);
     void Prepare(Draw2D frame);
     void Submit(Draw2D frame);
     void CompleteFrame();

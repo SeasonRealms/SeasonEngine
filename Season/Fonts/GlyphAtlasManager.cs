@@ -6,7 +6,10 @@ namespace Season.Fonts;
 
 // Shared types, platform-independent.
 
-internal readonly record struct GlyphAtlasKey(int FontSize, int CodePoint, Font? Font = null);
+// The font identity is the normalized font file name (Font.FileKey), not the Font instance:
+// all instances of one file (e.g. the 28px and 50px pair) share stable-page entries, since
+// rasterization output depends only on (font file bytes, raster size, code point).
+internal readonly record struct GlyphAtlasKey(int FontSize, int CodePoint, string? FontKey = null);
 
 internal readonly struct GlyphAtlasEntry
 {
@@ -178,7 +181,7 @@ internal sealed class GlyphAtlasManager<TTexture> : IDisposable
         out GlyphAtlasEntry entry, out bool full)
     {
         full = false;
-        var key = new GlyphAtlasKey(fontSize, codePoint, explicitFont);
+        var key = new GlyphAtlasKey(fontSize, codePoint, explicitFont?.FileKey);
 
         lock (_sync)
         {
@@ -336,7 +339,7 @@ internal sealed class GlyphAtlasManager<TTexture> : IDisposable
     {
         lock (_stableSync)
         {
-            var key = new GlyphAtlasKey(size, codePoint, font);
+            var key = new GlyphAtlasKey(size, codePoint, font.FileKey);
             foreach (var page in _stablePages)
             {
                 if (page._entries.TryGetValue(key, out entry))
