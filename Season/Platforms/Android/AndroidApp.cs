@@ -992,6 +992,51 @@ public class BaseActivity : Activity
 
         base.Window.Attributes!.LayoutInDisplayCutoutMode = LayoutInDisplayCutoutMode.ShortEdges;
 
+        // Hide both system bars; re-applied whenever the window regains focus.
+        ApplyImmersiveFullscreen();
+
+        // Create the Vulkan rendering SurfaceView and install it as the root view.
+        // The system triggers SurfaceCreated asynchronously after base.OnCreate,
+        // and Vulkan bootstrap begins there.
+        AndroidApp.SurfaceView = new SurfaceViewVulkan(this);
+        SetContentView(AndroidApp.SurfaceView);
+    }
+
+    protected override void OnPause()
+    {
+        if (ReferenceEquals(AndroidApp.MainActivity, this)) AndroidApp.Pause();
+        base.OnPause();
+    }
+
+    protected override void OnResume()
+    {
+        base.OnResume();
+        if (ReferenceEquals(AndroidApp.MainActivity, this)) AndroidApp.Resume();
+    }
+
+    /// <summary>
+    /// Re-apply fullscreen whenever the window regains focus. Vendor ROMs commonly re-show the
+    /// status and navigation bars after a trip to recents, a lock screen, or a system dialog, and
+    /// the immersive state is not restored automatically; re-applying is idempotent (setting the
+    /// same flags again is a no-op for the system) and is the standard immersive-mode recipe.
+    /// </summary>
+    public override void OnWindowFocusChanged(bool hasFocus)
+    {
+        base.OnWindowFocusChanged(hasFocus);
+
+        if (hasFocus) ApplyImmersiveFullscreen();
+    }
+
+    /// <summary>
+    /// Hide both system bars and let the window extend behind them.
+    /// API 30+ uses the window insets controller; Android 10 and below use the legacy system-ui
+    /// flags, because InsetsController and SetDecorFitsSystemWindows do not exist there and
+    /// FLAG_FULLSCREEN alone would leave the navigation bar visible (a white strip under the
+    /// content on a light theme). ImmersiveSticky mirrors the API 30+ ShowTransientBarsBySwipe
+    /// behavior: a system swipe reveals the bars temporarily, and they hide again on their own.
+    /// </summary>
+    void ApplyImmersiveFullscreen()
+    {
         if (OperatingSystem.IsAndroidVersionAtLeast(30))
         {
             try
@@ -1016,11 +1061,6 @@ public class BaseActivity : Activity
         }
         else
         {
-            // Android 10 and below: InsetsController and SetDecorFitsSystemWindows are API 30+, so
-            // FLAG_FULLSCREEN alone hides only the status bar and leaves the navigation bar visible -
-            // on a light theme that shows up as a white strip under the content. The legacy system-ui
-            // flags hide both bars and let the window extend behind them; ImmersiveSticky mirrors the
-            // API 30+ ShowTransientBarsBySwipe behavior: a system swipe reveals the bars temporarily.
             base.Window.DecorView.SystemUiVisibility = (StatusBarVisibility)(
                 SystemUiFlags.LayoutStable
                 | SystemUiFlags.LayoutHideNavigation
@@ -1029,24 +1069,6 @@ public class BaseActivity : Activity
                 | SystemUiFlags.Fullscreen
                 | SystemUiFlags.ImmersiveSticky);
         }
-
-        // Create the Vulkan rendering SurfaceView and install it as the root view.
-        // The system triggers SurfaceCreated asynchronously after base.OnCreate,
-        // and Vulkan bootstrap begins there.
-        AndroidApp.SurfaceView = new SurfaceViewVulkan(this);
-        SetContentView(AndroidApp.SurfaceView);
-    }
-
-    protected override void OnPause()
-    {
-        if (ReferenceEquals(AndroidApp.MainActivity, this)) AndroidApp.Pause();
-        base.OnPause();
-    }
-
-    protected override void OnResume()
-    {
-        base.OnResume();
-        if (ReferenceEquals(AndroidApp.MainActivity, this)) AndroidApp.Resume();
     }
 
     protected override void OnDestroy()
