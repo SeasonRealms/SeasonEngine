@@ -38,7 +38,8 @@ namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 ///   all passes use a negative-height viewport, set by BeginPass from the target size.
 ///   Offscreen and backbuffer content layouts therefore match, and FinalBlit keeps identity mapping with no direction compensation.
 /// - resource destruction:
-///   runtime destruction must go through EnqueueDeferredRelease for timeline-gated deferred release,
+///   runtime destruction must go through EnqueueDeferredRelease for retire-value-gated deferred release
+///   (timeline semaphore on 1.2 devices, VkFence tracking on the 1.1 fallback),
 ///   because Android tilers must not destroy in-flight resources immediately.
 ///   During resize, resources may be destroyed and recreated immediately only after DeviceWaitIdle,
 ///   with MatchBackbufferSize members inside OffscreenTargets recreated in place.
@@ -70,6 +71,15 @@ internal unsafe static class Device
     /// the value is read from the device rather than assumed. Zero until PickPhysicalDevice runs; 1 when unsupported.
     /// </summary>
     internal static float MaxSamplerAnisotropy;
+
+    /// <summary>
+    /// Whether the picked device reports core Vulkan 1.2 (apiVersion >= VK_API_VERSION_1_2), which enables
+    /// the timeline-semaphore synchronization path in CommandQueue. False selects the VkFence fallback so
+    /// 1.1-only devices, old games and old hardware, stay usable; VK_KHR_timeline_semaphore is deliberately
+    /// not probed because old Android drivers rarely expose it. Populated by PickPhysicalDevice before
+    /// CreateLogicalDevice reads it.
+    /// </summary>
+    internal static bool TimelineSemaphoreEnabled;
 
     internal static Silk.NET.Vulkan.Device LogicalDevice;
 
@@ -161,10 +171,10 @@ internal unsafe static class Device
 
     internal static FrameContext[] FrameContexts = null!;
 
-    /// <summary>Target timeline value per frame. GraphicsCommandQueue.WaitForFence(_fenceValues[FrameIndex]) reproduces the DX fenceValues[FrameIndex] pattern.</summary>
+    /// <summary>Per-slot completion value of the frame, carried by the timeline semaphore on 1.2 devices and by a registered VkFence on the 1.1 fallback. GraphicsCommandQueue.WaitForFence(_fenceValues[FrameIndex]) reproduces the DX fenceValues[FrameIndex] pattern.</summary>
     static ulong[] _fenceValues = null!;
 
-    /// <summary>Monotonic timeline counter. AfterRender increments it by 1 each time and writes the result into the current frame's _fenceValues.</summary>
+    /// <summary>Monotonic frame-completion counter. AfterRender increments it by 1 each time and writes the result into the current frame's _fenceValues.</summary>
     static ulong _nextFenceValue;
 
     // -- Deferred release, aligned with DX Graphics.EnqueueDeferredRelease and PumpDeferredReleases --
@@ -187,7 +197,7 @@ internal unsafe static class Device
 
     internal static ulong NextViewVersion() => Interlocked.Increment(ref _viewVersionSeed);
 
-    /// <summary>Timeline value that the currently recording frame will signal. All in-flight frames earlier than this one have smaller signal values, so waiting for it is sufficient for safety.</summary>
+    /// <summary>Completion value that the currently recording frame will signal. All in-flight frames earlier than this one have smaller signal values, so waiting for it is sufficient for safety.</summary>
     internal static ulong GetCurrentRetireFenceValue() => _nextFenceValue + 1;
 
     /// <summary>Enqueue a release action into the deferred-release queue.
@@ -348,6 +358,15 @@ internal unsafe static class Device
 
         var result = Vk.CreateInstance(in createInfo, null, out var instance);
 
+        // Pre-1.2 loaders reject a higher instance request outright instead of negotiating it down,
+        // so a VK_ERROR_INCOMPATIBLE_DRIVER falls back to 1.1. Nothing at the instance level needs
+        // 1.2: the device-side CommandQueue fallback keeps 1.1 GPUs fully usable.
+        if (result == Result.ErrorIncompatibleDriver)
+        {
+            appInfo.ApiVersion = Vk.Version11;
+            result = Vk.CreateInstance(in createInfo, null, out instance);
+        }
+
         SilkMarshal.Free(appNamePtr);
         SilkMarshal.Free(engineNamePtr);
         SilkMarshal.Free(extPtr);
@@ -449,6 +468,12 @@ internal unsafe static class Device
         Vk.GetPhysicalDeviceProperties(picked, out var pickedProps);
         SupportsSamplerAnisotropy = pickedFeatures.SamplerAnisotropy;
         MaxSamplerAnisotropy = SupportsSamplerAnisotropy ? pickedProps.Limits.MaxSamplerAnisotropy : 1f;
+
+        // Sync-path capability probe consumed by CreateLogicalDevice, CommandQueue, and ShaderCompiler:
+        // only core 1.2 devices may enable the timeline-semaphore feature, everything else takes the
+        // VkFence fallback. See the field doc for why the KHR extension is not probed.
+        TimelineSemaphoreEnabled = pickedProps.ApiVersion >= Vk.Version12;
+        DeviceServices.BaseApp?.AddLog(LogType.Backend, $"{DateTime.UtcNow} [VK] device apiVersion=0x{pickedProps.ApiVersion:X} syncPath={(TimelineSemaphoreEnabled ? "timeline-semaphore" : "fence-fallback")}");
         if (!pickedFeatures.IndependentBlend)
         {
             RenderQuality.Current.MotionVectors = false;
@@ -570,8 +595,9 @@ internal unsafe static class Device
             IndependentBlend = supportedFeatures.IndependentBlend
         };
 
-        // Vulkan 1.2 feature:
-        // enable timeline semaphores to align with DX12 monotonic fence semantics.
+        // Vulkan 1.2 feature, requested only when the device reports core 1.2: enabling a feature the
+        // device does not advertise would fail vkCreateDevice on 1.1 hardware. Devices without it take
+        // the VkFence fallback in CommandQueue, which keeps the same monotonic-value contract.
         var vk12Features = new PhysicalDeviceVulkan12Features
         {
             SType = StructureType.PhysicalDeviceVulkan12Features,
@@ -589,7 +615,7 @@ internal unsafe static class Device
             DeviceCreateInfo createInfo = new()
             {
                 SType = StructureType.DeviceCreateInfo,
-                PNext = &vk12Features,
+                PNext = TimelineSemaphoreEnabled ? &vk12Features : null,
                 QueueCreateInfoCount = (uint)queueCreateInfos.Length,
                 PQueueCreateInfos = qcip,
                 PEnabledFeatures = &features,
@@ -967,7 +993,8 @@ internal unsafe static class Device
     /// The fence for the same slot was already waited at the end of the previous frame in AfterRender, aligned with DX MoveToNextFrame,
     /// so CPU writes to per-frame buffers during this frame's Update phase never race with GPU reads.
     /// Equivalent to DX Device.BeforeRender.
-    /// Returning false means the swapchain is still OutOfDate, for example during interactive dragging, minimization, or ResizeSemaphore timeout.
+    /// Returning false means the swapchain is still OutOfDate, for example during interactive dragging, minimization, or ResizeSemaphore timeout,
+    /// or that the surface was lost as the app moves to the background.
     /// In that case the whole frame must be skipped, with no Draw and no AfterRender, and the next loop retries using the latest size.
     /// </summary>
     internal static bool BeforeRender()
@@ -1004,8 +1031,25 @@ internal unsafe static class Device
                 DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [VK] Acquire still OutOfDate after resize, skip frame");
                 return false;
             }
+            if (acquireResult == Result.ErrorSurfaceLostKhr)
+            {
+                // The surface died while the swapchain was being rebuilt, for example because the
+                // app was backgrounded again during the resize. ImageAvailable is not signaled, so
+                // the frame must be skipped; OnSurfaceLost and the next SurfaceCreated converge.
+                DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [VK] Acquire SurfaceLost after resize, skip frame");
+                return false;
+            }
             if (acquireResult != Result.Success && acquireResult != Result.SuboptimalKhr)
                 throw new Exception($"vkAcquireNextImageKHR failed after resize: {acquireResult}");
+        }
+        else if (acquireResult == Result.ErrorSurfaceLostKhr)
+        {
+            // The surface is being destroyed, typically because Android tears it down as the app
+            // moves to the background. ImageAvailable is not signaled, so the frame must be skipped:
+            // AfterRender would otherwise submit a wait on an unsignaled semaphore and can hang the
+            // queue. OnSurfaceLost releases the swapchain and the next SurfaceCreated soft-restarts
+            // it; the result change itself is already logged above.
+            return false;
         }
 
         frame.SetRenderTarget(SwapChain.Images[imageIndex], SwapChain.ImageViews[imageIndex], Display.Framebuffers[imageIndex]);
@@ -1573,47 +1617,76 @@ internal unsafe static class Device
         Trace("frame.End");
         frame.End();
 
-        // Submit and signal both the binary RenderFinished semaphore for present and the timeline value for the next CPU wait on the same frame slot.
+        // Submit and signal both the binary RenderFinished semaphore for present and the completion value
+        // for the next CPU wait on the same frame slot: through the timeline semaphore on 1.2 devices,
+        // or through a registered VkFence on the 1.1 fallback. The completion-value contract is identical.
         _nextFenceValue++;
         ulong signalTimeline = _nextFenceValue;
-        ulong dummyWaitValue = 0;
 
         var imgAvail = frame.ImageAvailable;
         // RenderFinished is indexed by swapchain image. See the note on RecreateRenderFinishedSemaphores.
         var renderDone = _renderFinishedPerImage[SwapChain.CurrentImageIndex];
-        var timelineSem = GraphicsCommandQueue.TimelineSemaphore;
-
-        var signalSems = stackalloc Silk.NET.Vulkan.Semaphore[2] { renderDone, timelineSem };
-        var signalValues = stackalloc ulong[2] { 0, signalTimeline };
-
-        var timelineInfo = new TimelineSemaphoreSubmitInfo
-        {
-            SType = StructureType.TimelineSemaphoreSubmitInfo,
-            WaitSemaphoreValueCount = 1,
-            PWaitSemaphoreValues = &dummyWaitValue,
-            SignalSemaphoreValueCount = 2,
-            PSignalSemaphoreValues = signalValues
-        };
 
         var waitStage = PipelineStageFlags.ColorAttachmentOutputBit;
         var cmd = frame.CommandList;
 
-        var submit = new SubmitInfo
-        {
-            SType = StructureType.SubmitInfo,
-            PNext = &timelineInfo,
-            WaitSemaphoreCount = 1,
-            PWaitSemaphores = &imgAvail,
-            PWaitDstStageMask = &waitStage,
-            CommandBufferCount = 1,
-            PCommandBuffers = &cmd,
-            SignalSemaphoreCount = 2,
-            PSignalSemaphores = signalSems
-        };
-
         Trace("QueueSubmit");
-        if (Vk.QueueSubmit(GraphicsQueue, 1, in submit, default) != Result.Success)
-            throw new Exception("vkQueueSubmit (graphics) failed");
+        if (GraphicsCommandQueue.TimelineMode)
+        {
+            ulong dummyWaitValue = 0;
+            var timelineSem = GraphicsCommandQueue.TimelineSemaphore;
+
+            var signalSems = stackalloc Silk.NET.Vulkan.Semaphore[2] { renderDone, timelineSem };
+            var signalValues = stackalloc ulong[2] { 0, signalTimeline };
+
+            var timelineInfo = new TimelineSemaphoreSubmitInfo
+            {
+                SType = StructureType.TimelineSemaphoreSubmitInfo,
+                WaitSemaphoreValueCount = 1,
+                PWaitSemaphoreValues = &dummyWaitValue,
+                SignalSemaphoreValueCount = 2,
+                PSignalSemaphoreValues = signalValues
+            };
+
+            var submit = new SubmitInfo
+            {
+                SType = StructureType.SubmitInfo,
+                PNext = &timelineInfo,
+                WaitSemaphoreCount = 1,
+                PWaitSemaphores = &imgAvail,
+                PWaitDstStageMask = &waitStage,
+                CommandBufferCount = 1,
+                PCommandBuffers = &cmd,
+                SignalSemaphoreCount = 2,
+                PSignalSemaphores = signalSems
+            };
+
+            if (Vk.QueueSubmit(GraphicsQueue, 1, in submit, default) != Result.Success)
+                throw new Exception("vkQueueSubmit (graphics) failed");
+        }
+        else
+        {
+            // 1.1 fallback: only the binary RenderFinished semaphore is signaled by the submission itself;
+            // the completion value rides on a VkFence that PrepareSubmit registers before the submission,
+            // so a concurrent WaitForFence(signalTimeline) can always find and wait on it.
+            var signalSems = stackalloc Silk.NET.Vulkan.Semaphore[1] { renderDone };
+
+            var submit = new SubmitInfo
+            {
+                SType = StructureType.SubmitInfo,
+                WaitSemaphoreCount = 1,
+                PWaitSemaphores = &imgAvail,
+                PWaitDstStageMask = &waitStage,
+                CommandBufferCount = 1,
+                PCommandBuffers = &cmd,
+                SignalSemaphoreCount = 1,
+                PSignalSemaphores = signalSems
+            };
+
+            var submitFence = GraphicsCommandQueue.PrepareSubmit(signalTimeline);
+            if (Vk.QueueSubmit(GraphicsQueue, 1, in submit, submitFence) != Result.Success)
+                throw new Exception("vkQueueSubmit (graphics) failed");
+        }
 
         _fenceValues[FrameIndex] = signalTimeline;
 
@@ -1726,7 +1799,7 @@ internal unsafe static class Device
                 if (rt.Desc.MatchBackbufferSize)
                     rt.Recreate((uint)fbW, (uint)fbH);
 
-            // Clear fence state so the next WaitForFence does not use stale timeline values.
+            // Clear fence state so the next WaitForFence does not use stale completion values.
             // Do not reset FrameIndex.
             // Update may already have written per-frame buffers for the current FrameIndex,
             // and switching slots mid-frame would make this frame read stale data from another slot.
@@ -1809,7 +1882,10 @@ internal unsafe static class Device
         // were allocated from the initial frameCount.
         // Changing it here would cause index overflow or slot confusion.
         // In-flight frame count and swapchain image count do not need to match.
-        RecreateRenderFinishedSemaphores();
+        // Rebuild every swapchain-attached semaphore, not only the per-image RenderFinished ones:
+        // a soft restart can follow a frame that died after acquiring an image, and the stale
+        // ImageAvailable of that slot must never be reused (see RecreateFrameSemaphores).
+        RecreateFrameSemaphores();
         DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [VK] RecreateSurfaceAndSwapChain requested={width}x{height} -> extent={SwapChain.Extent.Width}x{SwapChain.Extent.Height} images={SwapChain.FrameCount} presentMode={SwapChain.PresentMode}");
 
         // 4) Recreate the Display backend, keeping the existing RenderPass and refreshing only framebuffer, depth, and viewport.
@@ -1829,6 +1905,31 @@ internal unsafe static class Device
                 rt.Recreate((uint)fbW, (uint)fbH);
 
         // 5) Clear fence state without resetting FrameIndex, for the same reason as HandleResize.
+        for (int i = 0; i < _fenceValues.Length; i++) _fenceValues[i] = 0;
+    }
+
+    /// <summary>
+    /// Rebuild every semaphore attached to the swapchain: the per-frame ImageAvailable used by
+    /// acquire and the per-image RenderFinished waited by present. Called after a frame died
+    /// between acquiring an image and submitting it: that slot's ImageAvailable stays signaled, and
+    /// passing a signaled semaphore back to vkAcquireNextImageKHR is forbidden and can hang the
+    /// acquire. The caller must guarantee the render thread has stopped touching frame state;
+    /// DeviceWaitIdle runs first so nothing referenced by in-flight GPU work is destroyed, and the
+    /// fence bookkeeping is reset exactly as HandleResize does after its wait.
+    /// </summary>
+    internal static void RecreateFrameSemaphores()
+    {
+        if (LogicalDevice.Handle == 0 || FrameContexts == null) return;
+
+        CheckResult(Vk.DeviceWaitIdle(LogicalDevice));
+
+        foreach (var frame in FrameContexts)
+            frame?.RecreateSyncSemaphores();
+
+        if (SwapChain != null)
+            RecreateRenderFinishedSemaphores();
+
+        // After DeviceWaitIdle every slot is safe, and stale completion values must not be waited again.
         for (int i = 0; i < _fenceValues.Length; i++) _fenceValues[i] = 0;
     }
 

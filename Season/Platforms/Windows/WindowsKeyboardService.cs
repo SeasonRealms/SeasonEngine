@@ -140,6 +140,11 @@ internal sealed class WindowsKeyboardService : Basic.IKeyboardService
             return (Basic.Key)(Basic.Key.D0 + vk - '0');
         }
 
+        if (vk >= 0x60 && vk <= 0x69)
+        {
+            return (Basic.Key)(Basic.Key.D0 + vk - 0x60); // VK_NUMPAD0..VK_NUMPAD9
+        }
+
         return vk switch
         {
             0x20 => Basic.Key.Space,                       // VK_SPACE
@@ -147,6 +152,7 @@ internal sealed class WindowsKeyboardService : Basic.IKeyboardService
             0x1B => Basic.Key.Escape,                      // VK_ESCAPE
             0x09 => Basic.Key.Tab,                         // VK_TAB
             0x08 => Basic.Key.Backspace,                   // VK_BACK
+            0x2E => Basic.Key.Delete,                      // VK_DELETE
             0x25 => Basic.Key.Left,                        // VK_LEFT
             0x27 => Basic.Key.Right,                       // VK_RIGHT
             0x26 => Basic.Key.Up,                          // VK_UP
@@ -159,6 +165,10 @@ internal sealed class WindowsKeyboardService : Basic.IKeyboardService
             0x11 => Basic.Key.LeftCtrl,                    // VK_CONTROL
             0xA4 => Basic.Key.LeftAlt,                     // VK_LMENU
             0xA5 => Basic.Key.RightAlt,                    // VK_RMENU
+            0xBB => Basic.Key.OemPlus,                     // VK_OEM_PLUS (=)
+            0xBD => Basic.Key.OemMinus,                    // VK_OEM_MINUS (-)
+            0x6B => Basic.Key.OemPlus,                     // VK_ADD (numpad +)
+            0x6D => Basic.Key.OemMinus,                    // VK_SUBTRACT (numpad -)
             0x12 => Basic.Key.LeftAlt,                     // VK_MENU
             >= 0x70 and <= 0x7B => (Basic.Key)(Basic.Key.F1 + vk - 0x70), // VK_F1..VK_F12
             _ => Basic.Key.None

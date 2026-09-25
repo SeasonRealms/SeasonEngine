@@ -162,7 +162,7 @@ internal class WebStoreService : IStoreService
     public Task<string> Purchase(string product, Action<string> onResult)
         => throw new PlatformNotSupportedException();
 
-    public async Task<string> Review(string product) => "";
+    public async Task<string> Review(string product, string url) => "";
 
     public async Task<(int version, string desc)> CheckForUpdates() => (0, "");
 }

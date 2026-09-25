@@ -117,6 +117,18 @@ public sealed class AppleKeyboardService : Basic.IKeyboardService
             return (Basic.Key)((int)Basic.Key.F1 + v - (int)UIKeyboardHidUsage.KeyboardF1); // 58..69
         }
 
+        if (v >= 86 && v <= 87)
+        {
+            // HID keypad minus and plus; they share the engine zoom keys with - and =.
+            return v == 86 ? Basic.Key.OemMinus : Basic.Key.OemPlus;
+        }
+
+        if (v >= 89 && v <= 98)
+        {
+            // HID keypad 1..9 then 0; numpad digits collapse onto D1..D9/D0.
+            return (Basic.Key)((int)Basic.Key.D0 + (v <= 97 ? v - 88 : 0));
+        }
+
         return c switch
         {
             UIKeyboardHidUsage.KeyboardSpacebar => Basic.Key.Space,           // 44
@@ -124,6 +136,8 @@ public sealed class AppleKeyboardService : Basic.IKeyboardService
             UIKeyboardHidUsage.KeyboardEscape => Basic.Key.Escape,            // 41
             UIKeyboardHidUsage.KeyboardTab => Basic.Key.Tab,                  // 43
             UIKeyboardHidUsage.KeyboardDeleteOrBackspace => Basic.Key.Backspace, // 42
+            UIKeyboardHidUsage.KeyboardHyphen => Basic.Key.OemMinus,          // 45
+            UIKeyboardHidUsage.KeyboardEqualSign => Basic.Key.OemPlus,        // 46
             UIKeyboardHidUsage.KeyboardRightArrow => Basic.Key.Right,         // 79
             UIKeyboardHidUsage.KeyboardLeftArrow => Basic.Key.Left,           // 80
             UIKeyboardHidUsage.KeyboardDownArrow => Basic.Key.Down,           // 81
@@ -134,6 +148,7 @@ public sealed class AppleKeyboardService : Basic.IKeyboardService
             UIKeyboardHidUsage.KeyboardRightControl => Basic.Key.RightCtrl,   // 228
             UIKeyboardHidUsage.KeyboardLeftAlt => Basic.Key.LeftAlt,          // 226
             UIKeyboardHidUsage.KeyboardRightAlt => Basic.Key.RightAlt,        // 230
+            UIKeyboardHidUsage.KeyboardDeleteForward => Basic.Key.Delete,     // 77
             _ => Basic.Key.None
         };
     }

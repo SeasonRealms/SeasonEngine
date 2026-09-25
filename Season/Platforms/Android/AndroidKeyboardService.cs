@@ -110,6 +110,11 @@ internal sealed class AndroidKeyboardService : Basic.IKeyboardService
             return (Basic.Key)((int)Basic.Key.F1 + kc - (int)Keycode.F1); // KEYCODE_F1(131)..KEYCODE_F12(142)
         }
 
+        if (kc >= (int)Keycode.Numpad0 && kc <= (int)Keycode.Numpad9)
+        {
+            return (Basic.Key)((int)Basic.Key.D0 + kc - (int)Keycode.Numpad0); // KEYCODE_NUMPAD_0(144)..KEYCODE_NUMPAD_9(153)
+        }
+
         return keyCode switch
         {
             Keycode.Space => Basic.Key.Space,                     // KEYCODE_SPACE(62)
@@ -127,6 +132,11 @@ internal sealed class AndroidKeyboardService : Basic.IKeyboardService
             Keycode.CtrlRight => Basic.Key.RightCtrl,             // KEYCODE_CTRL_RIGHT(114)
             Keycode.AltLeft => Basic.Key.LeftAlt,                 // KEYCODE_ALT_LEFT(57)
             Keycode.AltRight => Basic.Key.RightAlt,               // KEYCODE_ALT_RIGHT(58)
+            Keycode.Minus => Basic.Key.OemMinus,                // KEYCODE_MINUS(69)
+            Keycode.Equals => Basic.Key.OemPlus,                // KEYCODE_EQUALS(70)
+            Keycode.NumpadSubtract => Basic.Key.OemMinus,       // KEYCODE_NUMPAD_SUBTRACT(80)
+            Keycode.NumpadAdd => Basic.Key.OemPlus,             // KEYCODE_NUMPAD_ADD(81)
+            Keycode.ForwardDel => Basic.Key.Delete,             // KEYCODE_FORWARD_DEL(112)
             _ => Basic.Key.None
         };
     }

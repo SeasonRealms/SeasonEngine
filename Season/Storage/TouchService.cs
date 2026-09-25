@@ -28,7 +28,11 @@ public static class TouchService
 
     internal static bool isDown;
 
+    internal static bool isRightDown;
+
     public static bool IsDown { get; set; }
+
+    public static bool IsRightDown { get; set; }
 
     public static bool IsReleased = false;
 
@@ -41,6 +45,8 @@ public static class TouchService
         Enable = true;
 
         IsDown = IsReleased = IsMoved = false;
+
+        IsRightDown = isRightDown;
 
         MoveX = 0; MoveY = 0;
 

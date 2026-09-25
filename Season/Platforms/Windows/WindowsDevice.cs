@@ -472,7 +472,44 @@ internal class WindowsFileService : IFileService
         return path;
     }
 
-    public async Task<List<TaskFile>> PickFiles(FileType fileType, string[] exts, bool multiple, bool open)
+    public Task<List<TaskFile>> PickFiles(FileType fileType, string[] exts, bool multiple, bool open)
+    {
+        // UI-thread affinity bridge (the same pattern WindowsDialogService already uses):
+        // the WinRT FileOpenPicker can only present its shell dialog from the XAML UI thread.
+        // The render loop runs on a ThreadPool work item (MTA), where a direct call either
+        // fails to show the picker or throws a COM apartment error, so the whole pick is
+        // dispatched to the UI thread whenever the caller is not already on it. A caller
+        // that blocks on the returned task keeps working: the continuations need the UI
+        // thread, not the blocked caller.
+        return RunOnUiThread(() => PickFilesCore(fileType, exts, multiple, open));
+    }
+
+    static Task<T> RunOnUiThread<T>(Func<Task<T>> action)
+    {
+        var window = WindowsApp.Window;
+
+        if (window is null || window.DispatcherQueue.HasThreadAccess)
+        {
+            return action();
+        }
+
+        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        if (!window.DispatcherQueue.TryEnqueue(async () =>
+        {
+            try { tcs.TrySetResult(await action()); }
+            catch (Exception ex) { tcs.TrySetException(ex); }
+        }))
+        {
+            // TryEnqueue reports false while the dispatcher is shutting down; fault the task
+            // instead of leaving the caller waiting forever (same guard as WindowsDialogService).
+            tcs.TrySetException(new InvalidOperationException("UI dispatcher rejected the picker request."));
+        }
+
+        return tcs.Task;
+    }
+
+    async Task<List<TaskFile>> PickFilesCore(FileType fileType, string[] exts, bool multiple, bool open)
     {
         List<TaskFile> taskFiles = null;
 

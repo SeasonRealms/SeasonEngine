@@ -15,7 +15,8 @@ namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 ///         · ImageBarrier: Undefined → TransferDstOptimal
 ///         · CmdCopyBufferToImage
 ///      (Do not transition to ShaderReadOnlyOptimal here because the transfer queue is not aware of the fragment stage)
-///   3. Submit the transfer queue and signal the timeline semaphore, then write the fence value back to each Texture
+///   3. Submit the transfer queue and signal the completion value (timeline semaphore on 1.2 devices,
+///      a registered VkFence on the 1.1 fallback), then write the fence value back to each Texture
 ///   4. When first used by the graphics queue, wait for this fence value through SubmitInfo.PWaitSemaphores,
 ///      and let Texture.EnsureReadyForRendering perform the layout transition on the graphics command buffer
 /// </summary>
@@ -142,31 +143,50 @@ internal unsafe class TextureUploadBatch : IDisposable
 
             Device.CheckResult(_vk.EndCommandBuffer(cmd));
 
-            // 4. Submit to the transfer queue and signal the timeline semaphore
+            // 4. Submit to the transfer queue. Timeline mode signals the queue's timeline semaphore; the
+            //    1.1 fallback registers a VkFence for the same completion value instead. Both keep the
+            //    value contract that step 5 and step 6 rely on.
             var transferCq = Device.TransferCommandQueue;
-            var sem = transferCq.TimelineSemaphore;
             ulong signalValue = transferCq.GetCompletedValue() + 1;
-
-            var timelineInfo = new TimelineSemaphoreSubmitInfo
-            {
-                SType = StructureType.TimelineSemaphoreSubmitInfo,
-                SignalSemaphoreValueCount = 1,
-                PSignalSemaphoreValues = &signalValue
-            };
             var cmdBuf = cmd;
-            var signalSem = sem;
-            var submit = new SubmitInfo
-            {
-                SType = StructureType.SubmitInfo,
-                PNext = &timelineInfo,
-                CommandBufferCount = 1,
-                PCommandBuffers = &cmdBuf,
-                SignalSemaphoreCount = 1,
-                PSignalSemaphores = &signalSem
-            };
 
-            if (_vk.QueueSubmit(transferCq.NativeQueue, 1, in submit, default) != Result.Success)
-                throw new Exception("vkQueueSubmit (texture upload) failed");
+            if (transferCq.TimelineMode)
+            {
+                var sem = transferCq.TimelineSemaphore;
+                var signalSem = sem;
+                var timelineInfo = new TimelineSemaphoreSubmitInfo
+                {
+                    SType = StructureType.TimelineSemaphoreSubmitInfo,
+                    SignalSemaphoreValueCount = 1,
+                    PSignalSemaphoreValues = &signalValue
+                };
+                var submit = new SubmitInfo
+                {
+                    SType = StructureType.SubmitInfo,
+                    PNext = &timelineInfo,
+                    CommandBufferCount = 1,
+                    PCommandBuffers = &cmdBuf,
+                    SignalSemaphoreCount = 1,
+                    PSignalSemaphores = &signalSem
+                };
+
+                if (_vk.QueueSubmit(transferCq.NativeQueue, 1, in submit, default) != Result.Success)
+                    throw new Exception("vkQueueSubmit (texture upload) failed");
+            }
+            else
+            {
+                var submit = new SubmitInfo
+                {
+                    SType = StructureType.SubmitInfo,
+                    CommandBufferCount = 1,
+                    PCommandBuffers = &cmdBuf
+                };
+
+                var submitFence = transferCq.PrepareSubmit(signalValue);
+                if (_vk.QueueSubmit(transferCq.NativeQueue, 1, in submit, submitFence) != Result.Success)
+                    throw new Exception("vkQueueSubmit (texture upload) failed");
+            }
+
             submitted = true;
 
             // 5. Mark the fence value and state for each texture

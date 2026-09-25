@@ -344,18 +344,75 @@ internal class AndroidMediaPlayer : IMediaPlayer
         }
     }
 
+    // True while Pause actually suspended a playing channel. Resume restarts exactly these, so a
+    // channel that already completed cannot replay its last track or effect from the beginning
+    // when the app returns to the foreground, and no Start runs in Idle state.
+    bool _musicHeld;
+
+    bool _soundHeld;
+
     public void Pause()
     {
-        MusicPlayer?.Pause();
+        _musicHeld = PauseChannel(MusicPlayer, _musicHeld, "Music");
 
-        SoundPlayer?.Pause();
+        _soundHeld = PauseChannel(SoundPlayer, _soundHeld, "Sound");
     }
 
     public void Resume()
     {
-        MusicPlayer?.Start();
+        _musicHeld = ResumeChannel(MusicPlayer, _musicHeld, "Music");
 
-        SoundPlayer?.Start();
+        _soundHeld = ResumeChannel(SoundPlayer, _soundHeld, "Sound");
+    }
+
+    /// <summary>
+    /// Suspend one channel, but only while it is really playing: MediaPlayer throws
+    /// IllegalStateException when Pause or Start runs in Idle or Error state, and restarting a
+    /// completed player would replay it from the beginning. Returns the new held state.
+    /// </summary>
+    static bool PauseChannel(MediaPlayer mediaPlayer, bool held, string channel)
+    {
+        if (mediaPlayer == null) return held;
+
+        try
+        {
+            if (mediaPlayer.IsPlaying)
+            {
+                mediaPlayer.Pause();
+
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogMediaFailure($"Pause({channel})", ex);
+        }
+
+        return held;
+    }
+
+    /// <summary>Continue a channel that was suspended earlier; see <see cref="PauseChannel"/>. Returns the new held state.</summary>
+    static bool ResumeChannel(MediaPlayer mediaPlayer, bool held, string channel)
+    {
+        if (mediaPlayer == null || !held) return false;
+
+        try
+        {
+            mediaPlayer.Start();
+        }
+        catch (Exception ex)
+        {
+            LogMediaFailure($"Resume({channel})", ex);
+        }
+
+        return false;
+    }
+
+    static void LogMediaFailure(string operation, Exception ex)
+    {
+        System.Diagnostics.Debug.WriteLine($"[Android] Media {operation} failed: {ex.GetType().Name}: {ex.Message}");
+
+        DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Android] Media {operation} failed: {ex.GetType().Name}: {ex.Message}");
     }
 }
 

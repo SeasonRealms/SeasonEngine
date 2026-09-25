@@ -154,7 +154,12 @@ public enum Key
     Space, Enter, Escape, Tab, Backspace,
     Left, Right, Up, Down,
     LeftShift, RightShift, LeftCtrl, RightCtrl, LeftAlt, RightAlt,
-    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12
+    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+    // =/- and numpad +/-: view zoom keys required by ported XNA titles (Zhsan keyboard zoom).
+    // =/- and numpad +/-: view zoom keys required by ported XNA titles (Zhsan keyboard zoom).
+    OemPlus, OemMinus,
+    // Delete: number-pad dialogs use it to clear the current entry (Zhsan NumberInputer).
+    Delete
 }
 
 public interface IMediaPlayer
@@ -570,7 +575,7 @@ public interface IStoreService
 
     Task<string> Purchase(string storeId, Action<string> onResult);
 
-    Task<string> Review(string product);
+    Task<string> Review(string product, string url);
 
     Task<(int version, string desc)> CheckForUpdates();
 }

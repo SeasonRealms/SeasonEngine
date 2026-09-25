@@ -106,6 +106,31 @@ internal unsafe sealed class FrameContext : IDisposable
         Framebuffer = fb;
     }
 
+    /// <summary>
+    /// Rebuild both synchronization semaphores in place. Used after a failed frame, where a slot may
+    /// hold a semaphore that stayed signaled because the frame never submitted; the caller,
+    /// Device.RecreateFrameSemaphores, must guarantee that the GPU is idle.
+    /// </summary>
+    public void RecreateSyncSemaphores()
+    {
+        if (ImageAvailable.Handle != 0)
+        {
+            _vk.DestroySemaphore(_device, ImageAvailable, null);
+            ImageAvailable = default;
+        }
+        if (RenderFinished.Handle != 0)
+        {
+            _vk.DestroySemaphore(_device, RenderFinished, null);
+            RenderFinished = default;
+        }
+
+        var semInfo = new SemaphoreCreateInfo { SType = StructureType.SemaphoreCreateInfo };
+        _vk.CreateSemaphore(_device, in semInfo, null, out var imgAvail);
+        ImageAvailable = imgAvail;
+        _vk.CreateSemaphore(_device, in semInfo, null, out var rendDone);
+        RenderFinished = rendDone;
+    }
+
     public void Dispose()
     {
         if (ImageAvailable.Handle != 0)

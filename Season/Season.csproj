@@ -42,7 +42,7 @@
 
 		<SupportedOSPlatformVersion Condition="'$(IsIOS)' == 'true'">17.0</SupportedOSPlatformVersion>
 		<SupportedOSPlatformVersion Condition="'$(IsMacCatalyst)' == 'true'">17.0</SupportedOSPlatformVersion>
-		<SupportedOSPlatformVersion Condition="'$(IsAndroid)' == 'true'">33.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="'$(IsAndroid)' == 'true'">29.0</SupportedOSPlatformVersion>
 		<SupportedOSPlatformVersion Condition="'$(IsWindows)' == 'true'">10.0.19041.0</SupportedOSPlatformVersion>
 		<TargetPlatformMinVersion Condition="'$(IsWindows)' == 'true'">10.0.19041.0</TargetPlatformMinVersion>
 

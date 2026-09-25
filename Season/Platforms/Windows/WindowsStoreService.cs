@@ -146,22 +146,28 @@ internal class WindowsStoreService : IStoreService
         return message;
     }
 
-    public async Task<string> Review(string product)
+    public async Task<string> Review(string product, string url)
     {
         var result = "";
-
         try
         {
-            await Launcher.OpenAsync(new Uri($"ms-windows-store://review/?ProductId={product}"));
+            if (String.IsNullOrEmpty(product))
+            {
+                await Launcher.OpenAsync(url);
+            }
+            else
+            {
+                await Launcher.OpenAsync(new Uri($"ms-windows-store://review/?ProductId={product}"));
 
-            //var review = await StoreContext.RequestRateAndReviewAppAsync();
-            //result = review.Status switch
-            //{
-            //    StoreRateAndReviewStatus.Succeeded => "Success",
-            //    StoreRateAndReviewStatus.CanceledByUser => "Cancel",
-            //    StoreRateAndReviewStatus.NetworkError => "Error",
-            //    StoreRateAndReviewStatus.Error => "Error"
-            //};
+                //var review = await StoreContext.RequestRateAndReviewAppAsync();
+                //result = review.Status switch
+                //{
+                //    StoreRateAndReviewStatus.Succeeded => "Success",
+                //    StoreRateAndReviewStatus.CanceledByUser => "Cancel",
+                //    StoreRateAndReviewStatus.NetworkError => "Error",
+                //    StoreRateAndReviewStatus.Error => "Error"
+                //};
+            }
         }
         catch (Exception ex)
         {

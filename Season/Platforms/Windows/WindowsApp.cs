@@ -243,18 +243,41 @@ public static class WindowsApp
         {
             UpdatePointer(e);
             swapChainPanel.CapturePointer(e.Pointer);
-            TouchService.isDown = true;
+
+            // Button isolation: right-button presses feed the secondary-button channel,
+            // while left mouse, touch, and pen keep the primary down state as before.
+            if (e.GetCurrentPoint(swapChainPanel).Properties.PointerUpdateKind
+                == Microsoft.UI.Input.PointerUpdateKind.RightButtonPressed)
+            {
+                TouchService.isRightDown = true;
+            }
+            else
+            {
+                TouchService.isDown = true;
+            }
         };
 
         swapChainPanel.PointerReleased += (s, e) =>
         {
             UpdatePointer(e);
-            TouchService.isDown = false;
+
+            // PointerUpdateKind identifies which button just went up; IsRightButtonPressed
+            // is already false at release time and cannot be used here.
+            if (e.GetCurrentPoint(swapChainPanel).Properties.PointerUpdateKind
+                == Microsoft.UI.Input.PointerUpdateKind.RightButtonReleased)
+            {
+                TouchService.isRightDown = false;
+            }
+            else
+            {
+                TouchService.isDown = false;
+            }
+
             swapChainPanel.ReleasePointerCapture(e.Pointer);
         };
 
-        swapChainPanel.PointerCanceled += (s, e) => TouchService.isDown = false;
-        swapChainPanel.PointerCaptureLost += (s, e) => TouchService.isDown = false;
+        swapChainPanel.PointerCanceled += (s, e) => { TouchService.isDown = false; TouchService.isRightDown = false; };
+        swapChainPanel.PointerCaptureLost += (s, e) => { TouchService.isDown = false; TouchService.isRightDown = false; };
         swapChainPanel.PointerEntered += (s, e) => UpdatePointer(e);
         swapChainPanel.PointerMoved += (s, e) => UpdatePointer(e);
 

@@ -554,7 +554,16 @@ public static class LinuxApp
 
                     case SDL_EventType.SDL_EVENT_MOUSE_BUTTON_DOWN:
 
-                        TouchService.isDown = true;
+                        // SDL_BUTTON_RIGHT feeds the secondary-button channel; every other
+                        // button (left, middle) keeps the primary down state for compatibility.
+                        if (ev.button.button == 3)
+                        {
+                            TouchService.isRightDown = true;
+                        }
+                        else
+                        {
+                            TouchService.isDown = true;
+                        }
 
                         break;
 
@@ -564,7 +573,14 @@ public static class LinuxApp
 
                     case SDL_EventType.SDL_EVENT_MOUSE_BUTTON_UP:
 
-                        TouchService.isDown = false;
+                        if (ev.button.button == 3)
+                        {
+                            TouchService.isRightDown = false;
+                        }
+                        else
+                        {
+                            TouchService.isDown = false;
+                        }
 
                         break;
 

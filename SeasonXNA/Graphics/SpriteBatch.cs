@@ -10,6 +10,7 @@ using Region = global::Season.Rendering.ImageRegion2D;
 using NativeRect = global::Season.Rendering.Rect2D;
 using Sampling = global::Season.Rendering.Sampling2D;
 using Flip = global::Season.Rendering.ImageFlip2D;
+using Canvas2D = global::Season.Rendering.Draw2D;
 using System.Text;
 
 namespace Microsoft.Xna.Framework.Graphics;
@@ -23,8 +24,10 @@ public sealed class SpriteBatch : IDisposable
     private bool _disposed;
     private Affine _transform;
     private Sampling _sampling;
+    private readonly Stack<Rectangle?> _clips = new();
+    private Rectangle? _clip;
     private readonly record struct Sprite(Texture2D? Texture, Region? Region, Affine Transform, Tint Color, Flip Flip,
-        SpriteFont? Font = null, TextLayout? Text = null);
+        SpriteFont? Font = null, TextLayout? Text = null, Rectangle? Clip = null);
 
     public SpriteBatch(DrawContext context) => _context = context ?? throw new ArgumentNullException(nameof(context));
     public bool IsDisposed => _disposed;
@@ -41,6 +44,27 @@ public sealed class SpriteBatch : IDisposable
         _transform = transform;
         _sampling = (samplerState ?? SamplerState.LinearClamp).IsPoint ? Sampling.Point : Sampling.Linear;
         _begun = true;
+    }
+
+    /// <summary>
+    /// Clips subsequent draws to <paramref name="rectangle"/>, intersected with the enclosing clip.
+    /// The rectangle shares the coordinate space of draw positions; it is captured per sprite at queue time
+    /// and becomes a per-command clip rect in the canvas (Draw2D), honored by every platform backend.
+    /// Pair with <see cref="PopClip"/>; a clip that intersects to nothing hides its sprites entirely.
+    /// </summary>
+    public void PushClip(Rectangle rectangle)
+    {
+        CheckBegun();
+        _clips.Push(_clip);
+        _clip = _clip is { } current ? Rectangle.Intersect(current, rectangle) : rectangle;
+    }
+
+    /// <summary>Restores the enclosing clip pushed by <see cref="PushClip"/>.</summary>
+    public void PopClip()
+    {
+        CheckBegun();
+        if (_clips.Count == 0) throw new InvalidOperationException("The clip stack is empty.");
+        _clip = _clips.Pop();
     }
 
     public void Draw(Texture2D texture, Vector2 position, Color color) =>
@@ -97,7 +121,7 @@ public sealed class SpriteBatch : IDisposable
         ValidateExtent(transform, source.Width, source.Height);
         // Validate before eliding invisible sprites, so invalid inputs never disappear silently.
         if (scale.X == 0 || scale.Y == 0 || color.A == 0) return;
-        _sprites.Add(new(texture, texture.GetRegion(source), transform, tint, (Flip)effects));
+        _sprites.Add(new(texture, texture.GetRegion(source), transform, tint, (Flip)effects, Clip: _clip));
     }
 
     public void DrawString(SpriteFont spriteFont, string text, Vector2 position, Color color) =>
@@ -131,7 +155,7 @@ public sealed class SpriteBatch : IDisposable
         foreach (var glyph in layout.Glyphs)
             ValidateExtent(Affine.CreateTranslation(glyph.Baseline) * transform, 0, 0, canvasToOutput);
         if (scale.X == 0 || scale.Y == 0 || color.A == 0 || layout.Glyphs.Length == 0) return;
-        _sprites.Add(new(null, null, transform, tint, Flip.None, spriteFont, layout));
+        _sprites.Add(new(null, null, transform, tint, Flip.None, spriteFont, layout, _clip));
     }
 
     public void DrawString(SpriteFont spriteFont, StringBuilder text, Vector2 position, Color color) =>
@@ -189,16 +213,20 @@ public sealed class SpriteBatch : IDisposable
             }
             foreach (var sprite in _sprites)
             {
-                canvas.PushTransform(sprite.Transform);
-                try
+                if (sprite.Clip is { } clip)
                 {
-                    if (sprite.Region is { } region)
-                        canvas.DrawImage(region, new NativeRect(0, 0, region.SourcePixels.Width,
-                            region.SourcePixels.Height), sprite.Color, _sampling, sprite.Flip);
-                    else
-                        canvas.DrawGlyphRun(sprite.Font!.Font, sprite.Font.Size, sprite.Text!.Glyphs, sprite.Color);
+                    // The clip was captured in draw-position space; map it to canvas space and let Draw2D
+                    // intersect it with the parent clip. It is pushed before the sprite transform because
+                    // Draw2D.PushClip requires an axis-aligned current transform.
+                    if (clip.Width <= 0 || clip.Height <= 0) continue; // Empty clip: the sprite is fully hidden.
+                    canvas.PushClip(ToCanvasClip(clip));
+                    try { FlushSprite(canvas, sprite); }
+                    finally { canvas.PopClip(); }
                 }
-                finally { canvas.PopTransform(); }
+                else
+                {
+                    FlushSprite(canvas, sprite);
+                }
             }
         }
         finally
@@ -208,9 +236,43 @@ public sealed class SpriteBatch : IDisposable
         }
     }
 
+    private void FlushSprite(Canvas2D canvas, in Sprite sprite)
+    {
+        canvas.PushTransform(sprite.Transform);
+        try
+        {
+            if (sprite.Region is { } region)
+                canvas.DrawImage(region, new NativeRect(0, 0, region.SourcePixels.Width,
+                    region.SourcePixels.Height), sprite.Color, _sampling, sprite.Flip);
+            else
+                canvas.DrawGlyphRun(sprite.Font!.Font, sprite.Font.Size, sprite.Text!.Glyphs, sprite.Color);
+        }
+        finally { canvas.PopTransform(); }
+    }
+
+    /// <summary>
+    /// Draw-position space to canvas space: the batch transform (Begin's transformMatrix) applies to draw
+    /// positions, while Draw2D.PushClip only re-applies the canvas transform (CanvasToOutput). With a
+    /// rotated/skewed batch transform the four mapped corners collapse to their axis-aligned bounding box.
+    /// </summary>
+    private NativeRect ToCanvasClip(Rectangle clip)
+    {
+        var a = System.Numerics.Vector2.Transform(new System.Numerics.Vector2(clip.Left, clip.Top), _transform);
+        var b = System.Numerics.Vector2.Transform(new System.Numerics.Vector2(clip.Right, clip.Top), _transform);
+        var c = System.Numerics.Vector2.Transform(new System.Numerics.Vector2(clip.Left, clip.Bottom), _transform);
+        var d = System.Numerics.Vector2.Transform(new System.Numerics.Vector2(clip.Right, clip.Bottom), _transform);
+        float x = Math.Min(Math.Min(a.X, b.X), Math.Min(c.X, d.X));
+        float y = Math.Min(Math.Min(a.Y, b.Y), Math.Min(c.Y, d.Y));
+        float right = Math.Max(Math.Max(a.X, b.X), Math.Max(c.X, d.X));
+        float bottom = Math.Max(Math.Max(a.Y, b.Y), Math.Max(c.Y, d.Y));
+        return new NativeRect(x, y, right - x, bottom - y);
+    }
+
     internal void CancelFromContext()
     {
         _sprites.Clear();
+        _clips.Clear();
+        _clip = null;
         _begun = false;
     }
 

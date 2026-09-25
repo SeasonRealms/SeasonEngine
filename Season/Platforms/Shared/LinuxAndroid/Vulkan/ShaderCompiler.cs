@@ -101,6 +101,11 @@ internal static unsafe class ShaderCompiler
         int messages = GlslangMessages.SpvRules | GlslangMessages.VulkanRules;
         if (debug) messages |= GlslangMessages.DebugInfo;
 
+        // The SPIR-V target follows the device sync path: 1.1 devices (the fence fallback in CommandQueue)
+        // only accept core SPIR-V 1.3, while 1.2 devices keep SPIR-V 1.5. Every shader on the immediate-2D
+        // path is #version 450, which emits clean SPIR-V 1.3 either way.
+        bool timelineSync = Device.TimelineSemaphoreEnabled;
+
         fixed (byte* pSrc = srcUtf8)
         {
             var input = new GlslangInput
@@ -108,9 +113,9 @@ internal static unsafe class ShaderCompiler
                 Language = GlslangSource.Glsl,
                 Stage = glslangStage,
                 Client = GlslangClient.Vulkan,
-                ClientVersion = GlslangTargetClientVersion.Vulkan12,
+                ClientVersion = timelineSync ? GlslangTargetClientVersion.Vulkan12 : GlslangTargetClientVersion.Vulkan11,
                 TargetLanguage = GlslangTargetLanguage.Spv,
-                TargetLanguageVersion = GlslangTargetLanguageVersion.Spv15,
+                TargetLanguageVersion = timelineSync ? GlslangTargetLanguageVersion.Spv15 : GlslangTargetLanguageVersion.Spv13,
                 Code = (IntPtr)pSrc,
                 DefaultVersion = 460,
                 DefaultProfile = GlslangProfile.None,

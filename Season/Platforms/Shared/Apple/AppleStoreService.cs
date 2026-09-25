@@ -173,9 +173,9 @@ internal class AppleStoreService : IStoreService
         return message;
     }
 
-    public async Task<string> Review(string product)
+    public async Task<string> Review(string product, string url)
     {
-        var url = $"itms-apps://itunes.apple.com/app/{product}?mt=8";
+        url = $"itms-apps://itunes.apple.com/app/{product}?mt=8";
 
         var result = await DeviceServices.File.OpenLink(url);
 

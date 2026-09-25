@@ -234,21 +234,23 @@ internal class AndroidStoreService : IStoreService
         return await tcsConnect.Task;
     }
 
-    public async Task<string> Review(string product)
+    public async Task<string> Review(string product, string url)
     {
         TaskCompletionSource<string> tcs = new();
 
         if (string.IsNullOrEmpty(product))
         {
-            var msg = "Application PackageName";
+            //var msg = "Application PackageName";
 
-            tcs.SetResult(msg);
+            DeviceServices.File.OpenLink(url);
+
+            tcs.SetResult(url);
         }
         else
         {
             var context = Application.Context;
 
-            var url = $"market://details?id={product}";
+            url = $"market://details?id={product}";
 
             try
             {

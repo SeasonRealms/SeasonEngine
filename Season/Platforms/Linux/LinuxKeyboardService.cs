@@ -94,6 +94,12 @@ internal sealed class LinuxKeyboardService : Basic.IKeyboardService
             return (Basic.Key)(Basic.Key.D1 + scancode - 30); // SDL_SCANCODE_1..9
         }
 
+        if (scancode >= 89 && scancode <= 98)
+        {
+            // SDL_SCANCODE_KP_1..KP_9 then KP_0; numpad digits collapse onto D1..D9/D0.
+            return (Basic.Key)(Basic.Key.D0 + (scancode <= 97 ? scancode - 88 : 0));
+        }
+
         return scancode switch
         {
             39 => Basic.Key.D0,                               // SDL_SCANCODE_0
@@ -102,11 +108,16 @@ internal sealed class LinuxKeyboardService : Basic.IKeyboardService
             42 => Basic.Key.Backspace,                        // SDL_SCANCODE_BACKSPACE
             43 => Basic.Key.Tab,                              // SDL_SCANCODE_TAB
             44 => Basic.Key.Space,                            // SDL_SCANCODE_SPACE
+            45 => Basic.Key.OemMinus,                         // SDL_SCANCODE_MINUS (-)
+            46 => Basic.Key.OemPlus,                          // SDL_SCANCODE_EQUALS (=)
             >= 58 and <= 69 => (Basic.Key)(Basic.Key.F1 + scancode - 58), // SDL_SCANCODE_F1..F12
+            76 => Basic.Key.Delete,                           // SDL_SCANCODE_DELETE
             79 => Basic.Key.Right,                            // SDL_SCANCODE_RIGHT
             80 => Basic.Key.Left,                             // SDL_SCANCODE_LEFT
             81 => Basic.Key.Down,                             // SDL_SCANCODE_DOWN
             82 => Basic.Key.Up,                               // SDL_SCANCODE_UP
+            86 => Basic.Key.OemMinus,                         // SDL_SCANCODE_KP_MINUS
+            87 => Basic.Key.OemPlus,                          // SDL_SCANCODE_KP_PLUS
             224 => Basic.Key.LeftCtrl,                        // SDL_SCANCODE_LCTRL
             225 => Basic.Key.LeftShift,                       // SDL_SCANCODE_LSHIFT
             226 => Basic.Key.LeftAlt,                         // SDL_SCANCODE_LALT

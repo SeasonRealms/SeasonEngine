@@ -17,6 +17,11 @@ public struct Rectangle : IEquatable<Rectangle>
         X = x; Y = y; Width = width; Height = height;
     }
 
+    public Rectangle(Point location, Point size)
+    {
+        X = location.X; Y = location.Y; Width = size.X; Height = size.Y;
+    }
+
     public static Rectangle Empty => default;
     public readonly int Left => X;
     public readonly int Top => Y;
@@ -26,6 +31,8 @@ public struct Rectangle : IEquatable<Rectangle>
 
     public readonly bool Contains(int x, int y) => x >= Left && x < Right && y >= Top && y < Bottom;
     public readonly bool Contains(Vector2 value) =>
+        value.X >= Left && value.X < Right && value.Y >= Top && value.Y < Bottom;
+    public readonly bool Contains(Point value) =>
         value.X >= Left && value.X < Right && value.Y >= Top && value.Y < Bottom;
     public readonly bool Contains(Rectangle value) =>
         Left <= value.Left && value.Right <= Right && Top <= value.Top && value.Bottom <= Bottom;

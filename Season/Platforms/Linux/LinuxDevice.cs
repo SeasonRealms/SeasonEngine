@@ -798,9 +798,9 @@ internal class LinuxStoreService : IStoreService
         throw new NotImplementedException();
     }
 
-    public async Task<string> Review(string product)
+    public async Task<string> Review(string product, string url)
     {
-        await DeviceServices.File.OpenLink("http://seasont.com");
+        await DeviceServices.File.OpenLink(url);
 
         return "";
     }
