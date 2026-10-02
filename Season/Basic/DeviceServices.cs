@@ -478,7 +478,11 @@ public abstract class RecordService
     /// <inheritdoc cref="IRecordService.LastFailure"/>
     public RecordFailure LastFailure { get; protected set; } = RecordFailure.None;
 
-    public async Task<TaskFile> TakePhoto()
+    /// <summary>
+    /// Platform default: no camera capture path, so the call reports "no photo" (null).
+    /// Platforms with a capture UI override this.
+    /// </summary>
+    public virtual async Task<TaskFile> TakePhoto()
     {
         return null;
         //var file = await MediaPicker.CapturePhotoAsync();

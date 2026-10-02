@@ -33,7 +33,8 @@ namespace Season.Platforms.Android;
 public enum ActivityResult
 {
     SaveFile = 10001,
-    FilePicker = 10002
+    FilePicker = 10002,
+    TakePhoto = 10003
 }
 
 internal class AndroidDeviceCore : IDeviceCore
@@ -575,30 +576,84 @@ internal class AndroidFileService : IFileService
         var action = Intent.ActionOpenDocument;
 
         var intent = new Intent(action);
-        intent.SetType(FileMimeTypes.All);
+
+        // 按文件類型限定 MIME：Image → image/*，其餘保持全類通配；exts 過濾由調用方
+        // 按返回的 Ext/Name 自行校驗（各平台 PickFiles 一致契約）。
+        intent.SetType(fileType switch
+        {
+            FileType.Image => FileMimeTypes.ImageAll,
+            FileType.Video => FileMimeTypes.VideoAll,
+            _ => FileMimeTypes.All
+        });
+
         intent.PutExtra(Intent.ExtraAllowMultiple, multiple);
 
         var pickerIntent = Intent.CreateChooser(intent, "Select file");
 
         try
         {
-            tcsPickFiles = new TaskCompletionSource<Uri[]>();
+            var tcs = new TaskCompletionSource<Uri[]>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-            AndroidApp.MainActivity.StartActivityForResult(pickerIntent, (int)ActivityResult.FilePicker);
+            tcsPickFiles = tcs;
 
-            var uris = await tcsPickFiles.Task;
+            // StartActivityForResult 携带 Activity 亲和性：渲染線程（後台）調用時必須投遞
+            // 到 UI 線程；啟動失敗（設備無文件選擇器）以空數組結束會話，不讓異常逃進 UI
+            // 線程消息循環。
+            var activity = AndroidApp.MainActivity;
+
+            activity.RunOnUiThread(() =>
+            {
+                try
+                {
+                    activity.StartActivityForResult(pickerIntent, (int)ActivityResult.FilePicker);
+                }
+                catch (Exception ex)
+                {
+                    DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [File] PickFiles launch failed: {ex}");
+
+                    tcsPickFiles = null;
+
+                    tcs.TrySetResult(Array.Empty<Uri>());
+                }
+            });
+
+            var uris = await tcs.Task;
+
+            if (uris is null || uris.Length == 0)
+            {
+                return taskFiles;
+            }
 
             foreach (var uri in uris)
             {
-                var cursor = AndroidCommon.DownloadQueryCursor(uri, null, null);
+                if (uri is null)
+                {
+                    continue;
+                }
 
-                cursor.MoveToNext();
+                // SAF/DocumentProvider 的列集不保證包含 MediaStore 的 mime_type；列缺失
+                // （GetColumnIndex 返回 -1）或查詢失敗時退回 ContentResolver.GetType。
+                string mimeType = null;
 
-                var index = cursor.GetColumnIndex(MediaStore.Files.IFileColumns.MimeType);
+                using (var cursor = AndroidCommon.DownloadQueryCursor(uri, null, null))
+                {
+                    if (cursor is not null && cursor.MoveToNext())
+                    {
+                        var index = cursor.GetColumnIndex(MediaStore.Files.IFileColumns.MimeType);
 
-                var mimeType = cursor.GetString(index);
+                        if (index >= 0)
+                        {
+                            mimeType = cursor.GetString(index);
+                        }
+                    }
+                }
 
-                var ext = "." + mimeType.Replace("image/", "");
+                if (string.IsNullOrEmpty(mimeType))
+                {
+                    mimeType = AndroidApp.MainActivity.ContentResolver?.GetType(uri);
+                }
+
+                var ext = string.IsNullOrEmpty(mimeType) ? "" : "." + mimeType.Replace("image/", "");
 
                 //image/png
                 //image/jpeg
@@ -627,10 +682,60 @@ internal class AndroidFileService : IFileService
         }
         catch (Exception ex)
         {
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [File] PickFiles failed: {ex}");
+
             return null;
         }
 
         return taskFiles;
+    }
+
+    /// <summary>
+    /// Completion entry point for <see cref="PickFiles"/>, called by MainActivity.OnActivityResult
+    /// for <see cref="ActivityResult.FilePicker"/>. Resolves the picked uris (the single result or
+    /// the ClipData items of a multi-select), or an empty array when the user cancels, so the
+    /// awaiting PickFiles returns an empty list instead of hanging.
+    /// </summary>
+    internal void OnFilePickerResult(global::Android.App.Result resultCode, Intent? data)
+    {
+        var tcs = tcsPickFiles;
+
+        tcsPickFiles = null;
+
+        if (tcs is null)
+        {
+            return;
+        }
+
+        var uris = Array.Empty<Uri>();
+
+        if (resultCode is global::Android.App.Result.Ok && data is not null)
+        {
+            var clipData = data.ClipData;
+
+            if (clipData is not null && clipData.ItemCount > 0)
+            {
+                var items = new List<Uri>(clipData.ItemCount);
+
+                for (var i = 0; i < clipData.ItemCount; i++)
+                {
+                    var itemUri = clipData.GetItemAt(i)?.Uri;
+
+                    if (itemUri is not null)
+                    {
+                        items.Add(itemUri);
+                    }
+                }
+
+                uris = items.ToArray();
+            }
+            else if (data.Data is not null)
+            {
+                uris = new Uri[] { data.Data };
+            }
+        }
+
+        tcs.TrySetResult(uris);
     }
 
     public TaskCompletionSource<Uri> tcsSaveFile = null;
@@ -668,11 +773,37 @@ internal class AndroidFileService : IFileService
 
         intent.PutExtra(DocumentsContract.ExtraInitialUri, initialFolderUri);
 
-        tcsSaveFile = new TaskCompletionSource<Uri>();
+        var tcs = new TaskCompletionSource<Uri>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        AndroidApp.MainActivity.StartActivityForResult(intent, (int)ActivityResult.SaveFile);
+        tcsSaveFile = tcs;
 
-        var uri = await tcsSaveFile.Task;
+        // 同 PickFiles：StartActivityForResult 攜帶 Activity 親和性，必須投遞到 UI 線程；
+        // 啟動失敗以 null 結束會話。
+        var activity = AndroidApp.MainActivity;
+
+        activity.RunOnUiThread(() =>
+        {
+            try
+            {
+                activity.StartActivityForResult(intent, (int)ActivityResult.SaveFile);
+            }
+            catch (Exception ex)
+            {
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [File] SaveFile launch failed: {ex}");
+
+                tcsSaveFile = null;
+
+                tcs.TrySetResult(null);
+            }
+        });
+
+        var uri = await tcs.Task;
+
+        if (uri is null)
+        {
+            // 用戶取消（或啟動失敗）：無輸出目標，返回空結果，避免解引用 null。
+            return "";
+        }
 
         var parcelFileDescriptor = Application.Context.ContentResolver?.OpenFileDescriptor(uri, "wt");
 
@@ -692,6 +823,25 @@ internal class AndroidFileService : IFileService
         result = uri.ToString() ?? throw new Exception($"Unable to resolve the file path'{uri}'.");
 
         return result;
+    }
+
+    /// <summary>
+    /// Completion entry point for <see cref="SaveFile"/>, called by MainActivity.OnActivityResult
+    /// for <see cref="ActivityResult.SaveFile"/>. Resolves the destination uri, or null when the
+    /// user cancels.
+    /// </summary>
+    internal void OnSaveFileResult(global::Android.App.Result resultCode, Intent? data)
+    {
+        var tcs = tcsSaveFile;
+
+        tcsSaveFile = null;
+
+        if (tcs is null)
+        {
+            return;
+        }
+
+        tcs.TrySetResult(resultCode is global::Android.App.Result.Ok ? data?.Data : null);
     }
 
     public async Task<string> OpenFile(string name, string category, byte[] bytes)
@@ -1026,6 +1176,12 @@ internal class AndroidRecordService : RecordService, IRecordService
 
     MemoryStream memoryStream = null;
 
+    // TakePhoto session state: the MediaStore row the camera app writes into, and the
+    // completion source MainActivity.OnActivityResult resolves through OnTakePhotoResult.
+    Uri? takePhotoUri = null;
+
+    TaskCompletionSource<Uri?>? tcsTakePhoto = null;
+
     public async Task<bool> StartRecord()
     {
         LastFailure = RecordFailure.None;
@@ -1173,6 +1329,161 @@ internal class AndroidRecordService : RecordService, IRecordService
     {
         // MediaExtractor + MediaCodec would be the Android implementation; not wired up yet.
         throw new NotImplementedException($"DecodeToWavPcm16 is not implemented on Android: {path}");
+    }
+
+    /// <summary>
+    /// Launches the system camera app and hands the captured photo back as bytes, or null when
+    /// the user cancels, no camera app is installed, or the capture cannot be read back. The
+    /// output goes through a pre-inserted MediaStore row: a file:// extra would trip StrictMode's
+    /// FileUriExposedException on modern Android, while the row gives the camera app a writable
+    /// uri (plus the granted write permission) without any FileProvider.
+    /// </summary>
+    public override async Task<TaskFile> TakePhoto()
+    {
+        LastFailure = RecordFailure.None;
+
+        try
+        {
+            var activity = AndroidApp.MainActivity;
+
+            var resolver = activity.ContentResolver;
+
+            var contentUri = MediaStore.Images.Media.ExternalContentUri;
+
+            if (resolver is null || contentUri is null)
+            {
+                return null;
+            }
+
+            var values = new ContentValues();
+
+            values.Put(MediaStore.Images.Media.InterfaceConsts.DisplayName, $"TakePhoto-{DateTime.Now:yyyyMMddHHmmss}.jpg");
+
+            values.Put(MediaStore.Images.Media.InterfaceConsts.MimeType, "image/jpeg");
+
+            var outputUri = resolver.Insert(contentUri, values);
+
+            if (outputUri is null)
+            {
+                return null;
+            }
+
+            takePhotoUri = outputUri;
+
+            var intent = new Intent(MediaStore.ActionImageCapture);
+
+            intent.PutExtra(MediaStore.ExtraOutput, outputUri);
+
+            intent.AddFlags(ActivityFlags.GrantWriteUriPermission);
+
+            // RunContinuationsAsynchronously 与 Windows/Apple 端的 UI 桥接 TCS 一致：
+            // 结果经 UI 线程回填时续体改由线程池执行，渲染线程同步等待（GetResult）不会
+            // 与 UI 线程互相阻塞。
+            var tcs = new TaskCompletionSource<Uri?>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            tcsTakePhoto = tcs;
+
+            // StartActivityForResult carries Activity affinity; the render loop calls this
+            // from a background thread, so the launch is posted to the UI thread. A launcher
+            // failure (no camera app installed) resolves the session with null instead of
+            // escaping into the UI thread's message loop and taking the app down.
+            activity.RunOnUiThread(() =>
+            {
+                try
+                {
+                    activity.StartActivityForResult(intent, (int)ActivityResult.TakePhoto);
+                }
+                catch (Exception ex)
+                {
+                    DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] TakePhoto launch failed: {ex}");
+
+                    tcsTakePhoto = null;
+
+                    tcs.TrySetResult(null);
+                }
+            });
+
+            var uri = await tcs.Task;
+
+            if (uri is null)
+            {
+                return null;
+            }
+
+            byte[] bytes;
+
+            using (var stream = resolver.OpenInputStream(uri))
+            using (var memory = new MemoryStream())
+            {
+                if (stream is null)
+                {
+                    return null;
+                }
+
+                stream.CopyTo(memory);
+                bytes = memory.ToArray();
+            }
+
+            if (bytes.Length == 0)
+            {
+                return null;
+            }
+
+            var taskFile = new TaskFile()
+            {
+                Name = uri.ToString() ?? "",
+                Ext = ".jpg",
+                Text = "",
+                Bytes = bytes
+            };
+
+            DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] TakePhoto captured {bytes.Length} bytes from '{uri}'");
+
+            return taskFile;
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] TakePhoto failed: {ex}");
+
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Completion entry point for <see cref="TakePhoto"/>, called by MainActivity.OnActivityResult
+    /// for <see cref="ActivityResult.TakePhoto"/>. Resolves the session with the output uri on OK
+    /// or with null on cancellation — deleting the placeholder row again, so a cancelled capture
+    /// leaves no zero-byte image behind in the gallery.
+    /// </summary>
+    internal void OnTakePhotoResult(global::Android.App.Result resultCode, Intent? data)
+    {
+        var uri = data?.Data ?? takePhotoUri;
+
+        takePhotoUri = null;
+
+        var tcs = tcsTakePhoto;
+
+        tcsTakePhoto = null;
+
+        if (tcs is null)
+        {
+            return;
+        }
+
+        if (resultCode is not global::Android.App.Result.Ok)
+        {
+            if (uri is not null)
+            {
+                try { AndroidApp.MainActivity.ContentResolver.Delete(uri, null); }
+                catch (Exception ex) { DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] TakePhoto placeholder cleanup failed: {ex.Message}"); }
+            }
+
+            tcs.TrySetResult(null);
+
+            return;
+        }
+
+        tcs.TrySetResult(uri);
     }
 }
 

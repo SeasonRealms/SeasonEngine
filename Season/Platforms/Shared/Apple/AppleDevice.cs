@@ -7,7 +7,6 @@ using UIKit;
 using AVFoundation;
 using CoreMedia;
 using CoreGraphics;
-using Photos;
 using StoreKit;
 using System.Net;
 
@@ -145,23 +144,16 @@ internal class AppleDeviceCore : IDeviceCore
     public async Task<bool> RequestPermissionAsync(string[] permissions)
     {
         // Microphone requests go through the TCC-backed AVCaptureDevice consent (one system
-        // prompt per app install); photo requests keep the existing Photos flow. Everything
-        // else is treated as granted, matching the other platforms.
+        // prompt per app install). Everything else is treated as granted, matching the other
+        // platforms: the former Photos fallback was removed for App Store compliance, so apps
+        // that need the photo library implement it in their own downstream code.
         var needsMicrophone = permissions is not null && permissions.Any(p =>
             p is not null && (p.Contains("RECORD_AUDIO", StringComparison.OrdinalIgnoreCase)
                 || p.Contains("MICROPHONE", StringComparison.OrdinalIgnoreCase)));
 
         if (!needsMicrophone)
         {
-            var status = PHPhotoLibrary.AuthorizationStatus;
-
-            bool authotization = status == PHAuthorizationStatus.Authorized;
-
-            if (!authotization)
-            {
-                authotization = await PHPhotoLibrary.RequestAuthorizationAsync() == PHAuthorizationStatus.Authorized;
-            }
-            return authotization;
+            return true;
         }
 
         return await RequestMicrophonePermissionAsync();
@@ -776,66 +768,85 @@ internal class AppleFileService : IFileService
 
         var fileUrl = Path.Combine(Path.GetTempPath(), fileName);
 
-        using var streamTarget = System.IO.File.OpenWrite(fileUrl);
-
-        var length = (int)(stream.Length < 4096 ? stream.Length : 4096);
-
-        var array = new byte[length];
-
-        int bytesRead = 0;
-
-        while ((bytesRead = stream.Read(array, 0, length)) > 0)
+        // The staged file must be fully on disk before the panel is presented: the out-of-process
+        // panel service reads this file as soon as the user confirms, so the write scope closes
+        // right here. A method-scoped 'using var' would keep the FileStream buffer (4 KB) alive
+        // until SaveFile returns, which is only after the panel closed: small files would then
+        // land empty on the first save and only appear from the second save on (old bytes flushed
+        // late). File.Create also truncates, so a reused temp file name never keeps stale bytes.
+        using (var streamTarget = System.IO.File.Create(fileUrl))
         {
-            streamTarget.Write(array, 0, bytesRead);
+            var length = (int)(stream.Length < 4096 ? stream.Length : 4096);
+
+            var array = new byte[length];
+
+            int bytesRead = 0;
+
+            while ((bytesRead = stream.Read(array, 0, length)) > 0)
+            {
+                streamTarget.Write(array, 0, bytesRead);
+            }
         }
 
         taskCompetedSource = new(cancellationToken);
-
-        var fileNsUrl = NSUrl.FromFilename(fileUrl);
-
-        documentPickerViewController = new UIDocumentPickerViewController(fileNsUrl, UIDocumentPickerMode.ExportToService)
-        {            
-            //DirectoryUrl = NSUrl.FromString("/")
-        };
-
-        documentPickerViewController.DidPickDocumentAtUrls += (s, e) =>
-        {
-            try
-            {
-                taskCompetedSource?.TrySetResult(e.Urls[0].Path ?? throw new Exception("Unable to get the file"));
-            }
-            finally
-            {
-                InternalDispose();
-            }
-        };
-
-        documentPickerViewController.WasCancelled += (s, e) =>
-        {
-            taskCompetedSource?.TrySetException(new Exception("Cancelled"));
-
-            InternalDispose();
-        };
 
         // Set by the presentation completion handler: false means the modal never made it on screen.
         var presented = false;
 
         UIApplication.SharedApplication.InvokeOnMainThread(delegate
         {
-            var currentViewController = Microsoft.Maui.ApplicationModel.Platform.GetCurrentUIViewController();
+            try
+            {
+                var currentViewController = Microsoft.Maui.ApplicationModel.Platform.GetCurrentUIViewController();
 
-            if (currentViewController is not null)
-            {
-                // The completion handler fires when the PRESENTATION animation finishes, not on dismissal;
-                // it is the only moment the presentation guard can know the modal made it on screen.
-                currentViewController.PresentViewController(documentPickerViewController, true, delegate
+                if (currentViewController is not null)
                 {
-                    presented = true;
-                });
+                    // UIKit view controllers must be created on the main thread: constructing the picker
+                    // on the caller's thread trips the UIKit Consistency check whenever SaveFile is invoked
+                    // from a background thread (e.g. the Task.Run wrapper of the download button).
+                    var fileNsUrl = NSUrl.FromFilename(fileUrl);
+
+                    documentPickerViewController = new UIDocumentPickerViewController(fileNsUrl, UIDocumentPickerMode.ExportToService)
+                    {
+                        //DirectoryUrl = NSUrl.FromString("/")
+                    };
+
+                    documentPickerViewController.DidPickDocumentAtUrls += (s, e) =>
+                    {
+                        try
+                        {
+                            taskCompetedSource?.TrySetResult(e.Urls[0].Path ?? throw new Exception("Unable to get the file"));
+                        }
+                        finally
+                        {
+                            InternalDispose();
+                        }
+                    };
+
+                    documentPickerViewController.WasCancelled += (s, e) =>
+                    {
+                        taskCompetedSource?.TrySetException(new Exception("Cancelled"));
+
+                        InternalDispose();
+                    };
+
+                    // The completion handler fires when the PRESENTATION animation finishes, not on dismissal;
+                    // it is the only moment the presentation guard can know the modal made it on screen.
+                    currentViewController.PresentViewController(documentPickerViewController, true, delegate
+                    {
+                        presented = true;
+                    });
+                }
+                else
+                {
+                    taskCompetedSource?.TrySetException(new Exception("No view controller to present the document picker."));
+                }
             }
-            else
+            catch (Exception ex)
             {
-                taskCompetedSource?.TrySetException(new Exception("No view controller to present the document picker."));
+                // The tcs must always be resolved: an exception escaping this block would leave
+                // WaitSaveSession guarding a session that never armed and could never complete it.
+                taskCompetedSource?.TrySetException(ex);
             }
         });
 
@@ -889,8 +900,6 @@ internal class AppleFileService : IFileService
             var cancellation = new CancellationTokenSource();
 
             result = await SaveFile(name, streamOrigin, cancellation.Token);
-
-            //OpenMediaGalleryFile(result);
         }
 
         return result;
@@ -995,60 +1004,16 @@ internal class AppleFileService : IFileService
     //    return result;
     //}
 
-    //Photo (Photo Permission)
-
     async Task<string> SaveStorageFile(string name)
     {
-        var file = "";
-
-        var images = new string[] { ".jpg", ".jpeg", ".png" };
-
-        var videos = new string[] { ".mp4", ".mov" };
-
+        // The former Photos branch (adding the file to the photo library and reading back the
+        // private asset URL) was removed for App Store compliance. The file is only staged in
+        // the cache directory; user-visible saving happens through the save panel in OpenFile.
         var fileName = Path.GetFileName(name);
 
-        var ext = Path.GetExtension(name).ToLower();
+        var file = Path.Combine(FileSystem.CacheDirectory, name);
 
-        var origin = Path.Combine(StorageService.Path(StorageService.DirectoryBase), name);
-
-        if (images.Contains(ext) || videos.Contains(ext))
-        {
-            var nsUrl = new NSUrl(origin);
-
-            NSError error = null;
-
-            string identifier = null;
-
-            var result = PHPhotoLibrary.SharedPhotoLibrary.PerformChangesAndWait(() =>
-            {
-                PHAssetChangeRequest request = null;
-
-                if (images.Contains(ext))
-                {
-                    request = PHAssetChangeRequest.FromImage(nsUrl);
-                }
-                else if (videos.Contains(ext))
-                {
-                    request = PHAssetChangeRequest.FromVideo(nsUrl);
-                }
-
-                identifier = request.PlaceholderForCreatedAsset.LocalIdentifier;
-            }, out error);
-
-            var assets = PHAsset.FetchAssetsUsingLocalIdentifiers(new string[] { identifier }, null);
-
-            var phAsset = assets.FirstObject as PHAsset;
-
-            var assetResource = PHAssetResource.GetAssetResources(phAsset)?.FirstOrDefault();
-
-            file = assetResource.ValueForKey(new NSString("privateFileURL")).ToString();
-        }
-        else
-        {
-            file = Path.Combine(FileSystem.CacheDirectory, name);
-
-            File.Copy(fileName, file);
-        }
+        File.Copy(fileName, file);
 
         return file;
     }
@@ -1060,16 +1025,6 @@ internal class AppleFileService : IFileService
         File.WriteAllBytes(file, bytes);
 
         return file;
-    }
-
-    async Task<bool> OpenMediaGalleryFile(string name)
-    {
-        var nsUrl = new NSUrl(name);
-
-        return await Launcher.OpenAsync(new OpenFileRequest
-        {
-            File = new ReadOnlyFile(nsUrl.RelativePath)
-        });
     }
 
     public async Task<bool> OpenLink(string name)
@@ -1172,192 +1127,32 @@ internal class AppleGalleryService : IGalleryService
 {
     public async Task<Stream> MediaAsset(MediaAsset mediaAsset)
     {
-        //var phAsset = mediaAsset.Object as PHAsset;
+        var tcs = new TaskCompletionSource<Stream>();
 
         if (mediaAsset.Path.IsNullOrWhiteSpace())
         {
-
+            tcs.TrySetResult(null);
         }
         else if (System.IO.File.Exists(mediaAsset.Path))
         {
-            var stream = File.OpenRead(mediaAsset.Path);
-
-            return stream;
-        }
-
-        var imageManager = new PHCachingImageManager();
-
-        var thumbnailRequestOptions = new PHImageRequestOptions();
-        thumbnailRequestOptions.ResizeMode = PHImageRequestOptionsResizeMode.Fast;
-        thumbnailRequestOptions.DeliveryMode = PHImageRequestOptionsDeliveryMode.FastFormat;
-        thumbnailRequestOptions.NetworkAccessAllowed = true;
-        thumbnailRequestOptions.Synchronous = true;
-
-        var requestOptions = new PHImageRequestOptions();
-        requestOptions.ResizeMode = PHImageRequestOptionsResizeMode.Exact;
-        requestOptions.DeliveryMode = PHImageRequestOptionsDeliveryMode.HighQualityFormat;
-        requestOptions.NetworkAccessAllowed = true;
-        requestOptions.Synchronous = true;
-
-        var tcs = new TaskCompletionSource<Stream>();
-
-        var fetchOptions = new PHFetchOptions();
-        fetchOptions.SortDescriptors = new NSSortDescriptor[] { new NSSortDescriptor("creationDate", false) };
-        fetchOptions.Predicate = NSPredicate.FromFormat($"mediaType == {(int)PHAssetMediaType.Image} || mediaType == {(int)PHAssetMediaType.Video}");
-
-        var nsUrls = new NSUrl[] { new NSUrl(mediaAsset.Path) };
-
-        PHFetchResult fetchResults = null; // PHAsset.FetchAssets(nsUrls, null);
-
-        if (fetchResults == null || fetchResults.Count == 0)
-        {
-            tcs.TrySetResult(null);
+            tcs.TrySetResult(File.OpenRead(mediaAsset.Path));
         }
         else
         {
-            var phAsset = fetchResults[0] as PHAsset;
-
-            var tmpPath = Path.GetTempPath();
-
-            var allAssets = fetchResults.Select(p => p as PHAsset).ToArray();
-
-            var thumbnailSize = new CGSize(300.0f, 300.0f);
-
-            var name = PHAssetResource.GetAssetResources(phAsset)?.FirstOrDefault()?.OriginalFilename;
-
-            if (phAsset.MediaType is PHAssetMediaType.Image)
-            {
-                imageManager.RequestImageData(phAsset, null, (data, dataUti, orientation, info) =>
-                {
-                    var bytes = data.ToArray();
-
-                    var stream = new MemoryStream(bytes);
-
-                    bytes = null;
-
-                    tcs.TrySetResult(stream);
-                });
-            }
-            else
-            {
-                PHVideoRequestOptions pHVideoRequestOptions = null;
-
-                imageManager.RequestAVAsset(phAsset, pHVideoRequestOptions, (asset, audioMix, info) =>
-                {
-                    var avAsset = asset as AVUrlAsset;
-
-                    if (avAsset == null)
-                    {
-
-                    }
-                    else
-                    {
-                        var url = avAsset.Url.RelativePath;
-
-                        var stream = System.IO.File.OpenRead(url);
-
-                        //var avData = NSData.FromUrl(avAsset.Url);
-                        //bytes = avData.ToArray();
-                        //stream.Write(bytes, 0, bytes.Length);
-
-                        tcs.TrySetResult(stream);
-                    }
-                });
-
-                //var memoryStream = new MemoryStream();
-                //var assetResource = PHAssetResource.GetAssetResources(phAsset)?.FirstOrDefault();
-                //PHAssetResourceRequestOptions option = null;
-                //PHAssetResourceManager.DefaultManager.RequestData(assetResource, option, nsData =>
-                //{
-                //    var bytes0 = nsData.ToArray();
-                //    memoryStream.Write(bytes0, 0, bytes0.Length);
-                //},
-                //err =>
-                //{
-                //    if (err == null)
-                //    {
-                //        tcs.TrySetResult(memoryStream);
-                //    }
-                //    else
-                //    {
-                //        tcs.TrySetResult(null);
-                //    }
-                //});
-            }
+            // The Photos-backed fallback (requesting asset data through PHImageManager) was
+            // removed with the rest of the gallery path for App Store compliance.
+            tcs.TrySetResult(null);
         }
 
         return await tcs.Task;
     }
 
-    public async Task<List<MediaAsset>> MediaGallery()
+    public Task<List<MediaAsset>> MediaGallery()
     {
-        var assets = new List<MediaAsset>();
-
-        var imageManager = new PHCachingImageManager();
-
-        var hasPermission = await DeviceServices.Core.RequestPermissionAsync(null);
-
-        if (hasPermission)
-        {
-            var thumbnailRequestOptions = new PHImageRequestOptions();
-            thumbnailRequestOptions.ResizeMode = PHImageRequestOptionsResizeMode.Fast;
-            thumbnailRequestOptions.DeliveryMode = PHImageRequestOptionsDeliveryMode.FastFormat;
-            thumbnailRequestOptions.NetworkAccessAllowed = true;
-            thumbnailRequestOptions.Synchronous = true;
-
-            var requestOptions = new PHImageRequestOptions();
-            requestOptions.ResizeMode = PHImageRequestOptionsResizeMode.Exact;
-            requestOptions.DeliveryMode = PHImageRequestOptionsDeliveryMode.HighQualityFormat;
-            requestOptions.NetworkAccessAllowed = true;
-            requestOptions.Synchronous = true;
-
-            var fetchOptions = new PHFetchOptions();
-            fetchOptions.SortDescriptors = new NSSortDescriptor[] { new NSSortDescriptor("creationDate", false) };
-            fetchOptions.Predicate = NSPredicate.FromFormat($"mediaType == {(int)PHAssetMediaType.Image} || mediaType == {(int)PHAssetMediaType.Video}");
-
-            var fetchResults = PHAsset.FetchAssets(fetchOptions);
-            var tmpPath = Path.GetTempPath();
-            var allAssets = fetchResults.Select(p => p as PHAsset).ToArray();
-            var thumbnailSize = new CoreGraphics.CGSize(300.0f, 300.0f);
-
-            imageManager.StartCaching(allAssets, thumbnailSize, PHImageContentMode.AspectFit, thumbnailRequestOptions);
-            imageManager.StartCaching(allAssets, PHImageManager.MaximumSize, PHImageContentMode.AspectFit, requestOptions);
-
-            foreach (var result in fetchResults)
-            {
-                var phAsset = (result as PHAsset);
-
-                var assetResource = PHAssetResource.GetAssetResources(phAsset)?.FirstOrDefault();
-
-                var size = assetResource.ValueForKey(new NSString("fileSize"));
-
-                var file = assetResource.ValueForKey(new NSString("privateFileURL"));
-
-                var name = assetResource?.OriginalFilename;
-
-                var date = (DateTime)phAsset.CreationDate;
-
-                var asset = new MediaAsset()
-                {
-                    Id = phAsset.LocalIdentifier,
-                    Name = Path.GetFileNameWithoutExtension(name),
-                    Ext = Path.GetExtension(name),
-                    Category = date.ToMonthDate(),
-                    Path = file.ToString(),
-                    PreviewPath = "",
-                    Type = phAsset.MediaType == PHAssetMediaType.Image ? MediaAssetType.Image : MediaAssetType.Video,
-                    Size = long.Parse(size.ToString()),
-                    Time = date.ToDateTimeSeconds(),
-                    Object = phAsset
-                };
-
-                assets.Add(asset);
-            }
-
-            return assets;
-        }
-
-        return null;
+        // The Photos-backed gallery was removed for App Store compliance: reading the photo
+        // library requires an NSPhotoLibraryUsageDescription in every host app. Apple apps
+        // that need the photo library implement it in their own downstream code.
+        throw new NotImplementedException("MediaGallery: not implemented on Apple platforms; implement photo library access in the consuming app");
     }
 
     public async Task<List<MediaAsset>> MediaGalleryDownloads()
@@ -1406,6 +1201,8 @@ internal class AppleGalleryService : IGalleryService
 
     public async Task<bool> MediaRemove(MediaAsset[] mediaAssets, bool delEmptyDirectory)
     {
+        // Only container files can be removed: the Photos-backed removal was removed with the
+        // rest of the gallery path for App Store compliance.
         var tcs = new TaskCompletionSource<bool>();
 
         if (mediaAssets == null || mediaAssets.Length == 0)
@@ -1414,38 +1211,12 @@ internal class AppleGalleryService : IGalleryService
         }
         else
         {
-            var mediaDowns = mediaAssets.Where(me => me.Object == null).NullToEmptyArray();
-
-            foreach (var mediaDown in mediaDowns)
+            foreach (var mediaDown in mediaAssets)
             {
                 System.IO.File.Delete(mediaDown.Path);
             }
 
-            var phAssets = mediaAssets.Where(me => me.Object != null).NullToEmptyArray().Select(me => me.Object as PHAsset).NullToEmptyArray();
-
-            if (phAssets.Length > 0)
-            {
-                PHPhotoLibrary.SharedPhotoLibrary.PerformChanges(() =>
-                {
-                    PHAssetChangeRequest.DeleteAssets(phAssets);
-
-                },
-                (result, err) =>
-                {
-                    if (result)
-                    {
-                        tcs.TrySetResult(true);
-                    }
-                    else
-                    {
-                        tcs.TrySetResult(false);
-                    }
-                });
-            }
-            else
-            {
-                tcs.TrySetResult(true);
-            }
+            tcs.TrySetResult(true);
         }
 
         return await tcs.Task;
@@ -2490,15 +2261,11 @@ internal class AppleDownloadService : IDownloadService
     {
         get
         {
-#if MACCATALYST
-            // Real user Downloads folder. Under App Sandbox, UserProfile resolves to the container's
-            // Data dir whose "Downloads" entry is a symlink to the real ~/Downloads; writing through
-            // it requires the com.apple.security.files.downloads.read-write entitlement.
-            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
-#else
-            // iOS has no user-visible Downloads folder; keep downloads inside the app container.
+            // Downloads are staged inside the app container. Writing into the real ~/Downloads folder
+            // (the container's Data/Downloads symlink) would require the entitlement
+            // com.apple.security.files.downloads.read-write, which Apple does not allow, so
+            // user-visible saves go through the system save panel in DownloadSave instead.
             return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Downloads");
-#endif
         }
     }
 
@@ -2637,6 +2404,28 @@ internal class AppleDownloadService : IDownloadService
 
     public void DownloadSave(string directory, string name, byte[] bytes, bool openFolder)
     {
+#if MACCATALYST
+        // App Store compliance: the real ~/Downloads folder cannot be written to without the
+        // entitlement com.apple.security.files.downloads.read-write, which Apple does not allow.
+        // Hand the bytes to the system save panel (UIDocumentPicker ExportToService) instead: it
+        // runs on com.apple.security.files.user-selected.read-write and lets the user pick the
+        // destination folder and file name explicitly.
+        Task.Run(async () =>
+        {
+            try
+            {
+                using var stream = new MemoryStream(bytes);
+
+                await DeviceServices.File.SaveFile(name, stream, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                // Dismissing the save panel is a normal outcome and must not read as a failure.
+                if (ex.Message is not "Cancelled")
+                    DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [DownloadSave] save panel for {name} failed: {ex}");
+            }
+        });
+#else
         if (directory.IsNullOrWhiteSpace())
         {
             directory = DownloadDir;
@@ -2669,19 +2458,14 @@ internal class AppleDownloadService : IDownloadService
         catch (Exception ex)
         {
             // Never let an IO failure here tear down the app: downloads run inside the
-            // render/update loop. Under MacCatalyst App Sandbox the usual cause is the real
-            // ~/Downloads folder being blocked; com.apple.security.files.downloads.read-write
-            // must be declared in Platforms/MacCatalyst/Entitlements.plist.
+            // render/update loop.
             DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [DownloadSave] file={file} failed err={ex}");
 
             return;
         }
 
-        if (openFolder)
-        {
-            // Reveal the download folder in Finder (matches the Windows implementation).
-            DeviceServices.File.OpenFolder(directory);
-        }
+        // openFolder is intentionally ignored: iOS has no file manager UI to reveal a folder in.
+#endif
     }
 
     public void DownloadUpdate(string directory, string name, string namenew)

@@ -1084,6 +1084,21 @@ public class BaseActivity : Activity
 
     protected override void OnActivityResult(int requestCode, [GeneratedEnum] global::Android.App.Result resultCode, Intent? data)
     {
+        // Route the launched capture/picker back to the device service that owns the session:
+        // camera capture belongs to the record service, file pick/save to the file service.
+        if (requestCode == (int)ActivityResult.TakePhoto)
+        {
+            (DeviceServices.Record as AndroidRecordService)?.OnTakePhotoResult(resultCode, data);
+        }
+        else if (requestCode == (int)ActivityResult.FilePicker)
+        {
+            (DeviceServices.File as AndroidFileService)?.OnFilePickerResult(resultCode, data);
+        }
+        else if (requestCode == (int)ActivityResult.SaveFile)
+        {
+            (DeviceServices.File as AndroidFileService)?.OnSaveFileResult(resultCode, data);
+        }
+
         base.OnActivityResult(requestCode, resultCode, data);
     }
 

@@ -1186,6 +1186,290 @@ internal class WindowsRecordService : RecordService, IRecordService
     }
 
     /// <summary>
+    /// Presents the Windows camera UI and reads the captured photo back as bytes, or null when
+    /// the user cancels (or no camera is reachable). Packaged apps use the WinAppSDK camera UI
+    /// (Microsoft.Windows.Media.Capture.CameraCaptureUI): the UWP Windows.Media.Capture.CameraCaptureUI
+    /// cannot attach its preview to a WinUI 3 window (it is initialized with a bare HWND), while the
+    /// WinAppSDK class parents itself through the WindowId. Unpackaged apps run the same picker over
+    /// a Path.GetTempPath() file instead (see CapturePhotoUnpackagedAsync): the WinAppSDK class digs
+    /// its hand-off file out of ApplicationData.Current, which needs package identity and throws
+    /// 0x80073D54 "The process has no package identity" before any camera UI appears. Either way the
+    /// capture lands in a temp file that is deleted once the bytes have been read back — the same
+    /// lifecycle StopRecord uses for its temp WAV.
+    /// </summary>
+    public override async Task<TaskFile> TakePhoto()
+    {
+        try
+        {
+            return await RunOnUiThread(TakePhotoCoreAsync);
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] TakePhoto failed: hresult=0x{ex.HResult:X8} {ex}");
+            System.Diagnostics.Debug.WriteLine($"[Record] TakePhoto failed: hresult=0x{ex.HResult:X8} {ex}");
+
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// UI-thread affinity bridge (the same contract WindowsFileService.PickFiles uses): the camera
+    /// UI can only be presented from the XAML UI thread, while the render loop runs on a ThreadPool
+    /// work item (MTA), so the capture is dispatched whenever the caller is not already on it.
+    /// A caller that blocks on the returned task keeps working: the continuations need the UI
+    /// thread, not the blocked caller.
+    /// </summary>
+    static Task<T> RunOnUiThread<T>(Func<Task<T>> action)
+    {
+        var window = WindowsApp.Window;
+
+        if (window is null || window.DispatcherQueue.HasThreadAccess)
+        {
+            return action();
+        }
+
+        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        if (!window.DispatcherQueue.TryEnqueue(async () =>
+        {
+            try { tcs.TrySetResult(await action()); }
+            catch (Exception ex) { tcs.TrySetException(ex); }
+        }))
+        {
+            // TryEnqueue reports false while the dispatcher is shutting down; fault the task
+            // instead of leaving the caller waiting forever (same guard as WindowsDialogService).
+            tcs.TrySetException(new InvalidOperationException("UI dispatcher rejected the camera capture request."));
+        }
+
+        return tcs.Task;
+    }
+
+    async Task<TaskFile> TakePhotoCoreAsync()
+    {
+        if (WindowsApp.Window is null)
+        {
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] TakePhoto aborted: the app window has not been created yet");
+
+            return null;
+        }
+
+        DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] TakePhoto begin thread={Environment.CurrentManagedThreadId} ui={WindowsApp.Window.DispatcherQueue.HasThreadAccess}");
+
+        var windowHandle = WinRT.Interop.WindowNative.GetWindowHandle(WindowsApp.Window);
+
+        var windowId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(windowHandle);
+
+        byte[] bytes;
+        string photoPath;
+
+        if (IsPackagedApp())
+        {
+            var cameraCaptureUI = new Microsoft.Windows.Media.Capture.CameraCaptureUI(windowId);
+
+            var photo = await cameraCaptureUI.CaptureFileAsync(Microsoft.Windows.Media.Capture.CameraCaptureUIMode.Photo);
+
+            if (photo is null)
+            {
+                // The user cancelled, or the camera UI could not be opened (privacy switch off,
+                // no camera hardware): not an error, the caller treats null as "no photo".
+                DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] TakePhoto returned no file (cancelled or no camera)");
+
+                return null;
+            }
+
+            photoPath = photo.Path;
+
+            try
+            {
+                using (var stream = await photo.OpenStreamForReadAsync())
+                using (var memory = new MemoryStream())
+                {
+                    await stream.CopyToAsync(memory);
+                    bytes = memory.ToArray();
+                }
+            }
+            finally
+            {
+                // The capture lives in the app temp folder and is never shown to the user
+                // elsewhere; drop it once the bytes are out, exactly like StopRecord does
+                // with its temp WAV.
+                try { await photo.DeleteAsync(); }
+                catch (Exception ex) { DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] TakePhoto temp cleanup failed: {ex.Message}"); }
+            }
+        }
+        else
+        {
+            var captured = await CapturePhotoUnpackagedAsync(windowHandle);
+
+            if (captured is null)
+            {
+                DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] TakePhoto returned no file (cancelled or no camera)");
+
+                return null;
+            }
+
+            (photoPath, bytes) = captured.Value;
+        }
+
+        if (bytes.Length == 0)
+        {
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] TakePhoto captured an empty file");
+
+            return null;
+        }
+
+        var taskFile = new TaskFile()
+        {
+            Name = photoPath,
+            Ext = System.IO.Path.GetExtension(photoPath),
+            Text = "",
+            Bytes = bytes
+        };
+
+        DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] TakePhoto captured {bytes.Length} bytes ext='{taskFile.Ext}'");
+
+        return taskFile;
+    }
+
+    /// <summary>
+    /// True when the process runs with an MSIX package identity, i.e. ApplicationData.Current is
+    /// reachable and the WinAppSDK camera UI can hand its capture file to the stock camera app.
+    /// A plain WinRAR/ZIP deployment reports none.
+    /// </summary>
+    static bool IsPackagedApp()
+    {
+        try
+        {
+            _ = global::Windows.ApplicationModel.Package.Current;
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Runs the camera picker from an unpackaged process: creates a Path.GetTempPath() file, shares
+    /// it through SharedStorageAccessManager.AddFile, launches the stock camera app with
+    /// Launcher.LaunchUriForResultsAsync (microsoft.windows.camera.picker:) — it writes the shot
+    /// into the shared file — and redeems the token the call comes back with. This is the exact
+    /// protocol WinAppSDK's CameraCaptureUI drives internally, minus the ApplicationData.Current
+    /// step that cannot work without package identity. The bytes are read here and the temp file
+    /// dropped before returning, so no artifact outlives the call. Returns null when the user
+    /// cancels or the picker responds without a token.
+    /// </summary>
+    static async Task<(string Path, byte[] Bytes)?> CapturePhotoUnpackagedAsync(IntPtr windowHandle)
+    {
+        var tempPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"CameraCapture-{Guid.NewGuid():N}.jpg");
+
+        System.IO.File.WriteAllBytes(tempPath, Array.Empty<byte>());
+
+        string? token = null;
+        string? redeemedPath = null;
+
+        try
+        {
+            var tempFile = await global::Windows.Storage.StorageFile.GetFileFromPathAsync(tempPath);
+
+            token = global::Windows.ApplicationModel.DataTransfer.SharedStorageAccessManager.AddFile(tempFile);
+
+            // Mirrors what CameraCaptureUI.PhotoSettings serializes by default (Jpeg, cropping
+            // allowed, highest resolution), so the picker UI behaves identically to the packaged path.
+            var properties = new global::Windows.Foundation.Collections.ValueSet
+            {
+                { "MediaType", "photo" },
+                { "AllowCropping", true },
+                { "PhotoFormat", 0 },
+                { "MaxResolution", 0 },
+                { "PhotoCropWidth", 0 },
+                { "PhotoCropHeight", 0 },
+                { "PhotoCropARWidth", 0 },
+                { "PhotoCropARHeight", 0 },
+                { "PhotoFileToken", token }
+            };
+
+            var options = new global::Windows.System.LauncherOptions()
+            {
+                TreatAsUntrusted = false,
+                DisplayApplicationPicker = false,
+                // Pin the picker to the stock camera app, exactly like CameraCaptureUI does.
+                TargetApplicationPackageFamilyName = "Microsoft.WindowsCamera_8wekyb3d8bbwe"
+            };
+
+            WinRT.Interop.InitializeWithWindow.Initialize(options, windowHandle);
+
+            var result = await global::Windows.System.Launcher.LaunchUriForResultsAsync(new Uri("microsoft.windows.camera.picker:"), options, properties);
+
+            if (result is null || result.Result is null)
+            {
+                // The camera app closed without a result: the user cancelled, not an error.
+                return null;
+            }
+
+            result.Result.TryGetValue("SelectedTokens", out var selected);
+
+            var selectedToken = selected as string;
+
+            if (string.IsNullOrEmpty(selectedToken))
+            {
+                // WinAppSDK throws hresult_canceled on this path; keep the cancellation a null result.
+                DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] TakePhoto picker finished without SelectedTokens (status={result.Status})");
+
+                return null;
+            }
+
+            var photo = await global::Windows.ApplicationModel.DataTransfer.SharedStorageAccessManager.RedeemTokenForFileAsync(selectedToken);
+
+            var filePath = photo.Path;
+
+            redeemedPath = filePath;
+
+            using (var stream = await photo.OpenStreamForReadAsync())
+            using (var memory = new MemoryStream())
+            {
+                await stream.CopyToAsync(memory);
+
+                return (filePath, memory.ToArray());
+            }
+        }
+        finally
+        {
+            // The picker wrote the shot into the shared temp file (the redeemed token resolves to
+            // that very path), so the share token and the file are dropped on every exit — success,
+            // cancel or failure — which is exactly the leak they would otherwise be.
+            if (token is not null)
+            {
+                try { global::Windows.ApplicationModel.DataTransfer.SharedStorageAccessManager.RemoveFile(token); }
+                catch (Exception ex) { DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] TakePhoto share cleanup failed: {ex.Message}"); }
+            }
+
+            DeletePhotoTempFile(tempPath);
+
+            if (redeemedPath is not null && !string.Equals(redeemedPath, tempPath, StringComparison.OrdinalIgnoreCase))
+            {
+                DeletePhotoTempFile(redeemedPath);
+            }
+        }
+    }
+
+    static void DeletePhotoTempFile(string path)
+    {
+        try
+        {
+            if (System.IO.File.Exists(path))
+            {
+                System.IO.File.Delete(path);
+            }
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] TakePhoto temp cleanup failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
     /// Decodes the audio of a media file (.m4a/.mp3/.wma, and the audio track of an .mp4/.m4v) into a
     /// complete WAV: 16 kHz mono 16-bit PCM behind the canonical RIFF header, i.e. the very output
     /// contract StartRecord/StopRecord has and the only layout the STT front ends parse. MediaTranscoder
