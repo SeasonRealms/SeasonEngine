@@ -949,8 +949,33 @@ internal class SettingPanel : BoardPanel
             {
                 var logs = String.Join("\r\n", App.Instance.Logs);
                 var bytes = Encoding.UTF8.GetBytes(logs);
+                var name = $"{DateTime.Now.ToDateTimeTicks()}.txt";
 
-                DeviceServices.Download.DownloadSave("", $"{DateTime.Now.ToDateTimeTicks()}.txt", bytes, true);
+#if MACCATALYST
+                // App Store compliance: the engine's MacCatalyst download service writes straight into
+                // the real ~/Downloads folder, which would require the
+                // 'com.apple.security.files.downloads.read-write' entitlement the App Store does not
+                // allow. Hand the log export to the system save panel (UIDocumentPicker ExportToService)
+                // instead: it runs on 'com.apple.security.files.user-selected.read-write' and lets the
+                // user pick the destination folder and file name explicitly.
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        using var stream = new MemoryStream(bytes);
+
+                        await DeviceServices.File.SaveFile(name, stream, CancellationToken.None);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Dismissing the save panel is a normal outcome and must not read as a failure.
+                        if (ex.Message is not "Cancelled")
+                            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [LogExport] save panel for {name} failed: {ex}");
+                    }
+                });
+#else
+                DeviceServices.Download.DownloadSave("", name, bytes, true);
+#endif
 
                 await Task.CompletedTask;
             }

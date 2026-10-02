@@ -29,8 +29,33 @@ internal class Logo : Panel
 
                         if (StorageService.TryGetBytes(StorageService.DirectoryBase, name, out byte[] bytes, out string errMsg))
                         {
+#if MACCATALYST
+                            // App Store compliance: the engine's MacCatalyst download service writes straight
+                            // into the real ~/Downloads folder, which would require the
+                            // 'com.apple.security.files.downloads.read-write' entitlement the App Store does
+                            // not allow. Hand the recording to the system save panel (UIDocumentPicker
+                            // ExportToService) instead: it runs on 'com.apple.security.files.user-selected.read-write'
+                            // and lets the user pick the destination folder and file name explicitly. No
+                            // DownloadDel counterpart here: the panel settles the destination itself.
+                            _ = Task.Run(async () =>
+                            {
+                                try
+                                {
+                                    using var stream = new MemoryStream(bytes);
+
+                                    await DeviceServices.File.SaveFile(name, stream, CancellationToken.None);
+                                }
+                                catch (Exception ex)
+                                {
+                                    // Dismissing the save panel is a normal outcome and must not read as a failure.
+                                    if (ex.Message is not "Cancelled")
+                                        DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Recorder] save panel for {name} failed: {ex}");
+                                }
+                            });
+#else
                             DeviceServices.Download.DownloadDel(null, name);
                             DeviceServices.Download.DownloadSave(null, name, bytes, true);
+#endif
                         }
                     }
                     else

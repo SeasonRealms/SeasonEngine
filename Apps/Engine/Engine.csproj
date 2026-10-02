@@ -75,9 +75,9 @@
 	</PropertyGroup>
 
 	<!-- Mac App Store distribution runs inside the App Sandbox. The entitlements file
-	     (sandbox, network client, microphone input, Downloads and user-selected file access)
-	     only takes effect when referenced here: MAUI does not wire it automatically.
-	     iOS needs no entitlements. -->
+	     (sandbox, network client, microphone input, and user-selected file access used by
+	     both the open and save panels) only takes effect when referenced here: MAUI does
+	     not wire it automatically. iOS needs no entitlements. -->
 	<PropertyGroup Condition="'$(IsMacCatalyst)' == 'true'">
 		<CodesignEntitlements>Platforms/MacCatalyst/Entitlements.plist</CodesignEntitlements>
 	</PropertyGroup>

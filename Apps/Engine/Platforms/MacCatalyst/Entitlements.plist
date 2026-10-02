@@ -12,10 +12,6 @@
         <!-- Required for microphone recording under App Sandbox. -->
         <key>com.apple.security.device.audio-input</key>
         <true/>
-        <!-- App Sandbox also requires this value to write into the user's real ~/Downloads
-             folder (the container's Data/Downloads symlink resolves there). -->
-        <key>com.apple.security.files.downloads.read-write</key>
-        <true/>
         <!-- Required for UIDocumentPickerViewController. MacCatalyst hands the picker over to the AppKit
              open panel service, and under App Sandbox that service refuses to display the panel without
              this entitlement: AppKit only logs "Unable to display open panel" while UIKit keeps an
