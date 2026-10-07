@@ -283,14 +283,14 @@ hr.se-hr { border: 0; border-top: 1px solid var(--border); margin: 34px 0; }
 }
 
 /* --- the film block ----------------------------------------------------- */
-
-.st-film { position: relative; border-radius: var(--radius); overflow: hidden; line-height: 0; }
+/* border-radius: var(--radius);  */
+.st-film { position: relative; overflow: hidden; line-height: 0; }
 
 .st-film video, .st-film img {
     display: block;
     width: 100%;
     height: auto;
-    border-radius: var(--radius);
+    /*border-radius: var(--radius);*/
 }
 
 /* Feather ring: transparent in the middle, the plate's rim colour at the
@@ -301,8 +301,8 @@ hr.se-hr { border: 0; border-top: 1px solid var(--border); margin: 34px 0; }
     position: absolute;
     inset: -1px;
     pointer-events: none;
-    background: radial-gradient(closest-side at 50% 48%,
-        rgba(0, 0, 0, 0) 56%, var(--film-edge) 100%);
+    /*background: radial-gradient(closest-side at 50% 48%,
+        rgba(0, 0, 0, 0) 56%, var(--film-edge) 100%);*/
 }
 
 .st-film__poster { display: none; }
