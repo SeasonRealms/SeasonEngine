@@ -234,33 +234,22 @@ internal unsafe partial class Graphics : IGraphics
                             }
                             else
                             {
-                                if (StorageService.FileExist(StorageService.DirectoryBase, sprite2D.Name))
-                                {
-
-                                }
-                                else
-                                {
-                                    StorageService.CopyToLocal(sprite2D.Name);
-                                }
-
                                 StorageService.TryGetStream(StorageService.DirectoryBase, sprite2D.Name, out Stream stream, out string errMsg);
+
+                                if (stream == null)
+                                {
+                                    stream = StorageService.LoadStream(sprite2D.Name);
+                                }
 
                                 using (stream)
                                 {
-                                    if (stream == null)
+                                    var imageExt = sprite2D.Ext;
+                                    if (imageExt.IsNullOrWhiteSpace())
                                     {
-
+                                        imageExt = System.IO.Path.GetExtension(sprite2D.Name).ToLower();
                                     }
-                                    else
-                                    {
-                                        var imageExt = sprite2D.Ext;
-                                        if (imageExt.IsNullOrWhiteSpace())
-                                        {
-                                            imageExt = System.IO.Path.GetExtension(sprite2D.Name).ToLower();
-                                        }
 
-                                        imageResult = ImageUtils.GetImageFromStream(stream, imageExt);
-                                    }
+                                    imageResult = ImageUtils.GetImageFromStream(stream, imageExt);
                                 }
                             }
 
@@ -364,10 +353,12 @@ internal unsafe partial class Graphics : IGraphics
     static INativeImageDecoder? DecodeImageFromPath(string path)
     {
         if (ImageUtils.CreateImageExist(path)) return ImageUtils.CreateImage(path);
-        if (!StorageService.FileExist(StorageService.DirectoryBase, path))
-            StorageService.CopyToLocal(path);
+
+        // Local files (desktop content, user storage) open in place; packaged assets only reachable
+        // through the asset archive are decoded straight from the packaged stream.
+        // Shipped content is never copied into local user storage any more.
         StorageService.TryGetStream(StorageService.DirectoryBase, path, out Stream stream, out _);
-        if (stream == null) return null;
+        if (stream == null) stream = StorageService.LoadStream(path);
         using (stream) return ImageUtils.GetImageFromStream(stream, null);
     }
 
@@ -1736,9 +1727,9 @@ internal unsafe partial class Graphics : IGraphics
                     }
                     else
                     {
-                        if (!StorageService.FileExist(StorageService.DirectoryBase, sprite.Name))
-                            StorageService.CopyToLocal(sprite.Name);
                         StorageService.TryGetStream(StorageService.DirectoryBase, sprite.Name, out Stream stream, out string errMsg);
+                        if (stream == null)
+                            stream = StorageService.LoadStream(sprite.Name);
                         using (stream)
                         {
                             if (stream != null)
@@ -1888,15 +1879,12 @@ internal unsafe partial class Graphics : IGraphics
             }
             else
             {
-                if (!StorageService.FileExist(StorageService.DirectoryBase, name))
-                    StorageService.CopyToLocal(name);
                 StorageService.TryGetStream(StorageService.DirectoryBase, name, out Stream stream, out string errMsg);
+                if (stream == null)
+                    stream = StorageService.LoadStream(name);
                 using (stream)
                 {
-                    if (stream != null)
-                    {
-                        imageResult = ImageUtils.GetImageFromStream(stream, null);
-                    }
+                    imageResult = ImageUtils.GetImageFromStream(stream, null);
                 }
             }
 

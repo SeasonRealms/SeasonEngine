@@ -97,18 +97,19 @@ internal class GltfAsset
     {
         Model = model;
 
-        if (StorageService.FileExist(StorageService.DirectoryBase, model.Name))
+        // Model assets stream straight from the package: user storage is consulted first only when
+        // a real file exists there (user-imported content), and packaged assets are never copied
+        // into local storage any more.
+        StorageService.TryGetStream(StorageService.DirectoryBase, model.Name, out Stream stream, out _);
+
+        if (stream == null)
+            stream = StorageService.LoadStream(model.Name);
+
+        ModelRoot glb;
+        using (stream)
         {
-
+            glb = ModelRoot.ReadGLB(stream, new ReadSettings() { Validation = ValidationMode.Skip });
         }
-        else
-        {
-            StorageService.CopyToLocal(model.Name);
-        }
-
-        StorageService.TryGetStream(StorageService.DirectoryBase, model.Name, out Stream stream, out string errMsg);
-
-        var glb = ModelRoot.ReadGLB(stream, new ReadSettings() { Validation = ValidationMode.Skip });
         //var model = ModelRoot.Load(@"C:\Docs\Engine\Models\" + Name, new ReadSettings() { Validation = ValidationMode.Skip });
 
         // Model-space bounding box in RH space: ComputeRestBounds uses the same source on all sides:

@@ -420,45 +420,184 @@ public static class ImageUtils
         return DeviceServices.Image.SaveImageAsync(image, imageFormat, quality);
     }
 
-    //public static void Flip(string source, Season.Basic.SpriteEffects mode)
-    //{
+    // ==================== CPU pixel transforms ====================
+    // Decoder-in, decoder-out transforms shared by downstream image pipelines (photo editing,
+    // circle masks, thumbnail resize). They all operate on straight RGBA8 rows and never touch
+    // a GPU texture, so every platform runs the identical algorithm.
 
-    //}
+    /// <summary>Copies the source rows into a tightly packed RGBA8 buffer (row stride = Width * 4).</summary>
+    static byte[] CopyPixels(INativeImageDecoder source)
+    {
+        int rowBytes = checked(source.Width * 4);
+        var pixels = new byte[checked(rowBytes * source.Height)];
+        for (int y = 0; y < source.Height; y++)
+            source.PixelSpan.Slice(y * source.Stride, rowBytes).CopyTo(pixels.AsSpan(y * rowBytes, rowBytes));
+        return pixels;
+    }
 
-    //public static void Rotate(string source, Basic.RotateMode mode)
-    //{
+    /// <summary>Crops the source to the given pixel rectangle.</summary>
+    public static INativeImageDecoder Crop(INativeImageDecoder source, int x, int y, int width, int height)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        if (x < 0 || y < 0 || width <= 0 || height <= 0
+            || (long)x + width > source.Width || (long)y + height > source.Height)
+            throw new ArgumentOutOfRangeException(nameof(width));
 
-    //}
+        var pixels = new byte[checked(width * height * 4)];
+        for (int row = 0; row < height; row++)
+            source.PixelSpan.Slice((y + row) * source.Stride + x * 4, width * 4)
+                .CopyTo(pixels.AsSpan(row * width * 4));
+        return new NativeImageData(width, height, pixels);
+    }
 
-    //public static void Crop(string source, float posX, float posY, float width, float height)
-    //{
+    /// <summary>Horizontal mirror (equivalent to RotateNoneFlipX).</summary>
+    public static INativeImageDecoder MirrorHorizontal(INativeImageDecoder source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        byte[] src = CopyPixels(source);
+        int width = source.Width, height = source.Height;
+        var pixels = new byte[checked(width * height * 4)];
+        for (int y = 0; y < height; y++)
+        {
+            var row = src.AsSpan(y * width * 4, width * 4);
+            var dst = pixels.AsSpan(y * width * 4, width * 4);
+            for (int x = 0; x < width; x++)
+                row.Slice((width - 1 - x) * 4, 4).CopyTo(dst.Slice(x * 4, 4));
+        }
+        return new NativeImageData(width, height, pixels);
+    }
 
-    //}
+    /// <summary>Clockwise rotation in 90-degree steps (rotate: 0-3), matching RotateFlipType.Rotate90/180/270.</summary>
+    public static INativeImageDecoder Rotate90(INativeImageDecoder source, int rotate)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        rotate = ((rotate % 4) + 4) % 4;
+        byte[] src = CopyPixels(source);
+        int width = source.Width, height = source.Height;
+        int outW = rotate % 2 == 0 ? width : height;
+        int outH = rotate % 2 == 0 ? height : width;
+        var pixels = new byte[checked(outW * outH * 4)];
+        for (int y = 0; y < height; y++)
+            for (int x = 0; x < width; x++)
+            {
+                int dx, dy;
+                if (rotate == 0) { dx = x; dy = y; }
+                else if (rotate == 1) { dx = height - 1 - y; dy = x; }
+                else if (rotate == 2) { dx = width - 1 - x; dy = height - 1 - y; }
+                else { dx = y; dy = width - 1 - x; }
+                src.AsSpan((y * width + x) * 4, 4).CopyTo(pixels.AsSpan((dy * outW + dx) * 4, 4));
+            }
+        return new NativeImageData(outW, outH, pixels);
+    }
 
-    //public static void Erase(string source, List<BrushPoint> brushPoints)
-    //{
+    /// <summary>Bilinear CPU resize. sameRatio keeps the aspect ratio, fitting inside the target box.</summary>
+    public static INativeImageDecoder ResizeBilinear(INativeImageDecoder source, int targetWidth, int targetHeight, bool sameRatio)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        int outW, outH;
+        if (sameRatio)
+        {
+            float scaleWidth = (float)targetWidth / source.Width;
+            float scaleHeight = (float)targetHeight / source.Height;
+            float scale = Math.Min(scaleWidth, scaleHeight);
+            outW = Math.Max(1, (int)Math.Round(source.Width * scale));
+            outH = Math.Max(1, (int)Math.Round(source.Height * scale));
+        }
+        else
+        {
+            outW = Math.Max(1, targetWidth);
+            outH = Math.Max(1, targetHeight);
+        }
 
-    //}
+        var src = source.PixelSpan;
+        int stride = source.Stride;
+        int inW = source.Width, inH = source.Height;
+        var pixels = new byte[checked(outW * outH * 4)];
+        float sx = (float)inW / outW;
+        float sy = (float)inH / outH;
+        for (int y = 0; y < outH; y++)
+        {
+            float fy = Math.Min((y + 0.5f) * sy - 0.5f, inH - 1);
+            if (fy < 0) fy = 0;
+            int y0 = (int)fy;
+            int y1 = Math.Min(y0 + 1, inH - 1);
+            float wy = fy - y0;
+            for (int x = 0; x < outW; x++)
+            {
+                float fx = Math.Min((x + 0.5f) * sx - 0.5f, inW - 1);
+                if (fx < 0) fx = 0;
+                int x0 = (int)fx;
+                int x1 = Math.Min(x0 + 1, inW - 1);
+                float wx = fx - x0;
+                int o = (y * outW + x) * 4;
+                for (int c = 0; c < 4; c++)
+                {
+                    float v00 = src[y0 * stride + x0 * 4 + c];
+                    float v10 = src[y0 * stride + x1 * 4 + c];
+                    float v01 = src[y1 * stride + x0 * 4 + c];
+                    float v11 = src[y1 * stride + x1 * 4 + c];
+                    float v = (v00 * (1 - wx) + v10 * wx) * (1 - wy) + (v01 * (1 - wx) + v11 * wx) * wy;
+                    pixels[o + c] = (byte)Math.Clamp((int)MathF.Round(v), 0, 255);
+                }
+            }
+        }
+        return new NativeImageData(outW, outH, pixels);
+    }
 
-    //public static string EraseAuto(string source, BrushPoint brushPoint)
-    //{
-    //    return source;
-    //}
+    /// <summary>Flattens straight alpha onto the given background color (photo pipelines use white).</summary>
+    public static INativeImageDecoder FlattenAlpha(INativeImageDecoder source,
+        byte red = 255, byte green = 255, byte blue = 255)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        byte[] pixels = CopyPixels(source);
+        for (int i = 0; i < pixels.Length; i += 4)
+        {
+            int a = pixels[i + 3];
+            if (a == 255) continue;
+            pixels[i] = (byte)((pixels[i] * a + red * (255 - a) + 127) / 255);
+            pixels[i + 1] = (byte)((pixels[i + 1] * a + green * (255 - a) + 127) / 255);
+            pixels[i + 2] = (byte)((pixels[i + 2] * a + blue * (255 - a) + 127) / 255);
+            pixels[i + 3] = 255;
+        }
+        return new NativeImageData(source.Width, source.Height, pixels);
+    }
 
-    //public static ImageResult LimitImageSize(ImageResult imageResult, long length)
-    //{
-    //    return imageResult;
-    //}
+    /// <summary>Clears every pixel outside the inscribed circle (centered at Width/2, Height/2, radius = Width/2).</summary>
+    public static INativeImageDecoder MaskCircle(INativeImageDecoder source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        byte[] pixels = CopyPixels(source);
+        int width = source.Width, height = source.Height;
+        int cx = width / 2, cy = height / 2;
+        long radius2 = (long)cx * cx;
+        for (int y = 0; y < height; y++)
+            for (int x = 0; x < width; x++)
+                if ((long)(x - cx) * (x - cx) + (long)(y - cy) * (y - cy) > radius2)
+                    pixels.AsSpan((y * width + x) * 4, 4).Clear();
+        return new NativeImageData(width, height, pixels);
+    }
 
-    //public static void SaveImageToSource(string source, ImageResult targetImage)
-    //{
-
-    //}
-
-    //public static void Round(string source, int? width, int? height, int mode)
-    //{
-
-    //}
-
+    /// <summary>
+    /// Solid circle of diameter radius * 2. The RGB channels are expanded by 255 / alpha so that
+    /// a premultiplied-looking source color stores as a straight-alpha pixel.
+    /// </summary>
+    public static INativeImageDecoder CreateImageCircle(int radius, byte red, byte green, byte blue, byte alpha)
+    {
+        int size = checked(radius * 2);
+        var pixels = new byte[checked(size * size * 4)];
+        for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++)
+                if ((long)(x - radius) * (x - radius) + (long)(y - radius) * (y - radius) <= (long)radius * radius)
+                {
+                    int offset = (y * size + x) * 4;
+                    if (alpha > 0)
+                    {
+                        pixels[offset] = (byte)(red * 255 / alpha);
+                        pixels[offset + 1] = (byte)(green * 255 / alpha);
+                        pixels[offset + 2] = (byte)(blue * 255 / alpha);
+                    }
+                    pixels[offset + 3] = alpha;
+                }
+        return new NativeImageData(size, size, pixels);
+    }
 }
-

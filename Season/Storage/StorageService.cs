@@ -69,9 +69,19 @@ public static class StorageService
         return path.Length > 0 && IsDirectorySeparator(path[path.Length - 1]);
     }
 
+    /// <summary>
+    /// Reads a packaged asset stream (caller owns disposal). The unified entry point for
+    /// packaged assets: the asset is returned as a raw stream, never decoded, never written
+    /// to disk, and never copied into local user storage.
+    /// </summary>
+    public static Stream LoadStream(string res)
+    {
+        return DeviceServices.Core.LoadFile(res);
+    }
+
     public static byte[] LoadBytes(string res)
     {
-        var stream = DeviceServices.Core.LoadFile(res);
+        using var stream = LoadStream(res);
 
         return stream.ReadAllBytes();
     }

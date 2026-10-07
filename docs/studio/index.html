@@ -74,9 +74,7 @@
                     <div class="se-hero__text">
                         <h1 class="se-hero__title">An Local AI Studio Built for Imagining</h1>
                         <p class="se-lede">
-                            SeasonStudio is an all-in-one creation studio that runs entirely on your own machine.
-                            Write, translate, paint, score, speak and look — eight tools in one window, with nothing
-                            to sign into and nothing sent away.
+                            SeasonStudio is an all-in-one AI creation studio that runs entirely on your own machine: write, translate, generate images, video, music and speech, and read what a picture holds.
                         </p>
 
                         <div class="se-btnrow">
@@ -85,46 +83,51 @@
                             <a class="se-btn se-btn--ghost" href="roadmap/">Roadmap</a>
                         </div>
 
-                        <div style="padding-top: 12px;">
-                            <span class="se-pill">No account</span>
-                            <span class="se-pill">No upload</span>
-                            <span class="se-pill">No queue</span>
-                            <span class="se-pill">No subscription</span>
-                        </div>
-
-                        <p class="se-muted" style="margin-top:16px;">
-                            New here? <a href="tools/">The eight tools</a> &middot;
-                            <a href="models/#maturity">what each one is really good at yet</a> &middot;
-                            <a href="guide/#first-run">your first ten minutes</a>.
-                        </p>
-
                         <p class="se-muted" style="margin-top:18px;">Get the app:</p>
                         <div class="se-store">
                             <span class="se-store__item se-store__item--soon" title="Coming soon" data-store="msstore">
-                                <img src="assets/img/WindowsStore.png" alt="Microsoft Store" />
-                                Coming soon
+                                <a href="https://apps.microsoft.com/detail/9n0vlcxdtw1g" target="_blank" style="font-weight:bold;">
+                                    <img src="assets/img/WindowsStore.png" alt="Microsoft Store" />
+                                    Windows Store
+                                </a>
                             </span>
                             <span class="se-store__item se-store__item--soon" title="Coming soon" data-store="appstore">
-                                <img src="assets/img/AppStore.png" alt="Mac App Store" />
-                                Coming soon
+                                <a href="https://apps.apple.com/app/seasonstudio/id6811876431" target="_blank" style="font-weight:bold;">
+                                    <img src="assets/img/AppStore.png" alt="Mac App Store" />
+                                    Mac App Store
+                                </a>
                             </span>
                             <span class="se-store__item se-store__item--muted" title="Not planned yet">
                                 <img src="assets/img/PlayStore.webp" alt="" />
                                 Later
                             </span>
                         </div>
+
+                        <div style="padding-top: 20px;">
+                            <span class="se-pill">No account</span>
+                            <span class="se-pill">No upload</span>
+                            <span class="se-pill">No queue</span>
+                            <span class="se-pill">No subscription</span>
+                        </div>
+
+                        <p class="se-muted" style="margin-top:12px;">
+                            Eight tools in one window, with nothing to sign into and nothing sent away.<br />
+                            New here? <a href="tools/">The eight tools</a> &middot;
+                            <a href="models/#maturity">what each one is really good at yet</a> &middot;
+                            <a href="guide/#first-run">your first ten minutes</a>.
+                        </p>
+
                     </div>
                     <div class="se-hero__art">
                         <!-- The plate behind this block is painted in the video's own colours,
                              and .st-film feathers the edges out to them, so the two meet
                              without a border. See --film-* in assets/css/studio.css. -->
-                        <div class="st-film">
+                        <div class="st-film" style="background-image: url(assets/img/Film-poster.jpg)">
                             <video src="assets/img/Film.mp4"
                                    poster="assets/img/Film-poster.jpg"
                                    autoplay loop muted playsinline
                                    preload="metadata"
                                    aria-label="A watercolour scene animated in SeasonStudio"></video>
-                            <img class="st-film__poster" src="assets/img/Film-poster.jpg" alt="A watercolour scene painted in SeasonStudio" />
                         </div>
                     </div>
                 </div>
@@ -180,7 +183,7 @@
 
                 <div class="se-grid se-grid--3">
                     <figure class="se-shot">
-                        <img src="assets/img/shot-magic.jpg" alt="A robed figure on a mountain summit raising a staff of light" width="1024" height="1024" loading="lazy" />
+                        <img src="assets/img/shot-magic.jpg" alt="A robed figure on a mountain summit raising a staff of light" width="800" height="480" loading="lazy" />
                         <span class="se-shot__tag">Image</span>
                         <figcaption>
                             <strong>The summoning</strong><br />
@@ -188,7 +191,7 @@
                         </figcaption>
                     </figure>
                     <figure class="se-shot">
-                        <img src="assets/img/shot-wizard.jpg" alt="A cartoon wizard in a glowing mushroom forest" width="1024" height="1024" loading="lazy" />
+                        <img src="assets/img/shot-wizard.jpg" alt="A cartoon wizard in a glowing mushroom forest" width="800" height="480" loading="lazy" />
                         <span class="se-shot__tag">Image</span>
                         <figcaption>
                             <strong>Mushroom hour</strong><br />
@@ -196,7 +199,7 @@
                         </figcaption>
                     </figure>
                     <figure class="se-shot">
-                        <img src="assets/img/shot-warrior.jpg" alt="An inked comic panel of a young general in lacquered armour" width="512" height="512" loading="lazy" />
+                        <img src="assets/img/shot-warrior.jpg" alt="An inked comic panel of a young general in lacquered armour" width="800" height="480" loading="lazy" />
                         <span class="se-shot__tag">Image</span>
                         <figcaption>
                             <strong>Young general</strong><br />
@@ -266,13 +269,13 @@
             <!-- a prompt beside its result -->
             <section class="se-card">
                 <h2 class="se-mt0">A prompt beside its result</h2>
-                <p class="se-muted" style="margin-bottom:22px;">
-                    There is no node graph and no scripting layer. You type a sentence, choose how long to let the
-                    sampler think, and the picture appears in the results panel.
-                </p>
 
                 <div class="se-codepair">
                     <div>
+                        <p class="se-muted" style="margin-bottom:22px;">
+                            There is no node graph and no scripting layer. You type a sentence, choose how long to let the
+                            sampler think, and the picture appears in the results panel.
+                        </p>
                         <div class="st-prompt">
                             <dl>
                                 <dt>Prompt</dt>
@@ -296,7 +299,7 @@
                         </p>
                     </div>
                     <figure class="se-shot">
-                        <img src="assets/img/shot-wizard.jpg" alt="A cartoon wizard reading under a glowing mushroom" width="1024" height="1024" loading="lazy" />
+                        <img src="assets/img/shot-wizard.jpg" alt="A cartoon wizard reading under a glowing mushroom" width="800" height="512" loading="lazy" />
                         <figcaption>The result, written as an ordinary PNG into the folder you chose.</figcaption>
                     </figure>
                 </div>
@@ -513,12 +516,20 @@
                         </p>
                         <div class="se-store">
                             <span class="se-store__item se-store__item--soon" title="Coming soon" data-store="msstore">
-                                <img src="assets/img/WindowsStore.png" alt="Microsoft Store" />
-                                Coming soon
+                                <a href="https://apps.microsoft.com/detail/9n0vlcxdtw1g" target="_blank" style="font-weight:bold;">
+                                    <img src="assets/img/WindowsStore.png" alt="Microsoft Store" />
+                                    Windows Store
+                                </a>
                             </span>
                             <span class="se-store__item se-store__item--soon" title="Coming soon" data-store="appstore">
-                                <img src="assets/img/AppStore.png" alt="Mac App Store" />
-                                Coming soon
+                                <a href="https://apps.apple.com/app/seasonstudio/id6811876431" target="_blank" style="font-weight:bold;">
+                                    <img src="assets/img/AppStore.png" alt="Mac App Store" />
+                                    Mac App Store
+                                </a>
+                            </span>
+                            <span class="se-store__item se-store__item--muted" title="Not planned yet">
+                                <img src="assets/img/PlayStore.webp" alt="" />
+                                Later
                             </span>
                         </div>
                     </div>
