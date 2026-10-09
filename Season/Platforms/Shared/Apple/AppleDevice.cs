@@ -347,7 +347,7 @@ internal class AppleDialogService : IDialogService
 
                 //var width = DeviceServices.BaseApp.DeviceResolution.X - 50;
 
-                var textView = new UITextView(new CGRect(new CGPoint(20, 20), new CGSize(580, 550)));
+                var textView = new UITextView(new CGRect(new CGPoint(20, 20), new CGSize(580, 250)));
 
                 textView.Font = UIFont.SystemFontOfSize(18);
                 textView.Text = text;
@@ -357,7 +357,7 @@ internal class AppleDialogService : IDialogService
 
                 alertController.View.AddSubview(textView);
 
-                var btnOK = new UIButton(new CGRect(150, 600, 100, 50));
+                var btnOK = new UIButton(new CGRect(150, 300, 100, 50));
 
                 btnOK.BackgroundColor = UIColor.Gray;
 
@@ -1027,14 +1027,39 @@ internal class AppleFileService : IFileService
         return file;
     }
 
-    public async Task<bool> OpenLink(string name)
+    public Task<bool> OpenLink(string name)
     {
-        var options = new UIApplicationOpenUrlOptions()
+        // UIApplication.OpenUrlAsync starts with the runtime's UI-thread consistency check:
+        // called from a background thread it throws UIKitThreadAccessException before the
+        // URL ever reaches the system. Callers run on every context (the frame loop, the
+        // Task.Run wrappers of buttons like Create or Download, and continuation threads
+        // after an await), and they invoke this service fire-and-forget, so such an
+        // exception would be swallowed and the link would silently never open.
+        // Marshal first, exactly like SaveFile / PickFiles / the gallery below.
+        var tcs = new TaskCompletionSource<bool>();
+
+        UIApplication.SharedApplication.InvokeOnMainThread(async delegate
         {
+            try
+            {
+                var options = new UIApplicationOpenUrlOptions()
+                {
 
-        };
+                };
 
-        return await UIApplication.SharedApplication.OpenUrlAsync(new NSUrl(name), options);
+                var result = await UIApplication.SharedApplication.OpenUrlAsync(new NSUrl(name), options);
+
+                tcs.TrySetResult(result);
+            }
+            catch (Exception ex)
+            {
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [OpenLink] open failed name={name} err={ex}");
+
+                tcs.TrySetException(ex);
+            }
+        });
+
+        return tcs.Task;
     }
 
     //public async Task<bool> OpenLink(string name)
