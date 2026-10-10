@@ -11,8 +11,10 @@ namespace Season.Platforms.Linux;
 
 // Known WSLg issue: [WARN:COPY MODE] appears, the taskbar shows a preview,
 // but the window itself is not displayed.
+//wsl
 //sudo mkdir -p /mnt/shared_memory
 //sudo mount -t tmpfs tmpfs /mnt/shared_memory
+//exit
 //wsl --shutdown
 
 public static class LinuxApp
@@ -622,6 +624,20 @@ public static class LinuxApp
             }
 
             if (!running) break;
+
+            // Gtk.Application.Init (RunCore) installs a GLibSynchronizationContext on this thread,
+            // so every default-awaited continuation that originates from a render-thread event
+            // handler is posted into the GLib main context instead of the thread pool. Nothing else
+            // in this loop ever runs that context, which would leave those continuations queued
+            // forever: a UI flow that waits on a background task then never resumes and stays in
+            // its pending state (for example, VisionPanel keeps showing "Loading..." after OCRLoad
+            // has already returned). Draining the context each frame dispatches those continuations
+            // on this thread, matching the GTK threading model. The budget keeps the frame bounded
+            // even if a source stays continuously ready.
+            var glibBudget = 32;
+            while (glibBudget-- > 0 && GLib.MainContext.Iteration(false))
+            {
+            }
 
             double newSeconds = stopWatch.Elapsed.TotalSeconds;
 

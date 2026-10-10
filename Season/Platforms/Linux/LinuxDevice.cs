@@ -447,22 +447,21 @@ internal class LinuxFileService : IFileService
         return null;
     }
 
-    public async Task<List<TaskFile>> PickFiles(FileType fileType, string[] exts, bool multiple, bool open)
+    public Task<List<TaskFile>> PickFiles(FileType fileType, string[] exts, bool multiple, bool open)
     {
-        var tcs = new TaskCompletionSource<List<TaskFile>>();
-
         List<TaskFile> taskFiles = null;
 
         //Gtk.Application.Init();
 
-        var window = new Gtk.Window("Pick Files");
-
-        var dialog = new FileChooserDialog("FileChooser", window, FileChooserAction.Open, Gtk.Stock.Cancel, Gtk.ResponseType.Cancel, Gtk.Stock.Open, Gtk.ResponseType.Accept);
+        // Pass a null parent: the dialog does not need one, and a parent window that
+        // is created but never shown only resurfaces during teardown (the old code
+        // literally showed it) as a stuck empty window on screen.
+        var dialog = new FileChooserDialog("FileChooser", null, FileChooserAction.Open, Gtk.Stock.Cancel, Gtk.ResponseType.Cancel, Gtk.Stock.Open, Gtk.ResponseType.Accept);
         //dialog.SelectMultiple = true;
 
         var filter = new Gtk.FileFilter();
-        dialog.Filter = new FileFilter();
-        dialog.Filter.AddPattern("*.*"); // .AddMimeType("image/jpeg");
+        filter.AddPattern("*.*"); // .AddMimeType("image/jpeg");
+        dialog.Filter = filter;
 
         var preview = new Gtk.Image();
         dialog.PreviewWidget = preview;
@@ -489,6 +488,7 @@ internal class LinuxFileService : IFileService
             }
         };
 
+        // gtk_dialog_run owns a nested main loop and hides the dialog on return.
         var result = dialog.Run();
 
         if (result is (int)Gtk.ResponseType.Accept)
@@ -519,87 +519,84 @@ internal class LinuxFileService : IFileService
 
         GC.SuppressFinalize(dialog);
 
-        window.ShowAll();
-
-        window.Close();
-
-        window.Destroy();
-
-        GC.SuppressFinalize(window);
+        // The engine's main loop is SDL/Vulkan and never pumps GTK, so now that the
+        // nested loop inside Run() has exited, every window op queued from here on
+        // (including the destruction above) would wait forever: the dialog would
+        // stay on screen and ignore clicks, including the title-bar close button.
+        // Drain the pending events by hand. EventsPending() is checked first
+        // because RunIteration() would block on an empty queue.
+        while (Gtk.Application.EventsPending())
+        {
+            Gtk.Application.RunIteration();
+        }
 
         GC.Collect();
 
-        return taskFiles;
+        return Task.FromResult(taskFiles!);
     }
 
     public Task<string> SaveFile(string fileName, Stream stream, CancellationToken cancellationToken)
     {
-        var window = new Gtk.Window("Save Files");
+        // Same model as PickFiles: a null parent instead of a stray window, and the
+        // GTK event queue drained by hand after Run() because the engine's SDL main
+        // loop never pumps GTK. Overwrite confirmation is GTK's built-in one
+        // (DoOverwriteConfirmation); the old hand-rolled SelectionChanged message box
+        // was unfinished and would have stranded a second stuck window anyway.
+        var dialog = new FileChooserDialog("FileChooser", null, FileChooserAction.Save, Gtk.Stock.Cancel, Gtk.ResponseType.Cancel, Gtk.Stock.Save, Gtk.ResponseType.Accept);
 
-        var dialog = new FileChooserDialog("FileChooser", window, FileChooserAction.Save, Gtk.Stock.Cancel, Gtk.ResponseType.Cancel, Gtk.Stock.Save, Gtk.ResponseType.Accept, "test2.png");
-        dialog.CurrentName = "test888.png";
-
-        var name = dialog.Filename;
-
-        dialog.CurrentFolderChanged += (s, e) =>
+        if (!string.IsNullOrWhiteSpace(fileName))
         {
+            dialog.CurrentName = System.IO.Path.GetFileName(fileName);
+        }
 
-        };
+        dialog.DoOverwriteConfirmation = true;
 
-        dialog.SelectionChanged += (s, e) =>
-        {
-            var fileName = dialog.Filename;
+        var filter = new Gtk.FileFilter();
+        filter.AddPattern("*.*");
+        dialog.Filter = filter;
 
-            if (fileName == name)
-            {
-
-            }
-            else
-            {
-                if (File.Exists(dialog.Filename))
-                {
-                    var message = new Gtk.MessageDialog(window, DialogFlags.DestroyWithParent, MessageType.Question, ButtonsType.OkCancel, "Already exists, overwrite?", Gtk.Stock.Cancel, Gtk.ResponseType.Cancel, Gtk.Stock.Save, Gtk.ResponseType.Accept);
-
-                    var mes = message.Run();
-
-                    if (mes is (int)Gtk.ResponseType.Accept)
-                    {
-
-                    }
-                    else if (mes is (int)Gtk.ResponseType.Cancel)
-                    {
-                        dialog.CurrentName = "";
-
-                        dialog.UnselectAll();
-                    }
-
-                    message.Destroy();
-                }
-            }
-        };
-
+        // gtk_dialog_run owns a nested main loop and hides the dialog on return.
         var result = dialog.Run();
 
-        if (result is (int)Gtk.ResponseType.Accept)
-        {
-
-        }
+        var path = result is (int)Gtk.ResponseType.Accept ? dialog.Filename : null;
 
         dialog.Destroy();
 
         GC.SuppressFinalize(dialog);
 
-        window.ShowAll();
-
-        window.Close();
-
-        window.Destroy();
-
-        GC.SuppressFinalize(window);
+        // Drain the pending GTK events, same as PickFiles: without this the teardown
+        // above never reaches the display server and a stuck window stays on screen.
+        while (Gtk.Application.EventsPending())
+        {
+            Gtk.Application.RunIteration();
+        }
 
         GC.Collect();
 
-        return null;
+        // Cancelled: report "not saved" with an empty string (Android semantics)
+        // rather than an exception, so callers can test with IsNullOrWhiteSpace.
+        if (string.IsNullOrWhiteSpace(path) || stream == null)
+        {
+            return Task.FromResult("");
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // Write only after the dialog is fully torn down, so a failed write cannot
+        // strand a GTK window. File handling mirrors WindowsDevice.SaveFile.
+        if (stream.CanSeek)
+        {
+            stream.Seek(0, SeekOrigin.Begin);
+        }
+
+        using (var target = new FileStream(path, FileMode.OpenOrCreate))
+        {
+            target.SetLength(0);
+
+            stream.CopyTo(target);
+        }
+
+        return Task.FromResult(path);
     }
 
     public async Task<string> OpenFile(string name, string category, byte[] bytes)
@@ -736,41 +733,79 @@ internal class LinuxRecordService : RecordService, IRecordService
 
 internal class LinuxDownloadService : IDownloadService
 {
-    public string Download(string url)
+    // Exports on Linux go through the GTK save dialog instead of a fixed download
+    // folder: there is no dependable "Downloads" location here. XDG defines one, but
+    // plenty of systems - WSL and server installs in particular - have neither a
+    // configured user-dirs.dirs nor an existing ~/Downloads (xdg-user-dir then falls
+    // back to $HOME, and the desktop directory is just as often absent). A save dialog
+    // mirrors the MacCatalyst DownloadSave behavior and lets the user pick a location
+    // that actually exists - under WSL that can even be a Windows drive under /mnt,
+    // where silently writing into the WSL home would leave the file invisible to them.
+    public void DownloadSave(string category, string name, byte[] bytes, bool openFolder)
     {
-        throw new NotImplementedException();
-    }
+        // Runs on the rendering thread - the only thread that owns the GTK main context
+        // (RunCore's Gtk.Application.Init) - and blocks inside the dialog's nested loop
+        // until the user decides, the same model as LinuxFileService.PickFiles/SaveFile.
+        // Do not marshal this to the thread pool: Gtk dialog.Run is not thread-safe and
+        // every caller is a click handler running on the render thread.
+        try
+        {
+            using var stream = new MemoryStream(bytes);
 
-    public void DownloadCancel(string requestId)
-    {
-        throw new NotImplementedException();
+            // Cancelled saves come back as an empty path (LinuxFileService semantics):
+            // dismissing the dialog is a normal outcome and must not read as a failure.
+            _ = DeviceServices.File.SaveFile(name, stream, CancellationToken.None).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            // A failed export must never tear down the app: this is called from click
+            // handlers and the render/update loop.
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [DownloadSave] save dialog for {name} failed: {ex}");
+        }
+
+        // openFolder is intentionally ignored: the file lands wherever the user pointed
+        // the dialog, so there is no separate folder to reveal.
     }
 
     public void DownloadDel(string category, string name)
     {
-        throw new NotImplementedException();
+        // Dialog-based exports have no staging file to delete: each save starts from the
+        // bytes the caller passes in, and overwrite confirmation is the save dialog's own
+        // DoOverwriteConfirmation. Kept as a no-op so the shared "DownloadDel +
+        // DownloadSave" export pattern stays cross-platform.
     }
 
     public void DownloadNew(string category, string name)
     {
-        throw new NotImplementedException();
-    }
-
-    public void DownloadSave(string category, string name, byte[] bytes, bool openFolder)
-    {
-        throw new NotImplementedException();
+        // Nothing is staged on disk before the save dialog runs, so there is no file or
+        // directory to prepare (counterpart of DownloadDel above).
     }
 
     public void DownloadUpdate(string category, string name, string namenew)
     {
-        throw new NotImplementedException();
+        // No staging directory exists and no caller renames exported files on Linux;
+        // keep the contract quiet instead of throwing from a click handler.
+    }
+
+    public string Download(string url)
+    {
+        // Background url downloads are not wired up on Linux: nothing in the app calls
+        // this, and exports go through DownloadSave's save dialog. Fail explicitly
+        // rather than pretending a download started.
+        throw new NotImplementedException("Background url downloads are not supported on Linux; exports use DownloadSave.");
     }
 
     public DownloadColumns DownloadQuery(string requestId, float time)
     {
-        throw new NotImplementedException();
+        // Counterpart of Download(url): no download manager state exists on Linux.
+        throw new NotImplementedException("Background url downloads are not supported on Linux; exports use DownloadSave.");
     }
 
+    public void DownloadCancel(string requestId)
+    {
+        // Counterpart of Download(url): no download manager state exists on Linux.
+        throw new NotImplementedException("Background url downloads are not supported on Linux; exports use DownloadSave.");
+    }
 }
 
 internal class LinuxStoreService : IStoreService
@@ -795,11 +830,23 @@ internal class LinuxStoreService : IStoreService
 
     public Task<string> Purchase(string product, Action<string> onResult)
     {
-        throw new NotImplementedException();
+        // Free on Linux: there is no store to buy from. The premium entitlement is
+        // seeded at startup (Foundation.Init) and Query(string) reports the product
+        // as owned, so the purchase UI never reaches here on the happy path; if it
+        // ever does, report a message instead of throwing - AINotice awaits this from
+        // an async void click handler, where an escaping exception would abort the app.
+        return Task.FromResult("Purchases are not available on this platform.");
     }
 
     public async Task<string> Review(string product, string url)
     {
+        // url is optional and AINotice passes none on platforms without a store;
+        // OpenLink would spawn xdg-open with a null argument, so skip instead.
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return "";
+        }
+
         await DeviceServices.File.OpenLink(url);
 
         return "";

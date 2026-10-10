@@ -40,9 +40,17 @@ internal class LinuxImageService : IImageService
             values = new[] { Math.Clamp(quality, 0, 100).ToString() };
         }
 
-        using var pixbuf = new Pixbuf(Colorspace.Rgb, true, 8, image.Width, image.Height);
+        // JPEG has no alpha channel and the Linux encoder stack rejects RGBA input
+        // (glycin: "The encoder or decoder for Jpeg does not support the color type `Rgba8`").
+        // Hand JPEG an opaque RGB pixbuf with the alpha channel dropped, which is the same
+        // implicit alpha handling the other platform encoders apply (WinRT/WIC,
+        // Android Bitmap.Compress and UIImage.AsJPEG all ignore alpha for JPEG).
+        // Formats that carry alpha keep the RGBA path.
+        bool hasAlpha = imageFormat != Basic.ImageFormat.Jpeg;
 
-        // Copy RGBA pixel data row by row (source stride may differ from pixbuf stride)
+        using var pixbuf = new Pixbuf(Colorspace.Rgb, hasAlpha, 8, image.Width, image.Height);
+
+        // Copy pixel data row by row (source stride may differ from pixbuf stride)
         var src = image.PixelSpan;
         int srcStride = image.Stride;
         int dstStride = pixbuf.Rowstride;
@@ -52,13 +60,32 @@ internal class LinuxImageService : IImageService
         fixed (byte* srcPtr = src)
         {
             byte* dstPtr = (byte*)pixbuf.Pixels;
-            for (int y = 0; y < image.Height; y++)
+            if (hasAlpha)
             {
-                System.Buffer.MemoryCopy(
-                    srcPtr + y * srcStride,
-                    dstPtr + y * dstStride,
-                    dstStride,
-                    rowBytes);
+                for (int y = 0; y < image.Height; y++)
+                {
+                    System.Buffer.MemoryCopy(
+                        srcPtr + y * srcStride,
+                        dstPtr + y * dstStride,
+                        dstStride,
+                        rowBytes);
+                }
+            }
+            else
+            {
+                // RGB rows are 3 bytes per pixel; the pixbuf row stride still pads
+                // each row to 4-byte alignment, so it can exceed Width * 3.
+                for (int y = 0; y < image.Height; y++)
+                {
+                    byte* srcRow = srcPtr + y * srcStride;
+                    byte* dstRow = dstPtr + y * dstStride;
+                    for (int x = 0; x < image.Width; x++)
+                    {
+                        dstRow[x * 3] = srcRow[x * 4];
+                        dstRow[x * 3 + 1] = srcRow[x * 4 + 1];
+                        dstRow[x * 3 + 2] = srcRow[x * 4 + 2];
+                    }
+                }
             }
         }
 
