@@ -125,6 +125,16 @@
 	</ItemGroup>	
 
 	<ItemGroup Condition="'$(IsAndroid)' == 'true'">
+		<!--
+		  Android 目标：剔除 AutoImport 误纳的桌面 native 库。Android SDK 的
+		  Sdk\AutoImport.props 会把项目目录下所有 **\*.so 自动导入为
+		  AndroidNativeLibrary，Platforms\Linux\runtimes\linux-*\native 的
+		  libglslang/libSDL3（只服务于 net10.0 目标的 P/Invoke）被一并吸纳，
+		  而 Android 类库构建的 AAR 打包（_CreateAar → CreateAar）会对其做
+		  ABI 判定，非 Android RID 的路径无法判定并报 XA4301。
+		  下方 Android 版 libglslang.so 的显式 Include 不受影响。
+		-->
+		<AndroidNativeLibrary Remove="Platforms\Linux\runtimes\linux-*\native\*.so" />
 		<AndroidNativeLibrary Include="Platforms\Android\libs\arm64-v8a\libglslang.so" />
 		<PackageReference Include="Xamarin.Android.Google.BillingClient">
 			<Version>8.0.0</Version>
