@@ -62,6 +62,7 @@ public static class LinuxApp
             },
             app.DisposeSaveSettingsRequest,
             LinuxAudioPlayer.ShutdownForExit,
+            LinuxRecorder.ShutdownForExit,
             SDL.Quit);
         lifetime.Completion.GetAwaiter().GetResult();
     }

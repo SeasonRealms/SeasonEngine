@@ -29,6 +29,9 @@ internal static partial class SDL
     /// <summary>SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK: let SDL pick the default playback device.</summary>
     public const uint AudioDeviceDefaultPlayback = 0xFFFFFFFF;
 
+    /// <summary>SDL_AUDIO_DEVICE_DEFAULT_RECORDING: let SDL pick the default recording device.</summary>
+    public const uint AudioDeviceDefaultRecording = 0xFFFFFFFE;
+
     // SDL_AudioFormat (SDL3/SDL_audio.h): bit 15 = signed, bit 12 = float,
     // bit 11 = big-endian, low byte = bit size.
     public const uint AudioFormatU8 = 0x0008;
@@ -88,4 +91,38 @@ internal static partial class SDL
 
     [LibraryImport(Library, EntryPoint = "SDL_DestroyAudioStream"), UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial void DestroyAudioStream(IntPtr stream);
+
+    // === Microphone (recording) APIs, used by LinuxRecorder ===
+
+    /// <summary>
+    /// Returns a malloc'd array of recording device ids (free with <see cref="Free"/>
+    /// and read with <see cref="GetAudioDeviceName"/>); <see cref="IntPtr.Zero"/> on
+    /// failure. The count is 0 when the audio stack simply has no input.
+    /// </summary>
+    [LibraryImport(Library, EntryPoint = "SDL_GetAudioRecordingDevices"), UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial IntPtr GetAudioRecordingDevices(out int count);
+
+    /// <summary>Human-readable device name for logs; UTF-8 pointer, may be null.</summary>
+    [LibraryImport(Library, EntryPoint = "SDL_GetAudioDeviceName"), UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial IntPtr GetAudioDeviceName(uint devid);
+
+    /// <summary>
+    /// Bytes already captured and converted to the stream's input format. Recording
+    /// streams are pull-model: SDL pushes nothing, the application polls this and then
+    /// reads what is ready.
+    /// </summary>
+    [LibraryImport(Library, EntryPoint = "SDL_GetAudioStreamAvailable"), UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int GetAudioStreamAvailable(IntPtr stream);
+
+    /// <summary>
+    /// Pulls up to <paramref name="len"/> bytes into <paramref name="buf"/>; blocks when
+    /// fewer bytes are available, so callers pass at most <see cref="GetAudioStreamAvailable"/>
+    /// to keep the read non-blocking. Returns the byte count, negative on error.
+    /// </summary>
+    [LibraryImport(Library, EntryPoint = "SDL_GetAudioStreamData"), UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int GetAudioStreamData(IntPtr stream, Span<byte> buf, int len);
+
+    /// <summary>SDL's allocator free, for the device array returned by <see cref="GetAudioRecordingDevices"/>.</summary>
+    [LibraryImport(Library, EntryPoint = "SDL_free"), UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void Free(IntPtr mem);
 }

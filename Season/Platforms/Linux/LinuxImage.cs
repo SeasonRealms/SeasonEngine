@@ -101,6 +101,31 @@ internal class LinuxImageService : IImageService
     {
         options ??= new VideoSaveOptions();
         var prepared = VideoEncodingHelper.PrepareFrames(images, options.Quality, options.FramesPerSecond);
+
+        // The mp4 path below shells out to an ffmpeg process. Minimal Linux installs (WSL
+        // among them) frequently ship the shared libraries without the CLI, and failing the
+        // whole generation would throw away frames that took minutes of GPU time. In that
+        // case encode a self-contained MJPEG AVI instead: the result stays registered,
+        // downloadable and playable in any MJPEG-AVI capable player. Callers learn the real
+        // container through options.ActualExtension and name the saved file accordingly.
+        if (!IsOnPath("ffmpeg"))
+        {
+            options.ActualExtension = ".avi";
+
+            System.Diagnostics.Debug.WriteLine($"[LinuxImage] ffmpeg not found on PATH; encoding MJPEG AVI fallback ({prepared.Frames.Count} frames).");
+
+            var jpegFrames = new byte[prepared.Frames.Count][];
+
+            for (int i = 0; i < prepared.Frames.Count; i++)
+            {
+                var frame = new NativeImageData(prepared.Width, prepared.Height, prepared.Frames[i]);
+
+                jpegFrames[i] = SaveImage(frame, Basic.ImageFormat.Jpeg, prepared.Quality);
+            }
+
+            return MjpegAviWriter.Write(prepared.Width, prepared.Height, prepared.FramesPerSecond, jpegFrames);
+        }
+
         string outputPath = Path.Combine(Path.GetTempPath(), $"season-video-linux-{Guid.NewGuid():N}.mp4");
 
         try
@@ -159,6 +184,31 @@ internal class LinuxImageService : IImageService
         {
             VideoEncodingHelper.TryDeleteFile(outputPath);
         }
+    }
+
+    /// <summary>
+    /// Checks PATH for an executable name, mirroring how Process.Start resolves it.
+    /// Missing or malformed entries are treated as "not found" rather than breaking video saving.
+    /// </summary>
+    static bool IsOnPath(string executable)
+    {
+        var path = Environment.GetEnvironmentVariable("PATH");
+        if (string.IsNullOrEmpty(path))
+            return false;
+
+        foreach (var directory in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            try
+            {
+                if (File.Exists(Path.Combine(directory, executable)))
+                    return true;
+            }
+            catch
+            {
+            }
+        }
+
+        return false;
     }
 
     public async Task<INativeImageDecoder[]> LoadVideo(Stream stream, VideoLoadOptions? options = null)

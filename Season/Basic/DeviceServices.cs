@@ -254,6 +254,14 @@ public sealed class VideoSaveOptions
     public int FramesPerSecond { get; set; } = 16;
 
     public int Quality { get; set; } = 90;
+
+    /// <summary>
+    /// Container extension actually produced by the <see cref="IImageService.SaveVideo"/> implementation,
+    /// including the leading dot, e.g. ".mp4". Filled in by the platform encoder when the result is not
+    /// the default mp4 container (the Linux encoder falls back to a self-contained ".avi" MJPEG file when
+    /// the ffmpeg binary is unavailable); callers should name the saved file with it instead of assuming ".mp4".
+    /// </summary>
+    public string? ActualExtension { get; set; }
 }
 
 public sealed class VideoLoadOptions
@@ -430,8 +438,9 @@ public interface IRecordService
     /// Decodes the audio of a media file (an .m4a/.m4v/.mp4/.mp3 recording, for example) into a
     /// complete WAV: 16 kHz, mono, 16-bit little-endian PCM behind the canonical 44-byte RIFF header,
     /// the very layout <see cref="IRecordService.StopRecord"/> returns and the only one the STT
-    /// front ends parse. Implemented through AVFoundation on Mac Catalyst/iOS and through Media
-    /// Foundation on Windows; the remaining platforms throw <see cref="NotImplementedException"/>.
+    /// front ends parse. Implemented through AVFoundation on Mac Catalyst/iOS, through Media
+    /// Foundation on Windows, and through the system's libavformat/libswresample shared libraries
+    /// (or the ffmpeg tool) on Linux; the remaining platforms throw <see cref="NotImplementedException"/>.
     /// Blocking, so callers run it on a background thread.
     /// </summary>
     byte[] DecodeToWavPcm16(string path);

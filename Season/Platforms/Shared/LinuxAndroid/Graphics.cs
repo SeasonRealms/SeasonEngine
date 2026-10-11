@@ -278,6 +278,9 @@ internal unsafe partial class Graphics : IGraphics
                     {
                         // Use Sprite instead of Texture2D
                         vkSprite2D = new VKSprite2D(view);
+
+                        sprite2D.OriginWidth = (int)vkSprite2D.VKTexture.Width;
+                        sprite2D.OriginHeight = (int)vkSprite2D.VKTexture.Height;
                     }
                     catch (Exception ex)
                     {

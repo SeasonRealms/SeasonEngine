@@ -11,8 +11,9 @@ namespace Season.Platforms.Linux;
 /// previously spawned by <c>LinuxMediaPlayer</c> so no external player has to be
 /// installed on the user's machine.
 ///
-/// Decoding is fully managed: NLayer for MP3 (music) and <see cref="WavDecoder"/>
-/// for RIFF/WAVE (sound effects). Output goes through SDL3 audio streams on the
+/// Decoding: NLayer for MP3 (music), <see cref="WavDecoder"/> for RIFF/WAVE (sound
+/// effects), and <see cref="LibavDecoder"/> (the FFmpeg 8 shared libraries) for the ISO
+/// base media family (.m4a/.mp4/.m4v). Output goes through SDL3 audio streams on the
 /// default playback device; SDL converts and resamples to the physical device
 /// format, and per-stream gain gives real volume control. Music plays once and
 /// stops at end of file, matching the previous per-platform behavior.
@@ -296,6 +297,16 @@ internal static class LinuxAudioPlayer
             {
                 return new WavDecoder(file);
             }
+
+            if (string.Equals(ext, ".m4a", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(ext, ".mp4", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(ext, ".m4v", StringComparison.OrdinalIgnoreCase))
+            {
+                // ISO base media containers (AAC/ALAC audio, any video track demuxed away):
+                // the family only libav can read. Fails without the FFmpeg 8 libraries and
+                // then falls back to mplayer like every other unsupported stream.
+                return new LibavDecoder(file);
+            }
         }
         catch (Exception ex)
         {
@@ -558,7 +569,7 @@ internal static class LinuxAudioPlayer
     }
 
     /// <summary>PCM source shared by the music/sound loops; read from the owning voice thread only.</summary>
-    abstract class Decoder : IDisposable
+    internal abstract class Decoder : IDisposable
     {
         public abstract int SampleRate { get; }
 

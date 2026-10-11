@@ -610,15 +610,41 @@ internal class LinuxFileService : IFileService
         return "";
     }
 
-    public async Task<bool> OpenLink(string name)
+    public Task<bool> OpenLink(string name)
     {
-        var startInfo = new System.Diagnostics.ProcessStartInfo("xdg-open", new string[] { name });  //google-chrome
+        // Minimal WSL installs ship neither xdg-open nor wslview (WSLg does not provide
+        // them either), so on WSL the link goes through the Windows interop instead:
+        // explorer.exe hands the URL to the default Windows browser. Plain Linux
+        // desktops keep the standard xdg-open.
+        var isWSL = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("WSL_DISTRO_NAME"))
+            || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("WSL_INTEROP"));
 
-        var player = System.Diagnostics.Process.Start(startInfo);
+        var openers = isWSL ? new string[] { "wslview", "explorer.exe" } : new string[] { "xdg-open" };
 
-        player.WaitForExit();
+        // Callers are fire-and-forget click handlers and a desktop may lack every
+        // candidate: a failed launcher must not surface as an UnobservedTaskException,
+        // so try each opener in turn and log the final failure instead of throwing.
+        Exception? lastError = null;
 
-        return true;
+        foreach (var opener in openers)
+        {
+            try
+            {
+                var startInfo = new System.Diagnostics.ProcessStartInfo(opener, new string[] { name });
+
+                System.Diagnostics.Process.Start(startInfo);
+
+                return Task.FromResult(true);
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+            }
+        }
+
+        DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [OpenLink] failed opening {name}: {lastError?.Message}");
+
+        return Task.FromResult(false);
     }
 
     public void OpenFolder(string name)
@@ -667,14 +693,59 @@ internal class LinuxRecordService : RecordService, IRecordService
     [DllImport("libX11.so.6")]
     static extern int XDisplayHeight(IntPtr display, int screen);
 
+    /// <summary>
+    /// Starts capturing from the default recording device through the SDL3 audio stack
+    /// (see LinuxRecorder). The device open can block on a slow audio daemon, so the
+    /// work runs on the thread pool; failures are classified into <see cref="RecordFailure"/>
+    /// for the UI's remedy message and logged with the underlying SDL error.
+    /// </summary>
     public Task<bool> StartRecord()
     {
-        throw new NotImplementedException();
+        return Task.Run(() =>
+        {
+            LastFailure = RecordFailure.None;
+
+            if (LinuxRecorder.Start(out var failure, out var error))
+            {
+                DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] started {LinuxRecorder.SampleRate}Hz/{LinuxRecorder.Channels}ch/{LinuxRecorder.BitsPerSample}bit");
+
+                return true;
+            }
+
+            LastFailure = failure switch
+            {
+                LinuxRecorder.Failure.Permission => RecordFailure.Permission,
+                LinuxRecorder.Failure.Device => RecordFailure.Device,
+                LinuxRecorder.Failure.Unknown => RecordFailure.Unknown,
+                _ => RecordFailure.None,
+            };
+
+            if (error != null)
+            {
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [Record] StartRecord failed: {error}");
+            }
+
+            return false;
+        });
     }
 
+    /// <summary>
+    /// Stops the recording and returns the captured audio as a complete WAV
+    /// (16 kHz mono 16-bit PCM behind the canonical 44-byte RIFF header), or null
+    /// when nothing was recording or no sample arrived. Runs on the thread pool:
+    /// stop waits (bounded) for the capture pump to drain. This layout is byte-for-byte
+    /// what <see cref="DecodeToWavPcm16"/> returns, the contract the STT front ends parse.
+    /// </summary>
     public Task<byte[]> StopRecord()
     {
-        throw new NotImplementedException();
+        return Task.Run(() =>
+        {
+            var wav = LinuxRecorder.Stop();
+
+            DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Record] stopped, {(wav == null ? "no data" : $"{wav.Length} bytes")}");
+
+            return wav;
+        });
     }
 
     public Task<INativeImageDecoder?> CaptureScreen()
@@ -724,10 +795,17 @@ internal class LinuxRecordService : RecordService, IRecordService
         return tcs.Task;
     }
 
+    /// <summary>
+    /// Decodes the audio of any container the system FFmpeg shares can read (.m4a/.m4v/.mp4/.mp3 ...)
+    /// into a complete WAV: 16 kHz mono 16-bit PCM behind the canonical 44-byte RIFF header, the
+    /// very output contract StopRecord has and the only layout the STT front ends parse.
+    /// Chains the libavformat/libswresample shared libraries (present on most desktop installs even
+    /// without the ffmpeg tool) and the ffmpeg binary itself; see LinuxAudioDecoder for the details.
+    /// Blocking, so callers run it on a background thread.
+    /// </summary>
     public byte[] DecodeToWavPcm16(string path)
     {
-        // No media decoder is wired up on Linux yet; FFmpeg or GStreamer would be the implementation.
-        throw new NotImplementedException($"DecodeToWavPcm16 is not implemented on Linux: {path}");
+        return LinuxAudioDecoder.DecodeToWavPcm16(path);
     }
 }
 
