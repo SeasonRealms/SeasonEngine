@@ -15,6 +15,8 @@ namespace Season.Platforms.Android;
 /// Video is decoded through MediaCodec in surface mode, then YUV planes are read from getOutputImage
 /// and converted on the CPU from YUV to RGBA.
 /// It has no GLES or EGL dependency and does not conflict with the Vulkan rendering pipeline.
+/// Frames are paced on the container presentation timeline so consumers that measure frame
+/// arrival spacing (the notice screen drives its reverse bounce from it) see native playback timing.
 /// </summary>
 internal sealed class AndroidVideoPlayerService : IVideoPlayerService
 {
@@ -59,6 +61,7 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
 
             int videoTrack = -1;
             string? mime = null;
+            MediaFormat? trackFormat = null;
             for (int i = 0; i < _extractor.TrackCount; i++)
             {
                 var fmt = _extractor.GetTrackFormat(i);
@@ -67,17 +70,24 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
                 {
                     videoTrack = i;
                     mime = m;
+                    trackFormat = fmt;
                     _width = fmt!.GetInteger(MediaFormat.KeyWidth);
                     _height = fmt.GetInteger(MediaFormat.KeyHeight);
                     break;
                 }
             }
-            if (videoTrack < 0 || mime == null)
+            if (videoTrack < 0 || mime == null || trackFormat == null)
                 throw new InvalidOperationException("No video track found.");
 
             _extractor.SelectTrack(videoTrack);
             _codec = MediaCodec.CreateDecoderByType(mime);
-            _codec.Configure(new MediaFormat(), null, null,
+
+            // Configure must receive the extractor's track format: MediaCodec's JNI layer
+            // hard-asserts (CHECK in android_media_MediaCodec.cpp) on a "mime" entry, and
+            // the track format also carries width/height plus the codec-specific data
+            // (csd-0/csd-1 SPS/PPS). A fresh empty MediaFormat aborts the whole process -
+            // that is a native assertion, not a catchable Java exception.
+            _codec.Configure(trackFormat, null, null,
                 MediaCodecConfigFlags.None);
             _codec.Start();
 
@@ -104,26 +114,43 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
     void DecodeLoop()
     {
         var bufInfo = new MediaCodec.BufferInfo();
+
+        // Pacing state: the first output's presentation time and wall clock, so every later
+        // frame can wait until its in-timeline moment instead of being pushed as soon as decoded.
+        long firstPtsUs = -1;
+        long firstTick = 0;
+
+        // EOS drain state: once the input side ends, keep dequeuing so the frames still
+        // buffered in the decoder drain out instead of being discarded at release.
+        bool inputDone = false;
+        long inputDoneAt = 0;
         try
         {
             while (_isPlaying && !_disposed && _codec != null && _extractor != null)
             {
                 // Input: feed encoded data into the decoder.
-                int inIdx = _codec.DequeueInputBuffer(10_000);
-                if (inIdx >= 0)
+                if (!inputDone)
                 {
-                    var inputBuf = _codec.GetInputBuffer(inIdx);
-                    int sampleSize = _extractor.ReadSampleData(inputBuf!, 0);
-                    if (sampleSize < 0)
+                    int inIdx = _codec.DequeueInputBuffer(10_000);
+                    if (inIdx >= 0)
                     {
-                        _codec.QueueInputBuffer(inIdx, 0, 0, 0,
-                            MediaCodecBufferFlags.EndOfStream);
-                        break;
+                        var inputBuf = _codec.GetInputBuffer(inIdx);
+                        int sampleSize = _extractor.ReadSampleData(inputBuf!, 0);
+                        if (sampleSize < 0)
+                        {
+                            _codec.QueueInputBuffer(inIdx, 0, 0, 0,
+                                MediaCodecBufferFlags.EndOfStream);
+                            inputDone = true;
+                            inputDoneAt = Environment.TickCount64;
+                        }
+                        else
+                        {
+                            _codec.QueueInputBuffer(inIdx, 0, sampleSize,
+                                _extractor.SampleTime,
+                                MediaCodecBufferFlags.None);
+                            _extractor.Advance();
+                        }
                     }
-                    _codec.QueueInputBuffer(inIdx, 0, sampleSize,
-                        _extractor.SampleTime,
-                        MediaCodecBufferFlags.None);
-                    _extractor.Advance();
                 }
 
                 // Output: obtain decoded frames through the Image API using direct shared-memory reads.
@@ -157,6 +184,30 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
                                 planes[1].PixelStride,
                                 w, h);
 
+                            // Pace to the container timeline: consumers measure frame arrival
+                            // spacing (the notice screen derives its reverse bounce from it), and
+                            // decoding flat out would flash the whole clip in one burst. Waits are
+                            // sliced so Stop and Replay stay responsive on low-frame-rate files.
+                            if (bufInfo.PresentationTimeUs >= 0)
+                            {
+                                if (firstPtsUs < 0)
+                                {
+                                    firstPtsUs = bufInfo.PresentationTimeUs;
+                                    firstTick = Environment.TickCount64;
+                                }
+                                else
+                                {
+                                    long dueMs = (bufInfo.PresentationTimeUs - firstPtsUs) / 1000;
+                                    long wait = dueMs - (Environment.TickCount64 - firstTick);
+
+                                    while (wait > 0 && _isPlaying && !_disposed)
+                                    {
+                                        Thread.Sleep((int)Math.Min(wait, 100));
+                                        wait = dueMs - (Environment.TickCount64 - firstTick);
+                                    }
+                                }
+                            }
+
                             VideoFrameAvailable?.Invoke(
                                 new NativeImageData(w, h, rgba));
                         }
@@ -177,6 +228,11 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
                 {
                     // Format change: ignore it. Surface mode rarely uses it, but handling it here is still safe.
                 }
+                else if (inputDone && Environment.TickCount64 - inputDoneAt > 250)
+                {
+                    // EOS queued and nothing is left to dequeue: the drain is complete.
+                    break;
+                }
             }
         }
         catch (Exception ex)
@@ -192,9 +248,14 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
     }
 
     /// <summary>
-    /// Converts YUV 420 SemiPlanar to RGBA8888 using full-range BT.601 integer arithmetic.
-    /// This matches the standard MediaCodec output COLOR_FormatYUV420SemiPlanar,
-    /// where U and V are interleaved in the same plane and pixel stride is 2.
+    /// Converts YUV 420 to RGBA8888 using full-range BT.601 integer arithmetic.
+    /// Handles both semi-planar (UV interleaved, the common MediaCodec output where U and V
+    /// share a plane and pixel stride is 2) and planar layouts. The planes are bulk-copied out
+    /// of their JNI buffers first: per-pixel ByteBuffer.Get costs a JNI call each and pushes a
+    /// 688x688 frame into the seconds range, while the copy is a single native read. Indexed
+    /// reads are clamped to the copied length because a plane's last row can be shorter than
+    /// its row stride (the UV plane's final byte is often one short of the stride x rows
+    /// layout, and reading it threw "index out of bounds" which dropped every frame).
     /// </summary>
     static byte[] ConvertYuv420ToRgba(
         Java.Nio.ByteBuffer yBuf,
@@ -204,27 +265,32 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
         int yPixelStride, int uPixelStride,
         int width, int height)
     {
-        var rgba = new byte[width * height * 4];
         bool uvInterleaved = uBuf == vBuf
             || uRowStride == vRowStride; // semi-planar
+
+        byte[] yPlane = CopyPlane(yBuf);
+        byte[] uPlane = CopyPlane(uBuf);
+        byte[] vPlane = uvInterleaved ? uPlane : CopyPlane(vBuf);
+
+        var rgba = new byte[width * height * 4];
 
         for (int j = 0; j < height; j++)
         {
             for (int i = 0; i < width; i++)
             {
-                int y = yBuf.Get(j * yRowStride + i * yPixelStride) & 0xFF;
+                int y = yPlane[Clamp(j * yRowStride + i * yPixelStride, yPlane.Length)] & 0xFF;
 
                 int u, v;
                 if (uvInterleaved)
                 {
                     int uvOff = (j / 2) * uRowStride + (i / 2) * uPixelStride;
-                    u = uBuf.Get(uvOff) & 0xFF;
-                    v = uBuf.Get(uvOff + 1) & 0xFF;
+                    u = uPlane[Clamp(uvOff, uPlane.Length)] & 0xFF;
+                    v = uPlane[Clamp(uvOff + 1, uPlane.Length)] & 0xFF;
                 }
                 else
                 {
-                    u = uBuf.Get((j / 2) * uRowStride + (i / 2) * uPixelStride) & 0xFF;
-                    v = vBuf.Get((j / 2) * vRowStride + (i / 2) * uPixelStride) & 0xFF;
+                    u = uPlane[Clamp((j / 2) * uRowStride + (i / 2) * uPixelStride, uPlane.Length)] & 0xFF;
+                    v = vPlane[Clamp((j / 2) * vRowStride + (i / 2) * uPixelStride, vPlane.Length)] & 0xFF;
                 }
 
                 // ITU-R BT.601 full range (JPEG)
@@ -246,22 +312,31 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
         return rgba;
     }
 
+    /// <summary>
+    /// Copies a MediaCodec plane ByteBuffer into managed memory with one bulk JNI read.
+    /// Image planes expose their valid bytes at [0, limit), so rewind first to make the
+    /// transfer start there.
+    /// </summary>
+    static byte[] CopyPlane(Java.Nio.ByteBuffer buffer)
+    {
+        int length = buffer.Limit();
+        var data = new byte[length];
+        buffer.Rewind();
+        buffer.Get(data, 0, length);
+        return data;
+    }
+
+    /// <summary>Clamps a plane index to the last copied byte, since stride padding can exceed the buffer length.</summary>
+    static int Clamp(int index, int length) => index < length ? index : length - 1;
+
     public void Replay()
     {
         if (_filePath == null) return;
         var path = _filePath;
 
-        // Stop the current run, then wait for the decode thread to fully exit
-        // before rebuilding the codec/extractor, so it cannot touch the fresh
-        // instances. Skipped when Replay is re-entered from the decode thread
-        // itself (e.g. a caller looping from the PlaybackEnded event).
-        var old = _decodeThread;
+        // Stop now joins the decode thread itself, so the old run cannot touch the
+        // fresh codec/extractor instances that Play builds next.
         Stop();
-        if (old != null && old != Thread.CurrentThread)
-        {
-            old.Join(2000);
-        }
-        _decodeThread = null;
 
         Play(path);
     }
@@ -269,6 +344,20 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
     public void Stop()
     {
         _isPlaying = false;
+
+        // The decode thread keeps calling into the native codec until its loop condition
+        // sees _isPlaying: releasing MediaCodec/MediaExtractor underneath a live
+        // DequeueOutputBuffer/GetOutputImage call is a use-after-free (observed as SIGSEGV
+        // in the SeasonVidAndroid thread when playback was stopped mid-run). Join it first -
+        // the dequeue timeouts and sliced pacing waits keep this bounded. Skipped when Stop
+        // re-enters from the decode thread itself (PlaybackEnded loops).
+        var thread = _decodeThread;
+        if (thread != null && thread != Thread.CurrentThread)
+        {
+            thread.Join(2000);
+        }
+        _decodeThread = null;
+
         try { _player?.Stop(); } catch { }
         _player?.Release();
         _player?.Dispose();

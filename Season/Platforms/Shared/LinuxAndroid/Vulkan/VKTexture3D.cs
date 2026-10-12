@@ -41,7 +41,7 @@ namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 /// Size contract:
 /// Vulkan only guarantees a minimum of 256 for maxImageDimension3D,
 /// so any dimension > 256 must first query device capabilities.
-/// A single SDF cascade is recommended to stay <= 128^3.
+/// A single SDF cascade is recommended to stay at or below 128^3.
 /// Format availability is pre-validated by Graphics.CheckComputeFormatSupport
 /// (vkGetPhysicalDeviceFormatProperties) in both CreateComputeKernel and CreateComputeTexture3D:
 /// missing StorageImageBit or, for sampled slots, SampledImageFilterLinearBit
@@ -92,7 +92,10 @@ internal unsafe sealed class VKTexture3D : IDisposable
     /// (`a` here is opacity, not transmittance).
     /// apParams0.x gating guarantees the dummy is never sampled when bound,
     /// so the content itself is never evaluated.
-    /// However, the layout must start as ShaderReadOnlyOptimal to satisfy the descriptor declaration.
+    /// However, the descriptor declares ShaderReadOnlyOptimal, so the image must rest in that layout.
+    /// vkCreateImage only accepts Undefined/Preinitialized as the initial layout
+    /// (VUID-VkImageCreateInfo-initialLayout-00993), so the image is created Undefined and
+    /// ClearToBlack clears it to zero and parks it in ShaderReadOnlyOptimal.
     /// (Mirrors DXTexture3D.DummyBlack.)</summary>
     static VKTexture3D? _dummyBlack;
 
@@ -116,8 +119,13 @@ internal unsafe sealed class VKTexture3D : IDisposable
             Depth = 1,
             Format = Silk.NET.Vulkan.Format.R8G8B8A8Unorm,
         };
-        tex.CreateImageResource(ImageLayout.ShaderReadOnlyOptimal);
+        // TransferDstBit is required by spec for vkCmdClearColorImage, which ClearToBlack runs.
+        tex.CreateImageResource(ImageUsageFlags.TransferDstBit);
         tex.CreateImageView();
+        // A newly created Vulkan image has undefined contents, while the dummy's contract
+        // is all zero (the identity element above). ClearToBlack also performs the
+        // Undefined -> ShaderReadOnlyOptimal transition the descriptor declares.
+        tex.ClearToBlack();
         tex.Ready = true;
         return tex;
     }
@@ -217,14 +225,19 @@ internal unsafe sealed class VKTexture3D : IDisposable
         CreateImageView();
         Ready = true;
     }
-    void CreateImageResource(ImageLayout initialLayout = ImageLayout.Undefined)
+    void CreateImageResource(ImageUsageFlags extraUsage = 0)
     {
-        // There is no upload chain, so the transfer queue never participates
-        // and SharingMode stays Exclusive.
-        // The 2D path uses Concurrent only to avoid transfer -> graphics ownership barriers,
-        // a case that does not exist here.
-        // initialLayout: the dummy starts directly in ShaderReadOnlyOptimal
-        // (see CreateDummyBlack).
+        // The storage textures never touch the transfer queue, so their SharingMode stays Exclusive.
+        // The dummy (extraUsage carries TransferDstBit) is cleared on the transfer queue by ClearToBlack;
+        // when the families differ that would need transfer -> graphics ownership barriers,
+        // so it is created Concurrent instead - same rationale as the 2D upload path.
+        // extraUsage: vkCmdClearColorImage requires TransferDstBit on the image (see CreateDummyBlack).
+        // InitialLayout is always Undefined: Vulkan accepts nothing else here
+        // (VUID-VkImageCreateInfo-initialLayout-00993), so reaching a "ready" layout
+        // is the first transition's job (ClearToBlack), never creation's.
+        bool concurrent = (extraUsage & ImageUsageFlags.TransferDstBit) != 0
+            && Device.GraphicsQueueFamily != Device.TransferQueueFamily;
+        var families = stackalloc uint[2] { Device.GraphicsQueueFamily, Device.TransferQueueFamily };
         var info = new ImageCreateInfo
         {
             SType = StructureType.ImageCreateInfo,
@@ -235,9 +248,11 @@ internal unsafe sealed class VKTexture3D : IDisposable
             ArrayLayers = 1,
             Samples = SampleCountFlags.Count1Bit,
             Tiling = ImageTiling.Optimal,
-            Usage = ImageUsageFlags.StorageBit | ImageUsageFlags.SampledBit,
-            SharingMode = SharingMode.Exclusive,
-            InitialLayout = initialLayout,
+            Usage = ImageUsageFlags.StorageBit | ImageUsageFlags.SampledBit | extraUsage,
+            SharingMode = concurrent ? SharingMode.Concurrent : SharingMode.Exclusive,
+            QueueFamilyIndexCount = concurrent ? 2u : 0u,
+            PQueueFamilyIndices = concurrent ? families : null,
+            InitialLayout = ImageLayout.Undefined,
         };
 
         if (Device.Vk.CreateImage(Device.LogicalDevice, in info, null, out Image) != Result.Success)
@@ -257,7 +272,75 @@ internal unsafe sealed class VKTexture3D : IDisposable
             throw new Exception($"vkAllocateMemory (3D image '{Name}') failed");
 
         Device.Vk.BindImageMemory(Device.LogicalDevice, Image, Memory, 0);
-        CurrentLayout = initialLayout;
+        CurrentLayout = ImageLayout.Undefined;
+    }
+
+    /// <summary>
+    /// Clear the freshly created image to all zero and park it in ShaderReadOnlyOptimal:
+    /// on a one-time transfer command buffer, transition Undefined -> TransferDstOptimal,
+    /// CmdClearColorImage(0), then transition to ShaderReadOnlyOptimal.
+    /// Used only by the dummy (see CreateDummyBlack): its descriptor declares
+    /// ShaderReadOnlyOptimal, so the image must rest in that layout, while creation can only
+    /// start at Undefined (VUID-VkImageCreateInfo-initialLayout-00993) -
+    /// the previous code side-stepped that by declaring an initial layout the spec forbids,
+    /// which validation flagged as VUID-00993.
+    /// All zero is exactly the dummy's intended content, so the clear both initializes the
+    /// previously undefined texels and produces the identity element documented above.
+    /// Visibility is guaranteed by the host-side QueueWaitIdle,
+    /// same precedent as the 2D upload chain and ClearToZero.
+    /// </summary>
+    void ClearToBlack()
+    {
+        var vk = Device.Vk;
+        var d = Device.LogicalDevice;
+
+        var allocInfo = new CommandBufferAllocateInfo
+        {
+            SType = StructureType.CommandBufferAllocateInfo,
+            Level = CommandBufferLevel.Primary,
+            CommandBufferCount = 1,
+            CommandPool = Device.TextureUploadBatch.Pool
+        };
+        CommandBuffer cmd;
+        vk.AllocateCommandBuffers(d, in allocInfo, out cmd);
+
+        var beginInfo = new CommandBufferBeginInfo
+        {
+            SType = StructureType.CommandBufferBeginInfo,
+            Flags = CommandBufferUsageFlags.OneTimeSubmitBit
+        };
+        vk.BeginCommandBuffer(cmd, in beginInfo);
+
+        // Undefined to TransferDstOptimal for a newly created image:
+        // old contents may be discarded and no source access is needed.
+        TransitionTo(cmd, ImageLayout.TransferDstOptimal,
+            PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit,
+            0, AccessFlags.TransferWriteBit);
+
+        var clearColor = new ClearColorValue(0f, 0f, 0f, 0f);
+        // For 3D images the layer range is the depth slice range: one slice is the whole 1x1x1 volume.
+        var range = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1);
+        vk.CmdClearColorImage(cmd, Image, ImageLayout.TransferDstOptimal, in clearColor, 1, in range);
+
+        // Rest in the layout the descriptor declares (CombinedImageSampler, read-only).
+        // This command buffer runs on the transfer queue, which cannot reference
+        // FragmentShader stages, so the destination stage is AllCommands,
+        // exactly like the 2D upload chain's final transition to ShaderReadOnlyOptimal.
+        TransitionTo(cmd, ImageLayout.ShaderReadOnlyOptimal,
+            PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit,
+            AccessFlags.TransferWriteBit, 0);
+
+        vk.EndCommandBuffer(cmd);
+
+        var submitInfo = new SubmitInfo
+        {
+            SType = StructureType.SubmitInfo,
+            CommandBufferCount = 1,
+            PCommandBuffers = &cmd
+        };
+        vk.QueueSubmit(Device.TransferCommandQueue.NativeQueue, 1, in submitInfo, default);
+        vk.QueueWaitIdle(Device.TransferCommandQueue.NativeQueue);
+        vk.FreeCommandBuffers(d, Device.TextureUploadBatch.Pool, 1, in cmd);
     }
 
     void CreateImageView()

@@ -134,7 +134,49 @@ internal class AndroidDeviceCore : IDeviceCore
 
     public string LoadFilePath(string res)
     {
-        return null;
+        var path = res.Replace('\\', '/');
+
+        // Real files win: user media picked through the document picker and files already
+        // copied into the data directory resolve to themselves, matching the desktop
+        // contract of returning the absolute path of an existing file.
+        if (System.IO.File.Exists(path))
+        {
+            return path;
+        }
+
+        // Everything else is expected in the APK assets tree (MauiAsset packs Resources\Raw\**
+        // keeping the relative path as the logical name, so "Musics/Warmfresh.wav" and
+        // "Assets/Qwen3.5-0.8B-Q4_K_M.gguf" map to assets 1:1). llama.cpp, ONNX Runtime and
+        // MediaPlayer cannot read AssetManager streams - they need a real file - so the asset
+        // is materialized into CacheDir, the same degradation SetMediaSource falls back to for
+        // compressed assets. An existing copy is reused, so a model is paid for only once.
+        var asset = ResolveAssetPath(res);
+
+        var cachePath = Path.Combine(AndroidApp.MainActivity.CacheDir.AbsolutePath, asset);
+
+        if (System.IO.File.Exists(cachePath))
+        {
+            return cachePath;
+        }
+
+        try
+        {
+            System.IO.Directory.CreateDirectory(Path.GetDirectoryName(cachePath));
+
+            using (var source = AndroidApp.MainActivity.BaseContext.Assets.Open(asset))
+            using (var target = System.IO.File.Create(cachePath))
+            {
+                source.CopyTo(target);
+            }
+        }
+        catch (Java.IO.FileNotFoundException)
+        {
+            // Neither on disk nor in the bundle. Callers that can read packaged assets
+            // themselves (LoadFile / stream consumers) treat null as "use the stream path".
+            return null;
+        }
+
+        return cachePath;
     }
 
     public bool LoadFileExists(string res)
