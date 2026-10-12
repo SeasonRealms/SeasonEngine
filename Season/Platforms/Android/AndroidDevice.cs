@@ -619,8 +619,8 @@ internal class AndroidFileService : IFileService
 
         var intent = new Intent(action);
 
-        // 按文件類型限定 MIME：Image → image/*，其餘保持全類通配；exts 過濾由調用方
-        // 按返回的 Ext/Name 自行校驗（各平台 PickFiles 一致契約）。
+        //Limit MIMEs by file type: Image → image/*, while keeping them universally compatible across all classes; Exts filtering is performed by the caller
+        //Perform self verification based on the returned Ext/Name (consistent contract for PickFiles across platforms).
         intent.SetType(fileType switch
         {
             FileType.Image => FileMimeTypes.ImageAll,
@@ -638,9 +638,9 @@ internal class AndroidFileService : IFileService
 
             tcsPickFiles = tcs;
 
-            // StartActivityForResult 携带 Activity 亲和性：渲染線程（後台）調用時必須投遞
-            // 到 UI 線程；啟動失敗（設備無文件選擇器）以空數組結束會話，不讓異常逃進 UI
-            // 線程消息循環。
+            //StartActiveForResult carries Activity affinity: It must be delivered when called by the rendering thread (backend)
+            //To the UI thread; Startup failed (device without file selector), end session with empty array to prevent exceptions from escaping into UI
+            //Thread message loop.
             var activity = AndroidApp.MainActivity;
 
             activity.RunOnUiThread(() =>
@@ -673,9 +673,11 @@ internal class AndroidFileService : IFileService
                     continue;
                 }
 
-                // SAF/DocumentProvider 的列集不保證包含 MediaStore 的 mime_type；列缺失
-                // （GetColumnIndex 返回 -1）或查詢失敗時退回 ContentResolver.GetType。
+                //The column set of SAF/DocumentProvider does not guarantee to contain the mime_type of MediaStore; Missing columns
+                //Return -1 for VNet ColumnIndex or ContentResolver.GetType when the query fails.
+                //D_splay_name is the SAF standard column, retrieved in one query with mime_type.
                 string mimeType = null;
+                string displayName = null;
 
                 using (var cursor = AndroidCommon.DownloadQueryCursor(uri, null, null))
                 {
@@ -687,6 +689,13 @@ internal class AndroidFileService : IFileService
                         {
                             mimeType = cursor.GetString(index);
                         }
+
+                        var nameIndex = cursor.GetColumnIndex(IOpenableColumns.DisplayName);
+
+                        if (nameIndex >= 0)
+                        {
+                            displayName = cursor.GetString(nameIndex);
+                        }
                     }
                 }
 
@@ -695,16 +704,73 @@ internal class AndroidFileService : IFileService
                     mimeType = AndroidApp.MainActivity.ContentResolver?.GetType(uri);
                 }
 
-                var ext = string.IsNullOrEmpty(mimeType) ? "" : "." + mimeType.Replace("image/", "");
+                if (displayName.IsNullOrWhiteSpace())
+                {
+                    displayName = uri.LastPathSegment;
+                }
 
-                //image/png
-                //image/jpeg
+                if (displayName.IsNullOrWhiteSpace())
+                {
+                    displayName = "picked_file";
+                }
+
+                var fileName = Path.GetFileName(displayName);
+
+                if (fileName.IsNullOrWhiteSpace())
+                {
+                    fileName = "picked_file";
+                }
+
+                //SAF content://uri is not a file system path: use it as a path (File.Cpy)/
+                //File. OpenRead) will be normalized to "/content:/..." by Path. GetFullPath and reported
+                //Could not find a part of the path. Align Apple UIDocumentPicker
+                //The semantics of Mode. Import - content first falls into the application cache and then returns to the local path - PickFiles on each end
+                //Unified 'Name=local readable path' (Windows/Linux native path, Apple sandbox import path
+                //Android cache import path), downstream CopyToLocal/File.Cpy/extension verification is not required
+                //Perception platform. Cache is reclaimed by the system during low storage.
+                var directory = Path.Combine(AndroidApp.MainActivity.CacheDir.AbsolutePath, "PickFiles");
+
+                System.IO.Directory.CreateDirectory(directory);
+
+                var localPath = Path.Combine(directory, fileName);
+
+                try
+                {
+                    //Copy and pay off program pool: PickFiles are awaiting by the rendering thread, with hundreds of MB of models/videos
+                    //Frame loops should not be blocked in the synchronization segment.
+                    await Task.Run(() =>
+                    {
+                        using var source = AndroidApp.MainActivity.ContentResolver.OpenInputStream(uri);
+                        using var destination = System.IO.File.Create(localPath);
+
+                        source.CopyTo(destination);
+                    });
+                }
+                catch (Exception ex)
+                {
+                    //If a single file fails to read, only skip that item (if multiple selections are made, the rest will remain the same), and prevent exceptions from escaping
+                    //Rendering loop.
+                    DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [File] PickFiles copy failed for {uri}: {ex}");
+
+                    continue;
+                }
+
+                var ext = Path.GetExtension(fileName).ToLower();
+
+                if (string.IsNullOrEmpty(ext) && !string.IsNullOrEmpty(mimeType))
+                {
+                    // Minimum guarantee for display name without extension: take mime subtype (image/jpeg → ". jpeg",
+                    // application/octet-stream → ".octet-stream"）。
+                    var slash = mimeType.LastIndexOf('/');
+
+                    ext = "." + (slash >= 0 ? mimeType[(slash + 1)..] : mimeType);
+                }
 
                 System.IO.Stream stream = null;
 
                 if (open)
                 {
-                    stream = AndroidApp.MainActivity.ContentResolver.OpenInputStream(uri);
+                    stream = System.IO.File.OpenRead(localPath);
                 }
                 else
                 {
@@ -713,7 +779,7 @@ internal class AndroidFileService : IFileService
 
                 var taskFile = new TaskFile()
                 {
-                    Name = uri?.ToString(),
+                    Name = localPath,
                     Ext = ext,
                     Text = "",
                     Stream = stream
@@ -788,15 +854,9 @@ internal class AndroidFileService : IFileService
 
         var result = "";
 
-        if (!OperatingSystem.IsAndroidVersionAtLeast(33))
-        {
-            var status = await Permissions.RequestAsync<Permissions.StorageWrite>().WaitAsync(cancellationToken).ConfigureAwait(false);
-
-            if (status is not PermissionStatus.Granted)
-            {
-                throw new PermissionException("Storage permission is not granted.");
-            }
-        }
+        // No storage permission is needed here: the user's pick through the SAF create-document
+        // panel grants a per-uri write authorization for the returned document, independent of
+        // WRITE_EXTERNAL_STORAGE (which requests on modern targets are auto-denied anyway).
 
         //if (Android.OS.Environment.ExternalStorageDirectory is not null)
         //{
@@ -819,8 +879,6 @@ internal class AndroidFileService : IFileService
 
         tcsSaveFile = tcs;
 
-        // 同 PickFiles：StartActivityForResult 攜帶 Activity 親和性，必須投遞到 UI 線程；
-        // 啟動失敗以 null 結束會話。
         var activity = AndroidApp.MainActivity;
 
         activity.RunOnUiThread(() =>
@@ -843,13 +901,15 @@ internal class AndroidFileService : IFileService
 
         if (uri is null)
         {
-            // 用戶取消（或啟動失敗）：無輸出目標，返回空結果，避免解引用 null。
             return "";
         }
 
-        var parcelFileDescriptor = Application.Context.ContentResolver?.OpenFileDescriptor(uri, "wt");
+        // Both wrappers own an OS file descriptor and must be released with the method - relying
+        // on finalizers would keep the descriptors alive until a GC cycle, and repeated saves
+        // would drain the per-process fd table.
+        using var parcelFileDescriptor = Application.Context.ContentResolver?.OpenFileDescriptor(uri, "wt");
 
-        var fileOutputStream = new Java.IO.FileOutputStream(parcelFileDescriptor?.FileDescriptor);
+        using var fileOutputStream = new Java.IO.FileOutputStream(parcelFileDescriptor?.FileDescriptor);
 
         var length = (int)(stream.Length < 4096 ? stream.Length : 4096);
 
@@ -957,8 +1017,6 @@ internal class AndroidFileService : IFileService
 
     async Task<string> SaveBytesFile(string name, byte[] bytes)
     {
-        DeviceServices.Download.DownloadNew(null, name);
-
         DeviceServices.Download.DownloadSave(null, name, bytes, false);
 
         //var downloads = Android.OS.Environment.GetExternalStoragePublicDirectory(Android.OS.Environment.DirectoryDownloads);
@@ -1707,12 +1765,15 @@ internal class AndroidDownloadService : IDownloadService
 
     public void DownloadSave(string directory, string name, byte[] bytes, bool openFolder)
     {
-        if (downloadUri == null)
-        {
-            DownloadNew(directory, name);
-        }
+        // Every save needs the entry created for this request: the static downloadUri
+        // only ever names the previous insert, and that entry may already be gone
+        // (a same-name DownloadDel before an export, an external removal, ...) -
+        // writing through it then throws FileNotFoundException "No item at
+        // content://media/external/file/<id>". Even while it survives, "wa" would
+        // append the new content to the previous file instead of saving this one.
+        DownloadNew(directory, name);
 
-        using (var output = AndroidApp.MainActivity.ContentResolver.OpenOutputStream(downloadUri, "wa"))
+        using (var output = AndroidApp.MainActivity.ContentResolver.OpenOutputStream(downloadUri, "w"))
         {
             output.Write(bytes);
         }
