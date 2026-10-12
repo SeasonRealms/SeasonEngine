@@ -91,6 +91,22 @@ public interface IDeviceCore
 
     Orientation Orientation { get; set; }
 
+    /// <summary>
+    /// Density factor: physical pixels per logical unit (Android dp / iOS pt / Windows DIP).
+    /// 1 means logical units are physical pixels, which is the historical engine behavior.
+    /// Platform bridges report the live display density and must sanitize to 1 when the
+    /// value is unavailable.
+    /// </summary>
+    float DensityScale { get; }
+
+    /// <summary>
+    /// Safe-area insets (left, top, right, bottom) in logical units, describing the area the
+    /// UI must keep clear of on displays with cutouts, rounded corners or system bars. The
+    /// mobile platforms report the live values so rotation and folding are picked up on the
+    /// next layout pass; the desktop platforms report zero.
+    /// </summary>
+    Vector4 SafeInsets { get; }
+
     string GetLocalIP();
 
     string LoadFilePath(string res);

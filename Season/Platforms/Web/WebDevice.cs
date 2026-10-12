@@ -33,6 +33,12 @@ internal class WebDeviceCore : IDeviceCore
 
     public Orientation Orientation { get; set; } = Orientation.LandscapeLeft;
 
+    /// <summary>The Web target is not built yet; the default canvas maps logical units to CSS pixels 1:1.</summary>
+    public float DensityScale => 1f;
+
+    /// <summary>The Web target is not built yet; report zero like the desktop targets.</summary>
+    public Vector4 SafeInsets => Vector4.Zero;
+
     public string GetLocalIP()
     {
         // The browser environment has no direct capability to retrieve a local IP address.

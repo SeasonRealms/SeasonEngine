@@ -106,6 +106,28 @@ internal class WindowsDeviceCore : IDeviceCore
     const uint DM_PELSWIDTH = 0x00080000;
     const uint DM_PELSHEIGHT = 0x00100000;
 
+    /// <summary>
+    /// Density factor in physical pixels per DIP, taken from the SwapChainPanel composition
+    /// scale that ApplyResolution writes. Before the first ApplyResolution it reports 1.
+    /// </summary>
+    public float DensityScale
+    {
+        get
+        {
+            var scale = DeviceServices.BaseApp?.CompositionScale.X ?? 1f;
+
+            if (!float.IsFinite(scale) || scale <= 0f)
+            {
+                return 1f;
+            }
+
+            return scale;
+        }
+    }
+
+    /// <summary>The Windows render surface has no display cutout; system chrome stays outside the SwapChainPanel.</summary>
+    public Vector4 SafeInsets => Vector4.Zero;
+
     public string GetLocalIP()
     {
         var ipAddress = "";

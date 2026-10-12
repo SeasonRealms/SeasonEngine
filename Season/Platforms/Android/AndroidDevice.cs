@@ -25,6 +25,7 @@ using Path = System.IO.Path;
 using Uri = Android.Net.Uri;
 using Orientation0 = Android.Content.Res.Orientation;
 using Build = Android.OS.Build;
+using WindowInsets = Android.Views.WindowInsets;
 
 using Season.Platforms.Shared.LinuxAndroid;
 
@@ -73,6 +74,70 @@ internal class AndroidDeviceCore : IDeviceCore
             else
             {
                 AndroidApp.MainActivity.RequestedOrientation = ScreenOrientation.Landscape;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Density factor in physical pixels per dp. Read from the current configuration so a
+    /// system display-size (density) change is picked up by the next resolution re-apply.
+    /// </summary>
+    public float DensityScale
+    {
+        get
+        {
+            var density = AndroidApp.MainActivity?.ApplicationContext?.Resources?.DisplayMetrics?.Density ?? 1f;
+
+            if (!float.IsFinite(density) || density <= 0f)
+            {
+                return 1f;
+            }
+
+            return density;
+        }
+    }
+
+    /// <summary>
+    /// Safe-area insets (left, top, right, bottom) in dp, read from the decor view so content
+    /// stays clear of cutouts and system bars. The raw insets are physical pixels and are
+    /// divided by the density factor to match the logical-unit convention. Insets are zero
+    /// until the decor view has been attached to a window.
+    /// </summary>
+    public Vector4 SafeInsets
+    {
+        get
+        {
+            try
+            {
+                var view = AndroidApp.MainActivity?.Window?.DecorView;
+
+                var windowInsets = view?.RootWindowInsets;
+
+                if (windowInsets is null)
+                {
+                    return Vector4.Zero;
+                }
+
+                var density = DensityScale;
+
+                if (OperatingSystem.IsAndroidVersionAtLeast(30))
+                {
+                    var insets = windowInsets.GetInsets(WindowInsets.Type.SystemBars());
+
+                    return new Vector4(insets.Left / density, insets.Top / density, insets.Right / density, insets.Bottom / density);
+                }
+                else
+                {
+                    return new Vector4(
+                        windowInsets.SystemWindowInsetLeft / density,
+                        windowInsets.SystemWindowInsetTop / density,
+                        windowInsets.SystemWindowInsetRight / density,
+                        windowInsets.SystemWindowInsetBottom / density);
+                }
+            }
+            catch (Exception)
+            {
+                return Vector4.Zero;
             }
         }
     }

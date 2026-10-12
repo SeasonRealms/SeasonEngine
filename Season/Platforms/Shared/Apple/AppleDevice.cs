@@ -87,6 +87,51 @@ internal class AppleDeviceCore : IDeviceCore
         }
     }
 
+    /// <summary>
+    /// Density factor in physical pixels per point on the main screen. iOS devices have a
+    /// single screen; a Mac Catalyst window can sit on a display with a different scale,
+    /// which the next drawable-size change re-applies in the same way inputs already read
+    /// UIScreen.MainScreen.NativeScale.
+    /// </summary>
+    public float DensityScale
+    {
+        get
+        {
+            var scale = (float)UIScreen.MainScreen.NativeScale;
+
+            if (!float.IsFinite(scale) || scale <= 0f)
+            {
+                return 1f;
+            }
+
+            return scale;
+        }
+    }
+
+    /// <summary>
+    /// Safe-area insets (left, top, right, bottom) in points from the active window, keeping
+    /// content clear of the notch, the dynamic island and the home indicator. Points already
+    /// match the logical-unit convention while density following is on.
+    /// </summary>
+    public Vector4 SafeInsets
+    {
+        get
+        {
+            try
+            {
+                var scene = UIApplication.SharedApplication.ConnectedScenes.ToArray().FirstOrDefault(cs => cs is UIWindowScene) as UIWindowScene;
+
+                var insets = scene?.Windows.FirstOrDefault()?.SafeAreaInsets ?? default;
+
+                return new Vector4((float)insets.Left, (float)insets.Top, (float)insets.Right, (float)insets.Bottom);
+            }
+            catch (Exception)
+            {
+                return Vector4.Zero;
+            }
+        }
+    }
+
     public string GetLocalIP()
     {
         var ipAddress = "";

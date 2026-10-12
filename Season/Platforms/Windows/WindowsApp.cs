@@ -342,7 +342,30 @@ public static class WindowsApp
 
         swapChainPanel.CompositionScaleChanged += (s, e) =>
         {
+            if (_closing) return;
+            lock (swapChainPanel)
+            {
+                // DPI change (the window moved to a display with a different scale): the physical
+                // backbuffer size changes even when the logical size does not. Mirror SizeChanged
+                // and let the render loop rebuild the SwapChain from ApplyResolution's result.
+                var backBufferWidth = ConvertLogicalToPhysicalPixels(swapChainPanel.ActualWidth, swapChainPanel.CompositionScaleX);
+                var backBufferHeight = ConvertLogicalToPhysicalPixels(swapChainPanel.ActualHeight, swapChainPanel.CompositionScaleY);
 
+                if (swapChainPanel.ActualWidth <= 0 || swapChainPanel.ActualHeight <= 0 || backBufferWidth <= 0 || backBufferHeight <= 0
+                    || swapChainPanel.CompositionScaleX < 0.01f || swapChainPanel.CompositionScaleY < 0.01f)
+                {
+                    return;
+                }
+
+                DeviceServices.BaseApp.ApplyResolution(backBufferWidth, backBufferHeight, swapChainPanel.CompositionScaleX, swapChainPanel.CompositionScaleY);
+
+                if (!firstTime)
+                {
+                    sizeChanged = true;
+
+                    _lastSwapChainChangeTime = DateTime.Now;
+                }
+            }
         };
 
         StoreContext = StoreContext.GetDefault();

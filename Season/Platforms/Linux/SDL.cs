@@ -69,9 +69,18 @@ internal static partial class SDL
     [return: MarshalAs(UnmanagedType.I1)]
     public static partial bool GetWindowSizeInPixels(IntPtr window, out int w, out int h);
 
+    /// <summary>Content scale of the display the window is on, as physical pixels per point. Returns 0.0f on failure.</summary>
+    [LibraryImport(Library, EntryPoint = "SDL_GetWindowDisplayScale"), UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial float GetWindowDisplayScale(IntPtr window);
+
     [LibraryImport(Library, EntryPoint = "SDL_SetWindowSize"), UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     [return: MarshalAs(UnmanagedType.I1)]
     public static partial bool SetWindowSize(IntPtr window, int w, int h);
+
+    /// <summary>Sets the window minimum size constraint in logical coordinates. Allowed before ShowWindow; a window smaller than the constraint is enlarged on the next state sync.</summary>
+    [LibraryImport(Library, EntryPoint = "SDL_SetWindowMinimumSize"), UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    [return: MarshalAs(UnmanagedType.I1)]
+    public static partial bool SetWindowMinimumSize(IntPtr window, int minW, int minH);
 
     /// <summary>Restores the window from maximized or minimized state. A maximized window ignores SDL_SetWindowSize, so this must be called before diagnostic forced resizing.</summary>
     [LibraryImport(Library, EntryPoint = "SDL_RestoreWindow"), UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
@@ -194,6 +203,9 @@ public enum SDL_EventType : uint
     SDL_EVENT_WINDOW_FOCUS_GAINED = 0x20E,
     SDL_EVENT_WINDOW_FOCUS_LOST = 0x20F,
     SDL_EVENT_WINDOW_CLOSE_REQUESTED = 0x210,
+    // 0x211 HIT_TEST, 0x212 ICCPROF_CHANGED and 0x213 DISPLAY_CHANGED are not consumed by the
+    // engine; DISPLAY_SCALE_CHANGED follows them, so its value must skip those three.
+    SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED = 0x214,
 
     SDL_EVENT_KEY_DOWN = 0x300,
     SDL_EVENT_KEY_UP = 0x301,

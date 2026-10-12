@@ -30,6 +30,9 @@ public static class LinuxApp
     // display change through ApplyWindowClientSize.
     static IntPtr _window;
 
+    /// <summary>Window handle for density queries. IntPtr.Zero before creation and after teardown.</summary>
+    internal static IntPtr Window => _window;
+
     public static unsafe void Run(BaseApp app)
     {
         ArgumentNullException.ThrowIfNull(app);
@@ -524,6 +527,31 @@ public static class LinuxApp
                             _resized = true;
                         }
                         SaveWindowState(window, immediate: false);
+
+                        break;
+
+                    case SDL_EventType.SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+
+                        // The window moved to a display with a different content scale. The pixel
+                        // size normally changes with it and arrives as PIXEL_SIZE_CHANGED, but
+                        // re-apply regardless because the density factor follows the display
+                        // scale; rebuild the SwapChain only when the mapping actually changed.
+                        SDL.GetWindowSizeInPixels(window, out int scaleW, out int scaleH);
+
+                        if (scaleW > 0 && scaleH > 0)
+                        {
+                            int prevW = (int)DeviceServices.BaseApp.DeviceResolution.X;
+                            int prevH = (int)DeviceServices.BaseApp.DeviceResolution.Y;
+                            float prevScale = DeviceServices.BaseApp.Scale;
+
+                            DeviceServices.BaseApp.ApplyResolution(scaleW, scaleH, 1f, 1f);
+
+                            if (prevW != scaleW || prevH != scaleH
+                                || prevScale != DeviceServices.BaseApp.Scale)
+                            {
+                                _resized = true;
+                            }
+                        }
 
                         break;
 

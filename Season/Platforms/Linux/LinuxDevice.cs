@@ -20,6 +20,35 @@ internal class LinuxDeviceCore : IDeviceCore
 
     public Basic.Orientation Orientation { get; set; } = Basic.Orientation.LandscapeLeft;
 
+    /// <summary>
+    /// Density factor in physical pixels per window point, queried from SDL for the display
+    /// the window is currently on (content scale). Before the window exists it reports 1.
+    /// </summary>
+    public float DensityScale
+    {
+        get
+        {
+            var window = LinuxApp.Window;
+
+            if (window == IntPtr.Zero)
+            {
+                return 1f;
+            }
+
+            var scale = SDL.GetWindowDisplayScale(window);
+
+            if (!float.IsFinite(scale) || scale <= 0f)
+            {
+                return 1f;
+            }
+
+            return scale;
+        }
+    }
+
+    /// <summary>Desktop Linux has no display cutout to stay clear of.</summary>
+    public Vector4 SafeInsets => Vector4.Zero;
+
     public string GetLocalIP()
     {
         var ipAddress = "";

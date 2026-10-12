@@ -24,6 +24,15 @@ public abstract class BaseApp : Panel
 
     public Vector2 DesignResolution { get; set; } = new Vector2(1280, 720);
 
+    /// <summary>
+    /// When enabled, one logical unit becomes a density-independent unit (Android dp / iOS pt /
+    /// Windows DIP): Scale is set to the display density factor and the logical canvas becomes
+    /// DeviceResolution / density, so UI keeps its physical size across resolutions and DPI
+    /// changes. Opt-in; the default keeps the historical mapping (Scale = 1 on desktop,
+    /// DesignResolution fitting on mobile).
+    /// </summary>
+    public bool DensityFollow { get; set; } = false;
+
     /// <summary>Instant 2D logic canvas and input inverse transformation; Its commands are managed uniformly by the frame scheduler.</summary>
     public Draw2D Canvas2D { get; } = new();
 
@@ -556,13 +565,41 @@ public abstract class BaseApp : Panel
         return base.Update(time, alpha: alpha, posX: posX, posY: posY, width: width, height: height);
     }
 
+    /// <summary>
+    /// Scale of the density-independent mapping: physical pixels per logical unit, so the
+    /// logical canvas is the physical size divided by the returned value. The default follows
+    /// the platform density (one logical unit = one dp/pt/DIP); apps can override it, for
+    /// example to map the short side of the output onto a fixed logical baseline.
+    /// </summary>
+    public virtual float GetCanvasScale(int width, int height)
+    {
+        return DeviceServices.Core.DensityScale;
+    }
+
     internal void ApplyResolution(int width, int height, float compositionScaleX, float compositionScaleY)
     {
         DeviceServices.BaseApp.DeviceResolution = new Vector2(width, height);
 
         DeviceServices.BaseApp.CompositionScale = new Vector2(compositionScaleX, compositionScaleY);
 
-        if (DeviceServices.Core.Platform is Platform.Windows or Platform.Linux or Platform.MacCatalyst or Platform.Web)
+        if (DeviceServices.BaseApp.DensityFollow)
+        {
+            // Density-independent mapping: Scale = GetCanvasScale (physical pixels per logical
+            // unit, density by default) and the logical canvas is the physical size divided by
+            // it, keeping Scale * Extend == DeviceResolution as the invariant the render pipeline
+            // and input mapping rely on.
+            var scale = GetCanvasScale(width, height);
+
+            if (!float.IsFinite(scale) || scale <= 0f) scale = 1f;
+
+            scale = Math.Clamp(scale, 0.5f, 5f);
+
+            DeviceServices.BaseApp.Scale = scale;
+
+            DeviceServices.BaseApp.ExtendResolution = DeviceServices.BaseApp.BasicResolution =
+                new Vector2(width / scale, height / scale);
+        }
+        else if (DeviceServices.Core.Platform is Platform.Windows or Platform.Linux or Platform.MacCatalyst or Platform.Web)
         {
             DeviceServices.BaseApp.ExtendResolution = DeviceServices.BaseApp.BasicResolution = DeviceServices.BaseApp.DeviceResolution;
             DeviceServices.BaseApp.Scale = 1f;

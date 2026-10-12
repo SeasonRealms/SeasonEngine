@@ -13,6 +13,7 @@ using Silk.NET.Vulkan.Extensions.KHR;
 using Season.Platforms.Shared.LinuxAndroid;
 using Season.Platforms.Shared.LinuxAndroid.Vulkan;
 using Activity = Android.App.Activity;
+using Configuration = Android.Content.Res.Configuration;
 using View = Android.Views.View;
 using SurfaceFormat = Android.Graphics.Format;
 using VkDevice = Season.Platforms.Shared.LinuxAndroid.Vulkan.Device;
@@ -255,6 +256,21 @@ public static class AndroidApp
         {
             AndroidRuntime.ANativeWindow_release(_currentNativeWindow);
             _currentNativeWindow = IntPtr.Zero;
+        }
+    }
+
+    /// <summary>
+    /// Re-applies the resolution mapping after a density-only configuration change (the system
+    /// "display size" setting), which changes the density factor without changing the surface's
+    /// physical size and therefore never raises SurfaceChanged. Marking a resize makes the
+    /// render loop re-run ApplyResolution and Resize on the next frame; the SwapChain rebuild
+    /// that follows is harmless because the pixel size is unchanged.
+    /// </summary>
+    internal static void ReapplyDensityResolution()
+    {
+        if (_currentWidth > 0 && _currentHeight > 0)
+        {
+            _resized = true;
         }
     }
 
@@ -1000,6 +1016,24 @@ public class BaseActivity : Activity
         // and Vulkan bootstrap begins there.
         AndroidApp.SurfaceView = new SurfaceViewVulkan(this);
         SetContentView(AndroidApp.SurfaceView);
+    }
+
+    /// <summary>
+    /// Hosts that keep the activity alive across configuration changes (the
+    /// ConfigurationChanges contract above) receive density changes - the system "display size"
+    /// setting - without an activity rebuild. The surface's physical size is unchanged, so no
+    /// SurfaceChanged arrives; route the change through the resize path so a density-following
+    /// app picks up the new density factor.
+    /// </summary>
+    public override void OnConfigurationChanged(Configuration newConfig)
+    {
+        base.OnConfigurationChanged(newConfig);
+
+        if (ReferenceEquals(AndroidApp.MainActivity, this)
+            && DeviceServices.BaseApp is { DensityFollow: true })
+        {
+            AndroidApp.ReapplyDensityResolution();
+        }
     }
 
     protected override void OnPause()
