@@ -20,7 +20,9 @@ public static class Localization
 
     public static string Translate(string word, Words words, string lan)
     {
-        string result = word;
+        bool newLine = word.EndsWith("\r\n");
+
+        string result = newLine ? word.Substring(0, word.Length - "\r\n".Length) : word;
 
         if (words?.Lans?.Count > 0)
         {
@@ -49,7 +51,7 @@ public static class Localization
             }
         }
 
-        return result;
+        return result + (newLine ? "\r\n" : "");
     }
 }
 

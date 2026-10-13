@@ -65,6 +65,20 @@ public class Texts : Control, IRenderOrder
     bool dotLayoutVisible;
     LineCheckpoint layoutCheckpoint;
 
+    // Inputs of the last successful layout, used by Update to replay a layout request whose
+    // Changed edge was cleared by a path that could not actually run the layout (a not-ready
+    // frame in Update, or FinishLoad on the loader thread). PosX/PosY never change again once
+    // set, so without this replay a lost edge would freeze the glyph buffers on the layout
+    // computed at load time. Render thread only; written under SyncRoot.
+    bool layoutSnapshotValid;
+    float layoutSnapshotPosX;
+    float layoutSnapshotPosY;
+    int? layoutSnapshotWidthRequest;
+    int? layoutSnapshotHeightRequest;
+    Vector2 layoutSnapshotScale;
+    int layoutSnapshotLineHeight;
+    float layoutSnapshotAlpha;
+
     // Incremental append state.
     // appendDirty and ContentDirty are mutually exclusive.
     // MarkContentDirty also discards pending appended data because a full rebuild reparses
@@ -803,6 +817,38 @@ public class Texts : Control, IRenderOrder
             && layoutCheckpoint.Scale == Scale
             && layoutCheckpoint.LineHeight == LineHeight
             && layoutCheckpoint.Alpha == Alpha;
+    }
+
+    /// <summary>Whether the inputs of the last successful layout still match the current ones.
+    /// This is the durable form of "a layout is pending": unlike the single-shot Changed edge it
+    /// cannot be cleared by a path that does not run the layout, so a change that lost its edge
+    /// while not layout-ready, or lost it to FinishLoad on the loader thread, is replayed on the
+    /// next ready frame. A never-layouted control reports a mismatch, so the first ready frame
+    /// always lays out once. Render thread only.</summary>
+    bool LayoutSnapshotMatches()
+    {
+        return layoutSnapshotValid
+            && layoutSnapshotPosX == PosX
+            && layoutSnapshotPosY == PosY
+            && layoutSnapshotWidthRequest == WidthRequest
+            && layoutSnapshotHeightRequest == HeightRequest
+            && layoutSnapshotScale == Scale
+            && layoutSnapshotLineHeight == LineHeight
+            && layoutSnapshotAlpha == Alpha;
+    }
+
+    /// <summary>Records the inputs of the layout pass just completed. The caller must hold
+    /// SyncRoot so the snapshot can never be observed while Position is half-applied.</summary>
+    void RecordLayoutSnapshot()
+    {
+        layoutSnapshotValid = true;
+        layoutSnapshotPosX = PosX;
+        layoutSnapshotPosY = PosY;
+        layoutSnapshotWidthRequest = WidthRequest;
+        layoutSnapshotHeightRequest = HeightRequest;
+        layoutSnapshotScale = Scale;
+        layoutSnapshotLineHeight = LineHeight;
+        layoutSnapshotAlpha = Alpha;
     }
 
     void RunLayout(bool resume)
@@ -1568,14 +1614,21 @@ public class Texts : Control, IRenderOrder
                 // Text has not finished loading yet, so Ready is false and layout changes cannot be consumed.
                 // Changed must be cleared here. Otherwise it would stay true forever, keeping Panel.Changed true
                 // and causing pointless full-scene redraws every frame.
+                // Dropping the edge here is lossless: a pending layout change is also carried by the
+                // LayoutSnapshotMatches comparison below, which no early-out path can clear.
                 Changed = false;
             }
 
-            if (Changed && canResolveLayout)
+            // Consume on either signal. The snapshot check covers the case where the single-shot
+            // Changed edge was already cleared by a path that did not run the layout: this branch on
+            // an earlier not-ready frame, or FinishLoad on the loader thread. The comparison re-runs
+            // Position until the inputs match what was laid out.
+            if (canResolveLayout && (Changed || !LayoutSnapshotMatches()))
             {
                 lock (SyncRoot)
                 {
                     Position();
+                    RecordLayoutSnapshot();
                     Changed = false;
                 }
             }
