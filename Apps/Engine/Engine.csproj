@@ -115,6 +115,7 @@
 
 	<Target Name="IncludeLinuxFilesForLinuxTarget" BeforeTargets="BeforeCompile" Condition="'$(IsLinux)' == 'true'">
 		<ItemGroup>
+			<Compile Remove="Platforms\Linux\**\*.cs" />
 			<Compile Include="Platforms\Linux\**\*.cs" />
 		</ItemGroup>
 	</Target>
