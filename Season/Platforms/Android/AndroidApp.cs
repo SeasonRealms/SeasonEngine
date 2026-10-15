@@ -1138,6 +1138,11 @@ public class BaseActivity : Activity
 
     public override void OnRequestPermissionsResult(int requestCode, string[] permissions, [GeneratedEnum] Permission[] grantResults)
     {
+        // Route the runtime-permission prompt back to the device core that issued it: the audio
+        // capture path awaits this result to decide whether recording may start. Without this the
+        // await in AndroidDeviceCore.RequestPermissionAsync never completes.
+        (DeviceServices.Core as AndroidDeviceCore)?.OnRequestPermissionsResult(requestCode, permissions, grantResults);
+
         base.OnRequestPermissionsResult(requestCode, permissions, grantResults);
     }
 }

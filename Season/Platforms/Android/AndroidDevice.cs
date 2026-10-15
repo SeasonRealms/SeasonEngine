@@ -40,6 +40,13 @@ public enum ActivityResult
 
 internal class AndroidDeviceCore : IDeviceCore
 {
+    /// <summary>
+    /// Request code carried by the runtime-permission prompts issued in
+    /// <see cref="RequestPermissionAsync"/>. BaseActivity forwards the dialog result back through
+    /// <see cref="OnRequestPermissionsResult"/>, matched against this code.
+    /// </summary>
+    internal const int PermissionsRequestCode = 1;
+
     internal TaskCompletionSource<bool> tcsPermissions = null;
 
     public Season.Basic.Platform Platform { get; set; } = Season.Basic.Platform.Android;
@@ -288,21 +295,55 @@ internal class AndroidDeviceCore : IDeviceCore
 
     public async Task<bool> RequestPermissionAsync(string[] permissions)
     {
-        tcsPermissions = new TaskCompletionSource<bool>();
-
-        // Verify that all required Media permissions have been granted.
-
-        if (permissions.Any(permission => AndroidX.Core.Content.ContextCompat.CheckSelfPermission(AndroidApp.MainActivity, permission) != Permission.Granted))
+        // Verify that all required permissions have been granted.
+        if (permissions.All(permission => AndroidX.Core.Content.ContextCompat.CheckSelfPermission(AndroidApp.MainActivity, permission) == Permission.Granted))
         {
-            AndroidX.Core.App.ActivityCompat.RequestPermissions(AndroidApp.MainActivity, permissions, 1);
-        }
-        else
-        {
-            // Permissions have been granted. 
-            tcsPermissions.TrySetResult(true);
+            return true;
         }
 
-        return await tcsPermissions.Task;
+        // RunContinuationsAsynchronously keeps the awaiting caller (often the render thread)
+        // off the UI thread's result callback, the same contract the file/camera bridges use.
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        tcsPermissions = tcs;
+
+        // The permission dialog carries Activity affinity; RequestPermissionAsync is invoked
+        // from the render thread, so the request is posted to the UI thread. Without this the
+        // dialog never appears and the await below would never be resolved.
+        AndroidApp.MainActivity.RunOnUiThread(() =>
+        {
+            AndroidX.Core.App.ActivityCompat.RequestPermissions(AndroidApp.MainActivity, permissions, PermissionsRequestCode);
+        });
+
+        return await tcs.Task;
+    }
+
+    /// <summary>
+    /// Completion entry point for <see cref="RequestPermissionAsync"/>, called by
+    /// BaseActivity.OnRequestPermissionsResult. Resolves the pending prompt with whether every
+    /// requested permission was granted, or with false when the dialog is dismissed, so the
+    /// awaiting caller does not hang.
+    /// </summary>
+    internal void OnRequestPermissionsResult(int requestCode, string[] permissions, Permission[] grantResults)
+    {
+        if (requestCode != PermissionsRequestCode)
+        {
+            return;
+        }
+
+        var tcs = tcsPermissions;
+
+        tcsPermissions = null;
+
+        if (tcs is null)
+        {
+            return;
+        }
+
+        var granted = grantResults is { Length: > 0 }
+            && grantResults.All(result => result == Permission.Granted);
+
+        tcs.TrySetResult(granted);
     }
 
     public DeviceMemoryInfo GetMemoryInfo()

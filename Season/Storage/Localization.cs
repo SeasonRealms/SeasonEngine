@@ -34,7 +34,7 @@ public static class Localization
             }
             else
             {
-                var wordLi = words.List.FirstOrDefault(li => li.ID.ToLower() == word.ToLower());
+                var wordLi = words.List.FirstOrDefault(li => li.ID.ToLower() == result.ToLower());
 
                 if (wordLi is null)
                 {
