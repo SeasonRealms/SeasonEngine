@@ -4,6 +4,7 @@
 
 using Foundation;
 using UIKit;
+using Metal;
 using AVFoundation;
 using CoreMedia;
 using CoreGraphics;
@@ -202,6 +203,64 @@ internal class AppleDeviceCore : IDeviceCore
         }
 
         return await RequestMicrophonePermissionAsync();
+    }
+
+    /// <summary>
+    /// Total memory resources for AI model grading: physical capacity only, never the
+    /// free/available amounts, so the verdict does not drift as other apps open or close.
+    /// iOS overrides the form factor; macOS reports a desktop.
+    /// </summary>
+    public virtual DeviceMemoryInfo GetMemoryInfo()
+    {
+        var info = new DeviceMemoryInfo
+        {
+            FormFactor = DeviceFormFactor.Desktop
+        };
+
+        try
+        {
+            // Foundation's PhysicalMemory is the total unified/physical RAM, the same
+            // total (not free) figure the other platforms report.
+            var total = NSProcessInfo.ProcessInfo.PhysicalMemory;
+
+            if (total > 0)
+            {
+                info.TotalSystemMemoryMb = (int)(total / (1024 * 1024));
+            }
+        }
+        catch
+        {
+            // Leave the system-memory figure at 0 when Foundation is unavailable.
+        }
+
+        try
+        {
+            var mtlDevice = MTLDevice.SystemDefault;
+
+            if (mtlDevice is not null)
+            {
+                // Apple Silicon and iOS/iPadOS share one pool; an Intel Mac with a
+                // discrete GPU reports a separate one and a usable VRAM budget.
+                info.IsUnifiedMemory = mtlDevice.HasUnifiedMemory;
+
+                if (!mtlDevice.HasUnifiedMemory)
+                {
+                    var workingSet = (ulong)mtlDevice.RecommendedMaxWorkingSetSize;
+
+                    if (workingSet > 0)
+                    {
+                        info.TotalVideoMemoryMb = (int)(workingSet / (1024 * 1024));
+                        info.IsDedicatedGpu = true;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Metal unavailable (for example a simulator with no device); leave GPU empty.
+        }
+
+        return info;
     }
 
     /// <summary>

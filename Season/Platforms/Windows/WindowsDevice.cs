@@ -217,6 +217,46 @@ internal class WindowsDeviceCore : IDeviceCore
         DeviceServices.BaseApp?.AddLog(LogType.None, $"{DateTime.UtcNow} [Permission] microphone probe status={status} granted={granted}");
         return granted;
     }
+
+    public DeviceMemoryInfo GetMemoryInfo()
+    {
+        var info = new DeviceMemoryInfo
+        {
+            FormFactor = DeviceFormFactor.Desktop
+        };
+
+        try
+        {
+            // GlobalMemoryStatusEx reports physical totals; the free figures it also
+            // returns are intentionally ignored so the grade does not drift with
+            // whatever the user happens to have open.
+            var status = new MEMORYSTATUSEX
+            {
+                dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>()
+            };
+
+            if (WindowsNative.GlobalMemoryStatusEx(ref status))
+            {
+                info.TotalSystemMemoryMb = (int)(status.ullTotalPhys / (1024 * 1024));
+            }
+        }
+        catch
+        {
+            // Leave the system-memory figure at 0 when the query fails.
+        }
+
+        try
+        {
+            info.TotalVideoMemoryMb = DirectX.Device.GetTotalVideoMemory(out var hasDedicatedGpu);
+            info.IsDedicatedGpu = hasDedicatedGpu;
+        }
+        catch
+        {
+            // Leave the video-memory figure at 0 when DXGI is unavailable.
+        }
+
+        return info;
+    }
 }
 
 internal class WindowsMediaPlayer : IMediaPlayer

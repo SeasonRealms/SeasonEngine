@@ -126,13 +126,13 @@
 
 	<ItemGroup Condition="'$(IsAndroid)' == 'true'">
 		<!--
-		  Android 目标：剔除 AutoImport 误纳的桌面 native 库。Android SDK 的
-		  Sdk\AutoImport.props 会把项目目录下所有 **\*.so 自动导入为
-		  AndroidNativeLibrary，Platforms\Linux\runtimes\linux-*\native 的
-		  libglslang/libSDL3（只服务于 net10.0 目标的 P/Invoke）被一并吸纳，
-		  而 Android 类库构建的 AAR 打包（_CreateAar → CreateAar）会对其做
-		  ABI 判定，非 Android RID 的路径无法判定并报 XA4301。
-		  下方 Android 版 libglslang.so 的显式 Include 不受影响。
+		  Android goal: Eliminate desktop native libraries mistakenly included in AutoImport. The Android SDK
+Sdk \ AutoImporter. apps will automatically import all * * \ *. so files in the project directory as
+AndroidNativeLibrary, Platforms \ Linux \ runtimes \ Linux - * \ native
+Libglslang/libSDL3 (only serving P/Invoke for net10.0 targets) has been absorbed together,
+And the AAR packaging built by the Android library (_Create Aar → Create Aar) will handle it
+ABI determination, non Android RID paths cannot be determined and XA4301 is reported.
+The explicit Include of libglslang.so for Android below is not affected.
 		-->
 		<AndroidNativeLibrary Remove="Platforms\Linux\runtimes\linux-*\native\*.so" />
 		<AndroidNativeLibrary Include="Platforms\Android\libs\arm64-v8a\libglslang.so" />
@@ -171,8 +171,15 @@
 		</ItemGroup>
 	</Target>
 
-	<Target Name="IncludeLinuxFilesForLinuxTarget" BeforeTargets="BeforeCompile" Condition="'$(IsLinux)' == 'true'">
+	<Target Name="IncludeLinuxFilesForLinuxTarget" AfterTargets="_MauiRemovePlatformCompileItems" Condition="'$(IsLinux)' == 'true'">
 		<ItemGroup>
+			<!-- Hanging after _ AuiRemovePlatformCompileItems instead of BeforeTargets=BeforeCompile:
+The cleaning target of MAUI 1.0.110 is executed only after the BeforeCompile hook in the project, and it will be executed before that
+The newly added Platforms \ * * file has been cleared again (due to the lack of Season. Platforms. Shared in Android).
+Hang it until the target is cleared and re add it to keep it safe; Net10.0/net10.0 browser does not load MAUI, clean up
+If the target is not executed, this target will be empty, and the file set will be provided by the default configuration+Exclude hook,
+Also, there will be no more Compile items (NETSDK1022) that are duplicated with the general configuration.-->
+			<Compile Remove="Platforms\Linux\**\*.cs" />
 			<Compile Include="Platforms\Linux\**\*.cs" />
 		</ItemGroup>
 	</Target>
@@ -207,14 +214,18 @@
 		</ItemGroup>
 	</Target>
 
-	<Target Name="IncludeSharedAppleFiles" BeforeTargets="BeforeCompile" Condition="'$(IsApple)' == 'true'">
+	<Target Name="IncludeSharedAppleFiles" AfterTargets="_MauiRemovePlatformCompileItems" Condition="'$(IsApple)' == 'true'">
 		<ItemGroup>
+			<!-- Include LinuxFilesForLinuxTarget: Hang it after cleaning the target in MAUI and re add it to prevent it from being cleared again; Remove ensures idempotency. -->
+			<Compile Remove="Platforms\Shared\Apple\**\*.cs" />
 			<Compile Include="Platforms\Shared\Apple\**\*.cs" />
 		</ItemGroup>
 	</Target>
 
-	<Target Name="IncludeSharedUnixFiles" BeforeTargets="BeforeCompile" Condition="'$(IsUnixLike)' == 'true'">
+	<Target Name="IncludeSharedUnixFiles" AfterTargets="_MauiRemovePlatformCompileItems" Condition="'$(IsUnixLike)' == 'true'">
 		<ItemGroup>
+			<!-- Include LinuxFilesForLinuxTarget: Hang it after cleaning the target in MAUI and re add it to prevent it from being cleared again; Remove ensures idempotency. -->
+			<Compile Remove="Platforms\Shared\LinuxAndroid\**\*.cs" />
 			<Compile Include="Platforms\Shared\LinuxAndroid\**\*.cs" />
 		</ItemGroup>
 	</Target>
@@ -229,8 +240,10 @@
 		</ItemGroup>
 	</Target>
 
-	<Target Name="IncludeWebFilesForBrowserTarget" BeforeTargets="BeforeCompile" Condition="'$(IsBrowser)' == 'true' or '$(TargetFramework)' == 'net10.0'">
+	<Target Name="IncludeWebFilesForBrowserTarget" AfterTargets="_MauiRemovePlatformCompileItems" Condition="'$(IsBrowser)' == 'true' or '$(TargetFramework)' == 'net10.0'">
 		<ItemGroup>
+			<!-- Include LinuxFilesForLinuxTarget: Hang it after cleaning the target in MAUI and re add it to prevent it from being cleared again; Remove ensures idempotency. -->
+			<Compile Remove="Platforms\Web\**\*.cs" />
 			<Compile Include="Platforms\Web\**\*.cs" />
 		</ItemGroup>
 	</Target>

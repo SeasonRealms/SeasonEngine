@@ -485,6 +485,66 @@ internal unsafe static class Device
         FindQueueFamilies(picked);
     }
 
+    /// <summary>
+    /// Total device-local GPU memory (MB), taken from the discrete GPU when one is
+    /// present and otherwise from the best remaining adapter, plus whether a discrete
+    /// GPU exists. Used by the AI feature to grade whether a model can run here.
+    /// Never throws; reports 0/false when Vulkan is unavailable.
+    /// </summary>
+    internal static int GetGpuMemoryInfo(out bool hasDedicatedGpu)
+    {
+        hasDedicatedGpu = false;
+        ulong bestDiscrete = 0;
+        ulong bestOther = 0;
+
+        try
+        {
+            uint count = 0;
+
+            if (Vk.EnumeratePhysicalDevices(Instance, ref count, null) != Result.Success || count == 0)
+            {
+                return 0;
+            }
+
+            var devices = new PhysicalDevice[count];
+            fixed (PhysicalDevice* p = devices)
+                Vk.EnumeratePhysicalDevices(Instance, ref count, p);
+
+            for (int i = 0; i < count; i++)
+            {
+                Vk.GetPhysicalDeviceProperties(devices[i], out var props);
+                Vk.GetPhysicalDeviceMemoryProperties(devices[i], out var memProps);
+
+                ulong deviceLocal = 0;
+
+                for (uint h = 0; h < memProps.MemoryHeapCount; h++)
+                {
+                    if ((memProps.MemoryHeaps[(int)h].Flags & MemoryHeapFlags.DeviceLocalBit) != 0)
+                    {
+                        deviceLocal += memProps.MemoryHeaps[(int)h].Size;
+                    }
+                }
+
+                if (props.DeviceType == PhysicalDeviceType.DiscreteGpu)
+                {
+                    hasDedicatedGpu = true;
+                    if (deviceLocal > bestDiscrete) bestDiscrete = deviceLocal;
+                }
+                else if (deviceLocal > bestOther)
+                {
+                    bestOther = deviceLocal;
+                }
+            }
+        }
+        catch
+        {
+            // A diagnostic probe must never break the caller.
+        }
+
+        var best = hasDedicatedGpu ? bestDiscrete : bestOther;
+        return (int)(best / (1024 * 1024));
+    }
+
     static bool IsDeviceSuitable(PhysicalDevice device)
     {
         // The swapchain extension must be supported.

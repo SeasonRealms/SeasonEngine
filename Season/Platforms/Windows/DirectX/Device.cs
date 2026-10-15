@@ -379,6 +379,78 @@ internal unsafe static class Device
         return adapter;
     }
 
+    /// <summary>Adapters reporting at least this much dedicated video memory are
+    /// treated as discrete GPUs. Integrated GPUs normally advertise only the shared
+    /// aperture (about 128 MB), so this separates them cleanly even on APUs.</summary>
+    const ulong MinDiscreteVramBytes = 1024UL * 1024 * 1024;
+
+    /// <summary>
+    /// Largest dedicated video memory across the machine's hardware adapters, in MB,
+    /// plus whether a discrete GPU is present. Used by the AI feature to grade whether
+    /// a model can run here. Never throws; reports 0/false when DXGI is unavailable.
+    /// </summary>
+    internal static int GetTotalVideoMemory(out bool hasDedicatedGpu)
+    {
+        hasDedicatedGpu = false;
+        ulong largestVram = 0;
+
+        IDXGIFactory1* factory = null;
+
+        try
+        {
+            var iid = IDXGIFactory1.Guid;
+            var result = Dxgi.CreateDXGIFactory1(&iid, (void**)&factory);
+
+            if (!HResult.IndicatesSuccess(result) || factory == null)
+            {
+                return 0;
+            }
+
+            for (var adapterIndex = 0u; ; ++adapterIndex)
+            {
+                IDXGIAdapter1* adapter = null;
+
+                if (!HResult.IndicatesSuccess(factory->EnumAdapters1(adapterIndex, &adapter)))
+                {
+                    break;
+                }
+
+                AdapterDesc1 desc;
+                _ = adapter->GetDesc1(&desc);
+
+                var vram = (ulong)desc.DedicatedVideoMemory;
+
+                if ((desc.Flags & (uint)AdapterFlag.Software) == 0)
+                {
+                    if (vram > largestVram)
+                    {
+                        largestVram = vram;
+                    }
+
+                    if (vram >= MinDiscreteVramBytes)
+                    {
+                        hasDedicatedGpu = true;
+                    }
+                }
+
+                adapter->Release();
+            }
+        }
+        catch
+        {
+            // A diagnostic probe must never break the caller.
+        }
+        finally
+        {
+            if (factory != null)
+            {
+                factory->Release();
+            }
+        }
+
+        return (int)(largestVram / (1024 * 1024));
+    }
+
     static bool TryEnableDebugLayer(bool debug)
     {
 #if DEBUG

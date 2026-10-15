@@ -81,8 +81,15 @@
 	  <Folder Include="Panels\" />
 	</ItemGroup>
 
-	<Target Name="IncludeLinuxFilesForLinuxTarget" BeforeTargets="BeforeCompile" Condition="'$(IsLinux)' == 'true'">
+	<!-- 
+The platform source must be added after _MauiRemovePlatformCompileItems: Cleanup target for MAUI 10.0.110
+  Execute hooks after the BeforeTargets=BeforeCompile phase, including those re-added during BeforeCompile
+  All files in the Platforms\** directory will be cleared again (this applies to all TFM in the current project, whether using Maui or SingleProject),
+  ```net10.0 will report CS5001 due to clearing. Remove + Include ensures exactly one, and does not match the default wildcard.```
+  Duplicate (NETSDK1022). -->
+	<Target Name="IncludeLinuxFilesForLinuxTarget" AfterTargets="_MauiRemovePlatformCompileItems" Condition="'$(IsLinux)' == 'true'">
 		<ItemGroup>
+			<Compile Remove="Platforms\Linux\**\*.cs" />
 			<Compile Include="Platforms\Linux\**\*.cs" />
 		</ItemGroup>
 	</Target>

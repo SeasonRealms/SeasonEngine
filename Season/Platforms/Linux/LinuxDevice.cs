@@ -1,4 +1,4 @@
-﻿// Copyright (c) SeasonEngine and contributors.
+// Copyright (c) SeasonEngine and contributors.
 // Licensed under the MIT License.
 // https://github.com/SeasonRealms/SeasonEngine
 
@@ -110,6 +110,52 @@ internal class LinuxDeviceCore : IDeviceCore
     public async Task<bool> RequestPermissionAsync(string[] permissions)
     {
         return await Task.FromResult(true);
+    }
+
+    public DeviceMemoryInfo GetMemoryInfo()
+    {
+        var info = new DeviceMemoryInfo
+        {
+            FormFactor = DeviceFormFactor.Desktop
+        };
+
+        try
+        {
+            // /proc/meminfo MemTotal is physical RAM in kB; the MemAvailable line is
+            // deliberately ignored so the grade does not drift with current load.
+            foreach (var line in File.ReadLines("/proc/meminfo"))
+            {
+                if (!line.StartsWith("MemTotal:", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+                if (parts.Length >= 2 && long.TryParse(parts[1], out var kb))
+                {
+                    info.TotalSystemMemoryMb = (int)(kb / 1024);
+                }
+
+                break;
+            }
+        }
+        catch
+        {
+            // Leave the system-memory figure at 0 when /proc is unavailable.
+        }
+
+        try
+        {
+            info.TotalVideoMemoryMb = Season.Platforms.Shared.LinuxAndroid.Vulkan.Device.GetGpuMemoryInfo(out var hasDedicatedGpu);
+            info.IsDedicatedGpu = hasDedicatedGpu;
+        }
+        catch
+        {
+            // Leave the video-memory figure at 0 when Vulkan is unavailable.
+        }
+
+        return info;
     }
 }
 

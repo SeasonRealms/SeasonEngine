@@ -65,6 +65,23 @@ internal static class WindowsNative
 
     [DllImport("winmm.dll", EntryPoint = "PlaySound")]
     internal static extern int PlaySound(string lpxzName, int hModul, int dwFlags);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+}
+
+[StructLayout(LayoutKind.Sequential)]
+struct MEMORYSTATUSEX
+{
+    public uint dwLength;
+    public uint dwMemoryLoad;
+    public ulong ullTotalPhys;
+    public ulong ullAvailPhys;
+    public ulong ullTotalPageFile;
+    public ulong ullAvailPageFile;
+    public ulong ullTotalVirtual;
+    public ulong ullAvailVirtual;
+    public ulong ullAvailExtendedVirtual;
 }
 
 [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]

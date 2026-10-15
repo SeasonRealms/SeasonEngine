@@ -304,6 +304,54 @@ internal class AndroidDeviceCore : IDeviceCore
 
         return await tcsPermissions.Task;
     }
+
+    public DeviceMemoryInfo GetMemoryInfo()
+    {
+        var info = new DeviceMemoryInfo
+        {
+            // Android SoCs share one physical pool between the CPU and GPU.
+            IsUnifiedMemory = true
+        };
+
+        try
+        {
+            var configuration = Application.Context.Resources?.Configuration;
+
+            if (configuration is not null)
+            {
+                // 600dp is Android's own tablet threshold (the sw600dp resource qualifier).
+                info.FormFactor = configuration.SmallestScreenWidthDp >= 600
+                    ? DeviceFormFactor.Tablet
+                    : DeviceFormFactor.Phone;
+            }
+        }
+        catch
+        {
+            // Leave the form factor Unknown when the configuration is unavailable.
+        }
+
+        try
+        {
+            if (AndroidApp.MainActivity?.GetSystemService(Context.ActivityService) is ActivityManager activityManager)
+            {
+                var memoryInfo = new ActivityManager.MemoryInfo();
+                activityManager.GetMemoryInfo(memoryInfo);
+
+                // TotalMem is physical RAM; AvailMem is deliberately ignored so the grade
+                // does not drift with whatever else the device currently has running.
+                if (memoryInfo.TotalMem > 0)
+                {
+                    info.TotalSystemMemoryMb = (int)(memoryInfo.TotalMem / (1024 * 1024));
+                }
+            }
+        }
+        catch
+        {
+            // Leave the system-memory figure at 0 when ActivityManager is unavailable.
+        }
+
+        return info;
+    }
 }
 
 internal class AndroidMediaPlayer : IMediaPlayer

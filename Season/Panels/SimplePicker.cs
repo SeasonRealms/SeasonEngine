@@ -8,6 +8,8 @@ public class SimplePicker : Panel
 {
     public int LineHeight { get; set; } = 80;
 
+    public string Tips { get; set; }
+
     public string Desc { get; set; }
 
     float Time { get; set; }
@@ -34,7 +36,7 @@ public class SimplePicker : Panel
 
     List<Texts> sourcesTitles, sourcesDescs;
 
-    Texts desc;
+    Texts tips, desc;
 
     public SimplePicker(List<EData> sources, List<EData> results)
     {
@@ -57,6 +59,13 @@ public class SimplePicker : Panel
             Color = new Season.Basic.Color(200, 200, 200, 255)
         };
         AddControl(ground);
+
+        tips = new Texts()
+        {
+            Color = Season.Basic.Colors.LightBlack,
+            Scale = Vector2.One * 0.85f
+        };
+        AddControl(tips);
 
         descBorder = new Shape()
         {
@@ -85,7 +94,7 @@ public class SimplePicker : Panel
         desc = new Texts()
         {
             Color = Season.Basic.Colors.LightBlack,
-            Scale = Vector2.One
+            Scale = Vector2.One * 0.85f
         };
         AddControl(desc);
 
@@ -206,12 +215,16 @@ public class SimplePicker : Panel
 
         if (posX + Width > DeviceServices.BaseApp.ExtendResolution.X)
         {
-            posX = (int)DeviceServices.BaseApp.ExtendResolution.X - (int)Width;
+            posX = (int)DeviceServices.BaseApp.ExtendResolution.X - (int)Width - 10;
         }
 
         border.Update(time, alpha: 1f, posX: posX, posY: posY, width: Width, height: Height);
 
         ground.Update(time, alpha: 1f, posX: posX + 2, posY: posY + 2, width: Width - 4, height: Height - 4);
+
+        tips.Content = Tips;
+        tips.WidthRequest = (int)Width - 30;
+        tips.Update(time, alpha: 1f, posX: posX + 15, posY: posY + Height - tips.Height - 20);
 
         if (Desc.IsNullOrWhiteSpace())
         {
@@ -222,11 +235,11 @@ public class SimplePicker : Panel
             descBorder.Alpha = descGround.Alpha = desc.Alpha = 1f;
         }
 
-        descBorder.Update(time, posX: border.PosX + border.Width + 15, posY: posY, width: 500, height: desc.Height + 85);
+        descBorder.Update(time, posX: border.PosX, posY: posY + border.Height + 15, width: border.Width, height: desc.Height + 40);
         descGround.Update(time, posX: descBorder.PosX + 2, posY: posY + 2, width: 500 - 4, height: descBorder.Height - 4);
         desc.Content = Desc;
-        desc.WidthRequest = (int)descBorder.Width - 40;
-        desc.Update(time, posX: descBorder.PosX + 25, posY: descBorder.PosY + 20);
+        desc.WidthRequest = (int)Width - 30;
+        desc.Update(time, posX: posX + 15, posY: descBorder.PosY + 10);
 
         movePanel.Alpha = Alpha;
         movePanel.PosX = (int)ground.PosX;

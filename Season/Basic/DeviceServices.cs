@@ -124,6 +124,15 @@ public interface IDeviceCore
 
     bool IsDarkMode();
 
+    /// <summary>
+    /// Reports the device's total (never free/available) memory resources so the AI
+    /// feature can grade whether a model can run here. Physical capacity is used on
+    /// purpose: free amounts swing with whatever else the user has open or after a
+    /// reboot, which would make the same model appear runnable today and un-runnable
+    /// tomorrow. Implementations must never throw; unavailable fields stay at 0.
+    /// </summary>
+    DeviceMemoryInfo GetMemoryInfo() => default;
+
     Task<bool> RequestPermissionAsync(string[] permissions);
 }
 
@@ -657,4 +666,42 @@ public enum Orientation
     PortraitUpsideDown,
     LandscapeLeft,
     LandscapeRight
+}
+
+/// <summary>
+/// Coarse physical form factor, used to pick the model recommendation ladder
+/// (a phone budget is far below a desktop budget) rather than a precise device model.
+/// </summary>
+public enum DeviceFormFactor
+{
+    Unknown,
+    Desktop,
+    Tablet,
+    Phone
+}
+
+/// <summary>
+/// Total device memory resources, used to grade whether a model can run.
+/// Every figure is a physical total in megabytes; free/available amounts are
+/// deliberately excluded so the verdict does not drift as other apps open or close.
+/// </summary>
+public struct DeviceMemoryInfo
+{
+    /// <summary>Total physical system memory (RAM) in MB. 0 when unknown.</summary>
+    public int TotalSystemMemoryMb;
+
+    /// <summary>Total dedicated GPU video memory in MB. 0 when the GPU shares system memory or none is present.</summary>
+    public int TotalVideoMemoryMb;
+
+    /// <summary>True when the CPU and GPU share one physical memory pool (Apple Silicon, iPad/iPhone, Android SoC).</summary>
+    public bool IsUnifiedMemory;
+
+    /// <summary>True when a discrete GPU with its own video memory is present.</summary>
+    public bool IsDedicatedGpu;
+
+    /// <summary>Physical form factor, which selects how the recommendation is phrased.</summary>
+    public DeviceFormFactor FormFactor;
+
+    /// <summary>True when the platform could not report any memory figure.</summary>
+    public bool IsKnown => TotalSystemMemoryMb > 0 || TotalVideoMemoryMb > 0;
 }

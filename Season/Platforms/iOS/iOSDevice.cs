@@ -36,6 +36,22 @@ internal class iOSDeviceCore : AppleDeviceCore
 
         return bundleFile;
     }
+
+    public override DeviceMemoryInfo GetMemoryInfo()
+    {
+        var info = base.GetMemoryInfo();
+
+        // iOS/iPadOS always share one memory pool between CPU and GPU.
+        info.IsUnifiedMemory = true;
+
+        // iPad Pro and other large iPads carry far more memory and cooling headroom than
+        // a phone, so the recommendation ladder must tell them apart.
+        info.FormFactor = UIDevice.CurrentDevice.UserInterfaceIdiom == UIUserInterfaceIdiom.Pad
+            ? DeviceFormFactor.Tablet
+            : DeviceFormFactor.Phone;
+
+        return info;
+    }
 }
 /*
 internal class iOSAds : IAds
