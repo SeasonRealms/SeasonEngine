@@ -72,8 +72,10 @@ internal readonly struct AtlasUploadRect
     }
 }
 
-// Generic shared glyph-atlas manager.
+// Only indicates that the optional preheating budget has been exhausted; True atlas or GPU errors must continue to propagate.
+internal sealed class GlyphPrewarmBudgetException : Exception { }
 
+// Generic shared glyph-atlas manager.
 /// <summary>
 /// Platform-independent glyph atlas manager.
 /// Responsible for MTSDF glyph rasterization, shelf packing, and dirty-rectangle tracking and merging.
@@ -94,6 +96,10 @@ internal sealed class GlyphAtlasManager<TTexture> : IDisposable
     readonly List<GlyphAtlasManager<TTexture>> _stablePages = new();
     // Stable pages are cached by font identity and do not overwrite UVs already referenced by frames; explicit failure occurs when budget is reached.
     const int MaxStablePages = 16;
+    const long MaxStableBytes = 512L * 1024 * 1024;
+    const long MaxPrewarmBytes = 64L * 1024 * 1024;
+    long StablePageBytes => checked((long)_atlasWidth * _atlasHeight * 8);
+    internal long EstimatedStableBytes { get { lock (_stableSync) return _stablePages.Count * StablePageBytes; } }
     readonly Dictionary<GlyphAtlasKey, GlyphAtlasEntry> _entries = new();
     readonly byte[] _pixels;
     readonly int _atlasWidth;
@@ -335,7 +341,7 @@ internal sealed class GlyphAtlasManager<TTexture> : IDisposable
     /// Explicit font stable paging entry, reusing the same packer and upload path. The single-page version semantics for regular Texts remain unchanged.
     /// When a page is full, it expands rather than resetting the atlas, ensuring that glyphs recorded in a frame are not overwritten by subsequent glyphs.
     /// </summary>
-    internal bool TryEnsureStableGlyph(Font font, int size, int codePoint, out GlyphAtlasEntry entry, out TTexture texture)
+    internal bool TryEnsureStableGlyph(Font font, int size, int codePoint, out GlyphAtlasEntry entry, out TTexture texture, bool prewarm = false)
     {
         lock (_stableSync)
         {
@@ -361,8 +367,11 @@ internal sealed class GlyphAtlasManager<TTexture> : IDisposable
             }
             if (full)
             {
-                if (_stablePages.Count >= MaxStablePages)
-                    throw new InvalidOperationException("The real-time glyph atlas has reached the stable page budget.");
+                long nextBytes = (_stablePages.Count + 1L) * StablePageBytes;
+                if (prewarm && (nextBytes > MaxPrewarmBytes || _stablePages.Count >= MaxStablePages - 2))
+                    throw new GlyphPrewarmBudgetException();
+                if (_stablePages.Count >= MaxStablePages || nextBytes > MaxStableBytes)
+                    throw new InvalidOperationException($"The capacity of the glyph atlas is exhausted:{_stablePages.Count} Page, CPU/GPU estimation {EstimatedStableBytes / 1024 / 1024} MiB");
                 var page = new GlyphAtlasManager<TTexture>(_atlasWidth, _atlasHeight, _createAtlasTexture,
                     _uploadFullPixels, _uploadSubRects, _getCurrentFrameIndex, _padding);
                 _stablePages.Add(page);
@@ -459,7 +468,7 @@ internal sealed class GlyphAtlasManager<TTexture> : IDisposable
 
         string codePointLabel = MsdfDiagnostics.DescribeCodePoint(codePoint);
         // Png save temporarily removed (SharpMSDF Png dependency removed).
-        DeviceServices.BaseApp.AddLog(LogType.Texts, $"{DateTime.UtcNow} MsdfGlyphDump codePoint={codePointLabel}, fontSize={fontSize}, atlasSize={_atlasWidth}x{_atlasHeight}, entries={_entries.Count}, version={_version}");
+        DeviceServices.BaseApp?.AddLog(LogType.Texts, $"{DateTime.UtcNow} MsdfGlyphDump codePoint={codePointLabel}, fontSize={fontSize}, atlasSize={_atlasWidth}x{_atlasHeight}, entries={_entries.Count}, version={_version}");
     }
 
     // Private methods: dirty-rectangle merging.

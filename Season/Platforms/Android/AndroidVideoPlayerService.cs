@@ -17,13 +17,14 @@ namespace Season.Platforms.Android;
 /// It has no GLES or EGL dependency and does not conflict with the Vulkan rendering pipeline.
 /// Frames are paced on the container presentation timeline so consumers that measure frame
 /// arrival spacing (the notice screen drives its reverse bounce from it) see native playback timing.
+/// The MediaExtractor/MediaCodec are created, configured and released entirely on the decode
+/// thread: MediaCodec.CreateDecoderByType/Configure/Start are synchronous and used to stall the
+/// calling (UI) thread for the length of the codec instantiation.
 /// </summary>
 internal sealed class AndroidVideoPlayerService : IVideoPlayerService
 {
     MediaPlayer? _player;
     string? _filePath;
-    MediaCodec? _codec;
-    MediaExtractor? _extractor;
     Thread? _decodeThread;
     volatile bool _isPlaying, _disposed;
     int _width, _height;
@@ -41,7 +42,8 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
         Stop();
         try
         {
-            // Audio: MediaPlayer.
+            // Audio: MediaPlayer. Stays on the calling thread - PrepareAsync completes on the
+            // platform's own callback thread, so it does not block this one.
             _player = new MediaPlayer();
             _player.SetDataSource(filePath);
             _player.Prepared += (s, e) => _player.Start();
@@ -55,16 +57,57 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
                     $"[AVideo] MediaPlayer error: {e.What}");
             _player.PrepareAsync();
 
-            // Video: MediaCodec.
-            _extractor = new MediaExtractor();
-            _extractor.SetDataSource(filePath);
+            // Video: the extractor and codec are built on the decode thread. The path is
+            // captured by the closure so a late Stop cannot redirect this run to the next
+            // playback's file.
+            _isPlaying = true;
+            _decodeThread = new Thread(() => DecodeLoop(filePath))
+            {
+                Name = "SeasonVidAndroid",
+                IsBackground = true
+            };
+            _decodeThread.Start();
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[AVideo] Play error: {ex.Message}");
+            Stop();
+        }
+    }
+
+    void DecodeLoop(string filePath)
+    {
+        var bufInfo = new MediaCodec.BufferInfo();
+
+        // Pacing state: the first output's presentation time and wall clock, so every later
+        // frame can wait until its in-timeline moment instead of being pushed as soon as decoded.
+        long firstPtsUs = -1;
+        long firstTick = 0;
+
+        // EOS drain state: once the input side ends, keep dequeuing so the frames still
+        // buffered in the decoder drain out instead of being discarded at release.
+        bool inputDone = false;
+        long inputDoneAt = 0;
+
+        // Owned by this thread and never released elsewhere: Stop only signals and joins, so a
+        // release can never land underneath a live DequeueOutputBuffer/GetOutputImage call.
+        MediaExtractor? extractor = null;
+        MediaCodec? codec = null;
+        bool started = false;
+        try
+        {
+            // Decoder setup. Runs here so MediaCodec.CreateDecoderByType/Configure/Start do not
+            // block the calling thread.
+            extractor = new MediaExtractor();
+            extractor.SetDataSource(filePath);
 
             int videoTrack = -1;
             string? mime = null;
             MediaFormat? trackFormat = null;
-            for (int i = 0; i < _extractor.TrackCount; i++)
+            for (int i = 0; i < extractor.TrackCount; i++)
             {
-                var fmt = _extractor.GetTrackFormat(i);
+                var fmt = extractor.GetTrackFormat(i);
                 var m = fmt?.GetString(MediaFormat.KeyMime);
                 if (m?.StartsWith("video/", StringComparison.Ordinal) == true)
                 {
@@ -79,85 +122,58 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
             if (videoTrack < 0 || mime == null || trackFormat == null)
                 throw new InvalidOperationException("No video track found.");
 
-            _extractor.SelectTrack(videoTrack);
-            _codec = MediaCodec.CreateDecoderByType(mime);
+            extractor.SelectTrack(videoTrack);
+            codec = MediaCodec.CreateDecoderByType(mime);
 
             // Configure must receive the extractor's track format: MediaCodec's JNI layer
             // hard-asserts (CHECK in android_media_MediaCodec.cpp) on a "mime" entry, and
             // the track format also carries width/height plus the codec-specific data
             // (csd-0/csd-1 SPS/PPS). A fresh empty MediaFormat aborts the whole process -
             // that is a native assertion, not a catchable Java exception.
-            _codec.Configure(trackFormat, null, null,
+            codec.Configure(trackFormat, null, null,
                 MediaCodecConfigFlags.None);
-            _codec.Start();
+            codec.Start();
 
-            // Background decode thread.
-            _isPlaying = true;
-            _decodeThread = new Thread(DecodeLoop)
-            {
-                Name = "SeasonVidAndroid",
-                IsBackground = true
-            };
-            _decodeThread.Start();
+            started = true;
 
             System.Diagnostics.Debug.WriteLine(
                 $"[AVideo] Started: {_width}x{_height}");
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine(
-                $"[AVideo] Play error: {ex.Message}");
-            Stop();
-        }
-    }
 
-    void DecodeLoop()
-    {
-        var bufInfo = new MediaCodec.BufferInfo();
+            var decoder = codec!;
+            var source = extractor!;
 
-        // Pacing state: the first output's presentation time and wall clock, so every later
-        // frame can wait until its in-timeline moment instead of being pushed as soon as decoded.
-        long firstPtsUs = -1;
-        long firstTick = 0;
-
-        // EOS drain state: once the input side ends, keep dequeuing so the frames still
-        // buffered in the decoder drain out instead of being discarded at release.
-        bool inputDone = false;
-        long inputDoneAt = 0;
-        try
-        {
-            while (_isPlaying && !_disposed && _codec != null && _extractor != null)
+            while (_isPlaying && !_disposed)
             {
                 // Input: feed encoded data into the decoder.
                 if (!inputDone)
                 {
-                    int inIdx = _codec.DequeueInputBuffer(10_000);
+                    int inIdx = decoder.DequeueInputBuffer(10_000);
                     if (inIdx >= 0)
                     {
-                        var inputBuf = _codec.GetInputBuffer(inIdx);
-                        int sampleSize = _extractor.ReadSampleData(inputBuf!, 0);
+                        var inputBuf = decoder.GetInputBuffer(inIdx);
+                        int sampleSize = source.ReadSampleData(inputBuf!, 0);
                         if (sampleSize < 0)
                         {
-                            _codec.QueueInputBuffer(inIdx, 0, 0, 0,
+                            decoder.QueueInputBuffer(inIdx, 0, 0, 0,
                                 MediaCodecBufferFlags.EndOfStream);
                             inputDone = true;
                             inputDoneAt = Environment.TickCount64;
                         }
                         else
                         {
-                            _codec.QueueInputBuffer(inIdx, 0, sampleSize,
-                                _extractor.SampleTime,
+                            decoder.QueueInputBuffer(inIdx, 0, sampleSize,
+                                source.SampleTime,
                                 MediaCodecBufferFlags.None);
-                            _extractor.Advance();
+                            source.Advance();
                         }
                     }
                 }
 
                 // Output: obtain decoded frames through the Image API using direct shared-memory reads.
-                int outIdx = _codec.DequeueOutputBuffer(bufInfo, 10_000);
+                int outIdx = decoder.DequeueOutputBuffer(bufInfo, 10_000);
                 if (outIdx >= 0)
                 {
-                    var image = _codec.GetOutputImage(outIdx);
+                    var image = decoder.GetOutputImage(outIdx);
                     if (image != null)
                     {
                         try
@@ -221,7 +237,7 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
                             image.Close();
                         }
                     }
-                    _codec.ReleaseOutputBuffer(outIdx, false);
+                    decoder.ReleaseOutputBuffer(outIdx, false);
                 }
                 else if (outIdx == (int)MediaCodecInfoState.OutputBuffersChanged ||
                          outIdx == (int)MediaCodecInfoState.OutputFormatChanged)
@@ -238,12 +254,23 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine(
-                $"[AVideo] Decode error: {ex.Message}");
+                $"[AVideo] {(started ? "Decode" : "Play")} error: {ex.Message}");
         }
         finally
         {
             _isPlaying = false;
-            PlaybackEnded?.Invoke();
+
+            // Release on this thread: it is the only one that ever touches these objects, so no
+            // release can race a live DequeueOutputBuffer/GetOutputImage call.
+            try { codec?.Stop(); } catch { }
+            codec?.Release();
+            codec?.Dispose();
+            extractor?.Release();
+            extractor?.Dispose();
+
+            // Only a run that reached decoding reports its end; a setup failure is already
+            // logged above and must not request a reversal.
+            if (started) PlaybackEnded?.Invoke();
         }
     }
 
@@ -345,12 +372,12 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
     {
         _isPlaying = false;
 
-        // The decode thread keeps calling into the native codec until its loop condition
-        // sees _isPlaying: releasing MediaCodec/MediaExtractor underneath a live
-        // DequeueOutputBuffer/GetOutputImage call is a use-after-free (observed as SIGSEGV
-        // in the SeasonVidAndroid thread when playback was stopped mid-run). Join it first -
-        // the dequeue timeouts and sliced pacing waits keep this bounded. Skipped when Stop
-        // re-enters from the decode thread itself (PlaybackEnded loops).
+        // The decode thread owns the extractor/codec and releases them in its own finally
+        // block. Releasing them here would race a live DequeueOutputBuffer/GetOutputImage
+        // call on that thread - a use-after-free observed as SIGSEGV in the SeasonVidAndroid
+        // thread when playback was stopped mid-run. Join it first - the dequeue timeouts and
+        // sliced pacing waits keep this bounded. Skipped when Stop re-enters from the decode
+        // thread itself (PlaybackEnded loops).
         var thread = _decodeThread;
         if (thread != null && thread != Thread.CurrentThread)
         {
@@ -358,17 +385,11 @@ internal sealed class AndroidVideoPlayerService : IVideoPlayerService
         }
         _decodeThread = null;
 
+        // Audio: owned by the calling thread.
         try { _player?.Stop(); } catch { }
         _player?.Release();
         _player?.Dispose();
         _player = null;
-        try { _codec?.Stop(); } catch { }
-        _codec?.Release();
-        _codec?.Dispose();
-        _codec = null;
-        _extractor?.Release();
-        _extractor?.Dispose();
-        _extractor = null;
     }
 
     public void Dispose()

@@ -29,6 +29,7 @@ public interface IImmediate2DBackend : IDisposable
     /// platform glyph atlas. Called on the frame thread (loading screens). Returns the number of glyphs
     /// added; 0 means no pack is registered for the font or pre-warming is already complete.
     /// </summary>
+    /// <remarks>The budget version is charged based on the number of attempted characters (including missing and cache hits), not new additions; 0 indicates no need to continue, including termination of capacity budget.</remarks>
     int PrewarmGlyphs(FontFace font, int maxCount);
     void Prepare(Draw2D frame);
     void Submit(Draw2D frame);

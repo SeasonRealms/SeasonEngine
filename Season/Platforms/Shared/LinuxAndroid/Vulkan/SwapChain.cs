@@ -188,7 +188,7 @@ internal unsafe sealed class SwapChain : IDisposable
     public Result AcquireNextImage(Silk.NET.Vulkan.Semaphore imageAvailable, out uint index)
     {
         index = 0;
-        var r = KhrSwapchain.AcquireNextImage(_device, Native, ulong.MaxValue, imageAvailable, default, ref index);
+        var r = KhrSwapchain.AcquireNextImage(_device, Native, 10_000_000_000, imageAvailable, default, ref index);
         CurrentImageIndex = index;
         return r;
     }

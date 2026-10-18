@@ -121,6 +121,10 @@ internal class AndroidStoreService : IStoreService
                         }
                         else if (purchase.PurchaseState is PurchaseState.Purchased)
                         {
+                            // Best effort: an unacknowledged purchase is still owned, so grant it
+                            // now and retry the acknowledgement on the next query.
+                            await AcknowledgeAsync(purchase);
+
                             product.InCollection = true;
                         }
                     }
@@ -139,7 +143,11 @@ internal class AndroidStoreService : IStoreService
 
         message = await ConnectAsync();
 
-        if (message is null)
+        if (message is null && productDetails is null)
+        {
+            message = "Product not loaded.";
+        }
+        else if (message is null)
         {
             var productDetailsParamsList = BillingFlowParams.ProductDetailsParams.NewBuilder().SetProductDetails(productDetails).Build();
 
@@ -183,9 +191,24 @@ internal class AndroidStoreService : IStoreService
 
                         message = purchaseProduct.InCollection ? product : "Not purchased";
                     }
+                    else if (purchase.Products?.FirstOrDefault() != product)
+                    {
+                        message = "Not purchased";
+                    }
+                    else if (purchase.PurchaseState is PurchaseState.Pending)
+                    {
+                        // Deferred payment methods settle later; ownership starts once the
+                        // purchase becomes Purchased and the premium page queries it.
+                        message = "Purchase pending";
+                    }
+                    else if (purchase.PurchaseState is not PurchaseState.Purchased)
+                    {
+                        message = "Purchase unspecified";
+                    }
                     else
                     {
-                        message = purchase.Products?.FirstOrDefault() == product ? product : "Not purchased";
+                        // Play refunds any purchase that is not acknowledged within three days.
+                        message = await AcknowledgeAsync(purchase) ?? product;
                     }
                 }
             }
@@ -196,6 +219,34 @@ internal class AndroidStoreService : IStoreService
         return message;
     }
 
+    /// <summary>
+    /// Acknowledges a completed purchase. Play refunds purchases that stay unacknowledged for
+    /// three days, and the ownership query treats every Purchased entry as owned, so this is
+    /// called both right after the purchase settles and whenever an owned product is queried.
+    /// Returns null once acknowledged, otherwise the diagnostic to surface.
+    /// </summary>
+    async Task<string> AcknowledgeAsync(Purchase purchase)
+    {
+        if (purchase.IsAcknowledged) return null;
+
+        try
+        {
+            var acknowledgeParams = AcknowledgePurchaseParams.NewBuilder()
+                .SetPurchaseToken(purchase.PurchaseToken)
+                .Build();
+
+            var result = await billingClient.AcknowledgePurchaseAsync(acknowledgeParams);
+
+            return result is null || result.ResponseCode is BillingResponseCode.Ok
+                ? null
+                : $"{result.ResponseCode}:{result.DebugMessage}";
+        }
+        catch (Exception ex)
+        {
+            return ex.Message;
+        }
+    }
+
     async Task<string> ConnectAsync(bool enablePendingPurchases = true, CancellationToken cancellationToken = default)
     {
         tcsPurchase?.TrySetCanceled();
@@ -203,6 +254,11 @@ internal class AndroidStoreService : IStoreService
 
         tcsConnect?.TrySetCanceled();
         tcsConnect = new TaskCompletionSource<string>();
+
+        // Each entry point builds a fresh client, so the previous service connection must be
+        // released instead of accumulating one per premium-page visit.
+        billingClient?.EndConnection();
+        billingClient = null;
 
         var builder = BillingClient.NewBuilder(Application.Context).EnablePendingPurchases(PendingPurchasesParams.NewBuilder().EnableOneTimeProducts().Build());
 

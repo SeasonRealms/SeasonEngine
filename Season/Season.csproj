@@ -61,14 +61,14 @@
 
 	<ItemGroup>
 		<PackageReference Include="SeasonMSDF" Version="0.2.0" />
-		<PackageReference Include="SharpGLTF.Core" Version="1.0.6" />
-		<PackageReference Include="SharpGLTF.Toolkit" Version="1.0.6" />
+		<PackageReference Include="SharpGLTF.Core" Version="1.0.7" />
+		<PackageReference Include="SharpGLTF.Toolkit" Version="1.0.7" />
 
 		<None Include="README.md" Pack="true" PackagePath="\" />
 	</ItemGroup>
 
 	<ItemGroup Condition="'$(IsWindows)' == 'true' or '$(IsIOS)' == 'true'">		
-		<PackageReference Include="Xamarin.Build.Download" Version="0.11.4" />
+		<PackageReference Include="Xamarin.Build.Download" Version="0.11.6" />
 	</ItemGroup>
 
 	<ItemGroup Condition="'$(IsWindows)' == 'true'">
@@ -76,7 +76,7 @@
 			<Link>runtimes\%(RecursiveDir)%(Filename)%(Extension)</Link>
 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 		</Content>
-		<PackageReference Include="System.Drawing.Common" Version="10.0.9" />
+		<PackageReference Include="System.Drawing.Common" Version="10.0.13" />
 		<PackageReference Include="Silk.NET.Direct3D12" Version="2.23.0" />
 		<PackageReference Include="Silk.NET.Direct3D.Compilers" Version="2.23.0" />
 	</ItemGroup>
@@ -84,7 +84,7 @@
 	<ItemGroup Condition="'$(IsLinux)' == 'true'">
 		<PackageReference Include="GtkSharp" Version="3.24.24.117-develop" />
 		<PackageReference Include="NLayer" Version="3.0.0" />
-		<PackageReference Include="System.Drawing.Common" Version="10.0.9" />
+		<PackageReference Include="System.Drawing.Common" Version="10.0.13" />
 		<!-- Linux native assets (libSDL3.so, libglslang.so).
 		     Both are deployed to runtimes/linux-<arch>/native/ (canonical
 		     NuGet-style layout). At runtime LinuxNativeLibraryResolver
@@ -107,7 +107,7 @@
 	</ItemGroup>
 
 	<ItemGroup Condition="'$(TargetFramework)' == 'net10.0' or '$(TargetFramework)' == 'net10.0-browser'">
-		<PackageReference Include="Microsoft.JSInterop" Version="10.0.9" />
+		<PackageReference Include="Microsoft.JSInterop" Version="10.0.13" />
 	</ItemGroup>
 
 	<ItemGroup Condition="'$(IsBrowser)' == 'true' or '$(TargetFramework)' == 'net10.0'">
@@ -121,7 +121,7 @@
 	</ItemGroup>
 
 	<ItemGroup Condition="'$(IsBrowser)' != 'true'">
-		<PackageReference Include="System.Runtime.Caching" Version="10.0.9" />
+		<PackageReference Include="System.Runtime.Caching" Version="10.0.13" />
 	</ItemGroup>	
 
 	<ItemGroup Condition="'$(IsAndroid)' == 'true'">

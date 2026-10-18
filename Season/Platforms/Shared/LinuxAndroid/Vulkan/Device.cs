@@ -1100,7 +1100,7 @@ internal unsafe static class Device
                 return false;
             }
             if (acquireResult != Result.Success && acquireResult != Result.SuboptimalKhr)
-                throw new Exception($"vkAcquireNextImageKHR failed after resize: {acquireResult}");
+                throw new VulkanCallException("vkAcquireNextImageKHR / resize", acquireResult);
         }
         else if (acquireResult == Result.ErrorSurfaceLostKhr)
         {
@@ -1111,6 +1111,9 @@ internal unsafe static class Device
             // it; the result change itself is already logged above.
             return false;
         }
+
+        if (acquireResult != Result.Success && acquireResult != Result.SuboptimalKhr)
+            throw new VulkanCallException("vkAcquireNextImageKHR", acquireResult);
 
         frame.SetRenderTarget(SwapChain.Images[imageIndex], SwapChain.ImageViews[imageIndex], Display.Framebuffers[imageIndex]);
 
@@ -1721,8 +1724,7 @@ internal unsafe static class Device
                 PSignalSemaphores = signalSems
             };
 
-            if (Vk.QueueSubmit(GraphicsQueue, 1, in submit, default) != Result.Success)
-                throw new Exception("vkQueueSubmit (graphics) failed");
+            GraphicsCommandQueue.CheckSubmit(Vk.QueueSubmit(GraphicsQueue, 1, in submit, default));
         }
         else
         {
@@ -1744,8 +1746,7 @@ internal unsafe static class Device
             };
 
             var submitFence = GraphicsCommandQueue.PrepareSubmit(signalTimeline);
-            if (Vk.QueueSubmit(GraphicsQueue, 1, in submit, submitFence) != Result.Success)
-                throw new Exception("vkQueueSubmit (graphics) failed");
+            GraphicsCommandQueue.CheckSubmit(Vk.QueueSubmit(GraphicsQueue, 1, in submit, submitFence));
         }
 
         _fenceValues[FrameIndex] = signalTimeline;
@@ -1770,6 +1771,9 @@ internal unsafe static class Device
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [VK] Present OutOfDate -> HandleResize {_backbufferWidth}x{_backbufferHeight}");
             HandleResize(_backbufferWidth, _backbufferHeight);
         }
+
+        else if (presentResult != Result.Success && presentResult != Result.SuboptimalKhr)
+            throw new VulkanCallException("vkQueuePresentKHR", presentResult);
 
         FrameIndex = (FrameIndex + 1) % frameCount;
 
@@ -2041,6 +2045,14 @@ internal unsafe static class Device
     internal static void CheckResult(Result result)
     {
         if (result != Result.Success)
-            throw new Exception($"Vulkan call failed: {result}");
+            throw new VulkanCallException("Vulkan", result);
     }
+}
+
+// Retain the original return code, and the platform layer distinguishes between surface failures and unrecoverable device/synchronization errors based on this.
+internal sealed class VulkanCallException : Exception
+{
+    internal Result Result { get; }
+    internal VulkanCallException(string operation, Result result)
+        : base($"{operation}: {result} ({(int)result})") => Result = result;
 }

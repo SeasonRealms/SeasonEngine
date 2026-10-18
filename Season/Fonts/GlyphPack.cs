@@ -402,23 +402,27 @@ internal static class GlyphPrewarm
             return 0;
 
         cursors.TryGetValue(font.FileKey, out int cursor);
-        int done = 0;
-        while (done < maxCount && cursor < codePoints.Length)
+        int attempted = 0;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        while (attempted < maxCount && cursor < codePoints.Length && clock.Elapsed.TotalMilliseconds < 4)
         {
             int codePoint = codePoints[cursor++];
+            attempted++;
             try
             {
-                if (atlas.TryEnsureStableGlyph(font, rasterSize, codePoint, out _, out _))
-                    done++;
+                atlas.TryEnsureStableGlyph(font, rasterSize, codePoint, out _, out _, prewarm: true);
             }
-            catch (InvalidOperationException)
+            catch (GlyphPrewarmBudgetException)
             {
                 // Stable-page budget exhausted: stop pre-warming, remaining glyphs use the lazy path.
+                DeviceServices.BaseApp?.AddLog(LogType.Backend,
+                    $"Font preheating reaches capacity budget:{font.FileKey}，{cursor}/{codePoints.Length}, estimate {atlas.EstimatedStableBytes / 1024 / 1024} MiB; Reserve on-demand drawing capacity");
                 cursor = codePoints.Length;
                 break;
             }
         }
         cursors[font.FileKey] = cursor;
-        return done;
+        // Return the number of attempts, missing glyph also consumes budget and cannot scan the entire package in one call.
+        return attempted;
     }
 }

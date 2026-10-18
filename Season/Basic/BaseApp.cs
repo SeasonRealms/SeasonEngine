@@ -108,7 +108,10 @@ public abstract class BaseApp : Panel
         }
     }
 
-    public static LogType LogTypes = LogType.None | LogType.Error | LogType.Backend;
+    // TEMP: LogType.Texts is enabled only to surface the MSDF glyph-pack registration line
+    // (GlyphPack.cs) in the device log while the pre-baked packs are being verified; remove it
+    // once that is confirmed.
+    public static LogType LogTypes = LogType.None | LogType.Error | LogType.Backend; // | LogType.Texts;
 
     public string Status { get; set; }
 

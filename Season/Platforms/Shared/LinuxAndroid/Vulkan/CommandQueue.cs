@@ -49,6 +49,24 @@ internal unsafe sealed class CommandQueue : IDisposable
 
     /// <summary>Highest completion value observed so far. Advances monotonically as pending entries retire.</summary>
     ulong _completed;
+    Exception? _failure;
+    const ulong WaitTimeoutNanoseconds = 10_000_000_000;
+
+    // After a failed submission, the fence that has not been submitted will not be considered completed, nor will it wait for it or reclaim associated resources.
+    internal void CheckSubmit(Result result) => CheckQueueResult(result, "vkQueueSubmit");
+
+    void CheckQueueResult(Result result, string operation)
+    {
+        if (result == Result.Success) return;
+        var error = new VulkanCallException(operation, result);
+        Interlocked.CompareExchange(ref _failure, error, null);
+        throw error;
+    }
+
+    void ThrowIfFailed()
+    {
+        if (Volatile.Read(ref _failure) is { } error) throw error;
+    }
 
     public CommandQueue(Vk vk, Silk.NET.Vulkan.Device device, Silk.NET.Vulkan.Queue queue, uint family)
     {
@@ -87,6 +105,7 @@ internal unsafe sealed class CommandQueue : IDisposable
     /// </summary>
     public Fence PrepareSubmit(ulong value)
     {
+        ThrowIfFailed();
         if (TimelineMode)
             return default;
 
@@ -120,6 +139,7 @@ internal unsafe sealed class CommandQueue : IDisposable
     /// </summary>
     public void Signal(ulong value)
     {
+        ThrowIfFailed();
         if (TimelineMode)
         {
             var sem = _semaphore;
@@ -138,15 +158,13 @@ internal unsafe sealed class CommandQueue : IDisposable
                 PSignalSemaphores = &sem
             };
 
-            if (_vk.QueueSubmit(NativeQueue, 1, in submit, default) != Result.Success)
-                throw new Exception("vkQueueSubmit (signal) failed");
+            CheckSubmit(_vk.QueueSubmit(NativeQueue, 1, in submit, default));
             return;
         }
 
         var emptySubmit = new SubmitInfo { SType = StructureType.SubmitInfo };
         var fence = PrepareSubmit(value);
-        if (_vk.QueueSubmit(NativeQueue, 1, in emptySubmit, fence) != Result.Success)
-            throw new Exception("vkQueueSubmit (signal) failed");
+        CheckSubmit(_vk.QueueSubmit(NativeQueue, 1, in emptySubmit, fence));
     }
 
     /// <summary>
@@ -159,6 +177,8 @@ internal unsafe sealed class CommandQueue : IDisposable
     /// </summary>
     public void WaitForFence(ulong value)
     {
+        ThrowIfFailed();
+        if (value == 0) return;
         if (TimelineMode)
         {
             var sem = _semaphore;
@@ -169,7 +189,7 @@ internal unsafe sealed class CommandQueue : IDisposable
                 PSemaphores = &sem,
                 PValues = &value
             };
-            _vk.WaitSemaphores(_device, in waitInfo, ulong.MaxValue);
+            CheckQueueResult(_vk.WaitSemaphores(_device, in waitInfo, WaitTimeoutNanoseconds), "vkWaitSemaphores");
             return;
         }
 
@@ -178,11 +198,13 @@ internal unsafe sealed class CommandQueue : IDisposable
             while (true)
             {
                 DrainCompletedLocked();
-                if (_completed >= value || _pending.Count == 0)
-                    return;
+                ThrowIfFailed();
+                if (_completed >= value) return;
+                if (_pending.Count == 0)
+                    throw new InvalidOperationException($"Waiting for Unsubmitted Vulkan Fences:{value}");
 
                 var target = _pending[0].Fence;
-                _vk.WaitForFences(_device, 1, &target, Vk.True, ulong.MaxValue);
+                CheckQueueResult(_vk.WaitForFences(_device, 1, &target, Vk.True, WaitTimeoutNanoseconds), "vkWaitForFences");
             }
         }
     }
@@ -190,9 +212,10 @@ internal unsafe sealed class CommandQueue : IDisposable
     /// <summary>Read the queue's current GPU progress value, equivalent to ID3D12Fence::GetCompletedValue.</summary>
     public ulong GetCompletedValue()
     {
+        ThrowIfFailed();
         if (TimelineMode)
         {
-            _vk.GetSemaphoreCounterValue(_device, _semaphore, out ulong v);
+            CheckQueueResult(_vk.GetSemaphoreCounterValue(_device, _semaphore, out ulong v), "vkGetSemaphoreCounterValue");
             return v;
         }
 
@@ -213,8 +236,9 @@ internal unsafe sealed class CommandQueue : IDisposable
         while (_pending.Count > 0)
         {
             var head = _pending[0];
-            if (_vk.GetFenceStatus(_device, head.Fence) != Result.Success)
-                break;
+            var result = _vk.GetFenceStatus(_device, head.Fence);
+            if (result == Result.NotReady) break;
+            CheckQueueResult(result, "vkGetFenceStatus");
 
             if (head.Value > _completed)
                 _completed = head.Value;
@@ -223,7 +247,11 @@ internal unsafe sealed class CommandQueue : IDisposable
         }
     }
 
-    public void WaitIdle() => _vk.QueueWaitIdle(NativeQueue);
+    public void WaitIdle()
+    {
+        ThrowIfFailed();
+        CheckQueueResult(_vk.QueueWaitIdle(NativeQueue), "vkQueueWaitIdle");
+    }
 
     public void Dispose()
     {

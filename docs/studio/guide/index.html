@@ -315,10 +315,11 @@
 
                         <h3>What the app does over the network</h3>
                         <p class="se-muted">
-                            One thing: downloading a model file you explicitly asked for. That is the entire list.
-                            Import your models from disk instead and the app has no reason to open a connection at
-                            all — you can verify this by running it offline, which is a perfectly normal way to use
-                            it.
+                            Downloading a model file you explicitly asked for, asking the store which purchases you
+                            own, and — only when you press <strong>Report</strong> — opening the report page in your
+                            browser. That is the entire list. Import your models from disk instead and the app has no
+                            reason to open a connection of its own at all — you can verify this by running it
+                            offline, which is a perfectly normal way to use it.
                         </p>
 
                         <h3>What is stored, and where</h3>
@@ -329,9 +330,17 @@
 
                         <h3>Store purchases</h3>
                         <p class="se-muted">
-                            The Premium unlock is handled entirely by the Microsoft Store or the Mac App Store, which
-                            means we never see a payment detail. Restoring a purchase on a new machine goes through
-                            the same store mechanism.
+                            The Premium unlock is handled entirely by the Microsoft Store, the Mac App Store or
+                            Google Play, which means we never see a payment detail. Restoring a purchase on a new
+                            device goes through the same store mechanism: the app asks the store what it owns.
+                        </p>
+
+                        <h3>Reporting content</h3>
+                        <p class="se-muted">
+                            Results carry a <strong>Report</strong> button. It opens this site's report page with the
+                            record placed after the <code>#</code> in the address, a part browsers never send to a
+                            server; that page has no analytics and no third-party scripts. Nothing reaches us until
+                            you send the email or open the GitHub issue yourself, and a GitHub issue is public.
                         </p>
                     </section>
 
@@ -459,6 +468,7 @@
                     <ul>
                         <li><a href="../../index.html">SeasonEngine</a></li>
                         <li><a href="https://github.com/SeasonRealms/SeasonEngine">GitHub</a></li>
+                        <li><a href="../report/">Report content</a></li>
                         <li><a href="#privacy">Privacy</a></li>
                     </ul>
                 </div>

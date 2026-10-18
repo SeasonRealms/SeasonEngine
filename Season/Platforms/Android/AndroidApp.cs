@@ -62,6 +62,7 @@ public static class AndroidApp
 
     /// <summary>Bounded automatic recovery attempts after a failed frame; every surface event resets it.</summary>
     static int _recoveryAttempts;
+    static int _fatalRenderError;
 
     const int MaxRenderRecoveryAttempts = 3;
 
@@ -137,7 +138,7 @@ public static class AndroidApp
     /// </summary>
     static void OnSurfaceAvailable(IntPtr nativeWindow, int width, int height)
     {
-        if (width <= 0 || height <= 0) return;
+        if (width <= 0 || height <= 0 || Volatile.Read(ref _fatalRenderError) != 0) return;
 
         _currentNativeWindow = nativeWindow;
 
@@ -312,12 +313,14 @@ public static class AndroidApp
     /// </summary>
     static void WakeRenderLoop()
     {
-        if (_paused || Volatile.Read(ref _closed) != 0 || _loopExit) return;
+        if (_paused || !_surfaceAlive || Volatile.Read(ref _closed) != 0 ||
+            Volatile.Read(ref _fatalRenderError) != 0 || _loopExit || _running) return;
 
         // A failed frame can leave acquire/present semaphores in an unknown state; rebuild them
         // before any frame runs again. The loop is parked or absent at this point, so the GPU wait
         // inside has no concurrent render-thread user.
-        EnsureFrameStateClean();
+        // Restoring GPU state must be executed on the original rendering thread; The UI thread only confirms parking and issues a wake-up call.
+        ParkRenderLoop();
 
         var thread = _renderThread;
         if (thread == null || !thread.IsAlive)
@@ -331,6 +334,7 @@ public static class AndroidApp
             thread.Start();
         }
 
+        _loopParked.Reset();
         _running = true;
         _loopRun.Set();
     }
@@ -344,17 +348,20 @@ public static class AndroidApp
     static void EnsureFrameStateClean()
     {
         if (Volatile.Read(ref _frameStateDirty) == 0) return;
+        // Images that have been acquired but not presented must also be returned; Rebuilding only the semaphore is not enough to restore.
+        BaseApp.ResizeSemaphore.Wait();
         try
         {
-            VkDevice.RecreateFrameSemaphores();
-            Volatile.Write(ref _frameStateDirty, 0);
-            Diag("[Android] Frame synchronization semaphores rebuilt after a failed frame");
+            VkDevice.ReleaseSurfaceAndSwapChain();
+            VkDevice.RecreateSurfaceAndSwapChain(_currentNativeWindow,
+                handle => CreateAndroidSurface(handle, _currentNativeWindow), _currentWidth, _currentHeight);
         }
-        catch (Exception error)
-        {
-            // Keep the flag set: the next attempt retries this path.
-            Diag($"[Android] Rebuilding frame synchronization semaphores failed: {error.GetType().Name}: {error.Message}");
-        }
+        finally { BaseApp.ResizeSemaphore.Release(); }
+        DeviceServices.BaseApp.ApplyResolution(_currentWidth, _currentHeight, 1f, 1f);
+        DeviceServices.BaseApp.Resize();
+        _resized = false;
+        Volatile.Write(ref _frameStateDirty, 0);
+        Diag("[Android] Reconstructed exchange chain and frame synchronization status");
     }
 
     internal static void Pause()
@@ -375,6 +382,7 @@ public static class AndroidApp
 
     internal static void Resume()
     {
+        if (Volatile.Read(ref _fatalRenderError) != 0) return;
         // Re-arm the input gate when coming back to the foreground.
         // On first launch OnResume precedes SurfaceChanged, so the gate is already active before frame 1.
         DeviceServices.BaseApp.IsActive = true;
@@ -741,7 +749,7 @@ public static class AndroidApp
     /// </summary>
     static void Diag(string message)
     {
-        System.Diagnostics.Debug.WriteLine(message);
+        global::Android.Util.Log.Info("Season", message);
 
         DeviceServices.BaseApp?.AddLog(LogType.Backend, $"{System.DateTime.UtcNow} {message}");
     }
@@ -786,6 +794,9 @@ public static class AndroidApp
             {
             try
             {
+                bool recovering = Volatile.Read(ref _frameStateDirty) != 0;
+                EnsureFrameStateClean();
+                if (recovering) previousSeconds = stopWatch.Elapsed.TotalSeconds;
                 double newSeconds = stopWatch.Elapsed.TotalSeconds;
                 float elapsed = (float)(newSeconds - previousSeconds);
                 previousSeconds = newSeconds;
@@ -911,9 +922,10 @@ public static class AndroidApp
             }
             catch (Exception ex)
             {
-                HandleFrameFailure(ex, frameCounter);
                 // Park at the next boundary; recovery or the next surface event wakes the loop.
                 _running = false;
+                _loopRun.Reset();
+                HandleFrameFailure(ex, frameCounter);
             }
             }
         }
@@ -949,6 +961,13 @@ public static class AndroidApp
 
         if (Volatile.Read(ref _closed) != 0) return;
 
+        if (ex is VulkanCallException vkError &&
+            vkError.Result != VkResult.ErrorOutOfDateKhr && vkError.Result != VkResult.ErrorSurfaceLostKhr)
+        {
+            Interlocked.CompareExchange(ref _fatalRenderError, 1, 0);
+            MainActivity?.RunOnUiThread(() => ShowFatalRenderError(ex));
+            return;
+        }
         if (_paused || !_surfaceAlive)
         {
             // Backgrounded or between surfaces: stay parked for the next surface event, which
@@ -964,18 +983,50 @@ public static class AndroidApp
     /// <summary>UI-thread recovery after a failed frame: repair the frame synchronization objects, then wake the parked loop to retry.</summary>
     static void OnRenderRecovery(Exception error)
     {
-        if (Volatile.Read(ref _closed) != 0 || _paused || !_surfaceAlive) return;
+        if (Volatile.Read(ref _closed) != 0 || Volatile.Read(ref _fatalRenderError) != 0) return;
+        if (error is VulkanCallException vkError &&
+            vkError.Result != VkResult.ErrorOutOfDateKhr && vkError.Result != VkResult.ErrorSurfaceLostKhr)
+        {
+            ShowFatalRenderError(error);
+            return;
+        }
+        if (_paused || !_surfaceAlive) return;
 
         if (_recoveryAttempts >= MaxRenderRecoveryAttempts)
         {
-            Diag($"[Android] Render recovery budget exhausted ({_recoveryAttempts} attempts); staying parked until the next surface event");
+            ShowFatalRenderError(error);
             return;
         }
         _recoveryAttempts++;
 
         Diag($"[Android] Render recovery attempt {_recoveryAttempts}/{MaxRenderRecoveryAttempts} after {error.GetType().Name}: {error.Message}");
-        EnsureFrameStateClean();
         WakeRenderLoop();
+    }
+
+    // The fallback interface on the UI thread does not go through the game font collection and Vulkan, and screenshots can still be taken even if the device is lost.
+    static void ShowFatalRenderError(Exception error)
+    {
+        // 1 indicates that a stop has been requested, 2 indicates that the UI has taken over; After the request is issued, the lifecycle callback cannot wake up the rendering again.
+        if (Interlocked.Exchange(ref _fatalRenderError, 2) == 2) return;
+        ParkRenderLoop();
+        DeviceServices.BaseApp.IsActive = false;
+        try { DeviceServices.Media?.Pause(); } catch { }
+        global::Android.Util.Log.Error("Season", error.ToString());
+        if (MainActivity == null || MainActivity.IsFinishing) return;
+        var text = new global::Android.Widget.TextView(MainActivity)
+        {
+            Text = $"Serious error: The screen has stopped. Please take a screenshot and restart the application. Do not clear application data.\r\n{DateTime.Now:yyyy-MM-dd HH:mm:ss}\n{error}",
+            TextSize = 16,
+            Gravity = GravityFlags.Top | GravityFlags.Left
+        };
+        text.SetTextColor(global::Android.Graphics.Color.Red);
+        text.SetBackgroundColor(global::Android.Graphics.Color.Black);
+        text.SetPadding(16, 16, 16, 16);
+        var panel = new global::Android.Widget.ScrollView(MainActivity);
+        panel.SetBackgroundColor(global::Android.Graphics.Color.Black);
+        panel.AddView(text);
+        MainActivity.AddContentView(panel, new ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.MatchParent));
     }
 }
 

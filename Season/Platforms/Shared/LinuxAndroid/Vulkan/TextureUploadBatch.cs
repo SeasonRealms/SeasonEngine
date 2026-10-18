@@ -29,6 +29,7 @@ internal unsafe class TextureUploadBatch : IDisposable
     readonly Silk.NET.Vulkan.Device _device;
 
     CommandPool _pool;
+    bool _incompleteSubmission;
     internal CommandPool Pool => _pool;
 
     public TextureUploadBatch(Vk vk, Silk.NET.Vulkan.Device device, uint transferQueueFamily)
@@ -170,8 +171,7 @@ internal unsafe class TextureUploadBatch : IDisposable
                     PSignalSemaphores = &signalSem
                 };
 
-                if (_vk.QueueSubmit(transferCq.NativeQueue, 1, in submit, default) != Result.Success)
-                    throw new Exception("vkQueueSubmit (texture upload) failed");
+                transferCq.CheckSubmit(_vk.QueueSubmit(transferCq.NativeQueue, 1, in submit, default));
             }
             else
             {
@@ -183,8 +183,7 @@ internal unsafe class TextureUploadBatch : IDisposable
                 };
 
                 var submitFence = transferCq.PrepareSubmit(signalValue);
-                if (_vk.QueueSubmit(transferCq.NativeQueue, 1, in submit, submitFence) != Result.Success)
-                    throw new Exception("vkQueueSubmit (texture upload) failed");
+                transferCq.CheckSubmit(_vk.QueueSubmit(transferCq.NativeQueue, 1, in submit, submitFence));
             }
 
             submitted = true;
@@ -211,9 +210,13 @@ internal unsafe class TextureUploadBatch : IDisposable
         finally
         {
             // Do not swallow upload failures or free staging storage still consumed by the transfer queue.
-            if (submitted) _vk.QueueWaitIdle(Device.TransferCommandQueue.NativeQueue);
-            if (cmd.Handle != 0) _vk.FreeCommandBuffers(_device, _pool, 1, in cmd);
-            Device.ResourceManager.DestroyBuffer(staging);
+            // Keep resources in transit when waiting for failure; Cannot wait indefinitely or consider timeout as completion in the final stage.
+            if (!submitted)
+            {
+                if (cmd.Handle != 0) _vk.FreeCommandBuffers(_device, _pool, 1, in cmd);
+                Device.ResourceManager.DestroyBuffer(staging);
+            }
+            else _incompleteSubmission = true;
             _tasks.Clear();
         }
     }
@@ -265,7 +268,7 @@ internal unsafe class TextureUploadBatch : IDisposable
 
     public void Dispose()
     {
-        if (_pool.Handle != 0) { _vk.DestroyCommandPool(_device, _pool, null); _pool = default; }
+        if (!_incompleteSubmission && _pool.Handle != 0) { _vk.DestroyCommandPool(_device, _pool, null); _pool = default; }
         _tasks.Clear();
     }
 }

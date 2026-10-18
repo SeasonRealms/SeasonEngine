@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<TargetFramework>net10.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<LangVersion>preview</LangVersion>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<RootNamespace>SanguoSeason.Tools.SeasonGlyphBake</RootNamespace>
+		<AssemblyName>SeasonGlyphBake</AssemblyName>
+		<InvariantGlobalization>true</InvariantGlobalization>
+		<!-- The engine Font.cs is compiled directly from the source code link: the baked output is byte level homologous to the runtime CreateMsdfGlyph. -->
+		<NoWarn>$(NoWarn);CS1591</NoWarn>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<!-- It must be consistent with the version referenced by SeasonEngine runtime (the rendering pipeline may vary between different versions). -->
+		<PackageReference Include="SeasonMSDF" Version="0.2.0" />
+		<!--<PackageReference Include="System.Text.Encoding.CodePages" Version="10.0.9" />-->
+	</ItemGroup>
+
+	<ItemGroup>
+		<!-- The engine source code is linked directly for compilation: the baked output is byte-level homologous to the runtime CreateMsdfGlyph. -->
+		<Compile Include="..\Season\Fonts\Font.cs" Link="Engine\Font.cs" />
+		<!-- Run time package parser same origin link: During the verify phase, use the same code as the game to read back and verify. -->
+		<Compile Include="..\Season\Fonts\GlyphPack.cs" Link="Engine\GlyphPack.cs" />
+	</ItemGroup>
+
+</Project>

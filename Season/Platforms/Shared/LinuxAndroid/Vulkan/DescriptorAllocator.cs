@@ -2,13 +2,16 @@
 // Licensed under the MIT License.
 // https://github.com/SeasonRealms/SeasonEngine
 
+using System.Collections.Concurrent;
 using Silk.NET.Vulkan;
 
 namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 
 /// <summary>
 /// Vulkan descriptor allocator aligned with the combined role of DX12 DescriptorAllocator and DescriptorHeapManager:
-/// one large VkDescriptorPool dynamically allocates and frees VkDescriptorSet objects by DescriptorSetLayout.
+/// large VkDescriptorPool objects dynamically allocate and free VkDescriptorSet objects by DescriptorSetLayout.
+/// When the current pool is exhausted, an additional pool of the same capacity is created transparently
+/// (up to <see cref="MaxPools"/> pools), so a single saturated pool no longer fails the whole allocation.
 ///
 /// Capacity, default 2048, reserves UBO and CombinedImageSampler descriptors proportionally:
 ///   - per set: 4 UBOs, matrix, light, material, and bone, plus 1 storage buffer for instanced bones
@@ -23,9 +26,24 @@ internal unsafe sealed class DescriptorAllocator : IDisposable
 
     readonly Silk.NET.Vulkan.Device _device;
 
+    /// <summary>Pools in creation order; the last one is used first for new allocations.</summary>
+    readonly List<DescriptorPool> _pools = new();
+
+    /// <summary>Remembers which pool a set was allocated from, which vkFreeDescriptorSets requires.</summary>
+    readonly ConcurrentDictionary<ulong, DescriptorPool> _setPools = new();
+
+    readonly object _poolLock = new();
+
+    /// <summary>Upper bound on pools per allocator, so an unbounded leak cannot exhaust device memory silently.</summary>
+    const int MaxPools = 8;
+
     public int Capacity { get; }
 
-    public DescriptorPool Pool { get; private set; }
+    /// <summary>Primary pool. Kept for compatibility; allocation may use additional overflow pools.</summary>
+    public DescriptorPool Pool
+    {
+        get { lock (_poolLock) return _pools[0]; }
+    }
 
     /// <summary>Number of UBOs per set, aligned with PipelineLayout and including binding 11 for TextDrawParams.</summary>
     public const uint UniformsPerSet = 5;
@@ -61,6 +79,11 @@ internal unsafe sealed class DescriptorAllocator : IDisposable
         _device = device;
         Capacity = capacity;
 
+        _pools.Add(CreatePool(capacity));
+    }
+
+    DescriptorPool CreatePool(int capacity)
+    {
         var poolSizes = stackalloc DescriptorPoolSize[4]
         {
             new DescriptorPoolSize
@@ -94,41 +117,76 @@ internal unsafe sealed class DescriptorAllocator : IDisposable
             PPoolSizes = poolSizes
         };
 
-        if (vk.CreateDescriptorPool(device, in info, null, out var pool) != Result.Success)
+        if (_vk.CreateDescriptorPool(_device, in info, null, out var pool) != Result.Success)
             throw new Exception("vkCreateDescriptorPool failed");
-        Pool = pool;
+        return pool;
     }
 
     /// <summary>Allocate one VkDescriptorSet from the pool using the specified layout. Equivalent to DX DescriptorAllocator.Allocate.</summary>
     public DescriptorSet AllocateSet(DescriptorSetLayout layout)
     {
         var setLayout = layout;
-        var allocInfo = new DescriptorSetAllocateInfo
-        {
-            SType = StructureType.DescriptorSetAllocateInfo,
-            DescriptorPool = Pool,
-            DescriptorSetCount = 1,
-            PSetLayouts = &setLayout
-        };
 
-        if (_vk.AllocateDescriptorSets(_device, in allocInfo, out var set) != Result.Success)
-            throw new Exception("vkAllocateDescriptorSets failed (pool may be exhausted)");
-        return set;
+        while (true)
+        {
+            DescriptorPool pool;
+            lock (_poolLock)
+                pool = _pools[^1];
+
+            var allocInfo = new DescriptorSetAllocateInfo
+            {
+                SType = StructureType.DescriptorSetAllocateInfo,
+                DescriptorPool = pool,
+                DescriptorSetCount = 1,
+                PSetLayouts = &setLayout
+            };
+
+            var result = _vk.AllocateDescriptorSets(_device, in allocInfo, out var set);
+            if (result == Result.Success)
+            {
+                _setPools[set.Handle] = pool;
+                return set;
+            }
+
+            // Pool exhausted or fragmented: grow by one pool and retry.
+            if (result is Result.ErrorOutOfPoolMemory or Result.ErrorFragmentedPool)
+            {
+                lock (_poolLock)
+                {
+                    if (_pools[^1].Handle == pool.Handle)
+                    {
+                        if (_pools.Count >= MaxPools)
+                            throw new Exception("vkAllocateDescriptorSets failed (pool exhausted and max pool count reached)");
+                        _pools.Add(CreatePool(Capacity));
+                    }
+                }
+                continue;
+            }
+
+            throw new Exception($"vkAllocateDescriptorSets failed: {result}");
+        }
     }
 
-    /// <summary>Return a set to the pool. Equivalent to DX DescriptorAllocator.Free.</summary>
+    /// <summary>Return a set to the pool it was allocated from. Equivalent to DX DescriptorAllocator.Free.</summary>
     public void FreeSet(DescriptorSet set)
     {
         if (set.Handle == 0) return;
-        _vk.FreeDescriptorSets(_device, Pool, 1, in set);
+
+        var pool = _setPools.TryRemove(set.Handle, out var owner) ? owner : Pool;
+        _vk.FreeDescriptorSets(_device, pool, 1, in set);
     }
 
     public void Dispose()
     {
-        if (Pool.Handle != 0)
+        lock (_poolLock)
         {
-            _vk.DestroyDescriptorPool(_device, Pool, null);
-            Pool = default;
+            foreach (var pool in _pools)
+            {
+                if (pool.Handle != 0)
+                    _vk.DestroyDescriptorPool(_device, pool, null);
+            }
+            _pools.Clear();
         }
+        _setPools.Clear();
     }
 }

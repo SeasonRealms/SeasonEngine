@@ -171,11 +171,13 @@ internal unsafe partial class Graphics : IGraphics
         };
         Unsafe.Write(_mappedTextMaterial, textMaterial);
 
-        // Create a dedicated DescriptorPool for text, fully isolated from the Sprite shared pool
+        // Create a dedicated DescriptorPool for text, fully isolated from the Sprite shared pool.
+        // Capacity matches the shared pool: each Texts control consumes frameCount sets,
+        // and the startup page can hold dozens of controls, so a small pool is exhausted quickly.
         _textDescriptorAllocator = new Vulkan.DescriptorAllocator(
-            Vulkan.Device.Vk, Vulkan.Device.LogicalDevice, capacity: 64);
+            Vulkan.Device.Vk, Vulkan.Device.LogicalDevice, capacity: 2048);
 
-        DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [VK Text] Init renderMode={textMaterial.RenderMode} isInstanced={textMaterial.IsInstanced} matBufSize={Unsafe.SizeOf<MaterialParams>()}");
+        DeviceServices.BaseApp.AddLog(LogType.Texts, $"{DateTime.UtcNow} [VK Text] Init renderMode={textMaterial.RenderMode} isInstanced={textMaterial.IsInstanced} matBufSize={Unsafe.SizeOf<MaterialParams>()}");
 
         // Note: TextDrawParams UBOs are per-Texts, per-frame resources
         // (VKTextInstanceState.DrawParamsBuffers),
@@ -525,7 +527,6 @@ internal unsafe partial class Graphics : IGraphics
             InstanceCapacity = instanceData.Length,
             DrawParamsBuffers = new BufferResource[frameCount],
             DrawParamsMappedPtrs = new byte*[frameCount],
-            DescriptorSets = new VkDs[frameCount],
         };
 
         var defaultDrawParams = new VKTextDrawParams
@@ -560,7 +561,11 @@ internal unsafe partial class Graphics : IGraphics
         }
 
         // Allocate one dedicated DescriptorSet per frame
-        // because per-frame buffers must be N-buffered
+        // because per-frame buffers must be N-buffered.
+        // For a freshly created state this is the single allocation point:
+        // EnsureGlyphBufferCapacity only reallocates sets when an existing control grows its buffers
+        // (UpdateTexts / AppendTexts), and it relies on DescriptorSets being null for a new state.
+        state.DescriptorSets = new VkDs[frameCount];
         AllocateTextDescriptorSets(ref state, _glyphAtlas.AtlasTexture, frameCount);
 
         // Replace the previous state
@@ -570,7 +575,7 @@ internal unsafe partial class Graphics : IGraphics
         _textInstances[texts] = state;
         texts.textureHoldersLoading = holders;
 
-        DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [VK Text] LoadTexts instanceCount={instanceIdx} frameCount={frameCount} glyphCap={state.GlyphCapacity} atlasReady={_glyphAtlas.AtlasTexture != null} atlasVer={_glyphAtlas.Version}");
+        DeviceServices.BaseApp.AddLog(LogType.Texts, $"{DateTime.UtcNow} [VK Text] LoadTexts instanceCount={instanceIdx} frameCount={frameCount} glyphCap={state.GlyphCapacity} atlasReady={_glyphAtlas.AtlasTexture != null} atlasVer={_glyphAtlas.Version}");
         return true;
     }
 
@@ -912,7 +917,7 @@ internal unsafe partial class Graphics : IGraphics
             }
             state.CanDraw = true;
             _textInstances[texts] = state;
-            DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [VK Text] UpdateTexts CanDraw=true instCount={instanceCount} glyphDirty={uploadGlyphData} layoutChanged={writeInstanceData} frameMask={state.InstanceFrameMask:X}");
+            DeviceServices.BaseApp.AddLog(LogType.Texts, $"{DateTime.UtcNow} [VK Text] UpdateTexts CanDraw=true instCount={instanceCount} glyphDirty={uploadGlyphData} layoutChanged={writeInstanceData} frameMask={state.InstanceFrameMask:X}");
         }
     }
 
@@ -937,7 +942,7 @@ internal unsafe partial class Graphics : IGraphics
                 || state.GlyphBuffers[fi].Buffer.Handle == 0
                 || state.InstanceBuffers == null || fi >= state.InstanceBuffers.Length)
             {
-                DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [VK Text] DrawTexts SKIP CanDraw={state.CanDraw} glyphBufsNull={state.GlyphBuffers == null} instBufNull={state.InstanceBuffers == null} fi={fi} instBufLen={state.InstanceBuffers?.Length ?? -1}");
+                DeviceServices.BaseApp.AddLog(LogType.Texts, $"{DateTime.UtcNow} [VK Text] DrawTexts SKIP CanDraw={state.CanDraw} glyphBufsNull={state.GlyphBuffers == null} instBufNull={state.InstanceBuffers == null} fi={fi} instBufLen={state.InstanceBuffers?.Length ?? -1}");
                 return;
             }
 
@@ -1184,10 +1189,11 @@ internal unsafe partial class Graphics : IGraphics
         state.GlyphMappedPtrs = ptrs;
         state.GlyphCapacity = requiredCount;
 
-        // If descriptor sets already exist
-        // (for example when UpdateTexts grows buffers mid-frame),
-        // they still point to obsolete buffers.
-        // They must not be updated in place through vkUpdateDescriptorSets
+        // If descriptor sets already exist, this is an existing control growing its buffers
+        // (UpdateTexts / AppendTexts), and they still point to obsolete buffers.
+        // A freshly created state (LoadTexts) has DescriptorSets == null here,
+        // so it falls through to LoadTexts, which is the single allocation point for new states.
+        // Existing sets must not be updated in place through vkUpdateDescriptorSets
         // because that is UB under in-flight references.
         // Allocate new sets and defer releasing the old ones.
         if (state.DescriptorSets != null)
@@ -1303,7 +1309,7 @@ internal unsafe partial class Graphics : IGraphics
     {
         var whiteView = _whiteTexture.View;
 
-        DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [VK Text] AllocateTextDS frameCount={frameCount} atlasNotNull={atlasTexture != null} whiteViewHandle={whiteView.Handle}");
+        DeviceServices.BaseApp.AddLog(LogType.Texts, $"{DateTime.UtcNow} [VK Text] AllocateTextDS frameCount={frameCount} atlasNotNull={atlasTexture != null} whiteViewHandle={whiteView.Handle}");
 
         for (int fi = 0; fi < frameCount; fi++)
         {

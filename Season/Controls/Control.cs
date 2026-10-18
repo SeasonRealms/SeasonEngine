@@ -120,14 +120,14 @@ public abstract class BaseControl
     public float PosX
     {
         get => _posX;
-        set { if (_posX != value && value != 0f) { _posX = value; Changed = true; } }
+        set { if (_posX != value) { _posX = value; Changed = true; } }
     }
 
     float _posY;
     public float PosY
     {
         get => _posY;
-        set { if (_posY != value && value != 0f) { _posY = value; Changed = true; } }
+        set { if (_posY != value) { _posY = value; Changed = true; } }
     }
 
     float _posZ;

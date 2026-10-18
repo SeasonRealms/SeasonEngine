@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<!--
+  SeasonStudio website - content report page.
+
+  The app opens this page with the record in the URL fragment (#z=... compressed,
+  or #d=... plain). Fragments are never sent in HTTP requests, so the details reach
+  this page without touching a server. The page then stays entirely local: no
+  analytics, no third-party script, no shared studio.js.
+
+  Keep it self-contained. Any script added here that reads location.href and reports
+  upstream would leak the record back out through the fragment.
+
+  Schema (v1), written by SeasonStudio/AI/ContentReport.cs:
+    v, id, t, app, os, lang, model, backend, pt, np, items[] of { ty, nm, bl, ex }
+-->
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Report content — SeasonStudio</title>
+    <meta name="robots" content="noindex,nofollow" />
+    <meta name="referrer" content="no-referrer" />
+    <link rel="icon" href="../favicon.ico" />
+    <link rel="stylesheet" href="../assets/css/studio.css" />
+    <style>
+        .rep-note {
+            width: 100%;
+            min-height: 120px;
+            padding: 12px 14px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            background: var(--surface-2);
+            color: var(--text);
+            font: inherit;
+            resize: vertical;
+        }
+
+        .rep-note:focus { outline: 2px solid var(--brand); outline-offset: 1px; }
+
+        .rep-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 16px;
+        }
+
+        .rep-actions button,
+        .rep-actions a {
+            display: inline-flex;
+            align-items: center;
+            min-height: 42px;
+            padding: 0 18px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            background: var(--surface-2);
+            color: var(--text);
+            font: inherit;
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        .rep-actions button:hover,
+        .rep-actions a:hover { border-color: var(--brand); color: var(--brand); }
+
+        .rep-actions .rep-primary {
+            border-color: var(--brand);
+            background: var(--brand-soft);
+            color: var(--brand);
+        }
+
+        .rep-fields {
+            display: grid;
+            grid-template-columns: max-content 1fr;
+            gap: 6px 18px;
+            margin: 0;
+            font-size: .95rem;
+        }
+
+        .rep-fields dt { color: var(--text-gray); }
+        .rep-fields dd { margin: 0; overflow-wrap: anywhere; }
+
+        .rep-item {
+            margin-top: 14px;
+            padding: 14px 16px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            background: var(--surface-2);
+        }
+
+        .rep-item__head { font-weight: 600; margin-bottom: 6px; }
+        .rep-item__file { color: var(--text-gray); font-size: .9rem; overflow-wrap: anywhere; }
+
+        .rep-excerpt {
+            margin: 10px 0 0;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            font-size: .92rem;
+            color: var(--text);
+        }
+
+        .rep-block {
+            margin: 10px 0 0;
+            padding: 12px 14px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            background: var(--surface-2);
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            font-size: .92rem;
+        }
+
+        .rep-status { min-height: 1.4em; color: var(--brand); font-size: .9rem; }
+
+        .rep-warn {
+            margin-top: 18px;
+            padding-left: 14px;
+            border-left: 3px solid var(--warn);
+            color: var(--text-gray);
+            font-size: .92rem;
+        }
+
+        .rep-hint { color: var(--text-gray); font-size: .9rem; }
+    </style>
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('st-theme') || 'dark';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) { }
+
+            window.addEventListener('DOMContentLoaded', function () {
+                var button = document.querySelector('.se-theme');
+                if (!button) return;
+                button.addEventListener('click', function () {
+                    var next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+                    document.documentElement.setAttribute('data-theme', next);
+                    try { localStorage.setItem('st-theme', next); } catch (e) { }
+                    var img = button.querySelector('img');
+                    if (img) {
+                        img.src = next === 'dark' ? '../assets/img/Moon.png' : '../assets/img/Sun.png';
+                        img.alt = next === 'dark' ? 'Dark theme' : 'Light theme';
+                    }
+                });
+            });
+        })();
+    </script>
+</head>
+<body>
+
+    <div class="se-topbar">
+        <div class="se-container">
+            <a href="../index.html">SeasonStudio</a>
+            <a href="../guide/#privacy">Privacy</a>
+            <button class="se-theme" type="button" title="Toggle light and dark theme">
+                <img src="../assets/img/Moon.png" alt="Dark theme" width="26" height="26" />
+            </button>
+        </div>
+    </div>
+
+    <nav class="se-nav">
+        <div class="se-container">
+            <a class="se-nav__brand" href="../index.html">
+                <img src="../assets/img/Logo.png" alt="SeasonStudio" width="38" height="40" />
+                <span>SeasonStudio</span>
+            </a>
+        </div>
+    </nav>
+
+    <div class="se-shell">
+        <div class="se-container">
+
+            <p class="se-crumbs"><a href="../index.html">Home</a> &rsaquo; Report content</p>
+
+            <div class="se-doc se-doc--wide">
+                <div class="se-doc__main">
+
+                    <section class="se-card">
+                        <h1 class="se-mt0">Report content</h1>
+                        <p class="se-lede">
+                            SeasonStudio generates text, images, video, music and speech locally on your device.
+                            If an output is offensive, harmful or simply wrong, tell us here so the filters and
+                            prompts can be fixed.
+                        </p>
+
+                        <p class="rep-hint">
+                            Nothing on this page is uploaded. The record travels in the part of the address after
+                            <code>#</code>, which browsers never send to a server. This page has no analytics and no
+                            third-party scripts.
+                        </p>
+
+                        <div id="rep-empty" hidden>
+                            <p>
+                                No record was carried in the link. You can still describe the problem below, or open
+                                this page by pressing <strong>Report</strong> under a result inside the app.
+                            </p>
+                        </div>
+
+                        <div id="rep-summary" hidden></div>
+
+                        <p style="margin-top:22px;">
+                            <label for="rep-note"><strong>What is wrong?</strong> Optional, but it helps us act on the report.</label>
+                        </p>
+                        <textarea id="rep-note" class="rep-note" spellcheck="true"
+                                  placeholder="For example: the image came out violent, or the text was abusive."></textarea>
+
+                        <div class="rep-actions">
+                            <button id="rep-copy" type="button">Copy report</button>
+                            <button id="rep-mail" type="button" class="rep-primary">Email us</button>
+                            <button id="rep-issue" type="button">Open a GitHub issue</button>
+                        </div>
+
+                        <p id="rep-status" class="rep-status" role="status" aria-live="polite"></p>
+
+                        <p class="rep-warn">
+                            A GitHub issue is public and indexed by search engines. The whole record, including your
+                            prompt, becomes visible to anyone. Use email unless you are comfortable with that.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">What we receive</h2>
+                        <p>
+                            If you press <strong>Email us</strong>, your own mail application opens with the report
+                            copied to the clipboard and a short summary in the body — paste the copied text into the
+                            message to include everything. Nothing is sent until you send it yourself.
+                        </p>
+                        <p>
+                            SeasonStudio has no account system, no telemetry and no server of its own, so there is no
+                            other channel by which this page could reach us. See the
+                            <a href="../guide/#privacy">privacy notes</a> for the full position.
+                        </p>
+                    </section>
+
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <footer class="se-footer">
+        <div class="se-container">
+            <div class="se-footer__bottom">
+                <span>&copy; 2026 SeasonRealms. SeasonStudio is the sister application of <a href="../../index.html">SeasonEngine</a>.</span>
+                <span>Reports are optional and are never collected automatically.</span>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        (function () {
+            'use strict';
+
+            var MAIL = 'Leming.cen@live.com';
+            var ISSUE = 'https://github.com/SeasonRealms/SeasonEngine/issues/new';
+
+            var record = null;
+
+            var summary = document.getElementById('rep-summary');
+            var empty = document.getElementById('rep-empty');
+            var note = document.getElementById('rep-note');
+            var status = document.getElementById('rep-status');
+
+            /* The fragment never reaches a server, but leaving it in the address bar puts
+               the record into history and bookmarks, and hands it to anything that reads
+               location.href later. Strip it before anything else runs. */
+            var hash = location.hash ? location.hash.slice(1) : '';
+
+            if (hash) {
+                try {
+                    history.replaceState(null, '', location.pathname + location.search);
+                } catch (e) { }
+            }
+
+            function fromB64Url(text) {
+                text = text.replace(/-/g, '+').replace(/_/g, '/');
+                while (text.length % 4) text += '=';
+
+                var binary = atob(text);
+                var bytes = new Uint8Array(binary.length);
+
+                for (var i = 0; i < binary.length; i++) {
+                    bytes[i] = binary.charCodeAt(i);
+                }
+
+                return bytes;
+            }
+
+            function gunzip(bytes) {
+                if (typeof DecompressionStream !== 'function') {
+                    return Promise.reject(new Error('DecompressionStream unavailable'));
+                }
+
+                var stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+
+                return new Response(stream).text();
+            }
+
+            function say(message) {
+                status.textContent = message || '';
+            }
+
+            function row(list, term, value) {
+                if (!value) return;
+
+                var dt = document.createElement('dt');
+                dt.textContent = term;
+
+                var dd = document.createElement('dd');
+                dd.textContent = value;
+
+                list.appendChild(dt);
+                list.appendChild(dd);
+            }
+
+            function block(title, text) {
+                var head = document.createElement('p');
+                head.style.margin = '16px 0 0';
+                head.textContent = title;
+
+                var pre = document.createElement('pre');
+                pre.className = 'rep-block';
+                pre.textContent = text;
+
+                summary.appendChild(head);
+                summary.appendChild(pre);
+            }
+
+            function render() {
+                summary.textContent = '';
+
+                var list = document.createElement('dl');
+                list.className = 'rep-fields';
+
+                row(list, 'Report ID', record.id);
+                row(list, 'Time (UTC)', record.t);
+                row(list, 'App', record.app);
+                row(list, 'Platform', record.os);
+                row(list, 'Language', record.lang);
+                row(list, 'Model', record.model);
+                row(list, 'Backend', record.backend);
+
+                summary.appendChild(list);
+
+                if (record.pt) block('Prompt', record.pt);
+                if (record.np) block('Negative prompt', record.np);
+
+                var items = record.items || [];
+
+                for (var i = 0; i < items.length; i++) {
+                    var item = items[i] || {};
+
+                    var card = document.createElement('div');
+                    card.className = 'rep-item';
+
+                    var head = document.createElement('div');
+                    head.className = 'rep-item__head';
+                    head.textContent = 'Result ' + (i + 1) + (item.ty ? ' — ' + item.ty : '') +
+                        (item.bl ? ' (flagged by the built-in filter)' : '');
+
+                    card.appendChild(head);
+
+                    if (item.nm) {
+                        var file = document.createElement('div');
+                        file.className = 'rep-item__file';
+                        file.textContent = item.nm;
+
+                        card.appendChild(file);
+                    }
+
+                    if (item.ex) {
+                        var excerpt = document.createElement('pre');
+                        excerpt.className = 'rep-excerpt';
+                        excerpt.textContent = item.ex;
+
+                        card.appendChild(excerpt);
+                    }
+
+                    summary.appendChild(card);
+                }
+
+                summary.hidden = false;
+                empty.hidden = true;
+            }
+
+            function fail() {
+                summary.hidden = true;
+                empty.hidden = false;
+
+                say('The record in this link could not be decoded. Describe the problem below and send it manually.');
+            }
+
+            function compose() {
+                var lines = ['SeasonStudio content report', ''];
+
+                if (record) {
+                    if (record.id) lines.push('Report ID: ' + record.id);
+                    if (record.t) lines.push('Time (UTC): ' + record.t);
+                    if (record.app || record.os) lines.push('App: ' + (record.app || '?') + (record.os ? ' on ' + record.os : ''));
+                    if (record.lang) lines.push('Language: ' + record.lang);
+                    if (record.model) lines.push('Model: ' + record.model);
+                    if (record.backend) lines.push('Backend: ' + record.backend);
+
+                    if (record.pt) lines.push('', 'Prompt:', record.pt);
+                    if (record.np) lines.push('', 'Negative prompt:', record.np);
+
+                    (record.items || []).forEach(function (item, index) {
+                        item = item || {};
+                        lines.push('', 'Result ' + (index + 1) + (item.ty ? ' (' + item.ty + ')' : '') +
+                            (item.bl ? ' [flagged]' : ''));
+                        if (item.nm) lines.push('File: ' + item.nm);
+                        if (item.ex) lines.push(item.ex);
+                    });
+                }
+
+                var text = note.value.trim();
+
+                if (text) lines.push('', 'What is wrong:', text);
+
+                lines.push('', '---', 'Reported by me from the SeasonStudio report page.');
+
+                return lines.join('\n');
+            }
+
+            function composeShort() {
+                var lines = [];
+
+                if (record && record.id) lines.push('Report ID: ' + record.id);
+
+                if (record) {
+                    var meta = [];
+
+                    if (record.app) meta.push('app ' + record.app);
+                    if (record.os) meta.push(record.os);
+                    if (record.model) meta.push(record.model);
+
+                    if (meta.length) lines.push(meta.join(' · '));
+                }
+
+                var text = note.value.trim();
+
+                if (text) lines.push('', text);
+
+                lines.push('', 'The full record was copied to the clipboard; paste it here to include it.');
+
+                return lines.join('\n');
+            }
+
+            function legacyCopy(text) {
+                var area = document.createElement('textarea');
+
+                area.value = text;
+                area.setAttribute('readonly', '');
+                area.style.position = 'fixed';
+                area.style.top = '-1000px';
+
+                document.body.appendChild(area);
+                area.select();
+
+                var ok = false;
+
+                try { ok = document.execCommand('copy'); } catch (e) { }
+
+                document.body.removeChild(area);
+
+                say(ok ? 'Copied.' : 'Copy failed. Select the text above and copy it manually.');
+
+                return ok;
+            }
+
+            function copyReport() {
+                var text = compose();
+
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(text).then(function () {
+                        say('Copied.');
+                    }, function () {
+                        legacyCopy(text);
+                    });
+                } else {
+                    legacyCopy(text);
+                }
+            }
+
+            document.getElementById('rep-copy').addEventListener('click', copyReport);
+
+            document.getElementById('rep-mail').addEventListener('click', function () {
+                /* Same click gesture, so the clipboard write is allowed to succeed; the
+                   body stays short because Windows gives mailto roughly 2 KB. */
+                copyReport();
+
+                var subject = 'SeasonStudio content report' + (record && record.id ? ' ' + record.id : '');
+
+                location.href = 'mailto:' + MAIL +
+                    '?subject=' + encodeURIComponent(subject) +
+                    '&body=' + encodeURIComponent(composeShort());
+
+                say('Your mail application should open. The full report is on the clipboard.');
+            });
+
+            document.getElementById('rep-issue').addEventListener('click', function () {
+                if (!window.confirm('GitHub issues are public. The whole record, including your prompt, will be visible to anyone. Continue?')) {
+                    return;
+                }
+
+                var body = compose();
+
+                if (body.length > 6000) body = body.slice(0, 6000) + '\n…';
+
+                var title = 'Content report' + (record && record.id ? ' ' + record.id : '');
+
+                window.open(ISSUE + '?title=' + encodeURIComponent(title) +
+                    '&body=' + encodeURIComponent(body), '_blank', 'noopener');
+            });
+
+            function accept(text) {
+                try {
+                    var data = JSON.parse(text);
+
+                    if (!data || typeof data !== 'object') throw new Error('shape');
+
+                    record = data;
+                    render();
+                } catch (e) {
+                    fail();
+                }
+            }
+
+            if (hash.indexOf('z=') === 0) {
+                try {
+                    gunzip(fromB64Url(hash.slice(2))).then(accept, fail);
+                } catch (e) {
+                    fail();
+                }
+            } else if (hash.indexOf('d=') === 0) {
+                try {
+                    accept(new TextDecoder().decode(fromB64Url(hash.slice(2))));
+                } catch (e) {
+                    fail();
+                }
+            } else {
+                summary.hidden = true;
+                empty.hidden = false;
+            }
+        })();
+    </script>
+</body>
+</html>
