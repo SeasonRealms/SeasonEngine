@@ -76,12 +76,15 @@ internal class AndroidStoreService : IStoreService
                 }
                 else
                 {
-                    var oneTime = productDetails.GetOneTimePurchaseOfferDetails();
+                    // Products configured with several purchase options expose only the
+                    // list; the single-offer accessor returns null there.
+                    var oneTime = productDetails.GetOneTimePurchaseOfferDetails()
+                        ?? productDetails.OneTimePurchaseOfferDetailsList?.FirstOrDefault();
 
                     product.StoreId = storeId;
                     product.Title = productDetails.Title;
                     product.Type = productDetails.ProductType;
-                    product.Price = oneTime.FormattedPrice;
+                    product.Price = oneTime?.FormattedPrice;
 
                     var query = QueryPurchasesParams.NewBuilder().SetProductType(skuType).Build();
 
@@ -139,8 +142,6 @@ internal class AndroidStoreService : IStoreService
     {
         var message = "";
 
-        CancellationToken cancellationToken = default;
-
         message = await ConnectAsync();
 
         if (message is null && productDetails is null)
@@ -157,13 +158,19 @@ internal class AndroidStoreService : IStoreService
 
             tcsPurchase = new TaskCompletionSource<(BillingResult billingResult, IList<Purchase> purchases)>();
 
-            var _ = cancellationToken.Register(() => tcsPurchase.TrySetCanceled());
-
             var result = billingClient.LaunchBillingFlow(AndroidApp.MainActivity, flowParams);
 
             if (result == null)
             {
                 message = "Product not exist.";
+            }
+            else if (result.ResponseCode is BillingResponseCode.ItemAlreadyOwned)
+            {
+                // Already-owned items can be reported synchronously; fall back to the
+                // ownership query, which also retries the acknowledgement.
+                var purchaseProduct = await Query(product);
+
+                message = purchaseProduct.InCollection ? product : $"{result.ResponseCode}:{result.DebugMessage}";
             }
             else if (result.ResponseCode != BillingResponseCode.Ok)
             {
@@ -177,23 +184,25 @@ internal class AndroidStoreService : IStoreService
                 {
 
                 }
+                else if (purchaseResult.billingResult.ResponseCode is BillingResponseCode.ItemAlreadyOwned)
+                {
+                    var purchaseProduct = await Query(product);
+
+                    message = purchaseProduct.InCollection ? product : "Not purchased";
+                }
                 else if (purchaseResult.billingResult.ResponseCode != BillingResponseCode.Ok)
                 {
                     message = $"{purchaseResult.billingResult.ResponseCode.ToString()}:{purchaseResult.billingResult.DebugMessage}";
                 }
                 else
                 {
-                    var purchase = purchaseResult.purchases?.FirstOrDefault();
+                    var purchase = purchaseResult.purchases?.FirstOrDefault(pu => pu.Products?.Contains(product) == true);
 
                     if (purchase == null)
                     {
                         var purchaseProduct = await Query(product);
 
                         message = purchaseProduct.InCollection ? product : "Not purchased";
-                    }
-                    else if (purchase.Products?.FirstOrDefault() != product)
-                    {
-                        message = "Not purchased";
                     }
                     else if (purchase.PurchaseState is PurchaseState.Pending)
                     {
@@ -207,8 +216,12 @@ internal class AndroidStoreService : IStoreService
                     }
                     else
                     {
-                        // Play refunds any purchase that is not acknowledged within three days.
-                        message = await AcknowledgeAsync(purchase) ?? product;
+                        // Grant even when the acknowledgement fails: the item is already owned
+                        // and the ownership query retries the acknowledgement (Play refunds
+                        // purchases that stay unacknowledged for three days).
+                        await AcknowledgeAsync(purchase);
+
+                        message = product;
                     }
                 }
             }
@@ -253,7 +266,11 @@ internal class AndroidStoreService : IStoreService
         tcsPurchase = null;
 
         tcsConnect?.TrySetCanceled();
-        tcsConnect = new TaskCompletionSource<string>();
+
+        // Capture this call's waiter: a late callback from a previous client must not
+        // resolve the connection attempt that replaced it.
+        var tcs = new TaskCompletionSource<string>();
+        tcsConnect = tcs;
 
         // Each entry point builds a fresh client, so the previous service connection must be
         // released instead of accumulating one per premium-page visit.
@@ -273,21 +290,23 @@ internal class AndroidStoreService : IStoreService
         {
             if (billingResult.ResponseCode == BillingResponseCode.Ok)
             {
-                tcsConnect.TrySetResult(null);
+                tcs.TrySetResult(null);
             }
             else
             {
-                var message = $"{billingResult.ResponseCode}:{billingResult.DebugMessage}";
-
-                tcsConnect.TrySetResult(message);
+                tcs.TrySetResult($"{billingResult.ResponseCode}:{billingResult.DebugMessage}");
             }
         },
         () =>
         {
+            // The service went away while a connection or purchase was waiting: release both
+            // waiters so the premium page cannot hang on a disabled button.
+            tcs.TrySetResult("Billing service disconnected");
 
+            tcsPurchase?.TrySetCanceled();
         });
 
-        return await tcsConnect.Task;
+        return await tcs.Task;
     }
 
     public async Task<string> Review(string product, string url)

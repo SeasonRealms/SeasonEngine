@@ -116,18 +116,26 @@ public abstract class BaseControl
     // Width extends along +X, Height drops along -Y, and Depth extends along +Z
     // (the anchor/scale contract Phase 2 is implemented in Mesh3DBase).
     // For 2D controls, PosZ and Depth stay 0 and do not participate in 2D layout for now.
+
+    /// <summary>
+    /// True once a layout pass has assigned PosX or PosY. Draw paths use it to skip
+    /// controls that were never positioned; an explicit (0, 0) layout still draws,
+    /// which the old "position equals the origin" heuristic could not express.
+    /// </summary>
+    public bool Positioned { get; private set; }
+
     float _posX;
     public float PosX
     {
         get => _posX;
-        set { if (_posX != value) { _posX = value; Changed = true; } }
+        set { Positioned = true; if (_posX != value) { _posX = value; Changed = true; } }
     }
 
     float _posY;
     public float PosY
     {
         get => _posY;
-        set { if (_posY != value) { _posY = value; Changed = true; } }
+        set { Positioned = true; if (_posY != value) { _posY = value; Changed = true; } }
     }
 
     float _posZ;
@@ -163,6 +171,33 @@ public abstract class BaseControl
     public virtual bool Ready { get; set; }
 
     public virtual bool MouseOver { get; set; }
+
+    /// <summary>
+    /// Bounds test in logical pixels, used to recover a tap that started and ended between
+    /// two frames: MouseOver is computed once per frame from the current pointer, so it never
+    /// saw the press at all. Controls with a visual hit area override this (Texts offsets its
+    /// top, Input uses its line width); the default keeps controls that do not take clicks out.
+    /// </summary>
+    public virtual bool ContainsPoint(float x, float y) => false;
+
+    /// <summary>
+    /// Whether a click released this frame belongs to this control: the pointer is over it
+    /// now, or the press that just ended began inside it.
+    /// </summary>
+    public bool IsHit
+    {
+        get
+        {
+            if (MouseOver)
+            {
+                return true;
+            }
+
+            return TouchService.IsReleased
+                && TouchService.LastDownPos is Vector2 press
+                && ContainsPoint(press.X, press.Y);
+        }
+    }
 
     public virtual bool Selected { get; set; }
 
@@ -205,7 +240,7 @@ public abstract class BaseControl
 
         if (depth is not null) Depth = depth.Value;
 
-        if (TouchService.Enable && Enable && Ready && Alpha > 0 && MouseOver)
+        if (TouchService.Enable && Enable && Ready && Alpha > 0 && IsHit)
         {
             if (TouchService.IsDown && OnTouch != null)
             {

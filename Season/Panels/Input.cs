@@ -87,10 +87,12 @@ public class Input : Panel
         {
             MouseOver = PosX < TouchService.PoX && TouchService.PoX < PosX + Line.Width && PosY < TouchService.PoY && TouchService.PoY < PosY + Height;
 
-            if (MouseOver)
+            if (IsHit)
             {
                 if (TouchService.IsReleased)
                 {
+                    TouchService.IsReleased = false;
+
                     InvokeAction();
 
                     result = true;
@@ -169,5 +171,13 @@ public class Input : Panel
         Desc.Update(time, alpha: Alpha, posX: Line.PosX, posY: Line.PosY + 5);
 
         return result;
+    }
+
+    public override bool ContainsPoint(float x, float y)
+    {
+        // The clickable row spans the underline, not the Width field, which is only
+        // assigned at the end of Update.
+        return Enable && Alpha > 0
+            && PosX <= x && x <= PosX + Line.Width && PosY <= y && y <= PosY + Height;
     }
 }

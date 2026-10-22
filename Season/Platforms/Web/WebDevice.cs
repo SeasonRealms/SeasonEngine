@@ -140,6 +140,8 @@ internal class WebFileService : IFileService
 
     public async Task<List<TaskFile>> PickFiles(FileType fileType, string[] exts, bool multiple, bool open) => null;
 
+    public Task<List<TaskFile>> PickPhotos(bool open) => Task.FromResult(new List<TaskFile>());
+
     public async Task<string> SaveFile(string fileName, Stream stream, CancellationToken cancellationToken) => null;
 
     public async Task<string> OpenFile(string name, string category, byte[] bytes) => null;

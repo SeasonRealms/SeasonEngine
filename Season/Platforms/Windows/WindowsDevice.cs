@@ -546,6 +546,13 @@ internal class WindowsFileService : IFileService
         return RunOnUiThread(() => PickFilesCore(fileType, exts, multiple, open));
     }
 
+    public Task<List<TaskFile>> PickPhotos(bool open)
+    {
+        // No native photo picker on this platform: report an empty selection, which callers
+        // handle exactly like a cancelled picker.
+        return Task.FromResult(new List<TaskFile>());
+    }
+
     static Task<T> RunOnUiThread<T>(Func<Task<T>> action)
     {
         var window = WindowsApp.Window;

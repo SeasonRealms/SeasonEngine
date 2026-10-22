@@ -50,7 +50,7 @@ public enum HighlightStyle
 ///
 /// Click-to-lock behavior:
 /// when a click is detected, where <see cref="TouchService.IsReleased"/> means the pointer was released
-/// within 20 px of the press point and is therefore treated as a click rather than a drag,
+/// within the tap slop of the press point and is therefore treated as a click rather than a drag,
 /// a hit target is locked by setting <see cref="Mesh3DBase.Selected"/> or
 /// <see cref="MeshInstanceTransform.Selected"/> to true.
 /// The highlight remains visible even after the pointer moves out of the projection bounds.
@@ -239,7 +239,7 @@ public class ObjectPicker : Panel
         }
 
         // 2.5 Click selection.
-        // IsReleased means the pointer was released within 20 px of the press point,
+        // IsReleased means the pointer was released within the tap slop of the press point,
         // so it counts as a click rather than a camera drag.
         // A hit target becomes locked and selected, while no hit means the click happened outside the bounds
         // and clears the current selection.

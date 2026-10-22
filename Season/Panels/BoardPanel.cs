@@ -61,7 +61,7 @@ public class BoardPanel : Panel
         board.Color = BoardColor;
         board.Update(time, alpha: Alpha, posX: PosX, posY: PosY, width: Width, height: Height);
 
-        if (TouchService.Enable && TouchService.IsReleased && !board.MouseOver)
+        if (TouchService.Enable && TouchService.IsReleased && !board.IsHit)
         {
             OnClose?.Invoke();
 

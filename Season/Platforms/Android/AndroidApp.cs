@@ -1054,7 +1054,10 @@ public class BaseActivity : Activity
         AndroidApp.MainActivity = this;
 
         base.Window!.AddFlags(WindowManagerFlags.Fullscreen);
-        base.Window.AddFlags(WindowManagerFlags.KeepScreenOn);
+        // KeepScreenOn is not set here: the screen-idle guard is driven by
+        // KeepAwake/AndroidDeviceCore.SetKeepAwake instead, while a model load or
+        // generation is running or while the host pins the display awake (games),
+        // mirroring the iOS IdleTimerDisabled behavior.
         base.Window.AddFlags(WindowManagerFlags.TranslucentStatus);
 
         base.Window.Attributes!.LayoutInDisplayCutoutMode = LayoutInDisplayCutoutMode.ShortEdges;
@@ -1096,7 +1099,16 @@ public class BaseActivity : Activity
     protected override void OnResume()
     {
         base.OnResume();
-        if (ReferenceEquals(AndroidApp.MainActivity, this)) AndroidApp.Resume();
+
+        if (ReferenceEquals(AndroidApp.MainActivity, this))
+        {
+            AndroidApp.Resume();
+
+            // A rebuilt activity starts with a fresh window, and a vendor ROM may
+            // have cleared the flag while the app was backgrounded. Re-apply an
+            // active load/generation hold, or a game's pin, before the next frame.
+            KeepAwake.Reapply();
+        }
     }
 
     /// <summary>
@@ -1253,9 +1265,7 @@ public class SurfaceViewVulkan : SurfaceView, ISurfaceHolderCallback, View.IOnTo
         {
             // DOWN
             case MotionEventActions.Down:
-                TouchService.isDown = true;
-                TouchService.PoX = (int)posX;
-                TouchService.PoY = (int)posY;
+                TouchService.RaiseDown(posX, posY);
                 break;
 
             // Second finger touched down: enter pinch mode and record the initial finger distance.
@@ -1266,21 +1276,19 @@ public class SurfaceViewVulkan : SurfaceView, ISurfaceHolderCallback, View.IOnTo
                     _isPinching = true;
                     // Suspend single-finger drag semantics during pinching
                     // to avoid rotating or panning the camera at the same time.
-                    TouchService.isDown = false;
+                    // The press is dropped, not merely released, so lifting either finger
+                    // when the pinch ends cannot be reported as a click.
+                    TouchService.RaiseCancel();
                 }
                 else
                 {
-                    TouchService.isDown = true;
-                    TouchService.PoX = (int)posX;
-                    TouchService.PoY = (int)posY;
+                    TouchService.RaiseDown(posX, posY);
                 }
                 break;
 
             // UP: the last finger was lifted, so the gesture ends completely.
             case MotionEventActions.Up:
-                TouchService.isDown = false;
-                TouchService.PoX = (int)posX;
-                TouchService.PoY = (int)posY;
+                TouchService.RaiseUp(posX, posY);
                 _isPinching = false;
                 _prevPinchDistance = 0f;
                 break;
@@ -1328,9 +1336,7 @@ public class SurfaceViewVulkan : SurfaceView, ISurfaceHolderCallback, View.IOnTo
             // CANCEL, OUTSIDE
             case MotionEventActions.Cancel:
             case MotionEventActions.Outside:
-                TouchService.isDown = false;
-                TouchService.PoX = (int)posX;
-                TouchService.PoY = (int)posY;
+                TouchService.RaiseCancel();
                 _isPinching = false;
                 _prevPinchDistance = 0f;
                 break;

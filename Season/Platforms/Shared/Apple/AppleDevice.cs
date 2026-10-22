@@ -8,8 +8,8 @@ using Metal;
 using AVFoundation;
 using CoreMedia;
 using CoreGraphics;
-using StoreKit;
 using System.Net;
+using PhotosUI;
 
 namespace Season.Platforms.Shared.Apple;
 
@@ -131,6 +131,37 @@ internal class AppleDeviceCore : IDeviceCore
                 return Vector4.Zero;
             }
         }
+    }
+
+    /// <summary>
+    /// Keeps the display awake while a model load or generation is running, or while a game
+    /// pins the screen. iOS is the only Apple target with an idle timer; Mac Catalyst follows
+    /// the Mac's own display sleep settings, so the method stays a no-op there.
+    /// </summary>
+    public void SetKeepAwake(bool enabled)
+    {
+#if IOS
+        void Apply()
+        {
+            try
+            {
+                UIApplication.SharedApplication.IdleTimerDisabled = enabled;
+            }
+            catch (Exception)
+            {
+                // Losing the idle-timer hint must never break the operation that asked for it.
+            }
+        }
+
+        if (NSThread.IsMain)
+        {
+            Apply();
+        }
+        else
+        {
+            UIApplication.SharedApplication.BeginInvokeOnMainThread(Apply);
+        }
+#endif
     }
 
     public string GetLocalIP()
@@ -302,18 +333,131 @@ internal class AppleDeviceCore : IDeviceCore
     }
 }
 
+/// <summary>
+/// Process-wide AVAudioSession state shared by recording and playback.
+/// The recorder needs an input category (Record), and that category has no output at
+/// all: it silences playback. Deactivating a session does not change its category, so
+/// after the first recording the session stayed at Record + inactive. The next
+/// AVPlayer.Play() then ran without an output route, failed at once (Rate 0) and the
+/// play button - which reads Rate to choose its icon - fell straight back to "stopped".
+/// Killing the app reset the category to the system default, which is why the same file
+/// played fine after a restart. Recording now restores a playback category when it
+/// ends, and every play restates that the session must be active.
+/// </summary>
+internal static class AppleAudioSession
+{
+    // The binding exposes no "None" member for the options flag enum.
+    const AVAudioSessionCategoryOptions NoCategoryOptions = (AVAudioSessionCategoryOptions)0;
+
+    /// <summary>
+    /// True while a recorder or engine capture owns the session. Playback must not
+    /// renegotiate the category then, or it would tear the input route away mid-record.
+    /// </summary>
+    internal static bool Recording { get; set; }
+
+    /// <summary>
+    /// Makes sure the shared session is active before an AVPlayer starts. Idempotent and
+    /// cheap, and it also recovers a session the system deactivated on an interruption.
+    /// The category is left alone: apps that never record keep the system default, and
+    /// after a recording <see cref="ReleaseCapture"/> has already restored Playback.
+    /// </summary>
+    internal static void EnsurePlayback()
+    {
+        if (Recording)
+        {
+            return;
+        }
+
+        try
+        {
+            var session = AVAudioSession.SharedInstance();
+
+            if (!session.SetActive(true, out NSError error))
+            {
+                Log(LogType.Error, $"SetActive(true) failed: {Describe(error)}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log(LogType.Error, $"activation failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Applies the input category a capture attempt needs and marks the session as owned
+    /// by the capture, so <see cref="EnsurePlayback"/> leaves the route alone.
+    /// </summary>
+    internal static void ApplyCapture(AVAudioSession session, AVAudioSessionCategory category, AVAudioSessionCategoryOptions options, bool activate)
+    {
+        Recording = true;
+
+        if (!session.SetCategory(category, options, out NSError categoryError))
+        {
+            Log(LogType.Error, $"SetCategory({category}, {options}) failed: {Describe(categoryError)}");
+        }
+
+        if (!activate)
+        {
+            return;
+        }
+
+        if (!session.SetActive(true, out NSError activeError))
+        {
+            Log(LogType.Error, $"SetActive(true) failed: {Describe(activeError)}");
+        }
+    }
+
+    /// <summary>
+    /// Gives the session back to playback after a capture ends or aborts. Restoring the
+    /// category is the part that matters: deactivating alone leaves it on Record, which
+    /// has no output route and silently breaks every later play until the app restarts.
+    /// </summary>
+    internal static void ReleaseCapture()
+    {
+        Recording = false;
+
+        try
+        {
+            var session = AVAudioSession.SharedInstance();
+
+            if (!session.SetCategory(AVAudioSessionCategory.Playback, NoCategoryOptions, out NSError categoryError))
+            {
+                Log(LogType.Error, $"SetCategory(Playback) failed: {Describe(categoryError)}");
+            }
+
+            try { session.SetActive(false, out _); }
+            catch { }
+        }
+        catch (Exception ex)
+        {
+            Log(LogType.Error, $"release failed: {ex.Message}");
+        }
+    }
+
+    static string Describe(NSError error)
+    {
+        return error == null ? "none" : $"{error.Domain} {error.Code} {error.LocalizedDescription}";
+    }
+
+    static void Log(LogType logType, string message)
+    {
+        DeviceServices.BaseApp?.AddLog(logType, $"{DateTime.UtcNow} [AudioSession] {message}");
+    }
+}
+
 internal class AppleMediaPlayer : IMediaPlayer
 {
     public bool IsPlaying
     {
         get
         {
-            if (MusicPlayer != null && MusicPlayer.Status != AVPlayerStatus.ReadyToPlay || SoundPlayer != null && SoundPlayer.Status != AVPlayerStatus.ReadyToPlay)
-            {
-                return true;
-            }
+            // Rate, not Status: a freshly created player (and one whose item failed to
+            // load) reports Unknown, and "not ReadyToPlay" was counting both as playing.
+            var music = MusicPlayer != null && MusicPlayer.Rate > 0f;
 
-            return false;
+            var sound = SoundPlayer != null && SoundPlayer.Rate > 0f;
+
+            return music || sound;
         }
     }
 
@@ -360,6 +504,10 @@ internal class AppleMediaPlayer : IMediaPlayer
 
     public void PlayMedia(string type, string id, string vol)
     {
+        // The session may still be deactivated (or, after a recording that never
+        // restored it, input-only). AVPlayer needs it active before the item starts.
+        AppleAudioSession.EnsurePlayback();
+
         if (MusicPlayer == null || SoundPlayer == null)
         {
             MusicPlayer = new AVPlayer();
@@ -434,9 +582,114 @@ internal class AppleMediaPlayer : IMediaPlayer
 
 internal class AppleDialogService : IDialogService
 {
+    /// <summary>
+    /// UIKit shows one modal at a time. A second PresentViewController issued while an
+    /// alert is already on screen is silently dropped by the system, and the dropped
+    /// caller would await a result that never arrives. Serializing keeps every call
+    /// paired with a controller that actually made it on screen.
+    /// </summary>
+    static readonly SemaphoreSlim DialogLock = new SemaphoreSlim(1, 1);
+
+    /// <summary>
+    /// Shows a native alert. The platform dialog contract (Android/Linux/Windows/Web
+    /// agree) is that the first button returns the caller's text and every other
+    /// dismissal returns null, so callers can read a non-null answer as "confirmed".
+    /// </summary>
     public async Task<string> ShowMessage(string title, string desc, string[] buttons, string text)
     {
-        return null;
+        if (buttons is null || buttons.Length == 0)
+        {
+            buttons = new string[] { "OK" };
+        }
+
+        await DialogLock.WaitAsync();
+
+        try
+        {
+            var tcs = new TaskCompletionSource<string>();
+
+            UIApplication.SharedApplication.InvokeOnMainThread(delegate
+            {
+                try
+                {
+                    var body = string.IsNullOrEmpty(desc)
+                        ? text
+                        : string.IsNullOrEmpty(text)
+                            ? desc
+                            : desc + "\n\n" + text;
+
+                    // UIKit raises if both the title and the message are nil.
+                    var alert = UIAlertController.Create(title ?? string.Empty, body ?? string.Empty, UIAlertControllerStyle.Alert);
+
+                    for (var i = 0; i < buttons.Length; i++)
+                    {
+                        var isPrimary = i == 0;
+
+                        // The trailing button of a multi-button alert reads as a
+                        // dismissal ("Cancel") and gets the cancel style, which sits
+                        // it below the rest.
+                        var style = !isPrimary && i == buttons.Length - 1
+                            ? UIAlertActionStyle.Cancel
+                            : UIAlertActionStyle.Default;
+
+                        alert.AddAction(UIAlertAction.Create(buttons[i] ?? string.Empty, style, _ =>
+                        {
+                            tcs.TrySetResult(isPrimary ? text : null);
+                        }));
+                    }
+
+                    var parentController = TopViewController();
+
+                    if (parentController is null)
+                    {
+                        tcs.TrySetResult(null);
+
+                        return;
+                    }
+
+                    parentController.PresentViewController(alert, true, delegate
+                    {
+                        // Fires when the presentation animation ends, not on dismissal.
+                        // Do NOT resolve tcs here in the normal case: doing so would return
+                        // before the user taps. It only releases the caller when UIKit
+                        // reports the alert is off screen, where no action can follow.
+                        if (alert.PresentingViewController is null)
+                        {
+                            tcs.TrySetResult(null);
+                        }
+                    });
+                }
+                catch (System.Exception ex)
+                {
+                    DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [ShowMessage] {ex}");
+
+                    tcs.TrySetResult(null);
+                }
+            });
+
+            return await tcs.Task;
+        }
+        finally
+        {
+            DialogLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// The controller a modal can be attached to: the current one, or the last one it is
+    /// already presenting. Presenting on a controller that is itself presenting gets the
+    /// alert rejected by UIKit (pickers and the keyboard dialog leave one up).
+    /// </summary>
+    static UIViewController TopViewController()
+    {
+        var controller = Microsoft.Maui.ApplicationModel.Platform.GetCurrentUIViewController();
+
+        while (controller?.PresentedViewController is not null)
+        {
+            controller = controller.PresentedViewController;
+        }
+
+        return controller;
     }
 
     public async Task<string> ShowKeyboard(string title, string desc, string[] buttons, string text)
@@ -449,19 +702,20 @@ internal class AppleDialogService : IDialogService
             {
                 var alertController = new UIViewController();
 
-                //var width = DeviceServices.BaseApp.DeviceResolution.X - 50;
-
-                var textView = new UITextView(new CGRect(new CGPoint(20, 20), new CGSize(580, 250)));
+                // The frames are assigned by LayoutKeyboardDialog once the dialog knows the surface
+                // it actually got (full screen on iPhone, a page sheet on iPad/Mac Catalyst). The
+                // old fixed 580x500 field at (20,20) overflowed a 414pt-wide iPhone.
+                var textView = new UITextView(new CGRect(0, 0, 0, 0));
 
                 textView.Font = UIFont.SystemFontOfSize(18);
                 textView.Text = text;
                 textView.Editable = true;
 
-                //textView.BecomeFirstResponder();
+                textView.BecomeFirstResponder();
 
                 alertController.View.AddSubview(textView);
 
-                var btnOK = new UIButton(new CGRect(150, 300, 100, 50));
+                var btnOK = new UIButton(UIButtonType.Custom);
 
                 btnOK.BackgroundColor = UIColor.Gray;
 
@@ -477,7 +731,7 @@ internal class AppleDialogService : IDialogService
 
                 alertController.View.AddSubview(btnOK);
 
-                var btnCancel = new UIButton(new CGRect(350, 600, 100, 50));
+                var btnCancel = new UIButton(UIButtonType.Custom);
 
                 btnCancel.BackgroundColor = UIColor.Gray;
 
@@ -492,15 +746,33 @@ internal class AppleDialogService : IDialogService
 
                 alertController.View.AddSubview(btnCancel);
 
+                // A swipe-down would close a page sheet without any button running, leaving the
+                // caller awaiting a result that never arrives. Only the two buttons close it.
+                alertController.ModalInPresentation = true;
+
                 var parentController = Microsoft.Maui.ApplicationModel.Platform.GetCurrentUIViewController();
 
                 if (parentController is not null)
                 {
                     // NOTE: the completionHandler of PresentViewController fires when the PRESENTATION
                     // animation finishes (i.e., right after the sheet appears), NOT when it is dismissed.
-                    // Do NOT resolve tcs here — otherwise the caller returns with the initial text before
-                    // the user gets a chance to edit, and later OK/Cancel TrySetResult calls become no-ops.
-                    parentController.PresentViewController(alertController, true, null);
+                    // Do NOT resolve tcs here in the normal case — otherwise the caller returns with the
+                    // initial text before the user gets a chance to edit, and later OK/Cancel TrySetResult
+                    // calls become no-ops. It is the first point where the presented view has its final
+                    // size, which is what LayoutKeyboardDialog needs.
+                    parentController.PresentViewController(alertController, true, delegate
+                    {
+                        // A null presenter means UIKit dropped the modal (another one is already up),
+                        // so no button can ever run and the caller has to be released here.
+                        if (alertController.PresentingViewController is null)
+                        {
+                            tcs.TrySetResult(null);
+
+                            return;
+                        }
+
+                        LayoutKeyboardDialog(alertController.View, textView, btnOK, btnCancel);
+                    });
                 }
                 else
                 {
@@ -514,6 +786,61 @@ internal class AppleDialogService : IDialogService
         });
 
         return await tcs.Task;
+    }
+
+    /// <summary>
+    /// Frames the editor and its two buttons inside the surface the dialog actually got. The
+    /// editor is confined to the upper half and the buttons start at the lower half: the
+    /// on-screen keyboard owns the bottom of the screen and cannot always be dismissed, so
+    /// anything placed there would be hidden while the user is typing.
+    /// </summary>
+    static void LayoutKeyboardDialog(UIView view, UITextView textView, UIButton btnOK, UIButton btnCancel)
+    {
+        var bounds = view.Bounds;
+
+        var insets = view.SafeAreaInsets;
+
+        const float margin = 20f;
+
+        const float buttonWidth = 120f;
+
+        const float buttonHeight = 50f;
+
+        const float buttonGap = 40f;
+
+        var viewWidth = (float)bounds.Width;
+
+        var viewHeight = (float)bounds.Height;
+
+        var safeTop = (float)insets.Top;
+
+        var safeBottom = (float)insets.Bottom;
+
+        // Capped so the field does not stretch across a wide iPad/Catalyst window.
+        var width = Math.Min(Math.Max(viewWidth - margin * 2f, 80f), 620f);
+
+        var middle = viewHeight * 0.5f;
+
+        // The buttons open the lower half, which on phones still sits above the keyboard; the
+        // clamp keeps them above the home indicator when the surface is too short for that.
+        var buttonY = Math.Min(middle + margin, viewHeight - safeBottom - margin - buttonHeight);
+
+        var contentTop = safeTop + margin;
+
+        var contentBottom = Math.Min(middle - margin, buttonY - margin);
+
+        // Never taller than the upper half, so the keyboard cannot cover the text being edited.
+        var contentHeight = Math.Max(60f, contentBottom - contentTop);
+
+        textView.Frame = new CGRect((viewWidth - width) / 2f, contentTop, width, contentHeight);
+
+        var buttonsWidth = buttonWidth * 2f + buttonGap;
+
+        var buttonLeft = (viewWidth - buttonsWidth) / 2f;
+
+        btnOK.Frame = new CGRect(buttonLeft, buttonY, buttonWidth, buttonHeight);
+
+        btnCancel.Frame = new CGRect(buttonLeft + buttonWidth + buttonGap, buttonY, buttonWidth, buttonHeight);
     }
 }
 
@@ -655,6 +982,177 @@ internal class AppleFileService : IFileService
         }
 
         return taskFiles;
+    }
+    
+    /// <summary>
+    /// Presents the system photo picker and returns the selected photo as a task file, or an
+    /// empty list when the user cancels or the asset cannot be read. PHPickerViewController is
+    /// used instead of UIImagePickerController on purpose: it runs out of process, so the app
+    /// never asks for - or receives - photo-library access, and Info.plist needs no
+    /// NSPhotoLibraryUsageDescription.
+    /// </summary>
+    public async Task<List<TaskFile>> PickPhotos(bool open)
+    {
+        var tcs = new TaskCompletionSource<byte[]?>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // The picker and the presenting controller both touch UIKit, which asserts it is
+        // on the main thread (EnsureUIThread), while the click handler runs on the render
+        // thread.
+        UIApplication.SharedApplication.InvokeOnMainThread(() =>
+        {
+            try
+            {
+                var configuration = new PHPickerConfiguration
+                {
+                    Filter = PHPickerFilter.ImagesFilter,
+                    SelectionLimit = 1
+                };
+
+                var controller = new PHPickerViewController(configuration)
+                {
+                    // An interactive swipe-down would dismiss the sheet without calling the
+                    // delegate, leaving the awaited task pending forever; Cancel/Done always report.
+                    ModalInPresentation = true
+                };
+                var pickerDelegate = new PHPickerDelegate(tcs);
+
+                controller.Delegate = pickerDelegate;
+
+                activeController = controller;
+                activeDelegate = pickerDelegate;
+
+                var parent = Microsoft.Maui.ApplicationModel.Platform.GetCurrentUIViewController();
+
+                if (parent is null)
+                {
+                    Complete(null, null, tcs);
+                    return;
+                }
+
+                parent.PresentViewController(controller, true, null);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[PickPhotos] failed to present the picker: {ex.Message}");
+
+                Complete(null, null, tcs);
+            }
+        });
+
+        var bytes = await tcs.Task;
+
+        var taskFiles = new List<TaskFile>();
+
+        if (bytes is null || bytes.Length == 0)
+        {
+            return taskFiles;
+        }
+
+        // PHPicker hands back pixels instead of a file, so the PickFiles contract - a
+        // readable local path plus an optional stream - is re-established with a JPEG in
+        // the container's tmp directory. That is the same transient location the document
+        // picker imports into, and callers copy what they need before it is reclaimed.
+        var ext = ".jpg";
+
+        var name = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+            $"Photo-{DateTime.Now:yyyyMMddHHmmss}-{Guid.NewGuid():N}{ext}");
+
+        System.IO.FileStream stream = null;
+
+        try
+        {
+            System.IO.File.WriteAllBytes(name, bytes);
+
+            if (open)
+            {
+                stream = System.IO.File.OpenRead(name);
+            }
+        }
+        catch (Exception ex)
+        {
+            // A failed write must not travel up through the render loop; report it and
+            // return no file so the caller leaves the current image untouched.
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [PickPhotos] writing {name} failed: {ex.Message}");
+
+            return taskFiles;
+        }
+
+        taskFiles.Add(new TaskFile()
+        {
+            Name = name,
+            Ext = ext,
+            Text = "",
+            Stream = stream
+        });
+
+        return taskFiles;
+    }
+
+    // UIKit keeps the delegate weak and nothing else references the controller once
+    // PresentViewController returns, so both are rooted here for the lifetime of the sheet.
+    static PHPickerViewController? activeController;
+    static PHPickerDelegate? activeDelegate;
+
+    static void Complete(PHPickerViewController? controller, byte[]? bytes, TaskCompletionSource<byte[]?> tcs)
+    {
+        controller?.DismissViewController(true, null);
+
+        activeController = null;
+        activeDelegate = null;
+
+        tcs.TrySetResult(bytes);
+    }
+
+    sealed class PHPickerDelegate : PHPickerViewControllerDelegate
+    {
+        readonly TaskCompletionSource<byte[]?> tcs;
+
+        internal PHPickerDelegate(TaskCompletionSource<byte[]?> tcs)
+        {
+            this.tcs = tcs;
+        }
+
+        public override void DidFinishPicking(PHPickerViewController picker, PHPickerResult[] results)
+        {
+            // An empty result set means the user cancelled; there is nothing to load.
+            if (results is not { Length: > 0 })
+            {
+                Complete(picker, null, tcs);
+                return;
+            }
+
+            _ = ReadAsync(picker, results[0]);
+        }
+
+        async Task ReadAsync(PHPickerViewController picker, PHPickerResult result)
+        {
+            byte[]? bytes = null;
+
+            try
+            {
+                // PHPicker hands back an item provider instead of a file URL: the asset may
+                // be HEIC, PNG or RAW, so it is decoded to UIImage and re-encoded as JPEG.
+                // PickPhotos then exposes that single .jpg as a regular task file.
+                var image = await result.ItemProvider.LoadObjectAsync<UIImage>();
+
+                if (image is not null)
+                {
+                    using var data = image.AsJPEG(0.9f);
+
+                    bytes = data?.ToArray();
+
+                    image.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[PickPhotos] failed to read the picked photo: {ex.Message}");
+            }
+
+            // The item-provider load finishes on a worker queue; dismissing the sheet and
+            // completing the caller belong on the main thread.
+            UIApplication.SharedApplication.BeginInvokeOnMainThread(() => Complete(picker, bytes, tcs));
+        }
     }
 
     /// <summary>Seconds waited after present before probing whether the picker actually made it on screen.</summary>
@@ -1249,1373 +1747,5 @@ class UIPresentationControllerDelegate : UIAdaptivePresentationControllerDelegat
         // weak delegate reference, which would wrongly complete the picker tcs with null. Dismissal
         // is handled by DidDismiss above.
         base.Dispose(disposing);
-    }
-}
-
-internal class AppleGalleryService : IGalleryService
-{
-    public async Task<Stream> MediaAsset(MediaAsset mediaAsset)
-    {
-        var tcs = new TaskCompletionSource<Stream>();
-
-        if (mediaAsset.Path.IsNullOrWhiteSpace())
-        {
-            tcs.TrySetResult(null);
-        }
-        else if (System.IO.File.Exists(mediaAsset.Path))
-        {
-            tcs.TrySetResult(File.OpenRead(mediaAsset.Path));
-        }
-        else
-        {
-            // The Photos-backed fallback (requesting asset data through PHImageManager) was
-            // removed with the rest of the gallery path for App Store compliance.
-            tcs.TrySetResult(null);
-        }
-
-        return await tcs.Task;
-    }
-
-    public Task<List<MediaAsset>> MediaGallery()
-    {
-        // The Photos-backed gallery was removed for App Store compliance: reading the photo
-        // library requires an NSPhotoLibraryUsageDescription in every host app. Apple apps
-        // that need the photo library implement it in their own downstream code.
-        throw new NotImplementedException("MediaGallery: not implemented on Apple platforms; implement photo library access in the consuming app");
-    }
-
-    public async Task<List<MediaAsset>> MediaGalleryDownloads()
-    {
-        var directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Downloads");
-
-        if (Directory.Exists(directory))
-        {
-
-        }
-        else
-        {
-            Directory.CreateDirectory(directory);
-        }
-
-        var files = Directory.GetFiles(directory).NullToEmptyArray();
-
-        var mediaAssets = new List<MediaAsset>();
-
-        foreach (var file in files)
-        {
-            var fileInfo = new FileInfo(file);
-
-            if (fileInfo.Attributes.HasFlag(System.IO.FileAttributes.Hidden))
-            {
-
-            }
-            else
-            {
-                var mediaAsset = new MediaAsset()
-                {
-                    Name = Path.GetFileNameWithoutExtension(file),
-                    Ext = Path.GetExtension(file),
-                    Path = file,
-                    Size = fileInfo.Length,
-                    Type = MediaAssetType.Unknown,
-                    Time = fileInfo.CreationTime.ToDateTimeSeconds()
-                };
-
-                mediaAssets.Add(mediaAsset);
-            }
-        }
-
-        return mediaAssets;
-    }
-
-    public async Task<bool> MediaRemove(MediaAsset[] mediaAssets, bool delEmptyDirectory)
-    {
-        // Only container files can be removed: the Photos-backed removal was removed with the
-        // rest of the gallery path for App Store compliance.
-        var tcs = new TaskCompletionSource<bool>();
-
-        if (mediaAssets == null || mediaAssets.Length == 0)
-        {
-            tcs.TrySetResult(false);
-        }
-        else
-        {
-            foreach (var mediaDown in mediaAssets)
-            {
-                System.IO.File.Delete(mediaDown.Path);
-            }
-
-            tcs.TrySetResult(true);
-        }
-
-        return await tcs.Task;
-    }
-}
-
-//Need Record Permission
-internal class AppleRecordService : RecordService, IRecordService
-{
-    //Record (Record Permission)
-
-    // Output contract shared with the Android/Windows/Web recorders: 16 kHz, mono, 16-bit
-    // little-endian PCM in a .wav container, handed back as byte[] by StopRecord.
-    const double RecordSampleRate = 16000;
-
-    const int RecordChannels = 1;
-
-    const int RecordBitsPerSample = 16;
-
-    // Fallback capture rate: the Mac hardware sample rate, used to tell whether a refused Record()
-    // is about the 16 kHz request rather than about the input itself.
-    const double RecordHardwareSampleRate = 48000;
-
-    // The binding exposes no "None" member for the options flag enum.
-    const AVAudioSessionCategoryOptions NoCategoryOptions = (AVAudioSessionCategoryOptions)0;
-
-    /// <summary>One AVAudioRecorder configuration to try; see <see cref="Attempts"/>.</summary>
-    readonly record struct RecordAttempt(string Name, AVAudioSessionCategory Category, AVAudioSessionCategoryOptions Options, double SampleRate, bool ConfigureSession, bool Prepare);
-
-    // AVAudioRecorder configurations, plainest first: AllowBluetooth/DefaultToSpeaker are iOS-only
-    // options that Mac Catalyst accepts and then ignores, and its AVAudioSession is just a shim over
-    // CoreAudio, so every step drops one more iOS assumption. The first attempt whose Record()
-    // actually starts wins, and each attempt logs the session state it ended up with.
-    static readonly RecordAttempt[] Attempts =
-    {
-        new("record-16k", AVAudioSessionCategory.Record, NoCategoryOptions, RecordSampleRate, true, true),
-        new("record-16k-noprepare", AVAudioSessionCategory.Record, NoCategoryOptions, RecordSampleRate, true, false),
-        new("playandrecord-16k", AVAudioSessionCategory.PlayAndRecord, NoCategoryOptions, RecordSampleRate, true, true),
-        new("record-16k-nosession", AVAudioSessionCategory.Record, NoCategoryOptions, RecordSampleRate, false, true),
-        new("record-48k", AVAudioSessionCategory.Record, NoCategoryOptions, RecordHardwareSampleRate, true, true),
-        new("playandrecord-16k-iosoptions", AVAudioSessionCategory.PlayAndRecord, AVAudioSessionCategoryOptions.DefaultToSpeaker | AVAudioSessionCategoryOptions.AllowBluetooth, RecordSampleRate, true, true)
-    };
-
-    AVAudioRecorder recorder = null;
-
-    TaskCompletionSource<byte[]> tcsRecord = null;
-
-    // Absolute path of the temp .wav the live recorder writes to, kept so StopRecord can delete
-    // it once the bytes have been read back.
-    string recordFile = null;
-
-#if MACCATALYST
-    // AVAudioEngine capture state: the Mac Catalyst path, which reaches CoreAudio without going
-    // through the AVAudioSession shim at all.
-    AVAudioEngine captureEngine = null;
-
-    // Strong reference to the installed tap block: it is invoked on the audio render thread and has
-    // to stay alive for as long as the engine runs.
-    AVAudioNodeTapBlock captureTap = null;
-
-    object captureGate = null;
-
-    List<float> captureSamples = null;
-
-    double captureSampleRate = 0;
-#endif
-
-    public async Task<bool> StartRecord()
-    {
-        LastFailure = RecordFailure.None;
-
-        var permissions = new string[]
-        {
-            "RECORD_AUDIO"
-        };
-
-        var hasPermission = await DeviceServices.Core.RequestPermissionAsync(permissions);
-
-        if (!hasPermission)
-        {
-            Log(LogType.Error, "StartRecord aborted, microphone permission not granted");
-
-            LastFailure = RecordFailure.Permission;
-
-            return false;
-        }
-
-        // AVAudioSession and AVAudioRecorder have to be driven from the main thread: the permission
-        // await above resumes on an AVFoundation callback queue, and configuring the session off
-        // the main run loop is on its own enough to make PrepareToRecord return false. A recorder
-        // left over from a session that was never stopped is released there too.
-        var tcs = new TaskCompletionSource<bool>();
-
-        UIApplication.SharedApplication.InvokeOnMainThread(delegate
-        {
-            tcs.TrySetResult(StartRecorder());
-        });
-
-        var success = await tcs.Task;
-
-        if (!success)
-        {
-            try { AVAudioSession.SharedInstance().SetActive(false, out _); }
-            catch { }
-        }
-
-        return success;
-    }
-
-    bool StartRecorder()
-    {
-        try
-        {
-            ReleaseStaleRecorder();
-
-            var session = AVAudioSession.SharedInstance();
-
-            LogSessionState(session);
-
-#if MACCATALYST
-            // The session starts out in SoloAmbient, a category with no input route at all, and on Mac
-            // Catalyst that leaves AVAudioEngine.InputNode without a hardware format (CommonFormat
-            // Other, 0 Hz, 0 channels) even though the microphone itself works, so the session has to
-            // be brought into an input-capable category and activated before the engine can see any
-            // hardware. PlayAndRecord rather than Record because the engine also instantiates its
-            // output node, and because the app keeps playing sound while a recording is armed.
-            if (!session.SetCategory(AVAudioSessionCategory.PlayAndRecord, NoCategoryOptions, out NSError sessionError))
-            {
-                Log(LogType.Error, $"SetCategory(PlayAndRecord) failed: {Describe(sessionError)}");
-            }
-
-            if (!session.SetActive(true, out NSError activeError))
-            {
-                Log(LogType.Error, $"SetActive(true) failed: {Describe(activeError)}");
-            }
-
-            LogRouteState(session, "session");
-
-            // Fail fast when the machine has no microphone: neither AVAudioRecorder nor AVAudioEngine
-            // reports a usable error in that case, PrepareToRecord still succeeds and writes a 4 KB
-            // WAV skeleton, Record() just returns false, and every rung of the ladder below then
-            // spends seconds re-activating a session that can never get a route. Mac mini and Mac
-            // Studio ship without a built-in microphone.
-            if (!ProbeInputDevice(out string inputDevice))
-            {
-                Log(LogType.Error, $"no input device ({inputDevice}): CoreAudio exposes no microphone to this Mac, connect a USB, Bluetooth or 3.5mm microphone and select it under System Settings > Sound > Input");
-
-                LastFailure = RecordFailure.Device;
-
-                return false;
-            }
-
-            Log(LogType.None, $"input device present: {inputDevice}");
-
-            // AVAudioRecorder reads its samples through the AVAudioSession route, while the engine's
-            // input node is wired to the CoreAudio HAL, so the engine is the more direct path here.
-            if (TryStartEngineCapture())
-            {
-                return true;
-            }
-#endif
-
-            foreach (var attempt in Attempts)
-            {
-                if (TryStartRecording(session, attempt))
-                {
-                    return true;
-                }
-            }
-
-            Log(LogType.Error, "StartRecord failed for every capture path, check System Settings > Privacy & Security > Microphone (an app launched from a terminal or IDE inherits that parent's microphone status) and System Settings > Sound > Input for a selected device");
-
-            LastFailure = RecordFailure.Unknown;
-
-            return false;
-        }
-        catch (Exception ex)
-        {
-            Log(LogType.Error, $"StartRecord failed: {ex}");
-
-            LastFailure = RecordFailure.Unknown;
-
-            return false;
-        }
-    }
-
-    bool TryStartRecording(AVAudioSession session, RecordAttempt attempt)
-    {
-        // On Mac Catalyst the audio session is only a partial shim of the iOS one, so a rejected
-        // category or activation is logged and recording is attempted anyway: the recorder is the
-        // authority on whether an input is really reachable.
-        if (attempt.ConfigureSession)
-        {
-            if (!session.SetCategory(attempt.Category, attempt.Options, out NSError categoryError))
-            {
-                Log(LogType.Error, $"{attempt.Name}: SetCategory({attempt.Category}, {attempt.Options}) failed: {Describe(categoryError)}");
-            }
-
-            if (!session.SetActive(true, out NSError activeError))
-            {
-                Log(LogType.Error, $"{attempt.Name}: SetActive(true) failed: {Describe(activeError)}");
-            }
-        }
-        else
-        {
-            // Leave the session untouched (and deactivated) to tell a recorder-settings problem apart
-            // from a session-route problem.
-            try { session.SetActive(false, out _); }
-            catch { }
-        }
-
-        LogRouteState(session, attempt.Name);
-
-        var audioFile = Path.Combine(Path.GetTempPath(), $"Record-{DateTime.Now:yyyyMMddHHmmssfff}-{attempt.Name}.wav");
-
-        Directory.CreateDirectory(Path.GetDirectoryName(audioFile));
-
-        var audioSettings = new AudioSettings
-        {
-            SampleRate = attempt.SampleRate,
-            NumberChannels = RecordChannels,
-            AudioQuality = AVAudioQuality.High,
-            Format = AudioToolbox.AudioFormatType.LinearPCM,
-            LinearPcmBitDepth = RecordBitsPerSample,
-            // WAV is little-endian integer PCM; leaving these unset lets the encoder fall back to
-            // its own defaults and produces a file the STT backends cannot decode.
-            LinearPcmFloat = false,
-            LinearPcmBigEndian = false
-        };
-
-        recorder = AVAudioRecorder.Create(NSUrl.FromFilename(audioFile), audioSettings, out NSError createError);
-
-        if (recorder == null)
-        {
-            Log(LogType.Error, $"{attempt.Name}: AVAudioRecorder.Create({audioFile}) failed: {Describe(createError)}");
-
-            DeleteTempFile(audioFile);
-
-            return false;
-        }
-
-        // The completion source is captured locally: StopRecord nulls the field before this callback
-        // is delivered, and reading the field here would throw and leave the caller awaiting a task
-        // that never completes.
-        var tcs = new TaskCompletionSource<byte[]>();
-
-        tcsRecord = tcs;
-
-        recordFile = audioFile;
-
-        // Set once this attempt gives up: Stop still queues FinishedRecording, and the callback would
-        // otherwise read a temp file that the failure path has just deleted.
-        var abandoned = false;
-
-        recorder.FinishedRecording += (s, e) =>
-        {
-            byte[] bytes = null;
-
-            try
-            {
-                if (!abandoned && e.Status && System.IO.File.Exists(audioFile))
-                {
-                    bytes = System.IO.File.ReadAllBytes(audioFile);
-                }
-            }
-            catch (Exception ex)
-            {
-                Log(LogType.Error, $"FinishedRecording read failed: {ex.Message}");
-            }
-
-            tcs.TrySetResult(bytes);
-        };
-
-        var prepared = !attempt.Prepare || recorder.PrepareToRecord();
-
-        // Deliberately no RecordAt(DeviceCurrentTime + delay) retry here: it blocks the calling thread
-        // until the scheduled device time and, when the reason for the refusal is a missing input
-        // rather than timing, it adds tens of seconds of frozen UI for a guaranteed false.
-        var started = prepared && recorder.Record();
-
-        // bytes is the decisive fact: PrepareToRecord alone writes a 4 KB WAV skeleton (RIFF/JUNK/fmt
-        // /FLLR, no data chunk), so a non-zero size still says nothing about audio having been read.
-        Log(started ? LogType.None : LogType.Error, $"{attempt.Name}: prepareToRecord={prepared} record={started} recording={recorder.Recording} bytes={FileLength(audioFile)} createError={Describe(createError)} file={audioFile}");
-
-        if (!started)
-        {
-            abandoned = true;
-
-            try { recorder.Stop(); }
-            catch { }
-
-            recorder.Dispose();
-
-            recorder = null;
-
-            tcsRecord = null;
-
-            recordFile = null;
-
-            // Release the session so the next category can be activated cleanly.
-            try { session.SetActive(false, out _); }
-            catch { }
-
-            DeleteTempFile(audioFile);
-
-            return false;
-        }
-
-        return true;
-    }
-
-    /// <summary>
-    /// Logs the route the session actually ended up with, which is the fact that decides whether
-    /// AVAudioRecorder can ever start. inputAvailable=false with a non-empty availableInputs means the
-    /// session shim never built an input route; both empty means macOS gave the process no input
-    /// device at all. Purely diagnostic, so a failure here must never abort the attempt.
-    /// </summary>
-    static void LogRouteState(AVAudioSession session, string tag)
-    {
-        try
-        {
-            var inputs = session.CurrentRoute?.Inputs.NullToEmptyArray().Select(input => $"{input.PortType} {input.PortName}").ToArray();
-
-            var available = session.AvailableInputs.NullToEmptyArray().Select(input => $"{input.PortType} {input.PortName}").ToArray();
-
-            Log(LogType.None, $"{tag}: applied category={session.Category} options={session.CategoryOptions} sampleRate={session.SampleRate} inputAvailable={session.InputAvailable} inputs=[{string.Join(", ", inputs.NullToEmptyArray())}] availableInputs=[{string.Join(", ", available.NullToEmptyArray())}]");
-        }
-        catch (Exception ex)
-        {
-            Log(LogType.None, $"{tag}: route state unavailable: {ex.Message}");
-        }
-    }
-
-    static long FileLength(string file)
-    {
-        try
-        {
-            return file != null && System.IO.File.Exists(file) ? new FileInfo(file).Length : -1;
-        }
-        catch
-        {
-            return -1;
-        }
-    }
-
-#if MACCATALYST
-    /// <summary>
-    /// Reports whether a microphone exists at all, through AVCaptureDevice discovery. That is the
-    /// right authority because it is independent of AVAudioSession: AVAudioEngine.InputNode has no
-    /// hardware format until the session sits in an input-capable category and is active, so probing
-    /// through the engine reads CommonFormat Other / 0 Hz / 0 channels on a machine whose microphone
-    /// works perfectly and would short-circuit every capture path behind it. GetDefaultDevice is the
-    /// AVFoundation counterpart of CoreAudio's default input device.
-    /// </summary>
-    static bool ProbeInputDevice(out string detail)
-    {
-        detail = "none";
-
-        try
-        {
-            var device = AVCaptureDevice.GetDefaultDevice(AVMediaTypes.Audio);
-
-            if (device == null)
-            {
-                return false;
-            }
-
-            detail = $"{device.LocalizedName} connected={device.Connected} uniqueId={device.UniqueID}";
-
-            return device.Connected;
-        }
-        catch (Exception ex)
-        {
-            detail = ex.Message;
-
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// Captures through a tap on an AVAudioEngine input node instead of AVAudioRecorder. The recorder
-    /// reads its samples through the AVAudioSession route, and the Mac Catalyst session shim reports
-    /// inputAvailable=false with no route inputs even after the category was accepted, the session was
-    /// activated and TCC granted the microphone, which makes Record() answer false while
-    /// PrepareToRecord already wrote the WAV skeleton. The engine's input node is wired straight to the
-    /// CoreAudio HAL and does not depend on that route; the float samples it delivers are converted
-    /// here to the same 16 kHz mono PCM16 WAV the other platforms hand back.
-    /// </summary>
-    bool TryStartEngineCapture()
-    {
-        AVAudioEngine engine = null;
-
-        try
-        {
-            engine = new AVAudioEngine();
-
-            var inputNode = engine.InputNode;
-
-            if (inputNode == null)
-            {
-                Log(LogType.Error, "engine: no input node");
-
-                return false;
-            }
-
-            var format = inputNode.GetBusOutputFormat((nuint)0);
-
-            // Only float32 exposes a FloatChannelData pointer; any other common format would need a
-            // conversion node in between, and the recorder ladder below is the cheaper fallback.
-            if (format == null || format.CommonFormat != AVAudioCommonFormat.PCMFloat32 || format.SampleRate <= 0 || format.ChannelCount == 0)
-            {
-                Log(LogType.Error, $"engine: unusable input format commonFormat={format?.CommonFormat} sampleRate={format?.SampleRate} channels={format?.ChannelCount}");
-
-                return false;
-            }
-
-            var gate = new object();
-
-            var samples = new List<float>();
-
-            var channels = (int)format.ChannelCount;
-
-            // Deinterleaved float32 (what an input node normally reports) hands over one pointer per
-            // channel; interleaved keeps them all in the first buffer with a stride.
-            var interleaved = format.Interleaved;
-
-            // Runs on the audio render thread, so it must not throw, must not touch the audio session
-            // and must keep its per-callback allocation down to the mono scratch buffer.
-            var tap = new AVAudioNodeTapBlock((buffer, when) =>
-            {
-                try
-                {
-                    var frames = (int)buffer.FrameLength;
-
-                    if (frames <= 0)
-                    {
-                        return;
-                    }
-
-                    var channelPointers = buffer.FloatChannelData;
-
-                    if (channelPointers == IntPtr.Zero)
-                    {
-                        return;
-                    }
-
-                    var mono = new float[frames];
-
-                    var data = interleaved ? new float[frames * channels] : new float[frames];
-
-                    if (interleaved)
-                    {
-                        var pointer = System.Runtime.InteropServices.Marshal.ReadIntPtr(channelPointers, 0);
-
-                        if (pointer != IntPtr.Zero)
-                        {
-                            System.Runtime.InteropServices.Marshal.Copy(pointer, data, 0, data.Length);
-
-                            for (var i = 0; i < frames; i++)
-                            {
-                                var sum = 0f;
-
-                                for (var channel = 0; channel < channels; channel++)
-                                {
-                                    sum += data[i * channels + channel];
-                                }
-
-                                mono[i] = sum / channels;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        for (var channel = 0; channel < channels; channel++)
-                        {
-                            var pointer = System.Runtime.InteropServices.Marshal.ReadIntPtr(channelPointers, channel * IntPtr.Size);
-
-                            if (pointer == IntPtr.Zero)
-                            {
-                                continue;
-                            }
-
-                            System.Runtime.InteropServices.Marshal.Copy(pointer, data, 0, frames);
-
-                            for (var i = 0; i < frames; i++)
-                            {
-                                mono[i] += data[i];
-                            }
-                        }
-
-                        if (channels > 1)
-                        {
-                            for (var i = 0; i < frames; i++)
-                            {
-                                mono[i] /= channels;
-                            }
-                        }
-                    }
-
-                    lock (gate)
-                    {
-                        samples.AddRange(mono);
-                    }
-                }
-                catch
-                {
-                    // Never propagate into the render thread.
-                }
-            });
-
-            inputNode.InstallTapOnBus((nuint)0, (uint)4096, format, tap);
-
-            engine.Prepare();
-
-            if (!engine.StartAndReturnError(out NSError startError))
-            {
-                Log(LogType.Error, $"engine: StartAndReturnError failed: {Describe(startError)}");
-
-                return false;
-            }
-
-            // captureTap keeps the block alive: without a strong reference it can be collected while
-            // the engine is still running, which crashes the render thread.
-            captureEngine = engine;
-
-            captureTap = tap;
-
-            captureGate = gate;
-
-            captureSamples = samples;
-
-            captureSampleRate = format.SampleRate;
-
-            Log(LogType.None, $"engine: capturing sampleRate={captureSampleRate} channels={channels} commonFormat={format.CommonFormat} interleaved={interleaved} running={engine.Running}");
-
-            return true;
-        }
-        catch (Exception ex)
-        {
-            Log(LogType.Error, $"engine: capture start failed: {ex.Message}");
-
-            return false;
-        }
-        finally
-        {
-            // Torn down here only when the engine never became the live capture; ownership moved to
-            // captureEngine otherwise.
-            if (engine != null && !ReferenceEquals(engine, captureEngine))
-            {
-                try { engine.InputNode.RemoveTapOnBus((nuint)0); }
-                catch { }
-
-                try { engine.Dispose(); }
-                catch { }
-            }
-        }
-    }
-
-    /// <summary>
-    /// Stops the tap, resamples what it collected and packs it into the shared WAV contract.
-    /// </summary>
-    byte[] FinishEngineCapture()
-    {
-        var engine = captureEngine;
-
-        var gate = captureGate;
-
-        var samples = captureSamples;
-
-        var rate = captureSampleRate;
-
-        captureEngine = null;
-
-        captureTap = null;
-
-        captureGate = null;
-
-        captureSamples = null;
-
-        captureSampleRate = 0;
-
-        if (engine == null || samples == null || gate == null)
-        {
-            return null;
-        }
-
-        try
-        {
-            engine.InputNode.RemoveTapOnBus((nuint)0);
-        }
-        catch (Exception ex)
-        {
-            Log(LogType.None, $"engine: RemoveTapOnBus failed: {ex.Message}");
-        }
-
-        try
-        {
-            engine.Stop();
-
-            engine.Dispose();
-        }
-        catch (Exception ex)
-        {
-            Log(LogType.None, $"engine: shutdown failed: {ex.Message}");
-        }
-
-        float[] captured;
-
-        lock (gate)
-        {
-            captured = samples.ToArray();
-        }
-
-        var audio = Resample(captured, rate, RecordSampleRate);
-
-        Log(LogType.None, $"engine: captured {captured.Length} frames at {rate} Hz, delivering {audio.Length} frames at {RecordSampleRate} Hz");
-
-        return WriteWavPcm16Mono(audio, (int)RecordSampleRate);
-    }
-
-    /// <summary>
-    /// Linear resample, which is all speech at 48 kHz down to 16 kHz needs; the STT backends resample
-    /// again internally.
-    /// </summary>
-    static float[] Resample(float[] source, double sourceRate, double targetRate)
-    {
-        if (source == null || source.Length == 0)
-        {
-            return Array.Empty<float>();
-        }
-
-        if (sourceRate <= 0 || targetRate <= 0 || Math.Abs(sourceRate - targetRate) < 0.5)
-        {
-            return source;
-        }
-
-        var ratio = sourceRate / targetRate;
-
-        var count = (int)(source.Length / ratio);
-
-        var result = new float[count];
-
-        for (var i = 0; i < count; i++)
-        {
-            var position = i * ratio;
-
-            var index = (int)position;
-
-            if (index >= source.Length)
-            {
-                break;
-            }
-
-            var fraction = (float)(position - index);
-
-            var left = source[index];
-
-            var right = index + 1 < source.Length ? source[index + 1] : left;
-
-            result[i] = left + (right - left) * fraction;
-        }
-
-        return result;
-    }
-
-    /// <summary>
-    /// Writes the canonical 44-byte WAV header plus little-endian PCM16 samples, the layout
-    /// Whisper.ReadWavPcm16 walks chunk by chunk.
-    /// </summary>
-    static byte[] WriteWavPcm16Mono(float[] samples, int sampleRate)
-    {
-        samples ??= Array.Empty<float>();
-
-        var dataBytes = samples.Length * 2;
-
-        var bytes = new byte[44 + dataBytes];
-
-        using var stream = new MemoryStream(bytes);
-        using var writer = new BinaryWriter(stream);
-
-        writer.Write("RIFF"u8.ToArray());
-        writer.Write(36 + dataBytes);
-        writer.Write("WAVE"u8.ToArray());
-        writer.Write("fmt "u8.ToArray());
-        writer.Write(16);
-        writer.Write((short)1);
-        writer.Write((short)RecordChannels);
-        writer.Write(sampleRate);
-        writer.Write(sampleRate * RecordChannels * RecordBitsPerSample / 8);
-        writer.Write((short)(RecordChannels * RecordBitsPerSample / 8));
-        writer.Write((short)RecordBitsPerSample);
-        writer.Write("data"u8.ToArray());
-        writer.Write(dataBytes);
-
-        foreach (var sample in samples)
-        {
-            writer.Write((short)(Math.Clamp(sample, -1f, 1f) * 32767f));
-        }
-
-        writer.Flush();
-
-        return bytes;
-    }
-#endif
-
-    /// <summary>
-    /// Drops a recorder whose StopRecord never ran (the caller was closed or threw in between), so
-    /// the field does not stay occupied and silently block every later attempt. A caller still
-    /// awaiting that session is completed with null instead of hanging.
-    /// </summary>
-    void ReleaseStaleRecorder()
-    {
-#if MACCATALYST
-        if (captureEngine != null)
-        {
-            Log(LogType.None, "releasing the leftover engine capture");
-
-            FinishEngineCapture();
-        }
-#endif
-
-        var rec = recorder;
-
-        var tcs = tcsRecord;
-
-        var file = recordFile;
-
-        recorder = null;
-
-        tcsRecord = null;
-
-        recordFile = null;
-
-        if (rec == null)
-        {
-            return;
-        }
-
-        Log(LogType.None, "releasing the leftover recorder");
-
-        try { rec.Stop(); }
-        catch { }
-
-        try { rec.Dispose(); }
-        catch { }
-
-        tcs?.TrySetResult(null);
-
-        DeleteTempFile(file);
-    }
-
-    static void DeleteTempFile(string file)
-    {
-        // The temp .wav is only an intermediate; callers keep the bytes, same as the Windows
-        // recorder which deletes its temp file after reading it back.
-        try
-        {
-            if (file != null && System.IO.File.Exists(file))
-            {
-                System.IO.File.Delete(file);
-            }
-        }
-        catch (Exception ex)
-        {
-            Log(LogType.None, $"temp cleanup failed: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// Logs the permission, route and mute facts that decide whether PrepareToRecord can ever
-    /// succeed. Purely diagnostic, so a failure here must never abort the recording attempt.
-    /// </summary>
-    static void LogSessionState(AVAudioSession session)
-    {
-        try
-        {
-            var inputs = session.CurrentRoute?.Inputs.NullToEmptyArray().Select(input => $"{input.PortType} {input.PortName}").ToArray();
-
-            Log(LogType.None, $"tcc={AVCaptureDevice.GetAuthorizationStatus(AVAuthorizationMediaType.Audio)} {AudioApplicationState()} category={session.Category} inputAvailable={session.InputAvailable} sampleRate={session.SampleRate} inputs=[{string.Join(", ", inputs.NullToEmptyArray())}] temp={Path.GetTempPath()}");
-        }
-        catch (Exception ex)
-        {
-            Log(LogType.None, $"session state unavailable: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// AVAudioApplication, which also reports the system-level microphone mute, only exists on
-    /// iOS/Mac Catalyst 17+ while the engine still supports 15+, so the query is version gated.
-    /// </summary>
-    static string AudioApplicationState()
-    {
-        if (OperatingSystem.IsIOSVersionAtLeast(17) || OperatingSystem.IsMacCatalystVersionAtLeast(17))
-        {
-            var application = AVAudioApplication.SharedInstance;
-
-            return $"recordPermission={application.RecordPermission} inputMuted={application.InputMuted}";
-        }
-
-        return "recordPermission=unavailable";
-    }
-
-    static string Describe(NSError error)
-    {
-        return error == null ? "none" : $"{error.Domain} {error.Code} {error.LocalizedDescription}";
-    }
-
-    static void Log(LogType logType, string message)
-    {
-        DeviceServices.BaseApp?.AddLog(logType, $"{DateTime.UtcNow} [Record] {message}");
-    }
-
-    public async Task<byte[]> StopRecord()
-    {
-#if MACCATALYST
-        // The engine path never touches the recorder, the temp file or FinishedRecording: it hands
-        // back the WAV bytes it assembled from the tap itself.
-        if (captureEngine != null)
-        {
-            var captured = FinishEngineCapture();
-
-            try { AVAudioSession.SharedInstance().SetActive(false, out _); }
-            catch { }
-
-            return captured;
-        }
-#endif
-
-        var rec = recorder;
-
-        var tcs = tcsRecord;
-
-        var file = recordFile;
-
-        recorder = null;
-
-        tcsRecord = null;
-
-        recordFile = null;
-
-        if (rec == null || tcs == null)
-        {
-            return null;
-        }
-
-        try
-        {
-            rec.Stop();
-        }
-        catch (Exception ex)
-        {
-            Log(LogType.Error, $"StopRecord stop failed: {ex.Message}");
-        }
-
-        // Stop only queues audioRecorderDidFinishRecording on the main run loop, and disposing the
-        // recorder before that callback lands drops it, so wait for the file to be finalized first.
-        // The timeout keeps a lost callback from hanging the caller forever.
-        var completed = await Task.WhenAny(tcs.Task, Task.Delay(5000)) == tcs.Task;
-
-        if (!completed)
-        {
-            Log(LogType.Error, "StopRecord timed out waiting for FinishedRecording");
-        }
-
-        try
-        {
-            rec.Dispose();
-        }
-        catch (Exception ex)
-        {
-            Log(LogType.Error, $"StopRecord dispose failed: {ex.Message}");
-        }
-
-        try { AVAudioSession.SharedInstance().SetActive(false, out _); }
-        catch { }
-
-        var bytes = completed ? await tcs.Task : null;
-
-        DeleteTempFile(file);
-
-        return bytes;
-    }
-
-    public Task<INativeImageDecoder?> CaptureScreen()
-    {
-        // iOS and MacCatalyst sandbox mode does not allow capturing external screen content.
-        return Task.FromResult<INativeImageDecoder?>(null);
-    }
-
-    public Task<INativeImageDecoder?> CaptureApp()
-    {
-        // Inject the TaskCompletionSource, set the NeedCaptureApp flag,
-        // then let the render thread detect it in AfterRender, read back from GPU, and call TrySetResult.
-        var tcs = new TaskCompletionSource<INativeImageDecoder?>();
-        BaseApp.CaptureAppTcs = tcs;
-        return tcs.Task;
-    }
-
-    /// <summary>
-    /// Decodes the audio of any container AVFoundation understands (.m4a/.m4v/.mp4/.mov/.mp3 ...)
-    /// into a complete WAV: 16 kHz mono 16-bit PCM behind the canonical 44-byte RIFF header. That is
-    /// the very output contract StopRecord has, and the only layout the STT front ends parse.
-    /// AVAssetReaderTrackOutput does the decoding, the channel mixing and the resampling in one pass,
-    /// and only the audio track is requested, so audio-only files and movies both work.
-    /// Blocking, so callers run it on a background thread.
-    /// </summary>
-    public byte[] DecodeToWavPcm16(string path)
-    {
-        if (!System.IO.File.Exists(path))
-        {
-            throw new InvalidDataException($"The audio file does not exist: {path}");
-        }
-
-        using var asset = AVAsset.FromUrl(NSUrl.FromFilename(path))
-            ?? throw new InvalidDataException($"Failed to open the audio file: {path}");
-
-        var audioTrack = asset.Tracks.FirstOrDefault(track => track.MediaType == AVMediaTypes.Audio.GetConstant()!)
-            ?? throw new InvalidDataException($"The file does not contain an audio track: {path}");
-
-        using var reader = new AVAssetReader(asset, out NSError error)
-            ?? throw new InvalidDataException(error?.LocalizedDescription ?? "Failed to create AVAssetReader.");
-
-        var audioSettings = new AudioSettings
-        {
-            Format = AudioToolbox.AudioFormatType.LinearPCM,
-            LinearPcmBigEndian = false,
-            LinearPcmFloat = false,
-            LinearPcmBitDepth = RecordBitsPerSample,
-            NumberChannels = RecordChannels,
-            SampleRate = RecordSampleRate
-        };
-
-        using var audioOutput = new AVAssetReaderTrackOutput(audioTrack, audioSettings);
-
-        reader.AddOutput(audioOutput);
-
-        if (!reader.StartReading())
-        {
-            throw new InvalidDataException(reader.Error?.LocalizedDescription ?? "Failed to start reading the audio track.");
-        }
-
-        using var pcm = new MemoryStream();
-
-        while (reader.Status == AVAssetReaderStatus.Reading)
-        {
-            using var sample = audioOutput.CopyNextSampleBuffer();
-
-            if (sample == null)
-            {
-                break;
-            }
-
-            using var blockBuffer = sample.GetDataBuffer();
-
-            if (blockBuffer == null)
-            {
-                continue;
-            }
-
-            nuint dataLength = blockBuffer.DataLength;
-
-            if (dataLength == 0)
-            {
-                continue;
-            }
-
-            var chunk = new byte[(int)dataLength];
-            var handle = GCHandle.Alloc(chunk, GCHandleType.Pinned);
-
-            try
-            {
-                nuint offset = 0;
-                var status = blockBuffer.CopyDataBytes(offset, dataLength, handle.AddrOfPinnedObject());
-
-                if (status == 0) // kCMBlockBufferNoErr
-                {
-                    pcm.Write(chunk, 0, chunk.Length);
-                }
-            }
-            finally
-            {
-                handle.Free();
-            }
-        }
-
-        if (reader.Status != AVAssetReaderStatus.Completed)
-        {
-            throw new InvalidDataException(reader.Error?.LocalizedDescription ?? $"Failed to decode the audio track ({reader.Status}).");
-        }
-
-        var pcmBytes = pcm.ToArray();
-
-        if (pcmBytes.Length == 0)
-        {
-            throw new InvalidDataException($"The audio track did not contain any samples: {path}");
-        }
-
-        Log(LogType.None, $"decode: '{Path.GetFileName(path)}' -> {pcmBytes.Length / (RecordChannels * RecordBitsPerSample / 8)} frames at {RecordSampleRate} Hz");
-
-        return WriteWavPcm16(pcmBytes, (int)RecordSampleRate);
-    }
-
-    /// <summary>
-    /// Writes the canonical 44-byte WAV header in front of little-endian PCM16 bytes that already are
-    /// in the recorder's output format, so no conversion is left to do.
-    /// </summary>
-    static byte[] WriteWavPcm16(byte[] pcm, int sampleRate)
-    {
-        var bytes = new byte[44 + pcm.Length];
-
-        using var stream = new MemoryStream(bytes);
-        using var writer = new BinaryWriter(stream);
-
-        writer.Write("RIFF"u8.ToArray());
-        writer.Write(36 + pcm.Length);
-        writer.Write("WAVE"u8.ToArray());
-        writer.Write("fmt "u8.ToArray());
-        writer.Write(16);
-        writer.Write((short)1);
-        writer.Write((short)RecordChannels);
-        writer.Write(sampleRate);
-        writer.Write(sampleRate * RecordChannels * RecordBitsPerSample / 8);
-        writer.Write((short)(RecordChannels * RecordBitsPerSample / 8));
-        writer.Write((short)RecordBitsPerSample);
-        writer.Write("data"u8.ToArray());
-        writer.Write(pcm.Length);
-        writer.Write(pcm);
-
-        writer.Flush();
-
-        return bytes;
-    }
-}
-
-internal class AppleDownloadService : IDownloadService
-{
-    DownloadColumns downloadColumns = null;
-
-    SeasonTask downloadTask = null;
-
-    static string DownloadDir
-    {
-        get
-        {
-            // Downloads are staged inside the app container. Writing into the real ~/Downloads folder
-            // (the container's Data/Downloads symlink) would require the entitlement
-            // com.apple.security.files.downloads.read-write, which Apple does not allow, so
-            // user-visible saves go through the system save panel in DownloadSave instead.
-            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Downloads");
-        }
-    }
-
-    public string Download(string url)
-    {
-        var id = DateTime.Now.ToDateTimeMilliseconds();
-
-        var fileName = Path.GetFileName(url);
-
-        var file = Path.Combine(DownloadDir, fileName);
-
-        downloadTask = new SeasonTask();
-
-        downloadColumns = new DownloadColumns();
-
-        var preTime = DateTime.Now;
-
-        var time = 0d;
-
-        long preAlready = 0;
-
-        downloadTask.Task = r =>
-        {
-            time += (DateTime.Now - preTime).TotalSeconds;
-
-            preTime = DateTime.Now;
-
-            var percent = downloadTask.Messages[0].ToInt();
-
-            var already = long.Parse(downloadTask.Messages[1]);
-
-            var total = long.Parse(downloadTask.Messages[2]);
-
-            downloadColumns.Id = id;
-            downloadColumns.Title = "";
-            downloadColumns.Desc = "";
-            downloadColumns.MediaType = "";
-            downloadColumns.LocalUri = file;
-            downloadColumns.TotalSize = (long)total;
-            downloadColumns.Already = already;
-
-            if (time >= 0.1f)
-            {
-                time -= 0.1f;
-
-                downloadColumns.Speed = (int)(downloadColumns.Already - preAlready) * 10;
-
-                preAlready = downloadColumns.Already;
-            }
-            else
-            {
-
-            }
-
-            downloadColumns.Progress = (int)percent;
-
-            downloadColumns.Status = percent == 100f ? "Successful" : "Running";   //Paused   Pending  Running  Successful  Failed
-        };
-
-        Task.Run(async () =>
-        {
-            var bytes = await Season.Net.WebClient.HttpDownload("", url, downloadTask);
-
-            File.WriteAllBytes(file, bytes);
-
-            downloadTask = null;
-
-            downloadColumns = null;
-        });
-
-        return id;
-    }
-
-    public void DownloadCancel(string requestId)
-    {
-        downloadTask.CancellationTokenSource.Cancel();
-
-        downloadColumns = null;
-
-        downloadTask = null;
-    }
-
-    public void DownloadDel(string directory, string name)
-    {
-        string file = "";
-
-        if (directory.IsNullOrWhiteSpace())
-        {
-            file = Path.Combine(DownloadDir, name);
-        }
-        else
-        {
-            file = Path.Combine(DownloadDir, directory, name);
-        }
-
-        if (System.IO.File.Exists(file))
-        {
-            System.IO.File.Delete(file);
-        }
-    }
-
-    public void DownloadNew(string directory, string name)
-    {
-        DownloadDel(directory, name);
-
-        if (directory.IsNullOrWhiteSpace())
-        {
-
-        }
-        else
-        {
-            directory = Path.Combine(DownloadDir, directory);
-
-            if (Directory.Exists(directory))
-            {
-
-            }
-            else
-            {
-                Directory.CreateDirectory(directory);
-            }
-        }
-    }
-
-    public DownloadColumns DownloadQuery(string requestId, float time)
-    {
-        if (downloadColumns == null || downloadColumns.Id == requestId)
-        {
-            return downloadColumns;
-        }
-        else
-        {
-            return null;
-        }
-    }
-
-    public void DownloadSave(string directory, string name, byte[] bytes, bool openFolder)
-    {
-#if MACCATALYST
-        // App Store compliance: the real ~/Downloads folder cannot be written to without the
-        // entitlement com.apple.security.files.downloads.read-write, which Apple does not allow.
-        // Hand the bytes to the system save panel (UIDocumentPicker ExportToService) instead: it
-        // runs on com.apple.security.files.user-selected.read-write and lets the user pick the
-        // destination folder and file name explicitly.
-        Task.Run(async () =>
-        {
-            try
-            {
-                using var stream = new MemoryStream(bytes);
-
-                await DeviceServices.File.SaveFile(name, stream, CancellationToken.None);
-            }
-            catch (Exception ex)
-            {
-                // Dismissing the save panel is a normal outcome and must not read as a failure.
-                if (ex.Message is not "Cancelled")
-                    DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [DownloadSave] save panel for {name} failed: {ex}");
-            }
-        });
-#else
-        if (directory.IsNullOrWhiteSpace())
-        {
-            directory = DownloadDir;
-        }
-        else
-        {
-            directory = Path.Combine(DownloadDir, directory);
-        }
-
-        var file = Path.Combine(directory, name);
-
-        try
-        {
-            if (Directory.Exists(directory))
-            {
-
-            }
-            else
-            {
-                Directory.CreateDirectory(directory);
-            }
-
-            using (var fs = System.IO.File.Open(file, FileMode.Append))
-            {
-                fs.Write(bytes);
-
-                fs.Close();
-            }
-        }
-        catch (Exception ex)
-        {
-            // Never let an IO failure here tear down the app: downloads run inside the
-            // render/update loop.
-            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [DownloadSave] file={file} failed err={ex}");
-
-            return;
-        }
-
-        // openFolder is intentionally ignored: iOS has no file manager UI to reveal a folder in.
-#endif
-    }
-
-    public void DownloadUpdate(string directory, string name, string namenew)
-    {
-        string fileName = "";
-
-        string fileNameNew = "";
-
-        if (directory.IsNullOrWhiteSpace())
-        {
-            fileName = Path.Combine(DownloadDir, name);
-
-            fileNameNew = Path.Combine(DownloadDir, namenew);
-        }
-        else
-        {
-            fileName = Path.Combine(DownloadDir, directory, name);
-
-            fileNameNew = Path.Combine(DownloadDir, directory, namenew);
-        }
-
-        File.Move(fileName, fileNameNew, true);
     }
 }

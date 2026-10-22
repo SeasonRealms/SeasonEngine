@@ -197,6 +197,15 @@ public class SimplePicker : Panel
             Width = stMax;
         }
 
+        // Callers may ask for a fixed width (for example 680) that is wider than a
+        // phone canvas. Clamp it to the viewport so the left icon and border stay
+        // on screen instead of being positioned at a negative X.
+        var maxWidth = DeviceServices.BaseApp.ExtendResolution.X - 20;
+        if (maxWidth > 0 && Width > maxWidth)
+        {
+            Width = maxWidth;
+        }
+
         Height = SourcesView.Count * LineHeight + 120;
 
         if (posY + Height > DeviceServices.BaseApp.ExtendResolution.Y)
@@ -236,7 +245,7 @@ public class SimplePicker : Panel
         }
 
         descBorder.Update(time, posX: border.PosX, posY: posY + border.Height + 15, width: border.Width, height: desc.Height + 40);
-        descGround.Update(time, posX: descBorder.PosX + 2, posY: posY + 2, width: 500 - 4, height: descBorder.Height - 4);
+        descGround.Update(time, posX: descBorder.PosX + 2, posY: posY + 2, width: (Width ?? 500f) - 4, height: descBorder.Height - 4);
         desc.Content = Desc;
         desc.WidthRequest = (int)Width - 30;
         desc.Update(time, posX: posX + 15, posY: descBorder.PosY + 10);
@@ -317,7 +326,7 @@ public class SimplePicker : Panel
             }
         }
 
-        if (border.MouseOver)
+        if (border.IsHit)
         {
             result = true;
         }
