@@ -47,15 +47,6 @@ public class AppDelegate : UIApplicationDelegate
         };
         Runtime.MarshalObjectiveCException += (_, e) => e.ExceptionMode = MarshalObjectiveCExceptionMode.UnwindManagedCode;
 
-        // UIScene lifecycle: Xcode 27 requires it on iOS and Mac Catalyst. When the
-        // app declares UIApplicationSceneManifest, UIKit delivers the window through
-        // the scene delegate's WillConnect. Creating one here as well would leave an
-        // unattached extra window behind the scene's.
-        if (NSBundle.MainBundle.InfoDictionary?["UIApplicationSceneManifest"] is not null)
-        {
-            return true;
-        }
-
         var scene = UIKit.UIApplication.SharedApplication.ConnectedScenes
             .ToArray().FirstOrDefault(cs => cs is UIWindowScene) as UIWindowScene;
 
@@ -65,13 +56,7 @@ public class AppDelegate : UIApplicationDelegate
         // which makes the whole UI scale up and clips the bottom and right edges.
         // Retina pixel resolution is obtained automatically from MTKView.DrawableSize,
         // which equals bounds times contentScaleFactor.
-        // Prefer the scene's coordinate space: on a resizable iPad the scene can be smaller
-        // than the screen (Split View, Slide Over, Stage Manager, windowed apps), and a
-        // screen-sized window would start larger than the scene until UIKit resizes it.
-        var sceneBounds = GetSceneBounds(scene);
-        var bounds = sceneBounds.Width > 0 && sceneBounds.Height > 0
-            ? sceneBounds
-            : scene?.Screen.Bounds ?? UIScreen.MainScreen.Bounds;
+        var bounds = scene?.Screen.Bounds ?? UIScreen.MainScreen.Bounds;
 
 #if MACCATALYST
         if (scene?.Titlebar is { } titlebar)
@@ -81,15 +66,33 @@ public class AppDelegate : UIApplicationDelegate
         }
 #endif
 
-        CreateWindow(scene is not null ? new UIWindow(scene) : CreateLegacyWindow(bounds));
+        var uiWindow = new UIWindow(bounds);
+        var uiViewController = new MetalViewController(uiWindow);
+
+        uiViewController.PrefersStatusBarHidden();
+
+        uiWindow.RootViewController = uiViewController;
+        uiWindow.MakeKeyAndVisible();
 
 #if MACCATALYST
-        _geometryRestoreAttempts = 0;
-        _restoreTargetFrame = null;
-        if (scene != null) RestoreWindowGeometry(scene);
+        if (scene.Titlebar is { } titlebar)
+        {
+            titlebar.TitleVisibility = UITitlebarTitleVisibility.Hidden;
+            titlebar.Toolbar = null;
+        }
 #endif
 
-        return true;
+        var window = CreateWindow(new UIWindow(scene));
+
+#if MACCATALYST
+        // The scene path bypasses the legacy FinishedLaunching window setup, so the
+        // Catalyst titlebar and geometry restore must run here as well.
+        _geometryRestoreAttempts = 0;
+        _restoreTargetFrame = null;
+        RestoreWindowGeometry(scene);
+#endif
+
+        return window;
     }
 
     /// <summary>
@@ -116,27 +119,7 @@ public class AppDelegate : UIApplicationDelegate
     /// UIApplicationSceneManifest and drives the UIScene lifecycle.
     /// </summary>
     internal static UIWindow CreateSceneWindow(UIWindowScene scene)
-    {
-#if MACCATALYST
-        if (scene.Titlebar is { } titlebar)
-        {
-            titlebar.TitleVisibility = UITitlebarTitleVisibility.Hidden;
-            titlebar.Toolbar = null;
-        }
-#endif
-
-        var window = CreateWindow(new UIWindow(scene));
-
-#if MACCATALYST
-        // The scene path bypasses the legacy FinishedLaunching window setup, so the
-        // Catalyst titlebar and geometry restore must run here as well.
-        _geometryRestoreAttempts = 0;
-        _restoreTargetFrame = null;
-        RestoreWindowGeometry(scene);
-#endif
-
-        return window;
-    }
+        => CreateWindow(new UIWindow(scene));
 
     public override void WillTerminate(UIApplication application)
     {
@@ -474,13 +457,29 @@ public class MetalView : MTKView
             scale = 1f;
         }
 
-        // Input arrives in window points; the active window's display scale is the
-        // authoritative conversion on foldables and external displays.
-        var window = AppleDeviceCore.GetActiveWindowScene()?.Windows.FirstOrDefault();
+            var nativeScale = (float)UIScreen.MainScreen.NativeScale;
 
-        var nativeScale = (float)(window?.TraitCollection.DisplayScale ?? UIScreen.MainScreen.NativeScale);
+            TouchService.PoX = (int)(pos.X * nativeScale / DeviceServices.BaseApp.Scale);
+            TouchService.PoY = (int)(pos.Y * nativeScale / DeviceServices.BaseApp.Scale);
 
-        return new Vector2((float)location.X * nativeScale / scale, (float)location.Y * nativeScale / scale);
+            switch (touch.Phase)
+            {
+                case UITouchPhase.Moved:
+                    TouchService.IsMoved = true;
+                    break;
+                case UITouchPhase.Began:
+                    TouchService.isDown = true;
+                    break;
+                case UITouchPhase.Ended:
+                    TouchService.isDown = false;
+                    break;
+                case UITouchPhase.Cancelled:
+                    TouchService.isDown = false;
+                    break;
+                default:
+                    break;
+            }
+        }
     }
 }
 
