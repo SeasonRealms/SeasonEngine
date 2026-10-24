@@ -102,7 +102,7 @@ public class ImageView : Panel
         clear.Alpha = ShowClear ? Alpha : 0f;
         clear.Enable = Enable;
         clear.Color = Enable ? (clear.MouseOver ? Season.Basic.Colors.Red : Season.Basic.Colors.LightBlack) : Season.Basic.Colors.Gray;
-        clear.Update(time, posX: Image.PosX + Image.Width + 20, posY: Image.PosY, width: ImageWidth, height: ImageHeight);
+        clear.Update(time, posX: Image.PosX + Image.Width + 16, posY: Image.PosY, width: ImageWidth, height: ImageHeight);
 
         return result;
     }

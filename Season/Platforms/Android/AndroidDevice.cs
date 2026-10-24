@@ -26,6 +26,7 @@ using Uri = Android.Net.Uri;
 using Orientation0 = Android.Content.Res.Orientation;
 using Build = Android.OS.Build;
 using WindowInsets = Android.Views.WindowInsets;
+using WindowManagerFlags = Android.Views.WindowManagerFlags;
 
 using Season.Platforms.Shared.LinuxAndroid;
 
@@ -147,6 +148,50 @@ internal class AndroidDeviceCore : IDeviceCore
                 return Vector4.Zero;
             }
         }
+    }
+
+    /// <summary>
+    /// Keeps the display awake while a model load or generation is running, or while a game
+    /// pins the screen, by setting FLAG_KEEP_SCREEN_ON on the activity window. The flag needs
+    /// no WAKE_LOCK permission and is scoped to the visible window: when the app leaves the
+    /// foreground Android ignores it, so the process can still be suspended.
+    /// </summary>
+    public void SetKeepAwake(bool enabled)
+    {
+        var activity = AndroidApp.MainActivity;
+
+        if (activity is null)
+        {
+            return;
+        }
+
+        void Apply()
+        {
+            try
+            {
+                var window = activity.Window;
+
+                if (window is null)
+                {
+                    return;
+                }
+
+                if (enabled)
+                {
+                    window.AddFlags(WindowManagerFlags.KeepScreenOn);
+                }
+                else
+                {
+                    window.ClearFlags(WindowManagerFlags.KeepScreenOn);
+                }
+            }
+            catch (Exception)
+            {
+                // Losing the keep-awake hint must never break the operation that asked for it.
+            }
+        }
+
+        activity.RunOnUiThread(Apply);
     }
 
     public string GetLocalIP()
@@ -950,6 +995,13 @@ internal class AndroidFileService : IFileService
         }
 
         return taskFiles;
+    }
+
+    public Task<List<TaskFile>> PickPhotos(bool open)
+    {
+        // No native photo picker on this platform: report an empty selection, which callers
+        // handle exactly like a cancelled picker.
+        return Task.FromResult(new List<TaskFile>());
     }
 
     /// <summary>

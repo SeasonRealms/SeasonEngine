@@ -101,13 +101,19 @@ public class Sprite2D : SpriteBase, IRenderOrder
 		return result;
     }
 
+    public override bool ContainsPoint(float x, float y)
+    {
+        return Enable && !Name.IsNullOrWhiteSpace()
+            && PosX <= x && x <= PosX + Width && PosY <= y && y <= PosY + Height;
+    }
+
 	public override bool Draw()
 	{
 		var result = false;
 
 		if (base.Draw())
 		{
-			if (Name.IsNullOrWhiteSpace() || Alpha == 0 || PosX == 0 && PosY == 0)
+			if (Name.IsNullOrWhiteSpace() || Alpha == 0 || !Positioned)
 			{
 
 			}

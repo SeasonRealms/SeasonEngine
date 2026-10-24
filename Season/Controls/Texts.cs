@@ -1660,6 +1660,15 @@ public class Texts : Control, IRenderOrder
         return result;
     }
 
+    public override bool ContainsPoint(float x, float y)
+    {
+        // Same visual top MouseOver uses: the layout box starts at PosY, the glyphs do not.
+        var visualTop = PosY + VisualOffsetTop;
+
+        return Enable && Alpha > 0 && Ready
+            && PosX <= x && x <= PosX + Width && visualTop <= y && y <= visualTop + Height;
+    }
+
     public override bool Draw()
     {
         var result = false;
@@ -1668,7 +1677,7 @@ public class Texts : Control, IRenderOrder
         {
             if (Ready)
             {
-                if (PosX == 0 && PosY == 0)
+                if (!Positioned)
                 {
 
                 }

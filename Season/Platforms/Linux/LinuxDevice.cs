@@ -610,6 +610,13 @@ internal class LinuxFileService : IFileService
         return Task.FromResult(taskFiles!);
     }
 
+    public Task<List<TaskFile>> PickPhotos(bool open)
+    {
+        // No native photo picker on this platform: report an empty selection, which callers
+        // handle exactly like a cancelled picker.
+        return Task.FromResult(new List<TaskFile>());
+    }
+
     public Task<string> SaveFile(string fileName, Stream stream, CancellationToken cancellationToken)
     {
         // Same model as PickFiles: a null parent instead of a stray window, and the

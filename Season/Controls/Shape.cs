@@ -151,13 +151,20 @@ public class Shape : SpriteBase, IRenderOrder
         return result;
     }
 
+    public override bool ContainsPoint(float x, float y)
+    {
+        return Enable && PosX <= x && x <= PosX + Width && PosY <= y && y <= PosY + Height;
+    }
+
     public override bool Draw()
     {
         var result = false;
 
         if (base.Draw())
         {
-            if (!Ready || Alpha == 0 || Width == 0 || Height == 0 || PosX == 0 && PosY == 0)
+            // An explicitly laid-out (0, 0) shape must draw; only controls that never
+            // received a position are skipped (a full-screen background sits at the origin).
+            if (!Ready || Alpha == 0 || Width == 0 || Height == 0 || !Positioned)
             {
                 
             }

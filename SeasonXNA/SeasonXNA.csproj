@@ -13,7 +13,7 @@
 	  <RepositoryType>git</RepositoryType>
 
 	  <PackageId>SeasonXNA</PackageId>
-	  <Version>0.2.0</Version>
+	  <Version>0.4.0</Version>
 	  <Authors>SeasonRealms</Authors>
 	  <Description>An XNA-style core 2D drawing compatibility layer for existing MonoGame/XNA sprite, image and text code, hosted by the SeasonEngine runtime</Description>
 	  <Product>SeasonXNA</Product>

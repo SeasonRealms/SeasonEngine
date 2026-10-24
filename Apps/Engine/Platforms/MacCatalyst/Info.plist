@@ -38,5 +38,24 @@
 	<string>Assets.xcassets/appicon.appiconset</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>SeasonEngine access to the microphone is required to record your voice input.</string>
+	<!-- Xcode 27 requires the UIScene lifecycle on Mac Catalyst as well as iOS.
+	     The engine's Metal host is process-wide, so multiple scenes are disabled. -->
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneConfigurationName</key>
+					<string>Default Configuration</string>
+					<key>UISceneDelegateClassName</key>
+					<string>SeasonSceneDelegate</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
 </dict>
 </plist>

@@ -47,6 +47,15 @@ public class AppDelegate : UIApplicationDelegate
         };
         Runtime.MarshalObjectiveCException += (_, e) => e.ExceptionMode = MarshalObjectiveCExceptionMode.UnwindManagedCode;
 
+        // UIScene lifecycle: Xcode 27 requires it on iOS and Mac Catalyst. When the
+        // app declares UIApplicationSceneManifest, UIKit delivers the window through
+        // the scene delegate's WillConnect. Creating one here as well would leave an
+        // unattached extra window behind the scene's.
+        if (NSBundle.MainBundle.InfoDictionary?["UIApplicationSceneManifest"] is not null)
+        {
+            return true;
+        }
+
         var scene = UIKit.UIApplication.SharedApplication.ConnectedScenes
             .ToArray().FirstOrDefault(cs => cs is UIWindowScene) as UIWindowScene;
 
@@ -56,7 +65,13 @@ public class AppDelegate : UIApplicationDelegate
         // which makes the whole UI scale up and clips the bottom and right edges.
         // Retina pixel resolution is obtained automatically from MTKView.DrawableSize,
         // which equals bounds times contentScaleFactor.
-        var bounds = scene?.Screen.Bounds ?? UIScreen.MainScreen.Bounds;
+        // Prefer the scene's coordinate space: on a resizable iPad the scene can be smaller
+        // than the screen (Split View, Slide Over, Stage Manager, windowed apps), and a
+        // screen-sized window would start larger than the scene until UIKit resizes it.
+        var sceneBounds = GetSceneBounds(scene);
+        var bounds = sceneBounds.Width > 0 && sceneBounds.Height > 0
+            ? sceneBounds
+            : scene?.Screen.Bounds ?? UIScreen.MainScreen.Bounds;
 
 #if MACCATALYST
         if (scene?.Titlebar is { } titlebar)
@@ -66,13 +81,7 @@ public class AppDelegate : UIApplicationDelegate
         }
 #endif
 
-        var uiWindow = new UIWindow(bounds);
-        var uiViewController = new MetalViewController(uiWindow);
-
-        uiViewController.PrefersStatusBarHidden();
-
-        uiWindow.RootViewController = uiViewController;
-        uiWindow.MakeKeyAndVisible();
+        CreateWindow(scene is not null ? new UIWindow(scene) : CreateLegacyWindow(bounds));
 
 #if MACCATALYST
         _geometryRestoreAttempts = 0;
@@ -81,6 +90,52 @@ public class AppDelegate : UIApplicationDelegate
 #endif
 
         return true;
+    }
+
+    /// <summary>
+    /// Installs the Metal host on a window. Shared by the legacy FinishedLaunching
+    /// path and the UIScene path so both build the root view controller identically.
+    /// </summary>
+    internal static UIWindow CreateWindow(UIWindow window)
+    {
+        var uiViewController = new MetalViewController(window);
+
+        // PrefersStatusBarHidden is a query, not a setter; calling it here does not
+        // hide the status bar. Kept as-is so the layout offsets stay unchanged.
+        uiViewController.PrefersStatusBarHidden();
+
+        window.RootViewController = uiViewController;
+        window.MakeKeyAndVisible();
+
+        return window;
+    }
+
+    /// <summary>
+    /// Creates the window for a UIScene connection. UIWindow(UIWindowScene) attaches
+    /// the window to the scene, which UIKit requires when the app declares a
+    /// UIApplicationSceneManifest and drives the UIScene lifecycle.
+    /// </summary>
+    internal static UIWindow CreateSceneWindow(UIWindowScene scene)
+    {
+#if MACCATALYST
+        if (scene.Titlebar is { } titlebar)
+        {
+            titlebar.TitleVisibility = UITitlebarTitleVisibility.Hidden;
+            titlebar.Toolbar = null;
+        }
+#endif
+
+        var window = CreateWindow(new UIWindow(scene));
+
+#if MACCATALYST
+        // The scene path bypasses the legacy FinishedLaunching window setup, so the
+        // Catalyst titlebar and geometry restore must run here as well.
+        _geometryRestoreAttempts = 0;
+        _restoreTargetFrame = null;
+        RestoreWindowGeometry(scene);
+#endif
+
+        return window;
     }
 
     public override void WillTerminate(UIApplication application)
@@ -107,6 +162,10 @@ public class AppDelegate : UIApplicationDelegate
     public override void OnActivated(UIApplication application)
     {
         SeasonMTKViewDelegate.Current?.SetPaused(false);
+
+        // iOS may clear the idle-timer flag while the app is inactive; re-assert the
+        // transient load/generation hold, or a game's pinned hold, on return.
+        KeepAwake.Reapply();
     }
 
 #if MACCATALYST
@@ -248,79 +307,180 @@ public class AppDelegate : UIApplicationDelegate
         DeviceServices.BaseApp.RequestSaveSettings();
     }
 #endif
+
+    /// <summary>
+    /// Bounds of the scene's coordinate space. iOS 26 obsoleted
+    /// UIWindowScene.CoordinateSpace in favour of EffectiveGeometry; the legacy member
+    /// stays as the pre-26 fallback. Split out of the frame-based UIWindow initializer
+    /// as well so CA1422 stays clean on the current SDK.
+    /// </summary>
+    static CGRect GetSceneBounds(UIWindowScene? scene)
+    {
+        if (scene is null)
+        {
+            return CGRect.Empty;
+        }
+
+#if IOS
+        if (OperatingSystem.IsIOSVersionAtLeast(26))
+#else
+        if (OperatingSystem.IsMacCatalystVersionAtLeast(26))
+#endif
+        {
+            return scene.EffectiveGeometry.CoordinateSpace.Bounds;
+        }
+
+#pragma warning disable CA1422
+        return scene.CoordinateSpace.Bounds;
+#pragma warning restore CA1422
+    }
+
+    /// <summary>
+    /// Frame-initialized window for hosts that declare no scene manifest. iOS 26
+    /// obsoleted this initializer, but pre-26 runtimes still need it; every Season
+    /// app ships a UIApplicationSceneManifest and takes the scene overload instead.
+    /// </summary>
+    static UIWindow CreateLegacyWindow(CGRect bounds)
+    {
+#pragma warning disable CA1422
+        return new UIWindow(bounds);
+#pragma warning restore CA1422
+    }
 }
 
 /// <summary>
 /// MetalView:
 /// MTKView subclass that maps UIView touch events into TouchService.
 /// Equivalent to the SDL_EVENT_MOUSE_BUTTON_DOWN, UP, and MOTION branches inside LinuxApp.RunLoop.
+/// Presses are reported as events (RaiseDown/RaiseUp/RaiseCancel) rather than as a sampled
+/// level, so a tap that begins and ends between two frames is not lost.
 /// </summary>
 public class MetalView : MTKView
 {
+    // Native handles of the fingers currently on the view. Only the first one drives the
+    // single-pointer state: a second finger cancels the press instead of taking it over, so
+    // lifting either finger after a pinch can no longer produce a phantom click.
+    readonly HashSet<IntPtr> activeTouches = new();
+
+    IntPtr? primaryTouch;
+
     public MetalView(CGRect frame, IMTLDevice device) : base(frame, device) { }
 
     public override void TouchesBegan(NSSet nsset, UIEvent uIEvent)
     {
         base.TouchesBegan(nsset, uIEvent);
-        ProcessTouches(nsset);
+
+        var touches = nsset.ToArray<UITouch>();
+
+        for (int i = 0; i < touches.Length; ++i)
+        {
+            activeTouches.Add(touches[i].Handle);
+
+            if (activeTouches.Count == 1)
+            {
+                primaryTouch = touches[i].Handle;
+
+                var pos = LogicalPosition(touches[i]);
+
+                TouchService.RaiseDown(pos.X, pos.Y);
+            }
+            else if (primaryTouch is not null)
+            {
+                // The gesture is no longer a click: drop the pending press so the
+                // eventual lift cannot report a release.
+                primaryTouch = null;
+
+                TouchService.RaiseCancel();
+            }
+        }
     }
 
     public override void TouchesEnded(NSSet nsset, UIEvent uIEvent)
     {
         base.TouchesEnded(nsset, uIEvent);
-        ProcessTouches(nsset);
+
+        var touches = nsset.ToArray<UITouch>();
+
+        for (int i = 0; i < touches.Length; ++i)
+        {
+            var handle = touches[i].Handle;
+
+            activeTouches.Remove(handle);
+
+            // Only the tracked finger ends the press; a second finger lifting mid-gesture
+            // must not release the one the UI is following.
+            if (primaryTouch != handle)
+            {
+                continue;
+            }
+
+            primaryTouch = null;
+
+            var pos = LogicalPosition(touches[i]);
+
+            TouchService.RaiseUp(pos.X, pos.Y);
+        }
     }
 
     public override void TouchesMoved(NSSet nsset, UIEvent uIEvent)
     {
         base.TouchesMoved(nsset, uIEvent);
-        ProcessTouches(nsset);
+
+        var touches = nsset.ToArray<UITouch>();
+
+        for (int i = 0; i < touches.Length; ++i)
+        {
+            if (primaryTouch != touches[i].Handle)
+            {
+                continue;
+            }
+
+            var pos = LogicalPosition(touches[i]);
+
+            TouchService.PoX = (int)pos.X;
+            TouchService.PoY = (int)pos.Y;
+        }
     }
 
     public override void TouchesCancelled(NSSet nsset, UIEvent uIEvent)
     {
         base.TouchesCancelled(nsset, uIEvent);
-        ProcessTouches(nsset);
+
+        var touches = nsset.ToArray<UITouch>();
+
+        for (int i = 0; i < touches.Length; ++i)
+        {
+            activeTouches.Remove(touches[i].Handle);
+        }
+
+        // A cancelled touch is not a click, and it is not a drag either: drop the press.
+        if (primaryTouch is not null)
+        {
+            primaryTouch = null;
+
+            TouchService.RaiseCancel();
+        }
     }
 
-    void ProcessTouches(NSSet nsset)
+    /// <summary>Converts a touch location to logical pixels, the unit TouchService uses.</summary>
+    static Vector2 LogicalPosition(UITouch touch)
     {
-        if ((long)nsset.Count == 0)
-            return;
+        var location = touch.LocationInView(touch.View);
 
-        var touchesArray = nsset.ToArray<UITouch>();
+        var scale = DeviceServices.BaseApp?.Scale ?? 1f;
 
-        for (int i = 0; i < touchesArray.Length; ++i)
+        if (!float.IsFinite(scale) || scale <= 0f)
         {
-            var touch = touchesArray[i];
-
-            var location = touch.LocationInView(touch.View);
-
-            var pos = new Vector2((float)location.X, (float)location.Y);
-
-            var nativeScale = (float)UIScreen.MainScreen.NativeScale;
-
-            TouchService.PoX = (int)(pos.X * nativeScale / DeviceServices.BaseApp.Scale);
-            TouchService.PoY = (int)(pos.Y * nativeScale / DeviceServices.BaseApp.Scale);
-
-            switch (touch.Phase)
-            {
-                case UITouchPhase.Moved:
-                    TouchService.IsMoved = true;
-                    break;
-                case UITouchPhase.Began:
-                    TouchService.isDown = true;
-                    break;
-                case UITouchPhase.Ended:
-                    TouchService.isDown = false;
-                    break;
-                case UITouchPhase.Cancelled:
-                    TouchService.isDown = false;
-                    break;
-                default:
-                    break;
-            }
+            scale = 1f;
         }
+
+        // Input arrives in window points; the active window's display scale is the
+        // authoritative conversion on foldables and external displays.
+        var window = AppleDeviceCore.GetActiveWindowScene()?.Windows.FirstOrDefault();
+
+        var nativeScale = (float)(window?.TraitCollection.DisplayScale ?? UIScreen.MainScreen.NativeScale);
+
+        return new Vector2((float)location.X * nativeScale / scale, (float)location.Y * nativeScale / scale);
     }
 }
 

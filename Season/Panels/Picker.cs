@@ -489,7 +489,7 @@ public class Picker : Panel
             Alpha = 1f;
         }
 
-        if (TouchService.IsReleased && !ground.MouseOver)
+        if (TouchService.IsReleased && !ground.IsHit)
         {
             TouchService.IsReleased = false;
 

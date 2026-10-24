@@ -50,6 +50,18 @@ public abstract class BaseApp : Panel
 
     public Vector2 CompositionScale { get; internal set; }
 
+    public int ReservedTop 
+    { 
+        get; 
+        set; 
+    }
+
+    public int ReservedRight 
+    { 
+        get; 
+        set; 
+    }
+
     public List<string> Logs = new();
 
     public float Scale { get; internal set; } = 1f;
@@ -564,6 +576,35 @@ public abstract class BaseApp : Panel
         TouchService.Update(time, Scale);
 
         KeyboardService.Update(time);
+
+        var duo = DeviceServices.Profile;
+
+        if (duo.IsOuterScreen)
+        {
+            if (ExtendResolution.X < ExtendResolution.Y)
+            {
+                ReservedTop = 0;
+                ReservedRight = 84 + 12;
+            }
+            else
+            {
+                ReservedTop = 84 + 12;
+                ReservedRight = 0;
+            }
+        }
+        else if (duo.IsInnerScreen)
+        {
+            if (ExtendResolution.X < ExtendResolution.Y)
+            {
+                ReservedTop = 84 + 12;
+                ReservedRight = 0;
+            }
+            else
+            {
+                ReservedTop = 0;
+                ReservedRight = 84 + 12;
+            }
+        }
 
         return base.Update(time, alpha: alpha, posX: posX, posY: posY, width: width, height: height);
     }

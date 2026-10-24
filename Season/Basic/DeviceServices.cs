@@ -10,6 +10,13 @@ public static class DeviceServices
 
     public static IDeviceCore Core { get; private set; }
 
+    /// <summary>
+    /// Semantic hardware traits of the current device, such as which display of a foldable
+    /// hosts the UI. Every platform reports <see cref="DeviceProfile.None"/> unless it has
+    /// something meaningful to add, so callers can read this unconditionally.
+    /// </summary>
+    public static DeviceProfile Profile => Core?.Profile ?? DeviceProfile.None;
+
     public static IMediaPlayer Media { get; private set; }
 
     public static IDialogService Dialog { get; private set; }
@@ -83,6 +90,152 @@ public static class DeviceServices
     }
 }
 
+/// <summary>
+/// Cross-platform screen-idle guard. A hold has two independent sources:
+/// <list type="bullet">
+/// <item>a reference-counted transient hold, taken while a long-running foreground
+/// operation (a model load or a generation) is in progress; and</item>
+/// <item>a permanent pin, taken by games and other full-screen experiences that must
+/// never let the display sleep for as long as they run.</item>
+/// </list>
+/// The platform flag stays set while either source is active, so a transient release
+/// can never clear a game's pin and a pin can never be cleared by an operation ending.
+/// </summary>
+public static class KeepAwake
+{
+    static readonly object gate = new();
+
+    static int count;
+
+    static bool pinned;
+
+    /// <summary>True when this guard was the one that last turned the platform flag on.</summary>
+    static bool applied;
+
+    /// <summary>
+    /// Marks the start of an operation that must not be interrupted by the screen
+    /// locking. Safe to call from any thread; the platform implementation marshals
+    /// to its UI thread.
+    /// </summary>
+    public static void Acquire()
+    {
+        lock (gate)
+        {
+            if (++count == 1)
+            {
+                Apply();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Marks the end of an operation started with <see cref="Acquire"/>. Extra releases
+    /// are ignored so an unbalanced caller cannot clear another operation's hold. A pin
+    /// keeps the display awake after the last transient hold is released.
+    /// </summary>
+    public static void Release()
+    {
+        lock (gate)
+        {
+            if (count == 0)
+            {
+                return;
+            }
+
+            if (--count == 0)
+            {
+                Apply();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pins the display awake for the lifetime of the host, independently of the transient
+    /// holds. Games call this once at startup; apps keep it off so the screen follows the
+    /// user's idle setting except while <see cref="Acquire"/> is held.
+    /// </summary>
+    public static void Pin(bool enabled)
+    {
+        lock (gate)
+        {
+            if (pinned == enabled)
+            {
+                return;
+            }
+
+            pinned = enabled;
+
+            Apply();
+        }
+    }
+
+    /// <summary>
+    /// Re-applies the active hold to the platform. Call when the host window may have
+    /// been recreated or its idle flag reset, such as when an activity resumes or an
+    /// app returns to the foreground. A flag set by a host outside this guard (for
+    /// example a game running against an older engine build) is left untouched.
+    /// </summary>
+    public static void Reapply()
+    {
+        lock (gate)
+        {
+            if (!pinned && count == 0 && !applied)
+            {
+                return;
+            }
+
+            Apply(force: true);
+        }
+    }
+
+    /// <summary>
+    /// Pushes the current state to the platform. <paramref name="force"/> re-sends the
+    /// value even when it matches the last one, which restores a window flag lost to an
+    /// activity or window rebuild.
+    /// </summary>
+    static void Apply(bool force = false)
+    {
+        var wanted = pinned || count > 0;
+
+        if (!force && wanted == applied)
+        {
+            return;
+        }
+
+        var core = DeviceServices.Core;
+
+        if (core is null)
+        {
+            return;
+        }
+
+        applied = wanted;
+
+        core.SetKeepAwake(wanted);
+    }
+}
+
+/// <summary>
+/// Hardware traits that describe the shape of the device rather than one model number, so a
+/// layout can adjust for it without sniffing for names. Only the Apple foldable fills this in
+/// today; a future Android foldable can report the same values without changing callers.
+/// </summary>
+/// <param name="IsFoldable">A device whose two displays differ in size and posture.</param>
+/// <param name="IsOuterScreen">UI is on the cover display: the smaller one that stays portrait.</param>
+/// <param name="IsInnerScreen">UI is on the main display, which rotates through four orientations.</param>
+/// <param name="HasSideControlColumn">A system-reserved column (status bar, camera, controls) runs down one side. Follows the live safe area, so it stays false until the window has been laid out.</param>
+/// <param name="SideControlWidth">Width of that reserved column in points; 0 when there is none, or before the first layout pass resolves it.</param>
+public readonly record struct DeviceProfile(
+    bool IsFoldable,
+    bool IsOuterScreen,
+    bool IsInnerScreen,
+    bool HasSideControlColumn,
+    float SideControlWidth)
+{
+    /// <summary>Not a foldable device, or the platform reports no traits.</summary>
+    public static DeviceProfile None => default;
+}
+
 public interface IDeviceCore
 {
     Platform Platform { get; }
@@ -106,6 +259,23 @@ public interface IDeviceCore
     /// next layout pass; the desktop platforms report zero.
     /// </summary>
     Vector4 SafeInsets { get; }
+
+    /// <summary>
+    /// Semantic hardware traits the layout cannot infer from size classes or the safe area, for
+    /// example which display of a foldable is active. Apple reads UIKit state to build it, so
+    /// callers take one snapshot for a layout pass instead of querying per frame from a worker;
+    /// the other platforms keep the default value.
+    /// </summary>
+    DeviceProfile Profile => DeviceProfile.None;
+
+    /// <summary>
+    /// Enables or disables the platform's screen-idle lock. Used by <see cref="KeepAwake"/>
+    /// to keep a long model load or generation, and a pinned game session, from being
+    /// interrupted when the user is not touching the screen. Platforms without an idle
+    /// timer keep the default no-op body; implementations must be safe to call from any
+    /// thread and must not throw.
+    /// </summary>
+    void SetKeepAwake(bool enabled) { }
 
     string GetLocalIP();
 
@@ -244,6 +414,8 @@ public interface IFileService
     Task<List<TaskFile>> PickFiles(FileType fileType, string[] exts, bool multiple, bool open);
 
     Task<string> SaveFile(string fileName, Stream stream, CancellationToken cancellationToken);
+
+    Task<List<TaskFile>> PickPhotos(bool open);
 
     void OpenFolder(string name);
 

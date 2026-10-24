@@ -45,10 +45,14 @@ internal class iOSDeviceCore : AppleDeviceCore
         info.IsUnifiedMemory = true;
 
         // iPad Pro and other large iPads carry far more memory and cooling headroom than
-        // a phone, so the recommendation ladder must tell them apart.
-        info.FormFactor = UIDevice.CurrentDevice.UserInterfaceIdiom == UIUserInterfaceIdiom.Pad
-            ? DeviceFormFactor.Tablet
-            : DeviceFormFactor.Phone;
+        // a phone, so the recommendation ladder must tell them apart. iPhone Duo reports the
+        // Pad idiom while unfolded, but its budget is still a phone's, so the hardware
+        // identifier takes precedence over the idiom.
+        info.FormFactor = AppleHardware.IsIPhoneDuo
+            ? DeviceFormFactor.Phone
+            : UIDevice.CurrentDevice.UserInterfaceIdiom == UIUserInterfaceIdiom.Pad
+                ? DeviceFormFactor.Tablet
+                : DeviceFormFactor.Phone;
 
         return info;
     }
