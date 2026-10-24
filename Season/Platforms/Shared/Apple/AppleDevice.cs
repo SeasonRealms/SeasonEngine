@@ -186,6 +186,112 @@ internal class AppleDeviceCore : IDeviceCore
         }
     }
 
+    /// <summary>
+    /// Semantic hardware traits for the foldable and <see cref="DeviceProfile.None"/> everywhere
+    /// else, including Mac Catalyst: the Platform check keeps a narrow desktop window or an iPad
+    /// Split View window from being mistaken for the cover display, since all three can be about
+    /// the same width. The two displays of the foldable share one model identifier and differ only
+    /// in the scene's native pixel size, so the screen kind comes from there and never from the
+    /// window bounds. The side column figures follow the window's live safe area and stay empty
+    /// until UIKit has laid it out: read the profile for the layout pass that consumes it instead
+    /// of caching the value read while the scene connects.
+    /// </summary>
+    public DeviceProfile Profile
+    {
+        get
+        {
+            try
+            {
+                if (Platform != Basic.Platform.iOS || !AppleHardware.IsIPhoneDuo)
+                {
+                    return DeviceProfile.None;
+                }
+
+                var scene = GetActiveWindowScene();
+
+                var screen = scene?.Screen;
+
+                if (screen is null)
+                {
+                    // The model is known but no scene has connected yet, so the device is a
+                    // foldable whose screen kind is still unknown rather than a plain phone.
+                    return new DeviceProfile(true, false, false, false, 0f);
+                }
+
+                var native = screen.NativeBounds;
+
+                var shortSide = (double)Math.Min(native.Width, native.Height);
+
+                var longSide = (double)Math.Max(native.Width, native.Height);
+
+                var isOuter = MatchesDisplay(OuterDisplay, shortSide, longSide);
+
+                var isInner = !isOuter && MatchesDisplay(InnerDisplay, shortSide, longSide);
+
+                var insets = SafeInsets;
+
+                return new DeviceProfile(true, isOuter, isInner, insets.Z > 0f, insets.Z);
+            }
+            catch (Exception)
+            {
+                return DeviceProfile.None;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Native pixel size of the cover display, short side first. NativeBounds is expressed in a
+    /// fixed portrait space, so the sides are compared sorted rather than as width and height.
+    /// </summary>
+    static readonly (double ShortSide, double LongSide) OuterDisplay = (1398d, 2034d);
+
+    /// <summary>Native pixel size of the main display, short side first.</summary>
+    static readonly (double ShortSide, double LongSide) InnerDisplay = (2007d, 2853d);
+
+    /// <summary>
+    /// Compares a native screen size with a known display. The tolerance absorbs the rounding
+    /// UIKit applies to native bounds; the model check that gates this comparison keeps a future
+    /// display of similar size from being mistaken for one of these.
+    /// </summary>
+    static bool MatchesDisplay((double ShortSide, double LongSide) display, double shortSide, double longSide)
+    {
+        const double tolerance = 8d;
+
+        return Math.Abs(shortSide - display.ShortSide) <= tolerance
+            && Math.Abs(longSide - display.LongSide) <= tolerance;
+    }
+
+    /// <summary>
+    /// Keeps the display awake while a model load or generation is running, or while a game
+    /// pins the screen. iOS is the only Apple target with an idle timer; Mac Catalyst follows
+    /// the Mac's own display sleep settings, so the method stays a no-op there.
+    /// </summary>
+    public void SetKeepAwake(bool enabled)
+    {
+#if IOS
+        void Apply()
+        {
+            try
+            {
+                UIApplication.SharedApplication.IdleTimerDisabled = enabled;
+            }
+            catch (Exception)
+            {
+                // Losing the idle-timer hint must never break the operation that asked for it.
+            }
+        }
+
+        if (NSThread.IsMain)
+        {
+            Apply();
+        }
+        else
+        {
+            UIApplication.SharedApplication.BeginInvokeOnMainThread(Apply);
+        }
+#endif
+    }
+
     public string GetLocalIP()
     {
         var ipAddress = "";
@@ -811,6 +917,61 @@ internal class AppleDialogService : IDialogService
         });
 
         return await tcs.Task;
+    }
+
+    /// <summary>
+    /// Frames the editor and its two buttons inside the surface the dialog actually got. The
+    /// editor is confined to the upper half and the buttons start at the lower half: the
+    /// on-screen keyboard owns the bottom of the screen and cannot always be dismissed, so
+    /// anything placed there would be hidden while the user is typing.
+    /// </summary>
+    static void LayoutKeyboardDialog(UIView view, UITextView textView, UIButton btnOK, UIButton btnCancel)
+    {
+        var bounds = view.Bounds;
+
+        var insets = view.SafeAreaInsets;
+
+        const float margin = 20f;
+
+        const float buttonWidth = 120f;
+
+        const float buttonHeight = 50f;
+
+        const float buttonGap = 40f;
+
+        var viewWidth = (float)bounds.Width;
+
+        var viewHeight = (float)bounds.Height;
+
+        var safeTop = (float)insets.Top;
+
+        var safeBottom = (float)insets.Bottom;
+
+        // Capped so the field does not stretch across a wide iPad/Catalyst window.
+        var width = Math.Min(Math.Max(viewWidth - margin * 2f, 80f), 620f);
+
+        var middle = viewHeight * 0.5f;
+
+        // The buttons open the lower half, which on phones still sits above the keyboard; the
+        // clamp keeps them above the home indicator when the surface is too short for that.
+        var buttonY = Math.Min(middle + margin, viewHeight - safeBottom - margin); // - buttonHeight);
+
+        var contentTop = safeTop + margin;
+
+        var contentBottom = Math.Min(middle - margin, buttonY - margin);
+
+        // Never taller than the upper half, so the keyboard cannot cover the text being edited.
+        var contentHeight = Math.Max(60f, contentBottom - contentTop);
+
+        textView.Frame = new CGRect((viewWidth - width) / 2f, contentTop, width, contentHeight);
+
+        var buttonsWidth = buttonWidth * 2f + buttonGap;
+
+        var buttonLeft = (viewWidth - buttonsWidth) / 2f;
+
+        btnOK.Frame = new CGRect(buttonLeft, buttonY, buttonWidth, buttonHeight);
+
+        btnCancel.Frame = new CGRect(buttonLeft + buttonWidth + buttonGap, buttonY, buttonWidth, buttonHeight);
     }
 }
 
