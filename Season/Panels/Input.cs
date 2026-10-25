@@ -20,6 +20,8 @@ public class Input : Panel
 
     public string Des { get; set; }
 
+    public int? DesWidth { get; set; }
+
     public Season.Controls.TextAlignment Alignment { get; set; }
 
     public Action OnAction, OnClear;
@@ -168,6 +170,7 @@ public class Input : Panel
 
         Desc.Translate = Translate;
         Desc.Content = Des;
+        Desc.WidthRequest = DesWidth;
         Desc.Update(time, alpha: Alpha, posX: Line.PosX, posY: Line.PosY + 5);
 
         return result;
