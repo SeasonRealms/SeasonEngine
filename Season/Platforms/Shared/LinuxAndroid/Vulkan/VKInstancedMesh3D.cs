@@ -318,11 +318,14 @@ internal unsafe class VKInstancedMesh3D : VKInstancedPrimitiveGroup
         {
             for (int i = 0; i < _prevInstanceWorldBuffers.Length; i++)
             {
+                // Bound at binding 14 by the sets already recorded into a frame in flight; retire instead of destroying
+                // (VUID-vkDestroyBuffer-buffer-00922). Unmapping is host-side only and can stay immediate.
+                var retired = _prevInstanceWorldBuffers[i];
                 if (_mappedPrevInstanceWorldBuffers != null && i < _mappedPrevInstanceWorldBuffers.Length
-                    && _mappedPrevInstanceWorldBuffers[i] != null && _prevInstanceWorldBuffers[i].Memory.Handle != 0)
-                    Device.Vk.UnmapMemory(Device.LogicalDevice, _prevInstanceWorldBuffers[i].Memory);
-                if (_prevInstanceWorldBuffers[i].Memory.Handle != 0)
-                    Device.ResourceManager.DestroyBuffer(_prevInstanceWorldBuffers[i]);
+                    && _mappedPrevInstanceWorldBuffers[i] != null && retired.Memory.Handle != 0)
+                    Device.Vk.UnmapMemory(Device.LogicalDevice, retired.Memory);
+                if (retired.Memory.Handle != 0)
+                    Device.EnqueueDeferredRelease(() => Device.ResourceManager.DestroyBuffer(retired));
             }
         }
 

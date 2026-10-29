@@ -77,7 +77,7 @@ public sealed class GtaoEffect : ComputeEffect
 
     public override string Name => "gtao";
 
-    public override ComputePhase Phase => ComputePhase.AfterScene;
+    public override ComputePhase Phase => ComputePhase.AfterOpaque;
 
     public override bool Initialize(IGraphics g)
     {
@@ -160,6 +160,12 @@ public sealed class GtaoEffect : ComputeEffect
 
     public override void Record(IGraphics g)
     {
+        FrameSchedule.AoReady = false;
+        var resolution = DeviceServices.BaseApp.DeviceResolution;
+        if (RenderQuality.Current.AmbientOcclusion != AoMode.Gtao || FrameSchedule.SceneDepth == null
+            || _width != Math.Max(8u, (uint)resolution.X / 2)
+            || _height != Math.Max(8u, (uint)resolution.Y / 2))
+            return;
         var camera = DeviceServices.BaseApp.Camera;
         uint gx = (_width + 7) / 8;
         uint gy = (_height + 7) / 8;
@@ -176,7 +182,9 @@ public sealed class GtaoEffect : ComputeEffect
         p[4] = RenderQuality.Current.AoRadius;
         p[5] = _width;
         p[6] = _height;
-        g.DispatchCompute(new ComputeDispatchArgs
+        p[7] = 0;
+        _mainRes![0] = FrameSchedule.SceneDepth;
+        if (!g.TryDispatchCompute(new ComputeDispatchArgs
         {
             Kernel = _main!,
             Params = MemoryMarshal.AsBytes(p),
@@ -184,7 +192,7 @@ public sealed class GtaoEffect : ComputeEffect
             GroupsX = gx,
             GroupsY = gy,
             GroupsZ = 1,
-        });
+        })) return;
 
         // 2) gtaoBlur X/Y passes: raw -> blurx -> ao.
         // Depth-aware separable Gaussian blur, with direction supplied through Params.
@@ -193,7 +201,7 @@ public sealed class GtaoEffect : ComputeEffect
         b[1] = _height;
         b[2] = 1f;
         b[3] = 0f;
-        g.DispatchCompute(new ComputeDispatchArgs
+        if (!g.TryDispatchCompute(new ComputeDispatchArgs
         {
             Kernel = _blur!,
             Params = MemoryMarshal.AsBytes(b),
@@ -201,11 +209,11 @@ public sealed class GtaoEffect : ComputeEffect
             GroupsX = gx,
             GroupsY = gy,
             GroupsZ = 1,
-        });
+        })) return;
 
         b[2] = 0f;
         b[3] = 1f;
-        g.DispatchCompute(new ComputeDispatchArgs
+        if (!g.TryDispatchCompute(new ComputeDispatchArgs
         {
             Kernel = _blur!,
             Params = MemoryMarshal.AsBytes(b),
@@ -213,7 +221,8 @@ public sealed class GtaoEffect : ComputeEffect
             GroupsX = gx,
             GroupsY = gy,
             GroupsZ = 1,
-        });
+        })) return;
+        FrameSchedule.AoReady = true;
     }
 
     public void Dispose()
@@ -223,7 +232,10 @@ public sealed class GtaoEffect : ComputeEffect
         _blur?.Dispose();
         _blur = null;
         if (FrameSchedule.AoTexture == TextureName)
+        {
             FrameSchedule.AoTexture = null;
+            FrameSchedule.AoReady = false;
+        }
     }
 
     // Shader sources (single source of truth; slots follow the class-level binding

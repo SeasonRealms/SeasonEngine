@@ -1318,6 +1318,8 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     internal static DXRenderTarget[] BackbufferRTs = null!;
     internal static DXRenderTarget? MsaaSceneRT;
     static DXRenderTarget? _activePass;
+    internal static DXRenderTarget? ActiveTarget => _activePass;
+    internal static DXRenderTarget? ActiveDepthTarget { get; private set; }
 
     /// <summary>Identifier of the current pass (set by BeginPass / restored by
     /// EndPass, default is Scene).
@@ -1427,6 +1429,12 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
 
         uint width = desc.MatchBackbufferSize ? (uint)Display.Viewport.Width : desc.Width;
         uint height = desc.MatchBackbufferSize ? (uint)Display.Viewport.Height : desc.Height;
+        // Publish the resolved size into Desc, the only size the shared layer can read back. A MatchBackbufferSize
+        // descriptor is requested with Width/Height = 0, so without this every consumer above the backend sees a zero-size
+        // target - the fog pass sizes its froxel grid from here and would decline to register at grid 0. Synchronize
+        // RenderTargetSizes does the same for Web after JS rebuilds a target.
+        rt.Desc.Width = width;
+        rt.Desc.Height = height;
         CreateOffscreenResourceAndViews(rt, width, height);
 
         _offscreenRTs.Add(rt);
@@ -1607,8 +1615,11 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     {
         foreach (var rt in _offscreenRTs)
         {
-            if (rt.Desc.MatchBackbufferSize)
-                CreateOffscreenResourceAndViews(rt, (uint)width, (uint)height);
+            if (!rt.Desc.MatchBackbufferSize) continue;
+            // Keep the published size in step with the resource, for the same reason CreateRenderTarget does.
+            rt.Desc.Width = (uint)width;
+            rt.Desc.Height = (uint)height;
+            CreateOffscreenResourceAndViews(rt, (uint)width, (uint)height);
         }
     }
 
@@ -1623,33 +1634,24 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         if (!_offscreenRTs.Remove(rt))
             return;
 
-        if (rt.Color != null)
-        {
-            rt.Color->Release();
-            rt.Color = null;
-        }
-
-        if (rt.Depth != null)
-        {
-            rt.Depth->Release();
-            rt.Depth = null;
-        }
-
-        if (rt.SrvIndex >= 0)
-        {
-            DescriptorAllocator.Free(rt.SrvIndex);
-            rt.SrvIndex = -1;
-        }
-
-        if (rt.DsvIndex >= 0)
-        {
-            _freeOffscreenDsvSlots.Push(rt.DsvIndex);
-            rt.DsvIndex = -1;
-        }
-
-        if (rt.RtvIndex != DXRenderTarget.NoRtv)
-            _freeOffscreenRtvSlots.Push(rt.RtvIndex);
+        // 雾可运行期注销；资源和描述符必须一起退休，不能覆盖在飞帧的 RTV/SRV。
+        nint color = (nint)rt.Color, depth = (nint)rt.Depth;
+        int srv = rt.SrvIndex, dsv = rt.DsvIndex;
+        uint rtv = rt.RtvIndex;
+        rt.Color = rt.Depth = null;
+        rt.SrvIndex = rt.DsvIndex = -1;
+        rt.RtvIndex = DXRenderTarget.NoRtv;
+        rt.GpuSrvHandle = default;
         rt.OwnsResource = false;
+        var allocator = DescriptorAllocator;
+        EnqueueDeferredRelease(GetCurrentRetireFenceValue(), () =>
+        {
+            if (color != 0) ((ID3D12Resource*)color)->Release();
+            if (depth != 0) ((ID3D12Resource*)depth)->Release();
+            if (srv >= 0) allocator.Free(srv);
+            if (dsv >= 0) _freeOffscreenDsvSlots.Push(dsv);
+            if (rtv != DXRenderTarget.NoRtv) _freeOffscreenRtvSlots.Push(rtv);
+        });
     }
 
     // ── GPU event markers (PIX / RenderDoc capture grouping) ──
@@ -1665,6 +1667,9 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         "OutlineMask\0"u8.ToArray(),
         "FinalBlit\0"u8.ToArray(),
         "Overlay\0"u8.ToArray(),
+        "SceneOpaque\0"u8.ToArray(),
+        "FogComposite\0"u8.ToArray(),
+        "SceneTransparent\0"u8.ToArray(),
         "Pass\0"u8.ToArray(),
     ];
 
@@ -1726,6 +1731,9 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     internal static void BeginPass(in PassDesc desc)
     {
         ActivePassId = desc.Id;
+        ActiveDepthTarget = null;
+        if (desc.Id is RenderPassId.Scene or RenderPassId.SceneOpaque or RenderPassId.Shadow)
+            DXFogCompositePipeline.ResetTransparent();
         int passIndex = (int)desc.Id;
         if ((uint)passIndex >= (uint)(_passLabels.Length - 1))
             passIndex = _passLabels.Length - 1;
@@ -1737,6 +1745,7 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         if (desc.ColorTarget == null && desc.DepthTarget is DXRenderTarget depthRT)
         {
             _activePass = depthRT;
+            ActiveDepthTarget = depthRT;
 
             SetViewportScissor(depthRT.Width, depthRT.Height);
 
@@ -1808,7 +1817,8 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
             GraphicsCommandList->ClearRenderTargetView(rtvHandle, clearColor, 0, null);
         }
 
-        if (desc.Id == RenderPassId.Scene || desc.Id == RenderPassId.OutlineMask)
+        bool scenePass = desc.Id is RenderPassId.Scene or RenderPassId.SceneOpaque or RenderPassId.SceneTransparent;
+        if (scenePass || desc.Id == RenderPassId.OutlineMask)
         {
             // Scene / OutlineMask bind depth. Post/FinalBlit are single-sampled
             // fullscreen passes and do not read or write depth. When MSAA is
@@ -1829,6 +1839,7 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
             {
                 sceneDepth.TransitionDepthTo(GraphicsCommandList, ResourceStates.DepthWrite);
                 dsvHandle = DsvHeapManager.GetCpuHandle((uint)sceneDepth.DsvIndex);
+                ActiveDepthTarget = sceneDepth;
             }
             bool bindDepth = desc.Id != RenderPassId.OutlineMask || _msaaSampleCount <= 1 || desc.DepthTarget is DXRenderTarget;
 
@@ -1839,7 +1850,7 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
             // MotionVectors and Msaa4x are already mutually exclusive after
             // initialization fallback, so this path never sees multisampled
             // color mixed with single-sampled velocity.
-            if (desc.Id == RenderPassId.Scene && desc.VelocityTarget is DXRenderTarget velocityRT)
+            if (scenePass && desc.VelocityTarget is DXRenderTarget velocityRT)
             {
                 velocityRT.TransitionTo(GraphicsCommandList, ResourceStates.RenderTarget);
 
@@ -1847,8 +1858,12 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
 
                 // Velocity always clears to zero, matching the optimized clear
                 // value: pixels not covered by geometry are static background.
-                float* velocityClear = stackalloc float[4] { 0f, 0f, 0f, 0f };
-                GraphicsCommandList->ClearRenderTargetView(velocityRtvHandle, velocityClear, 0, null);
+                // 透明阶段必须保留不透明阶段的速度，清除意图与颜色附件一致。
+                if (desc.ClearColorEnable)
+                {
+                    float* velocityClear = stackalloc float[4] { 0f, 0f, 0f, 0f };
+                    GraphicsCommandList->ClearRenderTargetView(velocityRtvHandle, velocityClear, 0, null);
+                }
 
                 CpuDescriptorHandle* rtvs = stackalloc CpuDescriptorHandle[2] { rtvHandle, velocityRtvHandle };
                 GraphicsCommandList->OMSetRenderTargets(2, rtvs, 0, bindDepth ? &dsvHandle : null);
@@ -1963,6 +1978,9 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         // Offscreen without MSAA stays in RenderTarget and needs no final barrier
 
         _activePass = null;
+        ActiveDepthTarget = null;
+        if (ActivePassId == RenderPassId.SceneTransparent)
+            DXFogCompositePipeline.ResetTransparent();
         ActivePassId = RenderPassId.Scene;
         PopDebugGroup();
     }

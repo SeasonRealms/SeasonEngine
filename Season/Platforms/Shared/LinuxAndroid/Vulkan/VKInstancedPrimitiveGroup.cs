@@ -106,7 +106,13 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup
             return;
 
         if (_instanceBuffer.Buffer.Handle != 0)
-            Device.ResourceManager.DestroyBuffer(_instanceBuffer);
+        {
+            // Never destroy a vertex buffer that a frame in flight may still reference. A capacity change happens at most
+            // one frame after the previous one, so the old buffer is still bound by pending command buffers; destroying it
+            // here is VUID-vkDestroyBuffer-buffer-00922, and on Android tilers it can read freed pages.
+            var retired = _instanceBuffer;
+            Device.EnqueueDeferredRelease(() => Device.ResourceManager.DestroyBuffer(retired));
+        }
 
         _instanceBuffer = Device.ResourceManager.CreateVertexBuffer<InstanceTransformData>((uint)count);
         _instanceCapacity = count;
@@ -116,6 +122,9 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup
     {
         if (!_transformInitialized || _instanceCount == 0)
             return;
+
+        // 收集期把本分组钉在快照页上：重放时实例缓冲与图元描述符集仍会被引用。
+        VKSceneDrawCollection.RetainOwner(this);
 
         var cmd = Device.GraphicsCommandBuffer;
         bool forceFadeByAlpha = _currentAlpha < 1.0f;
@@ -142,18 +151,21 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup
             for (int orderIndex = 0; orderIndex < _transparentInstanceOrder.Count; orderIndex++)
             {
                 int instanceIndex = _transparentInstanceOrder[orderIndex];
+                // 实例矩阵只存在于 CPU 侧（_instanceWorlds），GPU 侧的实例流是不可回读的；
+                // 所以透明排序深度必须由这里给出，否则收集期只能退化到图元级深度。
+                float depth = ComputeTransparentDepth(_instanceWorlds[instanceIndex], primitive.LocalBoundsCenter);
                 if (primitive.DoubleSided)
                 {
                     Pipeline.SetPipeline(cmd, PipelineMode.Transparent, CullModeFlags.FrontBit);
                     Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
                         primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
-                        _instanceBuffer.Buffer, 1, (uint)instanceIndex);
+                        _instanceBuffer.Buffer, 1, (uint)instanceIndex, depth);
                 }
 
                 Pipeline.SetPipeline(cmd, PipelineMode.Transparent, CullModeFlags.BackBit);
                 Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
                     primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
-                    _instanceBuffer.Buffer, 1, (uint)instanceIndex);
+                    _instanceBuffer.Buffer, 1, (uint)instanceIndex, depth);
             }
         }
 
@@ -182,6 +194,23 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup
 
         var cmd = Device.GraphicsCommandBuffer;
         int fi = (int)Device.FrameIndex;
+
+        // 和 VKPrimitiveGroup / VKInstancedModel.DrawShadow 同一套契约：binding 16-20 必须在本帧
+        // 第一次绑定之前对齐，否则主通道的 PreparePrimitive 会在「已被本帧录制的 set」上补写，
+        // 未声明 UPDATE_AFTER_BIND 的集合因此让整条命令缓冲失效。
+        // 实例分组不走场景收集，主通道也不会替它登记，所以这里同时把画过的图元交给下一帧的帧首预刷新。
+        for (int i = 0; i < _opaquePrimitives.Count; i++)
+        {
+            var primitive = _opaquePrimitives[i];
+            VKSceneDrawCollection.NotePrimitiveDrawn(primitive);
+            Pipeline.RefreshSceneBindings(primitive.DescriptorSets[fi],
+                ref primitive.EnvCubeViewVersions[fi],
+                ref primitive.DdgiAtlasViewVersions[fi],
+                ref primitive.DdgiDepthViewVersions[fi],
+                ref primitive.CloudNoiseViewVersions[fi],
+                ref primitive.AerialLutViewVersions[fi]);
+        }
+
         for (int i = 0; i < _opaquePrimitives.Count; i++)
         {
             var primitive = _opaquePrimitives[i];

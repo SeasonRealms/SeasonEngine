@@ -194,8 +194,16 @@ internal unsafe class VKModel : VKPrimitiveGroup
 
         var all = new List<PrimitiveData>();
         instance.CollectPrimitives(all);
-        foreach (var primitive in all)
-            instance.RewriteDescriptorSets(primitive);
+        // Same contract as AllocateAndWriteDescriptorSets: a rewrite reachable from the background loading thread
+        // must stay under the GPU gate, otherwise it reads LightConstantBuffers / ShadowMap / Pipeline.SetLayout
+        // while the render thread is rebuilding them during a resize or quality switch.
+        // The scope covers only this loop - holding the gate across the whole CreateInstance would stall frames
+        // for the duration of an asset clone.
+        using (Device.EnterGpuAccessScope())
+        {
+            foreach (var primitive in all)
+                instance.RewriteDescriptorSets(primitive);
+        }
 
         return instance;
     }

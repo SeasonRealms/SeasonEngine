@@ -16,6 +16,11 @@ public enum RenderPassId
     OutlineMask, // Windows DX only: Outline2D object mask pass
     FinalBlit,  // Off-screen -> backbuffer (enabled in Step 2; HDR sources use the tonemap(+bloom) variant, and degrade to an LDR resolve when Post is active - see PostResolve and the RenderQuality 1-4 contract revision 1)
     Overlay,    // UI/debug overlay after final presentation; does not participate in global post-processing
+
+    // 追加编号，保持 Web 互操作及已有 Pass 的数值稳定；执行顺序由调度器决定。
+    SceneOpaque = 6,
+    FogComposite = 7,
+    SceneTransparent = 8,
 }
 
 /// <summary>RenderTarget pixel format (cross-platform abstraction mapped to native formats per backend).</summary>
@@ -36,6 +41,9 @@ public struct RenderTargetDesc
     public RtFormat ColorFormat;
 
     public RtFormat DepthFormat;
+
+    /// <summary>颜色目标不创建平台兼容用的隐式深度；默认 false 保留旧附件形状，显式 DepthFormat 不受影响。</summary>
+    public bool NoImplicitDepth;
 
     /// <summary>When true, rebuild automatically with backbuffer resize; when false, use fixed Width/Height (shadowmap-style).</summary>
     public bool MatchBackbufferSize;
@@ -124,6 +132,102 @@ public static class FrameSchedule
     /// <summary>Off-screen color target for the Scene pass; null = direct render to backbuffer (Step 1 shape).</summary>
     public static RenderTarget? SceneColor;
 
+    /// <summary>本帧完整场景颜色（包括透明与雾）；未发布时回退原始 SceneColor。</summary>
+    public static RenderTarget? CompleteSceneColor { get; private set; }
+
+    public static RenderTarget? EffectiveSceneColor => CompleteSceneColor ?? SceneColor;
+
+    /// <summary>雾效果注册的独立 HDR 合成目标和后端绘制入口；任一缺失时保持单 Scene 路由。</summary>
+    public static RenderTarget? FogCompositeTarget;
+    public static Func<IGraphics, RenderTarget, FogCompositeResult>? RenderFogComposite;
+    /// <summary>所有 AfterOpaque 效果结束后、开启合成 Pass 前准备只读资源；false 跳过合成。</summary>
+    public static Func<IGraphics, bool>? PrepareFogComposite;
+
+    /// <summary>仅在本帧注入、滤波和积分都完成后置为 true，每帧开始自动清除。</summary>
+    public static bool FogOutputReady;
+    public static bool SceneCollectionActive { get; private set; }
+    /// <summary>分段收集的层级排序上下文；图元命令捕获 Current，不能保存控件引用。</summary>
+    public static SceneDrawOrderContext SceneDrawOrder { get; } = new();
+
+    /// <summary>本帧已经选择不透明/透明分段；雾 Compute 仅在此路由发布输出。</summary>
+    public static bool SceneSegmented { get; private set; }
+
+    /// <summary>TAA 之后的消费者使用此入口；TAA 自身只读取 EffectiveSceneColor。</summary>
+    public static ComputeResourceRef EffectiveSceneSource => SceneColorOverride is string name
+        ? new ComputeResourceRef { TextureName = name }
+        : new ComputeResourceRef { Target = EffectiveSceneColor };
+
+    /// <summary>AO 仅在本帧生成且尚未在 HDR 合成中消费时进入最终后处理。</summary>
+    public static bool AoReady { get; internal set; }
+    public static bool AoComposited { get; private set; }
+    public static string? PostAoTexture => AoReady && !AoComposited ? AoTexture : null;
+
+    /// <summary>必须在独立 HDR 目标完成写入后发布，不能把输入目标用作合成输出。</summary>
+    public static void PublishSceneComposite(RenderTarget target, bool consumedAo)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        var source = SceneColor ?? throw new InvalidOperationException("场景合成缺少 SceneColor。");
+        if (ReferenceEquals(source, target) || target.Desc.ColorFormat != RtFormat.Rgba16Float
+            || target.Desc.SampleCount > 1 || target.Desc.Width != source.Desc.Width
+            || target.Desc.Height != source.Desc.Height)
+            throw new ArgumentException("场景合成必须使用尺寸匹配的独立单采样 HDR 目标。", nameof(target));
+        if (consumedAo && !AoReady)
+            throw new InvalidOperationException("不能消费本帧尚未生成的 AO。");
+        CompleteSceneColor = target;
+        AoComposited = consumedAo;
+    }
+
+    /// <summary>效果退休或重建其目标时，立即撤销指向旧目标的有效颜色源。</summary>
+    internal static void ForgetSceneComposite(RenderTarget target)
+    {
+        if (!ReferenceEquals(CompleteSceneColor, target)) return;
+        CompleteSceneColor = null;
+        SceneColorOverride = null;
+        AoComposited = false;
+    }
+
+    static SceneLightParams _pendingLights, _frameLights;
+    static Matrix4x4 _pendingView, _pendingProjection, _pendingUnjitteredViewProjection;
+    static BaseApp? _pendingLightingApp;
+    static bool _lightingPending;
+
+    /// <summary>后端最终上传的光照副本，包含同一帧的灯序、CSM、聚光、环境与云参数。</summary>
+    public static ref readonly SceneLightParams LightingSnapshot => ref _frameLights;
+    public static bool LightingSnapshotValid { get; private set; }
+    public static Matrix4x4 RenderView { get; private set; }
+    public static Matrix4x4 RenderProjection { get; private set; }
+    public static Matrix4x4 UnjitteredRenderViewProjection { get; private set; }
+
+    /// <summary>仅由后端在最终光照上传点调用；不修改共享灯光 UBO。</summary>
+    public static void CaptureLighting(in SceneLightParams lights, in Matrix4x4 view,
+        in Matrix4x4 projection, in Matrix4x4 unjitteredViewProjection)
+    {
+        _pendingLights = lights;
+        _pendingView = view;
+        _pendingProjection = projection;
+        _pendingUnjitteredViewProjection = unjitteredViewProjection;
+        _pendingLightingApp = DeviceServices.BaseApp;
+        _lightingPending = true;
+    }
+
+    static void BeginSceneFrame(BaseApp app)
+    {
+        CompleteSceneColor = null;
+        SceneColorOverride = null;
+        AoReady = false;
+        AoComposited = false;
+        FogOutputReady = false;
+        SceneCollectionActive = false;
+        SceneSegmented = false;
+        LightingSnapshotValid = _lightingPending && ReferenceEquals(_pendingLightingApp, app);
+        _frameLights = LightingSnapshotValid ? _pendingLights : default;
+        RenderView = LightingSnapshotValid ? _pendingView : default;
+        RenderProjection = LightingSnapshotValid ? _pendingProjection : default;
+        UnjitteredRenderViewProjection = LightingSnapshotValid ? _pendingUnjitteredViewProjection : default;
+        _lightingPending = false;
+        _pendingLightingApp = null;
+    }
+
     /// <summary>Explicit depth target for the Scene pass (2-2 contract clause 2: full-size depth-only D32Float, registered by the backend
     /// during initialization in AO mode, replacing the global default depth and forcing StoreDepth=true so the AfterScene compute phase
     /// can consume it through a DepthTexture binding); null = reuse the backend default depth, with zero leftovers in the pipeline.</summary>
@@ -207,7 +311,16 @@ public static class FrameSchedule
     // an empty table is zero-cost (for iteration with no enumerator allocation); registration/unregistration is restricted to the frame-loop thread, matching the callback contract in this class. --
 
     static readonly List<ComputeEffect> _computeFrameStart = new();
+    static readonly List<ComputeEffect> _computeAfterOpaque = new();
     static readonly List<ComputeEffect> _computeAfterScene = new();
+
+    static List<ComputeEffect> EffectsFor(ComputePhase phase) => phase switch
+    {
+        ComputePhase.FrameStart => _computeFrameStart,
+        ComputePhase.AfterOpaque => _computeAfterOpaque,
+        ComputePhase.AfterScene => _computeAfterScene,
+        _ => throw new ArgumentOutOfRangeException(nameof(phase)),
+    };
 
     /// <summary>
     /// Register a compute effect: return false when the backend does not support it or Initialize fails
@@ -216,16 +329,20 @@ public static class FrameSchedule
     /// </summary>
     public static bool RegisterCompute(IGraphics g, ComputeEffect effect)
     {
+        var effects = EffectsFor(effect.Phase);
+        if (_computeFrameStart.Contains(effect) || _computeAfterOpaque.Contains(effect)
+            || _computeAfterScene.Contains(effect))
+            return true;
         if (!g.ComputeSupported) return false;
         if (!effect.Initialize(g)) return false;
-        (effect.Phase == ComputePhase.FrameStart ? _computeFrameStart : _computeAfterScene).Add(effect);
+        effects.Add(effect);
         return true;
     }
 
     public static void UnregisterCompute(ComputeEffect effect)
     {
-        _computeFrameStart.Remove(effect);
-        _computeAfterScene.Remove(effect);
+        bool removed = _computeFrameStart.Remove(effect) | _computeAfterOpaque.Remove(effect) | _computeAfterScene.Remove(effect);
+        if (removed) effect.OnUnregistered();
     }
 
     /// <summary>
@@ -235,14 +352,18 @@ public static class FrameSchedule
     /// </summary>
     public static void ResizeCompute(IGraphics g)
     {
+        g.SynchronizeRenderTargetSizes();
         for (int i = 0; i < _computeFrameStart.Count; i++)
             _computeFrameStart[i].OnResize(g);
+        for (int i = 0; i < _computeAfterOpaque.Count; i++)
+            _computeAfterOpaque[i].OnResize(g);
         for (int i = 0; i < _computeAfterScene.Count; i++)
             _computeAfterScene[i].OnResize(g);
     }
 
     public static void Execute(IGraphics g, BaseApp app, in Vector4 clearColor)
     {
+        BeginSceneFrame(app);
         var canvas = app.Canvas2D;
         var backend = g.Immediate2D;
         try
@@ -321,24 +442,97 @@ public static class FrameSchedule
             g.EndPass();
         }
 
-        g.BeginPass(new PassDesc
+        var segmented = g as ISegmentedSceneGraphics;
+        bool split = segmented != null && app.Fog.Enabled && g.ComputeSupported
+            && RenderQuality.Current.VolumetricFog != FogQuality.Off
+            && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float }
+            && SceneColor.Desc.SampleCount <= 1 && SceneDepth != null
+            && FogCompositeTarget is { Desc.ColorFormat: RtFormat.Rgba16Float }
+            && FogCompositeTarget.Desc.SampleCount <= 1
+            && FogCompositeTarget.Desc.Width == SceneColor.Desc.Width
+            && FogCompositeTarget.Desc.Height == SceneColor.Desc.Height
+            && !ReferenceEquals(FogCompositeTarget, SceneColor) && RenderFogComposite != null;
+        SceneSegmented = split;
+
+        try
         {
-            Id = RenderPassId.Scene,
-            ColorTarget = SceneColor,
-            DepthTarget = SceneDepth,
-            // 2-3 contract clause 2: non-null means Scene uses three targets (color + velocity + depth), with clear (0,0)
-            VelocityTarget = SceneVelocity,
-            ClearColor = clearColor,
-            ClearColorEnable = true,
-            ClearDepthEnable = true,
-            // 2-2 contract clause 2: when SceneDepth is explicit, depth must be preserved for AfterScene compute reads (with tiler bandwidth cost);
-            // otherwise keep DontCare to save bandwidth
-            StoreDepth = SceneDepth != null,
-        });
+            if (split)
+            {
+                SceneDrawOrder.BeginCollection();
+                SceneCollectionActive = true;
+                segmented!.BeginSceneCollection();
+                app.DrawScene();
+                SceneDrawOrder.Seal();
+                segmented.SealSceneCollection();
+                SceneCollectionActive = false;
+            }
 
-        app.DrawScene();
+            g.BeginPass(new PassDesc
+            {
+                Id = split ? RenderPassId.SceneOpaque : RenderPassId.Scene,
+                ColorTarget = SceneColor,
+                DepthTarget = SceneDepth,
+                VelocityTarget = SceneVelocity,
+                ClearColor = clearColor,
+                ClearColorEnable = true,
+                ClearDepthEnable = true,
+                StoreDepth = SceneDepth != null,
+            });
+            try
+            {
+                if (split) segmented!.DrawCollectedOpaque();
+                else app.DrawScene();
+            }
+            finally { g.EndPass(); }
 
-        g.EndPass();
+            for (int i = 0; i < _computeAfterOpaque.Count; i++)
+                _computeAfterOpaque[i].Record(g);
+
+            if (split)
+            {
+                bool composited = false;
+                if (FogOutputReady && (PrepareFogComposite?.Invoke(g) ?? true))
+                {
+                    g.BeginPass(new PassDesc
+                    {
+                        Id = RenderPassId.FogComposite,
+                        ColorTarget = FogCompositeTarget,
+                        ClearColorEnable = true,
+                        ClearDepthEnable = false,
+                        StoreDepth = false,
+                    });
+                    FogCompositeResult result;
+                    try { result = RenderFogComposite!(g, SceneColor!); }
+                    finally { g.EndPass(); }
+                    if (result.Success)
+                    {
+                        PublishSceneComposite(FogCompositeTarget!, result.AoApplied);
+                        composited = true;
+                    }
+                }
+                g.BeginPass(new PassDesc
+                {
+                    Id = RenderPassId.SceneTransparent,
+                    ColorTarget = EffectiveSceneColor,
+                    DepthTarget = SceneDepth,
+                    VelocityTarget = SceneVelocity,
+                    ClearColorEnable = false,
+                    ClearDepthEnable = false,
+                    StoreDepth = true,
+                });
+                try { segmented!.DrawCollectedTransparent(composited); }
+                finally { g.EndPass(); }
+            }
+        }
+        finally
+        {
+            SceneCollectionActive = false;
+            if (split)
+            {
+                try { segmented!.ReleaseSceneCollection(); }
+                finally { SceneDrawOrder.Reset(); }
+            }
+        }
 
         // AfterScene phase: dispatch after Scene writes complete and before Post (bloom downsampling/SSAO and similar effects use SceneColor as input)
         for (int i = 0; i < _computeAfterScene.Count; i++)
@@ -347,8 +541,8 @@ public static class FrameSchedule
         g.RenderOutlineMask();
 
         // Post (after Scene; input SceneColor, output PostColor; activated when later post-processing is registered)
-        var blitSource = SceneColor;
-        if (SceneColor != null && PostColor != null && RenderPost != null)
+        var blitSource = EffectiveSceneColor;
+        if (blitSource != null && PostColor != null && RenderPost != null)
         {
             g.BeginPass(new PassDesc
             {
@@ -359,7 +553,7 @@ public static class FrameSchedule
                 StoreDepth = false,
             });
 
-            RenderPost(g, SceneColor);
+            RenderPost(g, blitSource);
 
             g.EndPass();
             blitSource = PostColor;

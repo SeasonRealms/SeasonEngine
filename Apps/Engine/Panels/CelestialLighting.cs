@@ -71,6 +71,20 @@ internal class CelestialLighting
     static float _lastClockTime;
     static bool _clockReady;
 
+    /// <summary>
+    /// Last frame delta this clock integrated, in seconds. Exposed so other simulations can share the same notion of
+    /// "one frame" - including its clamp - instead of each holding its own copy of the previous time and drifting apart
+    /// from this one when the window was minimised or a breakpoint hit. Zero on the very first frame.
+    /// </summary>
+    internal static float FrameDelta { get; private set; }
+
+    /// <summary>
+    /// Ratio of the eased rate to the reference rate the weather and cloud clocks are expressed against. 1 is normal
+    /// speed, 0 is a frozen sky. Simulations that hang off the day clock - scene fog wind drift is the one today - scale
+    /// their own deltas by this so they stop and stretch together with the sun rather than with wall time.
+    /// </summary>
+    internal static float SimulationScale => _speedCurrent / ReferenceDayNightSpeed;
+
     // Phase rate that the weather and cloud clocks are expressed against. Dividing DayPhase by it recovers a
     // "seconds at the original speed" clock, so WeatherCycleSeconds below keeps its literal meaning at this rate
     // while still stretching, or stopping outright, together with DayNightSpeed.
@@ -252,6 +266,43 @@ internal class CelestialLighting
     }
 
     /// <summary>
+    /// The same jump without the persistence <see cref="SetStartHour"/> performs, for callers that are previewing a
+    /// time of day rather than choosing the world's opening one - an art pass flipping between a sunrise and a night
+    /// setup should not leave the last preview as the hour every future launch starts at.
+    /// </summary>
+    internal static void PreviewHour(float hour)
+    {
+        if (!float.IsFinite(hour))
+            return;
+
+        EnsureClockSeeded();
+        JumpToHour(Math.Clamp(hour, 0f, 24f));
+    }
+
+    /// <summary>
+    /// Mean coverage of the currently active cloud layers, 0 when the sky is clear and never more than 1. This is the
+    /// weather signal other systems read: coverage rather than density or layer count, because it is the number that
+    /// already means "how much of the sky is cloud" and therefore the one that can scale a scene effect without
+    /// per-sector reasoning. Zero layers deliberately reads as clear rather than as "unknown", since a backend without
+    /// procedural clouds is a clear sky as far as anything consuming this is concerned.
+    /// </summary>
+    internal static float CloudCoverage
+    {
+        get
+        {
+            var clouds = Season.Rendering.Atmosphere.Clouds;
+            int count = Math.Clamp(clouds.LayerCount, 0, Season.Rendering.SkyState.MaxLayers);
+            if (count == 0)
+                return 0f;
+
+            float sum = 0f;
+            for (int i = 0; i < count; i++)
+                sum += Math.Clamp(clouds.Layers[i].Coverage, 0f, 1f);
+            return sum / count;
+        }
+    }
+
+    /// <summary>
     /// Stops the day-night flow if it is running, or resumes it at the rate it was last running at. Both directions ease
     /// rather than switch, and because the phase is integrated the transition is continuous no matter how long the sample
     /// has been up. Callers used to assign DayNightSpeed directly, which moved the phase by elapsed time times the change.
@@ -347,6 +398,7 @@ internal class CelestialLighting
         float dt = _clockReady ? Math.Clamp(now - _lastClockTime, 0f, MaxFrameSeconds) : 0f;
         _lastClockTime = now;
         _clockReady = true;
+        FrameDelta = dt;
 
         // Read the persisted rate and start hour into the clock state before anything below uses either of them. It has to
         // happen here rather than in a field initializer, and it has to happen before the integration below rather than

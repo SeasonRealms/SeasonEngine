@@ -22,7 +22,11 @@ namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 /// </summary>
 internal unsafe class TextureUploadBatch : IDisposable
 {
-    readonly List<Texture> _tasks = new();
+    // Guarded by _tasksLock, never by the GPU gate: producers enqueue from the background loader while a frame may be
+    // in flight, and a frame holds the gate while it walks the texture dictionaries the loader already holds.
+    List<Texture> _tasks = new();
+
+    readonly object _tasksLock = new();
 
     readonly Vk _vk;
 
@@ -48,24 +52,57 @@ internal unsafe class TextureUploadBatch : IDisposable
             throw new Exception("vkCreateCommandPool (upload) failed");
     }
 
-    public List<Texture> GetTasks() => _tasks;
+    /// <summary>
+    /// Queue one texture for the next <see cref="Execute"/>.
+    /// Called from whichever thread created the texture - the background loader for Sprite2D/3D and for model materials -
+    /// and deliberately without the GPU gate. A producer reaching here can already hold one of the texture dictionaries
+    /// (Graphics.LoadSprite2D/LoadSprite3D/LoadShape/EnsureVKTexture all construct the VkTexture under the lock), while a
+    /// frame holds the gate and then looks textures up under those same dictionaries: any producer that waits for the
+    /// gate here inverts the order and deadlocks the frame against the loader. The gate is taken by Execute alone.
+    /// </summary>
+    public void AddTextureUpload(Texture texture)
+    {
+        lock (_tasksLock) _tasks.Add(texture);
+    }
 
-    public void AddTextureUpload(Texture texture) => _tasks.Add(texture);
+    /// <summary>Take a texture back out of the queue, for a producer whose upload failed before Execute drained it.</summary>
+    public void RemoveTask(Texture texture)
+    {
+        lock (_tasksLock) _tasks.Remove(texture);
+    }
 
     /// <summary>Execute one batched upload (synchronously waits for transfer completion; simple and reliable, can be changed to an asynchronous pipeline later).</summary>
     public void Execute()
     {
-        if (_tasks.Count == 0) return;
+        // This batch submits on the shared transfer queue and allocates from the shared upload command pool. Neither may
+        // be touched while the render thread is inside a frame: vkQueueSubmit and vkAllocateCommandBuffers are externally
+        // synchronized per object, and the validation layer reports the overlap as
+        // "THREADING ERROR : object of type VkQueue is simultaneously used". The render thread holds the gate for the
+        // whole frame, so a load that gets here mid-frame simply waits for it to end.
+        using var gpuAccess = Device.EnterGpuAccessScope();
+
+        // Take the queue under its own lock and leave the producers a fresh list, so a texture queued while this batch
+        // runs belongs to the next Execute instead of being dropped by the finally below. Waiting for the gate above
+        // before touching the list keeps the only possible order gate -> _tasksLock, which is what lets
+        // AddTextureUpload stay gate-free.
+        // An empty batch still returns here, before the staging buffer exists: vkCreateBuffer rejects a zero-byte size.
+        List<Texture> tasks;
+        lock (_tasksLock)
+        {
+            if (_tasks.Count == 0) return;
+            tasks = _tasks;
+            _tasks = new List<Texture>();
+        }
 
         // 1. Calculate the total size and align to 4 bytes (CmdCopyBufferToImage requires 4-byte alignment by default).
         // 2-6 clause 4: the size must come from ImageData rather than Width*Height*4, because a texture that owns a
         // mip chain carries every level in that same buffer.
         ulong totalSize = 0;
-        var offsets = new ulong[_tasks.Count];
-        for (int i = 0; i < _tasks.Count; i++)
+        var offsets = new ulong[tasks.Count];
+        for (int i = 0; i < tasks.Count; i++)
         {
             offsets[i] = totalSize;
-            ulong size = (ulong)(_tasks[i].ImageData?.Length ?? (int)(_tasks[i].Width * _tasks[i].Height * 4));
+            ulong size = (ulong)(tasks[i].ImageData?.Length ?? (int)(tasks[i].Width * tasks[i].Height * 4));
             totalSize += AlignUp(size, 4);
         }
 
@@ -83,9 +120,9 @@ internal unsafe class TextureUploadBatch : IDisposable
             if (_vk.MapMemory(_device, staging.Memory, 0, totalSize, 0, &p) != Result.Success)
                 throw new Exception("vkMapMemory (staging) failed");
             var basePtr = (byte*)p;
-            for (int i = 0; i < _tasks.Count; i++)
+            for (int i = 0; i < tasks.Count; i++)
             {
-                var t = _tasks[i];
+                var t = tasks[i];
                 if (t.ImageData == null) continue;
                 fixed (byte* pSrc = t.ImageData)
                     Unsafe.CopyBlock(basePtr + offsets[i], pSrc, (uint)t.ImageData.Length);
@@ -101,9 +138,9 @@ internal unsafe class TextureUploadBatch : IDisposable
             };
             Device.CheckResult(_vk.BeginCommandBuffer(cmd, in beginInfo));
 
-            for (int i = 0; i < _tasks.Count; i++)
+            for (int i = 0; i < tasks.Count; i++)
             {
-                var t = _tasks[i];
+                var t = tasks[i];
 
                 // Undefined → TransferDstOptimal
                 BarrierToTransferDst(cmd, t);
@@ -141,6 +178,13 @@ internal unsafe class TextureUploadBatch : IDisposable
                         ImageLayout.TransferDstOptimal, t.MipLevels, pRegions);
                 }
             }
+
+            // Leave every image in ShaderReadOnlyOptimal as part of this very submission, matching UploadPixels.
+            // The alternative - letting a later frame's EnsureReadyForRendering do it - is what made a texture
+            // uploaded and sampled in the same frame reach the draw still in TransferDstOptimal, which is
+            // VUID-vkCmdDraw-None-09600: the in-render-pass deferral can only drain on the next BeforeRender.
+            for (int i = 0; i < tasks.Count; i++)
+                BarrierToShaderRead(cmd, tasks[i]);
 
             Device.CheckResult(_vk.EndCommandBuffer(cmd));
 
@@ -188,24 +232,38 @@ internal unsafe class TextureUploadBatch : IDisposable
 
             submitted = true;
 
-            // 5. Mark the fence value and state for each texture
+            // 5. Record the fence value and state for each texture
             //
             // 2-6 clause 5: dropping ImageData here is why IGraphics.RebuildNormalVarianceTextures stays a no-op on this
             // backend - re-running a normal map's chain needs the authored level-0 pixels, and D3D12 can only offer that
             // knob because it keeps them for the resource's lifetime. Retaining them here would cost W*H*4 per normal map
             // permanently on Android, which is not worth paying for a development-time A/B; the switch still works there,
             // it just takes a restart to change. Keep the two in step if this ever changes.
-            foreach (var t in _tasks)
+            //
+            // Ready is deliberately not published here. It is set in step 6, after the transfer really completed:
+            // once a consumer observes Ready it may submit a draw sampling this image, and until the barrier recorded
+            // above has executed, the copy is still in flight and the pixels are undefined even though the layout
+            // tracker already says ShaderReadOnlyOptimal.
+            foreach (var t in tasks)
             {
                 t.UploadFenceValue = signalValue;
-                t.CurrentLayout = ImageLayout.TransferDstOptimal;
-                t.Ready = true;
                 t.ImageData = null;
             }
 
-            // 6. Wait for transfer completion on the CPU, then safely release the staging buffer and command buffer
+            // 6. Wait for transfer completion on the CPU, then publish readiness and release the staging buffer and
+            // command buffer. If the wait throws, Ready stays false: the textures are simply never drawn, which is a
+            // far better failure than sampling an image the GPU is still writing.
             transferCq.WaitForFence(signalValue);
             submitted = false;
+
+            foreach (var t in tasks)
+            {
+                // Advanced only after the copy is confirmed complete, matching UploadPixels: a stale TransferDstOptimal
+                // here would make the first consumer re-issue a transition (and, inside a render pass, defer it again)
+                // for no reason; a premature ShaderReadOnlyOptimal would claim a layout the GPU has not reached yet.
+                t.CurrentLayout = ImageLayout.ShaderReadOnlyOptimal;
+                Volatile.Write(ref t.Ready, true);
+            }
         }
         finally
         {
@@ -217,7 +275,9 @@ internal unsafe class TextureUploadBatch : IDisposable
                 Device.ResourceManager.DestroyBuffer(staging);
             }
             else _incompleteSubmission = true;
-            _tasks.Clear();
+
+            // tasks was already detached from the queue, so there is nothing to drain on the failure path either: a
+            // texture that failed here keeps Ready false and is dropped by its owner.
         }
     }
 
@@ -247,6 +307,38 @@ internal unsafe class TextureUploadBatch : IDisposable
             cmd,
             PipelineStageFlags.TopOfPipeBit,
             PipelineStageFlags.TransferBit,
+            0, 0, null, 0, null, 1, in barrier);
+    }
+
+    void BarrierToShaderRead(CommandBuffer cmd, Texture t)
+    {
+        var barrier = new ImageMemoryBarrier
+        {
+            SType = StructureType.ImageMemoryBarrier,
+            OldLayout = ImageLayout.TransferDstOptimal,
+            NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Image = t.Image,
+            SubresourceRange = new ImageSubresourceRange
+            {
+                AspectMask = ImageAspectFlags.ColorBit,
+                BaseMipLevel = 0,
+                LevelCount = t.MipLevels,
+                BaseArrayLayer = 0,
+                LayerCount = 1
+            },
+            SrcAccessMask = AccessFlags.TransferWriteBit,
+            DstAccessMask = AccessFlags.ShaderReadBit
+        };
+
+        // Recorded on the transfer queue, so neither mask may name a graphics stage.
+        // AllCommands stands in for FragmentShader the same way it does in Texture.UploadPixels.
+        // Cross-queue visibility comes from the timeline semaphore the render submission waits on.
+        _vk.CmdPipelineBarrier(
+            cmd,
+            PipelineStageFlags.TransferBit,
+            PipelineStageFlags.AllCommandsBit,
             0, 0, null, 0, null, 1, in barrier);
     }
 

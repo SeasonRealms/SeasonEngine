@@ -455,7 +455,9 @@ public static class LinuxApp
         // three attachments: color, velocity, and depth.
         // When AO is disabled, SceneDepth may be null, but MotionVectors still needs a depth attachment,
         // so fill it in here.
-        if (!immediate2D && RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
+        if (!immediate2D && Season.Rendering.FrameSchedule.SceneDepth == null
+            && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresFogSceneDepth(
+                VkDevice.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)))
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {

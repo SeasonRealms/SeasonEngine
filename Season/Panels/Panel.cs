@@ -41,6 +41,10 @@ public abstract class Panel : BaseControl, IRenderOrder
 
     public Action OnClose;
 
+    List<ControlItem>? _sceneControls;
+    List<PanelItem>? _scenePanels;
+    bool _collectingScene;
+
     public Panel()
     {
 
@@ -247,6 +251,12 @@ public abstract class Panel : BaseControl, IRenderOrder
         if (Alpha <= 0f)
             return;
 
+        if (Season.Rendering.FrameSchedule.SceneCollectionActive && renderDomain == Season.Controls.RenderDomain.Scene)
+        {
+            CollectScene(inheritedDomain, Layer, Order);
+            return;
+        }
+
         var effectiveDomain = ResolveRenderDomain(inheritedDomain);
 
         if (Controls.Count > 0)
@@ -310,6 +320,53 @@ public abstract class Panel : BaseControl, IRenderOrder
             items.Sort(PanelItemComparer.Instance);
 
             items.ForEach(it => it.Panel.Draw(renderDomain, effectiveDomain));
+        }
+    }
+
+    // 收集只调用一次叶子 Draw；材质分类与深度排序由后端图元队列完成。
+    // 复用成员列表固定本次成员与显式优先级，不在回放时访问控件或容器。
+    void CollectScene(Season.Controls.RenderDomain inheritedDomain, int layer, int order)
+    {
+        if (_collectingScene) throw new InvalidOperationException("场景容器不能在收集期间重入。");
+        _collectingScene = true;
+        var controls = _sceneControls ??= new();
+        var panels = _scenePanels ??= new();
+        try
+        {
+            using var priority = Season.Rendering.FrameSchedule.SceneDrawOrder.Push(layer, order);
+            var effectiveDomain = ResolveRenderDomain(inheritedDomain);
+            for (int i = 0; i < Controls.Count; i++)
+            {
+                var control = Controls[i];
+                if (control.Alpha <= 0 || ResolveControlRenderDomain(control, effectiveDomain) != Season.Controls.RenderDomain.Scene)
+                    continue;
+                var sorting = control as IRenderOrder;
+                controls.Add(new ControlItem(control, sorting?.Layer ?? 0, sorting?.Order ?? 0, i, false, 0));
+            }
+            for (int i = 0; i < Panels.Count; i++)
+            {
+                var panel = Panels[i];
+                if (panel.Alpha > 0)
+                    panels.Add(new PanelItem(panel, panel.Layer, panel.Order, i, false, 0));
+            }
+            controls.Sort(ControlItemComparer.Instance);
+            panels.Sort(PanelItemComparer.Instance);
+            for (int i = 0; i < controls.Count; i++)
+            {
+                var item = controls[i];
+                using var leafPriority = Season.Rendering.FrameSchedule.SceneDrawOrder.Push(item.Layer, item.Order);
+                item.Control.Draw();
+            }
+            for (int i = 0; i < panels.Count; i++)
+            {
+                var item = panels[i];
+                item.Panel.CollectScene(effectiveDomain, item.Layer, item.Order);
+            }
+        }
+        finally
+        {
+            controls.Clear(); panels.Clear();
+            _collectingScene = false;
         }
     }
 

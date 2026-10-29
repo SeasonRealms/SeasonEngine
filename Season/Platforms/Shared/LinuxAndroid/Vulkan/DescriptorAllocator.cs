@@ -63,11 +63,17 @@ internal unsafe sealed class DescriptorAllocator : IDisposable
     /// 2-4 adds 17 and 18 to reach 9, and 2-5 adds 19 and 20 to reach 11.
     /// 1-5 clause 15 adds binding 21 to reach 12: it is the shadow atlas a second time, through a point sampler instead of
     /// the comparison one, so it consumes a pool slot even though no new image is involved.
+    /// 工作包 C 再把 23/24（两张雾体积纹理）算上，达到 14：
+    /// 少算会让首池提前耗尽，只能靠溢出池容错，白白多建池。
     /// </summary>
-    public const uint SampledImagesPerSet = 12;
+    public const uint SampledImagesPerSet = 14;
 
     /// <summary>Number of storage buffers per set, aligned with PipelineLayout.</summary>
-    public const uint StorageBuffersPerSet = 2;
+    /// <remarks>
+    /// 9 是实例骨骼，10 是形变增量，13/14/15 是上一帧的骨骼/实例世界/形变权重，
+    /// 22 是雾帧常量（工作包 C 新增）。合计 6；原先只算 2，导致首池按 1/3 容量提前耗尽。
+    /// </remarks>
+    public const uint StorageBuffersPerSet = 6;
 
     /// <summary>1-6 Compute: storage-image pool capacity for per-kernel StorageTextureWrite bindings.
     /// The number of kernels is far smaller than the number of sprites, so capacity times 1 is already well beyond demand.</summary>
@@ -125,6 +131,11 @@ internal unsafe sealed class DescriptorAllocator : IDisposable
     /// <summary>Allocate one VkDescriptorSet from the pool using the specified layout. Equivalent to DX DescriptorAllocator.Allocate.</summary>
     public DescriptorSet AllocateSet(DescriptorSetLayout layout)
     {
+        // vkAllocateDescriptorSets is externally synchronized on the pool, and this allocator is shared with the
+        // background loading thread - a model or sprite load allocates its own sets - so both ends take the GPU gate
+        // instead of relying on the pool lock alone.
+        using var gpuAccess = Device.EnterGpuAccessScope();
+
         var setLayout = layout;
 
         while (true)
@@ -171,6 +182,9 @@ internal unsafe sealed class DescriptorAllocator : IDisposable
     public void FreeSet(DescriptorSet set)
     {
         if (set.Handle == 0) return;
+
+        // See AllocateSet: vkFreeDescriptorSets is externally synchronized on the same pool.
+        using var gpuAccess = Device.EnterGpuAccessScope();
 
         var pool = _setPools.TryRemove(set.Handle, out var owner) ? owner : Pool;
         _vk.FreeDescriptorSets(_device, pool, 1, in set);

@@ -36,8 +36,26 @@ namespace Season.Platforms.Shared.LinuxAndroid;
 ///
 /// Dictionary and lock usage follow the DX baseline strictly, with identical behavior.
 /// </summary>
-internal unsafe partial class Graphics : IGraphics
+internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 {
+    readonly VKSceneDrawCollection _sceneCollection = new();
+    public void BeginSceneCollection() => _sceneCollection.Begin();
+    public void SealSceneCollection() => _sceneCollection.Seal();
+    public void DrawCollectedOpaque() => _sceneCollection.DrawOpaque();
+    public void DrawCollectedTransparent(bool sampleFog) => _sceneCollection.DrawTransparent(sampleFog);
+    public void ReleaseSceneCollection() => _sceneCollection.Release();
+
+    public Season.Rendering.FogCompositePipeline? CreateFogCompositePipeline()
+    {
+        if (!ComputeSupported) return null;
+        try { return new VKFogCompositePipeline(DictionaryVKTexture); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[FogComposite] 创建失败：{ex.Message}");
+            return null;
+        }
+    }
+
     readonly GlyphAtlasManager<VkTexture> _glyphAtlas = new(
         2048, 2048,
         createAtlasTexture: (w, h) => VkTexture.CreateEmpty((uint)w, (uint)h, "TextAtlas"),
@@ -193,6 +211,8 @@ internal unsafe partial class Graphics : IGraphics
     public async Task<bool> LoadSprite2D(Sprite2D sprite2D)
     {
         VKSprite2D vkSprite2D = null!;
+        // Filled under the dictionary locks, uploaded only after every lock is released; see the call below.
+        VkTexture pendingUpload = null!;
 
         lock (DictionarySprite)
         {
@@ -213,100 +233,105 @@ internal unsafe partial class Graphics : IGraphics
                     sprite2D.OriginWidth = (int)vkSprite2D.VKTexture.Width;
                     sprite2D.OriginHeight = (int)vkSprite2D.VKTexture.Height;
                 }
+
+                return true;
             }
-            else
+        }
+
+        try
+        {
+            VkTexture view = null!;
+
+            lock (DictionaryVKTexture)
             {
-                try
+                if (DictionaryVKTexture.TryGetValue(sprite2D.Name, out view!))
                 {
-                    VkTexture view = null!;
-
-                    lock (DictionaryVKTexture)
-                    {
-                        if (DictionaryVKTexture.TryGetValue(sprite2D.Name, out view!))
-                        {
-                            view.AddRef();
-                        }
-                        else
-                        {
-                            INativeImageDecoder imageResult = null!;
-
-                            if (ImageUtils.CreateImageExist(sprite2D.Name))
-                            {
-                                imageResult = ImageUtils.CreateImage(sprite2D.Name);
-                            }
-                            else
-                            {
-                                StorageService.TryGetStream(StorageService.DirectoryBase, sprite2D.Name, out Stream stream, out string errMsg);
-
-                                if (stream == null)
-                                {
-                                    stream = StorageService.LoadStream(sprite2D.Name);
-                                }
-
-                                using (stream)
-                                {
-                                    var imageExt = sprite2D.Ext;
-                                    if (imageExt.IsNullOrWhiteSpace())
-                                    {
-                                        imageExt = System.IO.Path.GetExtension(sprite2D.Name).ToLower();
-                                    }
-
-                                    imageResult = ImageUtils.GetImageFromStream(stream, imageExt);
-                                }
-                            }
-
-                            if (imageResult == null)
-                            {
-
-                            }
-                            else
-                            {
-                                view = new VkTexture(imageResult);
-                                view.Name = sprite2D.Name;
-
-                                ExecuteUpload();
-                            }
-
-                            if (view == null)
-                            {
-                                DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} LoadTextureAsync GetTexture {sprite2D.Name}");
-                            }
-
-                            DictionaryVKTexture.Add(sprite2D.Name, view);
-                        }
-                    }
-
-                    try
-                    {
-                        // Use Sprite instead of Texture2D
-                        vkSprite2D = new VKSprite2D(view);
-
-                        sprite2D.OriginWidth = (int)vkSprite2D.VKTexture.Width;
-                        sprite2D.OriginHeight = (int)vkSprite2D.VKTexture.Height;
-                    }
-                    catch (Exception ex)
-                    {
-                        DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} LoadTextureAsync new Sprite {ex}");
-                    }
-
-                    lock (DictionarySprite)
-                    {
-                        if (DictionarySprite.ContainsKey((sprite2D.Name, sprite2D.ID)))
-                        {
-                            //impossible
-                        }
-                        else
-                        {
-                            DictionarySprite.Add((sprite2D.Name, sprite2D.ID), vkSprite2D);
-                        }
-                    }
+                    view.AddRef();
                 }
-                catch (Exception ex)
+                else
                 {
-                    DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} LoadTextureAsync new Sprite {ex}");
+                    INativeImageDecoder imageResult = null!;
+
+                    if (ImageUtils.CreateImageExist(sprite2D.Name))
+                    {
+                        imageResult = ImageUtils.CreateImage(sprite2D.Name);
+                    }
+                    else
+                    {
+                        StorageService.TryGetStream(StorageService.DirectoryBase, sprite2D.Name, out Stream stream, out string errMsg);
+
+                        if (stream == null)
+                        {
+                            stream = StorageService.LoadStream(sprite2D.Name);
+                        }
+
+                        using (stream)
+                        {
+                            var imageExt = sprite2D.Ext;
+                            if (imageExt.IsNullOrWhiteSpace())
+                            {
+                                imageExt = System.IO.Path.GetExtension(sprite2D.Name).ToLower();
+                            }
+
+                            imageResult = ImageUtils.GetImageFromStream(stream, imageExt);
+                        }
+                    }
+
+                    if (imageResult == null)
+                    {
+
+                    }
+                    else
+                    {
+                        view = new VkTexture(imageResult);
+                        view.Name = sprite2D.Name;
+
+                        pendingUpload = view;
+                    }
+
+                    if (view == null)
+                    {
+                        DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} LoadTextureAsync GetTexture {sprite2D.Name}");
+                    }
+
+                    DictionaryVKTexture.Add(sprite2D.Name, view);
+                }
+            }
+
+            // VKSprite2D owns a descriptor set, and allocating one takes the GPU gate; DrawSprite2D holds that gate while
+            // it looks sprites up under DictionarySprite, so the sprite is built with no dictionary lock held and
+            // registered afterwards.
+            try
+            {
+                // Use Sprite instead of Texture2D
+                vkSprite2D = new VKSprite2D(view);
+
+                sprite2D.OriginWidth = (int)vkSprite2D.VKTexture.Width;
+                sprite2D.OriginHeight = (int)vkSprite2D.VKTexture.Height;
+            }
+            catch (Exception ex)
+            {
+                DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} LoadTextureAsync new Sprite {ex}");
+            }
+
+            lock (DictionarySprite)
+            {
+                if (!DictionarySprite.ContainsKey((sprite2D.Name, sprite2D.ID)))
+                {
+                    DictionarySprite.Add((sprite2D.Name, sprite2D.ID), vkSprite2D);
                 }
             }
         }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} LoadTextureAsync new Sprite {ex}");
+        }
+
+        // Upload only after DictionarySprite and DictionaryVKTexture are both released. ExecuteUpload takes the GPU
+        // gate, and DrawSprite2D looks sprites up under DictionarySprite while holding that gate inside a frame, so
+        // uploading under the lock is a lock-order inversion that deadlocks as soon as a frame is in flight.
+        if (pendingUpload != null)
+            ExecuteUpload();
 
         return true;
     }
@@ -314,6 +339,10 @@ internal unsafe partial class Graphics : IGraphics
     public void UpdateSprite2D(Sprite2D sprite)
     {
         VKSprite2D vkSprite = null!;
+        // Resolved under the lock, applied after it: a replacement uploads a texture, and an upload takes the GPU gate
+        // that DrawSprite2D holds while it looks sprites up here. UpdateShape already resolves it outside its dictionary.
+        TextureUpdateSource pendingSource = default;
+        bool replacePending = false;
 
         lock (DictionarySprite)
         {
@@ -330,9 +359,9 @@ internal unsafe partial class Graphics : IGraphics
                     // Texture replacement
                     if (sprite.TextureOverride.HasValue)
                     {
-                        var source = sprite.TextureOverride;
+                        pendingSource = sprite.TextureOverride;
                         sprite.TextureOverride = default;
-                        ReplaceSpriteTexture(sprite.Name, vkSprite, source);
+                        replacePending = true;
                     }
 
                     if (sprite.Changed)
@@ -346,6 +375,9 @@ internal unsafe partial class Graphics : IGraphics
                 }
             }
         }
+
+        if (replacePending)
+            ReplaceSpriteTexture(sprite.Name, vkSprite, pendingSource);
     }
 
     static INativeImageDecoder? ResolveDecoder(TextureUpdateSource source)
@@ -949,9 +981,6 @@ internal unsafe partial class Graphics : IGraphics
             // Ensure the atlas texture is ready
             _glyphAtlas.AtlasTexture?.EnsureReadyForRendering(cmd);
 
-            // Set the pipeline (Transparent + DoubleSided)
-            Pipeline.SetPipeline(cmd, PipelineMode.Transparent, doubleSided: true);
-
             // Write TextDrawParams
             // using a per-Texts, per-frame dedicated UBO to eliminate same-frame cross-control overwrites
             var texSize = new Vector2(
@@ -975,6 +1004,23 @@ internal unsafe partial class Graphics : IGraphics
             // such as text recoloring or masking artifacts.
             var set = state.DescriptorSets[fi];
 
+            // 收集期：字形图集的布局转换已完成，参数 UBO 也已写入本帧槽，
+            // 剩下只需要记下不可变句柄。
+            // 排序深度用单位阵的投影距离：文字实例流是设备局部内存，
+            // GPU 侧矩阵不可回读（不同于 DX 的上传堆），
+            // 因此同帧文字共用同一个深度，彼此之间按添加顺序稳定排序。
+            if (VKSceneDrawCollection.Active is { } collection)
+            {
+                VKSceneDrawCollection.RetainOwner(texts);
+                collection.CaptureText(set, Pipeline.UnitQuadVertexBuffer.Buffer,
+                    Pipeline.UnitQuadIndexBuffer.Buffer, state.InstanceBuffers[fi].Buffer,
+                    (uint)state.InstanceCount, VKSceneDrawCollection.Depth(Vector3.Zero, Matrix4x4.Identity));
+                return;
+            }
+
+            // Set the pipeline (Transparent + DoubleSided)
+            Pipeline.SetPipeline(cmd, PipelineMode.Transparent, doubleSided: true);
+
             // Bind VB slot 0: unit quad; slot 1: current-frame instance buffer
             var vb0 = Pipeline.UnitQuadVertexBuffer.Buffer;
             var vb1 = state.InstanceBuffers[fi].Buffer;
@@ -994,6 +1040,9 @@ internal unsafe partial class Graphics : IGraphics
             var pipelineLayout = Pipeline.PipelineLayout;
 
             Vulkan.Device.Vk.CmdBindDescriptorSets(cmd, VkPipelineBindPoint.Graphics, pipelineLayout, 0, 1, &set, 0, null);
+            // 雾采样三件套在独立的 set 1：文字变体与 Sprite2D 共用同一个 FS，静态引用了它，
+            // 而布局里 set 1 参与兼容性检查，缺绑会被校验层报未绑定。
+            Pipeline.BindFogSet(cmd);
 
             // Single instanced draw
             Vulkan.Device.Vk.CmdDrawIndexed(cmd, 6, (uint)state.InstanceCount, 0, 0, 0);
@@ -1344,9 +1393,10 @@ internal unsafe partial class Graphics : IGraphics
                 imgInfos[i] = new VkDescriptorImageInfo
                 { ImageView = whiteView, ImageLayout = VkImageLayout.ShaderReadOnlyOptimal };
 
-            // Write 16 bindings
-            // (2-3 Step C adds default zero placeholders for previous-frame SSBO data at bindings 13/14/15)
-            var writes = stackalloc VkWriteDescriptorSet[16];
+            // Write 25 bindings（前缀提交，中间不能留洞）
+            // (2-3 Step C adds default zero placeholders for previous-frame SSBO data at bindings 13/14/15;
+            //  工作包 C 追加了 21 的原始阴影深度与 22/23/24 的雾采样占位)
+            var writes = stackalloc VkWriteDescriptorSet[25];
             writes[0] = MakeTextWrite(set, 0, VkDescriptorType.UniformBuffer, &matrixInfo);
             writes[1] = MakeTextWrite(set, 1, VkDescriptorType.UniformBuffer, &lightInfo);
             writes[2] = MakeTextWrite(set, 2, VkDescriptorType.UniformBuffer, &materialInfo);
@@ -1389,7 +1439,47 @@ internal unsafe partial class Graphics : IGraphics
             writes[14] = MakeTextWrite(set, 14, VkDescriptorType.StorageBuffer, &prevInstanceWorldInfo);
             writes[15] = MakeTextWrite(set, 15, VkDescriptorType.StorageBuffer, &prevMorphWeightsInfo);
 
-            Vulkan.Device.Vk.UpdateDescriptorSets(Vulkan.Device.LogicalDevice, 16, writes, 0, null);
+            // 1-5 clause 15: binding 21 是同一份阴影深度，
+            // 但走点采样器给蒙面搜索读原始深度（与 12 的比较采样器成对）。
+            //
+            // 16-20 必须写：文字的 drawIndexed 绑的就是这套 set，而文字变体与
+            // Sprite2D / 天空共用同一个 FS，SPIR-V 静态声明了 envCube/ddgiAtlas/
+            // ddgiDepth/cloudNoise/aerialLut 五个采样器，未写的绑定是空描述符，
+            // 校验层会按 VUID-vkCmdDrawIndexed-None-08114 报 imageView=0。
+            // 占位一律用各绑定在帧内的 Bound 回退值（白图 / DummyBlack），保证可采样。
+            var envCube = VKTextureCube.Bound;
+            var envCubeInfo = new VkDescriptorImageInfo
+            { ImageView = envCube.View, ImageLayout = VkImageLayout.ShaderReadOnlyOptimal };
+            writes[16] = MakeTextImageWrite(set, 16, &envCubeInfo);
+            var ddgiAtlas = VKPrimitiveGroup.DdgiAtlasBound;
+            var ddgiInfo = new VkDescriptorImageInfo
+            { ImageView = ddgiAtlas.View, ImageLayout = VkImageLayout.ShaderReadOnlyOptimal };
+            writes[17] = MakeTextImageWrite(set, 17, &ddgiInfo);
+            var ddgiDepth = VKPrimitiveGroup.DdgiDepthBound;
+            var ddgiDepthInfo = new VkDescriptorImageInfo
+            { ImageView = ddgiDepth.View, ImageLayout = VkImageLayout.ShaderReadOnlyOptimal };
+            writes[18] = MakeTextImageWrite(set, 18, &ddgiDepthInfo);
+            var cloudNoise = VKPrimitiveGroup.CloudNoiseBound;
+            var cloudInfo = new VkDescriptorImageInfo
+            { ImageView = cloudNoise.View, ImageLayout = VkImageLayout.ShaderReadOnlyOptimal };
+            writes[19] = MakeTextImageWrite(set, 19, &cloudInfo);
+            var aerialLut = VKPrimitiveGroup.AerialLutBound;
+            var aerialInfo = new VkDescriptorImageInfo
+            { ImageView = aerialLut.View, ImageLayout = VkImageLayout.ShaderReadOnlyOptimal };
+            writes[20] = MakeTextImageWrite(set, VKPrimitiveGroup.AerialLutBinding, &aerialInfo);
+            writes[21] = MakeTextImageWrite(set, 21, &shadowInfo);
+
+            // 雾采样三段（22/23/24）：文字入口在透明变体里静态引用，
+            // 未写的描述符是野值，必须先写占位。
+            // 22 为帧常量存储缓冲，真正内容由雾合成那边提供；
+            // 23/24 先用 AP 体积占位，由透明 Pass 在绑定前重写成本帧体积产物。
+            var fogFrameInfo = new VkDescriptorBufferInfo
+            { Buffer = Pipeline.DefaultFogFrameBuffers[fi].Buffer, Offset = 0, Range = SVk.WholeSize };
+            writes[22] = MakeTextWrite(set, Pipeline.SceneFogFrameBinding, VkDescriptorType.StorageBuffer, &fogFrameInfo);
+            writes[23] = MakeTextImageWrite(set, Pipeline.SceneFogIntegratedBinding, &aerialInfo);
+            writes[24] = MakeTextImageWrite(set, Pipeline.SceneFogLocalBinding, &aerialInfo);
+
+            Vulkan.Device.Vk.UpdateDescriptorSets(Vulkan.Device.LogicalDevice, 25, writes, 0, null);
         }
     }
 
@@ -1717,6 +1807,7 @@ internal unsafe partial class Graphics : IGraphics
             }
 
             VkTexture view = null!;
+            bool created = false;
             lock (DictionaryVKTexture)
             {
                 if (DictionaryVKTexture.TryGetValue(sprite.Name, out view!))
@@ -1755,12 +1846,16 @@ internal unsafe partial class Graphics : IGraphics
                     {
                         view = new VkTexture(imageResult);
                         view.Name = sprite.Name;
-                        ExecuteUpload();
+                        created = true;
                     }
                     if (view != null)
                         DictionaryVKTexture.Add(sprite.Name, view);
                 }
             }
+
+            // Upload outside the lock, same lock-order constraint as LoadSprite2D and EnsureVKTexture.
+            if (created)
+                ExecuteUpload();
 
             var vkSprite3D = new VKSprite3D(view);
 
@@ -1781,16 +1876,20 @@ internal unsafe partial class Graphics : IGraphics
     public void UpdateSprite3D(Sprite3D sprite, float time)
     {
         VKSprite3D vkSprite3D = null!;
+        // Same reason as UpdateSprite2D: the replacement uploads, so it runs after the dictionary lock is released.
+        TextureUpdateSource pendingSource = default;
+        bool replacePending = false;
+
         lock (DictionarySprite3D)
         {
             if (DictionarySprite3D.TryGetValue((sprite.Name, sprite.ID), out vkSprite3D!))
             {
-                    // Texture replacement
+                // Texture replacement
                 if (sprite.TextureOverride.HasValue)
                 {
-                    var source = sprite.TextureOverride;
+                    pendingSource = sprite.TextureOverride;
                     sprite.TextureOverride = default;
-                    ReplaceSpriteTexture(sprite.Name, vkSprite3D, source);
+                    replacePending = true;
                 }
 
                 vkSprite3D.Update(
@@ -1804,6 +1903,9 @@ internal unsafe partial class Graphics : IGraphics
                     sprite.Alpha);
             }
         }
+
+        if (replacePending)
+            ReplaceSpriteTexture(sprite.Name, vkSprite3D, pendingSource);
     }
 
     public void DrawSprite3D(Sprite3D sprite)
@@ -1868,6 +1970,7 @@ internal unsafe partial class Graphics : IGraphics
         string key = MipChain.CacheKey(name, mipPolicy);
 
         VkTexture view = null!;
+        bool created = false;
         lock (DictionaryVKTexture)
         {
             if (DictionaryVKTexture.TryGetValue(key, out view!))
@@ -1901,14 +2004,21 @@ internal unsafe partial class Graphics : IGraphics
             {
                 view = new VkTexture(imageResult, mipPolicy);
                 view.Name = name;
-                ExecuteUpload();
+                created = true;
             }
 
             if (view != null)
                 DictionaryVKTexture.Add(key, view);
-
-            return view!;
         }
+
+        // Upload outside the lock. ExecuteUpload takes the GPU gate, and the render thread holds that gate while it
+        // resolves descriptors under this same lock, so uploading inside the lock inverts the order: a loader waiting
+        // for the gate while a frame waits for the lock never resolves. This is the path a background model load
+        // reaches through the Mesh3D material resolver.
+        if (created)
+            ExecuteUpload();
+
+        return view!;
     }
 
     // Mesh3D surface-texture resolution
@@ -2416,6 +2526,20 @@ internal unsafe partial class Graphics : IGraphics
     /// </summary>
     public void ExecuteUpload()
     {
+        // Lock-order contract: Execute takes the GPU gate, and the render thread holds that gate while it looks
+        // textures up under these dictionaries inside a frame (DrawSprite2D, DrawSprite3D, DrawShape, the compute
+        // binding loop). Calling this with one of them held inverts the order and deadlocks the loader the moment a
+        // frame is in flight, so every producer here creates the texture under the lock and hands the upload to a
+        // point after the lock is released.
+        // Debug.Assert is stripped in Release, matching the rest of the gate diagnostics.
+        System.Diagnostics.Debug.Assert(
+            !System.Threading.Monitor.IsEntered(DictionarySprite)
+            && !System.Threading.Monitor.IsEntered(DictionarySprite3D)
+            && !System.Threading.Monitor.IsEntered(DictionaryVKTexture)
+            && !System.Threading.Monitor.IsEntered(DictionaryShape)
+            && !System.Threading.Monitor.IsEntered(DictionaryShapeTexture),
+            "ExecuteUpload called while holding a texture dictionary lock");
+
         Vulkan.Device.TextureUploadBatch?.Execute();
     }
 
@@ -2443,88 +2567,100 @@ internal unsafe partial class Graphics : IGraphics
 
         VKSprite2D vkSprite2D = null;
 
-        lock (DictionaryShape)
+        // Set where the shared texture is created and uploaded by the finally below, never under a dictionary lock.
+        VkTexture pendingShapeUpload = null;
+
+        // Resolved under DictionaryShape but built outside it: VKSprite2D allocates a descriptor set, and that takes the
+        // GPU gate a frame holds while DrawShape looks shapes up under this very dictionary.
+        VkTexture shapeTexture = null;
+
+        try
         {
-            if (shape.IsDisposed) return false;
-
-            // Historical failures may have cached a null entry:
-            // treat it as missing, remove it, and rebuild
-            if (DictionaryShape.TryGetValue(instanceKey, out vkSprite2D)
-                && (vkSprite2D == null || vkSprite2D.VKTexture == null))
+            lock (DictionaryShape)
             {
-                DictionaryShape.Remove(instanceKey);
-                vkSprite2D = null;
-            }
+                if (shape.IsDisposed) return false;
 
-            if (vkSprite2D != null)
-            {
-                shape.OriginWidth = (int)vkSprite2D.VKTexture.Width;
-                shape.OriginHeight = (int)vkSprite2D.VKTexture.Height;
-            }
-            else
-            {
-                // Get or create the shared shape texture
-                // cached by Type + Width + Height
-                VkTexture vkTexture = null;
-
-                lock (DictionaryShapeTexture)
+                // Historical failures may have cached a null entry:
+                // treat it as missing, remove it, and rebuild
+                if (DictionaryShape.TryGetValue(instanceKey, out vkSprite2D)
+                    && (vkSprite2D == null || vkSprite2D.VKTexture == null))
                 {
-                    if (DictionaryShapeTexture.TryGetValue(textureKey, out vkTexture!))
-                    {
-
-                    }
-                    else
-                    {
-                        var imageDecoder = Season.Models.ImageUtils.CreateShapeImage(shape.Type, shapeW, shapeH, shapeBorder);
-
-                        if (imageDecoder != null)
-                        {
-                            vkTexture = new VkTexture(imageDecoder);
-                            ExecuteUpload();
-                        }
-
-                        if (vkTexture == null)
-                        {
-                            DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} LoadShape VkTexture=null {shape.Type}");
-                        }
-                        else
-                        {
-                            // Cache only on success to avoid polluting future requests for the same key with null
-                            DictionaryShapeTexture[textureKey] = vkTexture;
-                        }
-                    }
+                    DictionaryShape.Remove(instanceKey);
+                    vkSprite2D = null;
                 }
 
-                if (vkTexture == null)
+                if (vkSprite2D != null)
                 {
-                    // Shared-texture creation failed:
-                    // do not register an empty entry, and let Load return false
-                    // so the caller can locate the issue from logs
-                    return false;
-                }
-
-                try
-                {
-                    vkSprite2D = new VKSprite2D(vkTexture);
-
                     shape.OriginWidth = (int)vkSprite2D.VKTexture.Width;
                     shape.OriginHeight = (int)vkSprite2D.VKTexture.Height;
                 }
-                catch (Exception ex)
-                {
-                    DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} LoadShape new VKSprite2D {shape.Type} {ex}");
+            }
 
-                    return false;
-                }
+            if (vkSprite2D != null)
+                return true;
 
-                lock (DictionaryShape)
+            // Get or create the shared shape texture
+            // cached by Type + Width + Height
+            lock (DictionaryShapeTexture)
+            {
+                if (!DictionaryShapeTexture.TryGetValue(textureKey, out shapeTexture!))
                 {
-                    if (!DictionaryShape.ContainsKey(instanceKey))
+                    var imageDecoder = Season.Models.ImageUtils.CreateShapeImage(shape.Type, shapeW, shapeH, shapeBorder);
+
+                    if (imageDecoder != null)
                     {
-                        DictionaryShape.Add(instanceKey, vkSprite2D);
+                        shapeTexture = new VkTexture(imageDecoder);
+                        pendingShapeUpload = shapeTexture;
+                    }
+
+                    if (shapeTexture == null)
+                    {
+                        DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} LoadShape VkTexture=null {shape.Type}");
+                    }
+                    else
+                    {
+                        // Cache only on success to avoid polluting future requests for the same key with null
+                        DictionaryShapeTexture[textureKey] = shapeTexture;
                     }
                 }
             }
+
+            if (shapeTexture == null)
+            {
+                // Shared-texture creation failed:
+                // do not register an empty entry, and let Load return false
+                // so the caller can locate the issue from logs
+                return false;
+            }
+
+            try
+            {
+                vkSprite2D = new VKSprite2D(shapeTexture);
+
+                shape.OriginWidth = (int)vkSprite2D.VKTexture.Width;
+                shape.OriginHeight = (int)vkSprite2D.VKTexture.Height;
+            }
+            catch (Exception ex)
+            {
+                DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} LoadShape new VKSprite2D {shape.Type} {ex}");
+
+                return false;
+            }
+
+            lock (DictionaryShape)
+            {
+                if (!DictionaryShape.ContainsKey(instanceKey))
+                {
+                    DictionaryShape.Add(instanceKey, vkSprite2D);
+                }
+            }
+        }
+        finally
+        {
+            // ExecuteUpload takes the GPU gate while DrawShape looks textures up under that lock inside a frame,
+            // so it must run only once every dictionary lock here has been released.
+            if (pendingShapeUpload != null)
+                ExecuteUpload();
         }
 
         return true;
@@ -2758,7 +2894,7 @@ internal unsafe partial class Graphics : IGraphics
     /// FrameSchedule.AoTexture (null means no AO).</summary>
     VkTexture? ResolveAoTexture()
     {
-        var aoName = Season.Rendering.FrameSchedule.AoTexture;
+        var aoName = Season.Rendering.FrameSchedule.PostAoTexture;
         if (aoName == null)
             return null;
         lock (DictionaryVKTexture)
@@ -2934,17 +3070,36 @@ internal unsafe partial class Graphics : IGraphics
         Season.Rendering.ComputeStorageFormat format = Season.Rendering.ComputeStorageFormat.Rgba8Unorm)
     {
         var vkFormat = VkTexture.MapComputeFormat(format);
+
+        VkTexture resizeTo = null!;
         lock (DictionaryVKTexture)
         {
             if (DictionaryVKTexture.TryGetValue(name, out var existing))
             {
                 // Recreate in place on size mismatch
                 // so the C# object identity stays stable and Sprite2D AddRef references remain valid
-                if (existing.Width != width || existing.Height != height)
-                    existing.RecreateComputeStorage(width, height);
-                return;
+                if (existing.Width == width && existing.Height == height)
+                    return;
+                resizeTo = existing;
             }
-            DictionaryVKTexture.Add(name, VkTexture.CreateComputeStorage(name, width, height, vkFormat));
+        }
+
+        // Storage creation clears the image through the transfer queue (ClearToZero), which takes the GPU gate, and
+        // the render thread holds that gate while resolving textures under DictionaryVKTexture. Both the recreate and
+        // the create therefore run only after the lock is released.
+        if (resizeTo != null)
+        {
+            resizeTo.RecreateComputeStorage(width, height);
+            return;
+        }
+
+        var created = VkTexture.CreateComputeStorage(name, width, height, vkFormat);
+        lock (DictionaryVKTexture)
+        {
+            if (DictionaryVKTexture.ContainsKey(name))
+                created.Release();   // Another registration won; keep the existing entry.
+            else
+                DictionaryVKTexture.Add(name, created);
         }
     }
 
@@ -2961,8 +3116,14 @@ internal unsafe partial class Graphics : IGraphics
     /// preserving graceful registration-time degradation.</summary>
     public void CreateComputeTexture3D(string name, uint width, uint height, uint depth,
         Season.Rendering.ComputeStorageFormat format = Season.Rendering.ComputeStorageFormat.Rgba8Unorm)
+        => TryCreateComputeTexture3D(name, width, height, depth, format);
+
+    public void ReleaseComputeTexture3D(string name) => Vulkan.VKTexture3D.Find(name)?.Dispose();
+
+    public bool TryCreateComputeTexture3D(string name, uint width, uint height, uint depth,
+        Season.Rendering.ComputeStorageFormat format = Season.Rendering.ComputeStorageFormat.Rgba8Unorm)
     {
-        if (!ComputeSupported) return;
+        if (!ComputeSupported) return false;
 
         var vkFormat = Vulkan.VKTexture3D.MapComputeFormat(format);
         // Sampled slots always go through the immutable Linear sampler,
@@ -2971,7 +3132,7 @@ internal unsafe partial class Graphics : IGraphics
         {
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [CreateComputeTexture3D] '{name}': "
                 + $"format {format} -> {vkFormat} lacks STORAGE_IMAGE or linear-filter support; not creating texture.");
-            return;
+            return false;
         }
 
         // maxImageDimension3D only guarantees a minimum of 256 by contract,
@@ -2982,17 +3143,18 @@ internal unsafe partial class Graphics : IGraphics
         {
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [CreateComputeTexture3D] '{name}': "
                 + $"{width}x{height}x{depth} exceeds this device's maxImageDimension3D={limit}; not creating texture.");
-            return;
+            return false;
         }
 
         try
         {
-            Vulkan.VKTexture3D.CreateOrUpdate(name, width, height, depth, vkFormat);
+            return Vulkan.VKTexture3D.CreateOrUpdate(name, width, height, depth, vkFormat).Ready;
         }
         catch (Exception ex)
         {
             DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [CreateComputeTexture3D] '{name}' "
                 + $"{width}x{height}x{depth} creation failed: {ex.Message}");
+            return false;
         }
     }
 
@@ -3011,26 +3173,29 @@ internal unsafe partial class Graphics : IGraphics
     /// so per-frame calls allocate nothing and avoid in-flight frame races;
     /// see VKStorageBuffer.GetStagingForCurrentFrame.</summary>
     public void UpdateStorageBuffer(Season.Rendering.StorageBuffer buffer, ReadOnlySpan<byte> data)
+        => TryUpdateStorageBuffer(buffer, data);
+
+    public bool TryUpdateStorageBuffer(Season.Rendering.StorageBuffer buffer, ReadOnlySpan<byte> data)
     {
-        if (!ComputeSupported || data.Length == 0) return;
+        if (!ComputeSupported || data.Length == 0 || data.Length > buffer.SizeInBytes || (data.Length & 3) != 0) return false;
         var cmd = Vulkan.Device.GraphicsCommandBuffer;
-        if (cmd.Handle == 0) return;
+        if (cmd.Handle == 0) return false;
 
         var vkBuffer = (VKStorageBuffer)buffer;
         var dst = vkBuffer.Buffer;
-        ulong size = Math.Min((ulong)data.Length, dst.Size);
-        if (size == 0) return;
+        ulong size = (ulong)data.Length;
+        if (dst.Buffer.Handle == 0 || size > dst.Size) return false;
 
         var staging = vkBuffer.TryGetStagingForCurrentFrame();
         if (staging.Buffer.Handle == 0)
-            return;
+            return false;
 
         var vk = Vulkan.Device.Vk;
         void* p;
         if (vk.MapMemory(Vulkan.Device.LogicalDevice, staging.Memory, 0, size, 0, &p) != VkResult.Success)
         {
             DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [UpdateStorageBuffer] vkMapMemory failed; skipping this upload.");
-            return;
+            return false;
         }
         fixed (byte* pSrc = data)
         {
@@ -3038,6 +3203,16 @@ internal unsafe partial class Graphics : IGraphics
         }
         vk.UnmapMemory(Vulkan.Device.LogicalDevice, staging.Memory);
 
+        // 目标缓冲跨帧复用，写入前等待上一帧的计算、顶点和片元消费者。
+        var beforeCopy = new VkBufferMemoryBarrier {
+            SType = VkStructureType.BufferMemoryBarrier,
+            SrcAccessMask = VkAccessFlags.ShaderReadBit | VkAccessFlags.ShaderWriteBit | VkAccessFlags.TransferWriteBit,
+            DstAccessMask = VkAccessFlags.TransferWriteBit,
+            SrcQueueFamilyIndex = SVk.QueueFamilyIgnored, DstQueueFamilyIndex = SVk.QueueFamilyIgnored,
+            Buffer = dst.Buffer, Offset = 0, Size = SVk.WholeSize };
+        vk.CmdPipelineBarrier(cmd,
+            VkPipelineStageFlags.ComputeShaderBit | VkPipelineStageFlags.VertexShaderBit | VkPipelineStageFlags.FragmentShaderBit | VkPipelineStageFlags.TransferBit,
+            VkPipelineStageFlags.TransferBit, 0, 0, null, 1, &beforeCopy, 0, null);
         var region = new Silk.NET.Vulkan.BufferCopy { SrcOffset = 0, DstOffset = 0, Size = size };
         vk.CmdCopyBuffer(cmd, staging.Buffer, dst.Buffer, 1, &region);
 
@@ -3056,8 +3231,9 @@ internal unsafe partial class Graphics : IGraphics
         };
         vk.CmdPipelineBarrier(cmd,
             VkPipelineStageFlags.TransferBit,
-            VkPipelineStageFlags.ComputeShaderBit | VkPipelineStageFlags.VertexShaderBit,
+            VkPipelineStageFlags.ComputeShaderBit | VkPipelineStageFlags.VertexShaderBit | VkPipelineStageFlags.FragmentShaderBit,
             0, 0, null, 1, &barrier, 0, null);
+        return true;
     }
 
     // 1-7 Cubemap
@@ -3094,11 +3270,13 @@ internal unsafe partial class Graphics : IGraphics
         }
     }
 
-    public void DispatchCompute(in Season.Rendering.ComputeDispatchArgs args)
+    public void DispatchCompute(in Season.Rendering.ComputeDispatchArgs args) => TryDispatchCompute(args);
+
+    public bool TryDispatchCompute(in Season.Rendering.ComputeDispatchArgs args)
     {
         var cmd = Vulkan.Device.GraphicsCommandBuffer;
         if (cmd.Handle == 0)
-            return;
+            return false;
 
         var vk = Vulkan.Device.Vk;
         var kernel = (VKComputeKernel)args.Kernel;
@@ -3172,7 +3350,7 @@ internal unsafe partial class Graphics : IGraphics
                     // Shape does not match the binding declaration
                     // DepthTexture requires a depth-only RT, while SampledTexture requires a color plane
                     Vulkan.Device.PopDebugGroup();
-                    return;
+                    return false;
                 }
                 imageInfos[i] = new VkDescriptorImageInfo
                 {
@@ -3205,7 +3383,7 @@ internal unsafe partial class Graphics : IGraphics
                 if (tex3d == null || !System.Threading.Volatile.Read(ref tex3d.Ready))
                 {
                     Vulkan.Device.PopDebugGroup();
-                    return;
+                    return false;
                 }
 
                 bool write3d = bindings[i].Type == Season.Rendering.ComputeBindingType.StorageTexture3DWrite;
@@ -3214,7 +3392,7 @@ internal unsafe partial class Graphics : IGraphics
                     // Undefined (first frame) / ShaderReadOnly (later frames) -> General:
                     // writing must wait until compute sampling from the previous frame is finished
                     tex3d.TransitionTo(cmd, layout3d,
-                        VkPipelineStageFlags.ComputeShaderBit, VkPipelineStageFlags.ComputeShaderBit,
+                        VkPipelineStageFlags.FragmentShaderBit | VkPipelineStageFlags.ComputeShaderBit, VkPipelineStageFlags.ComputeShaderBit,
                         VkAccessFlags.ShaderReadBit, VkAccessFlags.ShaderWriteBit);
                 else
                     // Content is written by an earlier kernel in the same frame
@@ -3256,7 +3434,7 @@ internal unsafe partial class Graphics : IGraphics
             if (tex == null || !System.Threading.Volatile.Read(ref tex.Ready))
             {
                 Vulkan.Device.PopDebugGroup();
-                return;
+                return false;
             }
 
             if (bindings[i].Type == Season.Rendering.ComputeBindingType.StorageTextureWrite)
@@ -3313,7 +3491,9 @@ internal unsafe partial class Graphics : IGraphics
         }
 
         if (writeCount > 0)
+        {
             vk.UpdateDescriptorSets(Vulkan.Device.LogicalDevice, writeCount, writes, 0, null);
+        }
 
         vk.CmdBindPipeline(cmd, VkPipelineBindPoint.Compute, kernel.PipelineState);
 
@@ -3352,7 +3532,7 @@ internal unsafe partial class Graphics : IGraphics
                 // because 3D textures never enter the 2D dictionary and therefore cannot be consumed by draw paths.
                 case Vulkan.VKTexture3D tex3d:
                     tex3d.TransitionTo(cmd, VkImageLayout.ShaderReadOnlyOptimal,
-                        VkPipelineStageFlags.ComputeShaderBit, VkPipelineStageFlags.ComputeShaderBit,
+                        VkPipelineStageFlags.ComputeShaderBit, VkPipelineStageFlags.FragmentShaderBit | VkPipelineStageFlags.ComputeShaderBit,
                         VkAccessFlags.ShaderWriteBit, VkAccessFlags.ShaderReadBit);
                     break;
                 case VKStorageBuffer buffer when bindings[i].Type == Season.Rendering.ComputeBindingType.StorageBufferReadWrite:
@@ -3377,6 +3557,7 @@ internal unsafe partial class Graphics : IGraphics
         }
 
         Vulkan.Device.PopDebugGroup();
+        return true;
     }
 
     }

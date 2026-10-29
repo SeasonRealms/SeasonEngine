@@ -689,6 +689,14 @@ public static class WindowsApp
         // fall back to the LDR baseline.
         DirectX.Device.HdrSceneColor = !immediate2D && UseOffscreenSceneColor && RenderQuality.Current.HdrSceneColor;
 
+        // D3D12 必然支持 Compute；在交换链、MRT 和 PSO 创建之前确定雾的单采样路径。
+        var fogAa = RenderQuality.Current.ResolveFogAntiAliasing(DirectX.Device.HdrSceneColor, immediate2D);
+        if (fogAa != RenderQuality.Current.AntiAliasing)
+        {
+            RenderQuality.Current.AntiAliasing = fogAa;
+            DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] 体积雾需要单采样场景，Msaa4x 降为 {fogAa}");
+        }
+
         // 2-1 contract clause 5: finalize the AA tier during initialization
         // (mutually exclusive single-choice; fall back and log when unsupported, with zero runtime branching).
         // This must happen before CreateSwapChain because the Display MSAA sample count is derived
@@ -914,7 +922,9 @@ public static class WindowsApp
         // why the dilation input was missing on exactly the validated backend.
         // SampleCount 1 is unconditionally correct here: MotionVectors and Msaa4x were already made
         // mutually exclusive above, so this branch is never reached with a multisampled scene.
-        if (!immediate2D && RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
+        if (!immediate2D && Season.Rendering.FrameSchedule.SceneDepth == null
+            && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresFogSceneDepth(
+                DirectX.Device.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)))
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {

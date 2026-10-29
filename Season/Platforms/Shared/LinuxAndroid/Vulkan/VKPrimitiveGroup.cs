@@ -489,6 +489,8 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
             ? VKTexture3D.Find(aerialName)
             : null;
 
+        FrameSchedule.CaptureLighting(lightParams, Camera.View, Camera.Projection,
+            DeviceServices.BaseApp.Camera.ViewProjection);
         Unsafe.Write(_mappedLightConstantBuffers[fi], lightParams);
     }
 
@@ -613,6 +615,11 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
     /// </summary>
     protected void AllocateAndWriteDescriptorSets(PrimitiveData p)
     {
+        // A model loaded on the background thread allocates and writes its sets here, including the 25-binding write
+        // batch in WriteDescriptorSet. The frame that is already recording may have bound the same slots, so the whole
+        // allocate-and-write stays under the GPU gate; see Device.EnterGpuAccessScope.
+        using var gpuAccess = Device.EnterGpuAccessScope();
+
         int n = (int)Device.frameCount;
         p.DescriptorSets = new DescriptorSet[n];
         // 1-7: binding 16 version cache aligned with DescriptorSets
@@ -682,6 +689,14 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
 
     void WriteDescriptorSet(PrimitiveData p, int fi, BufferResource[] bones, BufferResource[] instanceBones, BufferResource[] morphDeltas)
     {
+        // Every descriptor write funnels through here, so this is the one place that catches a producer which reached
+        // GPU state without the gate: AllocateAndWriteDescriptorSets and VKModel.CreateInstance both wrap their loops.
+        Device.AssertGpuGateHeld("VKPrimitiveGroup.WriteDescriptorSet");
+
+        // Rewrites happen from the render thread too (VKInstancedModel.Update on a bone capacity change rewrites every
+        // slot), so never touch a set whose frame is still on the GPU; see Device.WaitForFrameSlot.
+        Device.WaitForFrameSlot(fi);
+
         var matrixInfo = new DescriptorBufferInfo
         { Buffer = p.MatrixBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize };
         var lightInfo = new DescriptorBufferInfo
@@ -714,7 +729,7 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         { ImageView = p.EmissiveTexture.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
 
         var set = p.DescriptorSets[fi];
-        var writes = stackalloc WriteDescriptorSet[22];
+        var writes = stackalloc WriteDescriptorSet[25];
         writes[0] = MakeBufferWrite(set, 0, DescriptorType.UniformBuffer, &matrixInfo);
         writes[1] = MakeBufferWrite(set, 1, DescriptorType.UniformBuffer, &lightInfo);
         writes[2] = MakeBufferWrite(set, 2, DescriptorType.UniformBuffer, &materialInfo);
@@ -826,7 +841,22 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         if (p.AerialLutViewVersions != null)
             p.AerialLutViewVersions[fi] = aerialLut.ViewVersion;
 
-        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 22, writes, 0, null);
+        // 雾采样三段（22/23/24）：
+        // 22 是帧常量存储缓冲，先写零填充占位（帧内容由雾合成那边的帧缓冲提供，
+        // 透明阶段只负责把真正句柄补写进本槽描述符）；
+        // 23/24 是两张体积纹理，收集期拿不到本帧产物，先拿 AP 体积
+        // （DummyBlack 降落且已处于 ShaderReadOnlyOptimal）占位，
+        // 由透明阶段在绑定前重写。三者都必须在收集期先写，
+        // 否则着色器静态引用的描述符会是野值（WSL 驱动会直接中止）。
+        var fogFrameInfo = new DescriptorBufferInfo
+        { Buffer = Pipeline.DefaultFogFrameBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize };
+        writes[22] = MakeBufferWrite(set, Pipeline.SceneFogFrameBinding, DescriptorType.StorageBuffer, &fogFrameInfo);
+        var fogVolumeInfo = new DescriptorImageInfo
+        { ImageView = aerialLut.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
+        writes[23] = MakeImageWrite(set, Pipeline.SceneFogIntegratedBinding, &fogVolumeInfo);
+        writes[24] = MakeImageWrite(set, Pipeline.SceneFogLocalBinding, &fogVolumeInfo);
+
+        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 25, writes, 0, null);
     }
 
     /// <summary>2-3 Step C: derived classes may override this to return the prev bone SSBO
@@ -1975,6 +2005,10 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         if (!_transformInitialized)
             return;
 
+        // 收集期把本分组钉在快照页上：重放时命令缓冲还会引用图元、共享壳体模板与实例缓冲，
+        // 三者都挂在本分组上。非收集期是空操作。
+        VKSceneDrawCollection.RetainOwner(this);
+
         OnBeforeDraw();
 
         _drawList.Clear();
@@ -2116,6 +2150,27 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
 
         if (_shadowDrawList.Count == 0)
             return;
+
+        // 描述符集一旦被绑定到正在录制的命令缓冲，未声明 UPDATE_AFTER_BIND 的绑定就不允许再改写
+        // （否则整条命令缓冲进入 invalid 状态，收尾时报 VUID-vkEndCommandBuffer-commandBuffer-00059）。
+        // 常驻图元的 binding 16-20 已经在帧首、命令缓冲 begin 之前刷新过
+        // （Pipeline.RefreshSceneBindingsForFrameStart），这里会因为 ViewVersion 相同而全部跳过；
+        // 它现在的职责是本帧首次出现的图元的兜底，每个槽位首次绘制时刷新一次。
+        // 阴影的剔选结果与主通道不一定重合，所以这里还得把自己画过的图元登记给下一帧的帧首预刷新。
+        int fi = (int)Device.FrameIndex;
+        for (int i = 0; i < _shadowDrawList.Count; i++)
+        {
+            var p = _shadowDrawList[i];
+            if (p.IsTransparent)
+                continue;
+            VKSceneDrawCollection.NotePrimitiveDrawn(p);
+            Pipeline.RefreshSceneBindings(p.DescriptorSets[fi],
+                ref p.EnvCubeViewVersions[fi],
+                ref p.DdgiAtlasViewVersions[fi],
+                ref p.DdgiDepthViewVersions[fi],
+                ref p.CloudNoiseViewVersions[fi],
+                ref p.AerialLutViewVersions[fi]);
+        }
 
         OnBeforeDraw();
 

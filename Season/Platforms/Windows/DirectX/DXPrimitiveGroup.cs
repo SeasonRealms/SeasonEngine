@@ -283,6 +283,8 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
             ? DXTexture3D.Find(aerialName)
             : null;
 
+        FrameSchedule.CaptureLighting(lightParams, Camera.View, Camera.Projection,
+            DeviceServices.BaseApp.Camera.RenderViewProjection);
         Unsafe.Write(mappedLightConstantBuffers[fi], lightParams);
     }
 
@@ -1172,6 +1174,7 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     {
         var primitive = new PrimitiveData
         {
+            SharedGeometrySource = template.SharedGeometrySource ?? template,
             Vertices = template.Vertices,
             Indices = template.Indices,
             VertexBufferView = template.VertexBufferView,
@@ -1579,8 +1582,11 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
                 _singleSidedTransparentList.Add(p);
         }
 
-        _singleSidedTransparentList.Sort(CompareTransparentPrimitives);
-        _doubleSidedTransparentList.Sort(CompareTransparentPrimitives);
+        if (DXSceneDrawCollection.Active == null)
+        {
+            _singleSidedTransparentList.Sort(CompareTransparentPrimitives);
+            _doubleSidedTransparentList.Sort(CompareTransparentPrimitives);
+        }
 
         pipelineSet = false;
         currentDoubleSided = false;

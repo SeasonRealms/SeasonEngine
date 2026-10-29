@@ -7,8 +7,26 @@ using Silk.NET.Direct3D12;
 
 namespace Season.Platforms.Windows;
 
-internal unsafe partial class Graphics : IGraphics
+internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 {
+    readonly DXSceneDrawCollection _sceneCollection = new();
+    public void BeginSceneCollection() => _sceneCollection.Begin();
+    public void SealSceneCollection() => _sceneCollection.Seal();
+    public void DrawCollectedOpaque() => _sceneCollection.DrawOpaque();
+    public void DrawCollectedTransparent(bool sampleFog) => _sceneCollection.DrawTransparent(sampleFog);
+    public void ReleaseSceneCollection() => _sceneCollection.Release();
+
+    public Season.Rendering.FogCompositePipeline? CreateFogCompositePipeline()
+    {
+        if (!ComputeSupported) return null;
+        try { return new DXFogCompositePipeline(DictionaryDXTexture); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[FogComposite] 创建失败：{ex.Message}");
+            return null;
+        }
+    }
+
     // ── Text GPU Instancing: lightweight ITextureHolder (no GPU resources) ──
     internal sealed class TextGlyphHolder : ITextureHolder
     {
@@ -425,29 +443,40 @@ internal unsafe partial class Graphics : IGraphics
     /// in CreateComputeTexture).</summary>
     public void CreateComputeTexture3D(string name, uint width, uint height, uint depth,
         Season.Rendering.ComputeStorageFormat format = Season.Rendering.ComputeStorageFormat.Rgba8Unorm)
+        => TryCreateComputeTexture3D(name, width, height, depth, format);
+
+    public bool TryCreateComputeTexture3D(string name, uint width, uint height, uint depth,
+        Season.Rendering.ComputeStorageFormat format = Season.Rendering.ComputeStorageFormat.Rgba8Unorm)
     {
         try
         {
-            DirectX.DXTexture3D.CreateOrUpdate(name, width, height, depth, format);
+            return DirectX.DXTexture3D.CreateOrUpdate(name, width, height, depth, format).Ready;
         }
         catch (Exception ex)
         {
             DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [CreateComputeTexture3D] '{name}' "
                 + $"{width}x{height}x{depth} {format} creation failed: {ex.Message}");
+            return false;
         }
     }
+
+    public void ReleaseComputeTexture3D(string name) => DirectX.DXTexture3D.ReleaseByName(name);
 
     /// <summary>CPU-to-GPU constant block upload: staged through the upload heap and copied with
     /// CopyBufferRegion into the current frame command list
     /// (BeforeRender has already opened it; the caller must invoke this outside render/compute
     /// passes, see the IGraphics contract).</summary>
     public void UpdateStorageBuffer(Season.Rendering.StorageBuffer buffer, ReadOnlySpan<byte> data)
+        => TryUpdateStorageBuffer(buffer, data);
+
+    public bool TryUpdateStorageBuffer(Season.Rendering.StorageBuffer buffer, ReadOnlySpan<byte> data)
     {
         var cmd = DirectX.Device.GraphicsCommandList;
-        if (cmd == null || buffer is not DXStorageBuffer dxBuffer)
-            return;
-
+        if (cmd == null || buffer is not DXStorageBuffer dxBuffer || dxBuffer.Resource == null
+            || data.Length == 0 || data.Length > buffer.SizeInBytes || (data.Length & 3) != 0)
+            return false;
         dxBuffer.Upload(cmd, data);
+        return true;
     }
 
     // ── 1-7 Cubemap type + environment IBL (contract in IGraphics / Season.Rendering.Environment.cs) ──
@@ -532,11 +561,13 @@ internal unsafe partial class Graphics : IGraphics
         return rebuilt;
     }
 
-    public void DispatchCompute(in Season.Rendering.ComputeDispatchArgs args)
+    public void DispatchCompute(in Season.Rendering.ComputeDispatchArgs args) => TryDispatchCompute(args);
+
+    public bool TryDispatchCompute(in Season.Rendering.ComputeDispatchArgs args)
     {
         var cmd = DirectX.Device.GraphicsCommandList;
         if (cmd == null)
-            return;
+            return false;
 
         var kernel = (DXComputeKernel)args.Kernel;
         var bindings = kernel.Desc.Bindings;
@@ -570,7 +601,7 @@ internal unsafe partial class Graphics : IGraphics
             if (res.Buffer is DXStorageBuffer buffer)
             {
                 bool write = bindings[i].Type == Season.Rendering.ComputeBindingType.StorageBufferReadWrite;
-                buffer.TransitionTo(cmd, write ? ResourceStates.UnorderedAccess : ResourceStates.NonPixelShaderResource);
+                buffer.TransitionTo(cmd, write ? ResourceStates.UnorderedAccess : ResourceStates.AllShaderResource);
                 cmd->SetComputeRootDescriptorTable((uint)kernel.RootParamIndex[i], write ? buffer.UavGpuHandle : buffer.SrvGpuHandle);
                 kernel.ResolvedScratch[i] = buffer;
                 continue;
@@ -590,7 +621,7 @@ internal unsafe partial class Graphics : IGraphics
                 if (rt.SrvIndex < 0)
                 {
                     DirectX.Device.PopDebugGroup();
-                    return;
+                    return false;
                 }
                 if (rt.Color == null && rt.Depth != null)
                     rt.TransitionDepthTo(cmd, ResourceStates.NonPixelShaderResource);
@@ -617,7 +648,7 @@ internal unsafe partial class Graphics : IGraphics
                 if (tex3d == null || !tex3d.Ready)
                 {
                     DirectX.Device.PopDebugGroup();
-                    return;
+                    return false;
                 }
 
                 if (bindings[i].Type == Season.Rendering.ComputeBindingType.StorageTexture3DWrite)
@@ -645,7 +676,7 @@ internal unsafe partial class Graphics : IGraphics
             if (tex == null || !System.Threading.Volatile.Read(ref tex.Ready))
             {
                 DirectX.Device.PopDebugGroup();
-                return;
+                return false;
             }
 
             if (bindings[i].Type == Season.Rendering.ComputeBindingType.StorageTextureWrite)
@@ -709,6 +740,7 @@ internal unsafe partial class Graphics : IGraphics
         }
 
         DirectX.Device.PopDebugGroup();
+        return true;
     }
 
     public async Task<bool> LoadSprite2D(Sprite2D sprite2D)
@@ -1488,11 +1520,23 @@ internal unsafe partial class Graphics : IGraphics
                 || fi >= state.InstanceBufferViews.Length || fi >= state.InstanceBuffers.Length || state.InstanceBuffers[fi] == null)
                 return;
 
+            if (DXSceneDrawCollection.Active is { } collection)
+            {
+                var parameters = new TextDrawParams {
+                    PxRange = Season.Fonts.Font.PixelRange,
+                    AtlasSize = new Vector2(_glyphAtlas.AtlasTexture?.Width ?? 1f, _glyphAtlas.AtlasTexture?.Height ?? 1f),
+                    GlobalAlpha = Math.Clamp(texts.Alpha, 0f, 1f), TextColor = texts.Color.AsVector4 };
+                collection.CaptureText(_textMatrixBuffer, state.InstanceBuffers[fi], state.InstanceBufferViews[fi],
+                    state.GlyphBuffer, _glyphAtlas.AtlasTexture, (uint)state.InstanceCount, parameters);
+                return;
+            }
+
             // Ensure the atlas texture is ready.
             _glyphAtlas.AtlasTexture?.EnsureReadyForRendering(cmdList);
 
             // Set the pipeline (Transparent + DoubleSided -> no back-face culling).
             Pipeline.SetPipeline(PipelineMode.Transparent, doubleSided: true);
+            Pipeline.BindQuadSceneResources();
 
             // Bind VB slot 0 (unit quad) + slot 1 (instance transforms).
             var vertexViews = stackalloc VertexBufferView[2];
@@ -2957,7 +3001,7 @@ internal unsafe partial class Graphics : IGraphics
     /// <summary>2-2 Step B: resolves GTAO output from the instance dictionary through FrameSchedule.AoTexture (null = no AO).</summary>
     DXTexture ResolveAoTexture()
     {
-        var aoName = Season.Rendering.FrameSchedule.AoTexture;
+        var aoName = Season.Rendering.FrameSchedule.PostAoTexture;
         if (aoName == null)
             return null;
         lock (DictionaryDXTexture)

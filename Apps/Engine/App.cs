@@ -35,6 +35,16 @@ internal class App : BaseApp
     // Update must run it before sky because skybox tinting and marker visibility read its per-frame cache.
     CelestialLighting celestial;
 
+    // Scene-medium driver: the three authored fog presets, the local volumes they use, and the colonnade the sun-shaft
+    // preset needs as an occluder. Update runs right after celestial because the wind drift shares that clock's frame
+    // delta and simulation scale rather than reading App.Time.
+    internal Fog fog;
+
+    // The registered volumetric pass, or null when the tier or the backend declined it at registration time. Held only
+    // for the diagnostics row in the settings panel (grid size, history weight), which is the one place that needs to
+    // report what was actually built rather than what was asked for.
+    internal Season.Rendering.Effects.VolumetricFogEffect fogEffect;
+
     internal Ground ground;
 
     // Procedural sea: a 1400x1400m noisy water surface around the land.
@@ -52,6 +62,52 @@ internal class App : BaseApp
     // with 5 large, 5 medium, and 5 small variants.
     // Each variant gets one InstancedMesh3D and is scattered along the east shoreline. See Rocks.cs.
     internal Rocks rocks;
+
+    internal Forest forest;
+
+    // ── Forest mist patch ──
+    //
+    // Fog in this sample is authored as a patch, not as weather: the global medium is off (GlobalExtinction = 0), so the box
+    // below is the only medium in the world and every pixel outside it composites as identity. That is the shape a general
+    // "one fog per place" capability takes - the grove has mist, the beach, the road and the meadow do not.
+    //
+    // The patch covers the grove (x in [-60, -40], z in [-30, -10], trees 2 m tall) plus 12 m of feather on every side, so
+    // its box never reads as a box. Density is set so ~10 m inside it is already half opaque, while a viewer standing
+    // outside sees a lit bank between the trunks rather than a wall.
+    //
+    // Night needs no special case: a patch that nothing lights is invisible, and the player's torch (5 cd, 12 m range,
+    // registered in Player) turns it into a visible glow the moment they walk in. That is the intended behaviour.
+    //
+    // MaxDistance is the froxel depth range and is deliberately short: the slices are distributed exponentially over it, so
+    // 140 m spends far more of them on a 20 m patch than the 320 m a scene-wide medium would want.
+    // A runtime flag rather than a const so the panel's two paths both stay real code to the compiler: a const would
+    // fold the preset branch into unreachable code the moment anyone made this false on purpose.
+    internal static bool FixedIslandFog { get; set; } = true;
+
+    // The global medium is off. This is the one number that decides whether the world has weather or only patches.
+    const float GlobalExtinction = 0f;
+
+    // Anisotropy, depth range and wind are medium-wide by construction - the phase function and the froxel layout have no
+    // per-volume counterpart - so they stay here even though the global extinction is zero.
+    const float MistAnisotropy = 0.60f;    // Forward scattering: the sunlit side of the patch glows, the far side greys out.
+    const float MistMaxDistance = 140f;
+    static readonly Vector3 MistWind = new(0.30f, 0f, 0.10f);
+
+    // Density at the centre of the patch, before the density multiplier. Denser than a scene-wide medium on purpose: it
+    // only has 22 m to work with, so the contrast has to come from the near field.
+    const float ForestMistExtinction = 0.06f;
+
+    readonly FogVolume forestMist = new()
+    {
+        Shape = FogVolumeShape.Box,
+        Position = new Vector3(-50f, 2.4f, -20f),   // Grove centre, lifted so the densest layer sits at trunk height.
+        Size = new Vector3(44f, 6.5f, 44f),         // 20x20 grove plus 12 m of feather on every side.
+        Extinction = ForestMistExtinction,
+        EdgeFeather = 0.5f,
+        NoiseAmount = 0.5f,
+        NoiseScale = 0.05f,                          // ~20 m banks, so the trunks sit inside moving clumps.
+        Albedo = new Vector3(0.86f, 0.90f, 0.96f),   // Slightly darker than the sky: a pure-white patch vanishes at noon.
+    };
 
     internal Mountains mountains;
 
@@ -153,6 +209,19 @@ internal class App : BaseApp
         // then copied back here once the final default is chosen.
         // Only the sample default is overridden; the engine-level DefaultAerialIntensity remains 1.
         RenderQuality.DefaultAerialIntensity = 12f;
+
+        // Volumetric fog is a tier, so the decision has to happen here: this constructor runs before platform graphics
+        // initialization, and RequiresFogSceneDepth is what makes the backends allocate SceneDepth for it and what makes
+        // VolumetricFogEffect.Initialize accept the registration. Off cannot be rescued at runtime, because the pass is
+        // built once - the settings row that writes this tier therefore says "restart to apply".
+        //
+        // The sample runs Medium everywhere it can measure it. Low collapses the shadow taps to one, which is what the
+        // weaker mobile GPUs and the browser's single-threaded backend want; Medium is the tier the shafts are authored
+        // against. A saved setting still wins, because Init reads Settings.json after this and only snapshots these
+        // values when the file has no key of its own.
+        RenderQuality.DefaultVolumetricFog = OperatingSystem.IsAndroid() || OperatingSystem.IsBrowser()
+            ? FogQuality.Low
+            : FogQuality.Medium;
 
         ResetCamera();
     }
@@ -340,6 +409,54 @@ internal class App : BaseApp
         {
 
         }
+
+        // 3-x Step A: register VolumetricFogEffect.
+        // Last on purpose. It is an AfterOpaque effect, and GTAO is the other one: effects in a phase are recorded in
+        // registration order, so the fog composite has to come after GTAO for FrameSchedule.PostAoTexture to already hold
+        // this frame's ambient occlusion and for the composite to consume it exactly once and publish that it did.
+        //
+        // Registration is also where the tier becomes real: with VolumetricFog=Off, missing HDR offscreen color, a
+        // backend that is not segmented, or no depth target, Initialize declines and the pass simply does not exist.
+        // That is why nothing below or in the panel checks for it - Fog panel keeps writing SceneFog regardless, and the
+        // effect is the only thing that decides whether anything consumes it.
+fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
+        if (!Season.Rendering.FrameSchedule.RegisterCompute(
+                Season.Basic.Graphics.Instance, fogEffect))
+        {
+            // Declined: no HDR offscreen color, no depth target, no segmented scene, unsupported compute, or the tier is
+            // Off. The object is not registered, so dropping the handle is all that is left to do - nothing disposed it
+            // and nothing holds it.
+            fogEffect = null;
+        }
+    }
+
+    /// <summary>
+    /// Writes this frame's medium. Runs after fog.Update on purpose: the panel puts its own numbers in for this frame first,
+    /// and this call is what the pass actually reads. Nothing here resets the volumetric history - extinction and wind are
+    /// exactly the quantities the temporal filter exists to smooth - so the only history reset still in play is the panel's
+    /// own preset switch.
+    /// </summary>
+    void ApplyMist()
+    {
+        var scene = Fog;
+        if (scene == null) return;
+
+        var world = WorldSettings.Current;
+        float density = world.FogDensityScale > 0f && float.IsFinite(world.FogDensityScale) ? world.FogDensityScale : 1f;
+
+        // Fog off and the density multiplier stay live knobs: they are the two settings rows that describe the medium
+        // rather than the framing, and the pass itself is what the on/off switch has to reach.
+        scene.Enabled = world.FogEnabled;
+
+        // Extinction stays at zero: the world has no weather, only the patch below. Enabled above is what keeps the pass
+        // alive, so the volumes are still injected and still composited.
+        scene.Extinction = GlobalExtinction;
+        scene.Anisotropy = MistAnisotropy;
+        scene.MaxDistance = MistMaxDistance;
+        scene.WindVelocity = MistWind;
+
+        // The patch is the whole medium, so the density row scales it directly.
+        forestMist.Extinction = ForestMistExtinction * density;
     }
 
     // Fully synchronous and intentionally free of blocking loads.
@@ -374,6 +491,16 @@ internal class App : BaseApp
         sky = new Sky(celestial);
         AddPanel(sky);
 
+        // Scene medium right after the sky: it draws the sun-shaft colonnade, which is scenery and has to resolve depth
+        // against the ground and the models that follow. Its constructor registers the local volumes on App.Fog, so it
+        // must exist before the first frame that renders the volumetric pass.
+        fog = new Fog();
+        AddPanel(fog);
+
+        // The forest patch joins the same scene medium once, here, so it is present from the first frame and in every
+        // preset. Add only registers it: the density it contributes is written by ApplyMist below.
+        Fog.Add(forestMist);
+
         ground = new Ground();
         AddPanel(ground);
 
@@ -394,6 +521,10 @@ internal class App : BaseApp
         rocks = new Rocks();
         AddPanel(rocks);
         DeviceServices.BaseApp?.RequestLoad(rocks);   // Queue the whole panel so Load can extract in the background.
+
+        forest = new Forest();
+        AddPanel(forest);
+        DeviceServices.BaseApp?.RequestLoad(forest);   // Queue the whole panel so Load can extract in the background.
 
         //// Background mountain ring: extract four mountain meshes from background_mountains.glb at runtime,
         //// then assign each one to an InstancedMesh3D for ring instancing. See Mountains.cs.
@@ -841,6 +972,14 @@ internal class App : BaseApp
         // The lighting driver must run before the sky panel because Sky.Update reads the celestial per-frame cache
         // for DayPhase, SunUp, MoonUp, and MoonPhase when applying tint and marker visibility.
         celestial?.Update(time);
+
+        // Scene medium after the lighting driver: the wind drift is integrated from the frame delta that driver just
+        // published, and a preset switch previews an hour through the same clock.
+        fog?.Update(time);
+
+        // The patch after the panel's own write, so the fixed numbers are the ones the pass reads this frame.
+        ApplyMist();
+
         sky?.Update(time);
 
         // Ground is static; same pattern, with first-frame geometry upload and draw submission.
@@ -854,6 +993,8 @@ internal class App : BaseApp
 
         // Coastal rocks are statically instanced and early-out internally until extraction finishes.
         rocks?.Update(time);
+
+        forest?.Update(time);
 
         // Background mountains are statically instanced and early-out internally until extraction finishes.
         mountains?.Update(time);

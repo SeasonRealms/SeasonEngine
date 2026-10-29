@@ -301,6 +301,9 @@ internal unsafe sealed class VKTextureCube : IDisposable
     /// </summary>
     void UploadFaces(byte[][] faceData)
     {
+        // Transfer-queue submit plus a command buffer from the shared upload pool; see Texture.UploadPixels.
+        using var gpuAccess = Device.EnterGpuAccessScope();
+
         var vk = Device.Vk;
         var d = Device.LogicalDevice;
         var rm = Device.ResourceManager;

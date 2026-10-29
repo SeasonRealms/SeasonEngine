@@ -230,8 +230,15 @@ internal unsafe abstract class DXSpriteQuad : ITextureHolder, IDisposable
     /// Completes command-list binding for a Sprite quad: barriers, pipeline, VB,
     /// CBs, and descriptor tables t0-t4, then issues DrawInstanced(6,1,0,0).
     /// </summary>
-    protected void DrawQuad(VertexBufferView* vbv)
+    protected void DrawQuad(VertexBufferView* vbv, ID3D12Resource* vertexBuffer)
     {
+        if (DXSceneDrawCollection.Active is { } collection)
+        {
+            int frame = (int)Device.FrameIndex;
+            collection.CaptureQuad(vertexBuffer, *vbv, _matrixBuffers[frame], _materialBuffers[frame],
+                DXTexture, NormalMap, MetallicRoughnessMap, OcclusionMap, EmissiveMap);
+            return;
+        }
         // Ensure copy-queue uploads are complete and apply the
         // Common -> PixelShaderResource barrier.
         DXTexture.EnsureReadyForRendering(Device.GraphicsCommandList);
@@ -242,6 +249,7 @@ internal unsafe abstract class DXSpriteQuad : ITextureHolder, IDisposable
 
         // Set the transparent rendering pipeline.
         Pipeline.SetPipeline(PipelineMode.Transparent);
+        Pipeline.BindQuadSceneResources();
 
         // Bind vertex buffers: slot 0 = quad, slot 1 = identity instance
         // placeholder. The non-instanced shader path does not read slot 1, but

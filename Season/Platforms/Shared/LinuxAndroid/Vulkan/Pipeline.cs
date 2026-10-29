@@ -134,6 +134,77 @@ public static VkPipeline TransparentBackFacePipelineState;
     /// Using Clamp would stretch the outermost column into a motionless stripe across the sky, mirroring DX s2 wrapSampler.</summary>
     public static Sampler WrapSampler;
 
+    /// <summary>
+    /// 工作包 C：雾采样描述符索引，与 DX 的 FogFrameRoot / FogIntegratedRoot / FogLocalRoot 一一对应。
+    /// 22 是本帧雾常量（vec4 数组，std430 存储缓冲），23/24 是两张 3D 体积纹理（积分列 / 局部列）。
+    /// 透明阶段每绘制项都要在自己那一槽描述符集里改写这三个绑定：
+    /// 体积纹理是本帧雾合成阶段才产出的资源，收集期还拿不到句柄。
+    /// </summary>
+    internal const uint SceneFogFrameBinding = 22;
+
+    internal const uint SceneFogIntegratedBinding = 23;
+
+    internal const uint SceneFogLocalBinding = 24;
+
+    // 雾三件套已搬到独立的 set 1：set 0 里的 22/23/24 仍在布局中（无害的多余绑定），
+    // 但 shader 改从 set 1 取。原因是同一帧里阴影 pass 会绑定 set 0，而透明阶段要给每一项
+    // 改写雾绑定；两者撞在同一个 set 上，未声明 UPDATE_AFTER_BIND 的绑定被改写就会让整条
+    // 命令缓冲失效。拆成两个 set 后，阴影只绑 set 0、透明阶段只改绑 set 1，冲突从结构上消失。
+    /// <summary>set 1 内雾帧常量的绑定号。</summary>
+    internal const uint FogSetFrameBinding = 0;
+
+    /// <summary>set 1 内雾积分列体积纹理的绑定号。</summary>
+    internal const uint FogSetIntegratedBinding = 1;
+
+    /// <summary>set 1 内雾局部列体积纹理的绑定号。</summary>
+    internal const uint FogSetLocalBinding = 2;
+
+    /// <summary>雾采样 set 1 的专用布局。</summary>
+    public static DescriptorSetLayout FogSetLayout;
+
+    /// <summary>
+    /// 每帧槽一个的雾采样集。透明阶段的开头写一次、随后全帧复用：
+    /// 同一帧里所有透明绘制项拿到的是同一份雾资源（雾合成按帧产出，与绘制项无关），
+    /// 所以不必逐项一份集合，“写完再绑”的顺序也天然成立。
+    /// </summary>
+    static DescriptorSet[] _fogSets = null!;
+
+    /// <summary>本帧绘制要绑到 set 1 的雾采样集；透明阶段置为当前帧槽的集合，其余时候回落到 <see cref="DefaultFogSet"/>。</summary>
+    internal static DescriptorSet CurrentFogSet;
+
+    /// <summary>
+    /// 常量零帧 + 占位体积纹理的雾采样集，一旦创建就不再改写。
+    /// 直绘路径不经过透明阶段，拿不到本帧的雾资源，
+    /// 绑它等于“雾门控关闭”（SceneFogParams 为默认零值，shader 不会去采样）。
+    /// </summary>
+    public static DescriptorSet DefaultFogSet;
+
+    /// <summary>
+    /// 非不透明变体的 FS 是否在编译期启用了 FOG_SAMPLING，与 DX 的 _fogSamplingEnabled 同源。
+    /// 雾采样只发生在 HDR 场景色链路上，所以未开启 HDR 或处于 Immediate2D 时整条路径都不参与编译。
+    /// </summary>
+    public static bool SceneFogSamplingBaked;
+
+    /// <summary>
+    /// 本帧雾采样门控，作为 FS push constant 推送（与 outline mask 的颜色共用 16B@offset 0）。
+    /// x &gt; 0.5 时才真正采样；关闭时保持零值，于是镜头里不会读到尚未合成的体积纹理。
+    /// 只有透明阶段会把它置为 (1,0,0,0)。
+    /// </summary>
+    internal static Vector4 SceneFogParams;
+
+    /// <summary>
+    /// 雾采样关闭时占位的零帧常量（N 缓冲）。
+    /// 绑定 22 被 shader 静态引用，描述符集里必须有合法来源，否则校验层会报描述符未写入。
+    /// </summary>
+    public static BufferResource[] DefaultFogFrameBuffers = null!;
+
+    /// <summary>最近一次 SetPipeline 请求的绘制模式。</summary>
+    /// <remarks>
+    /// 雾门控要按模式区分（不透明变体没有 FOG_SAMPLING），而推常量发生在 DrawPrimitive 里，
+    /// 所以模式必须在这里留一份。与 PSO 选择共用同一个入口，两者不会失配。
+    /// </remarks>
+    static PipelineMode _boundMode;
+
     /// <summary>Identity instance buffer, 64 bytes, bound to slot 1 during regular drawing.</summary>
     public static BufferResource IdentityInstanceBuffer;
 
@@ -191,12 +262,21 @@ public static VkPipeline TransparentBackFacePipelineState;
         _overlayRenderPass = renderPass;
 
         // Create the identity instance buffer, 64 bytes = InstanceTransformData.
-        IdentityInstanceBuffer = Device.ResourceManager.CreateConstantBuffer(64, out var mapped);
+        // It is bound as vertex binding 1, so it must carry VERTEX_BUFFER usage: creating it through CreateConstantBuffer
+        // produced a UNIFORM_BUFFER-only buffer and vkCmdBindVertexBuffers rejected it with
+        // VUID-vkCmdBindVertexBuffers-pBuffers-00627, which in turn put command buffer 00059 into an invalid state.
+        IdentityInstanceBuffer = Device.ResourceManager.CreateVertexBuffer(64, out var mapped);
         Unsafe.InitBlock(mapped, 0, 64); // All fields are zero, which produces the float4 rows of the identity matrix.
 
         CreateIdentityInstanceBoneBuffers();
         CreateDefaultMorphDeltasBuffers();
         CreateDefaultPrevSSBOs();
+        CreateDefaultFogFrameBuffers();
+
+        // 与 DX CreateRootSignature 中的 _fogSamplingEnabled 同源：
+        // 档位刚在初始化前锁定，此后不会翻转，因此 FOG_SAMPLING 是一次性注入的编译期开关。
+        SceneFogSamplingBaked = RenderQuality.Current.RequiresFogSceneDepth(
+            Device.HdrSceneColor, true, Immediate2DMode.Enabled);
 
         // -- Text GPU Instancing: shared unit-quad VB plus IB for all Texts --
         CreateUnitQuad();
@@ -222,7 +302,11 @@ public static VkPipeline TransparentBackFacePipelineState;
         // the immutable wrap sampler for binding 19 must also be created before SetLayout.
         WrapSampler = CreateWrapSampler();
         SetLayout = CreateDescriptorSetLayout();
+        // 雾采样 set 1 的布局要先于 PipelineLayout 建好（它参与 set 0/1 的双集布局），
+        // 默认集与每槽集合则要在 PSO 烘焙之前就位。
+        FogSetLayout = CreateFogSetLayout();
         PipelineLayout = CreatePipelineLayout();
+        CreateFogSets();
 
         OpaquePipelineState = CreatePipelineState(PipelineMode.Opaque);
         OpaqueDoubleSidedPipelineState = CreatePipelineState(PipelineMode.Opaque, true);
@@ -326,6 +410,7 @@ public static VkPipeline TransparentBackFacePipelineState;
         if (VelFadeNoDepthDoubleSidedPipelineState.Handle != 0) vk.DestroyPipeline(d, VelFadeNoDepthDoubleSidedPipelineState, null);
         if (PipelineLayout.Handle != 0) vk.DestroyPipelineLayout(d, PipelineLayout, null);
         if (SetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(d, SetLayout, null);
+        if (FogSetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(d, FogSetLayout, null);
         if (StaticSampler.Handle != 0) vk.DestroySampler(d, StaticSampler, null);
         if (StaticPointSampler.Handle != 0) vk.DestroySampler(d, StaticPointSampler, null);
         if (ShadowComparisonSampler.Handle != 0) vk.DestroySampler(d, ShadowComparisonSampler, null);
@@ -351,6 +436,11 @@ public static VkPipeline TransparentBackFacePipelineState;
         _velocityRenderPass = default;
         PipelineLayout = default;
         SetLayout = default;
+        FogSetLayout = default;
+        // 描述符集随描述符池整体销毁，这里只丢句柄。
+        DefaultFogSet = default;
+        CurrentFogSet = default;
+        _fogSets = null!;
         StaticSampler = default;
         StaticPointSampler = default;
         if (IdentityInstanceBuffer.Memory.Handle != 0) rm.DestroyBuffer(IdentityInstanceBuffer);
@@ -429,6 +519,13 @@ public static VkPipeline TransparentBackFacePipelineState;
                 if (DefaultPrevMorphWeightsBuffers[i].Memory.Handle != 0)
                     rm.DestroyBuffer(DefaultPrevMorphWeightsBuffers[i]);
             DefaultPrevMorphWeightsBuffers = null!;
+        }
+        if (DefaultFogFrameBuffers != null)
+        {
+            for (int i = 0; i < DefaultFogFrameBuffers.Length; i++)
+                if (DefaultFogFrameBuffers[i].Memory.Handle != 0)
+                    rm.DestroyBuffer(DefaultFogFrameBuffers[i]);
+            DefaultFogFrameBuffers = null!;
         }
     }
 
@@ -531,6 +628,114 @@ public static VkPipeline TransparentBackFacePipelineState;
     }
 
     /// <summary>
+    /// 工作包 C：创建雾采样关闭时使用的零帧常量。
+    /// 尺寸与 VolumetricFogEffect.FrameVectorCount 完全一致：
+    /// 绑定 22 被 shader 静态引用，描述符里给 WholeSize 范围，零内容保证万一被读到也是恒等元素。
+    /// </summary>
+    static void CreateDefaultFogFrameBuffers()
+    {
+        int n = (int)Device.frameCount;
+        var usageFlags = BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferDstBit;
+        var memFlags = MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit;
+        ulong size = (ulong)Season.Rendering.Effects.VolumetricFogEffect.FrameVectorCount * 16;
+
+        DefaultFogFrameBuffers = new BufferResource[n];
+        for (int i = 0; i < n; i++)
+        {
+            DefaultFogFrameBuffers[i] = Device.ResourceManager.CreateBuffer(size, usageFlags, memFlags);
+            void* mapped;
+            if (Device.Vk.MapMemory(Device.LogicalDevice, DefaultFogFrameBuffers[i].Memory, 0, size, 0, &mapped) != Result.Success)
+                throw new Exception("vkMapMemory (DefaultFogFrameBuffers) failed");
+            new Span<byte>(mapped, (int)size).Clear();
+            Device.Vk.UnmapMemory(Device.LogicalDevice, DefaultFogFrameBuffers[i].Memory);
+        }
+    }
+
+    /// <summary>雾帧常量缓冲的字节数，与 <see cref="CreateDefaultFogFrameBuffers"/> 同源。</summary>
+    static ulong FogFrameByteSize => (ulong)Season.Rendering.Effects.VolumetricFogEffect.FrameVectorCount * 16;
+
+    /// <summary>
+    /// 建立雾采样集：一个永不改写的默认集（零帧 + 占位体积纹理），以及每帧槽各一个。
+    /// 默认集供直绘路径绑定，内容等价于“雾门控关闭”；每槽集合由透明阶段在绑定前改写。
+    /// </summary>
+    static void CreateFogSets()
+    {
+        int n = (int)Device.frameCount;
+        var dummy = VKTexture3D.DummyBlack;
+        DefaultFogSet = Device.DescriptorAllocator.AllocateSet(FogSetLayout);
+        WriteFogSet(DefaultFogSet, DefaultFogFrameBuffers[0].Buffer, FogFrameByteSize, dummy.View, dummy.View);
+
+        _fogSets = new DescriptorSet[n];
+        for (int i = 0; i < n; i++)
+        {
+            _fogSets[i] = Device.DescriptorAllocator.AllocateSet(FogSetLayout);
+            // 雾关闭的帧里这些集合不会被绑定，但描述符集一旦创建就得有合法内容。
+            WriteFogSet(_fogSets[i], DefaultFogFrameBuffers[i].Buffer, FogFrameByteSize, dummy.View, dummy.View);
+        }
+    }
+
+    /// <summary>往雾采样集里写三段描述符。调用方保证此刻这个集合没有被任何正在录制的命令缓冲引用。</summary>
+    static void WriteFogSet(DescriptorSet set, Silk.NET.Vulkan.Buffer frame, ulong frameRange,
+        Silk.NET.Vulkan.ImageView integrated, Silk.NET.Vulkan.ImageView local)
+    {
+        var frameInfo = new DescriptorBufferInfo { Buffer = frame, Offset = 0, Range = frameRange };
+        var integratedInfo = new DescriptorImageInfo
+        {
+            ImageView = integrated,
+            ImageLayout = ImageLayout.ShaderReadOnlyOptimal
+        };
+        var localInfo = new DescriptorImageInfo
+        {
+            ImageView = local,
+            ImageLayout = ImageLayout.ShaderReadOnlyOptimal
+        };
+        var writes = stackalloc WriteDescriptorSet[3];
+        writes[0] = new WriteDescriptorSet
+        {
+            SType = StructureType.WriteDescriptorSet,
+            DstSet = set,
+            DstBinding = FogSetFrameBinding,
+            DescriptorCount = 1,
+            DescriptorType = DescriptorType.StorageBuffer,
+            PBufferInfo = &frameInfo
+        };
+        writes[1] = new WriteDescriptorSet
+        {
+            SType = StructureType.WriteDescriptorSet,
+            DstSet = set,
+            DstBinding = FogSetIntegratedBinding,
+            DescriptorCount = 1,
+            DescriptorType = DescriptorType.CombinedImageSampler,
+            PImageInfo = &integratedInfo
+        };
+        writes[2] = new WriteDescriptorSet
+        {
+            SType = StructureType.WriteDescriptorSet,
+            DstSet = set,
+            DstBinding = FogSetLocalBinding,
+            DescriptorCount = 1,
+            DescriptorType = DescriptorType.CombinedImageSampler,
+            PImageInfo = &localInfo
+        };
+        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 3, writes, 0, null);
+    }
+
+    /// <summary>
+    /// 透明阶段入口：把本帧的雾资源写进当前帧槽的集合，并把 set 1 的绑定目标切过去。
+    /// 必须在第一次透明绘制之前调用一次；本帧内此后不再改写，“写完再绑”的顺序因此天然成立。
+    /// </summary>
+    internal static void PrepareTransparentFog(Silk.NET.Vulkan.Buffer frame, ulong frameRange,
+        Silk.NET.Vulkan.ImageView integrated, Silk.NET.Vulkan.ImageView local)
+    {
+        int fi = (int)Device.FrameIndex;
+        // 该槽三帧前的提交可能仍引用这个集合；未声明 UPDATE_AFTER_BIND 时改写会连带那条命令缓冲失效，
+        // 见 Device.WaitForFrameSlot。此刻它早已退休，这次等待实际上不会阻塞。
+        Device.WaitForFrameSlot(fi);
+        WriteFogSet(_fogSets[fi], frame, frameRange, integrated, local);
+        CurrentFogSet = _fogSets[fi];
+    }
+
+    /// <summary>
     /// Create the shared unit quad for Text GPU Instancing:
     /// 4 vertices, positions at +/-0.5 with UVs in 0..1, plus 6 indices.
     /// All Texts controls share the same VB and IB, bound at slot 0.
@@ -566,6 +771,18 @@ public static VkPipeline TransparentBackFacePipelineState;
     /// Transparent already skips depth writes, so it falls back to the regular variant.</summary>
     public static void SetPipeline(CommandBuffer cmd, PipelineMode mode, CullModeFlags cullMode, bool depthWrite)
     {
+        // 记录本次请求的模式：雾推常量发生在 DrawPrimitive 里，需要知道绑定的是不是不透明变体。
+        _boundMode = mode;
+
+        // 收集期只记状态，不绑定 PSO：
+        // 重放所在的 Pass 才能决定用哪一族（主场景 / 速度 MRT / Overlay / OutlineMask），
+        // 而收集发生在所有 Pass 之外，此时绑定任何一族对后续都没有意义。
+        if (VKSceneDrawCollection.Active is { } collection)
+        {
+            collection.RecordPipeline(mode, cullMode, depthWrite);
+            return;
+        }
+
         // Outline2D mask pass:
         // route to the dedicated PSO, with mask FS plus LessEqual plus no depth writes.
         // This mirrors the DX ActivePassId route.
@@ -641,6 +858,13 @@ public static VkPipeline TransparentBackFacePipelineState;
     /// then call vkCmdDrawIndexed according to instanceCount, where 1 versus N means instanced drawing.
     /// When instanceBuffer is null, IdentityInstanceBuffer is used automatically.
     /// </summary>
+    /// <param name="sortDepth">
+    /// 透明排序深度（沿相机前向的投影距离）。
+    /// 实例化路径逐实例拆分绘制时，矩阵 UBO 是组级/单位矩阵，
+    /// 从它读出的世界坐标对所有实例都是同一个值，无法用来排序；
+    /// 调用方手边正好有本实例的世界矩阵，所以由它显式传入。
+    /// NaN 表示“按图元矩阵自行计算”。
+    /// </param>
     public static void DrawPrimitive(
         CommandBuffer cmd,
         PrimitiveData primitiveData,
@@ -650,9 +874,32 @@ public static VkPipeline TransparentBackFacePipelineState;
         uint indexCount,
         VkBuffer instanceBuffer,
         uint instanceCount,
-        uint firstInstance)
+        uint firstInstance,
+        float sortDepth = float.NaN)
     {
-        var vk = Device.Vk;
+        // 工作包 C：场景分段收集期不提交任何绘制，只把不可变句柄交给重放队列。
+        // 这是全部 3D 路径（模型/实例模型/实例网格/高亮壳体）的唯一出口，
+        // 因此在这里拦截一次就覆盖了所有 PrimitiveData 绘制。
+        if (VKSceneDrawCollection.Active is { } collection)
+        {
+            collection.CapturePrimitive(cmd, primitiveData, primitiveVertexBuffer, primitiveIndexBuffer,
+                descriptorSet, indexCount, instanceBuffer, instanceCount, firstInstance, sortDepth);
+            return;
+        }
+
+        DrawPrimitiveCore(cmd, primitiveData, primitiveVertexBuffer, primitiveIndexBuffer,
+            descriptorSet, indexCount, instanceBuffer, instanceCount, firstInstance, prepared: false);
+    }
+
+    /// <summary>
+    /// 绘制前的纹理就绪与描述符刷新。
+    /// 单独抽出来是因为收集阶段必须完成它们：收集发生在所有渲染 Pass 之外，
+    /// 此时做布局转换才是合法的（Render Pass 内只允许插入延迟转换，而采样已经在同一 Pass 后面发生）。
+    /// 重放时传入 prepared: true 跳过这一段。
+    /// </summary>
+    internal static void PreparePrimitive(CommandBuffer cmd, PrimitiveData primitiveData, DescriptorSet descriptorSet)
+    {
+        int fi = (int)Device.FrameIndex;
 
         // Ensure textures are ready for rendering.
         primitiveData.BaseColorTexture?.EnsureReadyForRendering(cmd);
@@ -661,41 +908,144 @@ public static VkPipeline TransparentBackFacePipelineState;
         primitiveData.OcclusionTexture?.EnsureReadyForRendering(cmd);
         primitiveData.EmissiveTexture?.EnsureReadyForRendering(cmd);
 
-        // 1-7:
-        // refresh binding 16 to the environment radiance cube active for the current frame.
-        // Environment maps load asynchronously, so they inevitably become ready after the first descriptor-set write of early primitives.
-        // This path therefore refreshes by ViewVersion rather than by handle.
-        // Only the set for the current frame slot is touched.
-        // Its previous submission is already guaranteed retired by the same-slot fence waited at the end of AfterRender,
-        // while other slots may still be in flight and will be refreshed when their own frame arrives.
-        // The cube layout was already transitioned during upload, so this introduces no barrier.
-        // Layout transitions remain forbidden inside a render pass.
-        VKTextureCube.RefreshBinding(descriptorSet,
-            ref primitiveData.EnvCubeViewVersions[(int)Device.FrameIndex]);
+        RefreshSceneBindings(descriptorSet,
+            ref primitiveData.EnvCubeViewVersions[fi],
+            ref primitiveData.DdgiAtlasViewVersions[fi],
+            ref primitiveData.DdgiDepthViewVersions[fi],
+            ref primitiveData.CloudNoiseViewVersions[fi],
+            ref primitiveData.AerialLutViewVersions[fi]);
+    }
 
-        // Clause 10 of 2-4:
-        // refresh binding 17 to the DDGI atlas for the current frame.
-        // The atlas ping-pongs every frame, irr0 and irr1, and compute already transitions it to ShaderReadOnlyOptimal after writing.
-        // As with envCube, there is no barrier inside the render pass,
-        // so only the current frame-slot set is refreshed by ViewVersion under the same timing and fence guarantee.
-        VKPrimitiveGroup.RefreshDdgiBinding(descriptorSet,
-            ref primitiveData.DdgiAtlasViewVersions[(int)Device.FrameIndex]);
+    /// <summary>
+    /// 刷新场景级光照输入的描述符（binding 16-20）。
+    /// 环境立方图、DDGI 图集（辐射度 + 深度矩）、云噪声、AP 体积都是帧级资源，
+    /// 可能在首帧之后才就绪，也可能逐帧乒乓，所以按 ViewVersion 而非句柄比较。
+    /// 只碰当前帧槽位的描述符集：其它槽位可能仍在飞行中，轮到自己那一帧时再刷。
+    /// 这些转换在各自的上传/计算阶段已经完成，这里不引入 barrier——
+    /// Render Pass 内禁止布局转换，而描述符写入本身合法。
+    /// </summary>
+    internal static void RefreshSceneBindings(DescriptorSet descriptorSet,
+        ref ulong envCubeVersion, ref ulong ddgiAtlasVersion, ref ulong ddgiDepthVersion,
+        ref ulong cloudNoiseVersion, ref ulong aerialLutVersion)
+    {
+        // These rewrites bypass WriteDescriptorSet, so they need their own check: the scene sets are also reached
+        // from the shadow pass pre-refresh in VKPrimitiveGroup.DrawShadow, and from the background loading thread
+        // through VKModel.CreateInstance.
+        Device.AssertGpuGateHeld("Pipeline.RefreshSceneBindings");
 
-        // Step 3 of 2-4:
-        // refresh binding 18 in the same way to the current-frame DDGI depth atlas, with dep0 and dep1 ping-ponging in sync.
-        VKPrimitiveGroup.RefreshDdgiDepthBinding(descriptorSet,
-            ref primitiveData.DdgiDepthViewVersions[(int)Device.FrameIndex]);
+        VKTextureCube.RefreshBinding(descriptorSet, ref envCubeVersion);
+        VKPrimitiveGroup.RefreshDdgiBinding(descriptorSet, ref ddgiAtlasVersion);
+        VKPrimitiveGroup.RefreshDdgiDepthBinding(descriptorSet, ref ddgiDepthVersion);
+        VKPrimitiveGroup.RefreshCloudNoiseBinding(descriptorSet, ref cloudNoiseVersion);
+        VKPrimitiveGroup.RefreshAerialLutBinding(descriptorSet, ref aerialLutVersion);
+    }
 
-        // Step C of 2-5:
-        // refresh binding 19 to the current-frame cloud noise.
-        // The noise is baked only once in its lifetime, so the version converges after the first frame and stops changing.
-        VKPrimitiveGroup.RefreshCloudNoiseBinding(descriptorSet,
-            ref primitiveData.CloudNoiseViewVersions[(int)Device.FrameIndex]);
+    /// <summary>
+    /// Frame-start refresh of binding 16-20 for every scene set drawn in the previous frame.
+    ///
+    /// The scene sets are rewritten in place, and a set another recording command buffer already
+    /// references must not be updated without UPDATE_AFTER_BIND. The validation layer answers that by
+    /// putting the command buffer into an invalid state, after which every following command reports
+    /// VUID-vkEndCommandBuffer-commandBuffer-00059 and, worse, validation for the rest of the frame is
+    /// silenced. Collecting happens after the command buffer is begun, so the in-frame refresh inside
+    /// PreparePrimitive can never be early enough for a set that this frame will bind; the only window
+    /// that is always safe is between the command-buffer reset and its begin.
+    ///
+    /// That window has no knowledge of this frame's draw list, so this pass walks the primitives the
+    /// previous frame actually drew. For a steady scene those are exactly the sets about to be bound
+    /// again, and the version caches make the call a no-op once a binding has converged. A primitive
+    /// drawn for the first time is still stale here and falls back to PreparePrimitive; from its second
+    /// frame on it is covered.
+    /// </summary>
+    internal static void RefreshSceneBindingsForFrameStart()
+    {
+        var primitives = VKSceneDrawCollection.PreviousFramePrimitives;
+        var quads = VKSceneDrawCollection.PreviousFrameQuads;
+        if (primitives.Count == 0 && quads.Count == 0)
+            return;
 
-        // Step E of 2-5:
-        // refresh binding 20 in the same way to the current-frame AP volume, which is also baked only once.
-        VKPrimitiveGroup.RefreshAerialLutBinding(descriptorSet,
-            ref primitiveData.AerialLutViewVersions[(int)Device.FrameIndex]);
+        Device.AssertGpuGateHeld("Pipeline.RefreshSceneBindingsForFrameStart");
+
+        int fi = (int)Device.FrameIndex;
+        foreach (var primitive in primitives)
+        {
+            // Dispose nulls DescriptorSets and hands them back to the allocator, so a primitive that a
+            // loading thread released since the last frame must be skipped rather than written through.
+            // FreeSet and this pass both run under the GPU gate, so the pair cannot interleave.
+            var sets = primitive.DescriptorSets;
+            if (sets == null)
+                continue;
+
+            RefreshSceneBindings(sets[fi],
+                ref primitive.EnvCubeViewVersions[fi],
+                ref primitive.DdgiAtlasViewVersions[fi],
+                ref primitive.DdgiDepthViewVersions[fi],
+                ref primitive.CloudNoiseViewVersions[fi],
+                ref primitive.AerialLutViewVersions[fi]);
+        }
+
+        // 精灵走自己的描述符集与版本缓存，同样必须在 begin 之前对齐。
+        foreach (var quad in quads)
+            quad.RefreshSceneBindings(fi);
+    }
+
+    /// <summary>
+    /// 把本帧雾采样门控推给片元着色器。
+    /// 必须用 push constant 而不能是 UBO：同一帧内 CPU 后写的 UBO 会被 GPU 在提交后统一读取，
+    /// 不透明阶段也会读到已经打开的雾开关（那个变体根本没有雾采样代码）。
+    /// OutlineMask 必须跳过，否则 16B@offset 0 会覆写它的颜色推送。
+    ///
+    /// 阶段必须包含 VERTEX：布局里还有一条 VERTEX(0,64) 的影子矩阵范围与本次推送的字节重叠，
+    /// 按 VUID-vkCmdPushConstants-offset-01796 要求推送的 stageFlags 必须覆盖与之重叠的所有范围，
+    /// 只写 FRAGMENT 会被校验层判错。多写 VERTEX 是安全的：主场景 VS 根本不声明 push 块，
+    /// 影子矩阵按象限推送后已固化进各条 draw 的记录状态，后续覆写不会回溯影响它。
+    /// </summary>
+    internal static void PushSceneFog(CommandBuffer cmd)
+    {
+        if (Device.ActivePassId == Season.Rendering.RenderPassId.OutlineMask)
+            return;
+        var parameters = SceneFogParams;
+        Device.Vk.CmdPushConstants(cmd, PipelineLayout,
+            ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit, 0, 16, &parameters);
+    }
+
+    /// <summary>
+    /// 绑定雾采样 set 1。只有声明了 FOG_SAMPLING 的变体才静态引用它，
+    /// 但布局里 set 1 参与管线兼容性检查，缺绑会让绘制期间的校验报未绑定。
+    /// </summary>
+    internal static void BindFogSet(CommandBuffer cmd)
+    {
+        var set = CurrentFogSet.Handle != 0 ? CurrentFogSet : DefaultFogSet;
+        if (set.Handle == 0) return;
+        Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 1, 1, &set, 0, null);
+    }
+
+    /// <summary>重放/直绘共用的绘制主体；prepared 为 true 时跳过纹理就绪与描述符刷新。</summary>
+    internal static void DrawPrimitiveCore(
+        CommandBuffer cmd,
+        PrimitiveData primitiveData,
+        VkBuffer primitiveVertexBuffer,
+        VkBuffer primitiveIndexBuffer,
+        DescriptorSet descriptorSet,
+        uint indexCount,
+        VkBuffer instanceBuffer,
+        uint instanceCount,
+        uint firstInstance,
+        bool prepared)
+    {
+        var vk = Device.Vk;
+
+        if (!prepared)
+            PreparePrimitive(cmd, primitiveData, descriptorSet);
+
+        // 雾门控：只有开了 FOG_SAMPLING 的非不透明变体才声明了 push 块。
+        // 不透明变体不推送，避免无意义的逐绘制系统调用；
+        // 透明阶段（含 Fade）则必须每项都推——同一 PSO 会被许多绘制项复用。
+        if (SceneFogSamplingBaked && _boundMode != PipelineMode.Opaque)
+        {
+            PushSceneFog(cmd);
+            BindFogSet(cmd);
+        }
 
         // Bind vertex buffer slot 0 for geometry data.
         ulong vbOffset = 0;
@@ -769,11 +1119,13 @@ public static VkPipeline TransparentBackFacePipelineState;
             Device.Vk.CmdPushConstants(cmd, PipelineLayout, ShaderStageFlags.VertexBit, 0, 64, p);
     }
 
-    /// <summary>Write the Outline2D mask outline color group by group, at FS push constant offset 0 as a float4, mirroring the DX b6 root constant.</summary>
+    /// <summary>Write the Outline2D mask outline color group by group, at FS push constant offset 0 as a float4, mirroring the DX b6 root constant.
+    /// 阶段同样带上 VERTEX：与 VERTEX(0,64) 影子矩阵范围重叠，见 <see cref="PushSceneFog"/> 里的 01796 说明。</summary>
     public static void SetOutlineMaskColor(CommandBuffer cmd, in Vector4 color)
     {
         fixed (Vector4* p = &color)
-            Device.Vk.CmdPushConstants(cmd, PipelineLayout, ShaderStageFlags.FragmentBit, 0, 16, p);
+            Device.Vk.CmdPushConstants(cmd, PipelineLayout,
+                ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit, 0, 16, p);
     }
 
     /// <summary>
@@ -952,7 +1304,7 @@ public static VkPipeline TransparentBackFacePipelineState;
         var pointSampler = StaticPointSampler;
         var shadowSampler = ShadowComparisonSampler;
         var wrapSampler = WrapSampler;
-        var bindings = stackalloc DescriptorSetLayoutBinding[22];
+        var bindings = stackalloc DescriptorSetLayoutBinding[25];
 
         bindings[0] = new DescriptorSetLayoutBinding
         {
@@ -1132,10 +1484,41 @@ public static VkPipeline TransparentBackFacePipelineState;
             PImmutableSamplers = &pointSampler
         };
 
+        // 工作包 C：透明阶段的雾采样三件套，对应 GLSL 的 fogFrame / fogIntegrated / fogLocal。
+        // 绑定 22 是 std430 存储缓冲（vec4 数组，每列先补积分再做 XY 插值），与雾合成 Pass 的 binding 0 同一份内容，
+        // 但这里挂在图元自己的描述符集上，因为透明阶段要逐项绑定（不能像单次合成那样把常量推到根描述符）。
+        // 绑定 23/24 是两张 rgba16float 3D 体积纹理，沿用 binding 4..8 的线性 Clamp 不可变采样器：
+        // 体积纹理的 XY 插值在 shader 里由 4 次 texelFetch 手工完成，采样器只参与局部列的深度方向。
+        // 三者在任何描述符集里都必须有合法写入（见 VKPrimitiveGroup / VKSpriteQuad / AllocateTextDescriptorSets），
+        // 关闭时写零帧常量与 1x1x1 黑体占位，由 push constant 门控保证不会被真正采样。
+        bindings[22] = new DescriptorSetLayoutBinding
+        {
+            Binding = SceneFogFrameBinding,
+            DescriptorType = DescriptorType.StorageBuffer,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.FragmentBit
+        };
+        bindings[23] = new DescriptorSetLayoutBinding
+        {
+            Binding = SceneFogIntegratedBinding,
+            DescriptorType = DescriptorType.CombinedImageSampler,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.FragmentBit,
+            PImmutableSamplers = &sampler
+        };
+        bindings[24] = new DescriptorSetLayoutBinding
+        {
+            Binding = SceneFogLocalBinding,
+            DescriptorType = DescriptorType.CombinedImageSampler,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.FragmentBit,
+            PImmutableSamplers = &sampler
+        };
+
         var info = new DescriptorSetLayoutCreateInfo
         {
             SType = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 22,
+            BindingCount = 25,
             PBindings = bindings
         };
 
@@ -1144,9 +1527,56 @@ public static VkPipeline TransparentBackFacePipelineState;
         return layout;
     }
 
+    /// <summary>
+    /// 雾采样专用的 set 1 布局：0 = 帧常量存储缓冲，1/2 = 积分列与局部列两张 3D 体积纹理。
+    /// 沿用 binding 4..8 那条线性 Clamp 不可变采样器：体积纹理的 XY 插值在 shader 里手工做，
+    /// 采样器只参与局部列的深度方向。
+    /// </summary>
+    static DescriptorSetLayout CreateFogSetLayout()
+    {
+        var sampler = StaticSampler;
+        var bindings = stackalloc DescriptorSetLayoutBinding[3];
+        bindings[0] = new DescriptorSetLayoutBinding
+        {
+            Binding = FogSetFrameBinding,
+            DescriptorType = DescriptorType.StorageBuffer,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.FragmentBit
+        };
+        bindings[1] = new DescriptorSetLayoutBinding
+        {
+            Binding = FogSetIntegratedBinding,
+            DescriptorType = DescriptorType.CombinedImageSampler,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.FragmentBit,
+            PImmutableSamplers = &sampler
+        };
+        bindings[2] = new DescriptorSetLayoutBinding
+        {
+            Binding = FogSetLocalBinding,
+            DescriptorType = DescriptorType.CombinedImageSampler,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.FragmentBit,
+            PImmutableSamplers = &sampler
+        };
+        var info = new DescriptorSetLayoutCreateInfo
+        {
+            SType = StructureType.DescriptorSetLayoutCreateInfo,
+            BindingCount = 3,
+            PBindings = bindings
+        };
+        if (Device.Vk.CreateDescriptorSetLayout(Device.LogicalDevice, in info, null, out var layout) != Result.Success)
+            throw new Exception("vkCreateDescriptorSetLayout (fog set) failed");
+        return layout;
+    }
+
     static PipelineLayout CreatePipelineLayout()
     {
-        var setLayout = SetLayout;
+        // set 0 = 场景集，set 1 = 雾采样集。拆成两个 set 不是风格选择，是硬性要求：
+        // 阴影 pass 会绑定 set 0，而透明阶段要给本帧补写雾绑定；
+        // 未声明 UPDATE_AFTER_BIND 的 set 一旦被正在录制的命令缓冲引用就不能再改写，
+        // 两者落在同一个 set 上就必然让整条命令缓冲失效。分开之后阴影只碰 set 0、透明阶段只碰 set 1。
+        var setLayouts = stackalloc DescriptorSetLayout[2] { SetLayout, FogSetLayout };
 
         // 1-5:
         // VS push constant, 64 bytes, holding light-space ViewProj and written per quadrant in the shadow pass.
@@ -1174,8 +1604,8 @@ public static VkPipeline TransparentBackFacePipelineState;
         var info = new PipelineLayoutCreateInfo
         {
             SType = StructureType.PipelineLayoutCreateInfo,
-            SetLayoutCount = 1,
-            PSetLayouts = &setLayout,
+            SetLayoutCount = 2,
+            PSetLayouts = setLayouts,
             PushConstantRangeCount = 2,
             PPushConstantRanges = pushRanges
         };
@@ -1241,7 +1671,39 @@ public static VkPipeline TransparentBackFacePipelineState;
                 // The value is fixed for the process (RenderQuality is locked before graphics initialization), so a UBO
                 // field would cost a per-draw write to express something glslang can fold. Only the FS needs it, since
                 // the VS samples nothing.
-                + "#define TEXTURE_LOD_BIAS " + RenderQuality.Current.TextureLodBiasLiteral + "\n");
+                + "#define TEXTURE_LOD_BIAS " + RenderQuality.Current.TextureLodBiasLiteral + "\n"
+                // 工作包 C：透明阶段体积雾采样。开关与 DX 同构：
+                // 只有开了雾档位、HDR 场景色、Compute 可用，并且不是 Overlay / OutlineMask / 不透明变体时才编译进来。
+                // 声明段必须跟着开关一起注入：
+                // 雾三件套在独立的 set 1 里（场景 set 0 的那三个绑定已经不被 shader 引用），
+                // 只有启用了的变体才声明它们，于是不会因为占位描述符的布局不符而被校验层报错。
+                // push_constant 块与 OutlineMask 的颜色块互斥（FOG_SAMPLING 与 OUTLINE_MASK 不会同时为 1），
+                // 因此不会出现同一个阶段两个 push 块（VUID-StandaloneSpirv-PushConstant-06680）。
+                + ((SceneFogSamplingBaked && !overlay && !outlineMask && mode != PipelineMode.Opaque)
+                    ? "#define FOG_SAMPLING 1\n" : "#define FOG_SAMPLING 0\n")
+                + "#if FOG_SAMPLING\n"
+                // 三件套落在独立的 set 1（binding 0/1/2），理由见 CreatePipelineLayout：
+                // 场景集 set 0 会被阴影 pass 绑定，透明阶段的补写必须落在另一个 set 上才不会让命令缓冲失效。
+                + "layout(std430,set=1,binding=0) readonly buffer FogFrameBlock { vec4 fogFrame[]; };\n"
+                + "layout(set=1,binding=1) uniform sampler3D fogIntegrated;\n"
+                + "layout(set=1,binding=2) uniform sampler3D fogLocal;\n"
+                + "layout(push_constant) uniform SceneFogParams { vec4 fogParams; };\n"
+                + Season.Rendering.Effects.VolumetricFogEffect.SamplingGlsl + "\n"
+                + "#endif\n"
+                // 四个入口（文字 / 天空 / Sprite2D / PBR）共用的合成形状，与 DX ApplySceneFog 逐行对应。
+                // 使用 FogAtWorld（世界坐标直接采样）而不是 FogTransparent：
+                // 当前材质 PSO 是 straight alpha，混合阶段统一乘 alpha，这里只把消光与内散射叠在颜色上。
+                + @"
+vec4 ApplySceneFog(vec4 color, vec3 worldPos) {
+#if FOG_SAMPLING
+    if (fogParams.x > 0.5) {
+        vec4 fog = FogAtWorld(worldPos);
+        color.rgb = color.rgb * fog.w + fog.rgb;
+    }
+#endif
+    return color;
+}
+");
             fsModule = ShaderCompiler.CreateShaderModule(
                 Device.Vk, Device.LogicalDevice, fragmentSrc, ShaderStageFlags.FragmentBit, "main", "pipeline.frag", debug);
         }
@@ -2733,7 +3195,7 @@ void main() {
 #else
         vec3 color = albedo * vInstanceColor.rgb;
 #endif
-        outColor = vec4(color, alpha * vInstanceColor.a * textGlobalAlpha * coverage);
+        outColor = ApplySceneFog(vec4(color, alpha * vInstanceColor.a * textGlobalAlpha * coverage), vWorldPos);
         return;
     }
 
@@ -2784,7 +3246,7 @@ void main() {
 #if HDR_CHAIN
         // The LUT already stores linear HDR radiance.
         // Output it directly and let the full FinalBlit chain, exposure plus ACES plus gamma, close the path under the 1-4 contract.
-        outColor = vec4(skyRadiance, alpha);
+        outColor = ApplySceneFog(vec4(skyRadiance, alpha), vWorldPos);
         return;
 #else
         // LDR baseline, and Overlay always takes this branch:
@@ -2792,7 +3254,7 @@ void main() {
         // max(..., 0) is not a quality hack.
         // Radiance is physically non-negative, but the compiler cannot infer that from sampled value times material color.
         // The explicit clamp prevents undefined pow behavior on negative bases.
-        outColor = vec4(pow(max(skyRadiance, vec3(0.0)), vec3(1.0 / 2.2)), alpha);
+        outColor = ApplySceneFog(vec4(pow(max(skyRadiance, vec3(0.0)), vec3(1.0 / 2.2)), alpha), vWorldPos);
         return;
 #endif
     }
@@ -2816,11 +3278,11 @@ void main() {
         // Step A of 1-4:
         // output directly in pre-encoding space and move gamma into the FinalBlit tonemap variant.
         // This is a pure transport move and stays pixel-identical.
-        outColor = vec4(albedo, alpha);
+        outColor = ApplySceneFog(vec4(albedo, alpha), vWorldPos);
 #else
         // Direct gamma output.
         vec3 c = pow(albedo, vec3(1.0 / 2.2));
-        outColor = vec4(c, alpha);
+        outColor = ApplySceneFog(vec4(c, alpha), vWorldPos);
 #endif
         return;
     }
@@ -3011,7 +3473,10 @@ void main() {
     color = pow(color, vec3(1.0 / 2.2));
 #endif
 
-    outColor = vec4(color, alpha);
+    // 工作包 C：PBR 表面的雾合成放在 AP 体积之后、最终输出之前：
+    // 雾是“最后一段视线上的介质”，必须在表面颜色已经完全确定（含 AP）后再叠加，
+    // 否则 AP 会又给已经被雾氧化的颜色乘一次透射率。
+    outColor = ApplySceneFog(vec4(color, alpha), vWorldPos);
 }
 ";
 }

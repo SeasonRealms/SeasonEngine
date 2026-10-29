@@ -227,10 +227,7 @@ public sealed class BloomEffect : ComputeEffect
         // (ComputeResourceRef is a value type, so this stays allocation-free).
         // TaaEffect registers earlier than this effect, so SceneColorOverride for the current frame
         // has already been published by its Record call.
-        if (FrameSchedule.SceneColorOverride is string sceneOverride)
-            _prefilterRes![0] = sceneOverride;
-        else
-            _prefilterRes![0] = FrameSchedule.SceneColor!;
+        _prefilterRes![0] = FrameSchedule.EffectiveSceneSource;
 
         // 1) prefilter: scene source -> down[0]
         // (soft-threshold highlights, with threshold/knee runtime knobs uploaded every frame).

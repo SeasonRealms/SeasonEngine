@@ -20,12 +20,21 @@ internal sealed class WGPURenderTarget : Season.Rendering.RenderTarget
     static int _nextId;
 
     internal readonly string Name;
+    Action<WGPURenderTarget>? _onDisposed;
 
-    internal WGPURenderTarget(in Season.Rendering.RenderTargetDesc desc)
+    internal WGPURenderTarget(in Season.Rendering.RenderTargetDesc desc, Action<WGPURenderTarget> onDisposed)
     {
         Desc = desc;
         Name = $"rt_{_nextId++}";
+        _onDisposed = onDisposed;
     }
 
-    public override void Dispose() => WebGPUInterop.DisposeRenderTarget(Name);
+    public override void Dispose()
+    {
+        var notify = _onDisposed;
+        if (notify == null) return;
+        WebGPUInterop.DisposeRenderTarget(Name);
+        _onDisposed = null;
+        notify(this);
+    }
 }

@@ -234,6 +234,10 @@ internal unsafe class Texture : IDisposable
             throw new ArgumentException(
                 $"Pixel data size mismatch. Expected {expectedSize} bytes for {Width}×{Height}, got {rgbaPixels.Length}.");
 
+        // Submits on the shared transfer queue and allocates from the shared upload command pool, so it must not overlap a
+        // frame being recorded on the render thread.
+        using var gpuAccess = Device.EnterGpuAccessScope();
+
         var vk = Device.Vk;
         var d = Device.LogicalDevice;
         var rm = Device.ResourceManager;
@@ -481,7 +485,10 @@ internal unsafe class Texture : IDisposable
             return;
         }
 
-        // The source may be either Undefined, upload not completed yet, or TransferDstOptimal, upload completed.
+        // Reaching here means the tracker still holds a layout this image cannot be sampled from: an image that was
+        // never uploaded (Undefined), or an intermediate a compute producer left in General. Both upload paths -
+        // TextureUploadBatch and UploadPixels - now finish in ShaderReadOnlyOptimal inside their own submission, so
+        // the sampler case returns at the top and never reaches the deferral below.
         // Visibility of transfer writes is guaranteed by the timeline semaphore signal plus the CPU-side wait chain.
         TransitionTo(cmd,
             ImageLayout.ShaderReadOnlyOptimal,
@@ -555,6 +562,9 @@ internal unsafe class Texture : IDisposable
     /// </summary>
     internal unsafe void ClearToZero()
     {
+        // See UploadPixels: transfer-queue submit plus a command buffer from the shared upload pool.
+        using var gpuAccess = Device.EnterGpuAccessScope();
+
         var vk = Device.Vk;
         var d = Device.LogicalDevice;
 
@@ -637,6 +647,9 @@ internal unsafe class Texture : IDisposable
     /// </summary>
     internal void RecreateComputeStorage(uint width, uint height)
     {
+        // See UploadPixels. The whole recreate, including the zero clear at the end, stays under one gate.
+        using var gpuAccess = Device.EnterGpuAccessScope();
+
         var vk = Device.Vk;
         var d = Device.LogicalDevice;
         Device.CancelTextureTransition(this);
@@ -680,6 +693,9 @@ internal unsafe class Texture : IDisposable
         if (rgbaPixels.Length != expectedSize)
             throw new ArgumentException(
                 $"Pixel data size mismatch. Expected {expectedSize} bytes, got {rgbaPixels.Length}.");
+
+        // See UploadPixels: transfer-queue submit plus a command buffer from the shared upload pool.
+        using var gpuAccess = Device.EnterGpuAccessScope();
 
         var vk = Device.Vk;
         var d = Device.LogicalDevice;

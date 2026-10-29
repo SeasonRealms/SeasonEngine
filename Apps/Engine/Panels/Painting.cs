@@ -606,7 +606,7 @@ internal class Painting : Panel
 
     /// <summary>
     /// Placement hit test. Intersect the pointer ray against scene geometry and take the nearest hit among
-    /// the mountain ring, shoreline rocks, already placed entities, and the grass surface. If nothing is hit,
+    /// the mountain ring, shoreline rocks, the grove, already placed entities, and the grass surface. If nothing is hit,
     /// fall back to the Y=0 plane outside the grass region. Distances use the same world-space metric as ObjectPicker
     /// so results are comparable across controls and instances.
     /// </summary>
@@ -645,6 +645,15 @@ internal class Painting : Panel
                 if (field != null && field.TryPickInstanceSurface(origin, direction, out _, out var d))
                     Consider(d);
             }
+        }
+
+        // The whole grove shares one InstancedModel, so the host resolves the nearest tree across all instances
+        // in a single call. Instances are transform data only and carry no picking entry point of their own.
+        if (app.forest?.treeField != null)
+        {
+            var grove = app.forest.treeField;
+            if (grove.TryPickInstanceSurface(origin, direction, out _, out var d))
+                Consider(d);
         }
 
         for (int i = 0; i < app.meshes.Count; i++)

@@ -5,6 +5,24 @@
 namespace Season.Rendering;
 
 /// <summary>
+/// Authored fog setups the app can switch between. This is a preset name rather than a bag of numbers for the same
+/// reason RenderQuality keeps tiers rather than raw factors: the numbers themselves belong to whoever builds the medium,
+/// and only the choice of setup is a world parameter worth persisting. A preset that a given app does not implement is
+/// simply never selected, so the enum stays a naming scheme rather than a capability declaration.
+/// </summary>
+public enum FogPreset
+{
+    /// <summary>Low morning mist hugging the ground.</summary>
+    Morning,
+
+    /// <summary>Low sun through a colonnade, for visible light shafts.</summary>
+    SunShafts,
+
+    /// <summary>Night haze around the street lamp and the room lights.</summary>
+    NightLamps,
+}
+
+/// <summary>
 /// World-simulation settings: the parameters that say how the world itself behaves over time, as opposed to how it
 /// is rendered. Persisted in Settings.json next to <see cref="RenderQuality"/> and editable while the frame loop runs.
 ///
@@ -59,6 +77,51 @@ public class WorldSettings
     /// where changing the rate is not. CelestialLighting.SetStartHour is the entry point that does both that and the save.
     /// </summary>
     public float StartHour { get; set; } = DefaultStartHour;
+
+    /// <summary>Default value for FogPreset (overrideable in the app constructor and captured by Init()).</summary>
+    public static FogPreset DefaultFogPreset = FogPreset.Morning;
+
+    /// <summary>Default value for FogEnabled (overrideable in the app constructor and captured by Init()).</summary>
+    public static bool DefaultFogEnabled = true;
+
+    /// <summary>Default value for FogDensityScale (overrideable in the app constructor and captured by Init()).</summary>
+    public static float DefaultFogDensityScale = 1f;
+
+    /// <summary>Default value for FogWeatherLink (overrideable in the app constructor and captured by Init()).</summary>
+    public static bool DefaultFogWeatherLink = true;
+
+    /// <summary>
+    /// Which authored fog setup the world is running. The preset also names a time of day and a camera in the sample
+    /// app, but only the name is persisted: the numbers behind it live next to the code that builds the medium, so
+    /// retuning one is not a settings migration, and a world saved under a preset keeps meaning the same setup.
+    ///
+    /// Changing it is a step rather than an ease. Unlike the day-night rate there is no continuous quantity underneath
+    /// to integrate towards: the medium is replaced outright, so the volumetric history has to be dropped instead - see
+    /// SceneFog.ResetHistory. The owner of that reset is the panel that writes this property.
+    /// </summary>
+    public FogPreset FogPreset { get; set; } = DefaultFogPreset;
+
+    /// <summary>
+    /// Whether the scene medium participates at all. Separate from <see cref="RenderQuality.VolumetricFog"/> on purpose:
+    /// that one is a tier and decides whether the pass is built, which cannot change once the frame loop has started,
+    /// while this one is a switch every backend reads identically each frame and that has no notion of being
+    /// unsupported. Turning it off leaves the pass registered and costs nothing extra.
+    /// </summary>
+    public bool FogEnabled { get; set; } = DefaultFogEnabled;
+
+    /// <summary>
+    /// Multiplier on the preset's own extinction. This is the one fog number that is a world parameter rather than a
+    /// rendering tier, because it is the quantity a person actually reasons about - "thicker than yesterday" - and it
+    /// has the same meaning under every preset.
+    /// </summary>
+    public float FogDensityScale { get; set; } = DefaultFogDensityScale;
+
+    /// <summary>
+    /// Whether the medium follows the weather cycle. On, the extinction is scaled by how much cloud cover the current
+    /// weather segment carries, so the same preset reads thin on a clear day and thick under an overcast; off, the
+    /// preset runs at its authored density regardless of the sky.
+    /// </summary>
+    public bool FogWeatherLink { get; set; } = DefaultFogWeatherLink;
 
     static WorldSettings? _currentFallback;
 

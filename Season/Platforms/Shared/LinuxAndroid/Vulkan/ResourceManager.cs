@@ -94,6 +94,27 @@ internal unsafe sealed class ResourceManager
         return buffer;
     }
 
+    /// <summary>
+    /// Vertex buffer with a persistently mapped pointer, for the small host-written streams the engine keeps rewriting
+    /// in place, the identity instance stream for example.
+    /// Same shape as <see cref="CreateConstantBuffer"/> but with the VERTEX_BUFFER usage bit, so the result can be bound
+    /// through vkCmdBindVertexBuffers. A buffer created as UNIFORM_BUFFER must never be bound there
+    /// (VUID-vkCmdBindVertexBuffers-pBuffers-00627).
+    /// </summary>
+    public BufferResource CreateVertexBuffer(ulong size, out byte* mapped)
+    {
+        var buffer = CreateBuffer(
+            size,
+            BufferUsageFlags.VertexBufferBit | BufferUsageFlags.TransferDstBit,
+            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit);
+
+        void* p;
+        if (_vk.MapMemory(_device, buffer.Memory, 0, size, 0, &p) != Result.Success)
+            throw new Exception("vkMapMemory (CreateVertexBuffer) failed");
+        mapped = (byte*)p;
+        return buffer;
+    }
+
     public BufferResource CreateIndexBuffer(uint[] indices)
     {
         bool use32Bit = false;

@@ -3,6 +3,8 @@
 // https://github.com/SeasonRealms/SeasonEngine
 
 using Metal;
+using Season.Rendering;
+using Season.Rendering.Effects;
 
 namespace Season.Platforms.Shared.Apple.Metal;
 
@@ -736,5 +738,186 @@ fragment float4 blit_fs_outline_composite(BlitVSOut vsOut [[stage_in]],
         enc.SetFragmentSamplerState(_pointSampler!, 0);
         SetParams(enc, 0f, 0f, 1f / mask.Width, 1f / mask.Height, 0f, widthPixels);
         enc.DrawPrimitives(MTLPrimitiveType.Triangle, 0, 3);
+    }
+}
+
+/// <summary>单颜色、无深度的 HDR 雾合成；每次 Draw 重绑资源并快照小参数。</summary>
+internal sealed class MTLFogCompositePipeline : FogCompositePipeline
+{
+    const uint FrameBytes = VolumetricFogEffect.FrameVectorCount * 16;
+    readonly Dictionary<string, Texture> _textures;
+    IMTLRenderPipelineState? _pipeline;
+    IMTLDepthStencilState? _depthState;
+    IMTLCommandBuffer? _command;
+    MTLRenderTarget? _destination;
+    FogCompositeInputs _inputs;
+    Resources _prepared;
+    int _frame;
+    bool _disposed;
+
+    readonly record struct Resources(IMTLBuffer Frame, IMTLTexture Integrated, IMTLTexture Local,
+        IMTLTexture Color, IMTLTexture Depth, IMTLTexture Ao, IMTLTexture Destination)
+    {
+        // 同时比较托管身份与有效原生句柄，Resize 后不能误认复用的原生地址。
+        internal bool Same(in Resources other) => ReferenceEquals(Frame, other.Frame)
+            && ReferenceEquals(Integrated, other.Integrated) && ReferenceEquals(Local, other.Local)
+            && ReferenceEquals(Color, other.Color) && ReferenceEquals(Depth, other.Depth)
+            && ReferenceEquals(Ao, other.Ao) && ReferenceEquals(Destination, other.Destination);
+    }
+
+    internal MTLFogCompositePipeline(Dictionary<string, Texture> textures)
+    {
+        _textures = textures;
+        try
+        {
+            var vsLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, VolumetricFogEffect.CompositeVertexMsl);
+            var fsLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, VolumetricFogEffect.CompositeMsl);
+            using var vs = vsLibrary.CreateFunction("VSMain")
+                ?? throw new InvalidOperationException("未找到雾合成顶点入口。");
+            using var fs = fsLibrary.CreateFunction("PSMain")
+                ?? throw new InvalidOperationException("未找到雾合成片元入口。");
+            using var desc = new MTLRenderPipelineDescriptor
+            {
+                Label = "Season-FogComposite", VertexFunction = vs, FragmentFunction = fs,
+                DepthAttachmentPixelFormat = MTLPixelFormat.Invalid,
+                StencilAttachmentPixelFormat = MTLPixelFormat.Invalid, RasterSampleCount = 1,
+            };
+            desc.ColorAttachments[0].PixelFormat = MTLPixelFormat.RGBA16Float;
+            desc.ColorAttachments[0].BlendingEnabled = false;
+            _pipeline = Device.MtlDevice.CreateRenderPipelineState(desc, out Foundation.NSError? error)
+                ?? throw new InvalidOperationException($"雾合成 PSO 创建失败：{error?.LocalizedDescription}");
+            using var depth = new MTLDepthStencilDescriptor
+            {
+                DepthCompareFunction = MTLCompareFunction.Always, DepthWriteEnabled = false,
+            };
+            _depthState = Device.MtlDevice.CreateDepthStencilState(depth)
+                ?? throw new InvalidOperationException("雾合成深度状态创建失败。");
+        }
+        catch { Dispose(); throw; }
+    }
+
+    static bool Readable(IMTLTexture? texture, MTLTextureType type) => texture != null
+        && texture.Handle != IntPtr.Zero && texture.TextureType == type && texture.SampleCount == 1
+        && texture.Width > 0 && texture.Height > 0 && (texture.Usage & MTLTextureUsage.ShaderRead) != 0;
+
+    bool Resolve(in FogCompositeInputs inputs, MTLRenderTarget destination, out Resources resources)
+    {
+        resources = default;
+        if (inputs.Color is not MTLRenderTarget color || inputs.Depth is not MTLRenderTarget depth
+            || inputs.FrameBuffer is not MTLStorageBuffer frame || frame.SizeInBytes < FrameBytes
+            || frame.Buffer == null || frame.Buffer.Handle == IntPtr.Zero || frame.Buffer.Length < FrameBytes
+            || color.Desc.ColorFormat != RtFormat.Rgba16Float || color.Desc.SampleCount > 1
+            || depth.Desc.ColorFormat != RtFormat.None || depth.Desc.DepthFormat != RtFormat.D32Float
+            || depth.Desc.SampleCount > 1 || destination.Desc.ColorFormat != RtFormat.Rgba16Float
+            || destination.Desc.DepthFormat != RtFormat.None || destination.Desc.SampleCount > 1
+            || destination.DepthTexture != null || !float.IsFinite(inputs.AoIntensity) || inputs.AoIntensity < 0)
+            return false;
+
+        var src = color.ColorTexture;
+        var dst = destination.ColorTexture;
+        var sceneDepth = depth.DepthTexture;
+        if (!Readable(src, MTLTextureType.k2D) || !Readable(dst, MTLTextureType.k2D)
+            || !Readable(sceneDepth, MTLTextureType.k2D)
+            || src!.PixelFormat != MTLPixelFormat.RGBA16Float || dst!.PixelFormat != MTLPixelFormat.RGBA16Float
+            || sceneDepth!.PixelFormat != MTLPixelFormat.Depth32Float
+            || (dst.Usage & MTLTextureUsage.RenderTarget) == 0 || dst.Handle == src.Handle
+            || src.Width != dst.Width || src.Height != dst.Height
+            || src.Width != sceneDepth.Width || src.Height != sceneDepth.Height
+            || (nuint)color.Width != src.Width || (nuint)color.Height != src.Height
+            || (nuint)destination.Width != dst.Width || (nuint)destination.Height != dst.Height
+            || (nuint)depth.Width != sceneDepth.Width || (nuint)depth.Height != sceneDepth.Height)
+            return false;
+
+        var integrated = MTLTexture3D.Find(inputs.IntegratedVolume);
+        var local = MTLTexture3D.Find(inputs.LocalVolume);
+        if (integrated == null || local == null || !Volatile.Read(ref integrated.Ready) || !Volatile.Read(ref local.Ready)
+            || !Readable(integrated.Image, MTLTextureType.k3D) || !Readable(local.Image, MTLTextureType.k3D)
+            || integrated.Image.PixelFormat != MTLPixelFormat.RGBA16Float || local.Image.PixelFormat != MTLPixelFormat.RGBA16Float
+            || integrated.Image.Width != local.Image.Width || integrated.Image.Height != local.Image.Height
+            || local.Image.Depth == 0 || integrated.Image.Depth != local.Image.Depth + 1)
+            return false;
+
+        IMTLTexture? ao = src;
+        if (inputs.ApplyAo)
+        {
+            if (inputs.Ao.Target is MTLRenderTarget aoTarget) ao = aoTarget.ColorTexture;
+            else
+            {
+                Texture? texture = null;
+                if (inputs.Ao.TextureName != null)
+                    lock (_textures) _textures.TryGetValue(inputs.Ao.TextureName, out texture);
+                if (texture == null || !Volatile.Read(ref texture.Ready)) return false;
+                ao = texture.Image;
+            }
+            if (!Readable(ao, MTLTextureType.k2D) || ao!.Handle == dst.Handle
+                || ao.PixelFormat is not (MTLPixelFormat.R8Unorm or MTLPixelFormat.R16Float
+                    or MTLPixelFormat.RG16Float or MTLPixelFormat.RGBA16Float
+                    or MTLPixelFormat.RGBA8Unorm or MTLPixelFormat.BGRA8Unorm)) return false;
+        }
+        resources = new(frame.Buffer, integrated.Image, local.Image, src, sceneDepth, ao!, dst);
+        return true;
+    }
+
+    void ClearPrepared()
+    {
+        _destination = null;
+        _command = null;
+        _inputs = default;
+        _prepared = default;
+    }
+
+    public override bool Prepare(in FogCompositeInputs inputs, RenderTarget destination)
+    {
+        ClearPrepared();
+        var command = Device.GraphicsCommandBuffer;
+        if (_disposed || Device.GraphicsEncoder != null || command == null || command.Handle == IntPtr.Zero
+            || destination is not MTLRenderTarget target || !Resolve(inputs, target, out var resources)) return false;
+        // Metal 默认 hazard tracking 处理前一个 Compute encoder 的写入依赖。
+        _inputs = inputs;
+        _destination = target;
+        _prepared = resources;
+        _command = command;
+        _frame = Device.FrameIndex;
+        return true;
+    }
+
+    public override unsafe FogCompositeResult Draw()
+    {
+        var destination = _destination;
+        var inputs = _inputs;
+        var prepared = _prepared;
+        var command = _command;
+        ClearPrepared();
+        var encoder = Device.GraphicsEncoder;
+        if (_disposed || destination == null || encoder == null || encoder.Handle == IntPtr.Zero
+            || command == null || command.Handle == IntPtr.Zero || !ReferenceEquals(command, Device.GraphicsCommandBuffer)
+            || _frame != Device.FrameIndex || Device.ActivePassId != RenderPassId.FogComposite
+            || !ReferenceEquals(destination, Device.ActiveColorTarget)
+            || !Resolve(inputs, destination, out var resources) || !prepared.Same(resources)
+            || Device.ActiveColorTexture?.Handle != resources.Destination.Handle) return default;
+
+        encoder.SetRenderPipelineState(_pipeline!);
+        encoder.SetDepthStencilState(_depthState!);
+        encoder.SetCullMode(MTLCullMode.None);
+        encoder.SetFragmentBuffer(resources.Frame, 0, 0);
+        var parameters = new Vector4(inputs.AoIntensity, inputs.ApplyAo ? 1 : 0, 0, 0);
+        encoder.SetFragmentBytes((IntPtr)(&parameters), (nuint)sizeof(Vector4), 1);
+        encoder.SetFragmentTexture(resources.Integrated, 0);
+        encoder.SetFragmentTexture(resources.Local, 1);
+        encoder.SetFragmentTexture(resources.Color, 2);
+        encoder.SetFragmentTexture(resources.Depth, 3);
+        encoder.SetFragmentTexture(resources.Ao, 4);
+        encoder.DrawPrimitives(MTLPrimitiveType.Triangle, 0, 3);
+        return new(true, inputs.ApplyAo);
+    }
+
+    public override void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        ClearPrepared();
+        // 已编码资源由 command buffer 持有；未编码的准备结果已经失效。
+        _pipeline?.Dispose(); _pipeline = null;
+        _depthState?.Dispose(); _depthState = null;
     }
 }

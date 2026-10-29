@@ -1102,6 +1102,12 @@ internal unsafe class DXModel : DXPrimitiveGroup
     /// <summary>Binds the bone-matrix CB before Draw, at root-signature slot 8.</summary>
     protected override void OnBeforeDraw()
     {
+        if (DXSceneDrawCollection.Active is { } collection)
+        {
+            if (_boneMatrixBuffers != null)
+                collection.State.Bones = DXSceneDrawCollection.ConstantRef(_boneMatrixBuffers[Device.FrameIndex]);
+            return;
+        }
         if (_boneMatrixBuffers != null)
         {
             int fi = (int)Device.FrameIndex;
@@ -1110,9 +1116,12 @@ internal unsafe class DXModel : DXPrimitiveGroup
         }
     }
 
-    protected override GpuDescriptorHandle GetBoneSrvHandle() => _bonePaletteSrvHandle;
-    protected override GpuDescriptorHandle GetPrevBoneSrvHandle() => _prevBonePaletteSrvHandle;
-    protected override GpuDescriptorHandle GetPrevMorphSrvHandle() => _prevMorphWeightsSrvHandle;
+    protected override GpuDescriptorHandle GetBoneSrvHandle()
+        => DXSceneDrawCollection.Structured(_bonePaletteBuffer, 64, _bonePaletteSrvHandle);
+    protected override GpuDescriptorHandle GetPrevBoneSrvHandle()
+        => DXSceneDrawCollection.Structured(_prevBonePaletteBuffer, 64, _prevBonePaletteSrvHandle);
+    protected override GpuDescriptorHandle GetPrevMorphSrvHandle()
+        => DXSceneDrawCollection.Structured(_prevMorphWeightsBuffer, 16, _prevMorphWeightsSrvHandle);
 
     public override void Dispose()
     {

@@ -74,6 +74,7 @@ public sealed class TaaEffect : ComputeEffect
 
     /// <summary>Whether the history contains valid data. It stays false on the first frame, when texture contents are undefined, and after any bypass; feedback is forced to zero based on this.</summary>
     bool _historyValid;
+    RenderTarget? _previousSource;
 
     public override string Name => "taa";
 
@@ -169,7 +170,9 @@ public sealed class TaaEffect : ComputeEffect
         // stages fall back to the original SceneColor, history is invalidated, and convergence
         // restarts automatically once the size matches again.
         var res = DeviceServices.BaseApp.DeviceResolution;
-        if ((uint)res.X != _width || (uint)res.Y != _height)
+        var source = FrameSchedule.EffectiveSceneColor;
+        if (source == null || RenderQuality.Current.AntiAliasing != AaMode.Taa
+            || (uint)res.X != _width || (uint)res.Y != _height)
         {
             FrameSchedule.SceneColorOverride = null;
             FrameSchedule.TaaActive = false;
@@ -177,7 +180,11 @@ public sealed class TaaEffect : ComputeEffect
             return;
         }
 
+        if (!ReferenceEquals(source, _previousSource))
+            _historyValid = false;
+        _previousSource = source;
         _p ^= 1;
+        _res![_p][0] = source;
 
         Span<float> p = stackalloc float[8];
         p[0] = _width;
@@ -220,6 +227,7 @@ public sealed class TaaEffect : ComputeEffect
         _historyValid = false;
         _kernel?.Dispose();
         _kernel = null;
+        _previousSource = null;
     }
 
     // Shader sources (single source of truth; slots follow the class-level binding convention;

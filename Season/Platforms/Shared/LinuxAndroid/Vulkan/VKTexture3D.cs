@@ -291,6 +291,9 @@ internal unsafe sealed class VKTexture3D : IDisposable
     /// </summary>
     void ClearToBlack()
     {
+        // Transfer-queue submit plus a command buffer from the shared upload pool; see Texture.UploadPixels.
+        using var gpuAccess = Device.EnterGpuAccessScope();
+
         var vk = Device.Vk;
         var d = Device.LogicalDevice;
 

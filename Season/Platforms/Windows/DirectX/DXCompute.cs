@@ -154,9 +154,10 @@ internal sealed unsafe class DXComputeKernel : Season.Rendering.ComputeKernel
         RootSignature = rootSignature;
 
         // ── CS compilation + compute PSO ──
-        ID3D10Blob* csBlob = ShaderCompiler.CompileShaderFromSource(desc.Source.Hlsl!, desc.Source.EntryPoint, "cs_5_0");
+        ID3D10Blob* csBlob = null;
         try
         {
+            csBlob = ShaderCompiler.CompileShaderFromSource(desc.Source.Hlsl!, desc.Source.EntryPoint, "cs_5_0");
             var psoDesc = new ComputePipelineStateDesc
             {
                 PRootSignature = RootSignature,
@@ -168,27 +169,29 @@ internal sealed unsafe class DXComputeKernel : Season.Rendering.ComputeKernel
             Device.CheckResult(psoResult);
             PipelineState = pso;
         }
+        catch
+        {
+            Dispose();
+            throw;
+        }
         finally
         {
-            csBlob->Release();
+            if (csBlob != null) csBlob->Release();
         }
     }
 
     public override void Dispose()
     {
-        // Unregister path (called after UnregisterCompute): the caller must
-        // guarantee the kernel is no longer referenced by any in-flight frame,
-        // matching the direct-release semantics of DXTexture.Dispose.
-        if (PipelineState != null)
+        // 注销阻止后续调度；已录制的命令仍持有原生句柄，等本帧 fence 完成后释放。
+        nint pipeline = (nint)PipelineState, signature = (nint)RootSignature;
+        PipelineState = null;
+        RootSignature = null;
+        if (pipeline == 0 && signature == 0) return;
+        Device.EnqueueDeferredRelease(Device.GetCurrentRetireFenceValue(), () =>
         {
-            PipelineState->Release();
-            PipelineState = null;
-        }
-        if (RootSignature != null)
-        {
-            RootSignature->Release();
-            RootSignature = null;
-        }
+            if (pipeline != 0) ((ID3D12PipelineState*)pipeline)->Release();
+            if (signature != 0) ((ID3D12RootSignature*)signature)->Release();
+        });
     }
 }
 
@@ -205,9 +208,9 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
 {
     internal ID3D12Resource* Resource;
 
-    internal readonly int SrvDescriptorID;
+    internal int SrvDescriptorID = -1;
 
-    internal readonly int UavDescriptorID;
+    internal int UavDescriptorID = -1;
 
     internal GpuDescriptorHandle SrvGpuHandle;
 
@@ -339,7 +342,7 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
 
         TransitionTo(cmd, ResourceStates.CopyDest);
         cmd->CopyBufferRegion(Resource, 0, uploadHeap, 0, (ulong)data.Length);
-        TransitionTo(cmd, ResourceStates.NonPixelShaderResource);
+        TransitionTo(cmd, ResourceStates.AllShaderResource);
     }
 
     ID3D12Resource* EnsureUploadHeap(int slot, ulong requiredBytes)
@@ -394,21 +397,24 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
 
     public override void Dispose()
     {
-        if (Resource != null)
+        if (Resource == null && SrvDescriptorID < 0 && UavDescriptorID < 0) return;
+        nint resource = (nint)Resource;
+        var uploads = (IntPtr[])_uploadHeaps.Clone();
+        int srv = SrvDescriptorID, uav = UavDescriptorID;
+        var allocator = Device.DescriptorAllocator;
+        Resource = null;
+        SrvDescriptorID = UavDescriptorID = -1;
+        SrvGpuHandle = UavGpuHandle = default;
+        Array.Clear(_uploadHeaps);
+        Array.Clear(_uploadHeapCapacities);
+        // 资源和描述符同时退休，防止后续分配覆盖在飞帧所绑定的 SRV/UAV。
+        Device.EnqueueDeferredRelease(Device.GetCurrentRetireFenceValue(), () =>
         {
-            Resource->Release();
-            Resource = null;
-        }
-        for (int i = 0; i < _uploadHeaps.Length; i++)
-        {
-            var heap = (ID3D12Resource*)_uploadHeaps[i];
-            if (heap == null)
-                continue;
-            heap->Release();
-            _uploadHeaps[i] = IntPtr.Zero;
-            _uploadHeapCapacities[i] = 0;
-        }
-        Device.DescriptorAllocator.Free(SrvDescriptorID);
-        Device.DescriptorAllocator.Free(UavDescriptorID);
+            if (resource != 0) ((ID3D12Resource*)resource)->Release();
+            foreach (var upload in uploads)
+                if (upload != IntPtr.Zero) ((ID3D12Resource*)upload)->Release();
+            if (srv >= 0) allocator.Free(srv);
+            if (uav >= 0) allocator.Free(uav);
+        });
     }
 }

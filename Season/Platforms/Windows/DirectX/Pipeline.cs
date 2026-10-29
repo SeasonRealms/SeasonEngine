@@ -35,6 +35,8 @@ internal enum PipelineCullVariant
 internal static unsafe class Pipeline
 {
     internal static ID3D12RootSignature* RootSignature;
+    internal const uint FogFrameRoot = 23, FogIntegratedRoot = 24, FogLocalRoot = 25, FogParamsRoot = 26;
+    static bool _fogSamplingEnabled;
 
     internal static ID3D12PipelineState* OpaquePipelineState;
     internal static ID3D12PipelineState* OpaqueDoubleSidedPipelineState;
@@ -78,7 +80,7 @@ internal static unsafe class Pipeline
 
     // Phase 3: default Morph Target buffer (1 vertex x 9 floats, all zero, used for static-model binding)
     static ID3D12Resource* DefaultMorphDeltasBuffer;
-    static GpuDescriptorHandle DefaultMorphDeltasSrvHandle;
+    internal static GpuDescriptorHandle DefaultMorphDeltasSrvHandle;
     static int DefaultMorphDescriptorId = -1;
 
     // Phase 4: default per-instance bone buffer (one identity matrix, used as the non-instanced draw placeholder)
@@ -423,7 +425,10 @@ internal static unsafe class Pipeline
         // Root parameters: 23 total (five CBVs b0-b4 + 16 SRV tables t0-t7 + t8/t9/t10
         // + 1-7 envCube t11 + 2-4 ddgiAtlas t12 + 2-4 ddgiDepth t13 + 2-5 cloudNoise t14
         // + 2-5 apLut t15 + 1-5 shadow root constants b5 + Outline2D mask color root constants b6)
-        var rootParameters = new RootParameter[23];
+        // 新增独立雾绑定占 8 DWORD，总计 58，不改写已经提交的光照 CBV。
+        _fogSamplingEnabled = RenderQuality.Current.RequiresFogSceneDepth(
+            Device.HdrSceneColor, true, Immediate2DMode.Enabled);
+        var rootParameters = new RootParameter[27];
 
         // Constant buffer (b0)
         rootParameters[0] = new RootParameter
@@ -450,7 +455,8 @@ internal static unsafe class Pipeline
         // Create descriptor ranges for the 16 SRVs covering textures / morph / instance bone / shadow atlas /
         // prev bone / prev instance world / prev morph weights / env cube / DdgiAtlas / DdgiDepth /
         // CloudNoise / AerialLut (from t0 to t15)
-        var descriptorRanges = new DescriptorRange[16];
+        // 放在栈上，保证后续序列化时各 table 指针仍然有效。
+        Span<DescriptorRange> descriptorRanges = stackalloc DescriptorRange[18];
         for (int i = 0; i < 5; i++)
         {
             descriptorRanges[i] = new DescriptorRange
@@ -549,9 +555,21 @@ internal static unsafe class Pipeline
             RegisterSpace = 0
         };
 
+        descriptorRanges[16] = new() { RangeType = DescriptorRangeType.Srv, NumDescriptors = 1, BaseShaderRegister = 17 };
+        descriptorRanges[17] = new() { RangeType = DescriptorRangeType.Srv, NumDescriptors = 1, BaseShaderRegister = 18 };
+
         // Pin the descriptorRanges array with a fixed block
         fixed (DescriptorRange* pDescriptorRanges = descriptorRanges)
         {
+            rootParameters[FogFrameRoot] = new() { ParameterType = RootParameterType.TypeSrv,
+                Descriptor = new() { ShaderRegister = 16 }, ShaderVisibility = ShaderVisibility.Pixel };
+            for (int i = 0; i < 2; i++)
+                rootParameters[FogIntegratedRoot + i] = new() { ParameterType = RootParameterType.TypeDescriptorTable,
+                    DescriptorTable = new() { NumDescriptorRanges = 1, PDescriptorRanges = pDescriptorRanges + 16 + i },
+                    ShaderVisibility = ShaderVisibility.Pixel };
+            rootParameters[FogParamsRoot] = new() { ParameterType = RootParameterType.Type32BitConstants,
+                Constants = new() { ShaderRegister = 7, Num32BitValues = 4 }, ShaderVisibility = ShaderVisibility.Pixel };
+
             // Create 5 descriptor tables (one table per texture)
             for (int i = 0; i < 5; i++)
             {
@@ -899,7 +917,24 @@ internal static unsafe class Pipeline
             // to be defined for every variant including the shadow pass: fxc parses the whole translation unit, so an
             // undefined macro inside PSMain would break a compile that only asks for VSMain.
             + "#define TEXTURE_LOD_BIAS " + RenderQuality.Current.TextureLodBiasLiteral + "\n"
-            + @"cbuffer Matrices : register(b0)
+            + ((_fogSamplingEnabled && !overlay && !shadowPass && !outlineMask && mode != PipelineMode.Opaque)
+                ? "#define FOG_SAMPLING 1\n" : "#define FOG_SAMPLING 0\n")
+            + "#if FOG_SAMPLING\nByteAddressBuffer fogFrame:register(t16);\n"
+            + "Texture3D<float4> fogIntegrated:register(t17);\nTexture3D<float4> fogLocal:register(t18);\n"
+            + "cbuffer FogParams:register(b7) { float4 fogParams; };\n"
+            + Season.Rendering.Effects.VolumetricFogEffect.SamplingHlsl + "\n#endif\n"
+            + @"
+float4 ApplySceneFog(float4 color, float3 worldPos) {
+#if FOG_SAMPLING
+    [branch] if(fogParams.x > 0.5) {
+        float4 fog = FogAtWorld(worldPos);
+        // 当前材质 PSO 使用 straight alpha，混合阶段统一乘 alpha。
+        color.rgb = color.rgb * fog.w + fog.rgb;
+    }
+#endif
+    return color;
+}
+cbuffer Matrices : register(b0)
 {
     float4x4 world;
     float4x4 view;
@@ -1271,7 +1306,7 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
         if (hasMorphTargets != 0 && morphTargetCount > 0)
         {
             float4 prevW = hasPrevMorph != 0
-                ? (isInstanced != 0 ? g_PrevMorphWeights[instanceID] : g_PrevMorphWeights[0])
+                ? (isInstanced != 0 ? g_PrevMorphWeights[(uint)outlineMaskBoneBase.x + instanceID] : g_PrevMorphWeights[0])
                 : curMorphW;
             for (uint t = 0; t < morphTargetCount && t < 4; t++)
             {
@@ -1321,7 +1356,8 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
         float4x4 prevWorldMatrix;
         if (isInstanced != 0 && hasPrevInstanceWorld != 0)
         {
-            prevWorldMatrix = g_PrevInstanceWorlds[instanceID];
+                        // CPU 历史实例流按原始行序上传，StructuredBuffer 矩阵须转置后再参与行向量乘法。
+                        prevWorldMatrix = transpose(g_PrevInstanceWorlds[(uint)outlineMaskBoneBase.x + instanceID]);
             if (prevWorldMatrix._m33 == 0.0)
                 prevWorldMatrix = worldMatrix;
         }
@@ -1339,7 +1375,7 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
     float4 textColor = float4(1, 1, 1, 1);
     if (renderMode == 2 && isInstanced)
     {
-        TextGlyphData glyph = LoadTextGlyph(instanceID);
+        TextGlyphData glyph = LoadTextGlyph((uint)outlineMaskBoneBase.x + instanceID);
         float4 uvRect = glyph.uvRect;
         textColor = glyph.metrics.w > 0.5 ? glyph.color : textBaseColor;
         // Remap unit-quad UV (0..1) to the atlas sub-rectangle UV
@@ -2245,7 +2281,7 @@ float4 PSMain(PSInput input) : SV_TARGET
         float3 target = saturate(albedo * input.instanceColor.rgb);
         float safeExposure = params0.y > 0.0 ? params0.y : 1.0;
         float3 textColor = AcesFilmInv(pow(target, 2.2)) / safeExposure;
-        return float4(textColor, alpha * input.instanceColor.a * textGlobalAlpha * coverage);
+        return ApplySceneFog(float4(textColor, alpha * input.instanceColor.a * textGlobalAlpha * coverage), input.worldPos);
 #else
         return float4(albedo * input.instanceColor.rgb, alpha * input.instanceColor.a * textGlobalAlpha * coverage);
 #endif
@@ -2294,7 +2330,7 @@ float4 PSMain(PSInput input) : SV_TARGET
 #if HDR_CHAIN
         // The LUT already stores linear HDR radiance, so output it directly and let the
         // FinalBlit exposure + ACES + gamma chain close it out (1-4 contract).
-        return float4(skyRadiance, alpha);
+        return ApplySceneFog(float4(skyRadiance, alpha), input.worldPos);
 #else
         // LDR baseline (Overlay always takes this path): gamma-encode in place.
         // max(...,0) is not a quality safeguard. Radiance is physically non-negative, but the compiler cannot
@@ -2324,7 +2360,7 @@ float4 PSMain(PSInput input) : SV_TARGET
     {
 #if HDR_CHAIN
         // Sprite2D: unlit, output linear color directly and let the FinalBlit exposure + ACES + gamma chain close it out
-        return float4(albedo, alpha);
+        return ApplySceneFog(float4(albedo, alpha), input.worldPos);
 #else
         // Sprite2D: unlit, output texture color directly with gamma correction.
         // max(...,0) mirrors the sky-path X3571 guard: fxc reports raw pow of a possibly-negative base,
@@ -2579,7 +2615,7 @@ float4 PSMain(PSInput input) : SV_TARGET
     color = pow(max(color, 0.0), 1.0 / 2.2);
 #endif
 
-    return float4(color, alpha);
+    return ApplySceneFog(float4(color, alpha), input.worldPos);
 }
 
 float4 PSOutlineMask(PSInput input) : SV_TARGET
@@ -2840,6 +2876,11 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
     /// backbuffer-format variants and ignores depthWrite because overlay variants are already depthless.</summary>
     internal static void SetPipeline(PipelineMode mode, PipelineCullVariant cullVariant, bool depthWrite)
     {
+        if (DXSceneDrawCollection.Active is { } collection)
+        {
+            collection.SetPipeline(mode, cullVariant, depthWrite);
+            return;
+        }
         // Set the dedicated RootSignature
         DirectX.Device.GraphicsCommandList->SetGraphicsRootSignature(RootSignature);
 
@@ -2882,9 +2923,27 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
             };
         }
         DirectX.Device.GraphicsCommandList->SetPipelineState(pso);
+        if (_fogSamplingEnabled && mode != PipelineMode.Opaque
+            && Device.ActivePassId is not (RenderPassId.Overlay or RenderPassId.OutlineMask or RenderPassId.Shadow))
+            BindSceneFog();
     
         // Set the primitive topology
         DirectX.Device.GraphicsCommandList->IASetPrimitiveTopology(D3DPrimitiveTopology.D3DPrimitiveTopologyTrianglelist);
+    }
+
+    static void BindSceneFog()
+    {
+        if (!DXSceneDrawCollection.SuppressFog && DXFogCompositePipeline.BindTransparent()) return;
+        var command = Device.GraphicsCommandList;
+        // 未成功合成时仍绑定合法哨兵；门控为零，绝不访问哨兵中的雾参数。
+        // 复用既有骨骼缓冲和 AP 哨兵，不为雾关闭路径额外创建纹理。
+        var dummy = DXTexture3D.DummyBlack;
+        dummy.EnsureReadyForRendering(command);
+        command->SetGraphicsRootShaderResourceView(FogFrameRoot, DefaultInstanceBoneBuffer->GetGPUVirtualAddress());
+        command->SetGraphicsRootDescriptorTable(FogIntegratedRoot, dummy.GpuDescriptorHandle);
+        command->SetGraphicsRootDescriptorTable(FogLocalRoot, dummy.GpuDescriptorHandle);
+        var parameters = Vector4.Zero;
+        command->SetGraphicsRoot32BitConstants(FogParamsRoot, 4, &parameters, 0);
     }
 
     // ============================================================
@@ -2905,8 +2964,16 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         GpuDescriptorHandle instanceBoneSrvHandle = default,
         GpuDescriptorHandle prevBoneSrvHandle = default,
         GpuDescriptorHandle prevInstanceWorldSrvHandle = default,
-        GpuDescriptorHandle prevMorphSrvHandle = default)
+        GpuDescriptorHandle prevMorphSrvHandle = default,
+        ID3D12Resource* instanceResource = null)
     {
+        if (DXSceneDrawCollection.Active is { } collection)
+        {
+            collection.CapturePrimitive(primitiveData, lightConstantBuffer, matrixBuffer, instanceBufferView,
+                instanceResource, instanceCount, startInstanceLocation, instanceBoneSrvHandle, prevBoneSrvHandle,
+                prevInstanceWorldSrvHandle, prevMorphSrvHandle);
+            return;
+        }
         var cmdList = Device.GraphicsCommandList;
 
         primitiveData.BaseColorTexture.EnsureReadyForRendering(cmdList);
@@ -2948,12 +3015,6 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
                 ? instanceBoneSrvHandle
                 : DefaultInstanceBoneSrvHandle);
 
-        // 1-5: shadow atlas SRV (t7). During the Scene pass, EndPass has already transitioned the atlas to
-        // PixelShaderResource. Skip binding when it has not been created
-        // (ShadowsEnabled=false or not registered); shader-side all-zero shadowParams then prevent sampling.
-        if (FrameSchedule.ShadowMap is DXRenderTarget shadowRT && shadowRT.GpuSrvHandle.Ptr != 0)
-            cmdList->SetGraphicsRootDescriptorTable(12, shadowRT.GpuSrvHandle);
-
         // 2-3 Step C: previous-frame data SBs (t8/t9/t10). Bind the default zero-valued buffers when the
         // caller does not provide them, preserving sentinel semantics.
         cmdList->SetGraphicsRootDescriptorTable(14,
@@ -2962,6 +3023,61 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
             prevInstanceWorldSrvHandle.Ptr != 0 ? prevInstanceWorldSrvHandle : DefaultPrevInstanceWorldSrvHandle);
         cmdList->SetGraphicsRootDescriptorTable(16,
             prevMorphSrvHandle.Ptr != 0 ? prevMorphSrvHandle : DefaultPrevMorphWeightsSrvHandle);
+
+        BindSceneTextures();
+        // SV_InstanceID 不包含 StartInstanceLocation；普通透明逐实例绘制也需要显式基址。
+        SetOutlineMaskBoneBase(instanceBufferView != null ? startInstanceLocation : 0);
+        cmdList->DrawIndexedInstanced((uint)primitiveData.Indices.Length, instanceCount, 0, 0, startInstanceLocation);
+    }
+
+    // 精灵与文字也使用完整场景 Shader；合成切换根签名后不能依赖上一次图元的残留绑定。
+    internal static void BindQuadSceneResources()
+    {
+        var command = Device.GraphicsCommandList;
+        command->SetGraphicsRootConstantBufferView(8, DefaultTextDrawParamsGpuAddress);
+        command->SetGraphicsRootDescriptorTable(9, DefaultMorphDeltasSrvHandle);
+        command->SetGraphicsRootDescriptorTable(10, DefaultInstanceBoneSrvHandle);
+        command->SetGraphicsRootDescriptorTable(14, DefaultPrevBoneSrvHandle);
+        command->SetGraphicsRootDescriptorTable(15, DefaultPrevInstanceWorldSrvHandle);
+        command->SetGraphicsRootDescriptorTable(16, DefaultPrevMorphWeightsSrvHandle);
+        BindSceneTextures();
+    }
+
+    internal static void CaptureSceneTextures(ref DXSceneDrawCommand draw)
+    {
+        var arena = DXSceneDrawCollection.Arena;
+        var cmd = Device.GraphicsCommandList;
+        if (FrameSchedule.ShadowMap is DXRenderTarget shadow && shadow.Depth != null)
+        {
+            shadow.TransitionDepthTo(cmd, ResourceStates.AllShaderResource);
+            draw.Textures[12] = arena.CaptureView(shadow.Depth, new ShaderResourceViewDesc {
+                Format = Format.FormatR32Float, ViewDimension = SrvDimension.Texture2D, Shader4ComponentMapping = 0x1688,
+                Texture2D = new() { MipLevels = 1 } });
+        }
+        else draw.Textures[12] = DXSceneDrawCollection.Texture(null);
+        var cube = DXTextureCube.Active ?? DXTextureCube.DummyBlack;
+        cube.EnsureReadyForRendering(cmd);
+        draw.Textures[17] = arena.CaptureView(cube.NativeResource, new ShaderResourceViewDesc {
+            Format = cube.NativeResource->GetDesc().Format, ViewDimension = SrvDimension.Texturecube,
+            Shader4ComponentMapping = 0x1688, TextureCube = new() { MipLevels = 1 } });
+        draw.Textures[18] = DXSceneDrawCollection.Texture(DdgiAtlasActive);
+        draw.Textures[19] = DXSceneDrawCollection.Texture(DdgiDepthActive);
+        draw.Textures[21] = DXSceneDrawCollection.Texture(CloudNoiseActive);
+        var aerial = AerialLutActive ?? DXTexture3D.DummyBlack;
+        aerial.EnsureReadyForRendering(cmd);
+        draw.Textures[22] = arena.CaptureView(aerial.NativeResource, new ShaderResourceViewDesc {
+            Format = aerial.NativeFormat, ViewDimension = SrvDimension.Texture3D, Shader4ComponentMapping = 0x1688,
+            Texture3D = new() { MipLevels = 1 } });
+    }
+
+    static void BindSceneTextures()
+    {
+        var cmdList = Device.GraphicsCommandList;
+        Device.White.EnsureReadyForRendering(cmdList);
+        // 阴影未注册时也绑定合法哨兵，阴影参数为零时不会采样。
+        cmdList->SetGraphicsRootDescriptorTable(12,
+            FrameSchedule.ShadowMap is DXRenderTarget shadowRT && shadowRT.GpuSrvHandle.Ptr != 0
+                ? shadowRT.GpuSrvHandle : Device.White.GpuDescriptorHandle);
 
         // 1-7: environment radiance cube (t11). The shader statically references envCube, so this table must
         // be bound on every draw. Bind the 1x1 all-black dummy when no environment map exists
@@ -3006,8 +3122,6 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         var apLut = AerialLutActive ?? DXTexture3D.DummyBlack;
         apLut.EnsureReadyForRendering(cmdList);
         cmdList->SetGraphicsRootDescriptorTable(22, apLut.GpuDescriptorHandle);
-
-        cmdList->DrawIndexedInstanced((uint)primitiveData.Indices.Length, instanceCount, 0, 0, startInstanceLocation);
     }
 
     // ============================================================
@@ -3101,6 +3215,7 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
     /// (which resets outlineMaskBoneBase) and before DrawPrimitive.</summary>
     internal static void SetOutlineMaskBoneBase(uint boneBase)
     {
+        if (DXSceneDrawCollection.Active is { } collection) { collection.State.BoneBase = boneBase; return; }
         float* values = stackalloc float[4];
         values[0] = boneBase;
         values[1] = 0f;

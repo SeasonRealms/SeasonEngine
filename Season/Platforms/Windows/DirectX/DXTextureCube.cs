@@ -55,6 +55,7 @@ internal unsafe sealed class DXTextureCube : IDisposable
     Format _format = Format.FormatR8G8B8A8Unorm;
 
     ID3D12Resource* _resource = null;
+    internal ID3D12Resource* NativeResource => _resource;
 
     ResourceStates _currentState = ResourceStates.Common;
 

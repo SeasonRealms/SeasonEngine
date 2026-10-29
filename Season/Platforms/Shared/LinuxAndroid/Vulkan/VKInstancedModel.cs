@@ -378,7 +378,12 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
                 continue;
 
             if (stream.Buffer.Buffer.Handle != 0)
-                Device.ResourceManager.DestroyBuffer(stream.Buffer);
+            {
+                // Same rule as VKInstancedPrimitiveGroup.EnsureInstanceBufferCapacity: pending command buffers may still
+                // reference this stream, so hand it to the retire queue instead of destroying it here.
+                var retired = stream.Buffer;
+                Device.EnqueueDeferredRelease(() => Device.ResourceManager.DestroyBuffer(retired));
+            }
 
             stream.Buffer = Device.ResourceManager.CreateVertexBuffer<InstanceTransformData>((uint)count);
             stream.Capacity = count;
@@ -396,7 +401,8 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
 
             if (stream.Buffer.Buffer.Handle != 0)
             {
-                Device.ResourceManager.DestroyBuffer(stream.Buffer);
+                var retired = stream.Buffer;
+                Device.EnqueueDeferredRelease(() => Device.ResourceManager.DestroyBuffer(retired));
                 stream.Buffer = default;
             }
 
@@ -479,9 +485,13 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         {
             if (_instanceBoneBuffers[i].Buffer.Handle != 0)
             {
+                // Capacity growth can happen at any time, including while the last frames still reference the old buffer
+                // through binding 9. Unmapping is host-side only, so it stays here; the destroy goes to the retire queue
+                // so it cannot land before those frames complete (VUID-vkDestroyBuffer-buffer-00922).
+                var retired = _instanceBoneBuffers[i];
                 if (_mappedInstanceBoneBuffers != null && _mappedInstanceBoneBuffers[i] != null)
-                    Device.Vk.UnmapMemory(Device.LogicalDevice, _instanceBoneBuffers[i].Memory);
-                Device.ResourceManager.DestroyBuffer(_instanceBoneBuffers[i]);
+                    Device.Vk.UnmapMemory(Device.LogicalDevice, retired.Memory);
+                Device.EnqueueDeferredRelease(() => Device.ResourceManager.DestroyBuffer(retired));
             }
 
             _instanceBoneBuffers[i] = Device.ResourceManager.CreateBuffer(
@@ -527,11 +537,13 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         {
             for (int i = 0; i < _prevInstanceBoneBuffers.Length; i++)
             {
+                // Same retire rule as the current bone SSBO above: the set written for a frame in flight still points here.
+                var retired = _prevInstanceBoneBuffers[i];
                 if (_mappedPrevInstanceBoneBuffers != null && i < _mappedPrevInstanceBoneBuffers.Length
-                    && _mappedPrevInstanceBoneBuffers[i] != null && _prevInstanceBoneBuffers[i].Memory.Handle != 0)
-                    Device.Vk.UnmapMemory(Device.LogicalDevice, _prevInstanceBoneBuffers[i].Memory);
-                if (_prevInstanceBoneBuffers[i].Memory.Handle != 0)
-                    Device.ResourceManager.DestroyBuffer(_prevInstanceBoneBuffers[i]);
+                    && _mappedPrevInstanceBoneBuffers[i] != null && retired.Memory.Handle != 0)
+                    Device.Vk.UnmapMemory(Device.LogicalDevice, retired.Memory);
+                if (retired.Memory.Handle != 0)
+                    Device.EnqueueDeferredRelease(() => Device.ResourceManager.DestroyBuffer(retired));
             }
         }
 
@@ -565,11 +577,12 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         {
             for (int i = 0; i < _prevInstanceWorldBuffers.Length; i++)
             {
+                var retired = _prevInstanceWorldBuffers[i];
                 if (_mappedPrevInstanceWorldBuffers != null && i < _mappedPrevInstanceWorldBuffers.Length
-                    && _mappedPrevInstanceWorldBuffers[i] != null && _prevInstanceWorldBuffers[i].Memory.Handle != 0)
-                    Device.Vk.UnmapMemory(Device.LogicalDevice, _prevInstanceWorldBuffers[i].Memory);
-                if (_prevInstanceWorldBuffers[i].Memory.Handle != 0)
-                    Device.ResourceManager.DestroyBuffer(_prevInstanceWorldBuffers[i]);
+                    && _mappedPrevInstanceWorldBuffers[i] != null && retired.Memory.Handle != 0)
+                    Device.Vk.UnmapMemory(Device.LogicalDevice, retired.Memory);
+                if (retired.Memory.Handle != 0)
+                    Device.EnqueueDeferredRelease(() => Device.ResourceManager.DestroyBuffer(retired));
             }
         }
 
@@ -603,11 +616,12 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         {
             for (int i = 0; i < _prevMorphWeightsBuffers.Length; i++)
             {
+                var retired = _prevMorphWeightsBuffers[i];
                 if (_mappedPrevMorphWeightsBuffers != null && i < _mappedPrevMorphWeightsBuffers.Length
-                    && _mappedPrevMorphWeightsBuffers[i] != null && _prevMorphWeightsBuffers[i].Memory.Handle != 0)
-                    Device.Vk.UnmapMemory(Device.LogicalDevice, _prevMorphWeightsBuffers[i].Memory);
-                if (_prevMorphWeightsBuffers[i].Memory.Handle != 0)
-                    Device.ResourceManager.DestroyBuffer(_prevMorphWeightsBuffers[i]);
+                    && _mappedPrevMorphWeightsBuffers[i] != null && retired.Memory.Handle != 0)
+                    Device.Vk.UnmapMemory(Device.LogicalDevice, retired.Memory);
+                if (retired.Memory.Handle != 0)
+                    Device.EnqueueDeferredRelease(() => Device.ResourceManager.DestroyBuffer(retired));
             }
         }
 
@@ -954,6 +968,9 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         if (!_transformInitialized || _instanceCount == 0)
             return;
 
+        // 收集期把本模型钉在快照页上：重放时实例流与图元描述符集仍会被引用。
+        VKSceneDrawCollection.RetainOwner(this);
+
         var cmd = Device.GraphicsCommandBuffer;
         bool forceFadeByAlpha = _currentAlpha < 1.0f;
         int fi = (int)Device.FrameIndex;
@@ -992,18 +1009,21 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
             for (int orderIndex = 0; orderIndex < _transparentInstanceOrder.Count; orderIndex++)
             {
                 uint instanceIndex = (uint)_transparentInstanceOrder[orderIndex];
+                // 实例世界矩阵只在 CPU 侧（stream.Worlds），GPU 侧实例流不可回读，
+                // 所以透明排序深度必须由这里给出。
+                float depth = ComputeTransparentDepth(stream.Worlds[instanceIndex], primitive.LocalBoundsCenter);
                 if (primitive.DoubleSided)
                 {
                     Pipeline.SetPipeline(cmd, PipelineMode.Transparent, CullModeFlags.FrontBit);
                     Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
                         primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
-                        stream.Buffer.Buffer, 1, instanceIndex);
+                        stream.Buffer.Buffer, 1, instanceIndex, depth);
                 }
 
                 Pipeline.SetPipeline(cmd, PipelineMode.Transparent, CullModeFlags.BackBit);
                 Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
                     primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
-                    stream.Buffer.Buffer, 1, instanceIndex);
+                    stream.Buffer.Buffer, 1, instanceIndex, depth);
             }
         }
 
@@ -1043,6 +1063,25 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
 
         var cmd = Device.GraphicsCommandBuffer;
         int fi = (int)Device.FrameIndex;
+
+        // 和 VKPrimitiveGroup.DrawShadow 保持同一套契约：未声明 UPDATE_AFTER_BIND 的描述符集一旦被
+        // 正在录制的命令缓冲引用就不能再改写，否则整条命令缓冲进入 invalid 状态。所以 binding 16-20
+        // 必须赶在本帧第一次绑定之前对齐——这里先把要投影的图元全部刷一遍，随后的 bind 才是安全的。
+        // 好处是主通道的 PreparePrimitive 会因为 ViewVersion 相同而跳过，不会再写回同一批集合。
+        // 实例模型的绘制不走场景收集，主通道也不会替它登记，所以这里同时把它画过的图元交给下一帧的帧首预刷新。
+        for (int i = 0; i < _opaquePrimitives.Count; i++)
+        {
+            var primitive = _opaquePrimitives[i];
+            if (GetPrimitiveInstanceStream(primitive) == null)
+                continue;
+            VKSceneDrawCollection.NotePrimitiveDrawn(primitive);
+            Pipeline.RefreshSceneBindings(primitive.DescriptorSets[fi],
+                ref primitive.EnvCubeViewVersions[fi],
+                ref primitive.DdgiAtlasViewVersions[fi],
+                ref primitive.DdgiDepthViewVersions[fi],
+                ref primitive.CloudNoiseViewVersions[fi],
+                ref primitive.AerialLutViewVersions[fi]);
+        }
 
         for (int i = 0; i < _opaquePrimitives.Count; i++)
         {

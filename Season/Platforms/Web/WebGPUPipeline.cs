@@ -36,6 +36,22 @@ public static class WebGPUPipeline
 
     // ── Unified WGSL shader source ──
 
+    /// <summary>场景透明雾的独立绑定；现有 Web 混合使用 straight alpha，等价于预乘公式除以 alpha。</summary>
+    public const string SceneFogSamplingShader = """
+struct FogMaterialFrame { values:array<vec4f> }
+@group(1) @binding(0) var<storage,read> fogFrame:FogMaterialFrame;
+@group(1) @binding(1) var fogIntegrated:texture_3d<f32>;
+@group(1) @binding(2) var fogLocal:texture_3d<f32>;
+@group(1) @binding(3) var<uniform> fogSamplingParams:vec4f;
+""" + Season.Rendering.Effects.VolumetricFogEffect.SamplingWgsl + """
+
+fn ApplySceneFog(color:vec4f,world:vec3f)->vec4f {
+    if(fogSamplingParams.x<0.5) { return color; }
+    let fog=FogAtWorld(world);
+    return vec4f(color.xyz*fog.w+fog.xyz,color.w);
+}
+""";
+
     /// <summary>
     /// Main rendering-pipeline shader (WGSL).
     /// Includes full PBR lighting, MSDF text rendering, alpha testing, skeletal skinning,
@@ -1385,16 +1401,19 @@ fn shade(input: ShadeInput) -> vec4f {
     return vec4f(color, alpha);
 }
 
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4f {
+fn shadeVertex(input: VertexOutput) -> vec4f {
     return shade(ShadeInput(input.uv, input.normal, input.worldPos, input.tangent,
                             input.instanceColor, input.viewDepth, input.position.xy));
 }
 
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4f {
+    return shadeVertex(input);
+}
+
 // 2-3 Contract Clause 5: compute velocity unconditionally before any discard.
 // prevClip.w <= 0 means no history, covering all 2D/UI/text paths and the VS sentinel fallback, so the result stays zero.
-@fragment
-fn fs_main_mrt(input: VertexOutput) -> FragmentOutput {
+fn shadeVertexMrt(input: VertexOutput) -> FragmentOutput {
     var output: FragmentOutput;
     output.velocity = vec2f(0.0);
     if (input.prevClip.w > 0.0) {
@@ -1408,9 +1427,13 @@ fn fs_main_mrt(input: VertexOutput) -> FragmentOutput {
         let prevNdc = input.prevClip.xy / input.prevClip.w;
         output.velocity = (curNdc - prevNdc) * vec2f(0.5, -0.5);
     }
-    output.color = shade(ShadeInput(input.uv, input.normal, input.worldPos, input.tangent,
-                                    input.instanceColor, input.viewDepth, input.position.xy));
+    output.color = shadeVertex(input);
     return output;
+}
+
+@fragment
+fn fs_main_mrt(input: VertexOutput) -> FragmentOutput {
+    return shadeVertexMrt(input);
 }
 
 // ── Phase 4 Outline2D mask entry (mirrors VK OUTLINE_MASK / DX PSOutlineMask semantics) ──
@@ -1426,6 +1449,16 @@ fn fs_main_outline_mask(input: VertexOutput) -> @location(0) vec4f {
         discard;
     }
     return vec4f(u.hdrParams.rgb, 1.0);
+}
+""" + SceneFogSamplingShader + """
+
+@fragment fn fs_main_fog(input:VertexOutput)->@location(0) vec4f {
+    return ApplySceneFog(shadeVertex(input),input.worldPos);
+}
+@fragment fn fs_main_mrt_fog(input:VertexOutput)->FragmentOutput {
+    var output=shadeVertexMrt(input);
+    output.color=ApplySceneFog(output.color,input.worldPos);
+    return output;
 }
 """;
 

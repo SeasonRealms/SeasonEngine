@@ -1033,7 +1033,9 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         // MotionVectors requires an explicit depth target because the velocity render pass needs three attachments, color, velocity, and depth.
         // When AO is disabled, SceneDepth may still be null,
         // but MotionVectors still needs a depth attachment, so create it here, mirrored with WindowsApp, LinuxApp, and AndroidApp.
-        if (!immediate2D && RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
+        if (!immediate2D && Season.Rendering.FrameSchedule.SceneDepth == null
+            && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresFogSceneDepth(
+                MtlDevice.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)))
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {

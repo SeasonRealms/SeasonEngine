@@ -165,6 +165,9 @@ public abstract class BaseApp : Panel
     /// Add lights when scene objects appear and Remove them when they leave; no per-frame rebuild is needed.</summary>
     public readonly Season.Rendering.SceneLighting Lighting = new();
 
+    /// <summary>场景自己的近地雾介质及局部雾体注册表，类库默认关闭。</summary>
+    public Season.Rendering.SceneFog Fog { get; } = new();
+
     /// <summary>The effective scene lighting consumed by each platform frame loop (single convergence point;
     /// hdrExposure is still injected by each backend via SetLighting).</summary>
     public SceneLightParams EffectiveSceneLights => SceneLights;

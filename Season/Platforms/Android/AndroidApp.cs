@@ -718,7 +718,9 @@ public static class AndroidApp
         // three attachments: color, velocity, and depth.
         // When AO is disabled, SceneDepth may be null, but MotionVectors still needs a depth attachment,
         // so fill it in here.
-        if (!immediate2D && RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
+        if (!immediate2D && Season.Rendering.FrameSchedule.SceneDepth == null
+            && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresFogSceneDepth(
+                VkDevice.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)))
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -760,6 +762,11 @@ public static class AndroidApp
     /// resource stays the same for the whole session.</summary>
     static void RenderLoopBody()
     {
+        // Vulkan was bootstrapped on the UI thread, so the GPU-gate exemption still names that thread. Everything from
+        // here on - App.Update included, which rewrites descriptor sets between frames - runs on this one, so claim
+        // the record before the first frame. A recreated render thread claims it again.
+        VkDevice.MarkLoopThread();
+
         var stopWatch = System.Diagnostics.Stopwatch.StartNew();
         double previousSeconds = 0;
         int frameCounter = 0;
@@ -954,6 +961,10 @@ public static class AndroidApp
         // Mirror the Shutdown step: an exception escaping from inside a pass would leave the flag
         // set, and the next (recovered) frame would then reject every BeginPass.
         VkDevice.InRenderPass = false;
+
+        // The interrupted frame may still hold the exclusive GPU gate BeforeRender took. Release it here, or the
+        // background loading thread waits forever for a frame that will never finish.
+        VkDevice.AbortGpuAccessForCurrentThread();
 
         // The interrupted frame may have acquired an image without ever submitting it, leaving that
         // slot's semaphores signaled; they are rebuilt before any frame runs again.

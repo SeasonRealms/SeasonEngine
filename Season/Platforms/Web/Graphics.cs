@@ -84,7 +84,7 @@ internal sealed class WebInstancedDiagState
 ///    full 1136-byte block, so no extra UBO is introduced. WGSL always samples through
 ///    <c>textureSampleLevel(..., 0.0)</c> to avoid uniformity / implicit-derivative restrictions.
 /// </summary>
-internal partial class Graphics : IGraphics
+internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 {
     // ── HDR SceneColor (1-4 Step A, mirrored from DX/VK Device; WebGPU has no separate Device class,
     // and this class hosts the behavior) ──
@@ -168,6 +168,10 @@ internal partial class Graphics : IGraphics
     byte[] _skinnedBatchUniformBytes = new byte[128 * BYTES_PER_UNIFORM];
     int _skinnedBatchCount = 0;
     string? _currentSkinnedBatchSkinKey;
+    bool _sceneCollecting, _sceneCollectionLive, _scenePrioritySet;
+    SceneDrawPriority _scenePriority;
+    int[] _scenePriorityValues = [];
+    readonly string[] _sceneMeshKey = new string[1];
     readonly Queue<PendingStaticMeshUpload> _pendingStaticMeshUploads = new();
     readonly Dictionary<string, PendingStaticMeshUpload> _pendingStaticMeshUploadLookup = new();
     readonly HashSet<string> _uploadedStaticMeshKeys = new();
@@ -184,6 +188,7 @@ internal partial class Graphics : IGraphics
 
     internal void EnqueueDrawMesh3D(string cacheKey, float[] uniform100)
     {
+        if (CaptureSceneMesh(cacheKey, uniform100, null)) return;
         int needed = (_batchCount + 1) * BYTES_PER_UNIFORM;
         if (needed > _batchUniformBytes.Length)
         {
@@ -220,6 +225,7 @@ internal partial class Graphics : IGraphics
         if (string.IsNullOrEmpty(_currentSkinnedBatchSkinKey))
             throw new InvalidOperationException("Skinned batch requires BeginSkinnedModelDraw before enqueue.");
 
+        if (CaptureSceneMesh(cacheKey, uniform100, _currentSkinnedBatchSkinKey)) return;
         int needed = (_skinnedBatchCount + 1) * BYTES_PER_UNIFORM;
         if (needed > _skinnedBatchUniformBytes.Length)
         {
@@ -392,6 +398,22 @@ internal partial class Graphics : IGraphics
     readonly string _assetBasePath;
     bool _initialized;
 
+    public Season.Rendering.FogCompositePipeline? CreateFogCompositePipeline()
+    {
+        if (!ComputeSupported) return null;
+        var pipeline = new WGPUFogCompositePipeline();
+        try
+        {
+            if (pipeline.Initialize()) return pipeline;
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[FogComposite] 创建失败：{ex.Message}");
+        }
+        pipeline.Dispose();
+        return null;
+    }
+
     internal static Season.Basic.Camera Camera3D;
 
     // 1-2 Contract 8: mirrored scene lighting (SceneLightParams, 976B after the 2-3 expansion). After
@@ -416,6 +438,7 @@ internal partial class Graphics : IGraphics
     Dictionary<(string, long), WGPUMesh3D> DictionaryMesh3D = new();
     Dictionary<(string, long), WGPUInstancedMesh3D> DictionaryInstancedMesh3D = new();
     Dictionary<(string, long), WGPUInstancedModel> DictionaryInstancedModel = new();
+    readonly HashSet<WGPURenderTarget> _renderTargets = new();
     int _instancedDiagPollCounter = 0;
     string? _lastInstancedDiagSignature;
 
@@ -534,7 +557,8 @@ internal partial class Graphics : IGraphics
             velocityOutput, overlayMeshShader,
             // 2-6 clause 6: clamped here rather than in JS so all four backends resolve the count through the same
             // helper; the JS side re-clamps only because a stale host mirror could otherwise pass an illegal value.
-            RenderQuality.ClampAnisotropy(RenderQuality.Current.TextureMaxAnisotropy));
+            RenderQuality.ClampAnisotropy(RenderQuality.Current.TextureMaxAnisotropy),
+            RenderQuality.Current.RequiresFogSceneDepth(HdrSceneColor, true, Season.Rendering.Immediate2DMode.Enabled));
         _initialized = true;
     }
 
@@ -553,9 +577,79 @@ internal partial class Graphics : IGraphics
         return $"{_assetBasePath}/{relativePath}";
     }
 
+    public void BeginSceneCollection()
+    {
+        if (!_initialized || _sceneCollectionLive || _batchCount != 0 || _skinnedBatchCount != 0)
+            throw new InvalidOperationException("场景收集要求图形已初始化且上一阶段批次已消费。");
+        if (!FrameSchedule.SceneCollectionActive || !FrameSchedule.SceneDrawOrder.IsCollecting)
+            throw new InvalidOperationException("场景收集必须由帧调度器开启。");
+        WebGPUInterop.BeginSceneCollection();
+        _sceneCollecting = _sceneCollectionLive = true;
+        _scenePrioritySet = false;
+    }
+
+    public void SealSceneCollection()
+    {
+        if (!_sceneCollecting || _batchCount != 0 || _skinnedBatchCount != 0)
+            throw new InvalidOperationException("场景收集未开始或仍有未捕获的批次。");
+        WebGPUInterop.SealSceneCollection();
+        _sceneCollecting = false;
+    }
+
+    public void DrawCollectedOpaque() => WebGPUInterop.DrawCollectedOpaque();
+    public void DrawCollectedTransparent(bool sampleFog) => WebGPUInterop.DrawCollectedTransparent(sampleFog);
+
+    public void ReleaseSceneCollection()
+    {
+        try { WebGPUInterop.ReleaseSceneCollection(); }
+        finally
+        {
+            _sceneCollecting = _sceneCollectionLive = _scenePrioritySet = false;
+            _scenePriority = default;
+            _batchCount = _skinnedBatchCount = 0;
+            _currentSkinnedBatchSkinKey = null;
+            _sceneMeshKey[0] = null!;
+        }
+    }
+
+    // 只传值，不跨调用保留控件或优先级作用域；同一优先级的多个图元复用 JS 路径。
+    void PrepareSceneDraw()
+    {
+        if (!_sceneCollecting) return;
+        var priority = FrameSchedule.SceneDrawOrder.Current;
+        if (_scenePrioritySet && priority.CompareTo(_scenePriority) == 0) return;
+        int count = priority.Count * 2;
+        if (_scenePriorityValues.Length != count) _scenePriorityValues = new int[count];
+        for (int i = 0; i < priority.Count; i++)
+        {
+            var component = priority.Component(i);
+            _scenePriorityValues[i * 2] = component.Layer;
+            _scenePriorityValues[i * 2 + 1] = component.Order;
+        }
+        WebGPUInterop.SetSceneDrawPriority(_scenePriorityValues);
+        _scenePriority = priority;
+        _scenePrioritySet = true;
+    }
+
+    bool CaptureSceneMesh(string cacheKey, float[] uniform, string? skinKey)
+    {
+        if (!_sceneCollecting) return false;
+        PrepareSceneDraw();
+        _sceneMeshKey[0] = cacheKey;
+        try
+        {
+            // 同步进入 JS 固定纹理、材质和骨骼绑定，不能等控件更新后再 Flush。
+            WebGPUInterop.DrawMesh3DBatch(_sceneMeshKey,
+                MemoryMarshal.AsBytes(uniform.AsSpan()), 1, skinKey);
+        }
+        finally { _sceneMeshKey[0] = null!; }
+        return true;
+    }
+
     public void BeginFrame(float r = 1f, float g = 1f, float b = 1f, float a = 1f)
     {
         if (!_initialized) return;
+        if (_sceneCollectionLive) ReleaseSceneCollection();
         _frameIndex++;
         WebGPUInterop.BeginFrame(r, g, b, a);
     }
@@ -619,9 +713,9 @@ internal partial class Graphics : IGraphics
         // sampling source, never as a standalone pass target or present source).
         int formatKind;
         if (desc.ColorFormat == Season.Rendering.RtFormat.BackbufferCompatible && desc.DepthFormat == Season.Rendering.RtFormat.None)
-            formatKind = 0;
+            formatKind = desc.NoImplicitDepth ? 6 : 0;
         else if (desc.ColorFormat == Season.Rendering.RtFormat.Rgba16Float && desc.DepthFormat == Season.Rendering.RtFormat.None)
-            formatKind = 1;
+            formatKind = desc.NoImplicitDepth ? 5 : 1;
         else if (desc.ColorFormat == Season.Rendering.RtFormat.None && desc.DepthFormat == Season.Rendering.RtFormat.D32Float)
             formatKind = desc.MatchBackbufferSize ? 3 : 2;
         else if (desc.ColorFormat == Season.Rendering.RtFormat.Rg16Float && desc.DepthFormat == Season.Rendering.RtFormat.None)
@@ -633,9 +727,34 @@ internal partial class Graphics : IGraphics
         if (!desc.MatchBackbufferSize && (desc.Width == 0 || desc.Height == 0))
             throw new ArgumentException("[CreateRenderTarget] 固定尺寸 RT 需指定非零 Width/Height。");
 
-        var rt = new WGPURenderTarget(desc);
-        WebGPUInterop.CreateRenderTarget(rt.Name, (int)desc.Width, (int)desc.Height, desc.MatchBackbufferSize, formatKind);
+        var rt = new WGPURenderTarget(desc, UnregisterRenderTarget);
+        var resolved = WebGPUInterop.CreateRenderTarget(rt.Name, (int)desc.Width, (int)desc.Height, desc.MatchBackbufferSize, formatKind);
+        // JS resolves matchBackbuffer sizes from the canvas at creation time; publish them into Desc, the only size the
+        // shared layer can read back (fog grid, resize bookkeeping), same contract as DX/VK/Metal.
+        if (desc.MatchBackbufferSize && resolved.Length == 2 && resolved[0] > 0 && resolved[1] > 0)
+        {
+            rt.Desc.Width = (uint)resolved[0];
+            rt.Desc.Height = (uint)resolved[1];
+        }
+        _renderTargets.Add(rt);
         return rt;
+    }
+
+    void UnregisterRenderTarget(WGPURenderTarget target) => _renderTargets.Remove(target);
+
+    public void SynchronizeRenderTargetSizes()
+    {
+        if (!_initialized) return;
+        var size = WebGPUInterop.SynchronizeRenderTargetSizes();
+        if (size.Length != 2 || size[0] <= 0 || size[1] <= 0)
+            throw new InvalidOperationException("Web 渲染目标同步未返回有效画布尺寸。");
+        // JS 成功重建后才发布尺寸；效果 OnResize 从同一帧的实际资源描述分配纹理。
+        foreach (var target in _renderTargets)
+        {
+            if (!target.Desc.MatchBackbufferSize) continue;
+            target.Desc.Width = (uint)size[0];
+            target.Desc.Height = (uint)size[1];
+        }
     }
 
     /// <summary>2-3 Contract Clause 12: resolve the TAA output from FrameSchedule.SceneColorOverride into
@@ -688,7 +807,7 @@ internal partial class Graphics : IGraphics
             RenderQuality.Current.BloomIntensity,
             resolve: (int)Season.Rendering.PostResolve.Copy,
             sharpness: 0f,
-            Season.Rendering.FrameSchedule.AoTexture,
+            Season.Rendering.FrameSchedule.PostAoTexture,
             RenderQuality.Current.AoIntensity,
             ResolveSceneOverrideName(),
             _outline2DFrameActive ? _outlineMaskTarget?.Name : null,
@@ -709,7 +828,7 @@ internal partial class Graphics : IGraphics
             RenderQuality.Current.HdrExposure,
             Season.Rendering.FrameSchedule.BloomTexture,
             RenderQuality.Current.BloomIntensity,
-            Season.Rendering.FrameSchedule.AoTexture,
+            Season.Rendering.FrameSchedule.PostAoTexture,
             RenderQuality.Current.AoIntensity,
             ResolveSceneOverrideName());
     }
@@ -806,11 +925,21 @@ internal partial class Graphics : IGraphics
     /// registration-time fallback semantics as the other three backends.</summary>
     public void CreateComputeTexture3D(string name, uint width, uint height, uint depth,
         Season.Rendering.ComputeStorageFormat format = Season.Rendering.ComputeStorageFormat.Rgba8Unorm)
+        => TryCreateComputeTexture3D(name, width, height, depth, format);
+
+    public bool TryCreateComputeTexture3D(string name, uint width, uint height, uint depth,
+        Season.Rendering.ComputeStorageFormat format = Season.Rendering.ComputeStorageFormat.Rgba8Unorm)
     {
-        if (!_initialized) return;
-        if (!WebGPUInterop.CreateComputeTexture3D(name, (int)width, (int)height, (int)depth, (int)format))
-            DeviceServices.BaseApp.AddLog(LogType.Backend,
-                $"{DateTime.UtcNow} [CreateComputeTexture3D] '{name}' {width}×{height}×{depth} 创建失败");
+        if (!_initialized) return false;
+        bool ready = WebGPUInterop.CreateComputeTexture3D(name, (int)width, (int)height, (int)depth, (int)format);
+        if (!ready) DeviceServices.BaseApp.AddLog(LogType.Backend,
+            $"{DateTime.UtcNow} [CreateComputeTexture3D] '{name}' {width}×{height}×{depth} 创建失败");
+        return ready;
+    }
+
+    public void ReleaseComputeTexture3D(string name)
+    {
+        if (_initialized) WebGPUInterop.ReleaseComputeTexture3D(name);
     }
 
     /// <summary>1-8: constant-block upload (restricted to the frame-loop thread and outside render passes;
@@ -821,15 +950,18 @@ internal partial class Graphics : IGraphics
     /// same staging buffer. The scratch buffer only grows when capacity is insufficient, so allocations are
     /// amortized to zero.</summary>
     public void UpdateStorageBuffer(Season.Rendering.StorageBuffer buffer, ReadOnlySpan<byte> data)
+        => TryUpdateStorageBuffer(buffer, data);
+
+    public bool TryUpdateStorageBuffer(Season.Rendering.StorageBuffer buffer, ReadOnlySpan<byte> data)
     {
-        if (!_initialized || data.Length == 0) return;
+        if (!_initialized || data.Length == 0 || data.Length > buffer.SizeInBytes || (data.Length & 3) != 0) return false;
         // JSImport MemoryView does not accept ReadOnlySpan, so route through a growable scratch buffer
         // (same pattern as DispatchCompute params, except constant blocks can exceed 128B and therefore grow
         // on demand). JS copies the data during the synchronous call and does not retain it afterward.
         if (_storageUploadScratch.Length < data.Length)
             _storageUploadScratch = new byte[Math.Max(data.Length, _storageUploadScratch.Length * 2)];
         data.CopyTo(_storageUploadScratch);
-        WebGPUInterop.UpdateStorageBuffer(
+        return WebGPUInterop.UpdateStorageBuffer(
             ((WGPUStorageBuffer)buffer).Id, _storageUploadScratch.AsSpan(0, data.Length));
     }
 
@@ -840,12 +972,14 @@ internal partial class Graphics : IGraphics
     // so nothing is retained across calls. The frame loop is single-threaded, so there is no contention.
     static readonly byte[] _computeParamsScratch = new byte[128];
 
-    public void DispatchCompute(in Season.Rendering.ComputeDispatchArgs args)
+    public void DispatchCompute(in Season.Rendering.ComputeDispatchArgs args) => TryDispatchCompute(args);
+
+    public bool TryDispatchCompute(in Season.Rendering.ComputeDispatchArgs args)
     {
-        if (!_initialized) return;
+        if (!_initialized) return false;
         var kernel = (WGPUComputeKernel)args.Kernel;
         args.Params.CopyTo(_computeParamsScratch);
-        WebGPUInterop.DispatchCompute(
+        return WebGPUInterop.DispatchCompute(
             kernel.JsName,
             _computeParamsScratch.AsSpan(0, args.Params.Length),
             kernel.ResolveResourcesJson(args.Resources),
@@ -1153,6 +1287,7 @@ internal partial class Graphics : IGraphics
         FlushDrawMesh3DBatch();
         FlushDrawSkinnedMeshBatch();
 
+        PrepareSceneDraw();
         WebGPUInterop.DrawSprite2D(
             wgpuSprite.WGPUTexture.Name,
             ndcX, ndcY, ndcW, ndcH,
@@ -1600,6 +1735,7 @@ internal partial class Graphics : IGraphics
         // reads uLights.params0.y from binding(10), so the old per-draw exposure bypass has been removed to
         // match the other three backends).
         var textColor = texts.Color.AsVector4;
+        PrepareSceneDraw();
         WebGPUInterop.DrawTextInstanced(
             state.Key,
             Math.Clamp(texts.Alpha, 0f, 1f),
@@ -2234,8 +2370,9 @@ internal partial class Graphics : IGraphics
         FlushDrawMesh3DBatch();
         FlushDrawSkinnedMeshBatch();
 
+        PrepareSceneDraw();
         _jsRuntime.InvokeVoid("seasonWebGPU.drawSprite3D",
-            sprite.Name,
+            wgpuSprite3D.TextureName,
             uniformData,
             sprite.Mode == Season.Controls.BillboardMode.None ? 0 : 1);
     }
@@ -3227,6 +3364,7 @@ internal partial class Graphics : IGraphics
         CopyMatrixTransposed(Matrix4x4.Identity, matrixData, 0);
         CopyMatrixTransposed(wgpuMesh.View, matrixData, 16);
         CopyMatrixTransposed(wgpuMesh.Projection, matrixData, 32);
+        PrepareSceneDraw();
 
         foreach (var surface in mesh.Surfaces)
         {
@@ -3249,7 +3387,8 @@ internal partial class Graphics : IGraphics
             // (16 floats) is uploaded, which does not match the prev stream's per-instance 5×vec4 stride, so
             // prev is not fed there and behavior falls back to Step A (camera-motion velocity only).
             bool blendSurface = surface.Mode == SurfaceBlendMode.Blend;
-            byte[]? prevInstanceBytes = (!blendSurface
+            // 分段收集保留完整流，Blend 也可携带前帧数据；旧单 Scene 路由保留原历史降级。
+            byte[]? prevInstanceBytes = ((!blendSurface || _sceneCollecting)
                 && wgpuMesh.PrevInstanceBytes.Length > 0
                 && wgpuMesh.PrevInstanceBytes.Length == wgpuMesh.InstanceBytes.Length)
                 ? wgpuMesh.PrevInstanceBytes
@@ -3264,15 +3403,15 @@ internal partial class Graphics : IGraphics
             // frame's world, yielding camera-motion velocity only.
             WritePrevMatrices(uniformData);
 
-            if (blendSurface)
+            if (blendSurface && !_sceneCollecting)
             {
                 var orderedInstances = Enumerable.Range(0, wgpuMesh.EnabledInstanceCount)
                     .OrderByDescending(index => ComputeTransparentDepth(wgpuMesh.InstanceWorlds[index], cache.LocalBoundsCenter));
 
                 foreach (var instanceIndex in orderedInstances)
                 {
-                    var singleMatrixBytes = ToByteArray(new[] { wgpuMesh.InstanceWorlds[instanceIndex] });
-                    _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3D", cache.CacheKey, uniformData, singleMatrixBytes, 1);
+                    _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3D", cache.CacheKey, uniformData,
+                        wgpuMesh.InstanceBytes, 1, null, prevInstanceBytes, instanceIndex);
                 }
             }
             else
@@ -3392,6 +3531,7 @@ internal partial class Graphics : IGraphics
         CopyMatrixTransposed(wgpuModel.View, matrixData, 16);
         CopyMatrixTransposed(wgpuModel.Projection, matrixData, 32);
 
+        PrepareSceneDraw();
         var opaquePrimitives = new List<WGPUPrimitiveData>();
         var transparentPrimitives = new List<WGPUPrimitiveData>();
 
@@ -3407,7 +3547,8 @@ internal partial class Graphics : IGraphics
             // Ensure GPU upload.
             EnsureModelPrimitiveUploaded(prim);
 
-            if (prim.IsTransparent)
+            // 收集时按原图元顺序交给 JS 分类，避免提前分桶破坏等深度稳定顺序。
+            if (prim.IsTransparent && !_sceneCollecting)
                 transparentPrimitives.Add(prim);
             else
                 opaquePrimitives.Add(prim);
@@ -3449,7 +3590,7 @@ internal partial class Graphics : IGraphics
         // 2. Transparent: draw one instance at a time after depth sorting.
         foreach (var prim in transparentPrimitives)
         {
-            if (!wgpuModel.TryGetPrimitiveInstanceData(prim, out var instanceWorlds, out _) || instanceWorlds.Length == 0)
+            if (!wgpuModel.TryGetPrimitiveInstanceData(prim, out var instanceWorlds, out var instanceBytes) || instanceWorlds.Length == 0)
                 continue;
 
             var uniformData = BuildModelPrimitiveUniform(matrixData, prim, modelAlpha, isSkinned);
@@ -3462,8 +3603,8 @@ internal partial class Graphics : IGraphics
 
             foreach (var instanceIndex in orderedInstances)
             {
-                var singleMatrixBytes = ToByteArray(new[] { instanceWorlds[instanceIndex] });
-                _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3D", prim.CacheKey, uniformData, singleMatrixBytes, 1, wgpuModel.SkinKey);
+                _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3D", prim.CacheKey, uniformData,
+                    instanceBytes, 1, wgpuModel.SkinKey, null, instanceIndex);
             }
         }
 
@@ -4155,6 +4296,8 @@ internal partial class Graphics : IGraphics
         WebGPUInterop.SetCloudNoise(Season.Rendering.FrameSchedule.CloudNoiseTexture);
         WebGPUInterop.SetAerialLut(Season.Rendering.FrameSchedule.AerialLutTexture);
 
+        FrameSchedule.CaptureLighting(sceneLights, Camera3D.View, Camera3D.Projection,
+            camera3D.ViewProjection);
         Light3D = sceneLights;
         WebGPUInterop.UpdateSceneLights(MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref sceneLights, 1)));
 
@@ -4457,6 +4600,7 @@ internal partial class Graphics : IGraphics
         FlushDrawMesh3DBatch();
         FlushDrawSkinnedMeshBatch();
 
+        PrepareSceneDraw();
         _jsRuntime.InvokeVoid("seasonWebGPU.drawSprite2D",
             wgpuSprite.WGPUTexture.Name,
             ndcX, ndcY, ndcW, ndcH,

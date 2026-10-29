@@ -64,10 +64,13 @@ internal unsafe partial class Graphics
             BaseApp.ResizeSemaphore.Wait();
             try
             {
+                // _lifetime is not part of the render-thread lock order: only LoadImage, Release and Dispose take it,
+                // and no frame path ever does, so waiting for the GPU gate inside it cannot close a cycle.
                 lock (_lifetime)
                 {
                     ObjectDisposedException.ThrowIf(_disposed, this);
                     VkTexture texture;
+                    bool created = false;
                     lock (owner.DictionaryVKTexture)
                     {
                         if (owner.DictionaryVKTexture.TryGetValue(name, out var existing))
@@ -81,15 +84,40 @@ internal unsafe partial class Graphics
                                 ?? throw new FileNotFoundException("Cannot load immediate 2D image.", name);
                             texture = VkTexture.CreateFromDecoder(decoder);
                             texture.Name = name;
-                            try { owner.ExecuteUpload(); }
-                            catch
+                            created = true;
+                        }
+                    }
+
+                    // Upload outside the dictionary lock. ExecuteUpload takes the GPU gate, and the render thread
+                    // holds that gate while it resolves textures under this same lock, so uploading inside it is a
+                    // lock-order inversion that deadlocks as soon as a frame is in flight.
+                    if (created)
+                    {
+                        try { owner.ExecuteUpload(); }
+                        catch
+                        {
+                            // Staging allocation can fail before Execute enters its cleanup block. By then Execute may
+                            // already have detached the queue, in which case RemoveTask is a no-op and the texture is
+                            // simply never drawn.
+                            Vulkan.Device.TextureUploadBatch.RemoveTask(texture);
+                            texture.Dispose();
+                            throw;
+                        }
+
+                        lock (owner.DictionaryVKTexture)
+                        {
+                            // Register only after the upload succeeded, matching the original ordering. Another
+                            // thread may have registered the same name meanwhile; keep that one and drop this copy.
+                            if (owner.DictionaryVKTexture.TryGetValue(name, out var raced))
                             {
-                                // Staging allocation can fail before Execute enters its cleanup block.
-                                Vulkan.Device.TextureUploadBatch.GetTasks().Remove(texture);
                                 texture.Dispose();
-                                throw;
+                                texture = raced;
+                                texture.AddRef();
                             }
-                            owner.DictionaryVKTexture.Add(name, texture);
+                            else
+                            {
+                                owner.DictionaryVKTexture.Add(name, texture);
+                            }
                         }
                     }
                     var lease = new ImageLease(this, name, texture);

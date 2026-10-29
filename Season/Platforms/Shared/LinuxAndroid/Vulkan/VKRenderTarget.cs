@@ -128,6 +128,7 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
     /// </summary>
     public void Recreate(uint width, uint height)
     {
+        Device.ReleaseSceneTargetPasses(this, immediate: true);
         ReleaseSizeDependentResources();
         CreateSizeDependentResources(width, height);
         BlitPipeline.UpdateSourceDescriptor(SampleDescriptorSet,
@@ -136,7 +137,7 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
 
     void CreateColorRenderPass()
     {
-        RenderPass = CreateColorRenderPassForFormat(_colorFormat);
+        RenderPass = CreateColorRenderPassForFormat(_colorFormat, Desc.NoImplicitDepth);
     }
 
     /// <summary>
@@ -148,7 +149,7 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
     /// so render-pass compatibility
     /// (same attachment formats/count/sample counts) is guaranteed by the code path.
     /// </summary>
-    internal static RenderPass CreateColorRenderPassForFormat(Format colorFormat)
+    internal static RenderPass CreateColorRenderPassForFormat(Format colorFormat, bool colorOnly = false)
     {
         var colorAttachment = new AttachmentDescription
         {
@@ -227,6 +228,12 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
             PDependencies = dependencies
         };
 
+        // 雾合成全屏覆盖新颜色目标，不读取或写入深度附件。
+        if (colorOnly)
+        {
+            subpass.PDepthStencilAttachment = null;
+            rpInfo.AttachmentCount = 1;
+        }
         if (Device.Vk.CreateRenderPass(Device.LogicalDevice, in rpInfo, null, out var rp) != Result.Success)
             throw new Exception("vkCreateRenderPass (offscreen) failed");
         return rp;
@@ -243,7 +250,8 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
     ///   (same as DualTarget, for DepthTexture consumption);
     /// - the subpass has 2 color attachments (slot 0 = color, slot 1 = velocity).
     /// </summary>
-    internal static RenderPass CreateVelocityRenderPassForFormat(Format colorFormat)
+    internal static RenderPass CreateVelocityRenderPassForFormat(Format colorFormat,
+        bool clearColor = true, bool clearDepth = true, bool storeDepth = true)
     {
         var colorAttachment = new AttachmentDescription
         {
@@ -281,6 +289,9 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
             FinalLayout = ImageLayout.ShaderReadOnlyOptimal
         };
 
+        ConfigureSceneAttachment(ref colorAttachment, clearColor, true);
+        ConfigureSceneAttachment(ref velocityAttachment, clearColor, true);
+        ConfigureSceneAttachment(ref depthAttachment, clearDepth, storeDepth);
         var attachments = stackalloc AttachmentDescription[3]
             { colorAttachment, velocityAttachment, depthAttachment };
 
@@ -321,6 +332,8 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
             }
         };
 
+        // Clear/Load 与 PSO 锚点必须使用相同依赖，同时覆盖后续附件 Load 和 Compute 读取。
+        Display.FillColorDependencies(dependencies);
         var rpInfo = new RenderPassCreateInfo
         {
             SType = StructureType.RenderPassCreateInfo,
@@ -353,7 +366,8 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
     ///   (gtaoMain reads depth, bloom prefilter reads color).
     /// The matching framebuffer is created by Device from SceneColor.ColorView + SceneDepth.DepthView.
     /// </summary>
-    internal static RenderPass CreateDualTargetRenderPassForFormat(Format colorFormat)
+    internal static RenderPass CreateDualTargetRenderPassForFormat(Format colorFormat,
+        bool clearColor = true, bool clearDepth = true, bool storeDepth = true)
     {
         var colorAttachment = new AttachmentDescription
         {
@@ -379,6 +393,8 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
             FinalLayout = ImageLayout.ShaderReadOnlyOptimal
         };
 
+        ConfigureSceneAttachment(ref colorAttachment, clearColor, true);
+        ConfigureSceneAttachment(ref depthAttachment, clearDepth, storeDepth);
         var attachments = stackalloc AttachmentDescription[2] { colorAttachment, depthAttachment };
 
         var colorRef = new AttachmentReference(0, ImageLayout.ColorAttachmentOptimal);
@@ -607,10 +623,24 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
         RenderPass = rp;
     }
 
+    static void ConfigureSceneAttachment(ref AttachmentDescription attachment, bool clear, bool store)
+    {
+        attachment.LoadOp = clear ? AttachmentLoadOp.Clear : AttachmentLoadOp.Load;
+        attachment.StoreOp = store ? AttachmentStoreOp.Store : AttachmentStoreOp.DontCare;
+        // 上一场景阶段或雾合成已经发布为采样布局；Load 不得使用 Undefined。
+        attachment.InitialLayout = clear ? ImageLayout.Undefined : ImageLayout.ShaderReadOnlyOptimal;
+    }
+
     void CreateSizeDependentResources(uint width, uint height)
     {
         Width = width;
         Height = height;
+        // Publish the resolved size into Desc, the only size the shared layer can read back. The descriptor
+        // arrives with Width/Height = 0 for MatchBackbufferSize targets, and the fog pass sizes its froxel grid
+        // from Desc and declines to register at grid 0 (see DX Device.CreateRenderTarget). Recreate funnels
+        // through here as well, so the published size follows every resize.
+        Desc.Width = width;
+        Desc.Height = height;
 
         if (HasColor)
         {
@@ -623,11 +653,14 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
 
             // depth: owned by the offscreen target
             // (Vulkan framebuffer attachment sizes must match, so it cannot share Display depth)
-            (DepthImage, _depthMemory, DepthView) = CreateImage(
-                width, height, Device.DepthBufferFormat,
-                ImageUsageFlags.DepthStencilAttachmentBit,
-                ImageAspectFlags.DepthBit);
-            DepthViewVersion = Device.NextViewVersion();
+            if (!Desc.NoImplicitDepth)
+            {
+                (DepthImage, _depthMemory, DepthView) = CreateImage(
+                    width, height, Device.DepthBufferFormat,
+                    ImageUsageFlags.DepthStencilAttachmentBit,
+                    ImageAspectFlags.DepthBit);
+                DepthViewVersion = Device.NextViewVersion();
+            }
         }
         else
         {
@@ -644,7 +677,7 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
         {
             SType = StructureType.FramebufferCreateInfo,
             RenderPass = RenderPass,
-            AttachmentCount = HasColor ? 2u : 1u,
+            AttachmentCount = HasColor && !Desc.NoImplicitDepth ? 2u : 1u,
             PAttachments = attachments,
             Width = width,
             Height = height,
@@ -725,6 +758,8 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
     /// <c>Graphics.EnqueueDeferredRelease(DirectX.Device.GetCurrentRetireFenceValue(), ...)</c>.</summary>
     public override void Dispose()
     {
+        // 先退休引用这些 view 的组合 framebuffer，再退休纹理本身。
+        Device.ReleaseSceneTargetPasses(this);
         Device.OffscreenTargets.Remove(this);
 
         // Capture handle snapshots, clear fields immediately,

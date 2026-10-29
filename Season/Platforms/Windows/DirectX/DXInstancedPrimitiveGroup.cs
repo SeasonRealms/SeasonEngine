@@ -457,14 +457,14 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
             if (skinnedShell)
                 Pipeline.SetOutlineMaskBoneBase(startInstanceLocation);
             Pipeline.DrawPrimitive(box.Face, lightCB, _matrixBuffers[fi], vb, 1, startInstanceLocation,
-                GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), _prevInstanceWorldSrvHandle, GetPrevMorphSrvHandle());
+                GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer);
 
             Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Back);
             OnBeforeDraw();
             if (skinnedShell)
                 Pipeline.SetOutlineMaskBoneBase(startInstanceLocation);
             Pipeline.DrawPrimitive(box.Face, lightCB, _matrixBuffers[fi], vb, 1, startInstanceLocation,
-                GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), _prevInstanceWorldSrvHandle, GetPrevMorphSrvHandle());
+                GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer);
         }
 
         Pipeline.SetPipeline(PipelineMode.Opaque, PipelineCullVariant.None, depthWrite: true);
@@ -472,7 +472,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
         if (skinnedShell)
             Pipeline.SetOutlineMaskBoneBase(startInstanceLocation);
         Pipeline.DrawPrimitive(box.Edges, lightCB, _matrixBuffers[fi], vb, 1, startInstanceLocation,
-            GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), _prevInstanceWorldSrvHandle, GetPrevMorphSrvHandle());
+            GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer);
     }
 
     /// <summary>Unified highlighting for instancing: draws all instance shell
@@ -563,6 +563,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
         _transparentInstanceOrder.Clear();
         for (int i = 0; i < _instanceCount; i++)
             _transparentInstanceOrder.Add(i);
+        if (DXSceneDrawCollection.Active != null) return;
 
         _transparentInstanceOrder.Sort((a, b) =>
         {
@@ -595,7 +596,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
         fixed (VertexBufferView* instanceVB = &_instanceBufferView)
         {
             Pipeline.DrawPrimitive(primitiveData, lightConstantBuffer, _matrixBuffers[fi], instanceVB, instanceCount, startInstanceLocation,
-                GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle());
+                GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), _instanceBuffer);
         }
     }
 
@@ -665,7 +666,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
                 if (_outline2DHostActive)
                 {
                     Pipeline.DrawPrimitive(p, lightCB, _matrixBuffers[fi], instanceVB, (uint)_instanceCount, 0,
-                        GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle());
+                        GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), _instanceBuffer);
                 }
                 else
                 {
@@ -675,7 +676,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
                         if ((uint)idx >= (uint)_instanceCount)
                             continue;
                         Pipeline.DrawPrimitive(p, lightCB, _matrixBuffers[fi], instanceVB, 1, (uint)idx,
-                            GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle());
+                            GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), _instanceBuffer);
                     }
                 }
             }
@@ -692,11 +693,12 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
 
     /// <summary>2-3 Step C (tier B): derived classes may override this to return
     /// the previous per-instance bone SB SRV handle.</summary>
-    protected virtual GpuDescriptorHandle GetPrevBoneSrvHandle() => default;
+    protected override GpuDescriptorHandle GetPrevBoneSrvHandle() => default;
 
     /// <summary>2-3 Step C (tier C-a): returns the prev instance-world SB SRV
     /// handle maintained by the base class.</summary>
-    protected GpuDescriptorHandle GetPrevInstanceWorldSrvHandle() => _prevInstanceWorldSrvHandle;
+    protected GpuDescriptorHandle GetPrevInstanceWorldSrvHandle()
+        => DXSceneDrawCollection.Structured(_prevInstanceWorldBuffer, 64, _prevInstanceWorldSrvHandle);
 
     /// <summary>2-3 Step C (tier C-a): when a derived class such as
     /// DXInstancedModel manages its own instance-world array, it can explicitly

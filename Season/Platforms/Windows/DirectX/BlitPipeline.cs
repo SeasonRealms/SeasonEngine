@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 // https://github.com/SeasonRealms/SeasonEngine
 
+using Season.Rendering;
+using Season.Rendering.Effects;
 using Silk.NET.Core.Native;
 using Silk.NET.Direct3D12;
 using Silk.NET.DXGI;
@@ -819,5 +821,345 @@ float4 PSMainOutlineComposite(PSInput input) : SV_TARGET
         cmdList->SetGraphicsRoot32BitConstant(1, BitConverter.SingleToUInt32Bits(texelSizeY), 3);
         cmdList->SetGraphicsRoot32BitConstant(1, BitConverter.SingleToUInt32Bits(widthPixels), 5);
         cmdList->DrawInstanced(3, 1, 0, 0);
+    }
+}
+
+/// <summary>独立 RGBA16F 雾合成；每次准备均保留独立描述符与原生资源引用。</summary>
+internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
+{
+    const uint FrameBytes = VolumetricFogEffect.FrameVectorCount * 16;
+    readonly Dictionary<string, DXTexture> _textures;
+    readonly List<BindingSlot>[] _slots = new List<BindingSlot>[(int)Device.frameCount];
+    readonly int[] _cursors = new int[(int)Device.frameCount];
+    readonly ulong[] _stamps = new ulong[(int)Device.frameCount];
+    ID3D12RootSignature* _signature;
+    ID3D12PipelineState* _pipeline;
+    ID3D12GraphicsCommandList* _command;
+    FogCompositeInputs _inputs;
+    DXRenderTarget? _destination;
+    BindingSlot? _prepared;
+    static DXFogCompositePipeline? _transparentOwner;
+    BindingSlot? _transparentSlot;
+    FogCompositeInputs _transparentInputs;
+    DXRenderTarget? _transparentDestination;
+    ulong _stamp;
+    uint _frameIndex;
+    bool _disposed;
+
+    // 引用保活使 Resize 前后的原生地址不会被复用；描述符不可从共享可见堆原地借用。
+    sealed class BindingSlot
+    {
+        internal readonly int[] Ids = [-1, -1, -1, -1, -1, -1];
+        internal readonly nint[] Resources = new nint[7];
+        internal readonly ShaderResourceViewDesc[] Views = new ShaderResourceViewDesc[6];
+
+        internal BindingSlot()
+        {
+            try { for (int i = 0; i < Ids.Length; i++) Ids[i] = Device.DescriptorAllocator.Allocate(); }
+            catch { Dispose(); throw; }
+        }
+
+        internal void ReleaseResources()
+        {
+            for (int i = 0; i < Views.Length; i++)
+            {
+                if (Resources[i] == 0) continue;
+                var view = Views[i];
+                Device.D3dDevice->CreateShaderResourceView(null, &view, Device.SrvHeapManager.GetCpuHandle(Ids[i]));
+            }
+            for (int i = 0; i < Resources.Length; i++)
+            {
+                if (Resources[i] != 0) ((ID3D12Resource*)Resources[i])->Release();
+                Resources[i] = 0;
+            }
+        }
+
+        internal void Capture(ReadOnlySpan<nint> resources, ReadOnlySpan<ShaderResourceViewDesc> views)
+        {
+            ReleaseResources();
+            resources.CopyTo(Resources); views.CopyTo(Views);
+            foreach (nint resource in Resources) ((ID3D12Resource*)resource)->AddRef();
+            for (int i = 0; i < Views.Length; i++)
+            {
+                var view = Views[i];
+                Device.D3dDevice->CreateShaderResourceView((ID3D12Resource*)Resources[i], &view,
+                    Device.SrvHeapManager.GetCpuHandle(Ids[i]));
+            }
+        }
+
+        internal void Dispose()
+        {
+            ReleaseResources();
+            for (int i = 0; i < Ids.Length; i++)
+            {
+                if (Ids[i] >= 0) Device.DescriptorAllocator.Free(Ids[i]);
+                Ids[i] = -1;
+            }
+        }
+    }
+
+    internal DXFogCompositePipeline(Dictionary<string, DXTexture> textures)
+    {
+        _textures = textures;
+        for (int i = 0; i < _slots.Length; i++) _slots[i] = new();
+        try { Initialize(); }
+        catch { Dispose(); throw; }
+    }
+
+    void Initialize()
+    {
+        var ranges = stackalloc DescriptorRange[6];
+        var parameters = stackalloc RootParameter[7];
+        for (int i = 0; i < 6; i++)
+        {
+            ranges[i] = new() { RangeType = DescriptorRangeType.Srv, NumDescriptors = 1, BaseShaderRegister = (uint)i };
+            parameters[i] = new() { ParameterType = RootParameterType.TypeDescriptorTable,
+                DescriptorTable = new() { NumDescriptorRanges = 1, PDescriptorRanges = ranges + i },
+                ShaderVisibility = ShaderVisibility.Pixel };
+        }
+        parameters[6] = new() { ParameterType = RootParameterType.Type32BitConstants,
+            Constants = new() { ShaderRegister = 0, Num32BitValues = 4 }, ShaderVisibility = ShaderVisibility.Pixel };
+        var sampler = new StaticSamplerDesc { Filter = Filter.MinMagMipLinear,
+            AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp,
+            MaxLOD = float.MaxValue, ComparisonFunc = ComparisonFunc.Always, ShaderVisibility = ShaderVisibility.Pixel };
+        var root = new RootSignatureDesc { NumParameters = 7, PParameters = parameters,
+            NumStaticSamplers = 1, PStaticSamplers = &sampler };
+        using ComPtr<ID3D10Blob> blob = null;
+        using ComPtr<ID3D10Blob> error = null;
+        Device.CheckResult(Device.D3D12.SerializeRootSignature(&root, D3DRootSignatureVersion.Version1,
+            blob.GetAddressOf(), error.GetAddressOf()));
+        ID3D12RootSignature* signature = null;
+        var iid = ID3D12RootSignature.Guid;
+        Device.CheckResult(Device.D3dDevice->CreateRootSignature(0, blob.Get().GetBufferPointer(),
+            blob.Get().GetBufferSize(), &iid, (void**)&signature));
+        _signature = signature;
+        ID3D10Blob* vertex = null; ID3D10Blob* fragment = null;
+        try
+        {
+            vertex = ShaderCompiler.CompileShaderFromSource(VolumetricFogEffect.CompositeVertexHlsl, "VSMain", "vs_5_0");
+            fragment = ShaderCompiler.CompileShaderFromSource(VolumetricFogEffect.CompositeHlsl, "PSMain", "ps_5_0");
+            var stencil = new DepthStencilopDesc { StencilFailOp = StencilOp.Keep, StencilDepthFailOp = StencilOp.Keep,
+                StencilPassOp = StencilOp.Keep, StencilFunc = ComparisonFunc.Always };
+            var desc = new GraphicsPipelineStateDesc {
+                PRootSignature = _signature,
+                VS = new(vertex->GetBufferPointer(), vertex->GetBufferSize()),
+                PS = new(fragment->GetBufferPointer(), fragment->GetBufferSize()),
+                RasterizerState = new() { FillMode = FillMode.Solid, CullMode = CullMode.None, DepthClipEnable = 1 },
+                DepthStencilState = new() { DepthFunc = ComparisonFunc.Always, FrontFace = stencil, BackFace = stencil },
+                SampleMask = uint.MaxValue, PrimitiveTopologyType = PrimitiveTopologyType.Triangle,
+                NumRenderTargets = 1, SampleDesc = new(1, 0) };
+            desc.BlendState.RenderTarget[0] = new() { SrcBlend = Blend.One, DestBlend = Blend.Zero, BlendOp = BlendOp.Add,
+                SrcBlendAlpha = Blend.One, DestBlendAlpha = Blend.Zero, BlendOpAlpha = BlendOp.Add,
+                LogicOp = LogicOp.Noop, RenderTargetWriteMask = (byte)ColorWriteEnable.All };
+            desc.RTVFormats[0] = Format.FormatR16G16B16A16Float;
+            ID3D12PipelineState* pipeline = null;
+            iid = ID3D12PipelineState.Guid;
+            Device.CheckResult(Device.D3dDevice->CreateGraphicsPipelineState(&desc, &iid, (void**)&pipeline));
+            _pipeline = pipeline;
+        }
+        finally
+        {
+            if (vertex != null) vertex->Release();
+            if (fragment != null) fragment->Release();
+        }
+    }
+
+    static ShaderResourceViewDesc TextureView(Format format, bool volume = false) => new() {
+        Format = format, Shader4ComponentMapping = 0x1688,
+        ViewDimension = volume ? SrvDimension.Texture3D : SrvDimension.Texture2D,
+        Texture2D = new() { MipLevels = 1 } };
+
+    // Resolve 不改变 GPU 状态，Draw 也可用它核对资源身份；转换仅在 Pass 外执行。
+    bool Resolve(in FogCompositeInputs input, DXRenderTarget destination, Span<nint> resources,
+        Span<ShaderResourceViewDesc> views, bool transition)
+    {
+        if (input.Color is not DXRenderTarget color || input.Depth is not DXRenderTarget depth
+            || input.FrameBuffer is not DXStorageBuffer frame || frame.Resource == null || frame.SizeInBytes < FrameBytes
+            || color.Desc.ColorFormat != RtFormat.Rgba16Float || destination.Desc.ColorFormat != RtFormat.Rgba16Float
+            || destination.Desc.DepthFormat != RtFormat.None || destination.HasDepth
+            || depth.Color != null || depth.Desc.DepthFormat != RtFormat.D32Float
+            || color.Desc.SampleCount != 1 || depth.Desc.SampleCount != 1 || destination.Desc.SampleCount != 1
+            || color.Color == null || depth.Depth == null || destination.Color == null
+            || destination.RtvIndex == DXRenderTarget.NoRtv || destination.Color == color.Color
+            || color.Width == 0 || color.Height == 0 || color.Width != depth.Width || color.Height != depth.Height
+            || color.Width != destination.Width || color.Height != destination.Height
+            || color.ColorNativeFormat != Format.FormatR16G16B16A16Float
+            || destination.ColorNativeFormat != Format.FormatR16G16B16A16Float
+            || !float.IsFinite(input.AoIntensity) || input.AoIntensity < 0) return false;
+        var integrated = DXTexture3D.Find(input.IntegratedVolume); var local = DXTexture3D.Find(input.LocalVolume);
+        if (integrated == null || local == null || !integrated.Ready || !local.Ready
+            || integrated.NativeResource == null || local.NativeResource == null || local.Depth == 0
+            || local.Width == 0 || local.Height == 0 || integrated.Width != local.Width || integrated.Height != local.Height
+            || integrated.Depth != local.Depth + 1 || integrated.NativeFormat != Format.FormatR16G16B16A16Float
+            || local.NativeFormat != Format.FormatR16G16B16A16Float) return false;
+        DXRenderTarget? aoTarget = null; DXTexture? aoTexture = null;
+        ID3D12Resource* aoResource = color.Color;
+        Format aoFormat = color.ColorNativeFormat;
+        if (input.ApplyAo)
+        {
+            if (input.Ao.Target is DXRenderTarget target)
+            {
+                if (target.Color == null || target.Desc.SampleCount != 1 || target.Width == 0 || target.Height == 0) return false;
+                aoTarget = target; aoResource = target.Color; aoFormat = target.ColorNativeFormat;
+            }
+            else
+            {
+                if (input.Ao.TextureName != null)
+                    lock (_textures) _textures.TryGetValue(input.Ao.TextureName, out aoTexture);
+                if (aoTexture == null || !System.Threading.Volatile.Read(ref aoTexture.Ready)
+                    || aoTexture._textureResource == null || aoTexture.Width == 0 || aoTexture.Height == 0) return false;
+                aoResource = aoTexture._textureResource;
+                aoFormat = aoResource->GetDesc().Format;
+            }
+            if (aoResource == destination.Color || aoFormat is not (Format.FormatR8Unorm or Format.FormatR16Float
+                or Format.FormatR16G16Float or Format.FormatR16G16B16A16Float or Format.FormatR8G8B8A8Unorm)) return false;
+        }
+        resources[0] = (nint)frame.Resource; resources[1] = (nint)integrated.NativeResource;
+        resources[2] = (nint)local.NativeResource; resources[3] = (nint)color.Color;
+        resources[4] = (nint)depth.Depth; resources[5] = (nint)aoResource; resources[6] = (nint)destination.Color;
+        views[0] = new() { Format = Format.FormatR32Typeless, Shader4ComponentMapping = 0x1688,
+            ViewDimension = SrvDimension.Buffer, Buffer = new() { NumElements = FrameBytes / 4, Flags = BufferSrvFlags.Raw } };
+        views[1] = TextureView(integrated.NativeFormat, true); views[2] = TextureView(local.NativeFormat, true);
+        views[3] = TextureView(color.ColorNativeFormat); views[4] = TextureView(Format.FormatR32Float);
+        views[5] = TextureView(aoFormat);
+        if (transition)
+        {
+            var command = Device.GraphicsCommandList;
+            frame.TransitionTo(command, ResourceStates.AllShaderResource);
+            integrated.TransitionTo(command, ResourceStates.AllShaderResource);
+            local.TransitionTo(command, ResourceStates.AllShaderResource);
+            color.TransitionTo(command, ResourceStates.AllShaderResource);
+            depth.TransitionDepthTo(command, ResourceStates.AllShaderResource);
+            aoTarget?.TransitionTo(command, ResourceStates.AllShaderResource);
+            if (aoTexture != null)
+            {
+                aoTexture.EnsureReadyForRendering(command);
+                aoTexture.TransitionTo(command, ResourceStates.AllShaderResource);
+            }
+        }
+        else
+        {
+            const ResourceStates read = ResourceStates.PixelShaderResource;
+            if ((frame.CurrentState & read) == 0 || (integrated.CurrentState & read) == 0 || (local.CurrentState & read) == 0
+                || (color.CurrentState & read) == 0 || (depth.DepthCurrentState & read) == 0
+                || (aoTarget != null && (aoTarget.CurrentState & read) == 0)
+                || (aoTexture != null && (aoTexture.CurrentState & read) == 0)
+                || destination.CurrentState != ResourceStates.RenderTarget) return false;
+        }
+        return true;
+    }
+
+    public override bool Prepare(in FogCompositeInputs inputs, RenderTarget destination)
+    {
+        ResetTransparent();
+        _destination = null; _prepared = null; _inputs = default;
+        if (_disposed || Device.ActiveTarget != null || Device.FrameContexts == null
+            || Device.FrameIndex >= _slots.Length || Device.GraphicsCommandList == null
+            || destination is not DXRenderTarget target) return false;
+        int index = (int)Device.FrameIndex;
+        ulong stamp = Device.GetCurrentRetireFenceValue();
+        if (_stamps[index] != stamp)
+        {
+            if (_stamps[index] > Device.GetCompletedFenceValue()) return false;
+            _stamps[index] = stamp; _cursors[index] = 0;
+        }
+        Span<nint> resources = stackalloc nint[7];
+        Span<ShaderResourceViewDesc> views = stackalloc ShaderResourceViewDesc[6];
+        if (!Resolve(inputs, target, resources, views, true)) return false;
+        var ring = _slots[index];
+        if (_cursors[index] == ring.Count) ring.Add(new BindingSlot());
+        var slot = ring[_cursors[index]++];
+        slot.Capture(resources, views);
+        _inputs = inputs; _destination = target; _prepared = slot;
+        _command = Device.GraphicsCommandList; _stamp = stamp; _frameIndex = Device.FrameIndex;
+        return true;
+    }
+
+    public override FogCompositeResult Draw()
+    {
+        var destination = _destination; var inputs = _inputs; var slot = _prepared;
+        _destination = null; _inputs = default; _prepared = null;
+        if (_disposed || destination == null || slot == null || Device.ActivePassId != RenderPassId.FogComposite
+            || !ReferenceEquals(Device.ActiveTarget, destination) || Device.GraphicsCommandList != _command
+            || Device.FrameIndex != _frameIndex || Device.GetCurrentRetireFenceValue() != _stamp) return default;
+        Span<nint> resources = stackalloc nint[7];
+        Span<ShaderResourceViewDesc> views = stackalloc ShaderResourceViewDesc[6];
+        if (!Resolve(inputs, destination, resources, views, false) || !resources.SequenceEqual(slot.Resources)) return default;
+        for (int i = 0; i < views.Length; i++) if (views[i].Format != slot.Views[i].Format) return default;
+        var heap = Device.SrvHeapManager.Heap;
+        _command->SetDescriptorHeaps(1, &heap);
+        _command->SetGraphicsRootSignature(_signature);
+        _command->SetPipelineState(_pipeline);
+        _command->IASetPrimitiveTopology(D3DPrimitiveTopology.D3DPrimitiveTopologyTrianglelist);
+        for (uint i = 0; i < 6; i++)
+            _command->SetGraphicsRootDescriptorTable(i, Device.SrvHeapManager.GetGpuHandle(slot.Ids[i]));
+        var parameters = new Vector4(inputs.AoIntensity, inputs.ApplyAo ? 1 : 0, 0, 0);
+        _command->SetGraphicsRoot32BitConstants(6, 4, &parameters, 0);
+        _command->DrawInstanced(3, 1, 0, 0);
+        _transparentOwner = this;
+        _transparentSlot = slot;
+        _transparentInputs = inputs;
+        _transparentDestination = destination;
+        return new(true, inputs.ApplyAo);
+    }
+
+    internal static void ResetTransparent()
+    {
+        if (_transparentOwner is { } owner)
+        {
+            owner._transparentSlot = null;
+            owner._transparentInputs = default;
+            owner._transparentDestination = null;
+        }
+        _transparentOwner = null;
+    }
+
+    // 仅消费成功合成的同帧快照；绑定不转换深度状态，也不改写共享光照参数。
+    internal static bool BindTransparent()
+    {
+        var owner = _transparentOwner;
+        if (owner == null || owner._disposed || owner._transparentSlot is not { } slot
+            || Device.ActivePassId != RenderPassId.SceneTransparent
+            || Device.GraphicsCommandList != owner._command || Device.FrameIndex != owner._frameIndex
+            || Device.GetCurrentRetireFenceValue() != owner._stamp
+            || !ReferenceEquals(Device.ActiveTarget, owner._transparentDestination)
+            || !ReferenceEquals(Device.ActiveDepthTarget, owner._transparentInputs.Depth)) return false;
+        var input = owner._transparentInputs;
+        var destination = owner._transparentDestination;
+        var integrated = DXTexture3D.Find(input.IntegratedVolume);
+        var local = DXTexture3D.Find(input.LocalVolume);
+        const ResourceStates read = ResourceStates.PixelShaderResource;
+        if (destination == null || destination.Color == null || (nint)destination.Color != slot.Resources[6]
+            || destination.CurrentState != ResourceStates.RenderTarget
+            || input.Depth is not DXRenderTarget depth || depth.Depth == null || (nint)depth.Depth != slot.Resources[4]
+            || depth.DepthCurrentState != ResourceStates.DepthWrite
+            || destination.Width != depth.Width || destination.Height != depth.Height
+            || input.FrameBuffer is not DXStorageBuffer frame || frame.Resource == null
+            || (nint)frame.Resource != slot.Resources[0] || (frame.CurrentState & read) == 0
+            || integrated == null || local == null || !integrated.Ready || !local.Ready
+            || (nint)integrated.NativeResource != slot.Resources[1] || (nint)local.NativeResource != slot.Resources[2]
+            || (integrated.CurrentState & read) == 0 || (local.CurrentState & read) == 0) return false;
+        var command = Device.GraphicsCommandList;
+        command->SetGraphicsRootShaderResourceView(Pipeline.FogFrameRoot, frame.Resource->GetGPUVirtualAddress());
+        command->SetGraphicsRootDescriptorTable(Pipeline.FogIntegratedRoot, Device.SrvHeapManager.GetGpuHandle(slot.Ids[1]));
+        command->SetGraphicsRootDescriptorTable(Pipeline.FogLocalRoot, Device.SrvHeapManager.GetGpuHandle(slot.Ids[2]));
+        var parameters = new Vector4(1, 0, 0, 0);
+        command->SetGraphicsRoot32BitConstants(Pipeline.FogParamsRoot, 4, &parameters, 0);
+        return true;
+    }
+
+    public override void Dispose()
+    {
+        if (_disposed) return;
+        if (ReferenceEquals(_transparentOwner, this)) ResetTransparent();
+        _disposed = true; _destination = null; _prepared = null; _inputs = default;
+        nint pipeline = (nint)_pipeline, signature = (nint)_signature;
+        _pipeline = null; _signature = null;
+        Device.EnqueueDeferredRelease(Device.GetCurrentRetireFenceValue(), () =>
+        {
+            foreach (var ring in _slots) foreach (var slot in ring) slot.Dispose();
+            if (pipeline != 0) ((ID3D12PipelineState*)pipeline)->Release();
+            if (signature != 0) ((ID3D12RootSignature*)signature)->Release();
+        });
     }
 }

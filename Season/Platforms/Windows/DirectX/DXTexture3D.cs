@@ -68,6 +68,10 @@ internal unsafe sealed class DXTexture3D : IDisposable
 
     ID3D12Resource* _resource = null;
 
+    internal ID3D12Resource* NativeResource => _resource;
+    internal Format NativeFormat => _format;
+    internal ResourceStates CurrentState => _currentState;
+
     ResourceStates _currentState = ResourceStates.Common;
 
     readonly object _stateLock = new object();
@@ -117,6 +121,17 @@ internal unsafe sealed class DXTexture3D : IDisposable
             }
             return _dummyBlack;
         }
+    }
+
+    /// <summary>立即注销；在最后使用此资源的 fence 完成后释放资源与描述符。</summary>
+    internal static void ReleaseByName(string name)
+    {
+        DXTexture3D? texture;
+        lock (_registry)
+        {
+            if (!_registry.Remove(name, out texture)) return;
+        }
+        Device.EnqueueDeferredRelease(Device.GetCurrentRetireFenceValue(), texture.Dispose);
     }
 
     /// <summary>Looks up by name. Returns null when not registered.</summary>

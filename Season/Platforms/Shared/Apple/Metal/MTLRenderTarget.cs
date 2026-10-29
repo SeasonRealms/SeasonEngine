@@ -53,45 +53,62 @@ internal sealed class MTLRenderTarget : Season.Rendering.RenderTarget
         if (width <= 0 || height <= 0) return;
         if ((ColorTexture != null || DepthTexture != null) && Width == width && Height == height) return;
 
+        IMTLTexture? color = null, depth = null;
+        try
+        {
+            if (!IsDepthOnly)
+            {
+                var colorFormat = Desc.ColorFormat switch
+                {
+                    Season.Rendering.RtFormat.Rgba16Float => MTLPixelFormat.RGBA16Float,
+                    Season.Rendering.RtFormat.Rg16Float => MTLPixelFormat.RG16Float,
+                    _ => Device.BackBufferFormat,
+                };
+                using var colorDesc = MTLTextureDescriptor.CreateTexture2DDescriptor(
+                    colorFormat, (nuint)width, (nuint)height, false);
+                colorDesc.Usage = MTLTextureUsage.RenderTarget | MTLTextureUsage.ShaderRead;
+                colorDesc.StorageMode = MTLStorageMode.Private;
+                color = Device.MtlDevice.CreateTexture(colorDesc)
+                    ?? throw new Exception("MTLRenderTarget: CreateTexture(color) failed");
+                color.Label = IsVelocity ? "SceneVelocity" : "OffscreenColor";
+            }
+
+            // The velocity RT has no companion depth because it relies on the explicit SceneDepth from the Scene pass.
+            if (IsDepthOnly || (!IsVelocity && !Desc.NoImplicitDepth))
+            {
+                using var depthDesc = MTLTextureDescriptor.CreateTexture2DDescriptor(
+                    Device.DepthBufferFormat, (nuint)width, (nuint)height, false);
+                // The depth-only shadow-map shape must be sampled by 1-5,
+                // while companion depth for color targets is attachment-only.
+                depthDesc.Usage = IsDepthOnly
+                    ? MTLTextureUsage.RenderTarget | MTLTextureUsage.ShaderRead
+                    : MTLTextureUsage.RenderTarget;
+                depthDesc.StorageMode = MTLStorageMode.Private;
+                depth = Device.MtlDevice.CreateTexture(depthDesc)
+                    ?? throw new Exception("MTLRenderTarget: CreateTexture(depth) failed");
+                depth.Label = IsDepthOnly ? "ShadowMap" : "OffscreenDepth";
+            }
+        }
+        catch
+        {
+            color?.Dispose();
+            depth?.Dispose();
+            throw;
+        }
+
+        // 全部创建成功后才替换，失败时旧附件与尺寸保持一致。
         ColorTexture?.Dispose();
         DepthTexture?.Dispose();
-        ColorTexture = null;
-
-        if (!IsDepthOnly)
-        {
-            var colorFormat = Desc.ColorFormat switch
-            {
-                Season.Rendering.RtFormat.Rgba16Float => MTLPixelFormat.RGBA16Float,
-                Season.Rendering.RtFormat.Rg16Float => MTLPixelFormat.RG16Float,
-                _ => Device.BackBufferFormat,
-            };
-            var colorDesc = MTLTextureDescriptor.CreateTexture2DDescriptor(
-                colorFormat, (nuint)width, (nuint)height, false);
-            colorDesc.Usage = MTLTextureUsage.RenderTarget | MTLTextureUsage.ShaderRead;
-            colorDesc.StorageMode = MTLStorageMode.Private;
-            ColorTexture = Device.MtlDevice.CreateTexture(colorDesc)
-                ?? throw new Exception("MTLRenderTarget: CreateTexture(color) failed");
-            ColorTexture.Label = IsVelocity ? "SceneVelocity" : "OffscreenColor";
-        }
-
-        // The velocity RT has no companion depth because it relies on the explicit SceneDepth from the Scene pass.
-        if (!IsVelocity)
-        {
-            var depthDesc = MTLTextureDescriptor.CreateTexture2DDescriptor(
-                Device.DepthBufferFormat, (nuint)width, (nuint)height, false);
-            // The depth-only shadow-map shape must be sampled by 1-5,
-            // while companion depth for color targets is attachment-only.
-            depthDesc.Usage = IsDepthOnly
-                ? MTLTextureUsage.RenderTarget | MTLTextureUsage.ShaderRead
-                : MTLTextureUsage.RenderTarget;
-            depthDesc.StorageMode = MTLStorageMode.Private;
-            DepthTexture = Device.MtlDevice.CreateTexture(depthDesc)
-                ?? throw new Exception("MTLRenderTarget: CreateTexture(depth) failed");
-            DepthTexture.Label = IsDepthOnly ? "ShadowMap" : "OffscreenDepth";
-        }
-
+        ColorTexture = color;
+        DepthTexture = depth;
         Width = width;
         Height = height;
+        // Publish the resolved size into Desc, the only size the shared layer can read back. The descriptor
+        // arrives with Width/Height = 0 for MatchBackbufferSize targets, and the fog pass sizes its froxel grid
+        // from Desc and declines to register at grid 0 (see DX Device.CreateRenderTarget). This lazy path is
+        // also the resize path, so the published size follows every rebuild.
+        Desc.Width = (uint)width;
+        Desc.Height = (uint)height;
     }
 
     public override void Dispose()

@@ -322,7 +322,7 @@ internal unsafe class DXSprite2D : DXSpriteQuad
 
         fixed (VertexBufferView* vbv = &_vertexBufferView)
         {
-            DrawQuad(vbv);
+            DrawQuad(vbv, _vertexBuffer);
         }
     }
 

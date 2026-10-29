@@ -620,9 +620,12 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         }
     }
 
-    protected override GpuDescriptorHandle GetInstanceBoneSrvHandle() => _instanceBoneSrvHandle;
-    protected override GpuDescriptorHandle GetPrevBoneSrvHandle() => _prevInstanceBoneSrvHandle;
-    protected override GpuDescriptorHandle GetPrevMorphSrvHandle() => _prevMorphWeightsSrvHandle;
+    protected override GpuDescriptorHandle GetInstanceBoneSrvHandle()
+        => DXSceneDrawCollection.Structured(_instanceBoneBuffer, 64, _instanceBoneSrvHandle);
+    protected override GpuDescriptorHandle GetPrevBoneSrvHandle()
+        => DXSceneDrawCollection.Structured(_prevInstanceBoneBuffer, 64, _prevInstanceBoneSrvHandle);
+    protected override GpuDescriptorHandle GetPrevMorphSrvHandle()
+        => DXSceneDrawCollection.Structured(_prevMorphWeightsBuffer, 16, _prevMorphWeightsSrvHandle);
 
     public IReadOnlyList<string> GetAnimationNames()
     {
@@ -972,7 +975,7 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
             fixed (VertexBufferView* instanceVB = &stream.View)
             {
                 Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, (uint)_instanceCount, 0,
-                    _instanceBoneSrvHandle, _prevInstanceBoneSrvHandle, _prevInstanceWorldSrvHandle, _prevMorphWeightsSrvHandle);
+                    GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), stream.Buffer);
             }
         }
 
@@ -987,12 +990,13 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
             for (int instanceIndex = 0; instanceIndex < _instanceCount; instanceIndex++)
                 _transparentInstanceOrder.Add(instanceIndex);
 
-            _transparentInstanceOrder.Sort((a, b) =>
-            {
-                float depthA = ComputeTransparentDepth(stream.Worlds[a], primitive.LocalBoundsCenter);
-                float depthB = ComputeTransparentDepth(stream.Worlds[b], primitive.LocalBoundsCenter);
-                return depthB.CompareTo(depthA);
-            });
+            if (DXSceneDrawCollection.Active == null)
+                _transparentInstanceOrder.Sort((a, b) =>
+                {
+                    float depthA = ComputeTransparentDepth(stream.Worlds[a], primitive.LocalBoundsCenter);
+                    float depthB = ComputeTransparentDepth(stream.Worlds[b], primitive.LocalBoundsCenter);
+                    return depthB.CompareTo(depthA);
+                });
 
             fixed (VertexBufferView* instanceVB = &stream.View)
             {
@@ -1003,12 +1007,12 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
                     {
                         Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Front);
                         Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, 1, (uint)instanceIndex,
-                            _instanceBoneSrvHandle, _prevInstanceBoneSrvHandle, _prevInstanceWorldSrvHandle, _prevMorphWeightsSrvHandle);
+                            GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), stream.Buffer);
                     }
 
                     Pipeline.SetPipeline(PipelineMode.Transparent, primitive.DoubleSided ? PipelineCullVariant.Back : PipelineCullVariant.Back);
                     Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, 1, (uint)instanceIndex,
-                        _instanceBoneSrvHandle, _prevInstanceBoneSrvHandle, _prevInstanceWorldSrvHandle, _prevMorphWeightsSrvHandle);
+                        GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), stream.Buffer);
                 }
             }
         }

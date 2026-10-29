@@ -206,7 +206,7 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
     // ============================================================
     // DescriptorSet allocation + write
     // (4 UBOs + 5 material samplers + shadow atlas + 1-7 env cube
-    //  + 2 storage buffers + 1 placeholder UBO, 17 bindings in total)
+    //  + 2 storage buffers + 1 placeholder UBO + 4 fog bindings, 25 bindings in total)
     // ============================================================
 
     /// <summary>
@@ -215,6 +215,11 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
     /// </summary>
     protected void AllocateAndWriteDescriptorSets()
     {
+        // A Sprite2D loaded on the background thread allocates and writes its per-frame sets here. The frame already
+        // recording may have bound the same slots, so the whole allocate-and-write stays under the GPU gate;
+        // see Device.EnterGpuAccessScope.
+        using var gpuAccess = Device.EnterGpuAccessScope();
+
         int n = (int)Device.frameCount;
         if (_descriptorSets == null || _descriptorSets.Length != n)
         {
@@ -263,6 +268,9 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
 
     void WriteDescriptorSet(int fi)
     {
+        // Same rule as VKPrimitiveGroup.WriteDescriptorSet: the set of a frame still on the GPU must not be rewritten.
+        Device.WaitForFrameSlot(fi);
+
         var fallback = Device.White;
         var matrixInfo = new DescriptorBufferInfo
         { Buffer = _matrixBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize };
@@ -296,7 +304,7 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         { ImageView = (EmissiveMap ?? fallback).View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
 
         var set = _descriptorSets[fi];
-        var writes = stackalloc WriteDescriptorSet[21];
+        var writes = stackalloc WriteDescriptorSet[25];
         writes[0] = MakeBufferWrite(set, 0, DescriptorType.UniformBuffer, &matrixInfo);
         writes[1] = MakeBufferWrite(set, 1, DescriptorType.UniformBuffer, &lightInfo);
         writes[2] = MakeBufferWrite(set, 2, DescriptorType.UniformBuffer, &materialInfo);
@@ -394,7 +402,48 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         if (fi < _cachedAerialLutViewVersions.Length)
             _cachedAerialLutViewVersions[fi] = aerialLut.ViewVersion;
 
-        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 21, writes, 0, null);
+        // 1-5 clause 15: binding 21 is the shadow view again, reached through the immutable
+        // point sampler for the blocker search. The Sprite path shares the layout / FS
+        // with the 3D path, so it must supply the same pair (12 uses the comparison sampler).
+        writes[21] = MakeImageWrite(set, 21, &shadowInfo);
+
+        // 雾采样三段（22/23/24）：
+        // 22 是帧常量 UBO，先写零填充占位；真正的内容按帧槽轮转，透明阶段只补推常量。
+        // 23/24 是两张体积纹理，收集期拿不到本帧产物，先用 AP 体积
+        // （DummyBlack 降落，已在 ShaderReadOnlyOptimal）占位，
+        // 由透明阶段在绑定前重写。
+        var fogFrameInfo = new DescriptorBufferInfo
+        { Buffer = Pipeline.DefaultFogFrameBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize };
+        writes[22] = MakeBufferWrite(set, Pipeline.SceneFogFrameBinding, DescriptorType.StorageBuffer, &fogFrameInfo);
+        var fogVolumeInfo = new DescriptorImageInfo
+        { ImageView = aerialLut.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
+        writes[23] = MakeImageWrite(set, Pipeline.SceneFogIntegratedBinding, &fogVolumeInfo);
+        writes[24] = MakeImageWrite(set, Pipeline.SceneFogLocalBinding, &fogVolumeInfo);
+
+        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 25, writes, 0, null);
+    }
+
+    /// <summary>
+    /// 刷新本帧槽位的绑定 16-20（环境立方图、DDGI 图集与深度、云噪声、AP 体积）。
+    /// 这些是逐帧变化的帧级输入，而描述符集一旦被正在录制的命令缓冲绑定过就不能再改写，
+    /// 所以本方法除了绘制前调用，也会被帧首预刷新在命令缓冲 begin 之前调用；
+    /// 版本相同时各 Refresh*Binding 会自行跳过，重复调用无副作用。
+    /// </summary>
+    internal void RefreshSceneBindings(int fi)
+    {
+        if (_descriptorSets == null || fi >= _descriptorSets.Length || fi >= _cachedEnvCubeViewVersions.Length)
+            return;
+
+        // 1-7: binding 16, the environment radiance cube.
+        VKTextureCube.RefreshBinding(_descriptorSets[fi], ref _cachedEnvCubeViewVersions[fi]);
+        // 2-4 clause 10: binding 17, this frame's DDGI atlas.
+        VKPrimitiveGroup.RefreshDdgiBinding(_descriptorSets[fi], ref _cachedDdgiAtlasViewVersions[fi]);
+        // 2-4 Step 3: binding 18, the DDGI depth atlas.
+        VKPrimitiveGroup.RefreshDdgiDepthBinding(_descriptorSets[fi], ref _cachedDdgiDepthViewVersions[fi]);
+        // 2-5 Step C: binding 19, cloud noise (baked once, converges after the first frame).
+        VKPrimitiveGroup.RefreshCloudNoiseBinding(_descriptorSets[fi], ref _cachedCloudNoiseViewVersions[fi]);
+        // 2-5 Step E: binding 20, the AP volume.
+        VKPrimitiveGroup.RefreshAerialLutBinding(_descriptorSets[fi], ref _cachedAerialLutViewVersions[fi]);
     }
 
     static WriteDescriptorSet MakeBufferWrite(DescriptorSet set, uint binding, DescriptorType descriptorType, DescriptorBufferInfo* info)
@@ -531,6 +580,27 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         OcclusionMap?.EnsureReadyForRendering(cmd);
         EmissiveMap?.EnsureReadyForRendering(cmd);
 
+        int fi = (int)Device.FrameIndex;
+
+        // 记录本帧画过的精灵，供下一帧帧首预刷新使用（见 Pipeline.RefreshSceneBindingsForFrameStart）。
+        VKSceneDrawCollection.NoteQuadDrawn(this);
+
+        // 1-7: refresh binding 16 of the current frame slot to the environment radiance cube
+        // active for this frame (compare ViewVersion, not handles).
+        // Only this slot is touched - completion of its previous submission
+        // is guaranteed by the same-slot fence waited at the end of AfterRender.
+        RefreshSceneBindings(fi);
+
+        var set = _descriptorSets[fi];
+
+        // 收集期：描述符集已就绪，只记下句柄与世界矩阵；真正绘制发生在透明 Pass。
+        if (VKSceneDrawCollection.Active is { } collection)
+        {
+            VKSceneDrawCollection.RetainOwner(this);
+            collection.CaptureQuad(set, vb, QuadWorld(fi));
+            return;
+        }
+
         // Set the transparent rendering pipeline
         Pipeline.SetPipeline(cmd, PipelineMode.Transparent);
 
@@ -538,38 +608,20 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         ulong offset = 0;
         vk.CmdBindVertexBuffers(cmd, 0, 1, in vb, in offset);
 
-        int fi = (int)Device.FrameIndex;
-
-        // 1-7: refresh binding 16 of the current frame slot to the environment radiance cube
-        // active for this frame (compare ViewVersion, not handles).
-        // Only this slot is touched - completion of its previous submission
-        // is guaranteed by the same-slot fence waited at the end of AfterRender.
-        if (fi < _cachedEnvCubeViewVersions.Length)
-            VKTextureCube.RefreshBinding(_descriptorSets[fi], ref _cachedEnvCubeViewVersions[fi]);
-
-        // 2-4 clause 10: refresh binding 17 to this frame's DDGI atlas
-        // (same per-frame-slot patching pattern as envCube).
-        if (fi < _cachedDdgiAtlasViewVersions.Length)
-            VKPrimitiveGroup.RefreshDdgiBinding(_descriptorSets[fi], ref _cachedDdgiAtlasViewVersions[fi]);
-
-        // 2-4 Step 3: likewise refresh binding 18 to this frame's DDGI depth atlas.
-        if (fi < _cachedDdgiDepthViewVersions.Length)
-            VKPrimitiveGroup.RefreshDdgiDepthBinding(_descriptorSets[fi], ref _cachedDdgiDepthViewVersions[fi]);
-
-        // 2-5 Step C: likewise refresh binding 19 to this frame's cloud noise
-        // (it is baked only once in its lifetime and converges after the first frame).
-        if (fi < _cachedCloudNoiseViewVersions.Length)
-            VKPrimitiveGroup.RefreshCloudNoiseBinding(_descriptorSets[fi], ref _cachedCloudNoiseViewVersions[fi]);
-
-        // 2-5 Step E: likewise refresh binding 20 to this frame's AP volume.
-        if (fi < _cachedAerialLutViewVersions.Length)
-            VKPrimitiveGroup.RefreshAerialLutBinding(_descriptorSets[fi], ref _cachedAerialLutViewVersions[fi]);
-
-        var set = _descriptorSets[fi];
         vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
             Pipeline.PipelineLayout, 0, 1, in set, 0, null);
+        // 雾采样三件套在独立的 set 1，理由同 DrawPrimitiveCore：透明变体静态引用它。
+        Pipeline.BindFogSet(cmd);
 
         vk.CmdDraw(cmd, 6, 1, 0, 0);
+    }
+
+    /// <summary>读取当前帧槽矩阵 UBO 中的世界矩阵（存储时已转置）。</summary>
+    Matrix4x4 QuadWorld(int fi)
+    {
+        var mapped = _mappedMatrixBuffers[fi];
+        if (mapped == null) return Matrix4x4.Identity;
+        return Matrix4x4.Transpose(Unsafe.Read<MatrixBuffer>(mapped).World);
     }
 
     // ============================================================

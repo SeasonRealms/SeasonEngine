@@ -200,6 +200,29 @@ internal unsafe static class Device
     /// <summary>Completion value that the currently recording frame will signal. All in-flight frames earlier than this one have smaller signal values, so waiting for it is sufficient for safety.</summary>
     internal static ulong GetCurrentRetireFenceValue() => _nextFenceValue + 1;
 
+    /// <summary>
+    /// Block until the frame that last used frame slot fi has completed on the GPU.
+    /// Descriptor sets are per slot and rewritten in place (VKPrimitiveGroup.RewriteDescriptorSets, the sprite quad
+    /// equivalent), including from the render thread inside a frame: a bone or prev-SSBO capacity change rewrites all
+    /// slots while the frames of the last two slots are still pending. Rewriting a set that a pending command buffer
+    /// references is VUID-vkUpdateDescriptorSets-None-03047, and the validation layer answers it by putting that command
+    /// buffer in an invalid state, which then reports every following command as VUID-vkEndCommandBuffer-*.
+    /// The wait is cheap for the slot being recorded: its fence value belongs to a frame three slots back and has long
+    /// completed. For a loading thread it costs at most one in-flight frame.
+    /// </summary>
+    internal static void WaitForFrameSlot(int fi)
+    {
+        var values = _fenceValues;
+        if (values == null || (uint)fi >= (uint)values.Length)
+            return;
+
+        ulong value = values[fi];
+        if (value == 0)
+            return;
+
+        GraphicsCommandQueue.WaitForFence(value);
+    }
+
     /// <summary>Enqueue a release action into the deferred-release queue.
     /// Thread-safe and callable from loading threads.
     /// fenceValue must come from <see cref="GetCurrentRetireFenceValue"/>.
@@ -255,6 +278,107 @@ internal unsafe static class Device
         }
     }
 
+    // -- Exclusive GPU access gate --
+    // Vulkan requires external synchronization per object: two threads submitting on one VkQueue, or allocating from one
+    // VkDescriptorPool or VkCommandPool, is undefined behavior, and the validation layer reports the overlap as
+    // "THREADING ERROR : object of type ... is simultaneously used". The render thread therefore holds this gate for the
+    // whole frame, and every GPU-touching entry point reachable from the background loading thread - uploads, descriptor
+    // allocation and writes, surface rebuilds - takes it as well (see EnterGpuAccessScope).
+    // It is a re-entrant monitor, so calls the render thread makes inside its own frame, FlushTextAtlas for example, are
+    // free, and only a background thread actually waits, never for more than one frame.
+    // Lock order: BaseApp.ResizeSemaphore is always taken before this gate. The render thread's only inner wait is the
+    // bounded 200 ms ResizeSemaphore attempt in HandleResize, so the inverted order cannot deadlock, it can only defer
+    // one resize tick while a load holds the semaphore.
+    static readonly object _gpuAccessLock = new();
+
+    static int _gpuAccessDepth;
+
+    // Loop thread id, recorded by Init. App.Update runs on it outside the gate by design: VKInstancedMesh3D.Update
+    // rewrites descriptor sets between frames, when no command buffer is recording, and the gate exists to keep other
+    // threads out of that window rather than to fence the owner against itself.
+    // Init is only the first claim. Android bootstraps Vulkan on the UI thread and afterwards runs the loop on its own
+    // render thread, which takes the record over through MarkLoopThread; until it does, the UI thread keeps it, which
+    // is what covers the resource creation BaseApp.Create performs at the end of the bootstrap.
+    static int _ownerThreadId;
+
+    /// <summary>
+    /// Claims the calling thread as the frame-loop thread, the one allowed to touch GPU state outside the gate.
+    /// Platforms whose loop runs on the bootstrap thread need nothing, because Init already recorded it. Android
+    /// splits the two, so RenderLoopBody calls this before its first frame, and again whenever that thread is
+    /// recreated after a park.
+    /// </summary>
+    internal static void MarkLoopThread() => _ownerThreadId = Environment.CurrentManagedThreadId;
+
+    internal static void EnterGpuAccess()
+    {
+        Monitor.Enter(_gpuAccessLock);
+        _gpuAccessDepth++;
+    }
+
+    internal static void ExitGpuAccess()
+    {
+        if (_gpuAccessDepth <= 0)
+            throw new InvalidOperationException("ExitGpuAccess without a matching EnterGpuAccess");
+
+        _gpuAccessDepth--;
+        Monitor.Exit(_gpuAccessLock);
+    }
+
+    /// <summary>
+    /// Release every nesting level the current thread holds, so a frame that aborts mid-way cannot leave the gate locked
+    /// and wedge the background loading thread forever. Does nothing when another thread owns the gate.
+    /// </summary>
+    internal static void AbortGpuAccessForCurrentThread()
+    {
+        // IsEntered reports whether the current thread is the owner, which is exactly the question here.
+        if (!Monitor.IsEntered(_gpuAccessLock))
+            return;
+
+        while (_gpuAccessDepth > 0)
+        {
+            _gpuAccessDepth--;
+            Monitor.Exit(_gpuAccessLock);
+        }
+    }
+
+    /// <summary>Scope form for `using var gpuAccess = Device.EnterGpuAccessScope();`.</summary>
+    internal static GpuAccessScope EnterGpuAccessScope()
+    {
+        EnterGpuAccess();
+        return default;
+    }
+
+    /// <summary>
+    /// Guard for code that rewrites or submits through objects the render thread also owns: descriptor sets and pools,
+    /// the per-slot constant buffers, the command queues. Such a call may come from the loop thread - inside a frame,
+    /// or between frames during Update - and must otherwise hold the gate explicitly.
+    /// A violation cannot be caught later: it corrupts a frame, or binds an ImageView a resize already destroyed,
+    /// and surfaces as artifacts or a driver fault with no Vulkan message pointing at the real caller.
+    /// The depth counter cannot answer this because it is global, so ask the monitor which thread owns it.
+    /// Conditional("DEBUG") removes both the check and the call sites from Release.
+    /// </summary>
+    [Conditional("DEBUG")]
+    internal static void AssertGpuGateHeld(string what)
+    {
+        if (Monitor.IsEntered(_gpuAccessLock))
+            return;
+
+        // The loop thread is the one place where touching GPU state without the gate is correct: it runs Update and
+        // the frame in sequence, so it is never racing itself. Only another thread reaching here is a defect.
+        if (_ownerThreadId != 0 && Environment.CurrentManagedThreadId == _ownerThreadId)
+            return;
+
+        var message = $"GPU gate not held on a non-owner thread: {what}";
+        Console.Error.WriteLine($"[Vulkan] {message}");
+        Console.Error.Flush();
+        Debug.Fail(message);
+    }
+
+    internal readonly struct GpuAccessScope : IDisposable
+    {
+        public void Dispose() => ExitGpuAccess();
+    }
+
     static int _backbufferWidth;
 
     static int _backbufferHeight;
@@ -283,6 +407,10 @@ internal unsafe static class Device
     /// <param name="createSurface">Factory from the window system that creates VkSurfaceKHR. The input is the instance handle and the output is the surface handle.</param>
     internal static void Init(IntPtr window, bool debug, string[] surfaceExtensions, Func<ulong, ulong> createSurface)
     {
+        // Init runs on the loop thread, which is also where App.Update and the frame execute. Recording it here lets
+        // AssertGpuGateHeld tell "the owner thread between frames" apart from "a background producer that skipped the gate".
+        _ownerThreadId = Environment.CurrentManagedThreadId;
+
         WindowHandle = window;
         BackgroundColor = new Vector4(1f, 1f, 1f, 1f);
 
@@ -785,15 +913,39 @@ internal unsafe static class Device
     /// It is read only inside the pass body with no concurrency.</summary>
     internal static Season.Rendering.RenderPassId ActivePassId;
 
+    /// <summary>用于独立全屏管线核对实际输出附件；仅在当前 Pass 内有效。</summary>
+    internal static VKRenderTarget? ActiveColorTarget;
+
     // Pending texture layout transitions.
     // When requested inside a render pass they are queued here and drained outside passes during the next frame.
     // Accessed only by the render thread.
     static readonly List<Texture> _pendingTextureTransitions = new();
 
+    // How many deferred-transition diagnostics have been written. Deferring is a fallback, not a steady state,
+    // so the first few are worth surfacing and the rest would only flood the log every frame.
+    static int _deferTransitionWarnings;
+
     internal static void DeferTextureTransition(Texture tex)
     {
         if (!_pendingTextureTransitions.Contains(tex))
+        {
             _pendingTextureTransitions.Add(tex);
+
+            // Every producer that can be reached from a draw - TextureUploadBatch and Texture.UploadPixels - now
+            // leaves its image in ShaderReadOnlyOptimal before publishing Ready, so arriving here means some other
+            // path (a reused render target, an intermediate left in General) skipped its own transition. The pass
+            // that hit this keeps sampling the old layout until the queue drains in the next BeforeRender, which is
+            // exactly VUID-vkCmdDraw-None-09600 on a desktop driver and visible corruption on a tiler.
+            // Release builds still have to see it: Debug.WriteLine alone is compiled out.
+            if (_deferTransitionWarnings < 8)
+            {
+                _deferTransitionWarnings++;
+                Console.Error.WriteLine(
+                    $"[Vulkan] deferred texture layout transition requested inside a render pass (current layout {tex.CurrentLayout}); " +
+                    "the pass will sample this image with its previous layout");
+                Console.Error.Flush();
+            }
+        }
     }
 
     internal static void CancelTextureTransition(Texture tex)
@@ -1025,6 +1177,9 @@ internal unsafe static class Device
         "OutlineMask\0"u8.ToArray(),
         "FinalBlit\0"u8.ToArray(),
         "Overlay\0"u8.ToArray(),
+        "SceneOpaque\0"u8.ToArray(),
+        "FogComposite\0"u8.ToArray(),
+        "SceneTransparent\0"u8.ToArray(),
     ];
 
     internal static void PushDebugGroup(byte[] utf8LabelZ)
@@ -1058,6 +1213,31 @@ internal unsafe static class Device
     /// In that case the whole frame must be skipped, with no Draw and no AfterRender, and the next loop retries using the latest size.
     /// </summary>
     internal static bool BeforeRender()
+    {
+        // Hold exclusive GPU access for the whole frame. Everything the frame records - descriptor sets it binds,
+        // buffers and images it references, the command pool it resets - is then guaranteed untouched by the background
+        // loading thread until AfterRender completes.
+        EnterGpuAccess();
+
+        bool begun;
+        try
+        {
+            begun = BeforeRenderCore();
+        }
+        catch
+        {
+            ExitGpuAccess();
+            throw;
+        }
+
+        // A skipped frame never reaches AfterRender, so the gate is released here.
+        if (!begun)
+            ExitGpuAccess();
+
+        return begun;
+    }
+
+    static bool BeforeRenderCore()
     {
         var frame = FrameContexts[FrameIndex];
 
@@ -1121,11 +1301,17 @@ internal unsafe static class Device
         // reset the backbuffer-written flag so the first pass clears and later passes load.
         _backbufferWrittenThisFrame = false;
 
-        // 3) Reset cmd pool + begin cmd buffer
+        // 3) Refresh binding 16-20 of every scene set the previous frame drew.
+        // This must precede frame.Reset(): a set the command buffer already references may not be
+        // rewritten after begin without UPDATE_AFTER_BIND, and the whole buffer would be invalidated.
+        // See Pipeline.RefreshSceneBindingsForFrameStart.
+        Pipeline.RefreshSceneBindingsForFrameStart();
+
+        // 4) Reset cmd pool + begin cmd buffer
         frame.Reset();
         GraphicsCommandBuffer = frame.CommandList;
 
-        // 3.5) Drain deferred texture layout transitions.
+        // 4.5) Drain deferred texture layout transitions.
         // This must happen outside passes before any CmdBeginRenderPass.
         if (_pendingTextureTransitions.Count > 0)
         {
@@ -1142,31 +1328,11 @@ internal unsafe static class Device
     /// <summary>Registry of created offscreen RTs. During resize, members with MatchBackbufferSize are recreated in place. Accessed only by the render thread.</summary>
     internal static readonly List<VKRenderTarget> OffscreenTargets = new();
 
-    // -- 2-2 dual-target Scene pass, SceneColor plus explicit SceneDepth, contract clause 2:
-    //    the render pass is created lazily once because its format is fixed.
-    //    The framebuffer combines the views of the two RTs and is lazily rebuilt when views change after resize.
-    //    The resize path has already run DeviceWaitIdle, so the old framebuffer has no in-flight references and may be destroyed immediately.
-    //    Accessed only by the render thread. --
-    static RenderPass _dualTargetRenderPass;
-
-    static Framebuffer _dualTargetFramebuffer;
-
-    /// <summary>Cached color-view version for the dual-target framebuffer. See ColorViewVersion and Device.NextViewVersion.</summary>
-    static ulong _dualTargetColorVersion;
-
-    /// <summary>Cached depth-view version for the dual-target framebuffer.</summary>
-    static ulong _dualTargetDepthVersion;
-
-    // -- 2-3 triple-target Scene pass, SceneColor plus SceneVelocity plus SceneDepth, contract clause 2:
-    //    the render pass is created lazily once because its format is fixed and matches the render pass baked by velocity PSOs.
-    //    The framebuffer combines the views of the three RTs. --
-    static Framebuffer _velocityTargetFramebuffer;
-
-    static ulong _velocityTargetColorVersion;
-
-    static ulong _velocityTargetVelocityVersion;
-
-    static ulong _velocityTargetDepthVersion;
+    // 每个附件组合及 Load/Store 意图各有缓存；同帧切换雾合成目标不能销毁前一阶段的 framebuffer。
+    // RT 在 Resize/Dispose 之前主动失效缓存，不依赖可复用的原生 view 句柄。
+    readonly record struct ScenePassKey(VKRenderTarget Color, VKRenderTarget? Depth,
+        VKRenderTarget? Velocity, bool ClearColor, bool ClearDepth, bool StoreDepth);
+    static readonly Dictionary<ScenePassKey, (RenderPass Pass, Framebuffer Framebuffer)> _sceneTargetPasses = new();
 
     // -- Phase 4: Outline2D mask pass, with mask RT color=BackbufferCompatible plus shared SceneDepth.
     //    The render pass is created lazily once because its format is fixed and also serves as the anchor for baking mask PSOs.
@@ -1356,18 +1522,16 @@ internal unsafe static class Device
             extent = new Extent2D(maskRT.Width, maskRT.Height);
             attachmentCount = 2u;
         }
+        else if (desc.ColorTarget is VKRenderTarget compositeRT && desc.Id == Season.Rendering.RenderPassId.FogComposite)
+        {
+            (renderPass, framebuffer) = EnsureSceneTargetPass(compositeRT, null, null, true, false, false);
+            extent = new Extent2D(compositeRT.Width, compositeRT.Height);
+            attachmentCount = 1;
+        }
         else if (desc.ColorTarget is VKRenderTarget colorRT && desc.DepthTarget is VKRenderTarget depthRT)
         {
-            if (hasVelocity)
-            {
-                renderPass = EnsureVelocityTargetPass(colorRT, (VKRenderTarget)desc.VelocityTarget!, depthRT);
-                framebuffer = _velocityTargetFramebuffer;
-            }
-            else
-            {
-                renderPass = EnsureDualTargetPass(colorRT, depthRT);
-                framebuffer = _dualTargetFramebuffer;
-            }
+            (renderPass, framebuffer) = EnsureSceneTargetPass(colorRT, depthRT,
+                desc.VelocityTarget as VKRenderTarget, desc.ClearColorEnable, desc.ClearDepthEnable, desc.StoreDepth);
             extent = new Extent2D(colorRT.Width, colorRT.Height);
             attachmentCount = hasVelocity ? 3u : 2u;
         }
@@ -1417,7 +1581,7 @@ internal unsafe static class Device
         {
             clearValues[0] = new ClearValue { Color = new ClearColorValue(cc.X, cc.Y, cc.Z, cc.W) };
             clearValues[1] = new ClearValue { DepthStencil = new ClearDepthStencilValue(1f, 0) };
-            clearCount = 2u;
+            clearCount = attachmentCount;
         }
         var rpBegin = new RenderPassBeginInfo
         {
@@ -1430,6 +1594,7 @@ internal unsafe static class Device
         };
         Vk.CmdBeginRenderPass(GraphicsCommandBuffer, in rpBegin, SubpassContents.Inline);
         InRenderPass = true;
+        ActiveColorTarget = desc.ColorTarget as VKRenderTarget;
 
         // Set viewport and scissor from target size, using negative-height Y flip under the same convention as Display.UpdateViewportAndScissor.
         var vp = new Silk.NET.Vulkan.Viewport
@@ -1446,89 +1611,74 @@ internal unsafe static class Device
         Vk.CmdSetScissor(GraphicsCommandBuffer, 0, 1, in sc);
     }
 
-    /// <summary>
-    /// The render pass and framebuffer for the 2-2 dual-target Scene pass are made ready lazily.
-    /// The render pass is created once and reused forever because attachment formats are fixed
-    /// and stay render-pass compatible with the render pass baked into Scene PSOs.
-    /// The framebuffer is rebuilt whenever the views of the two RTs change during in-place resize recreation.
-    /// The resize path has already run DeviceWaitIdle, so the old framebuffer has no in-flight references and may be destroyed immediately.
-    /// Staleness is detected from ColorViewVersion and DepthViewVersion rather than View.Handle,
-    /// because the handle is a heap pointer and often stays equal after destroy plus recreate, which would silently miss the change.
-    /// </summary>
-    static RenderPass EnsureDualTargetPass(VKRenderTarget colorRT, VKRenderTarget depthRT)
+    static (RenderPass, Framebuffer) EnsureSceneTargetPass(VKRenderTarget color, VKRenderTarget? depth,
+        VKRenderTarget? velocity, bool clearColor, bool clearDepth, bool storeDepth)
     {
-        if (_dualTargetRenderPass.Handle == 0)
-            _dualTargetRenderPass = VKRenderTarget.CreateDualTargetRenderPassForFormat(SceneColorFormat);
+        if (color.ColorView.Handle == 0 || color.Width == 0 || color.Height == 0
+            || (depth != null && (depth.DepthView.Handle == 0 || depth.Width != color.Width || depth.Height != color.Height))
+            || (velocity != null && (depth == null || velocity.ColorView.Handle == 0
+                || velocity.Width != color.Width || velocity.Height != color.Height
+                || velocity.ColorFormat != Format.R16G16Sfloat)))
+            throw new InvalidOperationException("场景附件无效或尺寸/格式不匹配。");
 
-        if (_dualTargetFramebuffer.Handle == 0 ||
-            _dualTargetColorVersion != colorRT.ColorViewVersion ||
-            _dualTargetDepthVersion != depthRT.DepthViewVersion)
+        var key = new ScenePassKey(color, depth, velocity, clearColor, clearDepth, storeDepth);
+        if (_sceneTargetPasses.TryGetValue(key, out var cached)) return cached;
+        var rp = depth == null
+            ? VKRenderTarget.CreateColorRenderPassForFormat(color.ColorFormat, colorOnly: true)
+            : velocity != null
+                ? VKRenderTarget.CreateVelocityRenderPassForFormat(color.ColorFormat, clearColor, clearDepth, storeDepth)
+                : VKRenderTarget.CreateDualTargetRenderPassForFormat(color.ColorFormat, clearColor, clearDepth, storeDepth);
+        Framebuffer framebuffer = default;
+        try
         {
-            if (_dualTargetFramebuffer.Handle != 0)
-                Vk.DestroyFramebuffer(LogicalDevice, _dualTargetFramebuffer, null);
-
-            var attachments = stackalloc Silk.NET.Vulkan.ImageView[2] { colorRT.ColorView, depthRT.DepthView };
-            var fbInfo = new FramebufferCreateInfo
+            var attachments = stackalloc Silk.NET.Vulkan.ImageView[3];
+            attachments[0] = color.ColorView;
+            uint count = 1;
+            if (velocity != null) attachments[count++] = velocity.ColorView;
+            if (depth != null) attachments[count++] = depth.DepthView;
+            var info = new FramebufferCreateInfo
             {
                 SType = StructureType.FramebufferCreateInfo,
-                RenderPass = _dualTargetRenderPass,
-                AttachmentCount = 2,
+                RenderPass = rp,
+                AttachmentCount = count,
                 PAttachments = attachments,
-                Width = colorRT.Width,
-                Height = colorRT.Height,
+                Width = color.Width,
+                Height = color.Height,
                 Layers = 1
             };
-            if (Vk.CreateFramebuffer(LogicalDevice, in fbInfo, null, out var fb) != Result.Success)
-                throw new Exception("vkCreateFramebuffer (dual-target scene) failed");
-            _dualTargetFramebuffer = fb;
-            _dualTargetColorVersion = colorRT.ColorViewVersion;
-            _dualTargetDepthVersion = depthRT.DepthViewVersion;
+            if (Vk.CreateFramebuffer(LogicalDevice, in info, null, out framebuffer) != Result.Success)
+                throw new Exception("vkCreateFramebuffer (scene attachments) failed");
+            _sceneTargetPasses.Add(key, (rp, framebuffer));
+            return (rp, framebuffer);
         }
-        return _dualTargetRenderPass;
+        catch
+        {
+            if (framebuffer.Handle != 0) Vk.DestroyFramebuffer(LogicalDevice, framebuffer, null);
+            Vk.DestroyRenderPass(LogicalDevice, rp, null);
+            throw;
+        }
     }
 
-    /// <summary>
-    /// The render pass and framebuffer for the 2-3 triple-target Scene pass are made ready lazily.
-    /// The render pass is created once and reused forever because attachment formats are fixed
-    /// and stay render-pass compatible with the render pass baked into velocity PSOs.
-    /// The framebuffer is rebuilt whenever any of the three RT views changes during in-place resize recreation.
-    /// The resize path has already run DeviceWaitIdle, so the old framebuffer has no in-flight references and may be destroyed immediately.
-    /// Staleness is detected from ColorViewVersion and DepthViewVersion rather than View.Handle, as described in the 2-2 note.
-    /// </summary>
-    static RenderPass _velocityTargetRenderPass;
-
-    static RenderPass EnsureVelocityTargetPass(VKRenderTarget colorRT, VKRenderTarget velocityRT, VKRenderTarget depthRT)
+    /// <summary>RT 销毁时按 fence 退休；只有 Resize 的 GPU 空闲点允许立即清理。</summary>
+    internal static void ReleaseSceneTargetPasses(VKRenderTarget target, bool immediate = false)
     {
-        if (_velocityTargetRenderPass.Handle == 0)
-            _velocityTargetRenderPass = VKRenderTarget.CreateVelocityRenderPassForFormat(SceneColorFormat);
-
-        if (_velocityTargetFramebuffer.Handle == 0 ||
-            _velocityTargetColorVersion != colorRT.ColorViewVersion ||
-            _velocityTargetVelocityVersion != velocityRT.ColorViewVersion ||
-            _velocityTargetDepthVersion != depthRT.DepthViewVersion)
+        foreach (var entry in _sceneTargetPasses.ToArray())
         {
-            if (_velocityTargetFramebuffer.Handle != 0)
-                Vk.DestroyFramebuffer(LogicalDevice, _velocityTargetFramebuffer, null);
-
-            var attachments = stackalloc Silk.NET.Vulkan.ImageView[3] { colorRT.ColorView, velocityRT.ColorView, depthRT.DepthView };
-            var fbInfo = new FramebufferCreateInfo
+            var key = entry.Key;
+            if (!ReferenceEquals(key.Color, target) && !ReferenceEquals(key.Depth, target)
+                && !ReferenceEquals(key.Velocity, target)) continue;
+            _sceneTargetPasses.Remove(key);
+            var (rp, fb) = entry.Value;
+            var vk = Vk;
+            var device = LogicalDevice;
+            void Release()
             {
-                SType = StructureType.FramebufferCreateInfo,
-                RenderPass = _velocityTargetRenderPass,
-                AttachmentCount = 3,
-                PAttachments = attachments,
-                Width = colorRT.Width,
-                Height = colorRT.Height,
-                Layers = 1
-            };
-            if (Vk.CreateFramebuffer(LogicalDevice, in fbInfo, null, out var fb) != Result.Success)
-                throw new Exception("vkCreateFramebuffer (velocity-target scene) failed");
-            _velocityTargetFramebuffer = fb;
-            _velocityTargetColorVersion = colorRT.ColorViewVersion;
-            _velocityTargetVelocityVersion = velocityRT.ColorViewVersion;
-            _velocityTargetDepthVersion = depthRT.DepthViewVersion;
+                vk.DestroyFramebuffer(device, fb, null);
+                vk.DestroyRenderPass(device, rp, null);
+            }
+            if (immediate) Release();
+            else EnqueueDeferredRelease(Release);
         }
-        return _velocityTargetRenderPass;
     }
 
     /// <summary>
@@ -1623,6 +1773,7 @@ internal unsafe static class Device
         Vk.CmdEndRenderPass(GraphicsCommandBuffer);
         InRenderPass = false;
         ActivePassId = default;
+        ActiveColorTarget = null;
         PopDebugGroup();
     }
 
@@ -1668,6 +1819,19 @@ internal unsafe static class Device
     /// Equivalent to DX Device.AfterRender.
     /// </summary>
     internal static void AfterRender()
+    {
+        try
+        {
+            AfterRenderCore();
+        }
+        finally
+        {
+            // Releases the gate BeforeRender took, whether the frame completed or threw.
+            ExitGpuAccess();
+        }
+    }
+
+    static void AfterRenderCore()
     {
         var frame = FrameContexts[FrameIndex];
 
@@ -1886,6 +2050,21 @@ internal unsafe static class Device
     /// </summary>
     internal static void ReleaseSurfaceAndSwapChain()
     {
+        // Called from the UI thread on Android surface teardown: it waits for the device and destroys the swapchain, so
+        // it must not overlap a background load either. Re-entrant when the render thread drives it itself.
+        EnterGpuAccess();
+        try
+        {
+            ReleaseSurfaceAndSwapChainCore();
+        }
+        finally
+        {
+            ExitGpuAccess();
+        }
+    }
+
+    static void ReleaseSurfaceAndSwapChainCore()
+    {
         if (LogicalDevice.Handle != 0)
         {
             CheckResult(Vk.DeviceWaitIdle(LogicalDevice));
@@ -1911,6 +2090,20 @@ internal unsafe static class Device
     /// Because RenderPass is reused, this assumes BackBufferFormat stays unchanged, which normally holds for Android surfaces on the same physical device.
     /// </summary>
     internal static void RecreateSurfaceAndSwapChain(IntPtr window, Func<ulong, ulong> createSurface, int width, int height)
+    {
+        // Same reason as ReleaseSurfaceAndSwapChain: this rebuilds swapchain attachments on the UI thread.
+        EnterGpuAccess();
+        try
+        {
+            RecreateSurfaceAndSwapChainCore(window, createSurface, width, height);
+        }
+        finally
+        {
+            ExitGpuAccess();
+        }
+    }
+
+    static void RecreateSurfaceAndSwapChainCore(IntPtr window, Func<ulong, ulong> createSurface, int width, int height)
     {
         if (width <= 0 || height <= 0)
             throw new ArgumentException("Recreate surface requires positive size");
@@ -2003,20 +2196,31 @@ internal unsafe static class Device
     /// </summary>
     internal static void Shutdown()
     {
+        EnterGpuAccess();
+        try
+        {
+            ShutdownCore();
+        }
+        finally
+        {
+            ExitGpuAccess();
+        }
+    }
+
+    static void ShutdownCore()
+    {
         if (LogicalDevice.Handle != 0)
         {
             Vk.DeviceWaitIdle(LogicalDevice);
             // 2-2 dual-target Scene render pass and framebuffer, lazily created and possibly never enabled.
-            if (_dualTargetFramebuffer.Handle != 0) { Vk.DestroyFramebuffer(LogicalDevice, _dualTargetFramebuffer, null); _dualTargetFramebuffer = default; }
-            if (_dualTargetRenderPass.Handle != 0) { Vk.DestroyRenderPass(LogicalDevice, _dualTargetRenderPass, null); _dualTargetRenderPass = default; }
-            _dualTargetColorVersion = 0;
-            _dualTargetDepthVersion = 0;
+            foreach (var entry in _sceneTargetPasses.Values)
+            {
+                Vk.DestroyFramebuffer(LogicalDevice, entry.Framebuffer, null);
+                Vk.DestroyRenderPass(LogicalDevice, entry.Pass, null);
+            }
+            _sceneTargetPasses.Clear();
             // 2-3 triple-target velocity render pass and framebuffer.
-            if (_velocityTargetFramebuffer.Handle != 0) { Vk.DestroyFramebuffer(LogicalDevice, _velocityTargetFramebuffer, null); _velocityTargetFramebuffer = default; }
-            if (_velocityTargetRenderPass.Handle != 0) { Vk.DestroyRenderPass(LogicalDevice, _velocityTargetRenderPass, null); _velocityTargetRenderPass = default; }
-            _velocityTargetColorVersion = 0;
-            _velocityTargetVelocityVersion = 0;
-            _velocityTargetDepthVersion = 0;
+            // 速度附件与无深度雾合成的缓存已在上方统一销毁。
             // Deferred-release actions depend on LogicalDevice, so they must be drained before DestroyDevice.
             PumpDeferredReleases(force: true);
             Vk.DestroyDevice(LogicalDevice, null);

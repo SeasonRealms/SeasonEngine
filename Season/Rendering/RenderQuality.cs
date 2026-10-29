@@ -4,6 +4,9 @@
 
 namespace Season.Rendering;
 
+/// <summary>体积雾资源档位，在图形初始化时固定；Off 不分配任何雾资源。</summary>
+public enum FogQuality { Off, Low, Medium, High }
+
 /// <summary>
 /// Step 6 consolidation: render-quality settings have been merged into Season.Basic.RenderQuality (BaseApp.cs).
 /// That class now owns the static Default* sources and the runtime instance properties persisted in Settings.json;
@@ -419,6 +422,9 @@ public class RenderQuality
     /// <summary>Default value for AerialIntensity (overrideable in the app constructor and captured by Init()).</summary>
     public static float DefaultAerialIntensity = 1f;
 
+    public static FogQuality DefaultVolumetricFog = FogQuality.Off;
+    public static float DefaultFogHistoryWeight = 0.85f;
+
     /// <summary>Default value for TextureMipmaps (overrideable in the app constructor and captured by Init()).</summary>
     public static bool DefaultTextureMipmaps = true;
 
@@ -829,6 +835,24 @@ public class RenderQuality
 
     /// <summary>2-5 clause 12: aerial-perspective intensity scale. Runtime knob; values above 1 are allowed for artistic amplification on small-scale scenes.</summary>
     public float AerialIntensity { get; set; } = DefaultAerialIntensity;
+
+    /// <summary>资源画质，仅启动时生效；场景启停由 BaseApp.Fog.Enabled 控制。</summary>
+    public FogQuality VolumetricFog { get; set; } = DefaultVolumetricFog;
+
+    /// <summary>局部散射源项的历史权重，0 关闭历史；不对累计透射率做时域混合。</summary>
+    public float FogHistoryWeight { get; set; } = DefaultFogHistoryWeight;
+
+    public int FogShadowSamples => VolumetricFog == FogQuality.Low ? 1 : 4;
+
+    /// <summary>图形初始化的雾深度需求；与场景运行期开关、AO 和 TAA 无关。</summary>
+    public bool RequiresFogSceneDepth(bool hdrSceneColor, bool computeSupported, bool immediate2D)
+        => VolumetricFog is FogQuality.Low or FogQuality.Medium or FogQuality.High
+            && hdrSceneColor && computeSupported && !immediate2D;
+
+    /// <summary>资源创建前解析雾的单采样约束，不改写持久化的雾档位。</summary>
+    public AaMode ResolveFogAntiAliasing(bool hdrSceneColor, bool immediate2D)
+        => AntiAliasing == AaMode.Msaa4x && RequiresFogSceneDepth(hdrSceneColor, true, immediate2D)
+            ? AaMode.Fxaa : AntiAliasing;
 
     /// <summary>
     /// 2-6 clause 2: master switch for material-texture mip chains. Unlike most tiers this is locked at texture creation

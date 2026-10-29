@@ -149,6 +149,12 @@ window.seasonWebGPU = (() => {
     };
 
     let _commandEncoder = null, _passEncoder = null, _frameStarted = false;
+    let _activePassId = -1, _activeColorTarget = null, _activeColorView = null, _activeDepthView = null;
+
+    function _clearActivePass() {
+        _activePassId = -1; _activeColorTarget = _activeColorView = _activeDepthView = null;
+        _passDepthOnly = _passVelocity = _passOutlineMask = _passOverlay = false;
+    }
 
     // Buffer pools: grouped by usage and reused by resetting cursors each frame
     const _bufferPool = { vertex: [], index: [], uniform: [], storage: [] };
@@ -232,17 +238,17 @@ window.seasonWebGPU = (() => {
             // rebind-only calls (morphBytes is empty) must not touch morph buffers or counts,
             // avoiding accidental destruction of GPU morph data during texture rebinding
             if (morphBytes) {
+                const morphBuffers = _createMorphBuffer(morphBytes, morphTargetCount, morphVertexCount);
                 if (_staticMeshes[cacheKey].morphMetaBuffer) {
-                    _staticMeshes[cacheKey].morphMetaBuffer.destroy();
+                    _queueComputeRetirement(_staticMeshes[cacheKey].morphMetaBuffer);
                     _staticMeshes[cacheKey].morphMetaBuffer = null;
                 }
                 if (_staticMeshes[cacheKey].morphDataBuffer) {
-                    _staticMeshes[cacheKey].morphDataBuffer.destroy();
+                    _queueComputeRetirement(_staticMeshes[cacheKey].morphDataBuffer);
                     _staticMeshes[cacheKey].morphDataBuffer = null;
                 }
                 _staticMeshes[cacheKey].morphTargetCount = morphTargetCount >>> 0;
                 _staticMeshes[cacheKey].morphVertexCount = morphVertexCount >>> 0;
-                const morphBuffers = _createMorphBuffer(morphBytes, morphTargetCount, morphVertexCount);
                 _staticMeshes[cacheKey].morphMetaBuffer = morphBuffers ? morphBuffers.metaBuffer : null;
                 _staticMeshes[cacheKey].morphDataBuffer = morphBuffers ? morphBuffers.dataBuffer : null;
             }
@@ -289,6 +295,7 @@ window.seasonWebGPU = (() => {
             morphMetaBuffer: morphBuffers ? morphBuffers.metaBuffer : null,
             morphDataBuffer: morphBuffers ? morphBuffers.dataBuffer : null,
             indexCount: indexData.length,
+            boundsCenter: _meshBoundsCenter(vertexData, vertexStrideFloats || 20),
             indexFormat: resolvedIndexFormat,
             doubleSided: !!doubleSided,
             textureName: textureName || 'White',
@@ -349,6 +356,33 @@ window.seasonWebGPU = (() => {
         return new Uint8Array(x);
     }
 
+    // 已被本帧绘制快照引用的持久缓冲只读；后续写入采用 copy-on-write。
+    // 跨帧首次写入仍复用原缓冲，queue 顺序保证上一帧先消费。
+    const _sceneBufferReads = new WeakMap();
+    function _readSceneBuffer(buffer) {
+        if (buffer && _frameStarted) _sceneBufferReads.set(buffer, _computeFrameId);
+        return buffer;
+    }
+
+    function _writeSceneBuffer(current, bytes, usage, minimum = 4) {
+        if (!bytes || bytes.byteLength === 0 || bytes.byteLength % 4 !== 0)
+            throw new Error('场景缓冲上传必须非空且按 4 字节对齐');
+        const replace = !current || current.size < bytes.byteLength
+            || (_frameStarted && _sceneBufferReads.get(current) === _computeFrameId);
+        let buffer = current;
+        if (replace) buffer = _device.createBuffer({
+            size: Math.ceil(Math.max(bytes.byteLength, minimum) / 256) * 256,
+            usage: usage | GPUBufferUsage.COPY_DST });
+        try { _device.queue.writeBuffer(buffer, 0, bytes); }
+        catch (error) { if (replace) _queueComputeRetirement(buffer); throw error; }
+        if (replace && current) _queueComputeRetirement(current);
+        return buffer;
+    }
+
+    function _setSceneVertexBuffer(slot, buffer) {
+        _passEncoder.setVertexBuffer(slot, _readSceneBuffer(buffer));
+    }
+
     function uploadSkinnedBones(skinKey, boneBytes) {
         boneBytes = _interopToU8(boneBytes);
         if (!boneBytes || boneBytes.byteLength === 0) return;
@@ -359,17 +393,8 @@ window.seasonWebGPU = (() => {
             boneBytes = paddedBytes;
         }
 
-        let buffer = _skinnedBoneBuffers[skinKey];
-        if (!buffer || buffer.size < boneBytes.byteLength) {
-            if (buffer) buffer.destroy();
-            const size = Math.ceil(boneBytes.byteLength / 256) * 256;
-            buffer = _device.createBuffer({
-                size,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-            });
-            buffer.size = size;
-            _skinnedBoneBuffers[skinKey] = buffer;
-        }
+        const buffer = _writeSceneBuffer(_skinnedBoneBuffers[skinKey], boneBytes, GPUBufferUsage.STORAGE);
+        _skinnedBoneBuffers[skinKey] = buffer;
 
         // 2-3 Step C: roll forward the prev shadow copy
         // (prev first, then current; the order itself is the semantics, and it happens exactly once per frame).
@@ -380,23 +405,16 @@ window.seasonWebGPU = (() => {
             _prevSkinnedBoneFrame[skinKey] = _frameSerial;
             const prevBytes = _prevSkinnedBoneBytes[skinKey];
             if (prevBytes && prevBytes.byteLength === boneBytes.byteLength) {
-                let prevBuffer = _prevSkinnedBoneBuffers[skinKey];
-                if (!prevBuffer || prevBuffer.size < prevBytes.byteLength) {
-                    if (prevBuffer) prevBuffer.destroy();
-                    const psize = Math.ceil(prevBytes.byteLength / 256) * 256;
-                    prevBuffer = _device.createBuffer({
-                        size: psize,
-                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-                    });
-                    prevBuffer.size = psize;
-                    _prevSkinnedBoneBuffers[skinKey] = prevBuffer;
-                }
-                _device.queue.writeBuffer(prevBuffer, 0, prevBytes);
+                _prevSkinnedBoneBuffers[skinKey] = _writeSceneBuffer(
+                    _prevSkinnedBoneBuffers[skinKey], prevBytes, GPUBufferUsage.STORAGE);
+            } else {
+                const previous = _prevSkinnedBoneBuffers[skinKey];
+                delete _prevSkinnedBoneBuffers[skinKey];
+                if (previous) _queueComputeRetirement(previous);
             }
-            _prevSkinnedBoneBytes[skinKey] = boneBytes;
         }
-
-        _device.queue.writeBuffer(buffer, 0, boneBytes);
+        // MemoryView 归调用者所有；保存独立的最后一次上传，不能跨帧持有可变 WASM 内存。
+        _prevSkinnedBoneBytes[skinKey] = boneBytes.slice();
         if (_debugLog && _skinnedLogCount < 6) {
             _log(`[WebSkinningJS] uploadSkinnedBones skinKey=${skinKey} boneBytes=${boneBytes.byteLength}`);
             _skinnedLogCount++;
@@ -413,17 +431,9 @@ window.seasonWebGPU = (() => {
         vertexBytes = _interopToU8(vertexBytes);
         if (!vertexBytes || vertexBytes.byteLength === 0) return false;
 
-        if (!mesh.vBuffer || (mesh.vBuffer.size || 0) < vertexBytes.byteLength) {
-            if (mesh.vBuffer) mesh.vBuffer.destroy();
-            const newSize = Math.max(vertexBytes.byteLength, 4);
-            mesh.vBuffer = _device.createBuffer({
-                size: newSize,
-                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-            });
-            mesh.vBuffer.size = newSize;
-        }
-
-        _device.queue.writeBuffer(mesh.vBuffer, 0, vertexBytes);
+        mesh.vBuffer = _writeSceneBuffer(mesh.vBuffer, vertexBytes, GPUBufferUsage.VERTEX);
+        mesh.boundsCenter = _meshBoundsCenter(new Float32Array(vertexBytes.buffer, vertexBytes.byteOffset,
+            vertexBytes.byteLength / 4), mesh.vertexStrideFloats || 20);
         return true;
     }
 
@@ -717,7 +727,7 @@ window.seasonWebGPU = (() => {
     // the Overlay family and passes it here, while this backend still bakes the overlay PSOs from the main module.
     // The parameter is declared so the positional slot is visible rather than silently dropped, which is what let the
     // trailing maxAnisotropy argument be added safely behind it.
-    async function initialize(canvasId, shaderSource, blitShaderSource, hdrSceneColor, shadowDepthBias, shadowSlopeBias, velocityOutput, overlayShaderSource, maxAnisotropy = 1) {
+    async function initialize(canvasId, shaderSource, blitShaderSource, hdrSceneColor, shadowDepthBias, shadowSlopeBias, velocityOutput, overlayShaderSource, maxAnisotropy = 1, fogSampling = false) {
         if (_device) throw new Error('Reload the page before starting a second WebGPU host');
         _mesh3DShader = shaderSource;
         _blitShaderWGSL = blitShaderSource;
@@ -884,6 +894,7 @@ window.seasonWebGPU = (() => {
 
         // Create the unified pipeline
         // both skeletal skinning and instancing are already covered by it
+        if (fogSampling && hdrSceneColor) _initializeFogSampling();
         _createMesh3DPipeline();
 
         // Identity instance buffer (80B)
@@ -928,10 +939,27 @@ window.seasonWebGPU = (() => {
         return { success, width: meta.width || 0, height: meta.height || 0 };
     }
 
+    const _sceneTextureSources = new WeakMap(), _sceneTextureReads = new WeakMap(), _atlasShadows = new WeakMap();
+    function _readSceneTextureView(view) {
+        const texture = view && _sceneTextureSources.get(view);
+        if (texture && _frameStarted) _sceneTextureReads.set(texture, _computeFrameId);
+        return view;
+    }
+
+    function _sceneTextureInUse(texture) {
+        return _frameStarted && _sceneTextureReads.get(texture) === _computeFrameId;
+    }
+
     function _storeTexture(name, texture, width, height, mipLevelCount = 1) {
+        const view = texture.createView(), previous = _textures[name];
         _textures[name] = texture;
-        _textureViews[name] = texture.createView();
+        _textureViews[name] = view;
+        _sceneTextureSources.set(view, texture);
         _textureMeta[name] = { width, height, mipLevelCount };
+        if (previous && previous !== texture) {
+            _invalidateComputeBindGroups();
+            _queueComputeRetirement(previous);
+        }
         return _getTextureResult(name, true);
     }
 
@@ -1002,11 +1030,14 @@ window.seasonWebGPU = (() => {
         // previous content at distance, which is much harder to diagnose than having no mipmaps at all.
         const mipLevelCount = (_textureMeta[name] || {}).mipLevelCount || 1;
         const expectedSize = _packedChainByteLength(width, height, mipLevelCount);
-        if (rgbaPixels.length !== expectedSize) {
-            console.error(`updateTexturePixels: size mismatch, got ${rgbaPixels.length}, expected ${expectedSize}`);
+        if (!rgbaPixels || rgbaPixels.length !== expectedSize
+            || width !== tex.width || height !== tex.height) {
+            console.error(`updateTexturePixels: size mismatch, got ${rgbaPixels?.length}, expected ${expectedSize}`);
             return false;
         }
 
+        if (_sceneTextureInUse(tex))
+            return createTextureFromPixels(name, rgbaPixels, width, height, true, mipLevelCount).success;
         _writeTextureLevels(tex, rgbaPixels, width, height, mipLevelCount);
         return true;
     }
@@ -1022,16 +1053,20 @@ window.seasonWebGPU = (() => {
             // because mipLevelCount is fixed at creation time.
             if (meta.width === width && meta.height === height && (meta.mipLevelCount || 1) === mipLevelCount)
                 return updateTexturePixels(name, rgbaPixels, width, height) ? { success: true, width, height } : { success: false, width: 0, height: 0 };
-            _textures[name].destroy();
-            delete _textures[name]; delete _textureViews[name]; delete _textureMeta[name];
         }
         rgbaPixels = _interopToU8(rgbaPixels);
+        if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1
+            || mipLevelCount > Math.floor(Math.log2(Math.max(width, height))) + 1
+            || !rgbaPixels || rgbaPixels.length !== _packedChainByteLength(width, height, mipLevelCount))
+            return { success: false, width: 0, height: 0 };
         const texture = _device.createTexture({
             size: [width, height], format: 'rgba8unorm', mipLevelCount,
             usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
         });
-        _writeTextureLevels(texture, rgbaPixels, width, height, mipLevelCount);
-        return _storeTexture(name, texture, width, height, mipLevelCount);
+        try {
+            _writeTextureLevels(texture, rgbaPixels, width, height, mipLevelCount);
+            return _storeTexture(name, texture, width, height, mipLevelCount);
+        } catch (error) { _queueComputeRetirement(texture); throw error; }
     }
 
     // 1-7 cubemap (contract clause 3):
@@ -1112,26 +1147,13 @@ window.seasonWebGPU = (() => {
             size: [width, height], format: 'rgba8unorm',
             usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
         });
-        return _storeTexture(name, texture, width, height);
+        const result = _storeTexture(name, texture, width, height);
+        _atlasShadows.set(texture, new Uint8Array(width * height * 4));
+        return result;
     }
 
     function uploadGlyphAtlasSubRects(atlasName, rgbaData, atlasWidth, rects) {
-        const tex = _textures[atlasName];
-        if (!tex) { console.error(`uploadGlyphAtlasSubRects: atlas '${atlasName}' not found`); return; }
-        if (!(rgbaData instanceof Uint8Array)) rgbaData = new Uint8Array(rgbaData);
-
-        const bytesPerRow = atlasWidth * 4;
-        const rectCount = rects.length / 4;
-        for (let i = 0; i < rectCount; i++) {
-            const rx = rects[i * 4], ry = rects[i * 4 + 1];
-            const rw = rects[i * 4 + 2], rh = rects[i * 4 + 3];
-            _device.queue.writeTexture(
-                { texture: tex, origin: [rx, ry, 0] },
-                rgbaData,
-                { bytesPerRow, offset: (ry * atlasWidth + rx) * 4 },
-                { width: rw, height: rh, depthOrArrayLayers: 1 }
-            );
-        }
+        _uploadAtlasRects(atlasName, _interopToU8(rgbaData), rects, atlasWidth);
     }
 
     // [JSImport] compact dirty-rect upload (Phase 4):
@@ -1140,22 +1162,38 @@ window.seasonWebGPU = (() => {
     // The old uploadGlyphAtlasSubRects addressed data through full-image offsets
     // and was forced to upload the whole image.
     function uploadGlyphAtlasPackedRects(atlasName, packedData, rects) {
-        const tex = _textures[atlasName];
-        if (!tex) { console.error(`uploadGlyphAtlasPackedRects: atlas '${atlasName}' not found`); return; }
-        packedData = _interopToU8(packedData);
+        _uploadAtlasRects(atlasName, _interopToU8(packedData), rects, 0);
+    }
 
-        let offset = 0;
-        const rectCount = rects.length / 4;
-        for (let i = 0; i < rectCount; i++) {
-            const rx = rects[i * 4], ry = rects[i * 4 + 1];
-            const rw = rects[i * 4 + 2], rh = rects[i * 4 + 3];
-            _device.queue.writeTexture(
-                { texture: tex, origin: [rx, ry, 0] },
-                packedData,
-                { bytesPerRow: rw * 4, offset },
-                { width: rw, height: rh, depthOrArrayLayers: 1 }
-            );
-            offset += rw * rh * 4;
+    function _uploadAtlasRects(name, bytes, rects, sourceWidth) {
+        const texture = _textures[name], shadow = texture && _atlasShadows.get(texture);
+        if (!texture || !shadow) throw new Error('字形更新必须使用已创建的图集');
+        if (!bytes || !rects || rects.length % 4 !== 0) throw new Error('无效字形更新数据');
+        let expected = 0;
+        for (let i = 0; i < rects.length; i += 4) {
+            const x = rects[i], y = rects[i+1], w = rects[i+2], h = rects[i+3];
+            if (![x,y,w,h].every(Number.isInteger) || x < 0 || y < 0 || w < 1 || h < 1
+                || x+w > texture.width || y+h > texture.height) throw new Error('字形矩形越界');
+            expected += w*h*4;
+        }
+        if (sourceWidth ? sourceWidth !== texture.width || bytes.length !== shadow.length : bytes.length !== expected)
+            throw new Error('字形更新字节数不匹配');
+        if (rects.length === 0) return;
+        const replace = _sceneTextureInUse(texture), pixels = replace ? shadow.slice() : shadow;
+        let packedOffset = 0;
+        for (let i = 0; i < rects.length; i += 4) {
+            const x = rects[i], y = rects[i+1], w = rects[i+2], h = rects[i+3];
+            const stride = (sourceWidth || w)*4, offset = sourceWidth ? (y*sourceWidth+x)*4 : packedOffset;
+            if (!replace) _device.queue.writeTexture({ texture, origin:[x,y,0] }, bytes,
+                { bytesPerRow:stride, offset }, { width:w, height:h, depthOrArrayLayers:1 });
+            for (let row = 0; row < h; row++) pixels.set(bytes.subarray(offset+row*stride,offset+row*stride+w*4),
+                ((y+row)*texture.width+x)*4);
+            packedOffset += w*h*4;
+        }
+        if (replace) {
+            // 图集保留 CPU 影子以复制未更新区域；不在已捕获视图上修改部分纹理。
+            createTextureFromPixels(name, pixels, texture.width, texture.height, true);
+            _atlasShadows.set(_textures[name], pixels);
         }
     }
 
@@ -1341,9 +1379,11 @@ window.seasonWebGPU = (() => {
         };
 
         const buffers = vertexBuffers || [defaultVertexBuffer];
-
-        return _device.createRenderPipeline({
-            layout: _device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+        // 复用现有透明 PSO 档位；不为雾再创建一套材质变体矩阵。
+        const sampleFog = !!_fogSampling && !overlay && !modeKey.startsWith('opaque');
+        const layouts = sampleFog ? [bindGroupLayout, _fogSampling.layout] : [bindGroupLayout];
+        const pipeline = _device.createRenderPipeline({
+            layout: _device.createPipelineLayout({ bindGroupLayouts: layouts }),
             vertex: {
                 module: shaderModule,
                 entryPoint: vertexEntryPoint,
@@ -1357,7 +1397,7 @@ window.seasonWebGPU = (() => {
                 // Both share the same shade() body.
                 // WGSL has no preprocessor, so entry-point dispatch is used instead of
                 // #ifdef output-struct branching.
-                entryPoint: velocity ? 'fs_main_mrt' : 'fs_main',
+                entryPoint: (velocity ? 'fs_main_mrt' : 'fs_main') + (sampleFog ? '_fog' : ''),
                 targets: velocity
                     ? [_createColorTarget(modeKey), _createVelocityTarget(modeKey)]
                     : [_createColorTarget(modeKey, overlay ? _format : null)],
@@ -1373,6 +1413,8 @@ window.seasonWebGPU = (() => {
                 format: 'depth24plus',
             },
         });
+        if (sampleFog) _fogMaterialPipelines.add(pipeline);
+        return pipeline;
     }
 
     // 1-5 shadows
@@ -1748,11 +1790,13 @@ window.seasonWebGPU = (() => {
             usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
         });
         rt.colorView = rt.colorTex.createView();
-        rt.depthTex = _device.createTexture({
-            size: [width, height], format: 'depth24plus',
-            usage: GPUTextureUsage.RENDER_ATTACHMENT,
-        });
-        rt.depthView = rt.depthTex.createView();
+        if (!rt.noImplicitDepth) {
+            rt.depthTex = _device.createTexture({
+                size: [width, height], format: 'depth24plus',
+                usage: GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+            rt.depthView = rt.depthTex.createView();
+        }
         rt.width = width; rt.height = height;
         // 2-1: rebuilding colorView invalidates all variant bind-group caches
         // as a view-identity safety net.
@@ -1783,8 +1827,35 @@ window.seasonWebGPU = (() => {
     }
 
     function _destroyRenderTargetResources(rt) {
-        if (rt.colorTex) rt.colorTex.destroy();
-        if (rt.depthTex) rt.depthTex.destroy();
+        if (rt.colorTex) _queueComputeRetirement(rt.colorTex);
+        if (rt.depthTex) _queueComputeRetirement(rt.depthTex);
+        rt.colorTex = rt.depthTex = rt.colorView = rt.depthView = null;
+        rt.blitBindGroup = rt.blitBindGroupLinear = rt.variantBindGroups = null;
+        _invalidateComputeBindGroups();
+    }
+
+    function _resizeRenderTargetResources(rt, width, height) {
+        // 完整分配成功才替换；旧命令引用在提交完成前继续有效。
+        const replacement = { ...rt, colorTex: null, depthTex: null, colorView: null, depthView: null };
+        try { _createRenderTargetResources(replacement, width, height); }
+        catch (error) { _destroyRenderTargetResources(replacement); throw error; }
+        _destroyRenderTargetResources(rt);
+        Object.assign(rt, replacement);
+    }
+
+    function synchronizeRenderTargetSizes() {
+        if (!_device || !_canvas || _immediateClosed || _instancedDiag.deviceLost)
+            throw new Error('渲染目标尺寸同步要求有效 WebGPU 设备');
+        if (_frameStarted || _commandEncoder || _passEncoder || (_sceneCollection?.stage ?? 0) !== 0)
+            throw new Error('渲染目标尺寸同步必须在帧外执行');
+        const width = _canvas.width, height = _canvas.height;
+        if (!(width > 0 && height > 0)) throw new Error('渲染目标尺寸同步要求非零画布');
+        // 收集之前固定资源身份；C# 效果 Resize 在此成功后才读取新尺寸。
+        for (const rt of Object.values(_renderTargets)) {
+            if (rt.matchBackbuffer && (rt.width !== width || rt.height !== height))
+                _resizeRenderTargetResources(rt, width, height);
+        }
+        return [width, height];
     }
 
     // formatKind:
@@ -1803,19 +1874,26 @@ window.seasonWebGPU = (() => {
             matchBackbuffer: !!matchBackbuffer,
             depthOnly: formatKind === 2 || formatKind === 3,
             velocity: formatKind === 4,
+            // 5/6 保留 HDR/LDR 颜色，但不创建兼容旧场景管线的隐式深度。
+            noImplicitDepth: formatKind === 5 || formatKind === 6,
         };
         if (rt.depthOnly) {
             rt.depthFormat = formatKind === 3 ? 'depth24plus' : 'depth32float';
         } else if (rt.velocity) {
             rt.colorFormat = 'rg16float';
         } else {
-            rt.colorFormat = formatKind === 1 ? 'rgba16float' : _format;
+            rt.colorFormat = formatKind === 1 || formatKind === 5 ? 'rgba16float' : _format;
             _ensureBlitPipeline();
         }
         const w = matchBackbuffer ? _canvas.width : width;
         const h = matchBackbuffer ? _canvas.height : height;
-        _createRenderTargetResources(rt, w, h);
+        try { _createRenderTargetResources(rt, w, h); }
+        catch (error) { _destroyRenderTargetResources(rt); throw error; }
+        if (_renderTargets[name]) _destroyRenderTargetResources(_renderTargets[name]);
         _renderTargets[name] = rt;
+        // 把解析后的尺寸回传给 C#：matchBackbuffer 目标的描述符以 Width/Height = 0 申请，
+        // 而后端之上的效果按 Desc 分配资源（雾的 froxel 网格在 0x0 时会直接放弃分配）。
+        return [w, h];
     }
 
     function disposeRenderTarget(name) {
@@ -2363,6 +2441,7 @@ window.seasonWebGPU = (() => {
     function beginFrame(clearR, clearG, clearB, clearA) {
         if (_immediateClosed || _instancedDiag.deviceLost) throw new Error('WebGPU host closed or device lost');
         if (!_context || !_device) return;
+        synchronizeRenderTargetSizes();
         if (_debugLog) _fpsFrameStartMs = performance.now();
 
         const width = _canvas.width, height = _canvas.height;
@@ -2370,11 +2449,13 @@ window.seasonWebGPU = (() => {
 
         _poolCursor.vertex = _poolCursor.index = _poolCursor.uniform = _poolCursor.storage = 0;
         _computeFrameId++;
+        _fogSamplingFrame = null;
         // 2-3 Step C: frame serial
         // gate for the "roll prev bone shadow copy exactly once per frame" rule
         _frameSerial++;
 
         _commandEncoder = _device.createCommandEncoder();
+        _clearActivePass();
 
         _frameStarted = true;
     }
@@ -2387,10 +2468,17 @@ window.seasonWebGPU = (() => {
     // Offscreen targets are introduced in Step 2.
     // passId order matches the C# RenderPassId enum,
     // and the debug group is attached at the encoder level to wrap the whole pass (Step 0).
-    const _passLabels = ['Shadow', 'Scene', 'Post', 'OutlineMask', 'FinalBlit', 'Overlay'];
+    const _passLabels = ['Shadow', 'Scene', 'Post', 'OutlineMask', 'FinalBlit', 'Overlay', 'SceneOpaque', 'FogComposite', 'SceneTransparent'];
 
     function beginPass(passId, targetName, clearColorEnable, clearR, clearG, clearB, clearA, clearDepthEnable, storeDepth, depthTargetName, velocityTargetName) {
         if (!_frameStarted || !_commandEncoder) return;
+        if (_passEncoder) throw new Error('不能嵌套 WebGPU 渲染 Pass');
+        if (_isSceneCollecting()) throw new Error('场景收集封存之前不能开始渲染 Pass');
+        const fogTarget = targetName ? _renderTargets[targetName] : null;
+        if (passId === 7 && (!fogTarget || fogTarget.depthOnly || !fogTarget.noImplicitDepth
+            || fogTarget.colorFormat !== 'rgba16float' || depthTargetName || velocityTargetName))
+            throw new Error('雾合成必须使用独立 HDR 颜色目标，不能挂载深度或速度');
+        _clearActivePass();
 
         _commandEncoder.pushDebugGroup(_passLabels[passId] || `Pass${passId}`);
 
@@ -2403,8 +2491,7 @@ window.seasonWebGPU = (() => {
             // MatchBackbuffer RTs are lazily rebuilt on first use after resize
             // while the C# name handle remains unchanged
             if (rt.matchBackbuffer && (rt.width !== _canvas.width || rt.height !== _canvas.height)) {
-                _destroyRenderTargetResources(rt);
-                _createRenderTargetResources(rt, _canvas.width, _canvas.height);
+                _resizeRenderTargetResources(rt, _canvas.width, _canvas.height);
             }
             colorView = rt.colorView;
             depthView = rt.depthView;
@@ -2421,8 +2508,7 @@ window.seasonWebGPU = (() => {
         const drt = depthTargetName ? _renderTargets[depthTargetName] : null;
         if (drt) {
             if (drt.matchBackbuffer && (drt.width !== _canvas.width || drt.height !== _canvas.height)) {
-                _destroyRenderTargetResources(drt);
-                _createRenderTargetResources(drt, _canvas.width, _canvas.height);
+                _resizeRenderTargetResources(drt, _canvas.width, _canvas.height);
             }
             depthView = drt.depthView;
         }
@@ -2437,8 +2523,7 @@ window.seasonWebGPU = (() => {
         const vrt = (!depthOnly && velocityTargetName) ? _renderTargets[velocityTargetName] : null;
         if (vrt) {
             if (vrt.matchBackbuffer && (vrt.width !== _canvas.width || vrt.height !== _canvas.height)) {
-                _destroyRenderTargetResources(vrt);
-                _createRenderTargetResources(vrt, _canvas.width, _canvas.height);
+                _resizeRenderTargetResources(vrt, _canvas.width, _canvas.height);
             }
         }
         const velocityView = vrt ? vrt.colorView : null;
@@ -2453,7 +2538,7 @@ window.seasonWebGPU = (() => {
             colorAttachments.push({
                 view: velocityView,
                 clearValue: { r: 0, g: 0, b: 0, a: 0 },
-                loadOp: 'clear',
+                loadOp: clearColorEnable ? 'clear' : 'load',
                 storeOp: 'store',
             });
         }
@@ -2462,7 +2547,8 @@ window.seasonWebGPU = (() => {
             // Depth-only passes (shadow maps) use a depth-only attachment set,
             // and contents must be rendered through the dedicated depth32float pipeline (1-5)
             colorAttachments,
-            depthStencilAttachment: {
+            // FogComposite=7 只写颜色，不挂载也不清除原场景深度。
+            depthStencilAttachment: passId === 7 ? undefined : {
                 view: depthView,
                 depthClearValue: 1.0,
                 depthLoadOp: clearDepthEnable ? 'clear' : 'load',
@@ -2485,17 +2571,151 @@ window.seasonWebGPU = (() => {
         // routes draw sites to the overlay family
         // backbuffer format + depth off
         _passOverlay = (passId === 5);
+        _activePassId = passId;
+        _activeColorTarget = rt;
+        _activeColorView = colorView;
+        _activeDepthView = passId === 7 ? null : depthView;
     }
 
     function endPass() {
         if (!_passEncoder) return;
         _passEncoder.end();
         _passEncoder = null;
-        _passDepthOnly = false;
-        _passVelocity = false;
-        _passOutlineMask = false;
-        _passOverlay = false;
+        _clearActivePass();
         if (_commandEncoder) _commandEncoder.popDebugGroup();
+    }
+
+    // 收集器保存已经解析的 GPU 绑定，不保存 Control、纹理名称或 WASM MemoryView。
+    // 命令、排序索引和优先级数组跨帧复用；关闭路径不创建收集器。
+    let _sceneCollection = null;
+    let _sceneFogAllowed = true;
+    const _sceneImmediateDraw = {};
+    function _isSceneCollecting() { return _sceneCollection?.stage === 1; }
+
+    function beginSceneCollection() {
+        if (!_frameStarted || !_commandEncoder || _passEncoder || _instancedDiag.deviceLost)
+            throw new Error('场景收集必须在有效帧的 Pass 外开始');
+        const c = _sceneCollection ??= { stage: 0, entries: [], opaque: [], transparent: [], priorities: [] };
+        if (c.stage !== 0) throw new Error('上一批场景命令尚未释放');
+        c.frame = _computeFrameId; c.command = _commandEncoder; c.stage = 1;
+        c.count = 0; c.priorityOffset = c.priorityCount = 0;
+    }
+
+    function _requireSceneCollection(stage) {
+        const c = _sceneCollection;
+        if (!c || c.stage !== stage || !_frameStarted || c.frame !== _computeFrameId
+            || c.command !== _commandEncoder || _instancedDiag.deviceLost)
+            throw new Error('场景收集阶段或帧身份不匹配');
+        return c;
+    }
+
+    function setSceneDrawPriority(values) {
+        const c = _requireSceneCollection(1);
+        if (!values || values.length % 2 !== 0) throw new Error('场景优先级必须是 Layer/Order 整数对');
+        for (let i = 0; i < values.length; i++)
+            if (!Number.isInteger(values[i]) || values[i] < -2147483648 || values[i] > 2147483647)
+                throw new Error('场景优先级必须是 Layer/Order 整数对');
+        c.priorityOffset = c.priorities.length; c.priorityCount = values.length;
+        for (let i = 0; i < values.length; i++) c.priorities.push(values[i]);
+    }
+
+    function _compareSceneDraws(aIndex, bIndex, transparent) {
+        const c = _sceneCollection, a = c.entries[aIndex], b = c.entries[bIndex];
+        for (let i = 0; i < Math.max(a.priorityCount, b.priorityCount); i++) {
+            const av = i < a.priorityCount ? c.priorities[a.priorityOffset + i] : 0;
+            const bv = i < b.priorityCount ? c.priorities[b.priorityOffset + i] : 0;
+            if (av !== bv) return av - bv;
+        }
+        return (transparent ? b.depth - a.depth : 0) || aIndex - bIndex;
+    }
+
+    function sealSceneCollection() {
+        const c = _requireSceneCollection(1);
+        if (_passEncoder) throw new Error('不能在 Pass 内封存场景');
+        c.opaque.sort((a, b) => _compareSceneDraws(a, b, false));
+        c.transparent.sort((a, b) => _compareSceneDraws(a, b, true));
+        c.stage = 2;
+    }
+
+    function drawCollectedOpaque() {
+        const c = _requireSceneCollection(2);
+        if (!_passEncoder || _activePassId !== 6) throw new Error('不透明命令只能在 SceneOpaque 消费');
+        c.stage = 3;
+        for (const index of c.opaque) _executeSceneDraw(c.entries[index]);
+    }
+
+    function drawCollectedTransparent(sampleFog) {
+        const c = _requireSceneCollection(3);
+        if (!_passEncoder || _activePassId !== 8) throw new Error('透明命令只能在 SceneTransparent 消费');
+        c.stage = 4;
+        const previous = _sceneFogAllowed;
+        _sceneFogAllowed = !!sampleFog;
+        try { for (const index of c.transparent) _executeSceneDraw(c.entries[index]); }
+        finally { _sceneFogAllowed = previous; }
+    }
+
+    function releaseSceneCollection() {
+        const c = _sceneCollection;
+        if (!c) return;
+        for (let i = 0; i < c.count; i++) {
+            const entry = c.entries[i];
+            entry.group = entry.instances = entry.vertices = entry.indices = null;
+        }
+        c.opaque.length = c.transparent.length = c.priorities.length = 0;
+        c.count = c.stage = 0; c.command = null;
+    }
+
+    function _executeSceneDraw(entry) {
+        const pipelines = _activeMeshPipelines();
+        const draw = pipeline => {
+            _setMeshPipeline(pipeline);
+            if (entry.instances) _passEncoder.setVertexBuffer(0, entry.instances);
+            if (entry.vertices) _passEncoder.setVertexBuffer(1, entry.vertices);
+            _passEncoder.setBindGroup(0, entry.group);
+            if (entry.indices) {
+                _passEncoder.setIndexBuffer(entry.indices, entry.indexFormat);
+                _passEncoder.drawIndexed(entry.count, entry.instanceCount, 0, 0, entry.firstInstance);
+            } else _passEncoder.draw(entry.count, entry.instanceCount, 0, entry.firstInstance);
+        };
+        if (entry.indices) _drawIndexedWithOptionalDoubleSidedTransparency(pipelines, entry.mode, entry.doubleSided, draw);
+        else draw(pipelines[_getPipelineVariantKey(entry.mode, entry.doubleSided)]);
+    }
+
+    function _submitSceneDraw(mode, doubleSided, group, instances, vertices, indices, indexFormat, count,
+        instanceCount = 1, firstInstance = 0, depth = 0) {
+        if (!Number.isFinite(depth)) throw new Error('场景绘制深度必须有限');
+        const c = _isSceneCollecting() ? _requireSceneCollection(1) : null;
+        const entry = c ? (c.entries[c.count] ??= {}) : _sceneImmediateDraw;
+        entry.mode = mode; entry.doubleSided = doubleSided; entry.group = group;
+        entry.instances = _readSceneBuffer(instances); entry.vertices = _readSceneBuffer(vertices);
+        entry.indices = _readSceneBuffer(indices); entry.indexFormat = indexFormat;
+        entry.count = count; entry.instanceCount = instanceCount; entry.firstInstance = firstInstance; entry.depth = depth;
+        if (c) {
+            entry.priorityOffset = c.priorityOffset; entry.priorityCount = c.priorityCount;
+            (mode.startsWith('opaque') ? c.opaque : c.transparent).push(c.count++);
+        } else {
+            try { _executeSceneDraw(entry); }
+            finally { entry.group = entry.instances = entry.vertices = entry.indices = null; }
+        }
+    }
+
+    function _sceneDrawDepth(uniform, center = null, instanceData = null, firstInstance = 0) {
+        const m = instanceData || uniform, offset = instanceData ? firstInstance * 20 : 0;
+        const x = center?.[0] ?? 0, y = center?.[1] ?? 0, z = center?.[2] ?? 0;
+        const wx = x*m[offset]+y*m[offset+4]+z*m[offset+8]+m[offset+12];
+        const wy = x*m[offset+1]+y*m[offset+5]+z*m[offset+9]+m[offset+13];
+        const wz = x*m[offset+2]+y*m[offset+6]+z*m[offset+10]+m[offset+14];
+        return wx*uniform[18]+wy*uniform[22]+wz*uniform[26]+uniform[30];
+    }
+
+    function _meshBoundsCenter(vertices, stride) {
+        let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+        for (let i = 0; i + 2 < vertices.length; i += stride) {
+            minX = Math.min(minX, vertices[i]); maxX = Math.max(maxX, vertices[i]);
+            minY = Math.min(minY, vertices[i+1]); maxY = Math.max(maxY, vertices[i+1]);
+            minZ = Math.min(minZ, vertices[i+2]); maxZ = Math.max(maxZ, vertices[i+2]);
+        }
+        return vertices.length >= 3 ? [(minX+maxX)*0.5, (minY+maxY)*0.5, (minZ+maxZ)*0.5] : [0,0,0];
     }
 
     function _getUniformI32View(uniformData) {
@@ -2589,7 +2809,7 @@ window.seasonWebGPU = (() => {
         if (!_device) return;
         lightBytes = _interopToU8(lightBytes);
         if (!lightBytes || lightBytes.byteLength !== SCENE_LIGHT_BYTES) return;
-        _device.queue.writeBuffer(_ensureSceneLightBuffer(), 0, lightBytes);
+        _sceneLightBuffer = _writeSceneBuffer(_ensureSceneLightBuffer(), lightBytes, GPUBufferUsage.UNIFORM);
     }
 
     // prevBoneBuffer / prevInstanceBuffer (2-3 Step C):
@@ -2605,21 +2825,21 @@ window.seasonWebGPU = (() => {
             entries: [
                 { binding: 0, resource: { buffer: uniformBuffer } },
                 { binding: 1, resource: _samplers['linear'] },
-                { binding: 2, resource: texView },
-                { binding: 3, resource: normalView },
-                { binding: 4, resource: mrView },
-                { binding: 5, resource: aoView },
-                { binding: 6, resource: emissiveView },
-                { binding: 7, resource: { buffer: boneBuffer || _defaultBoneBuffer } },
-                { binding: 8, resource: { buffer: morphMetaBuffer || _defaultMorphMetaBuffer } },
-                { binding: 9, resource: { buffer: morphDataBuffer || _defaultMorphDataBuffer } },
-                { binding: 10, resource: { buffer: _ensureSceneLightBuffer() } },
+                { binding: 2, resource: _readSceneTextureView(texView) },
+                { binding: 3, resource: _readSceneTextureView(normalView) },
+                { binding: 4, resource: _readSceneTextureView(mrView) },
+                { binding: 5, resource: _readSceneTextureView(aoView) },
+                { binding: 6, resource: _readSceneTextureView(emissiveView) },
+                { binding: 7, resource: { buffer: _readSceneBuffer(boneBuffer || _defaultBoneBuffer) } },
+                { binding: 8, resource: { buffer: _readSceneBuffer(morphMetaBuffer || _defaultMorphMetaBuffer) } },
+                { binding: 9, resource: { buffer: _readSceneBuffer(morphDataBuffer || _defaultMorphDataBuffer) } },
+                { binding: 10, resource: { buffer: _readSceneBuffer(_ensureSceneLightBuffer()) } },
                 // 1-5: lazily resolve the atlas view by name-as-handle,
                 // falling back to a 1x1 dummy when the RT has not been created yet
                 { binding: 11, resource: _getShadowAtlasView() },
                 { binding: 12, resource: _samplers['shadow'] },
-                { binding: 13, resource: { buffer: prevBoneBuffer || _defaultBoneBuffer } },
-                { binding: 14, resource: { buffer: prevInstanceBuffer || _defaultPrevInstanceBuffer } },
+                { binding: 13, resource: { buffer: _readSceneBuffer(prevBoneBuffer || _defaultBoneBuffer) } },
+                { binding: 14, resource: { buffer: _readSceneBuffer(prevInstanceBuffer || _defaultPrevInstanceBuffer) } },
                 // 1-7: lazily resolve the environment cube view
                 // with the same name-as-handle pattern,
                 // falling back to a 1x1 all-black cube when not registered.
@@ -2750,9 +2970,9 @@ window.seasonWebGPU = (() => {
             layout: _shadowBindGroupLayout,
             entries: [
                 { binding: 0, resource: { buffer: uniformBuffer } },
-                { binding: 7, resource: { buffer: boneBuffer || _defaultBoneBuffer } },
-                { binding: 8, resource: { buffer: morphMetaBuffer || _defaultMorphMetaBuffer } },
-                { binding: 9, resource: { buffer: morphDataBuffer || _defaultMorphDataBuffer } },
+                { binding: 7, resource: { buffer: _readSceneBuffer(boneBuffer || _defaultBoneBuffer) } },
+                { binding: 8, resource: { buffer: _readSceneBuffer(morphMetaBuffer || _defaultMorphMetaBuffer) } },
+                { binding: 9, resource: { buffer: _readSceneBuffer(morphDataBuffer || _defaultMorphDataBuffer) } },
                 { binding: 13, resource: { buffer: _defaultBoneBuffer } },
                 { binding: 14, resource: { buffer: _defaultPrevInstanceBuffer } },
             ]
@@ -2775,7 +2995,7 @@ window.seasonWebGPU = (() => {
     }
 
     function drawSprite2D(name, x, y, width, height, alpha, colorR, colorG, colorB, colorA, flipX, flipY, renderMode, pixelRange, clock, sourceX, sourceY, sourceWidth, sourceHeight) {
-        if (!_frameStarted || !_passEncoder) return;
+        if (!_frameStarted || (!_passEncoder && !_isSceneCollecting())) return;
 
         const texView = _textureViews[name] || _textureViews['White'];
         if (!texView) return;
@@ -2860,15 +3080,12 @@ window.seasonWebGPU = (() => {
             whiteView,
             whiteView);
 
-        _passEncoder.setPipeline(_selectPipelineByUniform(_activeMeshPipelines(), uni));
-        _passEncoder.setVertexBuffer(0, _identityInstanceBuffer);
-        _passEncoder.setVertexBuffer(1, vertexBuffer);
-        _passEncoder.setBindGroup(0, bindGroup);
-        _passEncoder.draw(6);
+        _submitSceneDraw(_selectPipelineMode(uni[94], _getUniformI32View(uni)[98], _getUniformI32View(uni)[99]),
+            false, bindGroup, _identityInstanceBuffer, vertexBuffer, null, null, 6);
     }
 
     function drawTextAtlasSprite(x, y, width, height, u0, v0, u1, v1, alpha, colorR, colorG, colorB, colorA, renderMode, pixelRange) {
-        if (!_frameStarted || !_passEncoder) return;
+        if (!_frameStarted || (!_passEncoder && !_isSceneCollecting())) return;
 
         const texView = _textureViews['TextAtlas'] || _textureViews['White'];
         if (!texView) return;
@@ -2920,11 +3137,8 @@ window.seasonWebGPU = (() => {
             whiteView,
             whiteView);
 
-        _passEncoder.setPipeline(_selectPipelineByUniform(_activeMeshPipelines(), uni));
-        _passEncoder.setVertexBuffer(0, _identityInstanceBuffer);
-        _passEncoder.setVertexBuffer(1, vertexBuffer);
-        _passEncoder.setBindGroup(0, bindGroup);
-        _passEncoder.draw(6);
+        _submitSceneDraw(_selectPipelineMode(uni[94], _getUniformI32View(uni)[98], _getUniformI32View(uni)[99]),
+            false, bindGroup, _identityInstanceBuffer, vertexBuffer, null, null, 6);
     }
 
     // Text GPU instancing
@@ -2945,38 +3159,21 @@ window.seasonWebGPU = (() => {
 
         instanceBytes = _interopToU8(instanceBytes);
         if (instanceBytes && instanceBytes.byteLength > 0) {
-            if (!entry.instanceBuffer || (entry.instanceBuffer.size || 0) < instanceBytes.byteLength) {
-                if (entry.instanceBuffer) entry.instanceBuffer.destroy();
-                const size = Math.max(instanceBytes.byteLength, 16);
-                entry.instanceBuffer = _device.createBuffer({
-                    size,
-                    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-                });
-                entry.instanceBuffer.size = size;
-            }
+            entry.instanceBuffer = _writeSceneBuffer(entry.instanceBuffer, instanceBytes, GPUBufferUsage.VERTEX, 16);
+            // 下述跨帧复用仍成立；同帧已被读取的版本由上方 helper 独立保活。
             // queue.writeBuffer has no in-flight frame race here,
             // so one persistent buffer is enough
             // with no DX-style multi-frame synchronization needed
-            _device.queue.writeBuffer(entry.instanceBuffer, 0, instanceBytes);
         }
 
         glyphBytes = _interopToU8(glyphBytes);
         if (glyphBytes && glyphBytes.byteLength > 0) {
-            if (!entry.glyphBuffer || (entry.glyphBuffer.size || 0) < glyphBytes.byteLength) {
-                if (entry.glyphBuffer) entry.glyphBuffer.destroy();
-                const size = Math.max(glyphBytes.byteLength, 16);
-                entry.glyphBuffer = _device.createBuffer({
-                    size,
-                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-                });
-                entry.glyphBuffer.size = size;
-            }
-            _device.queue.writeBuffer(entry.glyphBuffer, 0, glyphBytes);
+            entry.glyphBuffer = _writeSceneBuffer(entry.glyphBuffer, glyphBytes, GPUBufferUsage.STORAGE, 16);
         }
     }
 
     function drawTextInstanced(key, alpha, colorR, colorG, colorB, colorA, pixelRange) {
-        if (!_frameStarted || !_passEncoder) return;
+        if (!_frameStarted || (!_passEncoder && !_isSceneCollecting())) return;
 
         const entry = _textInstances[key];
         if (!entry || !entry.instanceBuffer || !entry.glyphBuffer || entry.instanceCount <= 0) return;
@@ -3013,24 +3210,21 @@ window.seasonWebGPU = (() => {
 
         // Transparent + DoubleSided
         // aligned with DX SetPipeline(Transparent, doubleSided: true)
-        _passEncoder.setPipeline(_activeMeshPipelines().transparentDoubleSided);
-        _passEncoder.setVertexBuffer(0, entry.instanceBuffer);
-        _passEncoder.setVertexBuffer(1, _sprite3DVertexBuffer);
-        _passEncoder.setBindGroup(0, bindGroup);
-        _passEncoder.draw(6, entry.instanceCount);
+        _submitSceneDraw('transparent', true, bindGroup, entry.instanceBuffer, _sprite3DVertexBuffer,
+            null, null, 6, entry.instanceCount);
     }
 
     function disposeTextInstance(key) {
         const entry = _textInstances[key];
         if (!entry) return;
-        if (entry.instanceBuffer) entry.instanceBuffer.destroy();
-        if (entry.glyphBuffer) entry.glyphBuffer.destroy();
+        if (entry.instanceBuffer) _queueComputeRetirement(entry.instanceBuffer);
+        if (entry.glyphBuffer) _queueComputeRetirement(entry.glyphBuffer);
         delete _textInstances[key];
     }
 
     let _drawSprite3DDiagCount = 0;
     function drawSprite3D(name, uniformData, billboard) {
-        if (!_frameStarted || !_passEncoder) return;
+        if (!_frameStarted || (!_passEncoder && !_isSceneCollecting())) return;
         if (!ArrayBuffer.isView(uniformData)) uniformData = new Float32Array(uniformData);
         if (_debugLog && _drawSprite3DDiagCount < 3) {
             _log(`[drawSprite3D] name=${name} billboard=${billboard} alpha=${uniformData?.[94]?.toFixed(2)}`);
@@ -3055,16 +3249,14 @@ window.seasonWebGPU = (() => {
             whiteView,
             whiteView);
 
-        _passEncoder.setPipeline(_selectPipelineByUniform(_activeMeshPipelines(), uniformData));
-        _passEncoder.setVertexBuffer(0, _identityInstanceBuffer);
-        _passEncoder.setVertexBuffer(1, _sprite3DVertexBuffer);
-        _passEncoder.setBindGroup(0, bindGroup);
-        _passEncoder.draw(6);
+        _submitSceneDraw(_selectPipelineMode(uniformData[94], _getUniformI32View(uniformData)[98], _getUniformI32View(uniformData)[99]),
+            false, bindGroup, _identityInstanceBuffer, _sprite3DVertexBuffer, null, null, 6, 1, 0,
+            _isSceneCollecting() ? _sceneDrawDepth(uniformData) : 0);
     }
 
     let _drawMesh3DDiagCount = 0;
     function drawMesh3D(name, vertexData, indexData, uniformData, textureName, metallicRoughnessTextureName, indexFormat = 'uint16', doubleSided = false) {
-        if (!_frameStarted || !_passEncoder) return;
+        if (!_frameStarted || (!_passEncoder && !_isSceneCollecting())) return;
 
         if (_debugLog && _drawMesh3DDiagCount < 30) {
             _log(`[drawMesh3D] ${name} v${vertexData?.byteLength} i${indexData?.length} u${uniformData?.byteLength} ${textureName}`);
@@ -3102,19 +3294,14 @@ window.seasonWebGPU = (() => {
             emissiveView);
 
         const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[94], _getUniformI32View(uniformData)[98], _getUniformI32View(uniformData)[99]);
-        _drawIndexedWithOptionalDoubleSidedTransparency(_activeMeshPipelines(), modeKey, doubleSided, (pipeline) => {
-            _passEncoder.setPipeline(pipeline);
-            _passEncoder.setVertexBuffer(0, _identityInstanceBuffer);
-            _passEncoder.setVertexBuffer(1, vBuffer);
-            _passEncoder.setIndexBuffer(iBuffer, resolvedIndexFormat);
-            _passEncoder.setBindGroup(0, bindGroup);
-            _passEncoder.drawIndexed(indexData.length);
-        });
+        _submitSceneDraw(modeKey, doubleSided, bindGroup, _identityInstanceBuffer, vBuffer, iBuffer,
+            resolvedIndexFormat, indexData.length, 1, 0,
+            _isSceneCollecting() ? _sceneDrawDepth(uniformData, _meshBoundsCenter(vertexData, 20)) : 0);
     }
 
     // Draw static meshes that have already been uploaded into persistent GPU buffers
     function drawMesh3DCached(cacheKey, uniformData, textureName, metallicRoughnessTextureName) {
-        if (!_frameStarted || !_passEncoder) return;
+        if (!_frameStarted || (!_passEncoder && !_isSceneCollecting())) return;
         const mesh = _staticMeshes[cacheKey];
         if (!mesh) {
             if (_debugLog) console.warn(`[drawMesh3DCached] missing key=${cacheKey}, fallback ignored`);
@@ -3140,18 +3327,13 @@ window.seasonWebGPU = (() => {
             whiteView);
 
         const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[94], _getUniformI32View(uniformData)[98], _getUniformI32View(uniformData)[99]);
-        _drawIndexedWithOptionalDoubleSidedTransparency(_activeMeshPipelines(), modeKey, mesh.doubleSided, (pipeline) => {
-            _passEncoder.setPipeline(pipeline);
-            _passEncoder.setVertexBuffer(0, _identityInstanceBuffer);
-            _passEncoder.setVertexBuffer(1, mesh.vBuffer);
-            _passEncoder.setIndexBuffer(mesh.iBuffer, mesh.indexFormat || 'uint16');
-            _passEncoder.setBindGroup(0, bindGroup);
-            _passEncoder.drawIndexed(mesh.indexCount);
-        });
+        _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, _identityInstanceBuffer, mesh.vBuffer, mesh.iBuffer,
+            mesh.indexFormat || 'uint16', mesh.indexCount, 1, 0,
+            _isSceneCollecting() ? _sceneDrawDepth(uniformData, mesh.boundsCenter) : 0);
     }
 
     function drawMesh3DBatch(cacheKeys, uniformBytes, count, skinKey) {
-        if (!_frameStarted || !_passEncoder || count <= 0) return;
+        if (!_frameStarted || (!_passEncoder && !_isSceneCollecting()) || count <= 0) return;
 
         const boneBuffer = skinKey ? (_skinnedBoneBuffers[skinKey] || _defaultBoneBuffer) : _defaultBoneBuffer;
         // 2-3 Step C: the prev bone palette is populated automatically
@@ -3186,7 +3368,8 @@ window.seasonWebGPU = (() => {
         // Nd keys (2-2 contract clause 7):
         // GTAO-exempt modes keep the same bucket order as base modes
         // with opaque / fade first and transparent last
-        for (const modeKey of ['opaque', 'fade', 'opaqueNd', 'fadeNd', 'transparent']) {
+        // 收集时按原图元序列捕获，再做全场景排序，不能先按材质桶改变等深度顺序。
+        for (const batchMode of (_isSceneCollecting() ? [null] : ['opaque', 'fade', 'opaqueNd', 'fadeNd', 'transparent'])) {
             let activePipeline = null;
             for (let i = 0; i < count; i++) {
                 const cacheKey = cacheKeys[i];
@@ -3195,8 +3378,8 @@ window.seasonWebGPU = (() => {
 
                 const uniformBase = i * STRIDE;
                 const alphaMode = intView[uniformBase + 98];
-                const pipelineMode = _selectPipelineMode(floatView[uniformBase + 94], alphaMode, intView[uniformBase + 99]);
-                if (pipelineMode !== modeKey) continue;
+                const modeKey = _selectPipelineMode(floatView[uniformBase + 94], alphaMode, intView[uniformBase + 99]);
+                if (batchMode !== null && modeKey !== batchMode) continue;
 
                 const uniformView = floatView.subarray(uniformBase, uniformBase + STRIDE);
 
@@ -3213,7 +3396,7 @@ window.seasonWebGPU = (() => {
                         activePipeline = _shadowPipeline;
                     }
                     _passEncoder.setVertexBuffer(0, _identityInstanceBuffer);
-                    _passEncoder.setVertexBuffer(1, mesh.vBuffer);
+                    _setSceneVertexBuffer(1, mesh.vBuffer);
                     _passEncoder.setIndexBuffer(mesh.iBuffer, mesh.indexFormat || 'uint16');
                     _passEncoder.setBindGroup(0, sBindGroup);
                     _passEncoder.drawIndexed(mesh.indexCount);
@@ -3253,7 +3436,7 @@ window.seasonWebGPU = (() => {
                         activePipeline = maskPipeline;
                     }
                     _passEncoder.setVertexBuffer(0, _identityInstanceBuffer);
-                    _passEncoder.setVertexBuffer(1, mesh.vBuffer);
+                    _setSceneVertexBuffer(1, mesh.vBuffer);
                     _passEncoder.setIndexBuffer(mesh.iBuffer, mesh.indexFormat || 'uint16');
                     _passEncoder.setBindGroup(0, mBindGroup);
                     _passEncoder.drawIndexed(mesh.indexCount);
@@ -3282,17 +3465,9 @@ window.seasonWebGPU = (() => {
                     mesh.morphDataBuffer,
                     prevBoneBuffer);
 
-                _drawIndexedWithOptionalDoubleSidedTransparency(_activeMeshPipelines(), modeKey, mesh.doubleSided, (pipeline) => {
-                    if (activePipeline !== pipeline) {
-                        _passEncoder.setPipeline(pipeline);
-                        activePipeline = pipeline;
-                    }
-                    _passEncoder.setVertexBuffer(0, _identityInstanceBuffer);
-                    _passEncoder.setVertexBuffer(1, mesh.vBuffer);
-                    _passEncoder.setIndexBuffer(mesh.iBuffer, mesh.indexFormat || 'uint16');
-                    _passEncoder.setBindGroup(0, bindGroup);
-                    _passEncoder.drawIndexed(mesh.indexCount);
-                });
+                _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, _identityInstanceBuffer, mesh.vBuffer, mesh.iBuffer,
+                    mesh.indexFormat || 'uint16', mesh.indexCount, 1, 0,
+                    _isSceneCollecting() ? _sceneDrawDepth(uniformView, mesh.boundsCenter) : 0);
             }
         }
     }
@@ -3310,7 +3485,7 @@ window.seasonWebGPU = (() => {
     // through instance_index addressing,
     // mirroring Vulkan firstInstance.
     function drawInstancedMesh3D(cacheKey, uniformData, instanceBytes, instanceCount, skinKey, prevInstanceBytes = null, firstInstance = 0) {
-        if (!_frameStarted || !_passEncoder || !instanceCount || instanceCount <= 0) return;
+        if (!_frameStarted || (!_passEncoder && !_isSceneCollecting()) || !instanceCount || instanceCount <= 0) return;
 
         const boneBuffer = skinKey ? (_skinnedBoneBuffers[skinKey] || _defaultBoneBuffer) : _defaultBoneBuffer;
         const prevBoneBuffer = skinKey ? (_prevSkinnedBoneBuffers[skinKey] || boneBuffer) : _defaultBoneBuffer;
@@ -3373,7 +3548,7 @@ window.seasonWebGPU = (() => {
             const sBindGroup = _createShadowBindGroup(uBuffer, boneBuffer, mesh.morphMetaBuffer, mesh.morphDataBuffer);
             _passEncoder.setPipeline(_shadowPipeline);
             _passEncoder.setVertexBuffer(0, instanceBuffer);
-            _passEncoder.setVertexBuffer(1, mesh.vBuffer);
+            _setSceneVertexBuffer(1, mesh.vBuffer);
             _passEncoder.setIndexBuffer(mesh.iBuffer, mesh.indexFormat || 'uint16');
             _passEncoder.setBindGroup(0, sBindGroup);
             _passEncoder.drawIndexed(mesh.indexCount, instanceCount);
@@ -3402,7 +3577,7 @@ window.seasonWebGPU = (() => {
                 prevBoneBuffer);
             _passEncoder.setPipeline(mesh.doubleSided ? _maskPipelineDoubleSided : _maskPipeline);
             _passEncoder.setVertexBuffer(0, instanceBuffer);
-            _passEncoder.setVertexBuffer(1, mesh.vBuffer);
+            _setSceneVertexBuffer(1, mesh.vBuffer);
             _passEncoder.setIndexBuffer(mesh.iBuffer, mesh.indexFormat || 'uint16');
             _passEncoder.setBindGroup(0, mBindGroup);
             _passEncoder.drawIndexed(mesh.indexCount, instanceCount, 0, 0, firstInstance);
@@ -3426,19 +3601,24 @@ window.seasonWebGPU = (() => {
         const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[94], _getUniformI32View(uniformData)[98], _getUniformI32View(uniformData)[99]);
         _instancedDiag.lastModeKey = modeKey;
         try {
-            _drawIndexedWithOptionalDoubleSidedTransparency(_activeMeshPipelines(), modeKey, mesh.doubleSided, (pipeline) => {
-                _passEncoder.setPipeline(pipeline);
-                _passEncoder.setVertexBuffer(0, instanceBuffer);
-                _passEncoder.setVertexBuffer(1, mesh.vBuffer);
-                _passEncoder.setIndexBuffer(mesh.iBuffer, mesh.indexFormat || 'uint16');
-                _passEncoder.setBindGroup(0, bindGroup);
+            if (_isSceneCollecting()) {
+                // Fade 与 Blend 均按实例深度参加全局排序；完整实例流保留骨骼/morph 索引。
+                const splitInstances = !modeKey.startsWith('opaque');
+                for (let i = 0; i < (splitInstances ? instanceCount : 1); i++) {
+                    const index = firstInstance + i;
+                    _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, instanceBuffer, mesh.vBuffer, mesh.iBuffer,
+                        mesh.indexFormat || 'uint16', mesh.indexCount, splitInstances ? 1 : instanceCount, index,
+                        _sceneDrawDepth(uniformData, mesh.boundsCenter, instanceBytes, index));
+                }
+            } else {
                 // Per-slot drawing
                 // for skinned shells / per-instance outline:
                 // firstInstance offsets instance_index,
                 // and the bone palette automatically stays aligned through instanceIndex*100 addressing.
                 // Regular calls pass the default 0 and behavior stays unchanged.
-                _passEncoder.drawIndexed(mesh.indexCount, instanceCount, 0, 0, firstInstance);
-            });
+                _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, instanceBuffer, mesh.vBuffer, mesh.iBuffer,
+                    mesh.indexFormat || 'uint16', mesh.indexCount, instanceCount, firstInstance);
+            }
         } catch (error) {
             _instancedDiag.lastError = error?.message || `${error}`;
             throw error;
@@ -3471,6 +3651,242 @@ window.seasonWebGPU = (() => {
     // repeated dispatches of the same kernel in one frame each get an independent uniform buffer,
     // avoiding parameter overwrites caused by writeBuffer executing before the merged submit.
     // This is zero-allocation in steady state.
+
+    // group(1) 与共享光照 UBO 分离。启停参数创建后不再写入，避免同帧覆盖。
+    let _fogSampling = null, _fogSamplingFrame = null;
+    const _fogMaterialPipelines = new WeakSet();
+
+    function _initializeFogSampling() {
+        if (_fogSampling) return;
+        const visibility = GPUShaderStage.FRAGMENT;
+        const layout = _device.createBindGroupLayout({ label: 'fog_material_layout', entries: [
+            { binding: 0, visibility, buffer: { type: 'read-only-storage', minBindingSize: _fogFrameBytes } },
+            { binding: 1, visibility, texture: { sampleType: 'float', viewDimension: '3d' } },
+            { binding: 2, visibility, texture: { sampleType: 'float', viewDimension: '3d' } },
+            { binding: 3, visibility, buffer: { type: 'uniform', minBindingSize: 16 } },
+        ] });
+        const buffers = [];
+        try {
+            const frame = _device.createBuffer({ label: 'fog_disabled_frame', size: _fogFrameBytes,
+                usage: GPUBufferUsage.STORAGE });
+            buffers.push(frame);
+            const params = [0, 1].map(value => {
+                const buffer = _device.createBuffer({ label: `fog_sampling_${value}`, size: 16,
+                    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+                buffers.push(buffer);
+                _device.queue.writeBuffer(buffer, 0, new Float32Array([value, 0, 0, 0]));
+                return buffer;
+            });
+            // 关闭分支不会查询介质；复用已有 AP 哨兵，不分配额外雾体积。
+            const disabled = _device.createBindGroup({ layout, entries: [
+                { binding: 0, resource: { buffer: frame, size: _fogFrameBytes } },
+                { binding: 1, resource: _defaultAerialLutView },
+                { binding: 2, resource: _defaultAerialLutView },
+                { binding: 3, resource: { buffer: params[0], size: 16 } },
+            ] });
+            _fogSampling = { layout, disabled, enabledParams: params[1], buffers };
+        } catch (error) {
+            for (const buffer of buffers) _queueComputeRetirement(buffer);
+            throw error;
+        }
+    }
+
+    function _fogMaterialGroup() {
+        const frame = _fogSamplingFrame;
+        if (!_sceneFogAllowed || !frame || !_frameStarted || !_passEncoder || _instancedDiag.deviceLost || _activePassId !== 8
+            || frame.command !== _commandEncoder || frame.frameId !== _computeFrameId
+            || _activeColorTarget !== frame.refs[13] || _activeColorView !== frame.refs[12]
+            || _activeDepthView !== frame.refs[10]
+            || !_sameFogResources(frame.refs, _resolveFogComposite(frame.input))) return _fogSampling.disabled;
+        return frame.samplingGroup;
+    }
+
+    function _setMeshPipeline(value) {
+        _passEncoder.setPipeline(value);
+        if (_fogMaterialPipelines.has(value)) _passEncoder.setBindGroup(1, _fogMaterialGroup());
+    }
+
+    // 独立雾合成：生产 WGSL 由 C# 提供；异步编译完成前 Prepare 明确回退。
+    const _fogComposites = Object.create(null);
+    const _fogFrameBytes = 384 * 16;
+    const _fogAoFormats = new Set(['r8unorm', 'r16float', 'rg16float', 'rgba16float',
+        'rgba8unorm', 'bgra8unorm']);
+
+    function createFogCompositePipeline(name, vertex, fragment) {
+        if (!_device || _instancedDiag.deviceLost || !name) return false;
+        if (_fogComposites[name]) return !_fogComposites[name].failed;
+        const device = _device;
+        const state = { device, pipeline: null, slots: [], cursor: 0, frameId: -1, prepared: null, failed: false };
+        let scopeOpen = false;
+        try {
+            device.pushErrorScope('validation'); scopeOpen = true;
+            const visibility = GPUShaderStage.FRAGMENT;
+            state.layout = device.createBindGroupLayout({ label: `${name}_layout`, entries: [
+                { binding: 0, visibility, buffer: { type: 'read-only-storage', minBindingSize: _fogFrameBytes } },
+                { binding: 1, visibility, texture: { sampleType: 'float', viewDimension: '3d' } },
+                { binding: 2, visibility, texture: { sampleType: 'float', viewDimension: '3d' } },
+                { binding: 3, visibility, texture: { sampleType: 'float', viewDimension: '2d' } },
+                { binding: 4, visibility, texture: { sampleType: 'depth', viewDimension: '2d' } },
+                { binding: 5, visibility, texture: { sampleType: 'float', viewDimension: '2d' } },
+                { binding: 6, visibility, buffer: { type: 'uniform', minBindingSize: 16 } },
+                { binding: 7, visibility, sampler: { type: 'filtering' } },
+            ] });
+            state.sampler = device.createSampler({ minFilter: 'linear', magFilter: 'linear',
+                addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge' });
+            const pending = device.createRenderPipelineAsync({ label: name,
+                layout: device.createPipelineLayout({ bindGroupLayouts: [state.layout] }),
+                vertex: { module: device.createShaderModule({ label: `${name}_vs`, code: vertex }), entryPoint: 'VSMain' },
+                fragment: { module: device.createShaderModule({ label: `${name}_ps`, code: fragment }),
+                    entryPoint: 'PSMain', targets: [{ format: 'rgba16float' }] },
+                primitive: { topology: 'triangle-list', cullMode: 'none' }, multisample: { count: 1 },
+            });
+            const validation = device.popErrorScope(); scopeOpen = false;
+            _fogComposites[name] = state;
+            Promise.all([pending, validation]).then(([pipeline, error]) => {
+                if (error) throw new Error(error.message);
+                if (_fogComposites[name] === state && _device === device && !_instancedDiag.deviceLost)
+                    state.pipeline = pipeline;
+            }).catch(error => {
+                state.failed = true; state.prepared = null;
+                console.error(`雾合成 '${name}' 编译失败：${error}`);
+            });
+            return true;
+        } catch (error) {
+            if (scopeOpen) device.popErrorScope().catch(() => {});
+            console.error(`雾合成 '${name}' 创建失败：${error}`);
+            return false;
+        }
+    }
+
+    function _fogTexture(texture, dimension, usage) {
+        return !!texture && texture.dimension === dimension && texture.sampleCount === 1
+            && texture.width > 0 && texture.height > 0 && texture.depthOrArrayLayers > 0
+            && (texture.usage & usage) === usage;
+    }
+
+    function _resolveFogComposite(input) {
+        const color = _renderTargets[input.color], depth = _renderTargets[input.depth];
+        const destination = _renderTargets[input.destination], frame = _storageBuffers[input.frame];
+        if (!color || !depth || !destination || color.depthOnly || !depth.depthOnly || destination.depthOnly
+            || !destination.noImplicitDepth || destination.depthTex || destination.depthView
+            || !frame || frame.size < _fogFrameBytes || !(frame.usage & GPUBufferUsage.STORAGE)
+            || !Number.isFinite(input.aoIntensity) || input.aoIntensity < 0) return null;
+        // 输入绝不在此重建；过期尺寸代表本帧数据不完整，必须回退。
+        for (const rt of [color, depth, destination])
+            if (rt.matchBackbuffer && (!_canvas || rt.width !== _canvas.width || rt.height !== _canvas.height)) return null;
+        const c = color.colorTex, d = depth.depthTex, out = destination.colorTex;
+        const sampled = GPUTextureUsage.TEXTURE_BINDING;
+        if (!_fogTexture(c, '2d', sampled) || c.format !== 'rgba16float'
+            || !_fogTexture(d, '2d', sampled) || !['depth24plus', 'depth32float'].includes(d.format)
+            || !_fogTexture(out, '2d', GPUTextureUsage.RENDER_ATTACHMENT) || out.format !== 'rgba16float'
+            || c.depthOrArrayLayers !== 1 || d.depthOrArrayLayers !== 1 || out.depthOrArrayLayers !== 1
+            || c === out || c.width !== d.width || c.height !== d.height
+            || c.width !== out.width || c.height !== out.height
+            || c.width !== color.width || c.height !== color.height
+            || d.width !== depth.width || d.height !== depth.height
+            || out.width !== destination.width || out.height !== destination.height) return null;
+        const integrated = _textures3d[input.integrated], local = _textures3d[input.local];
+        if (!_fogTexture(integrated, '3d', sampled) || !_fogTexture(local, '3d', sampled)
+            || integrated.format !== 'rgba16float' || local.format !== 'rgba16float'
+            || integrated.width !== local.width || integrated.height !== local.height
+            || integrated.depthOrArrayLayers !== local.depthOrArrayLayers + 1) return null;
+        let ao = c, aoView = color.colorView;
+        if (input.applyAo) {
+            if (input.aoTarget) {
+                const rt = _renderTargets[input.aoTarget];
+                if (!rt || rt.depthOnly || (rt.matchBackbuffer
+                    && (!_canvas || rt.width !== _canvas.width || rt.height !== _canvas.height))) return null;
+                ao = rt.colorTex; aoView = rt.colorView;
+            } else {
+                ao = _textures[input.aoTexture]; aoView = _textureViews[input.aoTexture];
+            }
+            if (!_fogTexture(ao, '2d', sampled) || ao.depthOrArrayLayers !== 1
+                || !_fogAoFormats.has(ao.format) || ao === out) return null;
+        }
+        const refs = [frame, integrated, local, c, d, ao, out, _textureViews3d[input.integrated],
+            _textureViews3d[input.local], color.colorView, depth.depthView, aoView, destination.colorView, destination];
+        return refs.every(Boolean) ? refs : null;
+    }
+
+    function _sameFogResources(a, b) {
+        return !!a && !!b && a.length === b.length && a.every((value, index) => value === b[index]);
+    }
+
+    function prepareFogComposite(name, color, depth, frame, integrated, local, aoTexture, aoTarget,
+        aoIntensity, applyAo, destination) {
+        const state = _fogComposites[name];
+        _fogSamplingFrame = null;
+        if (!state) return false;
+        state.prepared = null;
+        if (!_frameStarted || !_commandEncoder || _passEncoder || _instancedDiag.deviceLost
+            || state.device !== _device || !state.pipeline || state.failed) return false;
+        const input = { color, depth, frame, integrated, local, aoTexture, aoTarget, aoIntensity, applyAo, destination };
+        // 输出尚未用作本帧附件，可以在 Pass 外按当前画布重建。
+        const target = _renderTargets[destination];
+        try {
+            if (target && target.matchBackbuffer && (target.width !== _canvas.width || target.height !== _canvas.height))
+                _resizeRenderTargetResources(target, _canvas.width, _canvas.height);
+            const refs = _resolveFogComposite(input);
+            if (!refs) return false;
+            if (state.frameId !== _computeFrameId) { state.frameId = _computeFrameId; state.cursor = 0; }
+            const index = state.cursor++;
+            let slot = state.slots[index];
+            if (!slot) {
+                slot = { buffer: _device.createBuffer({ label: `${name}_params_${index}`, size: 16,
+                    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }), params: new Float32Array(4) };
+                state.slots[index] = slot;
+            }
+            // 同一提交中的不同合成拥有独立槽；下一帧复用由 queue 顺序保证安全。
+            slot.params[0] = aoIntensity; slot.params[1] = applyAo ? 1 : 0;
+            _device.queue.writeBuffer(slot.buffer, 0, slot.params);
+            if (!_sameFogResources(slot.refs, refs)) {
+                slot.group = _device.createBindGroup({ layout: state.layout, entries: [
+                    { binding: 0, resource: { buffer: refs[0], size: _fogFrameBytes } },
+                    { binding: 1, resource: refs[7] }, { binding: 2, resource: refs[8] },
+                    { binding: 3, resource: refs[9] }, { binding: 4, resource: refs[10] },
+                    { binding: 5, resource: refs[11] }, { binding: 6, resource: { buffer: slot.buffer, size: 16 } },
+                    { binding: 7, resource: state.sampler },
+                ] });
+                slot.samplingGroup = _fogSampling ? _device.createBindGroup({ layout: _fogSampling.layout, entries: [
+                    { binding: 0, resource: { buffer: refs[0], size: _fogFrameBytes } },
+                    { binding: 1, resource: refs[7] }, { binding: 2, resource: refs[8] },
+                    { binding: 3, resource: { buffer: _fogSampling.enabledParams, size: 16 } },
+                ] }) : null;
+                slot.refs = refs;
+            }
+            state.prepared = { input, refs, group: slot.group, samplingGroup: slot.samplingGroup,
+                owner: state, command: _commandEncoder, frameId: _computeFrameId };
+            return true;
+        } catch (error) {
+            console.error(`雾合成 '${name}' 准备失败：${error}`);
+            return false;
+        }
+    }
+
+    function drawFogComposite(name) {
+        const state = _fogComposites[name], prepared = state?.prepared;
+        if (!prepared) return 0;
+        state.prepared = null;
+        if (!_frameStarted || !_passEncoder || _instancedDiag.deviceLost || state.device !== _device
+            || prepared.command !== _commandEncoder || prepared.frameId !== _computeFrameId
+            || _activePassId !== 7 || _passDepthOnly || _passVelocity
+            || _activeColorTarget !== prepared.refs[13] || _activeColorView !== prepared.refs[12]
+            || !_sameFogResources(prepared.refs, _resolveFogComposite(prepared.input))) return 0;
+        _passEncoder.setPipeline(state.pipeline);
+        _passEncoder.setBindGroup(0, prepared.group);
+        _passEncoder.draw(3);
+        _fogSamplingFrame = prepared.samplingGroup ? prepared : null;
+        return prepared.input.applyAo ? 3 : 1;
+    }
+
+    function disposeFogCompositePipeline(name) {
+        const state = _fogComposites[name];
+        if (!state) return;
+        delete _fogComposites[name]; state.prepared = null;
+        if (_fogSamplingFrame?.owner === state) _fogSamplingFrame = null;
+        for (const slot of state.slots) _queueComputeRetirement(slot.buffer);
+        state.slots.length = 0;
+    }
 
     const _computeKernels = {};
     const _storageBuffers = {};
@@ -3602,7 +4018,7 @@ window.seasonWebGPU = (() => {
     function disposeComputeKernel(name) {
         const k = _computeKernels[name];
         if (!k) return;
-        for (const slot of k.slots) if (slot && slot.paramsBuffer) slot.paramsBuffer.destroy();
+        for (const slot of k.slots) if (slot && slot.paramsBuffer) _queueComputeRetirement(slot.paramsBuffer);
         delete _computeKernels[name];
     }
 
@@ -3617,13 +4033,15 @@ window.seasonWebGPU = (() => {
         const existing = _textures[name];
         if (existing) {
             const meta = _textureMeta[name] || {};
-            if (meta.width === width && meta.height === height) return _getTextureResult(name, true);
+            if (meta.width === width && meta.height === height && existing.format === _mapStorageFormat(formatKind))
+                return _getTextureResult(name, true);
             // On size changes, destroy the old GPUTexture and rebuild in place
             // while keeping the same name so consumer paths need no changes.
             // Compute bind-group caches holding the old textureView are now invalid
             // and are cleared entirely.
             // Resize is infrequent, so the cost is negligible.
-            existing.destroy();
+            _queueComputeRetirement(existing);
+            delete _textures[name]; delete _textureViews[name]; delete _textureMeta[name];
             _invalidateComputeBindGroups();
         }
         const texture = _device.createTexture({
@@ -3644,7 +4062,8 @@ window.seasonWebGPU = (() => {
     // createView() on a dimension:'3d' texture naturally creates a '3d' view,
     // matching layout viewDimension:'3d' by default.
     function createComputeTexture3D(name, width, height, depth, formatKind) {
-        if (!_device) return false;
+        if (!_device || _instancedDiag.deviceLost || !(width > 0 && height > 0 && depth > 0)
+            || Math.max(width, height, depth) > _device.limits.maxTextureDimension3D) return false;
         const format = _mapStorageFormat(formatKind);
         const meta = _textureMeta3d[name];
         if (meta) {
@@ -3653,8 +4072,7 @@ window.seasonWebGPU = (() => {
             // On size / format changes, rebuild in place.
             // Cached bind groups still hold destroyed views and must be fully cleared,
             // same as the 2D path.
-            _textures3d[name].destroy();
-            _invalidateComputeBindGroups();
+            releaseComputeTexture3D(name);
         }
         try {
             const texture = _device.createTexture({
@@ -3678,12 +4096,36 @@ window.seasonWebGPU = (() => {
     // and an old cache hit would bind a destroyed view.
     // Resize is infrequent, so clearing everything has no practical performance impact.
     function _invalidateComputeBindGroups() {
+        _fogSamplingFrame = null;
+        for (const state of Object.values(_fogComposites)) {
+            state.prepared = null;
+            for (const slot of state.slots) { slot.refs = null; slot.group = null; slot.samplingGroup = null; }
+        }
         for (const kn in _computeKernels) {
             const k = _computeKernels[kn];
             if (k.slots) for (const slot of k.slots) {
-                if (slot) { slot.bindGroup = null; slot.resKey = null; slot.rtRefs = null; }
+                if (slot) { slot.bindGroup = null; slot.resKey = null; slot.rtRefs = null; slot.bufferRefs = null; }
             }
         }
+    }
+
+    let _retiredComputeResources = [];
+    function releaseComputeTexture3D(name) {
+        const texture = _textures3d[name];
+        delete _textures3d[name]; delete _textureViews3d[name]; delete _textureMeta3d[name];
+        _invalidateComputeBindGroups();
+        if (texture) _queueComputeRetirement(texture);
+    }
+    function _queueComputeRetirement(resource) {
+        // 帧内资源必须等当前编码提交或丢弃后才能进入 GPU 退休队列。
+        _retiredComputeResources.push(resource);
+        if (!_frameStarted) _retireComputeResources();
+    }
+    function _retireComputeResources() {
+        if (!_retiredComputeResources.length) return;
+        const resources = _retiredComputeResources; _retiredComputeResources = [];
+        const dispose = () => { for (const resource of resources) resource.destroy(); };
+        _device.queue.onSubmittedWorkDone().then(dispose, dispose);
     }
 
     function createStorageBuffer(id, sizeInBytes) {
@@ -3703,24 +4145,31 @@ window.seasonWebGPU = (() => {
     // and ordering relative to later dispatches is guaranteed by submission order,
     // so no barrier is needed.
     function updateStorageBuffer(id, bytes) {
+        if (!_device || _instancedDiag.deviceLost || _passEncoder) return false;
         const buf = _storageBuffers[id];
-        if (!buf) { console.error(`updateStorageBuffer: storage buffer '${id}' not found`); return; }
+        if (!buf) { console.error(`updateStorageBuffer: storage buffer '${id}' not found`); return false; }
         const data = _interopToU8(bytes);
-        if (!data || data.byteLength === 0) return;
-        // 4-byte alignment + no overflow:
-        // createStorageBuffer already rounds up to 4,
-        // and any excess is truncated with a warning
-        const size = Math.min(data.byteLength & ~3, buf.size);
-        if (size < data.byteLength)
-            console.error(`updateStorageBuffer '${id}': ${data.byteLength}B exceeds buffer ${buf.size}B or is not 4-byte aligned, truncating to ${size}B`);
-        if (size > 0) _device.queue.writeBuffer(buf, 0, data, 0, size);
+        if (!data || data.byteLength === 0) return false;
+        // 必须完整上传；截断会留下上一帧参数，不能作为成功结果发布。
+        if ((data.byteLength & 3) !== 0 || data.byteLength > buf.size) {
+            console.error(`updateStorageBuffer '${id}': invalid ${data.byteLength}B for buffer ${buf.size}B`);
+            return false;
+        }
+        try {
+            _device.queue.writeBuffer(buf, 0, data, 0, data.byteLength);
+            return true;
+        } catch (e) {
+            console.error(`updateStorageBuffer '${id}' failed: ${e}`);
+            return false;
+        }
     }
 
     function disposeStorageBuffer(id) {
         const buf = _storageBuffers[id];
         if (!buf) return;
-        buf.destroy();
         delete _storageBuffers[id];
+        _invalidateComputeBindGroups();
+        _queueComputeRetirement(buf);
     }
 
     // resourcesJson:
@@ -3736,9 +4185,9 @@ window.seasonWebGPU = (() => {
     // so checking only the key would incorrectly hit old views.
     function dispatchCompute(name, paramsBytes, resourcesJson, gx, gy, gz) {
         const k = _computeKernels[name];
-        if (!k) { console.error(`dispatchCompute: kernel '${name}' not found`); return; }
-        if (!_frameStarted || !_commandEncoder) { console.error(`dispatchCompute '${name}': outside frame`); return; }
-        if (_passEncoder) { console.error(`dispatchCompute '${name}': dispatch is forbidden inside a render pass (contract violation)`); return; }
+        if (!k) { console.error(`dispatchCompute: kernel '${name}' not found`); return false; }
+        if (!_frameStarted || !_commandEncoder) { console.error(`dispatchCompute '${name}': outside frame`); return false; }
+        if (_passEncoder) { console.error(`dispatchCompute '${name}': dispatch is forbidden inside a render pass (contract violation)`); return false; }
 
         if (k.frameId !== _computeFrameId) { k.frameId = _computeFrameId; k.cursor = 0; }
         const slotIdx = k.cursor++;
@@ -3751,6 +4200,7 @@ window.seasonWebGPU = (() => {
                 bindGroup: null,
                 resKey: null,
                 rtRefs: null,
+                bufferRefs: null,
             };
             k.slots[slotIdx] = slot;
         }
@@ -3768,10 +4218,12 @@ window.seasonWebGPU = (() => {
                 if (!rt || (ref.depth ? rt.depthView : rt.colorView) !== ref.view) { rtStale = true; break; }
             }
         }
-        if (slot.resKey !== resourcesJson || rtStale) {
+        // 同名缓冲可能因 copy-on-write 切换版本；不能继续引用已退休的旧对象。
+        const bufferStale = slot.bufferRefs?.some(ref => _storageBuffers[ref.name] !== ref.buffer) ?? false;
+        if (slot.resKey !== resourcesJson || rtStale || bufferStale) {
             const resources = resourcesJson ? JSON.parse(resourcesJson) : [];
             const entries = [];
-            const rtRefs = [];
+            const rtRefs = [], bufferRefs = [];
             let resIndex = 0;
             for (let i = 0; i < k.bindings.length; i++) {
                 const type = k.bindings[i].type;
@@ -3780,7 +4232,7 @@ window.seasonWebGPU = (() => {
                     continue;
                 }
                 const ref = resources[resIndex++];
-                if (ref === undefined) { console.error(`dispatchCompute '${name}': resource count does not match the binding declaration`); return; }
+                if (ref === undefined) { console.error(`dispatchCompute '${name}': resource count does not match the binding declaration`); return false; }
                 if (ref.startsWith('r:')) {
                     const rtName = ref.slice(2);
                     const rt = _renderTargets[rtName];
@@ -3788,7 +4240,7 @@ window.seasonWebGPU = (() => {
                     // otherwise colorView
                     const wantDepth = type === 2;
                     const view = rt ? (wantDepth ? rt.depthView : rt.colorView) : null;
-                    if (!view) { console.error(`dispatchCompute '${name}': render target '${rtName}' not found`); return; }
+                    if (!view) { console.error(`dispatchCompute '${name}': render target '${rtName}' not found`); return false; }
                     entries.push({ binding: i, resource: view });
                     rtRefs.push({ name: rtName, view, depth: wantDepth });
                 } else if (type === 6 || type === 7) {
@@ -3797,17 +4249,18 @@ window.seasonWebGPU = (() => {
                     // and mixing them would silently bind the wrong dimension.
                     const texName = ref.slice(2);
                     const view = _textureViews3d[texName];
-                    if (!view) { console.error(`dispatchCompute '${name}': 3D texture '${texName}' not found`); return; }
+                    if (!view) { console.error(`dispatchCompute '${name}': 3D texture '${texName}' not found`); return false; }
                     entries.push({ binding: i, resource: view });
                 } else if (type === 1 || type === 3) {
                     const texName = ref.slice(2);
                     const view = _textureViews[texName];
-                    if (!view) { console.error(`dispatchCompute '${name}': texture '${texName}' not found`); return; }
+                    if (!view) { console.error(`dispatchCompute '${name}': texture '${texName}' not found`); return false; }
                     entries.push({ binding: i, resource: view });
                 } else {
                     const buf = _storageBuffers[ref.slice(2)];
-                    if (!buf) { console.error(`dispatchCompute '${name}': storage buffer '${ref.slice(2)}' not found`); return; }
+                    if (!buf) { console.error(`dispatchCompute '${name}': storage buffer '${ref.slice(2)}' not found`); return false; }
                     entries.push({ binding: i, resource: { buffer: buf } });
+                    bufferRefs.push({ name: ref.slice(2), buffer: buf });
                 }
             }
             if (k.hasSampled)
@@ -3815,6 +4268,7 @@ window.seasonWebGPU = (() => {
             slot.bindGroup = _device.createBindGroup({ label: `compute_${name}_bg`, layout: k.bindGroupLayout, entries });
             slot.resKey = resourcesJson;
             slot.rtRefs = rtRefs.length > 0 ? rtRefs : null;
+            slot.bufferRefs = bufferRefs.length > 0 ? bufferRefs : null;
         }
 
         const pass = _commandEncoder.beginComputePass({ label: `compute_${name}` });
@@ -3822,13 +4276,16 @@ window.seasonWebGPU = (() => {
         pass.setBindGroup(0, slot.bindGroup);
         pass.dispatchWorkgroups(gx, gy, gz);
         pass.end();
+        return true;
     }
 
     function endFrame() {
         if (!_frameStarted || !_commandEncoder) return;
         // Defensive handling for an unmatched EndPass
         // normal paths should already have closed the pass via endPass
-        if (_passEncoder) { _passEncoder.end(); _passEncoder = null; }
+        if (_passEncoder) endPass();
+        _clearActivePass();
+        releaseSceneCollection();
         let readback = null;
         const capture = _nextCapture;
         _nextCapture = null;
@@ -3859,6 +4316,7 @@ window.seasonWebGPU = (() => {
         }
         _commandEncoder = null; _frameStarted = false;
         _retireImmediateResources();
+        _retireComputeResources();
 
         if (_debugLog) {
             const now = performance.now(), frameMs = now - _fpsFrameStartMs;
@@ -3966,7 +4424,7 @@ window.seasonWebGPU = (() => {
             if (!group) {
                 group = _device.createBindGroup({ layout: _immediateLayout, entries: [
                     { binding: 0, resource: { buffer, offset: 0, size: 112 } },
-                    { binding: 1, resource: view },
+                    { binding: 1, resource: _readSceneTextureView(view) },
                     { binding: 2, resource: _immediateLinear },
                     { binding: 3, resource: _immediatePoint }
                 ] });
@@ -3991,6 +4449,7 @@ window.seasonWebGPU = (() => {
         if (!texture) return;
         // Remove the name now, but keep the captured object alive through encoding and submission.
         delete _textures[name]; delete _textureViews[name]; delete _textureMeta[name];
+        _invalidateComputeBindGroups();
         _immediateGarbage.push(() => texture.destroy());
         if (!_frameStarted) _retireImmediateResources();
     }
@@ -4008,9 +4467,12 @@ window.seasonWebGPU = (() => {
 
     function abortFrame() {
         if (_nextCapture) { _nextCapture.reject(new Error('Frame aborted')); _nextCapture = null; }
-        if (_passEncoder) { _passEncoder.end(); _passEncoder = null; }
+        if (_passEncoder) endPass();
+        _clearActivePass();
+        releaseSceneCollection();
         _commandEncoder = null; _frameStarted = false; _immediateDraws = [];
         _retireImmediateResources();
+        _retireComputeResources();
     }
 
     async function closeImmediate() {
@@ -4042,10 +4504,13 @@ window.seasonWebGPU = (() => {
         encodeH264Video,
         decodeH264Video,
         beginFrame,
+        beginSceneCollection, setSceneDrawPriority, sealSceneCollection,
+        drawCollectedOpaque, drawCollectedTransparent, releaseSceneCollection,
         beginPass,
         endPass,
         createRenderTarget,
         disposeRenderTarget,
+        synchronizeRenderTargetSizes,
         blitToBackbuffer,
         renderPost,
         drawSprite2D,
@@ -4095,12 +4560,13 @@ window.seasonWebGPU = (() => {
         getInstancedDiagState,
         createComputeKernel,
         disposeComputeKernel,
+        createFogCompositePipeline, prepareFogComposite, drawFogComposite, disposeFogCompositePipeline,
         createComputeTexture,
         createStorageBuffer,
         disposeStorageBuffer,
         dispatchCompute,
         // 1-8 Compute 3D resource expansion
-        createComputeTexture3D,
+        createComputeTexture3D, releaseComputeTexture3D,
         updateStorageBuffer,
     };
 })();

@@ -54,15 +54,37 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.endPass")]
     internal static partial void EndPass();
 
+    [JSImport("globalThis.seasonWebGPU.beginSceneCollection")]
+    internal static partial void BeginSceneCollection();
+
+    [JSImport("globalThis.seasonWebGPU.setSceneDrawPriority")]
+    internal static partial void SetSceneDrawPriority(int[] values);
+
+    [JSImport("globalThis.seasonWebGPU.sealSceneCollection")]
+    internal static partial void SealSceneCollection();
+
+    [JSImport("globalThis.seasonWebGPU.drawCollectedOpaque")]
+    internal static partial void DrawCollectedOpaque();
+
+    [JSImport("globalThis.seasonWebGPU.drawCollectedTransparent")]
+    internal static partial void DrawCollectedTransparent(bool sampleFog);
+
+    [JSImport("globalThis.seasonWebGPU.releaseSceneCollection")]
+    internal static partial void ReleaseSceneCollection();
+
     // ── 1-1 Offscreen RT / FinalBlit (Step 2/3): name-as-handle, with real resources owned by the JS side ──
 
     /// <summary>formatKind: 0 = BackbufferCompatible color, 1 = Rgba16Float color, 2 = depth-only D32Float,
     /// 3 = depth-only SceneDepth (2-2: depth24plus + TEXTURE_BINDING, matching the depth format already baked into the pipeline).</summary>
     [JSImport("globalThis.seasonWebGPU.createRenderTarget")]
-    internal static partial void CreateRenderTarget(string name, int width, int height, bool matchBackbuffer, int formatKind);
+    /// <summary>Creates the JS-side target and returns the resolved [width, height] (matchBackbuffer targets resolve from the canvas).</summary>
+    internal static partial int[] CreateRenderTarget(string name, int width, int height, bool matchBackbuffer, int formatKind);
 
     [JSImport("globalThis.seasonWebGPU.disposeRenderTarget")]
     internal static partial void DisposeRenderTarget(string name);
+
+    [JSImport("globalThis.seasonWebGPU.synchronizeRenderTargetSizes")]
+    internal static partial int[] SynchronizeRenderTargetSizes();
 
     /// <summary>2-1 Step D expansion: pass exposure/bloomIntensity with the blit
     /// (HDR sources writeBuffer them into the params uniform, while LDR sources ignore them).
@@ -292,6 +314,19 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.disposeComputeKernel")]
     internal static partial void DisposeComputeKernel(string name);
 
+    [JSImport("globalThis.seasonWebGPU.createFogCompositePipeline")]
+    internal static partial bool CreateFogCompositePipeline(string name, string vertex, string fragment);
+
+    [JSImport("globalThis.seasonWebGPU.prepareFogComposite")]
+    internal static partial bool PrepareFogComposite(string name, string color, string depth, string frame,
+        string integrated, string local, string? aoTexture, string? aoTarget, float aoIntensity, bool applyAo, string destination);
+
+    [JSImport("globalThis.seasonWebGPU.drawFogComposite")]
+    internal static partial int DrawFogComposite(string name);
+
+    [JSImport("globalThis.seasonWebGPU.disposeFogCompositePipeline")]
+    internal static partial void DisposeFogCompositePipeline(string name);
+
     /// <summary>Registers a storage texture (write-only storage + sampleable) into the JS _textures dictionary.
     /// formatKind is aligned with ComputeStorageFormat (0=rgba8unorm, 1=rgba16float, used by the 2-1 bloom chain).</summary>
     [JSImport("globalThis.seasonWebGPU.createComputeTexture")]
@@ -311,18 +346,21 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.createComputeTexture3D")]
     internal static partial bool CreateComputeTexture3D(string name, int width, int height, int depth, int formatKind);
 
+    [JSImport("globalThis.seasonWebGPU.releaseComputeTexture3D")]
+    internal static partial void ReleaseComputeTexture3D(string name);
+
     /// <summary>1-8: CPU → storage-buffer write path (StorageBufferRead constant-block channel).
     /// Must be called from the frame-loop thread and outside a render pass.
     /// On the JS side, queue.writeBuffer is ordered relative to later dispatches by submission order.</summary>
     [JSImport("globalThis.seasonWebGPU.updateStorageBuffer")]
-    internal static partial void UpdateStorageBuffer(
+    internal static partial bool UpdateStorageBuffer(
         string id,
         [JSMarshalAs<JSType.MemoryView>] Span<byte> bytes);
 
     /// <summary>Must be called outside a render pass (FrameStart/AfterScene phases).
     /// The JS side encodes writeBuffer plus a standalone compute pass into the current frame encoder.</summary>
     [JSImport("globalThis.seasonWebGPU.dispatchCompute")]
-    internal static partial void DispatchCompute(
+    internal static partial bool DispatchCompute(
         string name,
         [JSMarshalAs<JSType.MemoryView>] Span<byte> paramsBytes,
         string resourcesJson,

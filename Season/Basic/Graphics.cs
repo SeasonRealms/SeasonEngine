@@ -117,6 +117,12 @@ public interface IGraphics
     Season.Rendering.RenderTarget CreateRenderTarget(in Season.Rendering.RenderTargetDesc desc)
         => throw new NotImplementedException("CreateRenderTarget: implement when step 2 off-screen render targets are introduced");
 
+    /// <summary>在效果 Resize 前同步随窗口变化的 RT 资源与尺寸描述；已在平台 Resize 完成同步的后端无需额外操作。</summary>
+    void SynchronizeRenderTargetSizes() { }
+
+    /// <summary>缺少独立 HDR 雾合成能力时返回 null，不注册不完整的效果。</summary>
+    Season.Rendering.FogCompositePipeline? CreateFogCompositePipeline() => null;
+
     void BeginPass(in Season.Rendering.PassDesc desc)
         => throw new NotImplementedException("BeginPass: this platform has not integrated pass scheduling yet");
 
@@ -184,6 +190,19 @@ public interface IGraphics
 
     void DispatchCompute(in Season.Rendering.ComputeDispatchArgs args)
         => throw new NotImplementedException("DispatchCompute: this platform has not integrated the 1-6 compute foundation yet");
+
+    /// <summary>返回本次调度是否已录制；缺少任一资源时为 false，不代表 GPU 已执行完成。</summary>
+    bool TryDispatchCompute(in Season.Rendering.ComputeDispatchArgs args) => false;
+
+    /// <summary>完整帧数据上传已录制才返回 true；失败时消费者不得发布旧缓冲对应的输出。</summary>
+    bool TryUpdateStorageBuffer(Season.Rendering.StorageBuffer buffer, ReadOnlySpan<byte> data) => false;
+
+    /// <summary>创建或在 GPU 安全点重建三维纹理，返回真实资源是否可用。</summary>
+    bool TryCreateComputeTexture3D(string name, uint width, uint height, uint depth,
+        Season.Rendering.ComputeStorageFormat format = Season.Rendering.ComputeStorageFormat.Rgba8Unorm) => false;
+
+    /// <summary>注销效果独占的三维纹理，并按后端在飞资源契约延迟释放。</summary>
+    void ReleaseComputeTexture3D(string name) { }
 
     // Contract 1-7 cubemap type + environment IBL.
     // - On platforms with TextureCubeSupported=false, EnvironmentMap.LoadFromFacesAsync returns null,

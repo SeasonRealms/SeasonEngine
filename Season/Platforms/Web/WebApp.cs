@@ -265,7 +265,9 @@ public static class WebApp
             // (clause 10). Mirrors WindowsApp/LinuxApp/AndroidApp/AppDelegate. SampleCount 1 needs no guard
             // here for a different reason than on D3D12: this backend has no MSAA offscreen chain at all and
             // rewrote Msaa4x to Fxaa during tier finalization, so a multisampled scene is unreachable.
-            if (!immediate2D && RenderQuality.Current.MotionVectors && Season.Rendering.FrameSchedule.SceneDepth == null)
+            if (!immediate2D && Season.Rendering.FrameSchedule.SceneDepth == null
+                && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresFogSceneDepth(
+                    Graphics.HdrSceneColor, _graphics.ComputeSupported, immediate2D)))
             {
                 Season.Rendering.FrameSchedule.SceneDepth = _graphics.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
                 {

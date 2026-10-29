@@ -252,9 +252,13 @@ internal static unsafe class BlitPipeline
         Device.Vk.CmdBindPipeline(cmd, PipelineBindPoint.Graphics, pso);
         Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 0, 1, in sourceSet, 0, null);
         if (bloom)
+        {
             Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 1, 1, in bloomSet, 0, null);
+        }
         if (ao)
+        {
             Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 2, 1, in aoSet, 0, null);
+        }
         if (tonemap || bloom)
             PushParams(cmd, Device.HdrExposure, RenderQuality.Current.BloomIntensity, 0f, 0f,
                 RenderQuality.Current.AoIntensity);
@@ -277,9 +281,13 @@ internal static unsafe class BlitPipeline
         Device.Vk.CmdBindPipeline(cmd, PipelineBindPoint.Graphics, pso);
         Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 0, 1, in sourceSet, 0, null);
         if (bloom)
+        {
             Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 1, 1, in bloomSet, 0, null);
+        }
         if (ao)
+        {
             Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 2, 1, in aoSet, 0, null);
+        }
         PushParams(cmd, Device.HdrExposure, RenderQuality.Current.BloomIntensity, 0f, 0f,
             RenderQuality.Current.AoIntensity);
         Device.Vk.CmdDraw(cmd, 3, 1, 0, 0);
@@ -1057,4 +1065,266 @@ void main()
     outColor = vec4(clamp(result, vec3(0.0), vec3(1.0)), 1.0);
 }
 ";
+}
+
+/// <summary>独立 HDR 雾合成。描述符按帧槽与同帧调用轮转，所有销毁等待 GPU 退休。</summary>
+internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompositePipeline
+{
+    readonly Dictionary<string, Texture> _textures;
+    readonly List<DescriptorSet>[] _sets = new List<DescriptorSet>[(int)Device.frameCount];
+    readonly int[] _cursors = new int[(int)Device.frameCount];
+    readonly ulong[] _stamps = new ulong[(int)Device.frameCount];
+    readonly Silk.NET.Vulkan.ImageView[] _views = new Silk.NET.Vulkan.ImageView[5];
+    readonly ulong[] _versions = new ulong[6];
+    DescriptorSetLayout _setLayout;
+    PipelineLayout _layout;
+    VkPipeline _pipeline;
+    RenderPass _renderPass;
+    DescriptorSet _preparedSet;
+    Season.Rendering.FogCompositeInputs _inputs;
+    VKRenderTarget? _destination;
+    Silk.NET.Vulkan.Buffer _buffer;
+    CommandBuffer _command;
+    ulong _stamp;
+    uint _frameIndex;
+    bool _disposed;
+
+    // 透明阶段复用本次合成产出的雾资源：两张体积纹理只在 Resolve 校验通过后
+    // 才发布出去，且只允许在同一次提交、同一帧槽内被消费。
+    VKTexture3D? _fogIntegrated;
+    VKTexture3D? _fogLocal;
+    bool _composed;
+
+    /// <summary>本帧正在使用的合成流水线；透明阶段通过它取回雾采样资源。</summary>
+    internal static VKFogCompositePipeline? Active { get; private set; }
+
+    internal VKFogCompositePipeline(Dictionary<string, Texture> textures)
+    {
+        _textures = textures;
+        for (int i = 0; i < _sets.Length; i++) _sets[i] = new();
+        try { Initialize(); }
+        catch { Dispose(); throw; }
+    }
+
+    void Initialize()
+    {
+        var vk = Device.Vk; var device = Device.LogicalDevice;
+        var point = Pipeline.StaticPointSampler; var linear = Pipeline.StaticSampler;
+        if (point.Handle == 0 || linear.Handle == 0) throw new InvalidOperationException("雾合成采样器尚未初始化。");
+        var bindings = stackalloc DescriptorSetLayoutBinding[6];
+        for (int i = 0; i < 6; i++)
+            bindings[i] = new() { Binding = (uint)i, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit,
+                DescriptorType = i == 0 ? DescriptorType.StorageBuffer : DescriptorType.CombinedImageSampler,
+                PImmutableSamplers = i == 0 ? null : i == 5 ? &linear : &point };
+        var setInfo = new DescriptorSetLayoutCreateInfo { SType = StructureType.DescriptorSetLayoutCreateInfo,
+            BindingCount = 6, PBindings = bindings };
+        if (vk.CreateDescriptorSetLayout(device, in setInfo, null, out _setLayout) != Result.Success)
+            throw new InvalidOperationException("创建雾合成描述符布局失败。");
+        var setLayout = _setLayout;
+        var push = new PushConstantRange { StageFlags = ShaderStageFlags.FragmentBit, Size = 16 };
+        var layoutInfo = new PipelineLayoutCreateInfo { SType = StructureType.PipelineLayoutCreateInfo,
+            SetLayoutCount = 1, PSetLayouts = &setLayout, PushConstantRangeCount = 1, PPushConstantRanges = &push };
+        if (vk.CreatePipelineLayout(device, in layoutInfo, null, out _layout) != Result.Success)
+            throw new InvalidOperationException("创建雾合成管线布局失败。");
+        _renderPass = VKRenderTarget.CreateColorRenderPassForFormat(Format.R16G16B16A16Sfloat, colorOnly: true);
+        ShaderModule vertex = default, fragment = default;
+        try
+        {
+            vertex = ShaderCompiler.CreateShaderModule(vk, device, Season.Rendering.Effects.VolumetricFogEffect.CompositeVertexGlsl,
+                ShaderStageFlags.VertexBit, "main", "fog_composite.vert", false);
+            fragment = ShaderCompiler.CreateShaderModule(vk, device, Season.Rendering.Effects.VolumetricFogEffect.CompositeGlsl,
+                ShaderStageFlags.FragmentBit, "main", "fog_composite.frag", false);
+            ReadOnlySpan<byte> entry = "main\0"u8;
+            fixed (byte* name = entry)
+            {
+                var stages = stackalloc PipelineShaderStageCreateInfo[2];
+                stages[0] = new() { SType = StructureType.PipelineShaderStageCreateInfo, Stage = ShaderStageFlags.VertexBit, Module = vertex, PName = name };
+                stages[1] = new() { SType = StructureType.PipelineShaderStageCreateInfo, Stage = ShaderStageFlags.FragmentBit, Module = fragment, PName = name };
+                var input = new PipelineVertexInputStateCreateInfo { SType = StructureType.PipelineVertexInputStateCreateInfo };
+                var assembly = new PipelineInputAssemblyStateCreateInfo { SType = StructureType.PipelineInputAssemblyStateCreateInfo, Topology = PrimitiveTopology.TriangleList };
+                var viewport = new PipelineViewportStateCreateInfo { SType = StructureType.PipelineViewportStateCreateInfo, ViewportCount = 1, ScissorCount = 1 };
+                var raster = new PipelineRasterizationStateCreateInfo { SType = StructureType.PipelineRasterizationStateCreateInfo,
+                    PolygonMode = PolygonMode.Fill, CullMode = CullModeFlags.None, FrontFace = FrontFace.Clockwise, LineWidth = 1 };
+                var samples = new PipelineMultisampleStateCreateInfo { SType = StructureType.PipelineMultisampleStateCreateInfo, RasterizationSamples = SampleCountFlags.Count1Bit };
+                var blendAttachment = new PipelineColorBlendAttachmentState {
+                    ColorWriteMask = ColorComponentFlags.RBit | ColorComponentFlags.GBit | ColorComponentFlags.BBit | ColorComponentFlags.ABit };
+                var blend = new PipelineColorBlendStateCreateInfo { SType = StructureType.PipelineColorBlendStateCreateInfo, AttachmentCount = 1, PAttachments = &blendAttachment };
+                var states = stackalloc DynamicState[2] { DynamicState.Viewport, DynamicState.Scissor };
+                var dynamic = new PipelineDynamicStateCreateInfo { SType = StructureType.PipelineDynamicStateCreateInfo, DynamicStateCount = 2, PDynamicStates = states };
+                var info = new GraphicsPipelineCreateInfo { SType = StructureType.GraphicsPipelineCreateInfo,
+                    StageCount = 2, PStages = stages, PVertexInputState = &input, PInputAssemblyState = &assembly,
+                    PViewportState = &viewport, PRasterizationState = &raster, PMultisampleState = &samples,
+                    PColorBlendState = &blend, PDynamicState = &dynamic, Layout = _layout, RenderPass = _renderPass };
+                if (vk.CreateGraphicsPipelines(device, default, 1, in info, null, out _pipeline) != Result.Success)
+                    throw new InvalidOperationException("创建雾合成图形管线失败。");
+            }
+        }
+        finally
+        {
+            if (vertex.Handle != 0) vk.DestroyShaderModule(device, vertex, null);
+            if (fragment.Handle != 0) vk.DestroyShaderModule(device, fragment, null);
+        }
+    }
+
+    // 只接受生产者已经完成写入并转入采样布局的资源，不在 Pass 内补发 barrier。
+    bool Resolve(in Season.Rendering.FogCompositeInputs input, VKRenderTarget destination,
+        Span<Silk.NET.Vulkan.ImageView> views, Span<ulong> versions, out BufferResource buffer)
+    {
+        buffer = default;
+        if (input.Color is not VKRenderTarget color || input.Depth is not VKRenderTarget depth
+            || input.FrameBuffer is not VKStorageBuffer frame || frame.Buffer.Buffer.Handle == 0
+            || frame.Buffer.Size < Season.Rendering.Effects.VolumetricFogEffect.FrameVectorCount * 16
+            || color.Desc.ColorFormat != Season.Rendering.RtFormat.Rgba16Float
+            || destination.Desc.ColorFormat != Season.Rendering.RtFormat.Rgba16Float
+            || depth.HasColor || depth.Desc.DepthFormat != Season.Rendering.RtFormat.D32Float
+            || color.Desc.SampleCount != 1 || depth.Desc.SampleCount != 1 || destination.Desc.SampleCount != 1
+            || color.ColorView.Handle == 0 || depth.DepthView.Handle == 0 || destination.ColorView.Handle == 0
+            || destination.ColorImage.Handle == color.ColorImage.Handle || color.Width == 0 || color.Height == 0
+            || color.Width != destination.Width || color.Height != destination.Height
+            || color.Width != depth.Width || color.Height != depth.Height
+            || !float.IsFinite(input.AoIntensity) || input.AoIntensity < 0
+            || string.IsNullOrEmpty(input.IntegratedVolume) || string.IsNullOrEmpty(input.LocalVolume)) return false;
+        var integrated = VKTexture3D.Find(input.IntegratedVolume); var local = VKTexture3D.Find(input.LocalVolume);
+        if (integrated == null || local == null || !integrated.Ready || !local.Ready
+            || integrated.View.Handle == 0 || local.View.Handle == 0 || local.Depth == 0
+            || integrated.Width != local.Width || integrated.Height != local.Height || integrated.Depth != local.Depth + 1
+            || local.Width == 0 || local.Height == 0
+            || integrated.Format != Format.R16G16B16A16Sfloat || local.Format != Format.R16G16B16A16Sfloat
+            || integrated.CurrentLayout != ImageLayout.ShaderReadOnlyOptimal || local.CurrentLayout != ImageLayout.ShaderReadOnlyOptimal) return false;
+        views[0] = integrated.View; views[1] = local.View; views[2] = color.ColorView; views[3] = depth.DepthView;
+        versions[0] = integrated.ViewVersion; versions[1] = local.ViewVersion;
+        versions[2] = color.ColorViewVersion; versions[3] = depth.DepthViewVersion;
+        // AO 关闭仍绑定有效颜色占位，片元分支保证不采样。
+        views[4] = color.ColorView; versions[4] = color.ColorViewVersion;
+        if (input.ApplyAo)
+        {
+            if (input.Ao.Target is VKRenderTarget ao)
+            {
+                if (!ao.HasColor || ao.ColorView.Handle == 0 || ao.Desc.SampleCount != 1
+                    || ao.ColorImage.Handle == destination.ColorImage.Handle) return false;
+                views[4] = ao.ColorView; versions[4] = ao.ColorViewVersion;
+            }
+            else
+            {
+                Texture? aoTexture = null;
+                if (input.Ao.TextureName != null)
+                    lock (_textures) _textures.TryGetValue(input.Ao.TextureName, out aoTexture);
+                if (aoTexture == null || !aoTexture.Ready || aoTexture.View.Handle == 0
+                    || aoTexture.CurrentLayout != ImageLayout.ShaderReadOnlyOptimal
+                    || aoTexture.Image.Handle == destination.ColorImage.Handle) return false;
+                views[4] = aoTexture.View; versions[4] = aoTexture.ViewVersion;
+            }
+        }
+        versions[5] = destination.ColorViewVersion;
+        buffer = frame.Buffer;
+        return true;
+    }
+
+    public override bool Prepare(in Season.Rendering.FogCompositeInputs inputs, Season.Rendering.RenderTarget destination)
+    {
+        _destination = null; _inputs = default; _preparedSet = default;
+        if (_disposed || Device.InRenderPass || Device.GraphicsCommandBuffer.Handle == 0
+            || destination is not VKRenderTarget target || !Resolve(inputs, target, _views, _versions, out var buffer)) return false;
+        int index = (int)Device.FrameIndex;
+        ulong stamp = Device.GetCurrentRetireFenceValue();
+        if (_stamps[index] != stamp)
+        {
+            // 本帧第一次 Prepare 会复用 ring[0]，也就是同一槽三帧前用过的那个 set。
+            // 那批提交可能仍在 GPU 上，而未声明 UPDATE_AFTER_BIND 的 set 被 pending
+            // 命令缓冲引用时改写会让那条缓冲整体失效；见 Device.WaitForFrameSlot。
+            Device.WaitForFrameSlot(index);
+            _stamps[index] = stamp; _cursors[index] = 0;
+        }
+        var ring = _sets[index];
+        if (_cursors[index] == ring.Count) ring.Add(Device.DescriptorAllocator.AllocateSet(_setLayout));
+        var set = ring[_cursors[index]++];
+        var bufferInfo = new DescriptorBufferInfo { Buffer = buffer.Buffer, Range = Season.Rendering.Effects.VolumetricFogEffect.FrameVectorCount * 16 };
+        var images = stackalloc DescriptorImageInfo[5];
+        var writes = stackalloc WriteDescriptorSet[6];
+        writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = set, DstBinding = 0,
+            DescriptorCount = 1, DescriptorType = DescriptorType.StorageBuffer, PBufferInfo = &bufferInfo };
+        for (int i = 0; i < 5; i++)
+        {
+            images[i] = new() { ImageView = _views[i], ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
+            writes[i + 1] = new() { SType = StructureType.WriteDescriptorSet, DstSet = set, DstBinding = (uint)i + 1,
+                DescriptorCount = 1, DescriptorType = DescriptorType.CombinedImageSampler, PImageInfo = &images[i] };
+        }
+        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 6, writes, 0, null);
+        _inputs = inputs; _destination = target; _preparedSet = set; _buffer = buffer.Buffer;
+        _command = Device.GraphicsCommandBuffer; _stamp = stamp; _frameIndex = Device.FrameIndex;
+        _fogIntegrated = VKTexture3D.Find(inputs.IntegratedVolume);
+        _fogLocal = VKTexture3D.Find(inputs.LocalVolume);
+        _composed = false;
+        Active = this;
+        return true;
+    }
+
+    /// <summary>
+    /// 透明阶段取回本次合成使用的雾采样资源。只有合成真正落地（<see cref="Draw"/> 成功）之后
+    /// 才可用，否则透明阶段应当回落到不采样雾的着色器变体。
+    /// </summary>
+    internal static bool TryGetTransparentBinding(out Silk.NET.Vulkan.Buffer frame, out ulong frameRange,
+        out Silk.NET.Vulkan.ImageView integrated, out Silk.NET.Vulkan.ImageView local)
+    {
+        frame = default; frameRange = 0; integrated = default; local = default;
+        var self = Active;
+        if (self == null || self._disposed || !self._composed || self._buffer.Handle == 0
+            || Device.GraphicsCommandBuffer.Handle != self._command.Handle
+            || Device.FrameIndex != self._frameIndex
+            || Device.GetCurrentRetireFenceValue() != self._stamp) return false;
+        var integratedVolume = self._fogIntegrated; var localVolume = self._fogLocal;
+        if (integratedVolume == null || localVolume == null
+            || !integratedVolume.Ready || !localVolume.Ready
+            || integratedVolume.View.Handle == 0 || localVolume.View.Handle == 0
+            || integratedVolume.CurrentLayout != ImageLayout.ShaderReadOnlyOptimal
+            || localVolume.CurrentLayout != ImageLayout.ShaderReadOnlyOptimal) return false;
+        frame = self._buffer;
+        frameRange = Season.Rendering.Effects.VolumetricFogEffect.FrameVectorCount * 16;
+        integrated = integratedVolume.View;
+        local = localVolume.View;
+        return true;
+    }
+
+    public override Season.Rendering.FogCompositeResult Draw()
+    {
+        var destination = _destination; var inputs = _inputs;
+        _destination = null; _inputs = default;
+        if (_disposed || destination == null || !Device.InRenderPass
+            || Device.ActivePassId != Season.Rendering.RenderPassId.FogComposite
+            || !ReferenceEquals(Device.ActiveColorTarget, destination)
+            || Device.GraphicsCommandBuffer.Handle != _command.Handle || Device.FrameIndex != _frameIndex
+            || Device.GetCurrentRetireFenceValue() != _stamp) return default;
+        Span<Silk.NET.Vulkan.ImageView> views = stackalloc Silk.NET.Vulkan.ImageView[5];
+        Span<ulong> versions = stackalloc ulong[6];
+        if (!Resolve(inputs, destination, views, versions, out var buffer) || buffer.Buffer.Handle != _buffer.Handle
+            || !versions.SequenceEqual(_versions)) return default;
+        for (int i = 0; i < views.Length; i++) if (views[i].Handle != _views[i].Handle) return default;
+        var vk = Device.Vk;
+        vk.CmdBindPipeline(_command, PipelineBindPoint.Graphics, _pipeline);
+        var set = _preparedSet;
+        vk.CmdBindDescriptorSets(_command, PipelineBindPoint.Graphics, _layout, 0, 1, &set, 0, null);
+        var parameters = new Vector4(inputs.AoIntensity, inputs.ApplyAo ? 1 : 0, 0, 0);
+        vk.CmdPushConstants(_command, _layout, ShaderStageFlags.FragmentBit, 0, 16, &parameters);
+        vk.CmdDraw(_command, 3, 1, 0, 0);
+        _composed = true;
+        return new(true, inputs.ApplyAo);
+    }
+
+    public override void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true; _destination = null; _inputs = default; _composed = false;
+        if (ReferenceEquals(Active, this)) Active = null;
+        var vk = Device.Vk; var device = Device.LogicalDevice; var allocator = Device.DescriptorAllocator;
+        var pipeline = _pipeline; var layout = _layout; var setLayout = _setLayout; var renderPass = _renderPass;
+        _pipeline = default; _layout = default; _setLayout = default; _renderPass = default;
+        Device.EnqueueDeferredRelease(() =>
+        {
+            foreach (var ring in _sets) foreach (var set in ring) allocator.FreeSet(set);
+            if (pipeline.Handle != 0) vk.DestroyPipeline(device, pipeline, null);
+            if (layout.Handle != 0) vk.DestroyPipelineLayout(device, layout, null);
+            if (setLayout.Handle != 0) vk.DestroyDescriptorSetLayout(device, setLayout, null);
+            if (renderPass.Handle != 0) vk.DestroyRenderPass(device, renderPass, null);
+        });
+    }
 }

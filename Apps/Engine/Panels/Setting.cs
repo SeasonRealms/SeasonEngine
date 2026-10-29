@@ -47,9 +47,9 @@ internal class SettingPanel : BoardPanel
 
     Texts title;
 
-    Texts textsMode, textsMovement, textsFov, textsDayNightSpeed, textsStartHour, textsStep, textsAntiAliasing, textsGi, textsShadows, textsAo, textsShadowOffset, textsShadowSoftness, textsShadowContact, textsNormalVariance, textsLog;
+    Texts textsMode, textsMovement, textsFov, textsDayNightSpeed, textsStartHour, textsStep, textsAntiAliasing, textsGi, textsShadows, textsAo, textsFog, textsFogPreset, textsFogDensity, textsFogQuality, textsFogHistory, textsFogInfo, textsShadowOffset, textsShadowSoftness, textsShadowContact, textsNormalVariance, textsLog;
 
-    Input inputMode, inputMovement, inputFov, inputDayNightSpeed, inputStartHour, inputStep, inputAntiAliasing, inputGi, inputShadows, inputAo, inputShadowOffset, inputShadowSoftness, inputShadowContact, inputNormalVariance, inputLog;
+    Input inputMode, inputMovement, inputFov, inputDayNightSpeed, inputStartHour, inputStep, inputAntiAliasing, inputGi, inputShadows, inputAo, inputFog, inputFogPreset, inputFogDensity, inputFogQuality, inputFogHistory, inputFogInfo, inputShadowOffset, inputShadowSoftness, inputShadowContact, inputNormalVariance, inputLog;
 
     BaseControl current = null;
 
@@ -241,6 +241,60 @@ internal class SettingPanel : BoardPanel
             Scale = Vector2.One * 1f
         };
         AddControl(textsLog);
+
+        // Scene medium. The row pair below is split the way the whole fog block is: what the world asks for (these four
+        // rows, all live) and what the renderer could build (the quality row, which is a tier and therefore needs a
+        // restart in one direction).
+        textsFog = new Texts()
+        {
+            Content = "Fog",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsFog);
+
+        textsFogPreset = new Texts()
+        {
+            Content = "Fog preset",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsFogPreset);
+
+        textsFogDensity = new Texts()
+        {
+            Content = "Fog density",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsFogDensity);
+
+        // The tier, not the world switch above. Reads like the anti-alias row and for the same reason: the pass and the
+        // depth target it needs are decided once, so turning the pass on mid-session cannot happen. Turning it off can,
+        // because the effect compares the tier against the one it was built with before it records anything.
+        textsFogQuality = new Texts()
+        {
+            Content = "Fog quality",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsFogQuality);
+
+        textsFogHistory = new Texts()
+        {
+            Content = "Fog history",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsFogHistory);
+
+        textsFogInfo = new Texts()
+        {
+            Content = "Fog info",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsFogInfo);
 
         inputMode = new Input()
         {
@@ -744,6 +798,268 @@ internal class SettingPanel : BoardPanel
         };
         AddPanel(inputAo);
 
+        inputFog = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                var sources = new List<Season.Entities.EData>
+                {
+                    new Season.Entities.EData() { Key = "0", Title = "Off (clear scene)" },
+                    new Season.Entities.EData() { Key = "1", Title = "On (scene medium)" }
+                };
+
+                current = inputFog;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null)
+                        {
+                            // World-side switch, so it is live no matter what tier the pass was built with: the effect
+                            // gates on SceneFog.Enabled every frame. Fog panel reads this back and writes App.Fog.
+                            Season.Rendering.WorldSettings.Current.FogEnabled = picked.Key == "1";
+
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputFog);
+
+        inputFogPreset = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                var sources = new List<Season.Entities.EData>
+                {
+                    new Season.Entities.EData() { Key = FogPreset.Morning.ToString(), Title = "Morning mist" },
+                    new Season.Entities.EData() { Key = FogPreset.SunShafts.ToString(), Title = "Sun shafts (07:00)" },
+                    new Season.Entities.EData() { Key = FogPreset.NightLamps.ToString(), Title = "Night lamps (22:00)" }
+                };
+
+                current = inputFogPreset;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null && Enum.TryParse<FogPreset>(picked.Key, out var preset))
+                        {
+                            // Writing the preset is enough to switch: Fog panel sees the change on its next Update and
+                            // does the rest - medium, volumes, history reset, and the preview hour and camera. That
+                            // keeps all of the preset's content in one place instead of split across two callers.
+                            Season.Rendering.WorldSettings.Current.FogPreset = preset;
+
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputFogPreset);
+
+        inputFogDensity = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                var sources = new List<Season.Entities.EData>();
+
+                foreach (var scale in new[] { "0.5", "0.75", "1", "1.5", "2", "3" })
+                {
+                    sources.Add(new Season.Entities.EData()
+                    {
+                        Key = scale,
+                        Title = scale + "x authored"
+                    });
+                }
+
+                current = inputFogDensity;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null)
+                        {
+                            // Multiplier only, so it keeps meaning the same thing under every preset. Live: Fog panel
+                            // rewrites the scene extinction from it every frame.
+                            Season.Rendering.WorldSettings.Current.FogDensityScale =
+                                float.Parse(picked.Key, System.Globalization.CultureInfo.InvariantCulture);
+
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputFogDensity);
+
+        inputFogQuality = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                var sources = new List<Season.Entities.EData>
+                {
+                    new Season.Entities.EData() { Key = "Off", Title = "Off (no volumetric pass)" },
+                    new Season.Entities.EData() { Key = "Low", Title = "Low (1 shadow tap)" },
+                    new Season.Entities.EData() { Key = "Medium", Title = "Medium (4 shadow taps)" },
+                    new Season.Entities.EData() { Key = "High", Title = "High (4 taps, finer grid)" }
+                };
+
+                current = inputFogQuality;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null && Enum.TryParse<FogQuality>(picked.Key, out var quality))
+                        {
+                            RenderQuality.Current.VolumetricFog = quality;
+
+                            // Persisted here for the same reason the anti-alias row is: this is a tier, so the value
+                            // that is not in force yet would otherwise be lost before the launch that applies it.
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+
+                            App.Instance.AddLog(LogType.Backend,
+                                $"{DateTime.UtcNow} [Setting] VolumetricFog={quality} saved, pass built={Season.Rendering.FrameSchedule.RenderFogComposite != null}");
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputFogQuality);
+
+        inputFogHistory = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                var sources = new List<Season.Entities.EData>
+                {
+                    new Season.Entities.EData() { Key = "0", Title = "Off (no reprojection)" },
+                    new Season.Entities.EData() { Key = "1", Title = "On (temporal filter)" }
+                };
+
+                current = inputFogHistory;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null)
+                        {
+                            // Restoring goes back to the tier default rather than to whatever was there before, since 0
+                            // is the only value this row can have written. Read live by the effect every frame.
+                            RenderQuality.Current.FogHistoryWeight = picked.Key == "1"
+                                ? RenderQuality.DefaultFogHistoryWeight
+                                : 0f;
+
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputFogHistory);
+
+        inputFogInfo = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                // Read-only row: the values a question about the fog always needs first are the ones that are not on the
+                // panel, so they go to the log rather than into a box that cannot hold them.
+                var scene = App.Instance.Fog;
+                var effect = App.Instance.fogEffect;
+                var world = Season.Rendering.WorldSettings.Current;
+
+                App.Instance.AddLog(LogType.Backend,
+                    $"{DateTime.UtcNow} [Fog] preset={world.FogPreset}, enabled={scene.Enabled}, " +
+                    $"extinction={scene.Extinction:0.####}, height={scene.BaseHeight:0.##}/{scene.HeightFalloff:0.###}, " +
+                    $"anisotropy={scene.Anisotropy:0.##}, noise={scene.NoiseAmount:0.##}@{scene.NoiseScale:0.###}, " +
+                    $"wind={scene.WindOffset}, volumes={scene.ActiveVolumeCount}/{SceneFog.MaxActiveVolumes}, " +
+                    $"tier={RenderQuality.Current.VolumetricFog}, grid={(effect == null ? "-" : $"{effect.Grid.Width}x{effect.Grid.Height}x{effect.Grid.Slices}")}, " +
+                    $"history={scene.HistoryRevision}/{effect?.HistoryWeight:0.##}, " +
+                    $"lights={App.Instance.SceneLights.LightCount}, shadowMap={Season.Rendering.FrameSchedule.ShadowMap != null}, " +
+                    $"aoPending={Season.Rendering.FrameSchedule.PostAoTexture != null}");
+
+                await Task.CompletedTask;
+            }
+        };
+        AddPanel(inputFogInfo);
+
         inputShadowOffset = new Input()
         {
             WidthMin = WidthMin,
@@ -1008,7 +1324,7 @@ internal class SettingPanel : BoardPanel
         //
         // The column count is derived from the space rather than fixed, because the caller sizes this panel from the window
         // (see App.settingPanel.Update): one column on a tall window, three on a short one, with no size hardcoded here.
-        const int rowCount = 15;
+        const int rowCount = 21;
         var rowTop = (int)(title.PosY + padding + paddingH);
         var rowWidth = inputLeft + width0 + 100;
         var panelWidth = (int)(width ?? App.Instance.ExtendResolution.X - 200);
@@ -1075,6 +1391,24 @@ internal class SettingPanel : BoardPanel
             ? Season.Rendering.FrameSchedule.AoTexture != null ? "On" : "On *"
             : "Off");
 
+        // The fog block follows the AO row because the two are read together: the volumetric composite is the only
+        // consumer of AO that is not the final blit, so whether fog is on decides where the occlusion lands. The * here
+        // means the same thing it does above - the world asks for it, but this session has no fog pass to feed, either
+        // because the tier was Off at startup or because a backend declined it.
+        Place(textsFog, inputFog, Season.Rendering.WorldSettings.Current.FogEnabled
+            ? Season.Rendering.FrameSchedule.RenderFogComposite != null ? "On" : "On *"
+            : "Off");
+        Place(textsFogPreset, inputFogPreset, FogText(Season.Rendering.WorldSettings.Current.FogPreset));
+        Place(textsFogDensity, inputFogDensity, Season.Rendering.WorldSettings.Current.FogDensityScale.ToString("0.##",
+            System.Globalization.CultureInfo.InvariantCulture) + "x");
+        Place(textsFogQuality, inputFogQuality, RenderQuality.Current.VolumetricFog.ToString()
+            + (RenderQuality.Current.VolumetricFog != FogQuality.Off
+                && Season.Rendering.FrameSchedule.RenderFogComposite == null ? " *" : ""));
+        Place(textsFogHistory, inputFogHistory, RenderQuality.Current.FogHistoryWeight > 0f ? "On" : "Off");
+        Place(textsFogInfo, inputFogInfo, App.Instance.fogEffect is { } fogEffect
+            ? $"{fogEffect.Grid.Width}x{fogEffect.Grid.Height}x{fogEffect.Grid.Slices}"
+            : "-");
+
         Place(textsShadowOffset, inputShadowOffset, RenderQuality.Current.ShadowNormalOffset.ToString("0.##",
             System.Globalization.CultureInfo.InvariantCulture) + " texel");
         Place(textsShadowSoftness, inputShadowSoftness, RenderQuality.Current.ShadowSoftnessTexels.ToString("0.##",
@@ -1094,5 +1428,14 @@ internal class SettingPanel : BoardPanel
         Season.Rendering.AaMode.Msaa4x => "MSAA 4x",
         Season.Rendering.AaMode.Fxaa => "FXAA",
         _ => "TAA",
+    };
+
+    // Same split for the fog preset: the picker titles name the hour that makes each setup readable, which is useful
+    // context in a list and noise in the box.
+    static string FogText(FogPreset preset) => preset switch
+    {
+        FogPreset.SunShafts => "Sun shafts",
+        FogPreset.NightLamps => "Night lamps",
+        _ => "Morning mist",
     };
 }

@@ -157,7 +157,7 @@ internal unsafe class DXSprite3D : DXSpriteQuad
 
         fixed (VertexBufferView* vbv = &_sharedVertexBufferView)
         {
-            DrawQuad(vbv);
+            DrawQuad(vbv, _sharedVertexBuffer);
         }
     }
 

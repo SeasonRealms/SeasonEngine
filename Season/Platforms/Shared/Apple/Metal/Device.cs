@@ -154,7 +154,7 @@ internal static class Device
     static MTLRenderPassDescriptor? _backbufferRpd;
 
     /// <summary>Pass debug labels used for encoder.Label and Xcode GPU capture markers in step 0. The index matches RenderPassId.</summary>
-    static readonly string[] _passLabels = { "Shadow", "Scene", "Post", "OutlineMask", "FinalBlit", "Overlay" };
+    static readonly string[] _passLabels = { "Shadow", "Scene", "Post", "OutlineMask", "FinalBlit", "Overlay", "SceneOpaque", "FogComposite", "SceneTransparent" };
 
     /// <summary>Phase 4 current pass id, written by BeginPass and reset by EndPass.
     /// Pipeline.SetPipeline uses it to route OutlineMask passes to the mask PSO,
@@ -162,6 +162,9 @@ internal static class Device
     /// Overlay passes are routed to the overlay family, which renders directly to the backbuffer
     /// and therefore also requires dedicated PSOs with depth fully disabled.</summary>
     internal static Season.Rendering.RenderPassId ActivePassId;
+
+    internal static MTLRenderTarget? ActiveColorTarget { get; private set; }
+    internal static IMTLTexture? ActiveColorTexture { get; private set; }
 
     // ── GPU readback for CaptureApp ──
     static IMTLBuffer? _captureStagingBuffer;
@@ -380,6 +383,13 @@ internal static class Device
     /// </summary>
     internal static void BeginPass(in Season.Rendering.PassDesc desc)
     {
+        if (GraphicsEncoder != null)
+            throw new InvalidOperationException("不能嵌套 Metal 渲染 Pass。");
+        if (desc.Id == Season.Rendering.RenderPassId.FogComposite
+            && (desc.ColorTarget is not MTLRenderTarget || desc.DepthTarget != null || desc.VelocityTarget != null))
+            throw new ArgumentException("雾合成必须使用独立颜色目标，不能挂载深度或速度。", nameof(desc));
+        ActiveColorTarget = null;
+        ActiveColorTexture = null;
         // Phase 4: record the current pass id so Pipeline.SetPipeline can route OutlineMask passes to the mask PSO.
         ActivePassId = desc.Id;
 
@@ -428,7 +438,9 @@ internal static class Device
             rpd = new MTLRenderPassDescriptor();
             if (!depthOnly)
                 rpd.ColorAttachments[0].Texture = rt.ColorTexture;
-            rpd.DepthAttachment.Texture = explicitDepth?.DepthTexture ?? rt.DepthTexture;
+            // 雾合成使用独立的无深度全屏管线；透明阶段再挂载原场景深度。
+            rpd.DepthAttachment.Texture = desc.Id == Season.Rendering.RenderPassId.FogComposite
+                ? null : explicitDepth?.DepthTexture ?? rt.DepthTexture;
 
             // 2-3 triple-target velocity attachment at ColorAttachments[1].
             if (velocityRT != null && velocityRT.ColorTexture != null)
@@ -474,6 +486,8 @@ internal static class Device
         enc.Label = _passLabels[(int)desc.Id];
         frame.Encoder = enc;
         GraphicsEncoder = enc;
+        ActiveColorTarget = desc.ColorTarget as MTLRenderTarget;
+        ActiveColorTexture = rpd.ColorAttachments[0].Texture;
 
         // Baseline binding replay:
         // each new pass encoder starts with cleared bindings,
@@ -483,6 +497,9 @@ internal static class Device
         // Instanced text rendering overrides them later with its own per-frame buffers.
         enc.SetViewport(new MTLViewport { OriginX = 0, OriginY = 0, Width = vpWidth, Height = vpHeight, ZNear = 0.0, ZFar = 1.0 });
         enc.SetScissorRect(new MTLScissorRect { X = 0, Y = 0, Width = (nuint)vpWidth, Height = (nuint)vpHeight });
+
+        // 合成管线在 Draw 完整绑定自身资源，不访问主材质的环境和光照后备资源。
+        if (desc.Id == Season.Rendering.RenderPassId.FogComposite) return;
 
         // Immediate-2D compatibility mode (Season.Rendering.Immediate2DMode):
         // Pipeline.Init and every 3D resource bound below were skipped for the session,
@@ -596,6 +613,8 @@ internal static class Device
             frame.Encoder = null;
             GraphicsEncoder = null!;
             ActivePassId = default;
+            ActiveColorTarget = null;
+            ActiveColorTexture = null;
         }
     }
 
@@ -689,6 +708,8 @@ internal static class Device
             _backbufferRpd = null;
             _capturePending = false;
             ActivePassId = default;
+            ActiveColorTarget = null;
+            ActiveColorTexture = null;
             _inFlight.Release();
         }
     }

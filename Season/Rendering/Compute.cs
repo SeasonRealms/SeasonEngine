@@ -247,6 +247,9 @@ public enum ComputePhase
 {
     FrameStart,
     AfterScene,
+
+    /// <summary>不透明场景结束后、透明场景开始前；未分段时紧随完整 Scene 执行。</summary>
+    AfterOpaque,
 }
 
 /// <summary>
@@ -266,6 +269,9 @@ public abstract class ComputeEffect
 
     /// <summary>Records dispatch work every frame, called from the frame-loop thread. Only DispatchCompute is allowed here, with zero allocations.</summary>
     public abstract void Record(IGraphics g);
+
+    /// <summary>从注册表移除后通知效果撤销其附加帧路由；缺省保留原有手动释放契约。</summary>
+    public virtual void OnUnregistered() { }
 
     /// <summary>Window resize notification, driven by FrameSchedule.ResizeCompute after the GPU becomes idle.
     /// Effects override this to rebuild storage textures in place against the new DeviceResolution.

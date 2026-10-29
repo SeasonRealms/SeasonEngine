@@ -90,3 +90,42 @@ internal sealed class WGPUStorageBuffer : Season.Rendering.StorageBuffer
 
     public override void Dispose() => WebGPUInterop.DisposeStorageBuffer(Id);
 }
+
+/// <summary>独立 HDR 雾合成句柄；原生 PSO、资源身份与同帧参数槽由 JS 管理。</summary>
+internal sealed class WGPUFogCompositePipeline : Season.Rendering.FogCompositePipeline
+{
+    static int _nextId;
+    readonly string _name = $"fog_composite_{_nextId++}";
+    bool _disposed, _prepared;
+
+    internal bool Initialize() => WebGPUInterop.CreateFogCompositePipeline(_name,
+        Season.Rendering.Effects.VolumetricFogEffect.CompositeVertexWgsl,
+        Season.Rendering.Effects.VolumetricFogEffect.CompositeWgsl);
+
+    public override bool Prepare(in Season.Rendering.FogCompositeInputs inputs, Season.Rendering.RenderTarget destination)
+    {
+        _prepared = false;
+        if (_disposed || inputs.Color is not WGPURenderTarget color || inputs.Depth is not WGPURenderTarget depth
+            || inputs.FrameBuffer is not WGPUStorageBuffer frame || destination is not WGPURenderTarget target)
+            return false;
+        _prepared = WebGPUInterop.PrepareFogComposite(_name, color.Name, depth.Name, frame.Id,
+            inputs.IntegratedVolume, inputs.LocalVolume, inputs.Ao.TextureName,
+            (inputs.Ao.Target as WGPURenderTarget)?.Name, inputs.AoIntensity, inputs.ApplyAo, target.Name);
+        return _prepared;
+    }
+
+    public override Season.Rendering.FogCompositeResult Draw()
+    {
+        if (_disposed || !_prepared) return default;
+        _prepared = false;
+        int flags = WebGPUInterop.DrawFogComposite(_name);
+        return new((flags & 1) != 0, (flags & 2) != 0);
+    }
+
+    public override void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true; _prepared = false;
+        WebGPUInterop.DisposeFogCompositePipeline(_name);
+    }
+}

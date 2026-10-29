@@ -26,6 +26,17 @@ namespace Season.Platforms.Shared.Apple;
 /// </summary>
 internal unsafe partial class Graphics : IGraphics
 {
+    public Season.Rendering.FogCompositePipeline? CreateFogCompositePipeline()
+    {
+        if (!ComputeSupported) return null;
+        try { return new MTLFogCompositePipeline(DictionaryMtlTexture); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[FogComposite] 创建失败：{ex.Message}");
+            return null;
+        }
+    }
+
     readonly GlyphAtlasManager<MTLTexture> _glyphAtlas = new(
         2048, 2048,
         createAtlasTexture: (w, h) => MTLTexture.CreateEmpty((uint)w, (uint)h, "TextAtlas"),
@@ -1286,7 +1297,7 @@ internal unsafe partial class Graphics : IGraphics
     /// <summary>Step C of 2-2: resolve GTAO output from the instance dictionary through FrameSchedule.AoTexture. Null means no AO.</summary>
     MTLTexture? ResolveAoTexture()
     {
-        var aoName = Season.Rendering.FrameSchedule.AoTexture;
+        var aoName = Season.Rendering.FrameSchedule.PostAoTexture;
         if (aoName == null)
             return null;
         lock (DictionaryMtlTexture)
@@ -2729,16 +2740,23 @@ internal unsafe partial class Graphics : IGraphics
     /// reusing the existing resource-not-ready semantics.</summary>
     public void CreateComputeTexture3D(string name, uint width, uint height, uint depth,
         Season.Rendering.ComputeStorageFormat format = Season.Rendering.ComputeStorageFormat.Rgba8Unorm)
+        => TryCreateComputeTexture3D(name, width, height, depth, format);
+
+    public void ReleaseComputeTexture3D(string name) => MTLTexture3D.Find(name)?.Dispose();
+
+    public bool TryCreateComputeTexture3D(string name, uint width, uint height, uint depth,
+        Season.Rendering.ComputeStorageFormat format = Season.Rendering.ComputeStorageFormat.Rgba8Unorm)
     {
-        if (!ComputeSupported) return;
+        if (!ComputeSupported) return false;
         try
         {
-            MTLTexture3D.CreateOrUpdate(name, width, height, depth, MTLTexture3D.MapComputeFormat(format));
+            return MTLTexture3D.CreateOrUpdate(name, width, height, depth, MTLTexture3D.MapComputeFormat(format)).Ready;
         }
         catch (Exception ex)
         {
             DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [CreateComputeTexture3D] '{name}' "
                 + $"{width}x{height}x{depth} creation failed: {ex.Message}");
+            return false;
         }
     }
 
@@ -2755,17 +2773,20 @@ internal unsafe partial class Graphics : IGraphics
     /// partitioned by FrameIndex and kept alive after creation, so per-frame calls allocate nothing and avoid in-flight frame races.
     /// See MTLStorageBuffer.TryGetStagingForCurrentFrame.</summary>
     public void UpdateStorageBuffer(Season.Rendering.StorageBuffer buffer, ReadOnlySpan<byte> data)
+        => TryUpdateStorageBuffer(buffer, data);
+
+    public bool TryUpdateStorageBuffer(Season.Rendering.StorageBuffer buffer, ReadOnlySpan<byte> data)
     {
-        if (!ComputeSupported || data.Length == 0) return;
+        if (!ComputeSupported || data.Length == 0 || data.Length > buffer.SizeInBytes || (data.Length & 3) != 0) return false;
         var cmd = Metal.Device.GraphicsCommandBuffer;
-        if (cmd == null) return;
+        if (cmd == null) return false;
 
         var dst = (MTLStorageBuffer)buffer;
-        int size = (int)Math.Min((uint)data.Length, dst.SizeInBytes);
-        if (size <= 0) return;
+        int size = data.Length;
+        if (dst.Buffer == null) return false;
 
         var staging = dst.TryGetStagingForCurrentFrame();
-        if (staging == null) return;
+        if (staging == null) return false;
 
         fixed (byte* pSrc = data)
         {
@@ -2776,10 +2797,11 @@ internal unsafe partial class Graphics : IGraphics
         if (blit == null)
         {
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [UpdateStorageBuffer] CreateBlitCommandEncoder failed, render encoder may still be open, skipping this upload.");
-            return;
+            return false;
         }
         blit.CopyFromBuffer(staging, 0, dst.Buffer, 0, (nuint)size);
         blit.EndEncoding();
+        return true;
     }
 
     // -- 1-7 Cubemap, see the contract summary in the IGraphics and RenderQuality class headers --
@@ -2818,18 +2840,20 @@ internal unsafe partial class Graphics : IGraphics
         }
     }
 
-    public void DispatchCompute(in Season.Rendering.ComputeDispatchArgs args)
+    public void DispatchCompute(in Season.Rendering.ComputeDispatchArgs args) => TryDispatchCompute(args);
+
+    public bool TryDispatchCompute(in Season.Rendering.ComputeDispatchArgs args)
     {
         var cmd = Metal.Device.GraphicsCommandBuffer;
         if (cmd == null)
-            return;
+            return false;
 
         var kernel = (MTLComputeKernel)args.Kernel;
         var bindings = kernel.Desc.Bindings;
 
         var enc = cmd.ComputeCommandEncoder;
         if (enc == null)
-            return;
+            return false;
         enc.Label = kernel.Label;
 
         enc.SetComputePipelineState(kernel.PipelineState);
@@ -2881,7 +2905,7 @@ internal unsafe partial class Graphics : IGraphics
                 if (rtTex == null)
                 {
                     enc.EndEncoding();
-                    return;
+                    return false;
                 }
                 enc.SetTexture(rtTex, textureIdx);
                 textureIdx++;
@@ -2904,7 +2928,7 @@ internal unsafe partial class Graphics : IGraphics
                 if (tex3d == null || !System.Threading.Volatile.Read(ref tex3d.Ready))
                 {
                     enc.EndEncoding();
-                    return;
+                    return false;
                 }
                 enc.SetTexture(tex3d.Image, textureIdx);
                 textureIdx++;
@@ -2930,7 +2954,7 @@ internal unsafe partial class Graphics : IGraphics
             if (tex == null || !System.Threading.Volatile.Read(ref tex.Ready))
             {
                 enc.EndEncoding();
-                return;
+                return false;
             }
 
             enc.SetTexture(tex.Image, textureIdx);
@@ -2962,5 +2986,6 @@ internal unsafe partial class Graphics : IGraphics
 
         // No post synchronization is needed under rule 2.
         // Resource lifetime is guaranteed by command-buffer retained references under rule 5.
+        return true;
     }
 }

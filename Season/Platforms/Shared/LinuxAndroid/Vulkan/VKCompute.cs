@@ -202,6 +202,10 @@ internal sealed unsafe class VKComputeKernel : Season.Rendering.ComputeKernel
         ulong stamp = Device.GetCurrentRetireFenceValue();
         if (_setStamps[f] != stamp)
         {
+            // The first dispatch of this frame rewrites the sets the same slot used three frames ago. With three frames
+            // in flight those submissions can still be on the GPU, and rewriting a set that a pending command buffer
+            // references is VUID-vkUpdateDescriptorSets-None-03047; see Device.WaitForFrameSlot.
+            Device.WaitForFrameSlot(f);
             _setStamps[f] = stamp;
             _setCursors[f] = 0;
         }

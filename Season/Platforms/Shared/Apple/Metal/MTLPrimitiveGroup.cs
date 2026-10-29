@@ -318,6 +318,8 @@ internal abstract class MTLPrimitiveGroup : IDisposable
             : null;
         AerialLutActive = MTLTexture3D.Find(Season.Rendering.FrameSchedule.AerialLutTexture);
 
+        FrameSchedule.CaptureLighting(lightParams, Camera.View, Camera.Projection,
+            DeviceServices.BaseApp.Camera.ViewProjection);
         WriteStruct(LightConstantBuffers[fi], lightParams);
     }
 
