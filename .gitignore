@@ -59,3 +59,4 @@ TestResult.xml
 nunit-*.xml
 /.vs
 /Apps/Engine/Engine.csproj.user
+/Tests
