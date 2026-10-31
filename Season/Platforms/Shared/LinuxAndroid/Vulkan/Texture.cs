@@ -82,6 +82,14 @@ internal unsafe class Texture : IDisposable
 
     int _refCount = 1;
 
+    /// <summary>
+    /// True when <see cref="Image"/>/<see cref="View"/> are borrowed from a render target instead of owned here,
+    /// which is how a secondary view's presentation image is published as a sampleable texture
+    /// (see Graphics.RegisterViewSurface). Such a texture only unlinks its cache entry when released:
+    /// the image belongs to the render target and dies with it.
+    /// </summary>
+    public bool Borrowed;
+
     public int RefCount => _refCount;
 
     public void AddRef() => Interlocked.Increment(ref _refCount);
@@ -805,6 +813,39 @@ internal unsafe class Texture : IDisposable
     /// </summary>
     Texture() { }
 
+    /// <summary>
+    /// Wraps a render target's color plane as a sampleable texture without taking ownership (see
+    /// <see cref="Borrowed"/>). This is what publishes a secondary view's presentation image: Sprite2D then
+    /// resolves the name through the ordinary texture dictionary, so displaying a rendered view needs no new
+    /// control type and no readback. The target ends every frame in ShaderReadOnlyOptimal, the layout the
+    /// wrapper declares, so sampling needs no transition.
+    /// </summary>
+    internal static Texture WrapRenderTarget(string name, VKRenderTarget target) => new()
+    {
+        Name = name,
+        Borrowed = true,
+        Ready = true,
+        Image = target.ColorImage,
+        View = target.ColorView,
+        ViewVersion = target.ColorViewVersion,
+        Width = target.Width,
+        Height = target.Height,
+        Format = target.ColorFormat,
+        CurrentLayout = ImageLayout.ShaderReadOnlyOptimal,
+    };
+
+    /// <summary>Re-points a wrapper at its target's current view after a recreate, keeping the identity controls hold.</summary>
+    internal void RefreshFromTarget(VKRenderTarget target)
+    {
+        Image = target.ColorImage;
+        View = target.ColorView;
+        ViewVersion = target.ColorViewVersion;
+        Width = target.Width;
+        Height = target.Height;
+        Format = target.ColorFormat;
+        CurrentLayout = ImageLayout.ShaderReadOnlyOptimal;
+    }
+
     public void Dispose()
     {
         var vk = Device.Vk;
@@ -813,15 +854,18 @@ internal unsafe class Texture : IDisposable
 
         // Same rule as RecreateComputeStorage:
         // in-flight command buffers may still reference this texture, so destruction must wait until the timeline passes the retire value.
+        // A borrowed texture only unlinks its cache entry: the image and its view belong to the render target, whose
+        // own lifetime owns that destruction.
         var oldView = View; View = default;
         var oldImage = Image; Image = default;
         var oldMemory = Memory; Memory = default;
-        Device.EnqueueDeferredRelease(() =>
-        {
-            if (oldView.Handle != 0) vk.DestroyImageView(d, oldView, null);
-            if (oldImage.Handle != 0) vk.DestroyImage(d, oldImage, null);
-            if (oldMemory.Handle != 0) vk.FreeMemory(d, oldMemory, null);
-        });
+        if (!Borrowed)
+            Device.EnqueueDeferredRelease(() =>
+            {
+                if (oldView.Handle != 0) vk.DestroyImageView(d, oldView, null);
+                if (oldImage.Handle != 0) vk.DestroyImage(d, oldImage, null);
+                if (oldMemory.Handle != 0) vk.FreeMemory(d, oldMemory, null);
+            });
 
         string key = string.IsNullOrEmpty(_cacheKey) ? Name : _cacheKey;
         if (Device.DictionaryTexture.TryGetValue(key, out var current) && ReferenceEquals(current, this))

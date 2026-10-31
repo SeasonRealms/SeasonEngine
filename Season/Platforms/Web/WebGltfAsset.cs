@@ -15,7 +15,7 @@ internal class WebGltfAsset : GltfAsset
 
     public void SetGlbBytes(byte[] bytes) { _glbBytes = bytes; }
 
-    public override void Load(Season.Controls.Model model, Season.Basic.Camera camera)
+    public override void Load(Season.Controls.Model model)
     {
         Model = model;
         var totalStopwatch = System.Diagnostics.Stopwatch.StartNew();
@@ -49,7 +49,7 @@ internal class WebGltfAsset : GltfAsset
         var processNodesStopwatch = System.Diagnostics.Stopwatch.StartNew();
         foreach (var node in sceneRootNodes)
         {
-            ProcessNode(node, Matrix4x4.Identity, camera, model);
+            ProcessNode(node, Matrix4x4.Identity, model);
         }
         BindSkins(glb);
         int primitiveCount = 0;

@@ -122,13 +122,17 @@ internal sealed class MTLStorageBuffer : Season.Rendering.StorageBuffer
     /// Slot safety is guaranteed by the frame-loop _inFlight semaphore, matching the engine's other per-frame buffers.</summary>
     IMTLBuffer[]? _staging;
 
-    internal MTLStorageBuffer(uint sizeInBytes)
+    internal MTLStorageBuffer(uint sizeInBytes, Season.Rendering.StorageBufferUsage usage)
     {
         // Round capacity up to 16 bytes so alignment matches the D3D12 raw-view granularity
         // and behavior stays consistent across backends.
         uint alignedSize = (sizeInBytes + 15u) & ~15u;
         SizeInBytes = sizeInBytes;
+        Usage = usage;
         _alignedSize = (nuint)alignedSize;
+        // A0.1：Metal 没有缓冲用途位也没有状态机，StorageModePrivate 缓冲直接就能当
+        // indirectBuffer 传给 DrawIndexedPrimitives，写后读的依赖由驱动 hazard tracking 兑现。
+        // usage 在这一端只是记录，用于跟其他三端保持同一套准入判定。
         Buffer = Device.ResourceManager.CreateBuffer(_alignedSize, MTLResourceOptions.StorageModePrivate);
     }
 

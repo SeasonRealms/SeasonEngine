@@ -91,6 +91,9 @@ window.seasonWebGPU = (() => {
     // It shares the same bindGroupLayout as the main table,
     // so bind groups can be reused across tables.
     let _mesh3DPipelineVelocity = null, _velocityOutput = false;
+    // A0.2: SceneNormal (MRT slot 2, rgba16float). Fixed at initialize and only ever true with _velocityOutput, so
+    // it does not add a table: it changes the velocity table itself to fs_main_mrtn + three targets.
+    let _normalOutput = false;
     // Overlay PSO family (backbuffer format + depth off):
     // the Overlay pass (passId===5) renders directly to the backbuffer.
     // In HDR mode, attachment state is incompatible with _sceneFormat (rgba16float),
@@ -153,7 +156,7 @@ window.seasonWebGPU = (() => {
 
     function _clearActivePass() {
         _activePassId = -1; _activeColorTarget = _activeColorView = _activeDepthView = null;
-        _passDepthOnly = _passVelocity = _passOutlineMask = _passOverlay = false;
+        _passDepthOnly = _passVelocity = _passNormal = _passOutlineMask = _passOverlay = false;
     }
 
     // Buffer pools: grouped by usage and reused by resetting cursors each frame
@@ -686,33 +689,70 @@ window.seasonWebGPU = (() => {
         -0.5, -0.5, 0,  0, 1,  0, 0, -1,  1, 0, 0, 1,  0, 0, 0, 0,  0, 0, 0, 0,
     ]);
 
+    // ── P2: per-view uniform buffer (binding 22) ──
+    // One 256-byte slot per view / shadow quadrant. Slot map mirrors WebGPUViewUniformLayout on the C# side:
+    // 0..7 = render views, 8..11 = shadow quadrants (3 cascades + spotlight), 13 = screen space (2D sprite / text).
+    // The slot is pinned into the bind group through a fixed buffer offset instead of a dynamic offset, so a
+    // collected scene draw replays with the view it was recorded with and setBindGroup(0, group) stays a two-argument
+    // call at every site.
+    const VIEW_SLOT_BYTES = 256;               // ViewConstants.SizeInBytes == minUniformBufferOffsetAlignment
+    const VIEW_SLOT_COUNT = 16;
+    const VIEW_SLOT_FLOATS = VIEW_SLOT_BYTES / 4;
+    const SCREEN_SPACE_VIEW_SLOT = 13;
+    let _viewSlotBuffer = null;
+    let _currentViewSlot = 0;
+    // z row of the current view matrix, used for transparent depth sorting.
+    // ViewConstants stores row-major matrices, so M13/M23/M33/M43 sit at floats 2/6/10/14.
+    const _viewSlotZRows = new Float32Array(VIEW_SLOT_COUNT * 4);
+    let _currentViewZRow = _viewSlotZRows.subarray(0, 4);
+
+    function _ensureViewSlotBuffer() {
+        if (!_viewSlotBuffer) {
+            _viewSlotBuffer = _device.createBuffer({
+                label: 'view_constants',
+                size: VIEW_SLOT_BYTES * VIEW_SLOT_COUNT,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+        }
+        return _viewSlotBuffer;
+    }
+
+    // C# upload of one RenderView.Constants block: View @ 0, Projection @ 64, PrevViewProjection @ 128.
+    // Each slot is written at most once per frame (shadow quadrants use one slot each) and every write is queued
+    // before the frame's single submit, so all draws bound to a slot observe that slot's final contents.
+    function setViewConstants(slot, bytes) {
+        if (!_device) return;
+        slot = slot | 0;
+        if (slot < 0 || slot >= VIEW_SLOT_COUNT) return;
+        const data = _interopToU8(bytes);
+        if (!data || data.byteLength !== VIEW_SLOT_BYTES) return;
+        _device.queue.writeBuffer(_ensureViewSlotBuffer(), slot * VIEW_SLOT_BYTES, data);
+        const floats = new Float32Array(data.buffer, data.byteOffset, VIEW_SLOT_FLOATS);
+        const row = _viewSlotZRows.subarray(slot * 4, slot * 4 + 4);
+        row[0] = floats[2]; row[1] = floats[6]; row[2] = floats[10]; row[3] = floats[14];
+        _currentViewSlot = slot;
+        _currentViewZRow = row;
+    }
+
     // Sprite2D scratch:
     // vertices + uniform are rewritten every frame
-    // (108 floats aligned to WGSL Uniforms;
-    // [48..83]/[104..107] are retired reserved slots from 1-2 -
-    // camera / lighting / exposure now come from the shared UBO at binding(10),
-    // so keeping them at 0 is sufficient)
+    // (60 floats aligned to WGSL Uniforms; view/projection now come from the per-view UBO, so only the identity
+    // world matrix has to be pre-seeded here)
     const _SPRITE2D_VERTEX_SCRATCH = new Float32Array(120);
-    const _SPRITE2D_UNIFORM_SCRATCH = new Float32Array(108);
-    const _SPRITE2D_UNIFORM_I32 = new Int32Array(_SPRITE2D_UNIFORM_SCRATCH.buffer, 96 * 4, 4);
+    const _SPRITE2D_UNIFORM_SCRATCH = new Float32Array(60);
+    const _SPRITE2D_UNIFORM_I32 = new Int32Array(_SPRITE2D_UNIFORM_SCRATCH.buffer, 48 * 4, 4);
     _SPRITE2D_UNIFORM_SCRATCH[0]=1; _SPRITE2D_UNIFORM_SCRATCH[5]=1; _SPRITE2D_UNIFORM_SCRATCH[10]=1; _SPRITE2D_UNIFORM_SCRATCH[15]=1;
-    _SPRITE2D_UNIFORM_SCRATCH[16]=1; _SPRITE2D_UNIFORM_SCRATCH[21]=1; _SPRITE2D_UNIFORM_SCRATCH[26]=1; _SPRITE2D_UNIFORM_SCRATCH[31]=1;
-    _SPRITE2D_UNIFORM_SCRATCH[32]=1; _SPRITE2D_UNIFORM_SCRATCH[37]=1; _SPRITE2D_UNIFORM_SCRATCH[42]=1; _SPRITE2D_UNIFORM_SCRATCH[47]=1;
-    _SPRITE2D_UNIFORM_SCRATCH[91]=1; _SPRITE2D_UNIFORM_SCRATCH[93]=1; _SPRITE2D_UNIFORM_SCRATCH[95]=0.5;
+    _SPRITE2D_UNIFORM_SCRATCH[43]=1; _SPRITE2D_UNIFORM_SCRATCH[45]=1; _SPRITE2D_UNIFORM_SCRATCH[47]=0.5;
     _SPRITE2D_UNIFORM_I32.fill(0); _SPRITE2D_UNIFORM_I32[2]=2;
 
     // Dedicated scratch for text GPU instancing:
     // separate from Sprite2D scratch so the instancing bit in flags.w
     // cannot leak into later sprite draws.
-    // 108 floats aligned to WGSL Uniforms;
-    // [104] is the retired hdrExposure slot
-    // (1-2 contract 8: text exposure now reads uLights.params0.y).
-    const _TEXT_UNIFORM_SCRATCH = new Float32Array(108);
-    const _TEXT_UNIFORM_I32 = new Int32Array(_TEXT_UNIFORM_SCRATCH.buffer, 96 * 4, 4);
+    // 60 floats aligned to WGSL Uniforms (identity world only; view state comes from the screen-space slot).
+    const _TEXT_UNIFORM_SCRATCH = new Float32Array(60);
+    const _TEXT_UNIFORM_I32 = new Int32Array(_TEXT_UNIFORM_SCRATCH.buffer, 48 * 4, 4);
     _TEXT_UNIFORM_SCRATCH[0]=1; _TEXT_UNIFORM_SCRATCH[5]=1; _TEXT_UNIFORM_SCRATCH[10]=1; _TEXT_UNIFORM_SCRATCH[15]=1;
-    _TEXT_UNIFORM_SCRATCH[16]=1; _TEXT_UNIFORM_SCRATCH[21]=1; _TEXT_UNIFORM_SCRATCH[26]=1; _TEXT_UNIFORM_SCRATCH[31]=1;
-    _TEXT_UNIFORM_SCRATCH[32]=1; _TEXT_UNIFORM_SCRATCH[37]=1; _TEXT_UNIFORM_SCRATCH[42]=1; _TEXT_UNIFORM_SCRATCH[47]=1;
-    _TEXT_UNIFORM_SCRATCH[91]=1; _TEXT_UNIFORM_SCRATCH[93]=1; _TEXT_UNIFORM_SCRATCH[95]=0.5;
+    _TEXT_UNIFORM_SCRATCH[43]=1; _TEXT_UNIFORM_SCRATCH[45]=1; _TEXT_UNIFORM_SCRATCH[47]=0.5;
     // flags:
     // x = reserved 0 (old lightCount, punctual count now reads uLights.params0.x),
     // y = renderMode=2 (TextMsdf),
@@ -727,7 +767,7 @@ window.seasonWebGPU = (() => {
     // the Overlay family and passes it here, while this backend still bakes the overlay PSOs from the main module.
     // The parameter is declared so the positional slot is visible rather than silently dropped, which is what let the
     // trailing maxAnisotropy argument be added safely behind it.
-    async function initialize(canvasId, shaderSource, blitShaderSource, hdrSceneColor, shadowDepthBias, shadowSlopeBias, velocityOutput, overlayShaderSource, maxAnisotropy = 1, fogSampling = false) {
+    async function initialize(canvasId, shaderSource, blitShaderSource, hdrSceneColor, shadowDepthBias, shadowSlopeBias, velocityOutput, overlayShaderSource, maxAnisotropy = 1, fogSampling = false, normalOutput = false) {
         if (_device) throw new Error('Reload the page before starting a second WebGPU host');
         _mesh3DShader = shaderSource;
         _blitShaderWGSL = blitShaderSource;
@@ -743,6 +783,8 @@ window.seasonWebGPU = (() => {
         // The WGSL VELOCITY_OUTPUT constant has already been injected in sync
         // through C# string replacement.
         _velocityOutput = !!velocityOutput;
+        // A0.2: the WGSL NORMAL_OUTPUT constant has been injected in sync by the same C# substitution.
+        _normalOutput = _velocityOutput && !!normalOutput;
         if (!navigator.gpu) throw new Error('WebGPU not supported.');
         const adapter = await navigator.gpu.requestAdapter();
         if (!adapter) throw new Error('WebGPU adapter unavailable.');
@@ -1351,6 +1393,11 @@ window.seasonWebGPU = (() => {
         return { format: 'rg16float', writeMask: modeKey.startsWith('opaque') ? GPUColorWrite.ALL : 0 };
     }
 
+    // A0.2: slot 2 follows slot 1's rule - only opaque surfaces are what SSR / decals should see.
+    function _createNormalTarget(modeKey) {
+        return { format: 'rgba16float', writeMask: modeKey.startsWith('opaque') ? GPUColorWrite.ALL : 0 };
+    }
+
     function _createUnifiedPipelineVariant(shaderModule, bindGroupLayout, modeKey, cullModeKey = 'back', vertexEntryPoint = 'vs_main', vertexBuffers = null, velocity = false, overlay = false) {
         // 2-2 contract clause 7:
         // suffix Nd = GTAO-exempt mode, routed from the flags.w NoDepthWrite bit.
@@ -1382,6 +1429,11 @@ window.seasonWebGPU = (() => {
         // 复用现有透明 PSO 档位；不为雾再创建一套材质变体矩阵。
         const sampleFog = !!_fogSampling && !overlay && !modeKey.startsWith('opaque');
         const layouts = sampleFog ? [bindGroupLayout, _fogSampling.layout] : [bindGroupLayout];
+        const normal = velocity && _normalOutput;
+        const targets = velocity
+            ? [_createColorTarget(modeKey), _createVelocityTarget(modeKey)]
+            : [_createColorTarget(modeKey, overlay ? _format : null)];
+        if (normal) targets.push(_createNormalTarget(modeKey));
         const pipeline = _device.createRenderPipeline({
             layout: _device.createPipelineLayout({ bindGroupLayouts: layouts }),
             vertex: {
@@ -1397,10 +1449,9 @@ window.seasonWebGPU = (() => {
                 // Both share the same shade() body.
                 // WGSL has no preprocessor, so entry-point dispatch is used instead of
                 // #ifdef output-struct branching.
-                entryPoint: (velocity ? 'fs_main_mrt' : 'fs_main') + (sampleFog ? '_fog' : ''),
-                targets: velocity
-                    ? [_createColorTarget(modeKey), _createVelocityTarget(modeKey)]
-                    : [_createColorTarget(modeKey, overlay ? _format : null)],
+                // A0.2: fs_main_mrtn adds slot 2 (SceneNormal) when the process baked NORMAL_OUTPUT.
+                entryPoint: (velocity ? (normal ? 'fs_main_mrtn' : 'fs_main_mrt') : 'fs_main') + (sampleFog ? '_fog' : ''),
+                targets,
             },
             primitive: {
                 topology: 'triangle-list',
@@ -1431,6 +1482,10 @@ window.seasonWebGPU = (() => {
     // draw sites implicitly route to the MRT variant table,
     // with zero new draw API on the C# side.
     let _passVelocity = false;
+    // A0.2: set by beginPass when the SceneNormal attachment (slot 2) is present, reset by endPass. Draw sites do not
+    // route on it - the velocity table already carries slot 2 when _normalOutput - it only lets them refuse a pass
+    // whose attachment set disagrees with what was baked.
+    let _passNormal = false;
     // Phase 4 Outline2D:
     // OutlineMask pass flag
     // set by beginPass when passId===3 and reset by endPass.
@@ -1457,6 +1512,8 @@ window.seasonWebGPU = (() => {
         // The overlay family bakes _format + depth off,
         // avoiding HDR backbuffer attachment-state incompatibility (rule 3).
         if (_passOverlay && _mesh3DPipelineOverlay) return _mesh3DPipelineOverlay;
+        // A0.2: a velocity pass without slot 2 under _normalOutput (or vice versa) is a caller bug; it falls through
+        // to WebGPU validation exactly like the missing-table case above.
         return (_passVelocity && _mesh3DPipelineVelocity) ? _mesh3DPipelineVelocity : _mesh3DPipeline;
     }
 
@@ -1565,6 +1622,10 @@ window.seasonWebGPU = (() => {
                 // the texture is the one already at binding 11. Referenced statically only by fs_main, so
                 // _shadowBindGroupLayout is not expanded, same as binding 20 above.
                 { binding: 21, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'non-filtering' } },
+                // P2: per-view uniform (View / Projection / PrevViewProjection), one 256B slot per view.
+                // Referenced statically by vs_main, so _shadowBindGroupLayout must declare it as well
+                // (same reason as bindings 13/14).
+                { binding: 22, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 192 } },
             ]
         });
 
@@ -1690,6 +1751,9 @@ window.seasonWebGPU = (() => {
                 { binding: 9, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
                 { binding: 13, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
                 { binding: 14, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+                // P2: same reason as 13/14 - vs_main references the per-view UBO through a global const path, so
+                // the vertex-only shadow layout has to declare it too.
+                { binding: 22, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 192 } },
             ]
         });
         _shadowPipeline = _device.createRenderPipeline({
@@ -1754,6 +1818,68 @@ window.seasonWebGPU = (() => {
     // matching the _ensureDepthTexture pattern,
     // while the C# reference (name) remains valid.
     const _renderTargets = {};
+
+    // P3 secondary views: a rendered view presents into its own colour target, and that target is published as a
+    // sampleable texture under the name a 2D control was given, so a minimap or a rear mirror needs no new control
+    // and no readback. The surface map is kept beside the targets (surface name -> target name) instead of inside
+    // _textures: the sampled view identity changes whenever a target is rebuilt, and the name has to survive that
+    // while the published entry is refreshed from the mapping.
+    const _viewSurfaces = {};
+
+    function _refreshViewSurface(surfaceName) {
+        const rtName = _viewSurfaces[surfaceName];
+        const rt = rtName ? _renderTargets[rtName] : null;
+        if (!rt || rt.depthOnly || !rt.colorView) {
+            delete _textureViews[surfaceName];
+            delete _textureMeta[surfaceName];
+            return;
+        }
+        _textureViews[surfaceName] = rt.colorView;
+        // Recorded as a scene read source so a retirement queued while a sprite still samples it is deferred.
+        _sceneTextureSources.set(rt.colorView, rt.colorTex);
+        _textureMeta[surfaceName] = { width: rt.width, height: rt.height, mipLevelCount: 1 };
+    }
+
+    function _refreshViewSurfacesOf(rtName) {
+        for (const surfaceName of Object.keys(_viewSurfaces))
+            if (_viewSurfaces[surfaceName] === rtName) _refreshViewSurface(surfaceName);
+    }
+
+    // Publishes / revokes one presentation target. Both return false when the request cannot be honoured, which is
+    // the signal the C# side turns into "this backend refused the view surface" (the control is then not created).
+    function publishViewSurface(surfaceName, rtName) {
+        const rt = rtName ? _renderTargets[rtName] : null;
+        if (!surfaceName || !rt || rt.depthOnly || !rt.colorView) return false;
+        _viewSurfaces[surfaceName] = rtName;
+        _refreshViewSurface(surfaceName);
+        return true;
+    }
+
+    function unpublishViewSurface(surfaceName) {
+        if (!surfaceName || !(surfaceName in _viewSurfaces)) return false;
+        delete _viewSurfaces[surfaceName];
+        delete _textureViews[surfaceName];
+        delete _textureMeta[surfaceName];
+        return true;
+    }
+
+    function _unpublishSurfacesOf(rtName) {
+        for (const surfaceName of Object.keys(_viewSurfaces))
+            if (_viewSurfaces[surfaceName] === rtName) unpublishViewSurface(surfaceName);
+    }
+
+    // A presentation target carries no implicit depth yet every blit / overlay pipeline bakes a depth24plus
+    // attachment shape, so such a target gets a private plane of its own size, created once and retired with it.
+    function _ensureTargetDepth(rt) {
+        if (rt.auxDepthView) return rt.auxDepthView;
+        rt.auxDepthTex = _device.createTexture({
+            label: 'rt_auxdepth',
+            size: [rt.width, rt.height], format: 'depth24plus',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        rt.auxDepthView = rt.auxDepthTex.createView();
+        return rt.auxDepthView;
+    }
 
     function _createRenderTargetResources(rt, width, height) {
         if (rt.depthOnly) {
@@ -1829,18 +1955,23 @@ window.seasonWebGPU = (() => {
     function _destroyRenderTargetResources(rt) {
         if (rt.colorTex) _queueComputeRetirement(rt.colorTex);
         if (rt.depthTex) _queueComputeRetirement(rt.depthTex);
+        if (rt.auxDepthTex) _queueComputeRetirement(rt.auxDepthTex);
         rt.colorTex = rt.depthTex = rt.colorView = rt.depthView = null;
+        rt.auxDepthTex = rt.auxDepthView = null;
         rt.blitBindGroup = rt.blitBindGroupLinear = rt.variantBindGroups = null;
         _invalidateComputeBindGroups();
     }
 
     function _resizeRenderTargetResources(rt, width, height) {
         // 完整分配成功才替换；旧命令引用在提交完成前继续有效。
-        const replacement = { ...rt, colorTex: null, depthTex: null, colorView: null, depthView: null };
+        const replacement = { ...rt, colorTex: null, depthTex: null, colorView: null, depthView: null,
+            auxDepthTex: null, auxDepthView: null };
         try { _createRenderTargetResources(replacement, width, height); }
         catch (error) { _destroyRenderTargetResources(replacement); throw error; }
         _destroyRenderTargetResources(rt);
         Object.assign(rt, replacement);
+        // The published surface sampled the old view, so it has to point at the rebuilt one.
+        if (rt.name) _refreshViewSurfacesOf(rt.name);
     }
 
     function synchronizeRenderTargetSizes() {
@@ -1871,6 +2002,7 @@ window.seasonWebGPU = (() => {
     //   and matches SceneVelocity format on the other three backends)
     function createRenderTarget(name, width, height, matchBackbuffer, formatKind) {
         const rt = {
+            name,
             matchBackbuffer: !!matchBackbuffer,
             depthOnly: formatKind === 2 || formatKind === 3,
             velocity: formatKind === 4,
@@ -1891,6 +2023,9 @@ window.seasonWebGPU = (() => {
         catch (error) { _destroyRenderTargetResources(rt); throw error; }
         if (_renderTargets[name]) _destroyRenderTargetResources(_renderTargets[name]);
         _renderTargets[name] = rt;
+        // A view surface published for this target samples the view created just now (the P3 publish order is
+        // target first, then surface, so this only matters when a name is reused).
+        _refreshViewSurfacesOf(name);
         // 把解析后的尺寸回传给 C#：matchBackbuffer 目标的描述符以 Width/Height = 0 申请，
         // 而后端之上的效果按 Desc 分配资源（雾的 froxel 网格在 0x0 时会直接放弃分配）。
         return [w, h];
@@ -1899,6 +2034,8 @@ window.seasonWebGPU = (() => {
     function disposeRenderTarget(name) {
         const rt = _renderTargets[name];
         if (!rt) return;
+        // Retiring a target that still answers a surface name would leave the controls sampling a destroyed view.
+        _unpublishSurfacesOf(name);
         _destroyRenderTargetResources(rt);
         delete _renderTargets[name];
     }
@@ -2450,6 +2587,7 @@ window.seasonWebGPU = (() => {
         _poolCursor.vertex = _poolCursor.index = _poolCursor.uniform = _poolCursor.storage = 0;
         _computeFrameId++;
         _fogSamplingFrame = null;
+        _weatherSamplingFrame = null;
         // 2-3 Step C: frame serial
         // gate for the "roll prev bone shadow copy exactly once per frame" rule
         _frameSerial++;
@@ -2468,15 +2606,15 @@ window.seasonWebGPU = (() => {
     // Offscreen targets are introduced in Step 2.
     // passId order matches the C# RenderPassId enum,
     // and the debug group is attached at the encoder level to wrap the whole pass (Step 0).
-    const _passLabels = ['Shadow', 'Scene', 'Post', 'OutlineMask', 'FinalBlit', 'Overlay', 'SceneOpaque', 'FogComposite', 'SceneTransparent'];
+    const _passLabels = ['Shadow', 'Scene', 'Post', 'OutlineMask', 'FinalBlit', 'Overlay', 'SceneOpaque', 'FogComposite', 'SceneTransparent', 'WeatherComposite'];
 
-    function beginPass(passId, targetName, clearColorEnable, clearR, clearG, clearB, clearA, clearDepthEnable, storeDepth, depthTargetName, velocityTargetName) {
+    function beginPass(passId, targetName, clearColorEnable, clearR, clearG, clearB, clearA, clearDepthEnable, storeDepth, depthTargetName, velocityTargetName, normalTargetName) {
         if (!_frameStarted || !_commandEncoder) return;
         if (_passEncoder) throw new Error('不能嵌套 WebGPU 渲染 Pass');
         if (_isSceneCollecting()) throw new Error('场景收集封存之前不能开始渲染 Pass');
         const fogTarget = targetName ? _renderTargets[targetName] : null;
-        if (passId === 7 && (!fogTarget || fogTarget.depthOnly || !fogTarget.noImplicitDepth
-            || fogTarget.colorFormat !== 'rgba16float' || depthTargetName || velocityTargetName))
+        if ((passId === 7 || passId === 9) && (!fogTarget || fogTarget.depthOnly || !fogTarget.noImplicitDepth
+            || fogTarget.colorFormat !== 'rgba16float' || depthTargetName || velocityTargetName || normalTargetName))
             throw new Error('雾合成必须使用独立 HDR 颜色目标，不能挂载深度或速度');
         _clearActivePass();
 
@@ -2505,13 +2643,22 @@ window.seasonWebGPU = (() => {
         // rebind the depth plane to explicit SceneDepth
         // (depth24plus shape, formatKind 3, matching the format already baked into pipelines).
         // Lazy-rebuild rules are the same as for color targets.
+        // P3: a secondary view supplies its own depth plane, but as a depth32float shadow-shaped target
+        // (formatKind 2), which no scene pipeline accepts. Only a depth24plus plane - or a colour target that has
+        // none of its own - is bound here; otherwise the colour target's implicit plane is kept, which is exactly
+        // the same size and format the view's attachments need.
         const drt = depthTargetName ? _renderTargets[depthTargetName] : null;
-        if (drt) {
+        if (drt && (!rt || !rt.depthView || drt.depthFormat === 'depth24plus')) {
             if (drt.matchBackbuffer && (drt.width !== _canvas.width || drt.height !== _canvas.height)) {
                 _resizeRenderTargetResources(drt, _canvas.width, _canvas.height);
             }
             depthView = drt.depthView;
         }
+
+        // P3: the presentation target of a secondary view has no implicit depth, yet the blit pipelines bake a
+        // depth24plus attachment. A private plane of the target's own size keeps the attachment set identical to
+        // the backbuffer one without paying for it on the targets that never present.
+        if (!depthOnly && !depthView && rt && passId !== 7 && passId !== 9) depthView = _ensureTargetDepth(rt);
 
         // 2-3 contract clause 2:
         // velocity attachment (MRT slot 1, formatKind 4 = rg16float with no companion depth).
@@ -2528,6 +2675,18 @@ window.seasonWebGPU = (() => {
         }
         const velocityView = vrt ? vrt.colorView : null;
 
+        // A0.2: SceneNormal attachment (MRT slot 2, formatKind 5 = rgba16float without companion depth), only ever next to
+        // slot 1. Cleared to (0,0,0,0) and loaded/stored exactly like velocity.
+        const nrt = (velocityView && normalTargetName) ? _renderTargets[normalTargetName] : null;
+        if (nrt) {
+            if (nrt.depthOnly || nrt.colorFormat !== 'rgba16float')
+                throw new Error('SceneNormal 必须是 rgba16float 颜色目标');
+            if (nrt.matchBackbuffer && (nrt.width !== _canvas.width || nrt.height !== _canvas.height)) {
+                _resizeRenderTargetResources(nrt, _canvas.width, _canvas.height);
+            }
+        }
+        const normalView = nrt ? nrt.colorView : null;
+
         const colorAttachments = depthOnly ? [] : [{
             view: colorView,
             clearValue: { r: clearR, g: clearG, b: clearB, a: clearA },
@@ -2542,13 +2701,21 @@ window.seasonWebGPU = (() => {
                 storeOp: 'store',
             });
         }
+        if (normalView) {
+            colorAttachments.push({
+                view: normalView,
+                clearValue: { r: 0, g: 0, b: 0, a: 0 },
+                loadOp: clearColorEnable ? 'clear' : 'load',
+                storeOp: 'store',
+            });
+        }
 
         _passEncoder = _commandEncoder.beginRenderPass({
             // Depth-only passes (shadow maps) use a depth-only attachment set,
             // and contents must be rendered through the dedicated depth32float pipeline (1-5)
             colorAttachments,
             // FogComposite=7 只写颜色，不挂载也不清除原场景深度。
-            depthStencilAttachment: passId === 7 ? undefined : {
+            depthStencilAttachment: (passId === 7 || passId === 9) ? undefined : {
                 view: depthView,
                 depthClearValue: 1.0,
                 depthLoadOp: clearDepthEnable ? 'clear' : 'load',
@@ -2564,6 +2731,7 @@ window.seasonWebGPU = (() => {
         // 2-3: the velocity flag drives draw sites to switch to the MRT variant table
         // attachment set and pipeline must match exactly, per rule 3
         _passVelocity = !!velocityView;
+        _passNormal = !!normalView;
         // Phase 4: OutlineMask pass (RenderPassId.OutlineMask=3)
         // routes draw sites to the mask pipeline
         _passOutlineMask = (passId === 3);
@@ -2574,7 +2742,7 @@ window.seasonWebGPU = (() => {
         _activePassId = passId;
         _activeColorTarget = rt;
         _activeColorView = colorView;
-        _activeDepthView = passId === 7 ? null : depthView;
+        _activeDepthView = (passId === 7 || passId === 9) ? null : depthView;
     }
 
     function endPass() {
@@ -2699,13 +2867,16 @@ window.seasonWebGPU = (() => {
         }
     }
 
+    // The view-space z row now comes from the per-view slot the draw will bind (set by setViewConstants),
+    // instead of being read out of the per-draw uniform.
     function _sceneDrawDepth(uniform, center = null, instanceData = null, firstInstance = 0) {
         const m = instanceData || uniform, offset = instanceData ? firstInstance * 20 : 0;
         const x = center?.[0] ?? 0, y = center?.[1] ?? 0, z = center?.[2] ?? 0;
         const wx = x*m[offset]+y*m[offset+4]+z*m[offset+8]+m[offset+12];
         const wy = x*m[offset+1]+y*m[offset+5]+z*m[offset+9]+m[offset+13];
         const wz = x*m[offset+2]+y*m[offset+6]+z*m[offset+10]+m[offset+14];
-        return wx*uniform[18]+wy*uniform[22]+wz*uniform[26]+uniform[30];
+        const row = _currentViewZRow;
+        return wx*row[0]+wy*row[1]+wz*row[2]+row[3];
     }
 
     function _meshBoundsCenter(vertices, stride) {
@@ -2750,7 +2921,7 @@ window.seasonWebGPU = (() => {
 
     function _isTransparentMode(uniformData) {
         const uniformI32 = _getUniformI32View(uniformData);
-        return _selectPipelineMode(uniformData[94], uniformI32[98], uniformI32[99]) === 'transparent';
+        return _selectPipelineMode(uniformData[46], uniformI32[50], uniformI32[51]) === 'transparent';
     }
 
     function _drawIndexedWithOptionalDoubleSidedTransparency(pipelineSet, modeKey, doubleSided, setStateAndDraw) {
@@ -2765,7 +2936,7 @@ window.seasonWebGPU = (() => {
 
     function _selectPipelineByUniform(pipelineSet, uniformData, doubleSided = false) {
         const uniformI32 = _getUniformI32View(uniformData);
-        const modeKey = _selectPipelineMode(uniformData[94], uniformI32[98], uniformI32[99]);
+        const modeKey = _selectPipelineMode(uniformData[46], uniformI32[50], uniformI32[51]);
         return pipelineSet[_getPipelineVariantKey(modeKey, doubleSided)];
     }
 
@@ -2792,7 +2963,7 @@ window.seasonWebGPU = (() => {
     // semantically identical to SetLighting on the other three backends.
     // Length must exactly match C# SceneLightParams.Bytes,
     // or updateSceneLights silently drops the upload.
-    const SCENE_LIGHT_BYTES = 1376;
+    const SCENE_LIGHT_BYTES = 2432;
     let _sceneLightBuffer = null;
 
     function _ensureSceneLightBuffer() {
@@ -2819,7 +2990,10 @@ window.seasonWebGPU = (() => {
     // When the corresponding hasPrev* bits are 0, VS does not read them,
     // so contents are irrelevant
     // which is exactly the case for text / sprite paths.
-    function _createMeshBindGroup(layout, uniformBuffer, texView, normalView, mrView, aoView, emissiveView, boneBuffer, morphMetaBuffer, morphDataBuffer, prevBoneBuffer, prevInstanceBuffer) {
+    // viewSlot pins the per-view UBO (binding 22). 2D sprite / text call sites pass SCREEN_SPACE_VIEW_SLOT;
+    // everything derived from a RenderView passes _currentViewSlot, which setViewConstants established before the
+    // pass chain started.
+    function _createMeshBindGroup(layout, viewSlot, uniformBuffer, texView, normalView, mrView, aoView, emissiveView, boneBuffer, morphMetaBuffer, morphDataBuffer, prevBoneBuffer, prevInstanceBuffer) {
         return _device.createBindGroup({
             layout,
             entries: [
@@ -2872,6 +3046,9 @@ window.seasonWebGPU = (() => {
                 { binding: 20, resource: _samplers['repeat'] },
                 // 1-5 clause 15: same atlas as binding 11, reached non-comparatively so the blocker search can read depth.
                 { binding: 21, resource: _samplers['shadowPoint'] },
+                // P2: per-view uniform. A fixed 256B-aligned buffer offset replaces a dynamic offset: the slot is
+                // part of the bind group, which is what keeps a deferred scene draw bound to its own view.
+                { binding: 22, resource: { buffer: _ensureViewSlotBuffer(), offset: viewSlot * VIEW_SLOT_BYTES, size: VIEW_SLOT_BYTES } },
             ]
         });
     }
@@ -2965,6 +3142,8 @@ window.seasonWebGPU = (() => {
     // It does not include the atlas
     // because attachment binding and sampled binding are mutually exclusive under validation.
     // The depth path does not need prev data and always binds the default fallback sentinels.
+    // The shadow pass is the current view slot: RenderShadowPass publishes the quadrant's light-space
+    // ViewConstants before app.DrawShadow(), so _currentViewSlot already addresses that quadrant's matrix.
     function _createShadowBindGroup(uniformBuffer, boneBuffer, morphMetaBuffer, morphDataBuffer) {
         return _device.createBindGroup({
             layout: _shadowBindGroupLayout,
@@ -2975,6 +3154,7 @@ window.seasonWebGPU = (() => {
                 { binding: 9, resource: { buffer: _readSceneBuffer(morphDataBuffer || _defaultMorphDataBuffer) } },
                 { binding: 13, resource: { buffer: _defaultBoneBuffer } },
                 { binding: 14, resource: { buffer: _defaultPrevInstanceBuffer } },
+                { binding: 22, resource: { buffer: _ensureViewSlotBuffer(), offset: _currentViewSlot * VIEW_SLOT_BYTES, size: VIEW_SLOT_BYTES } },
             ]
         });
     }
@@ -3002,11 +3182,11 @@ window.seasonWebGPU = (() => {
         const whiteView = _textureViews['White'] || texView;
 
         const uni = _SPRITE2D_UNIFORM_SCRATCH;
-        uni[84] = colorR; uni[85] = colorG; uni[86] = colorB; uni[87] = colorA;
-        uni[94] = alpha;
+        uni[36] = colorR; uni[37] = colorG; uni[38] = colorB; uni[39] = colorA;
+        uni[46] = alpha;
 
         _SPRITE2D_UNIFORM_I32[1] = renderMode || 0;
-        uni[92] = pixelRange || 0;
+        uni[44] = pixelRange || 0;
 
         const uniformBuffer = _acquireBuffer('uniform', uni.byteLength, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
         _device.queue.writeBuffer(uniformBuffer, 0, uni);
@@ -3071,8 +3251,10 @@ window.seasonWebGPU = (() => {
         const vertexBuffer = _acquireBuffer('vertex', vd.byteLength, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
         _device.queue.writeBuffer(vertexBuffer, 0, vd);
 
+        // 2D sprite: identity view/projection comes from the dedicated screen-space slot.
         const bindGroup = _createMeshBindGroup(
             _mesh3DPipeline.bindGroupLayout,
+            SCREEN_SPACE_VIEW_SLOT,
             uniformBuffer,
             texView,
             whiteView,
@@ -3080,7 +3262,7 @@ window.seasonWebGPU = (() => {
             whiteView,
             whiteView);
 
-        _submitSceneDraw(_selectPipelineMode(uni[94], _getUniformI32View(uni)[98], _getUniformI32View(uni)[99]),
+        _submitSceneDraw(_selectPipelineMode(uni[46], _getUniformI32View(uni)[50], _getUniformI32View(uni)[51]),
             false, bindGroup, _identityInstanceBuffer, vertexBuffer, null, null, 6);
     }
 
@@ -3092,11 +3274,11 @@ window.seasonWebGPU = (() => {
         const whiteView = _textureViews['White'] || texView;
 
         const uni = _SPRITE2D_UNIFORM_SCRATCH;
-        uni[84] = colorR; uni[85] = colorG; uni[86] = colorB; uni[87] = colorA;
-        uni[94] = alpha;
+        uni[36] = colorR; uni[37] = colorG; uni[38] = colorB; uni[39] = colorA;
+        uni[46] = alpha;
 
         _SPRITE2D_UNIFORM_I32[1] = renderMode || 0;
-        uni[92] = pixelRange || 0;
+        uni[44] = pixelRange || 0;
 
         const uniformBuffer = _acquireBuffer('uniform', uni.byteLength, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
         _device.queue.writeBuffer(uniformBuffer, 0, uni);
@@ -3128,8 +3310,10 @@ window.seasonWebGPU = (() => {
         const vertexBuffer = _acquireBuffer('vertex', vd.byteLength, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
         _device.queue.writeBuffer(vertexBuffer, 0, vd);
 
+        // 2D text atlas quad: same screen-space slot as Sprite2D.
         const bindGroup = _createMeshBindGroup(
             _mesh3DPipeline.bindGroupLayout,
+            SCREEN_SPACE_VIEW_SLOT,
             uniformBuffer,
             texView,
             whiteView,
@@ -3137,7 +3321,7 @@ window.seasonWebGPU = (() => {
             whiteView,
             whiteView);
 
-        _submitSceneDraw(_selectPipelineMode(uni[94], _getUniformI32View(uni)[98], _getUniformI32View(uni)[99]),
+        _submitSceneDraw(_selectPipelineMode(uni[46], _getUniformI32View(uni)[50], _getUniformI32View(uni)[51]),
             false, bindGroup, _identityInstanceBuffer, vertexBuffer, null, null, 6);
     }
 
@@ -3185,9 +3369,9 @@ window.seasonWebGPU = (() => {
         _ensureSprite3DBuffer();
 
         const uni = _TEXT_UNIFORM_SCRATCH;
-        uni[84] = colorR; uni[85] = colorG; uni[86] = colorB; uni[87] = colorA;
-        uni[92] = pixelRange || 0;   // material.x = PxRange
-        uni[94] = alpha;             // material.z = GlobalAlpha
+        uni[36] = colorR; uni[37] = colorG; uni[38] = colorB; uni[39] = colorA;
+        uni[44] = pixelRange || 0;   // material.x = PxRange
+        uni[46] = alpha;             // material.z = GlobalAlpha
         // [104] old hdrExposure slot is retired
         // (1-2 contract 8: inverse-ACES compensation for text now reads uLights.params0.y)
 
@@ -3198,6 +3382,7 @@ window.seasonWebGPU = (() => {
         // reusing the morph-deltas slot and matching DX t5 / Vulkan binding 10
         const bindGroup = _createMeshBindGroup(
             _mesh3DPipeline.bindGroupLayout,
+            SCREEN_SPACE_VIEW_SLOT,
             uniformBuffer,
             texView,
             whiteView,
@@ -3227,7 +3412,7 @@ window.seasonWebGPU = (() => {
         if (!_frameStarted || (!_passEncoder && !_isSceneCollecting())) return;
         if (!ArrayBuffer.isView(uniformData)) uniformData = new Float32Array(uniformData);
         if (_debugLog && _drawSprite3DDiagCount < 3) {
-            _log(`[drawSprite3D] name=${name} billboard=${billboard} alpha=${uniformData?.[94]?.toFixed(2)}`);
+            _log(`[drawSprite3D] name=${name} billboard=${billboard} alpha=${uniformData?.[46]?.toFixed(2)}`);
             _drawSprite3DDiagCount++;
         }
 
@@ -3240,8 +3425,10 @@ window.seasonWebGPU = (() => {
         _ensureSprite3DBuffer();
 
         const whiteView = _textureViews['White'] || texView;
+        // Billboard sprite is 3D geometry, so it follows the render view rather than the screen-space slot.
         const bindGroup = _createMeshBindGroup(
             _mesh3DPipeline.bindGroupLayout,
+            _currentViewSlot,
             uniformBuffer,
             texView,
             whiteView,
@@ -3249,7 +3436,7 @@ window.seasonWebGPU = (() => {
             whiteView,
             whiteView);
 
-        _submitSceneDraw(_selectPipelineMode(uniformData[94], _getUniformI32View(uniformData)[98], _getUniformI32View(uniformData)[99]),
+        _submitSceneDraw(_selectPipelineMode(uniformData[46], _getUniformI32View(uniformData)[50], _getUniformI32View(uniformData)[51]),
             false, bindGroup, _identityInstanceBuffer, _sprite3DVertexBuffer, null, null, 6, 1, 0,
             _isSceneCollecting() ? _sceneDrawDepth(uniformData) : 0);
     }
@@ -3286,6 +3473,7 @@ window.seasonWebGPU = (() => {
 
         const bindGroup = _createMeshBindGroup(
             _mesh3DPipeline.bindGroupLayout,
+            _currentViewSlot,
             uBuffer,
             texView,
             normalView,
@@ -3293,7 +3481,7 @@ window.seasonWebGPU = (() => {
             aoView,
             emissiveView);
 
-        const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[94], _getUniformI32View(uniformData)[98], _getUniformI32View(uniformData)[99]);
+        const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[46], _getUniformI32View(uniformData)[50], _getUniformI32View(uniformData)[51]);
         _submitSceneDraw(modeKey, doubleSided, bindGroup, _identityInstanceBuffer, vBuffer, iBuffer,
             resolvedIndexFormat, indexData.length, 1, 0,
             _isSceneCollecting() ? _sceneDrawDepth(uniformData, _meshBoundsCenter(vertexData, 20)) : 0);
@@ -3319,6 +3507,7 @@ window.seasonWebGPU = (() => {
 
         const bindGroup = _createMeshBindGroup(
             _mesh3DPipeline.bindGroupLayout,
+            _currentViewSlot,
             uBuffer,
             texView,
             whiteView,
@@ -3326,7 +3515,7 @@ window.seasonWebGPU = (() => {
             whiteView,
             whiteView);
 
-        const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[94], _getUniformI32View(uniformData)[98], _getUniformI32View(uniformData)[99]);
+        const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[46], _getUniformI32View(uniformData)[50], _getUniformI32View(uniformData)[51]);
         _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, _identityInstanceBuffer, mesh.vBuffer, mesh.iBuffer,
             mesh.indexFormat || 'uint16', mesh.indexCount, 1, 0,
             _isSceneCollecting() ? _sceneDrawDepth(uniformData, mesh.boundsCenter) : 0);
@@ -3348,8 +3537,8 @@ window.seasonWebGPU = (() => {
         // because identity matrices would snap vertices back to rest pose.
         const prevBoneBuffer = skinKey ? (_prevSkinnedBoneBuffers[skinKey] || boneBuffer) : _defaultBoneBuffer;
 
-        const STRIDE = 108;  // Aligned with C# WebGPUUniformLayout.TotalFloats
-                             // including the hdrParams vec4 added at the end in 1-4 Step B
+        const STRIDE = 60;  // Aligned with C# WebGPUUniformLayout.TotalFloats (per-object state only;
+                            // the view matrices live in the per-view UBO at binding 22)
         const BYTES_PER_UNIFORM = STRIDE * 4;
 
         uniformBytes = _interopToU8(uniformBytes);
@@ -3377,8 +3566,8 @@ window.seasonWebGPU = (() => {
                 if (!mesh) continue;
 
                 const uniformBase = i * STRIDE;
-                const alphaMode = intView[uniformBase + 98];
-                const modeKey = _selectPipelineMode(floatView[uniformBase + 94], alphaMode, intView[uniformBase + 99]);
+                const alphaMode = intView[uniformBase + 50];
+                const modeKey = _selectPipelineMode(floatView[uniformBase + 46], alphaMode, intView[uniformBase + 51]);
                 if (batchMode !== null && modeKey !== batchMode) continue;
 
                 const uniformView = floatView.subarray(uniformBase, uniformBase + STRIDE);
@@ -3420,6 +3609,7 @@ window.seasonWebGPU = (() => {
                     _device.queue.writeBuffer(mBuffer, 0, uniformView);
                     const mBindGroup = _createMeshBindGroup(
                         _mesh3DPipeline.bindGroupLayout,
+                        _currentViewSlot,
                         mBuffer,
                         mTexView,
                         mNormalView,
@@ -3454,6 +3644,7 @@ window.seasonWebGPU = (() => {
 
                 const bindGroup = _createMeshBindGroup(
                     _mesh3DPipeline.bindGroupLayout,
+                    _currentViewSlot,
                     uBuffer,
                     texView,
                     normalView,
@@ -3565,6 +3756,7 @@ window.seasonWebGPU = (() => {
             if (_isTransparentMode(uniformData)) return;
             const mBindGroup = _createMeshBindGroup(
                 _mesh3DPipeline.bindGroupLayout,
+                _currentViewSlot,
                 uBuffer,
                 texView,
                 normalView,
@@ -3586,6 +3778,7 @@ window.seasonWebGPU = (() => {
 
         const bindGroup = _createMeshBindGroup(
             _mesh3DPipeline.bindGroupLayout,
+            _currentViewSlot,
             uBuffer,
             texView,
             normalView,
@@ -3598,7 +3791,7 @@ window.seasonWebGPU = (() => {
             prevBoneBuffer,
             prevInstanceBuffer);
 
-        const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[94], _getUniformI32View(uniformData)[98], _getUniformI32View(uniformData)[99]);
+        const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[46], _getUniformI32View(uniformData)[50], _getUniformI32View(uniformData)[51]);
         _instancedDiag.lastModeKey = modeKey;
         try {
             if (_isSceneCollecting()) {
@@ -3653,7 +3846,7 @@ window.seasonWebGPU = (() => {
     // This is zero-allocation in steady state.
 
     // group(1) 与共享光照 UBO 分离。启停参数创建后不再写入，避免同帧覆盖。
-    let _fogSampling = null, _fogSamplingFrame = null;
+    let _fogSampling = null, _fogSamplingFrame = null, _weatherSamplingFrame = null;
     const _fogMaterialPipelines = new WeakSet();
 
     function _initializeFogSampling() {
@@ -3670,11 +3863,11 @@ window.seasonWebGPU = (() => {
             const frame = _device.createBuffer({ label: 'fog_disabled_frame', size: _fogFrameBytes,
                 usage: GPUBufferUsage.STORAGE });
             buffers.push(frame);
-            const params = [0, 1].map(value => {
+            const params = [0, 1, 2, 3].map(value => {
                 const buffer = _device.createBuffer({ label: `fog_sampling_${value}`, size: 16,
                     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
                 buffers.push(buffer);
-                _device.queue.writeBuffer(buffer, 0, new Float32Array([value, 0, 0, 0]));
+                _device.queue.writeBuffer(buffer, 0, new Float32Array([value & 1, value >> 1, 0, 0]));
                 return buffer;
             });
             // 关闭分支不会查询介质；复用已有 AP 哨兵，不分配额外雾体积。
@@ -3684,7 +3877,13 @@ window.seasonWebGPU = (() => {
                 { binding: 2, resource: _defaultAerialLutView },
                 { binding: 3, resource: { buffer: params[0], size: 16 } },
             ] });
-            _fogSampling = { layout, disabled, enabledParams: params[1], buffers };
+            const weatherOnly = _device.createBindGroup({ layout, entries: [
+                { binding: 0, resource: { buffer: frame, size: _fogFrameBytes } },
+                { binding: 1, resource: _defaultAerialLutView },
+                { binding: 2, resource: _defaultAerialLutView },
+                { binding: 3, resource: { buffer: params[2], size: 16 } },
+            ] });
+            _fogSampling = { layout, disabled, weatherOnly, enabledParams: params[1], combinedParams: params[3], buffers };
         } catch (error) {
             for (const buffer of buffers) _queueComputeRetirement(buffer);
             throw error;
@@ -3692,13 +3891,16 @@ window.seasonWebGPU = (() => {
     }
 
     function _fogMaterialGroup() {
-        const frame = _fogSamplingFrame;
-        if (!_sceneFogAllowed || !frame || !_frameStarted || !_passEncoder || _instancedDiag.deviceLost || _activePassId !== 8
-            || frame.command !== _commandEncoder || frame.frameId !== _computeFrameId
-            || _activeColorTarget !== frame.refs[13] || _activeColorView !== frame.refs[12]
-            || _activeDepthView !== frame.refs[10]
-            || !_sameFogResources(frame.refs, _resolveFogComposite(frame.input))) return _fogSampling.disabled;
-        return frame.samplingGroup;
+        if (!_frameStarted || !_passEncoder || _instancedDiag.deviceLost || _activePassId !== 8) return _fogSampling.disabled;
+        const frame = _fogSamplingFrame, rain = _weatherSamplingFrame;
+        const fog = _sceneFogAllowed && frame && frame.command === _commandEncoder && frame.frameId === _computeFrameId
+            && _activeColorTarget === frame.refs[13] && _activeColorView === frame.refs[12]
+            && _activeDepthView === frame.refs[10] && _sameFogResources(frame.refs, _resolveFogComposite(frame.input));
+        const weather = rain && rain.command === _commandEncoder && rain.frameId === _computeFrameId
+            && _activeDepthView === rain.refs[10] && _sameFogResources(rain.refs, _resolveFogComposite(rain.input))
+            && (fog || (_activeColorTarget === rain.refs[13] && _activeColorView === rain.refs[12]));
+        if (fog) return weather ? frame.weatherSamplingGroup : frame.samplingGroup;
+        return weather ? _fogSampling.weatherOnly : _fogSampling.disabled;
     }
 
     function _setMeshPipeline(value) {
@@ -3708,23 +3910,25 @@ window.seasonWebGPU = (() => {
 
     // 独立雾合成：生产 WGSL 由 C# 提供；异步编译完成前 Prepare 明确回退。
     const _fogComposites = Object.create(null);
-    const _fogFrameBytes = 384 * 16;
+    const _fogFrameBytes = 448 * 16;
+    const _weatherFrameBytes = 160 * 16;
     const _fogAoFormats = new Set(['r8unorm', 'r16float', 'rg16float', 'rgba16float',
         'rgba8unorm', 'bgra8unorm']);
 
-    function createFogCompositePipeline(name, vertex, fragment) {
+    function createFogCompositePipeline(name, vertex, fragment, weather = false) {
         if (!_device || _instancedDiag.deviceLost || !name) return false;
         if (_fogComposites[name]) return !_fogComposites[name].failed;
         const device = _device;
-        const state = { device, pipeline: null, slots: [], cursor: 0, frameId: -1, prepared: null, failed: false };
+        const state = { device, weather, frameBytes: weather ? _weatherFrameBytes : _fogFrameBytes,
+            pipeline: null, slots: [], cursor: 0, frameId: -1, prepared: null, failed: false };
         let scopeOpen = false;
         try {
             device.pushErrorScope('validation'); scopeOpen = true;
             const visibility = GPUShaderStage.FRAGMENT;
             state.layout = device.createBindGroupLayout({ label: `${name}_layout`, entries: [
-                { binding: 0, visibility, buffer: { type: 'read-only-storage', minBindingSize: _fogFrameBytes } },
-                { binding: 1, visibility, texture: { sampleType: 'float', viewDimension: '3d' } },
-                { binding: 2, visibility, texture: { sampleType: 'float', viewDimension: '3d' } },
+                { binding: 0, visibility, buffer: { type: 'read-only-storage', minBindingSize: state.frameBytes } },
+                { binding: 1, visibility, texture: { sampleType: 'float', viewDimension: weather ? '2d' : '3d' } },
+                { binding: 2, visibility, texture: { sampleType: 'float', viewDimension: weather ? '2d' : '3d' } },
                 { binding: 3, visibility, texture: { sampleType: 'float', viewDimension: '2d' } },
                 { binding: 4, visibility, texture: { sampleType: 'depth', viewDimension: '2d' } },
                 { binding: 5, visibility, texture: { sampleType: 'float', viewDimension: '2d' } },
@@ -3769,7 +3973,7 @@ window.seasonWebGPU = (() => {
         const destination = _renderTargets[input.destination], frame = _storageBuffers[input.frame];
         if (!color || !depth || !destination || color.depthOnly || !depth.depthOnly || destination.depthOnly
             || !destination.noImplicitDepth || destination.depthTex || destination.depthView
-            || !frame || frame.size < _fogFrameBytes || !(frame.usage & GPUBufferUsage.STORAGE)
+            || !frame || frame.size < (input.weather ? _weatherFrameBytes : _fogFrameBytes) || !(frame.usage & GPUBufferUsage.STORAGE)
             || !Number.isFinite(input.aoIntensity) || input.aoIntensity < 0) return null;
         // 输入绝不在此重建；过期尺寸代表本帧数据不完整，必须回退。
         for (const rt of [color, depth, destination])
@@ -3785,11 +3989,11 @@ window.seasonWebGPU = (() => {
             || c.width !== color.width || c.height !== color.height
             || d.width !== depth.width || d.height !== depth.height
             || out.width !== destination.width || out.height !== destination.height) return null;
-        const integrated = _textures3d[input.integrated], local = _textures3d[input.local];
-        if (!_fogTexture(integrated, '3d', sampled) || !_fogTexture(local, '3d', sampled)
+        const integrated = input.weather ? c : _textures3d[input.integrated], local = input.weather ? c : _textures3d[input.local];
+        if (!input.weather && (!_fogTexture(integrated, '3d', sampled) || !_fogTexture(local, '3d', sampled)
             || integrated.format !== 'rgba16float' || local.format !== 'rgba16float'
             || integrated.width !== local.width || integrated.height !== local.height
-            || integrated.depthOrArrayLayers !== local.depthOrArrayLayers + 1) return null;
+            || integrated.depthOrArrayLayers !== local.depthOrArrayLayers + 1)) return null;
         let ao = c, aoView = color.colorView;
         if (input.applyAo) {
             if (input.aoTarget) {
@@ -3803,8 +4007,10 @@ window.seasonWebGPU = (() => {
             if (!_fogTexture(ao, '2d', sampled) || ao.depthOrArrayLayers !== 1
                 || !_fogAoFormats.has(ao.format) || ao === out) return null;
         }
-        const refs = [frame, integrated, local, c, d, ao, out, _textureViews3d[input.integrated],
-            _textureViews3d[input.local], color.colorView, depth.depthView, aoView, destination.colorView, destination];
+        const refs = [frame, integrated, local, c, d, ao, out,
+            input.weather ? color.colorView : _textureViews3d[input.integrated],
+            input.weather ? color.colorView : _textureViews3d[input.local],
+            color.colorView, depth.depthView, aoView, destination.colorView, destination];
         return refs.every(Boolean) ? refs : null;
     }
 
@@ -3815,12 +4021,12 @@ window.seasonWebGPU = (() => {
     function prepareFogComposite(name, color, depth, frame, integrated, local, aoTexture, aoTarget,
         aoIntensity, applyAo, destination) {
         const state = _fogComposites[name];
-        _fogSamplingFrame = null;
         if (!state) return false;
+        if (state.weather) _weatherSamplingFrame = null; else _fogSamplingFrame = null;
         state.prepared = null;
         if (!_frameStarted || !_commandEncoder || _passEncoder || _instancedDiag.deviceLost
             || state.device !== _device || !state.pipeline || state.failed) return false;
-        const input = { color, depth, frame, integrated, local, aoTexture, aoTarget, aoIntensity, applyAo, destination };
+        const input = { color, depth, frame, integrated, local, aoTexture, aoTarget, aoIntensity, applyAo, destination, weather: state.weather };
         // 输出尚未用作本帧附件，可以在 Pass 外按当前画布重建。
         const target = _renderTargets[destination];
         try {
@@ -3841,21 +4047,23 @@ window.seasonWebGPU = (() => {
             _device.queue.writeBuffer(slot.buffer, 0, slot.params);
             if (!_sameFogResources(slot.refs, refs)) {
                 slot.group = _device.createBindGroup({ layout: state.layout, entries: [
-                    { binding: 0, resource: { buffer: refs[0], size: _fogFrameBytes } },
+                    { binding: 0, resource: { buffer: refs[0], size: state.frameBytes } },
                     { binding: 1, resource: refs[7] }, { binding: 2, resource: refs[8] },
                     { binding: 3, resource: refs[9] }, { binding: 4, resource: refs[10] },
                     { binding: 5, resource: refs[11] }, { binding: 6, resource: { buffer: slot.buffer, size: 16 } },
                     { binding: 7, resource: state.sampler },
                 ] });
-                slot.samplingGroup = _fogSampling ? _device.createBindGroup({ layout: _fogSampling.layout, entries: [
+                const sampleGroup = params => _device.createBindGroup({ layout: _fogSampling.layout, entries: [
                     { binding: 0, resource: { buffer: refs[0], size: _fogFrameBytes } },
                     { binding: 1, resource: refs[7] }, { binding: 2, resource: refs[8] },
-                    { binding: 3, resource: { buffer: _fogSampling.enabledParams, size: 16 } },
-                ] }) : null;
+                    { binding: 3, resource: { buffer: params, size: 16 } },
+                ] });
+                slot.samplingGroup = _fogSampling && !state.weather ? sampleGroup(_fogSampling.enabledParams) : null;
+                slot.weatherSamplingGroup = _fogSampling && !state.weather ? sampleGroup(_fogSampling.combinedParams) : null;
                 slot.refs = refs;
             }
             state.prepared = { input, refs, group: slot.group, samplingGroup: slot.samplingGroup,
-                owner: state, command: _commandEncoder, frameId: _computeFrameId };
+                weatherSamplingGroup: slot.weatherSamplingGroup, owner: state, command: _commandEncoder, frameId: _computeFrameId };
             return true;
         } catch (error) {
             console.error(`雾合成 '${name}' 准备失败：${error}`);
@@ -3869,13 +4077,14 @@ window.seasonWebGPU = (() => {
         state.prepared = null;
         if (!_frameStarted || !_passEncoder || _instancedDiag.deviceLost || state.device !== _device
             || prepared.command !== _commandEncoder || prepared.frameId !== _computeFrameId
-            || _activePassId !== 7 || _passDepthOnly || _passVelocity
+            || _activePassId !== (state.weather ? 9 : 7) || _passDepthOnly || _passVelocity
             || _activeColorTarget !== prepared.refs[13] || _activeColorView !== prepared.refs[12]
             || !_sameFogResources(prepared.refs, _resolveFogComposite(prepared.input))) return 0;
         _passEncoder.setPipeline(state.pipeline);
         _passEncoder.setBindGroup(0, prepared.group);
         _passEncoder.draw(3);
-        _fogSamplingFrame = prepared.samplingGroup ? prepared : null;
+        if (state.weather) _weatherSamplingFrame = prepared;
+        else _fogSamplingFrame = prepared.samplingGroup ? prepared : null;
         return prepared.input.applyAo ? 3 : 1;
     }
 
@@ -3884,8 +4093,204 @@ window.seasonWebGPU = (() => {
         if (!state) return;
         delete _fogComposites[name]; state.prepared = null;
         if (_fogSamplingFrame?.owner === state) _fogSamplingFrame = null;
+        if (_weatherSamplingFrame?.owner === state) _weatherSamplingFrame = null;
         for (const slot of state.slots) _queueComputeRetirement(slot.buffer);
         state.slots.length = 0;
+    }
+
+    // A0.1 粒子间接绘制：WGSL 全部由 C# 下发，JS 只负责 PSO、绑定与那一条 drawIndexedIndirect。
+    // PSO 按本帧真实附件形状异步烘焙；未就绪时 Prepare 明确回退，和雾合成同一回退语义。
+    const _particleDraws = Object.create(null);
+    // 必须与 ParticleDraw.FrameBytes 一致：绑定组声明的 size 若小于着色器读到的下标，
+    // WebGPU 校验器会直接判非法，而报错点只出现在首次 draw 那一帧。
+    const _particleFrameBytes = 192;
+    const _particleInstanceStride = 32;
+    const _particleArgsBytes = 20;
+    let _particleQuadIndex = null;
+
+    // 四个角按 0,1,2,1,3,2 展开成两个三角形，与其它三端共用的单位四边形索引一致；
+    // reset kernel 写进 indexCount 的 6 就是这里的长度。粒子关闭剔除，绕序只决定顶点序。
+    // 索引内容与任何效果实例无关，所以按设备共享一只，随设备一起消亡。
+    function _particleQuadIndexBuffer() {
+        if (_particleQuadIndex && _particleQuadIndex.device === _device) return _particleQuadIndex.buffer;
+        const data = new Uint16Array([0, 1, 2, 1, 3, 2]);
+        const buffer = _device.createBuffer({ label: 'particle_quad_index', size: data.byteLength,
+            usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+        _device.queue.writeBuffer(buffer, 0, data);
+        _particleQuadIndex = { device: _device, buffer };
+        return buffer;
+    }
+
+    function createParticleDrawPipeline(name, vertex, fragment, fragmentVelocity) {
+        if (!_device || _instancedDiag.deviceLost || !name) return false;
+        if (_particleDraws[name]) return !_particleDraws[name].failed;
+        const device = _device;
+        const state = { device, variants: Object.create(null), prepared: null, failed: false,
+            refs: null, group: null };
+        try {
+            // 实例与帧数据都是顶点阶段只读。可写 storage 在顶点阶段不可见，而绘制侧也不需要写回：
+            // 计数由 compute 写进间接参数，顶点阶段只按 instance_index 取第 slot 条记录。
+            const visibility = GPUShaderStage.VERTEX;
+            state.layout = device.createBindGroupLayout({ label: `${name}_layout`, entries: [
+                { binding: 0, visibility, buffer: { type: 'read-only-storage', minBindingSize: _particleInstanceStride } },
+                { binding: 1, visibility, buffer: { type: 'read-only-storage', minBindingSize: _particleFrameBytes } },
+            ] });
+            state.pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [state.layout] });
+            state.vertex = device.createShaderModule({ label: `${name}_vs`, code: vertex });
+            state.fragment = device.createShaderModule({ label: `${name}_ps`, code: fragment });
+            state.fragmentVelocity = device.createShaderModule({ label: `${name}_ps_mrt`, code: fragmentVelocity });
+            _particleDraws[name] = state;
+            return true;
+        } catch (error) {
+            console.error(`粒子管线 '${name}' 创建失败：${error}`);
+            return false;
+        }
+    }
+
+    // 颜色与深度格式由本帧真实附件决定，但速度槽的有无只有进了 Pass 才知道（_passVelocity）。
+    // 所以同一附件形状下两个变体一起烘焙，Draw 时按标志取用，绝不在 Pass 内创建管线。
+    function _particleVariant(state, colorFormat, depthFormat) {
+        const key = `${colorFormat}|${depthFormat}`;
+        let variant = state.variants[key];
+        if (variant) return variant;
+        variant = { color: null, velocity: null };
+        state.variants[key] = variant;
+        const device = state.device;
+        // 预乘 alpha：片元已经把 rgb 乘进 alpha，所以源因子是 one，而不是主管线透明档的 src-alpha。
+        const blend = {
+            color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+        };
+        const common = {
+            layout: state.pipelineLayout,
+            // 没有顶点缓冲也没有顶点属性：角点来自 vertex_index，每实例数据来自 storage buffer。
+            vertex: { module: state.vertex, entryPoint: 'VSMain' },
+            primitive: { topology: 'triangle-list', cullMode: 'none' },
+            // 粒子是最后一层透明：测试但不写深度，与主管线透明档的 less-equal 一致。
+            depthStencil: { depthWriteEnabled: false, depthCompare: 'less-equal', format: depthFormat },
+            multisample: { count: 1 },
+        };
+        let scopeOpen = false;
+        try {
+            device.pushErrorScope('validation'); scopeOpen = true;
+            const pendingColor = device.createRenderPipelineAsync({ ...common, label: `particle_${key}`,
+                fragment: { module: state.fragment, entryPoint: 'PSMain',
+                    targets: [{ format: colorFormat, blend }] } });
+            // 速度槽 writeMask 置零，和主管线让透明体不污染速度的做法一致（2-3 条款 7）。
+            // A0.2：法线槽同理；它是否存在由进程级 _normalOutput 决定，所以仍只烘这两个变体。
+            // writeMask 为零的槽不要求片元有对应输出，所以沿用速度版片元模块。
+            const velocityTargets = [{ format: colorFormat, blend }, { format: 'rg16float', writeMask: 0 }];
+            if (_normalOutput) velocityTargets.push({ format: 'rgba16float', writeMask: 0 });
+            const pendingVelocity = device.createRenderPipelineAsync({ ...common, label: `particle_${key}_mrt`,
+                fragment: { module: state.fragmentVelocity, entryPoint: 'PSMain',
+                    targets: velocityTargets } });
+            const validation = device.popErrorScope(); scopeOpen = false;
+            Promise.all([pendingColor, pendingVelocity, validation]).then(([color, velocity, error]) => {
+                if (error) throw new Error(error.message);
+                if (state.variants[key] !== variant || _device !== device || _instancedDiag.deviceLost) return;
+                variant.color = color; variant.velocity = velocity;
+            }).catch(error => {
+                state.failed = true; state.prepared = null;
+                console.error(`粒子管线变体 '${key}' 编译失败：${error}`);
+            });
+        } catch (error) {
+            if (scopeOpen) device.popErrorScope().catch(() => {});
+            state.failed = true;
+            console.error(`粒子管线变体 '${key}' 创建失败：${error}`);
+        }
+        return variant;
+    }
+
+    function _resolveParticleDraw(input) {
+        const color = _renderTargets[input.color];
+        const depth = input.depth ? _renderTargets[input.depth] : null;
+        const instances = _storageBuffers[input.instances];
+        const args = _storageBuffers[input.args];
+        const frame = _storageBuffers[input.frame];
+        if (!color || color.depthOnly || !instances || !args || !frame) return null;
+        // depth 为空代表场景 Pass 跑在默认深度缓冲上，这是环境光遮蔽档之外的常态，不是失败。
+        if (input.depth && (!depth || !depth.depthOnly)) return null;
+        if (instances.size < _particleInstanceStride || frame.size < _particleFrameBytes
+            || args.size < _particleArgsBytes || !(args.usage & GPUBufferUsage.INDIRECT)
+            || !(instances.usage & GPUBufferUsage.STORAGE) || !(frame.usage & GPUBufferUsage.STORAGE)
+            || instances === args || instances === frame || args === frame) return null;
+        // 过期尺寸代表本帧附件不完整，只能回退而不能在此重建：颜色与深度已经是本帧 Pass 的附件。
+        for (const rt of depth ? [color, depth] : [color])
+            if (rt.matchBackbuffer && (!_canvas || rt.width !== _canvas.width || rt.height !== _canvas.height)) return null;
+        const colorFormat = color.colorFormat || _sceneFormat;
+        const depthFormat = depth ? depth.depthFormat : 'depth24plus';
+        if (!colorFormat || !depthFormat || !color.colorView) return null;
+        return { color, depth, instances, args, frame, colorFormat, depthFormat,
+            colorView: color.colorView, depthView: depth ? depth.depthView : null };
+    }
+
+    function _sameParticleRefs(a, b) {
+        return !!a && !!b && a.color === b.color && a.depth === b.depth
+            && a.instances === b.instances && a.args === b.args && a.frame === b.frame
+            && a.colorView === b.colorView && a.depthView === b.depthView
+            && a.colorFormat === b.colorFormat && a.depthFormat === b.depthFormat;
+    }
+
+    function prepareParticleDraw(name, color, depth, instances, args, frame) {
+        const state = _particleDraws[name];
+        if (!state) return false;
+        state.prepared = null;
+        if (!_frameStarted || !_commandEncoder || _passEncoder || _instancedDiag.deviceLost
+            || state.device !== _device || state.failed) return false;
+        const input = { color, depth: depth || null, instances, args, frame };
+        try {
+            const refs = _resolveParticleDraw(input);
+            if (!refs) return false;
+            const variant = _particleVariant(state, refs.colorFormat, refs.depthFormat);
+            // 首次见到这组附件形状时管线仍在异步编译：本帧明确不绘制，下一帧再试。
+            if (state.failed || !variant.color || !variant.velocity) return false;
+            if (!_sameParticleRefs(state.refs, refs)) {
+                state.group = _device.createBindGroup({ layout: state.layout, entries: [
+                    { binding: 0, resource: { buffer: refs.instances } },
+                    { binding: 1, resource: { buffer: refs.frame, size: _particleFrameBytes } },
+                ] });
+                state.refs = refs;
+            }
+            state.prepared = { input, refs, variant, group: state.group, args: refs.args,
+                indices: _particleQuadIndexBuffer(), command: _commandEncoder, frameId: _computeFrameId };
+            return true;
+        } catch (error) {
+            console.error(`粒子绘制 '${name}' 准备失败：${error}`);
+            return false;
+        }
+    }
+
+    function drawParticles(name) {
+        const state = _particleDraws[name], prepared = state?.prepared;
+        if (!prepared) return false;
+        // 一次 Prepare 只兑付一次提交，与其它三端同一约定。
+        state.prepared = null;
+        if (!_frameStarted || !_passEncoder || _instancedDiag.deviceLost || state.device !== _device
+            || prepared.command !== _commandEncoder || prepared.frameId !== _computeFrameId
+            // Scene=1 与 SceneTransparent=8 是粒子唯一的落点；两者都必然挂载深度附件。
+            || (_activePassId !== 1 && _activePassId !== 8)
+            || _passDepthOnly || _passOutlineMask || _passOverlay
+            // A0.2：速度变体是否带法线槽是按 _normalOutput 烘的，本 Pass 的附件集必须与之一致。
+            || (_passVelocity && _passNormal !== _normalOutput)
+            || _activeColorTarget !== prepared.refs.color || _activeColorView !== prepared.refs.colorView
+            // depth 为空时无法比对身份：默认深度视图每个 Pass 现建，只能要求它确实存在。
+            || !_activeDepthView || (prepared.refs.depthView && _activeDepthView !== prepared.refs.depthView)
+            || !_sameParticleRefs(prepared.refs, _resolveParticleDraw(prepared.input))) return false;
+        const pipeline = _passVelocity ? prepared.variant.velocity : prepared.variant.color;
+        if (!pipeline) return false;
+        _passEncoder.setPipeline(pipeline);
+        _passEncoder.setBindGroup(0, prepared.group);
+        _passEncoder.setIndexBuffer(prepared.indices, 'uint16');
+        // 实例数由 GPU 在参数块里决定；CPU 全程不回读，这正是间接绘制的意义。
+        _passEncoder.drawIndexedIndirect(prepared.args, 0);
+        return true;
+    }
+
+    function disposeParticleDrawPipeline(name) {
+        const state = _particleDraws[name];
+        if (!state) return;
+        delete _particleDraws[name];
+        state.prepared = null; state.refs = null; state.group = null;
     }
 
     const _computeKernels = {};
@@ -4097,9 +4502,10 @@ window.seasonWebGPU = (() => {
     // Resize is infrequent, so clearing everything has no practical performance impact.
     function _invalidateComputeBindGroups() {
         _fogSamplingFrame = null;
+        _weatherSamplingFrame = null;
         for (const state of Object.values(_fogComposites)) {
             state.prepared = null;
-            for (const slot of state.slots) { slot.refs = null; slot.group = null; slot.samplingGroup = null; }
+            for (const slot of state.slots) { slot.refs = null; slot.group = null; slot.samplingGroup = null; slot.weatherSamplingGroup = null; }
         }
         for (const kn in _computeKernels) {
             const k = _computeKernels[kn];
@@ -4128,11 +4534,15 @@ window.seasonWebGPU = (() => {
         _device.queue.onSubmittedWorkDone().then(dispose, dispose);
     }
 
-    function createStorageBuffer(id, sizeInBytes) {
+    // A0.1: indirect 为真时追加 GPUBufferUsage.INDIRECT。用途位只能在 createBuffer 时声明，
+    // 之后无法加宽，所以这个标志由 C# 侧的 StorageBufferUsage 一路传到这里。
+    function createStorageBuffer(id, sizeInBytes, indirect) {
         if (_storageBuffers[id]) return true;
+        let usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+        if (indirect) usage |= GPUBufferUsage.INDIRECT;
         _storageBuffers[id] = _device.createBuffer({
             size: Math.max(4, Math.ceil(sizeInBytes / 4) * 4),
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+            usage,
         });
         return true;
     }
@@ -4510,6 +4920,8 @@ window.seasonWebGPU = (() => {
         endPass,
         createRenderTarget,
         disposeRenderTarget,
+        publishViewSurface,
+        unpublishViewSurface,
         synchronizeRenderTargetSizes,
         blitToBackbuffer,
         renderPost,
@@ -4525,6 +4937,7 @@ window.seasonWebGPU = (() => {
         uploadStaticMeshInterop,
         uploadSkinnedBones,
         updateSceneLights,
+        setViewConstants,
         setShadowViewport,
         setShadowAtlas,
         // 1-7 Cubemap + environment IBL
@@ -4561,6 +4974,8 @@ window.seasonWebGPU = (() => {
         createComputeKernel,
         disposeComputeKernel,
         createFogCompositePipeline, prepareFogComposite, drawFogComposite, disposeFogCompositePipeline,
+        // A0.1 粒子间接绘制
+        createParticleDrawPipeline, prepareParticleDraw, drawParticles, disposeParticleDrawPipeline,
         createComputeTexture,
         createStorageBuffer,
         disposeStorageBuffer,

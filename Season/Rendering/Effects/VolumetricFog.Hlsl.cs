@@ -139,6 +139,10 @@ float4 CloudSample(float2 uv) {
     }
     return n;
 }
+float4 WeatherH(int i) { float4 h=F(118+i); if(i==0 && F(16).w<0.5) h.y=0; return h; }
+float4 WeatherR(int i,int row) { return F(120+i*8+row); }
+float4 WeatherNoise(float2 uv) { return CloudSample(uv); }
+""" + WeatherShaders.CommonHlsl + WeatherShaders.CloudHlsl + """
 float CloudShadow(float3 p,float3 l) {
     float tau=0;
     if(F(16).w>0.5 && F(116).x>0 && l.y>0) {
@@ -151,7 +155,7 @@ float CloudShadow(float3 p,float3 l) {
             d*=saturate(1.0-b.w*0.5*(n.y+n.z)); tau+=d*a.w*a.y*invY;
         }
     }
-    return 1.0-F(116).x*saturate(1.0-exp(-tau));
+    return (1.0-F(116).x*saturate(1.0-exp(-tau)))*WeatherCloudShadow(p,l);
 }
 float ShadowTile(float3 p,uint matrixIndex,int tile) {
     float4 clip=Transform(float4(p,1),matrixIndex); float result=1;
@@ -198,7 +202,7 @@ float Visibility(float3 p,float depth,int light) {
         float4 global=F(11); float sigma=global.x*exp(-global.z*max(p.y-global.y,0.0))*Noise(windP,F(12).w,global.w);
         float3 scattering=F(12).xyz*sigma; float exclude=1;
         for(int i=0;i<min(int(F(13).w),32);i++) {
-            uint base=128+i*8; float3 local=Transform(float4(p,1),base).xyz;
+            uint base=192+i*8; float3 local=Transform(float4(p,1),base).xyz;
             float4 shape=F(base+5), medium=F(base+4);
             float r=shape.x>0.5?length(local):max(abs(local.x),max(abs(local.y),abs(local.z)));
             float edge=saturate((1.0-r)/max(shape.z,1e-6)); float weight=r<1?edge*edge*(3.0-2.0*edge):0;

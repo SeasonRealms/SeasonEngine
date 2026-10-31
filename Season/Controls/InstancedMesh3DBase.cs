@@ -347,7 +347,7 @@ public abstract class InstancedMesh3DBase : Control
         if (!RenderQuality.Current.FrustumCulling || !CullingEnabled)
             return false;
 
-        return IsCulledBy(in DeviceServices.BaseApp.Camera.Frustum);
+        return IsCulledBy(in Season.Rendering.RenderView.Current.Frustum);
     }
 
     /// <summary>

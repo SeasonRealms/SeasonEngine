@@ -176,6 +176,11 @@ public enum TextureMipPolicy
 /// - 2-6 material texture filtering: mip chains are opt-in per texture slot, generated once on the CPU and keyed into the shared
 ///   texture dictionary by policy, filtered with anisotropy, variance-corrected through Toksvig, and sharpened by a
 ///   TAA-only LOD bias. Every gate degrades to the pre-2-6 single-level image rather than to a different one.
+/// - A0.2 scene normals: SceneNormal is Scene pass MRT slot 2 (Rgba16Float: octahedral world normal in xy, the Toksvig-corrected
+///   roughness in z, metallic in w), cleared to zero so an all-zero texel reads as "no opaque surface". It is not a tier of its own:
+///   it only ever extends the velocity shape, so requesting it forces MotionVectors on during initialization and anything that
+///   later turns velocity off (Msaa4x, missing independent blend) takes the normals with it. That keeps the baked shapes at three -
+///   color, color+velocity, color+velocity+normal - instead of four. Transparent geometry does not write it, same as velocity.
 /// </summary>
 public class RenderQuality
 {
@@ -304,6 +309,15 @@ public class RenderQuality
     /// <summary>Default value for MotionVectors (overrideable in the app constructor and captured by Init()).</summary>
     public static bool DefaultMotionVectors = true;
 
+    /// <summary>Default value for SceneNormals (overrideable in the app constructor and captured by Init()).
+    /// Off, because until SSR, water reflection or decals read it the target is a full-size Rgba16Float written every frame for
+    /// nothing but the debug view.</summary>
+    public static bool DefaultSceneNormals = false;
+
+    /// <summary>Default value for Decals (overrideable in the app constructor and captured by Init()).
+    /// Off, because D1 要为一个只在不透明阶段生效的额外 Pass 打散场景：默认开会让每个不带贴花的项目都付这笔钱。</summary>
+    public static bool DefaultDecals = false;
+
     /// <summary>Default value for JitterScale (overrideable in the app constructor and captured by Init()).</summary>
     public static float DefaultJitterScale = 1.0f;
 
@@ -368,7 +382,11 @@ public class RenderQuality
     /// <summary>Default value for GiChebyshevOcclusion (overrideable in the app constructor and captured by Init()).</summary>
     public static bool DefaultGiChebyshevOcclusion = true;
 
-    /// <summary>Default value for GiIntensity (overrideable in the app constructor and captured by Init()).</summary>
+    /// <summary>Default value for GiIntensity (overrideable in the app constructor and captured by Init()).
+    /// This is the blend weight between the pre-DDGI diffuse term and the probe result, not a brightness multiplier on the
+    /// probe result: the consumer evaluates lerp(fallback, probeIrr, valid*boundsFade*GiIntensity). 0 disables the DDGI
+    /// contribution entirely without touching the probe chain, 1 uses it in full, and because an unoccluded point evaluates
+    /// to fallback anyway, the value never changes the baseline brightness of an open scene.</summary>
     public static float DefaultGiIntensity = 0.4f;
 
     /// <summary>Default value for GiHysteresis (overrideable in the app constructor and captured by Init()).</summary>
@@ -683,6 +701,15 @@ public class RenderQuality
     /// <summary>2-1 contract clause 5: anti-aliasing mode. Mutually exclusive, fixed at initialization, and downgraded with logging when unsupported. Default is Taa.</summary>
     public AaMode AntiAliasing { get; set; } = DefaultAntiAliasing;
 
+    AaMode? _effectiveAntiAliasing;
+    /// <summary>本次图形初始化解析出的 AA；不序列化，也不覆盖用户保存的选择。</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public AaMode EffectiveAntiAliasing
+    {
+        get => _effectiveAntiAliasing ?? AntiAliasing;
+        set => _effectiveAntiAliasing = value;
+    }
+
     /// <summary>2-2 contract clause 1: ambient-occlusion tier. Mutually exclusive, fixed at initialization, and downgraded to Off when unsupported.</summary>
     public AoMode AmbientOcclusion { get; set; } = DefaultAmbientOcclusion;
 
@@ -700,6 +727,21 @@ public class RenderQuality
 
     /// <summary>2-3 contract clause 1: global motion-vector switch. Independent from AaMode, fixed at initialization, forced on by TAA, and ignored by unsupported backends.</summary>
     public bool MotionVectors { get; set; } = DefaultMotionVectors;
+
+    /// <summary>A0.2 contract clause 1: requests the scene-normal target (MRT slot 2). Fixed at initialization. Requesting it forces
+    /// MotionVectors on, because the normal output only exists as an extension of the velocity shape; read
+    /// <see cref="EffectiveSceneNormals"/> for whether it actually survived initialization.</summary>
+    public bool SceneNormals { get; set; } = DefaultSceneNormals;
+
+    /// <summary>A0.2 contract clause 1: whether the NORMAL_OUTPUT variant is baked and SceneNormal exists. Derived rather than
+    /// stored, so every path that drops velocity during initialization - the Msaa4x exclusion in the platform init, a Vulkan device
+    /// without independent blend - drops the normals with it without having to know about them. Get-only so it stays out of
+    /// Settings.json (JsonUtils sets IgnoreReadOnlyProperties).</summary>
+    public bool EffectiveSceneNormals => SceneNormals && MotionVectors;
+
+    /// <summary>D1 契约第 1 条：屏幕空间贴花开关。初始化期固定，且只有它能在初始化时把 SceneDepth 补出来 ——
+    /// 贴花完全依赖深度重建世界坐标，没有显式深度就没有贴花。运行时关闭贴花只影响绘制，不拆任何资源。</summary>
+    public bool Decals { get; set; } = DefaultDecals;
 
     /// <summary>2-3 contract clauses 4/14: TAA jitter amplitude in NDC subpixel units. Effective only when TAA is active.</summary>
     public float JitterScale { get; set; } = DefaultJitterScale;
@@ -739,7 +781,7 @@ public class RenderQuality
     /// finalized during initialization and fixed for the process, so this cannot disagree with the tier that decided to
     /// create PostColor. Reachable only when PostColor exists; the Off/Msaa4x arms are unreachable in practice and return
     /// Copy so that a future tier registering the slot presents a correct image instead of an accidental filter.</summary>
-    public static PostResolve PostResolveFilter() => Current.AntiAliasing switch
+    public static PostResolve PostResolveFilter() => Current.EffectiveAntiAliasing switch
     {
         AaMode.Fxaa => PostResolve.Fxaa,
         AaMode.Taa => PostResolve.Rcas,
@@ -839,6 +881,14 @@ public class RenderQuality
     /// <summary>资源画质，仅启动时生效；场景启停由 BaseApp.Fog.Enabled 控制。</summary>
     public FogQuality VolumetricFog { get; set; } = DefaultVolumetricFog;
 
+    /// <summary>区域云与远景雨幕的启动档位；不改变近景粒子预算。</summary>
+    public static RegionalWeatherQuality DefaultRegionalWeather = RegionalWeatherQuality.Off;
+    public RegionalWeatherQuality RegionalWeather { get; set; } = DefaultRegionalWeather;
+    public bool RequiresAtmosphereSceneDepth(bool hdrSceneColor, bool computeSupported, bool immediate2D)
+        => (VolumetricFog is FogQuality.Low or FogQuality.Medium or FogQuality.High
+            || RegionalWeather is RegionalWeatherQuality.Low or RegionalWeatherQuality.High)
+            && hdrSceneColor && computeSupported && !immediate2D;
+
     /// <summary>局部散射源项的历史权重，0 关闭历史；不对累计透射率做时域混合。</summary>
     public float FogHistoryWeight { get; set; } = DefaultFogHistoryWeight;
 
@@ -849,9 +899,14 @@ public class RenderQuality
         => VolumetricFog is FogQuality.Low or FogQuality.Medium or FogQuality.High
             && hdrSceneColor && computeSupported && !immediate2D;
 
+    /// <summary>D1 契约第 2 条：贴花对显式 SceneDepth 的需求。要求 HDR 场景颜色是因为贴花只写线性 HDR 目标，
+    /// LDR 直出路径没有可混合的单采样 SceneColor。</summary>
+    public bool RequiresDecalSceneDepth(bool hdrSceneColor, bool immediate2D)
+        => Decals && hdrSceneColor && !immediate2D;
+
     /// <summary>资源创建前解析雾的单采样约束，不改写持久化的雾档位。</summary>
     public AaMode ResolveFogAntiAliasing(bool hdrSceneColor, bool immediate2D)
-        => AntiAliasing == AaMode.Msaa4x && RequiresFogSceneDepth(hdrSceneColor, true, immediate2D)
+        => AntiAliasing == AaMode.Msaa4x && RequiresAtmosphereSceneDepth(hdrSceneColor, true, immediate2D)
             ? AaMode.Fxaa : AntiAliasing;
 
     /// <summary>
@@ -961,7 +1016,7 @@ public class RenderQuality
     /// though it were the authored one - <see cref="TextureLodBias"/> is the only member here that should round-trip.
     /// </summary>
     public float EffectiveTextureLodBias
-        => AntiAliasing == AaMode.Taa ? Math.Clamp(TextureLodBias, -2f, 2f) : 0f;
+        => EffectiveAntiAliasing == AaMode.Taa ? Math.Clamp(TextureLodBias, -2f, 2f) : 0f;
 
     /// <summary>
     /// 2-6 clause 7: <see cref="EffectiveTextureLodBias"/> formatted as a shader-source literal, wrapped in

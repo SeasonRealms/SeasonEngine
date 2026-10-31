@@ -23,16 +23,16 @@ internal unsafe class VKInstancedMesh3D : VKInstancedPrimitiveGroup
     {
     }
 
-    public void Load(Season.Controls.InstancedMesh3D mesh, Season.Basic.Camera camera, Func<Season.Controls.Surface, TextureSlot, Texture> resolveTexture)
+    public void Load(Season.Controls.InstancedMesh3D mesh, Func<Season.Controls.Surface, TextureSlot, Texture> resolveTexture)
     {
         foreach (var surface in mesh.Surfaces)
-            _primitives.Add(CreatePrimitiveData(surface, resolveTexture, camera));
+            _primitives.Add(CreatePrimitiveData(surface, resolveTexture));
 
         RebuildPrimitiveBuckets();
         SyncAlpha(mesh.Alpha);
     }
 
-    PrimitiveData CreatePrimitiveData(Season.Controls.Surface surface, Func<Season.Controls.Surface, TextureSlot, Texture> resolveTexture, Season.Basic.Camera camera)
+    PrimitiveData CreatePrimitiveData(Season.Controls.Surface surface, Func<Season.Controls.Surface, TextureSlot, Texture> resolveTexture)
     {
         var localBounds = Season.Rendering.Bounds3D.FromVertices(surface.Vertices);
         var p = new PrimitiveData
@@ -55,11 +55,7 @@ internal unsafe class VKInstancedMesh3D : VKInstancedPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(camera.View),
-            Projection = Matrix4x4.Transpose(camera.Projection),
-            // 2-3 Step C: in the instanced path, PrevWorld stays all zero;
-            // PrevViewProjection follows the same convention as DX
-            PrevViewProjection = Matrix4x4.Transpose(camera.PrevViewProjection),
+            // 2-3 Step C: in the instanced path, PrevWorld stays all zero
         };
 
         for (int i = 0; i < Device.frameCount; i++)
@@ -272,12 +268,9 @@ internal unsafe class VKInstancedMesh3D : VKInstancedPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(Camera.View),
-            Projection = Matrix4x4.Transpose(Camera.Projection),
             // 2-3 Step C (track C-a): the per-instance previous world matrices now come from
             // the prev instance world SB (binding 14),
             // so b0.PrevWorld stays all zero because the instanced shader path does not read it.
-            PrevViewProjection = Matrix4x4.Transpose(Camera.PrevViewProjection),
         };
 
         foreach (var primitive in _primitives)

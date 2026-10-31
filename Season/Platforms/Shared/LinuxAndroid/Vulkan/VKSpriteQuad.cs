@@ -57,6 +57,9 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
     // to avoid misalignment from identity matrices
     protected bool _transformInitialized;
 
+    /// <summary>true: bind the screen-space view set (2D); false: bind the main view set (3D billboards).</summary>
+    protected virtual bool ScreenSpaceView => true;
+
     // Descriptor-set invalidation detection:
     // when the underlying View of the main texture changes
     // (after in-place rebuild via RecreateComputeStorage),
@@ -114,8 +117,6 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         var identity = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Identity,
-            Projection = Matrix4x4.Identity
         };
         for (int i = 0; i < n; i++)
             Unsafe.Write(_mappedMatrixBuffers[i], identity);
@@ -597,7 +598,7 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         if (VKSceneDrawCollection.Active is { } collection)
         {
             VKSceneDrawCollection.RetainOwner(this);
-            collection.CaptureQuad(set, vb, QuadWorld(fi));
+            collection.CaptureQuad(set, vb, QuadWorld(fi), ScreenSpaceView);
             return;
         }
 
@@ -610,6 +611,7 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
 
         vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
             Pipeline.PipelineLayout, 0, 1, in set, 0, null);
+        Pipeline.BindViewSet(cmd, ScreenSpaceView ? Pipeline.ScreenViewSet : Pipeline.ActiveViewSet);
         // 雾采样三件套在独立的 set 1，理由同 DrawPrimitiveCore：透明变体静态引用它。
         Pipeline.BindFogSet(cmd);
 

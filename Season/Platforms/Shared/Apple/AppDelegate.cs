@@ -868,12 +868,12 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         // Fxaa also depends on the HDR offscreen chain because the uber pass bakes luma.
         // The whole tier normalization is skipped in immediate-2D mode: no AA path exists to
         // configure, and the values stay unused because no pass ever consults them.
-        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
+        if (!immediate2D && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
         {
-            RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Fxaa;
+            RenderQuality.Current.EffectiveAntiAliasing = Season.Rendering.AaMode.Fxaa;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] AaMode.Msaa4x is supported only on D3D12, falling back to Fxaa");
         }
-        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa)
+        if (!immediate2D && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Taa)
         {
             // Contract clause 1 of 2-3:
             // selecting Taa forces the velocity infrastructure to be enabled because TAA is invalid without velocity.
@@ -889,15 +889,21 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
             // so the image falls back to non-TAA SceneColor without jitter, matching clauses 14 and 15.
             if (!MtlDevice.HdrSceneColor)
             {
-                RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Fxaa;
+                RenderQuality.Current.EffectiveAntiAliasing = Season.Rendering.AaMode.Fxaa;
                 DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] Taa depends on the HDR offscreen chain, which is not enabled now, falling back to Fxaa while keeping MotionVectors enabled");
             }
         }
-        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa && !MtlDevice.HdrSceneColor)
+        if (!immediate2D && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Fxaa && !MtlDevice.HdrSceneColor)
         {
-            RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Off;
+            RenderQuality.Current.EffectiveAntiAliasing = Season.Rendering.AaMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] Fxaa depends on the HDR offscreen chain, which is not enabled now, falling back to Off");
         }
+
+        // Contract clause 1 of A0.2:
+        // scene normals only exist as an extension of the velocity shape, so requesting them forces velocity on,
+        // before Pipeline.Init bakes the velocity library variant, mirrored with WindowsApp.
+        if (!immediate2D && RenderQuality.Current.SceneNormals)
+            RenderQuality.Current.MotionVectors = true;
 
         // 4) Three pipeline variants, Opaque, Transparent, and Fade.
         // The main PSO is baked against SceneColorFormat.
@@ -957,6 +963,21 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
             });
         }
 
+        // Contract clause 2 of A0.2:
+        // SceneNormal is a full-size Rgba16Float target used as MRT slot 2,
+        // and is only ever created next to SceneVelocity, mirrored with WindowsApp.
+        if (!immediate2D && RenderQuality.Current.EffectiveSceneNormals && Season.Rendering.FrameSchedule.SceneVelocity != null)
+        {
+            Season.Rendering.FrameSchedule.SceneNormal = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
+            {
+                ColorFormat = Season.Rendering.RtFormat.Rgba16Float,
+                MatchBackbufferSize = true,
+                SampleCount = 1,
+                NoImplicitDepth = true,
+                ClearColor = System.Numerics.Vector4.Zero,
+            });
+        }
+
         // 8.55) Step D of 2-1:
         // register the FXAA Post pair, PostColor plus RenderPost, mirrored with WindowsApp.
         // Uber composition moves into the Post pass, and FinalBlit degenerates into FXAA resolve,
@@ -967,8 +988,8 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         // of FXAA; RenderPostPass forwards SceneColorOverride, and the Post pass runs after the AfterScene
         // phase, so it reads the resolve output of the current frame rather than SceneColor.
         // In tiers that ask for neither, both remain null, leaving no residue in the pipeline.
-        if ((RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
-                || (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa
+        if ((RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Fxaa
+                || (RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Taa
                     && RenderQuality.Current.TaaSharpness > 0f))
             && Season.Rendering.FrameSchedule.SceneColor != null)
         {
@@ -1014,7 +1035,7 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         }
         if (!immediate2D
             && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off
-            && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
+            && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
         {
             RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] AO is mutually exclusive with Msaa4x because MSAA depth cannot be used as compute input, falling back to Off");
@@ -1034,8 +1055,9 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         // When AO is disabled, SceneDepth may still be null,
         // but MotionVectors still needs a depth attachment, so create it here, mirrored with WindowsApp, LinuxApp, and AndroidApp.
         if (!immediate2D && Season.Rendering.FrameSchedule.SceneDepth == null
-            && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresFogSceneDepth(
-                MtlDevice.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)))
+            && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresAtmosphereSceneDepth(
+                MtlDevice.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)
+                || RenderQuality.Current.RequiresDecalSceneDepth(MtlDevice.HdrSceneColor, immediate2D)))
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {

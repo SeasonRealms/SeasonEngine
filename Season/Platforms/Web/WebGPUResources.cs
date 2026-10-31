@@ -109,8 +109,6 @@ internal class WGPUPrimitiveData
     public SharpGLTF.Schema2.Image? EmissiveTexture;
 
     public Matrix4x4 World = Matrix4x4.Identity;
-    public Matrix4x4 View = Matrix4x4.Identity;
-    public Matrix4x4 Projection = Matrix4x4.Identity;
 
     /// <summary>
     /// 2-3 contract clause 6: CPU shadow copy of the previous frame world matrix (not transposed, semantically identical to

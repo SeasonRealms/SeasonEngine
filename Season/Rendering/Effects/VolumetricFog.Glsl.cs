@@ -138,6 +138,10 @@ vec4 CloudSample(vec2 uv) {
     }
     return n;
 }
+vec4 WeatherH(int i) { vec4 h=F(118+i); if(i==0 && F(16).w<0.5) h.y=0; return h; }
+vec4 WeatherR(int i,int row) { return F(120+i*8+row); }
+vec4 WeatherNoise(vec2 uv) { return CloudSample(uv); }
+""" + WeatherShaders.CommonGlsl + WeatherShaders.CloudGlsl + """
 float CloudShadow(vec3 p,vec3 l) {
     float tau=0;
     if(F(16).w>0.5 && F(116).x>0 && l.y>0) {
@@ -149,7 +153,7 @@ float CloudShadow(vec3 p,vec3 l) {
             d*=Sat(1.0-b.w*0.5*(n.y+n.z)); tau+=d*a.w*a.y*invY;
         }
     }
-    return 1.0-F(116).x*Sat(1.0-exp(-tau));
+    return (1.0-F(116).x*Sat(1.0-exp(-tau)))*WeatherCloudShadow(p,l);
 }
 float ShadowTile(vec3 p,int matrixIndex,int tile) {
     vec4 clip=Transform(vec4(p,1),matrixIndex); float result=1;
@@ -194,7 +198,7 @@ void main() {
         float sigma=global.x*exp(-global.z*max(p.y-global.y,0.0))*Noise(windP,F(12).w,global.w);
         vec3 scattering=F(12).xyz*sigma; float exclude=1;
         for(int i=0;i<min(int(F(13).w),32);i++) {
-            int base=128+i*8; vec3 local=Transform(vec4(p,1),base).xyz; vec4 shape=F(base+5),medium=F(base+4);
+            int base=192+i*8; vec3 local=Transform(vec4(p,1),base).xyz; vec4 shape=F(base+5),medium=F(base+4);
             float r=shape.x>0.5?length(local):max(abs(local.x),max(abs(local.y),abs(local.z)));
             float edge=Sat((1.0-r)/max(shape.z,1e-6)),weight=r<1?edge*edge*(3.0-2.0*edge):0;
             if(shape.y>0.5) exclude*=1.0-weight;

@@ -1070,6 +1070,10 @@ void main()
 /// <summary>独立 HDR 雾合成。描述符按帧槽与同帧调用轮转，所有销毁等待 GPU 退休。</summary>
 internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompositePipeline
 {
+    readonly bool _weather;
+    ulong FrameBytes => (ulong)(_weather ? Season.Rendering.Effects.WeatherCurtainEffect.FrameVectorCount
+        : Season.Rendering.Effects.VolumetricFogEffect.FrameVectorCount) * 16;
+    Season.Rendering.RenderPassId CompositePass => _weather ? Season.Rendering.RenderPassId.WeatherComposite : Season.Rendering.RenderPassId.FogComposite;
     readonly Dictionary<string, Texture> _textures;
     readonly List<DescriptorSet>[] _sets = new List<DescriptorSet>[(int)Device.frameCount];
     readonly int[] _cursors = new int[(int)Device.frameCount];
@@ -1098,8 +1102,11 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
     /// <summary>本帧正在使用的合成流水线；透明阶段通过它取回雾采样资源。</summary>
     internal static VKFogCompositePipeline? Active { get; private set; }
 
-    internal VKFogCompositePipeline(Dictionary<string, Texture> textures)
+    internal VKFogCompositePipeline(Dictionary<string, Texture> textures) : this(textures, false) { }
+
+    internal VKFogCompositePipeline(Dictionary<string, Texture> textures, bool weather)
     {
+        _weather = weather;
         _textures = textures;
         for (int i = 0; i < _sets.Length; i++) _sets[i] = new();
         try { Initialize(); }
@@ -1132,7 +1139,7 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
         {
             vertex = ShaderCompiler.CreateShaderModule(vk, device, Season.Rendering.Effects.VolumetricFogEffect.CompositeVertexGlsl,
                 ShaderStageFlags.VertexBit, "main", "fog_composite.vert", false);
-            fragment = ShaderCompiler.CreateShaderModule(vk, device, Season.Rendering.Effects.VolumetricFogEffect.CompositeGlsl,
+            fragment = ShaderCompiler.CreateShaderModule(vk, device, _weather ? Season.Rendering.Effects.WeatherShaders.CompositeGlsl : Season.Rendering.Effects.VolumetricFogEffect.CompositeGlsl,
                 ShaderStageFlags.FragmentBit, "main", "fog_composite.frag", false);
             ReadOnlySpan<byte> entry = "main\0"u8;
             fixed (byte* name = entry)
@@ -1173,7 +1180,7 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
         buffer = default;
         if (input.Color is not VKRenderTarget color || input.Depth is not VKRenderTarget depth
             || input.FrameBuffer is not VKStorageBuffer frame || frame.Buffer.Buffer.Handle == 0
-            || frame.Buffer.Size < Season.Rendering.Effects.VolumetricFogEffect.FrameVectorCount * 16
+            || frame.Buffer.Size < FrameBytes
             || color.Desc.ColorFormat != Season.Rendering.RtFormat.Rgba16Float
             || destination.Desc.ColorFormat != Season.Rendering.RtFormat.Rgba16Float
             || depth.HasColor || depth.Desc.DepthFormat != Season.Rendering.RtFormat.D32Float
@@ -1183,16 +1190,19 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
             || color.Width != destination.Width || color.Height != destination.Height
             || color.Width != depth.Width || color.Height != depth.Height
             || !float.IsFinite(input.AoIntensity) || input.AoIntensity < 0
-            || string.IsNullOrEmpty(input.IntegratedVolume) || string.IsNullOrEmpty(input.LocalVolume)) return false;
-        var integrated = VKTexture3D.Find(input.IntegratedVolume); var local = VKTexture3D.Find(input.LocalVolume);
-        if (integrated == null || local == null || !integrated.Ready || !local.Ready
+            || (!_weather && (string.IsNullOrEmpty(input.IntegratedVolume) || string.IsNullOrEmpty(input.LocalVolume)))) return false;
+        var integrated = _weather ? null : VKTexture3D.Find(input.IntegratedVolume);
+        var local = _weather ? null : VKTexture3D.Find(input.LocalVolume);
+        if (!_weather && (integrated == null || local == null || !integrated.Ready || !local.Ready
             || integrated.View.Handle == 0 || local.View.Handle == 0 || local.Depth == 0
             || integrated.Width != local.Width || integrated.Height != local.Height || integrated.Depth != local.Depth + 1
             || local.Width == 0 || local.Height == 0
             || integrated.Format != Format.R16G16B16A16Sfloat || local.Format != Format.R16G16B16A16Sfloat
-            || integrated.CurrentLayout != ImageLayout.ShaderReadOnlyOptimal || local.CurrentLayout != ImageLayout.ShaderReadOnlyOptimal) return false;
-        views[0] = integrated.View; views[1] = local.View; views[2] = color.ColorView; views[3] = depth.DepthView;
-        versions[0] = integrated.ViewVersion; versions[1] = local.ViewVersion;
+            || integrated.CurrentLayout != ImageLayout.ShaderReadOnlyOptimal || local.CurrentLayout != ImageLayout.ShaderReadOnlyOptimal)) return false;
+        views[0] = _weather ? color.ColorView : integrated!.View;
+        views[1] = _weather ? color.ColorView : local!.View; views[2] = color.ColorView; views[3] = depth.DepthView;
+        versions[0] = _weather ? color.ColorViewVersion : integrated!.ViewVersion;
+        versions[1] = _weather ? color.ColorViewVersion : local!.ViewVersion;
         versions[2] = color.ColorViewVersion; versions[3] = depth.DepthViewVersion;
         // AO 关闭仍绑定有效颜色占位，片元分支保证不采样。
         views[4] = color.ColorView; versions[4] = color.ColorViewVersion;
@@ -1238,7 +1248,7 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
         var ring = _sets[index];
         if (_cursors[index] == ring.Count) ring.Add(Device.DescriptorAllocator.AllocateSet(_setLayout));
         var set = ring[_cursors[index]++];
-        var bufferInfo = new DescriptorBufferInfo { Buffer = buffer.Buffer, Range = Season.Rendering.Effects.VolumetricFogEffect.FrameVectorCount * 16 };
+        var bufferInfo = new DescriptorBufferInfo { Buffer = buffer.Buffer, Range = FrameBytes };
         var images = stackalloc DescriptorImageInfo[5];
         var writes = stackalloc WriteDescriptorSet[6];
         writes[0] = new() { SType = StructureType.WriteDescriptorSet, DstSet = set, DstBinding = 0,
@@ -1252,10 +1262,10 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
         Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 6, writes, 0, null);
         _inputs = inputs; _destination = target; _preparedSet = set; _buffer = buffer.Buffer;
         _command = Device.GraphicsCommandBuffer; _stamp = stamp; _frameIndex = Device.FrameIndex;
-        _fogIntegrated = VKTexture3D.Find(inputs.IntegratedVolume);
-        _fogLocal = VKTexture3D.Find(inputs.LocalVolume);
+        _fogIntegrated = _weather ? null : VKTexture3D.Find(inputs.IntegratedVolume);
+        _fogLocal = _weather ? null : VKTexture3D.Find(inputs.LocalVolume);
         _composed = false;
-        Active = this;
+        if (!_weather) Active = this;
         return true;
     }
 
@@ -1290,7 +1300,7 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
         var destination = _destination; var inputs = _inputs;
         _destination = null; _inputs = default;
         if (_disposed || destination == null || !Device.InRenderPass
-            || Device.ActivePassId != Season.Rendering.RenderPassId.FogComposite
+            || Device.ActivePassId != CompositePass
             || !ReferenceEquals(Device.ActiveColorTarget, destination)
             || Device.GraphicsCommandBuffer.Handle != _command.Handle || Device.FrameIndex != _frameIndex
             || Device.GetCurrentRetireFenceValue() != _stamp) return default;

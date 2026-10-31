@@ -74,8 +74,6 @@ internal sealed class WGPUInstancedModel
 
     public IReadOnlyList<WGPUPrimitiveData> Primitives => _primitives;
 
-    public Matrix4x4 View { get; set; } = Matrix4x4.Identity;
-    public Matrix4x4 Projection { get; set; } = Matrix4x4.Identity;
 
     public int EnabledInstanceCount { get; private set; }
     public float ModelAlpha { get; set; } = 1f;
@@ -181,7 +179,7 @@ internal sealed class WGPUInstancedModel
         return false;
     }
 
-    public void Update(Season.Controls.InstancedModel model, float time, Season.Basic.Camera camera)
+    public void Update(Season.Controls.InstancedModel model, float time)
     {
         // Unified highlight: clear the per-instance bounds draw list for this frame
         // (rebuilt every frame; BoundsActive is set by the per-instance hook below).
@@ -225,8 +223,6 @@ internal sealed class WGPUInstancedModel
                 stream.PrevReady = false;
             }
             BoneMatricesBytes = Array.Empty<byte>();
-            View = camera.View;
-            Projection = camera.Projection;
             TransformInitialized = true;
             PrevBonesReady = false;
             ModelAlpha = model.Alpha;
@@ -394,8 +390,6 @@ internal sealed class WGPUInstancedModel
             BoneMatricesBytes = Array.Empty<byte>();
         }
 
-        View = camera.View;
-        Projection = camera.Projection;
         TransformInitialized = true;
         PrevBonesReady = wasInitialized && hasSkinning;
         ModelAlpha = model.Alpha;

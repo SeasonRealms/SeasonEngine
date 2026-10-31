@@ -35,6 +35,20 @@ internal sealed class MTLRenderTarget : Season.Rendering.RenderTarget
 
     public int Height { get; private set; }
 
+    /// <summary>
+    /// Wrappers published through Graphics.RegisterViewSurface. A MatchBackbufferSize target swaps its texture on
+    /// resize, and the control holding the wrapper must keep sampling the current image, so every publish point is
+    /// re-pointed here instead of being replaced.
+    /// </summary>
+    readonly List<Texture> _surfaces = new();
+
+    internal void AttachSurface(Texture surface)
+    {
+        if (!_surfaces.Contains(surface)) _surfaces.Add(surface);
+    }
+
+    internal void DetachSurface(Texture surface) => _surfaces.Remove(surface);
+
     public MTLRenderTarget(in Season.Rendering.RenderTargetDesc desc, int width, int height)
     {
         Desc = desc;
@@ -74,7 +88,12 @@ internal sealed class MTLRenderTarget : Season.Rendering.RenderTarget
             }
 
             // The velocity RT has no companion depth because it relies on the explicit SceneDepth from the Scene pass.
-            if (IsDepthOnly || (!IsVelocity && !Desc.NoImplicitDepth))
+            // A backbuffer-compatible color target always gets one, even when Desc asks for none: the blit family
+            // (FinalBlit/Post) bakes DepthAttachmentPixelFormat, and a pass whose attachment set lacks depth is a
+            // pipeline/pass mismatch on Metal. NoImplicitDepth therefore only applies to the MRT slots.
+            bool companionDepth = IsDepthOnly || (!IsVelocity &&
+                (!Desc.NoImplicitDepth || Desc.ColorFormat == Season.Rendering.RtFormat.BackbufferCompatible));
+            if (companionDepth)
             {
                 using var depthDesc = MTLTextureDescriptor.CreateTexture2DDescriptor(
                     Device.DepthBufferFormat, (nuint)width, (nuint)height, false);
@@ -103,6 +122,8 @@ internal sealed class MTLRenderTarget : Season.Rendering.RenderTarget
         DepthTexture = depth;
         Width = width;
         Height = height;
+        for (int i = 0; i < _surfaces.Count; i++)
+            _surfaces[i].RefreshFromTarget(this);
         // Publish the resolved size into Desc, the only size the shared layer can read back. The descriptor
         // arrives with Width/Height = 0 for MatchBackbufferSize targets, and the fog pass sizes its froxel grid
         // from Desc and declines to register at grid 0 (see DX Device.CreateRenderTarget). This lazy path is
@@ -113,6 +134,7 @@ internal sealed class MTLRenderTarget : Season.Rendering.RenderTarget
 
     public override void Dispose()
     {
+        _surfaces.Clear();
         ColorTexture?.Dispose();
         DepthTexture?.Dispose();
         ColorTexture = null;

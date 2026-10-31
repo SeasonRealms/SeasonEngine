@@ -24,8 +24,34 @@ namespace Season.Platforms.Shared.Apple;
 ///
 /// Dictionary and lock usage follows the shared blueprint exactly, preserving identical behavior.
 /// </summary>
-internal unsafe partial class Graphics : IGraphics
+internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedSceneGraphics
 {
+    // 工作包 D：三段式场景队列。不透明与透明在同一帧里分两个 Metal Pass 重放，
+    // 中间插入雾合成，于是透明阶段能拿到本帧刚积分出的体积纹理。
+    // 收集本身不提交任何绘制，理由是 Metal 只有在 BeginPass 之后才存在 encoder。
+    readonly MTLSceneDrawCollection _sceneCollection = new();
+
+    public void BeginSceneCollection() => _sceneCollection.Begin();
+
+    public void SealSceneCollection() => _sceneCollection.Seal();
+
+    public void DrawCollectedOpaque() => _sceneCollection.DrawOpaque();
+
+    public void DrawCollectedTransparent(bool sampleFog) => _sceneCollection.DrawTransparent(sampleFog);
+
+    public void ReleaseSceneCollection() => _sceneCollection.Release();
+
+    public Season.Rendering.Effects.WeatherCompositePipeline? CreateWeatherCompositePipeline()
+    {
+        if (!ComputeSupported) return null;
+        try { return new(new MTLFogCompositePipeline(DictionaryMtlTexture, true)); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherComposite] 创建失败：{ex.Message}");
+            return null;
+        }
+    }
+
     public Season.Rendering.FogCompositePipeline? CreateFogCompositePipeline()
     {
         if (!ComputeSupported) return null;
@@ -51,6 +77,10 @@ internal unsafe partial class Graphics : IGraphics
         getCurrentFrameIndex: () => (uint)Metal.Device.FrameIndex);
 
     Dictionary<string, MTLTexture> DictionaryMtlTexture = new();
+
+    // P3: names published through RegisterViewSurface, mapped to the target that owns them. Kept apart from
+    // DictionaryMtlTexture so UnregisterViewSurface can never remove a real texture's entry.
+    readonly Dictionary<string, MTLRenderTarget> _viewSurfaces = new();
 
     Dictionary<(string, long), MTLSprite2D> DictionarySprite = new();
 
@@ -151,8 +181,6 @@ internal unsafe partial class Graphics : IGraphics
         var identityMatrix = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(Matrix4x4.Identity),
-            Projection = Matrix4x4.Transpose(Matrix4x4.Identity),
         };
         *(MatrixBuffer*)_textMatrixBuffer.Contents = identityMatrix;
 
@@ -191,7 +219,110 @@ internal unsafe partial class Graphics : IGraphics
         // TextDrawParams UBO is a per-Texts, per-frame resource stored in MTLTextInstanceState.DrawParamsBuffers.
         // It is created in LoadTexts and must not be shared globally,
         // or multiple controls in the same frame would overwrite each other's colors.
+
+        // P3: per-view constants are uploaded right before each view's draws, and the view loop is followed by a
+        // reset so the Overlay pass binds the main view again (Metal binds everything per draw, but the capture
+        // queue records the buffer at collection time, which is inside the view loop).
+        Season.Rendering.FrameSchedule.PrepareView = OnPrepareView;
+        Season.Rendering.FrameSchedule.AfterViews = OnAfterViews;
     }
+
+    // -- P3 secondary views (contract in IGraphics) --
+
+    /// <summary>
+    /// Metal renders a secondary view through its own attachments plus its own ViewConstants buffer, and those
+    /// targets come from the same MTLRenderTarget path the main view uses, so the PSO family stays pass compatible.
+    /// There is no MSAA tier to decline here, so the capability is unconditional.
+    /// </summary>
+    public bool SecondaryViewSupported => true;
+
+    /// <summary>
+    /// Publishes an offscreen target as a sampleable texture: an <see cref="MTLTexture"/> that borrows the target's
+    /// color texture. Sprite2D then resolves the name through <see cref="LoadSprite2D"/> like any other texture, so
+    /// displaying a rendered view needs no new control type and no readback.
+    /// </summary>
+    public bool RegisterViewSurface(string name, Season.Rendering.RenderTarget target)
+    {
+        if (name.IsNullOrWhiteSpace() || target is not MTLRenderTarget mtlTarget) return false;
+        if (mtlTarget.IsDepthOnly || mtlTarget.ColorTexture == null) return false;
+
+        lock (DictionaryMtlTexture)
+        {
+            if (_viewSurfaces.TryGetValue(name, out var published))
+            {
+                // Same target re-registered: refresh the borrowed image in place, keeping the wrapper the controls hold.
+                if (!ReferenceEquals(published, mtlTarget)) return false;
+                if (DictionaryMtlTexture.TryGetValue(name, out var same) && same != null)
+                {
+                    same.RefreshFromTarget(mtlTarget);
+                    mtlTarget.AttachSurface(same);
+                }
+                return true;
+            }
+
+            // The name belongs to a real texture file: never steal it.
+            if (DictionaryMtlTexture.TryGetValue(name, out var existing) && existing != null) return false;
+            // A failed earlier load can leave a null entry behind; registering over it is the recovery path.
+            DictionaryMtlTexture.Remove(name);
+
+            var wrapper = MTLTexture.WrapRenderTarget(name, mtlTarget);
+            DictionaryMtlTexture.Add(name, wrapper);
+            _viewSurfaces.Add(name, mtlTarget);
+            mtlTarget.AttachSurface(wrapper);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Drops a publication made by <see cref="RegisterViewSurface"/>. The wrapper is unlinked from the texture
+    /// dictionary, and because it borrows the target's image the render target itself is left untouched.
+    /// </summary>
+    public bool UnregisterViewSurface(string name)
+    {
+        if (name.IsNullOrWhiteSpace()) return false;
+        lock (DictionaryMtlTexture)
+        {
+            if (!_viewSurfaces.Remove(name, out var owner)) return false;
+            // Only a borrowed wrapper is ours to unlink; anything else under this name belongs to its loader.
+            if (DictionaryMtlTexture.TryGetValue(name, out var existing) && existing != null && existing.Borrowed)
+            {
+                DictionaryMtlTexture.Remove(name);
+                owner.DetachSurface(existing);
+                existing.Dispose();
+            }
+            return true;
+        }
+    }
+
+    /// <summary>Uploads a view's constants and selects it for the draws that follow.</summary>
+    static void OnPrepareView(IGraphics g, Season.Rendering.RenderView view)
+    {
+        if (g is not Graphics) return;
+
+        Metal.Pipeline.SetActiveView(view.Index);
+        if (view.Index == 0)
+        {
+            // The main view was already prepared (and its constants written) at the camera update point, before the
+            // shadow pass needed its cascades. Rewriting the same values keeps a harness that skips that update sane.
+            if (view.Prepared) Metal.Pipeline.WriteViewConstants(0, view.Constants);
+            return;
+        }
+
+        // A secondary view renders into a fixed-size offscreen target and is sampled on screen by a 2D control, so
+        // no DPI compensation applies here: the control's layout already handles composition scaling, and
+        // compensating twice would shrink the view into the top-left corner of its own texture.
+        Season.Rendering.ViewTargets? targets = view.Targets;
+        float width = targets?.Width ?? 0u;
+        float height = targets?.Height ?? 0u;
+        if (width <= 0f || height <= 0f) return;
+
+        view.Prepare(width, height);
+        Metal.Pipeline.WriteViewConstants(view.Index, view.Constants);
+    }
+
+    /// <summary>FrameSchedule.AfterViews hook: the view loop left a secondary view selected, so put the main view
+    /// back before the Overlay pass collects anything of its own.</summary>
+    static void OnAfterViews(IGraphics g) => Metal.Pipeline.ResetActiveView();
 
     static Vertex CreateTextQuadVertex(float x, float y, float u, float v)
     {
@@ -977,7 +1108,6 @@ internal unsafe partial class Graphics : IGraphics
         // GPU-instancing path: one instanced DrawPrimitives call.
         if (TryGetTextInstanceState(texts, out var state) && state.InstanceCount > 0)
         {
-            var enc = Metal.Device.GraphicsEncoder;
             int fi = Metal.Device.FrameIndex;
 
             // Capture this frame's buffers once and use these locals for the guard AND for the
@@ -991,17 +1121,15 @@ internal unsafe partial class Graphics : IGraphics
             var drawParamsBuffer = state.DrawParamsBuffers != null && fi < state.DrawParamsBuffers.Length ? state.DrawParamsBuffers[fi] : null;
             var atlasTexture = _glyphAtlas.AtlasTexture;
 
-            if (enc == null || !state.CanDraw
+            if (!state.CanDraw
                 || glyphBuffer == null || instanceBuffer == null || drawParamsBuffer == null
                 || atlasTexture == null)
             {
                 return;
             }
 
-            // Set the pipeline, Transparent plus DoubleSided, including static sampler(0).
-            Pipeline.SetPipeline(enc, PipelineMode.Transparent, doubleSided: true);
-
             // Write TextDrawParams, using a per-Texts, per-frame dedicated UBO to prevent same-frame cross-control overwrites.
+            // 收集期也要写：重放读的是同一帧同一槽的 CPU 可见缓冲，写入与提交在同一条命令流里。
             var drawParams = new MTLTextDrawParams
             {
                 AtlasSize = new Vector2(atlasTexture.Width, atlasTexture.Height),
@@ -1011,11 +1139,35 @@ internal unsafe partial class Graphics : IGraphics
             };
             *(MTLTextDrawParams*)drawParamsBuffer.Contents = drawParams;
 
+            // 工作包 D：收集期没有 encoder，直接把这批不可变句柄交给透明队列。
+            // 直绘路径末尾的“恢复 VS buffer(4)”在重放里不需要：
+            // 每条命令重绑完整槽位，不存在跨命令残留。
+            if (Metal.MTLSceneDrawCollection.Active is { } collecting)
+            {
+                collecting.CaptureText(_textQuadVertexBuffer, _textMatrixBuffer, instanceBuffer,
+                    MTLPrimitiveGroup.IdentityBoneBuffers[fi], _textMaterialBuffer, glyphBuffer,
+                    MTLPrimitiveGroup.IdentityInstanceBoneBuffers[fi], drawParamsBuffer,
+                    MTLPrimitiveGroup.LightConstantBuffers[fi], atlasTexture, Metal.Device.White,
+                    (nuint)state.InstanceCount);
+                return;
+            }
+
+            var enc = Metal.Device.GraphicsEncoder;
+            if (enc == null)
+            {
+                return;
+            }
+
+            // Set the pipeline, Transparent plus DoubleSided, including static sampler(0).
+            Pipeline.SetPipeline(enc, PipelineMode.Transparent, doubleSided: true);
+
             // VS slots:
             // 0=unit quad, 1=identity Matrices, 2=instance stream, 3=IdentityBone,
-            // 4=text material, 5=glyph data reusing morphDeltas, 6=InstanceBone placeholder, 7=TextDrawParams.
+            // 4=text material, 5=glyph data reusing morphDeltas, 6=InstanceBone placeholder, 7=TextDrawParams,
+            // 11=screen-space ViewConstants (identity View/Projection).
             enc.SetVertexBuffer(_textQuadVertexBuffer, 0, 0);
             enc.SetVertexBuffer(_textMatrixBuffer, 0, 1);
+            Pipeline.BindView(enc, Pipeline.ScreenViewBuffer);
             enc.SetVertexBuffer(instanceBuffer, 0, 2);
             enc.SetVertexBuffer(MTLPrimitiveGroup.IdentityBoneBuffers[fi], 0, 3);
             enc.SetVertexBuffer(_textMaterialBuffer, 0, 4);
@@ -1238,6 +1390,14 @@ internal unsafe partial class Graphics : IGraphics
         if (src is not MTLRenderTarget rt) return;
         var enc = Metal.Device.GraphicsEncoder;
         if (enc == null) return;
+        // P3: a secondary view's FinalBlit presents that view's own image only. Bloom, AO and the scene override are
+        // frame-wide products of the *main* view; letting them through would paint the main camera's bloom onto the
+        // minimap and its TAA resolve into the rear mirror. Plain copy, no resolve filter, no outline composite.
+        if (!ReferenceEquals(Season.Rendering.FrameSchedule.ActiveTargets, Season.Rendering.FrameSchedule.PrimaryTargets))
+        {
+            BlitPipeline.Draw(enc, rt);
+            return;
+        }
         // Step D of 2-1:
         // when the source is PostColor, where the uber pass already closed tonemap plus bloom and luma is stored in alpha,
         // run the resolve path for the tier that owns the slot.
@@ -1579,12 +1739,12 @@ internal unsafe partial class Graphics : IGraphics
             try
             {
                 var template = task.GetAwaiter().GetResult();
-                mtlModel = template.CreateInstance(model, MTLPrimitiveGroup.Camera);
+                mtlModel = template.CreateInstance(model);
             }
             catch
             {
                 mtlModel = new MTLModel(model.Name);
-                mtlModel.Load(model, MTLPrimitiveGroup.Camera);
+                mtlModel.Load(model);
                 ExecuteUpload();
             }
 
@@ -1636,7 +1796,7 @@ internal unsafe partial class Graphics : IGraphics
         };
 
         var template = new MTLModel(modelName);
-        template.Load(templateModel, MTLPrimitiveGroup.Camera);
+        template.Load(templateModel);
         ExecuteUpload();
         return Task.FromResult(template);
     }
@@ -1892,12 +2052,15 @@ internal unsafe partial class Graphics : IGraphics
                     ReplaceSpriteTexture(sprite.Name, mtlSprite3D, source);
                 }
 
+                // Billboard orientation must be built from the view actually being rendered (not the legacy
+                // camera mirror), so a second view billboards toward its own camera.
+                var view = Season.Rendering.RenderView.Current;
                 mtlSprite3D.Update(
                     new Vector3(sprite.PosX, sprite.PosY, sprite.PosZ),
                     new Vector2(sprite.Width ?? 1f, sprite.Height ?? 1f),
                     sprite.Rotation,
-                    MTLPrimitiveGroup.Camera.View,
-                    MTLPrimitiveGroup.Camera.Projection,
+                    view.View,
+                    view.RenderProjection,
                     sprite.Mode,
                     sprite.Color,
                     sprite.Alpha);
@@ -2194,7 +2357,7 @@ internal unsafe partial class Graphics : IGraphics
 
         // 2. Construct MTLMesh3D by resolving cached MTLTexture objects per slot, with pure-color fallback when missing.
         var mtlMesh = new MTLMesh3D(mesh.Name);
-        mtlMesh.Load(mesh, MTLPrimitiveGroup.Camera, BuildSurfaceTextureResolver(mesh.Name, mesh.ID, mesh.Surfaces));
+        mtlMesh.Load(mesh, BuildSurfaceTextureResolver(mesh.Name, mesh.ID, mesh.Surfaces));
 
         // 3. Clear TextureOverride after Load completes, following the one-shot consumption contract.
         foreach (var surface in mesh.Surfaces)
@@ -2273,7 +2436,7 @@ internal unsafe partial class Graphics : IGraphics
 
         // 2. Construct MTLInstancedMesh3D by resolving cached MTLTexture objects per slot, with pure-color fallback when missing.
         var mtlMesh = new MTLInstancedMesh3D(mesh.Name);
-        mtlMesh.Load(mesh, MTLPrimitiveGroup.Camera, BuildSurfaceTextureResolver(mesh.Name, mesh.ID, mesh.Surfaces));
+        mtlMesh.Load(mesh, BuildSurfaceTextureResolver(mesh.Name, mesh.ID, mesh.Surfaces));
 
         // 3. Clear TextureOverride after Load completes, following the one-shot consumption contract.
         foreach (var surface in mesh.Surfaces)
@@ -2360,7 +2523,7 @@ internal unsafe partial class Graphics : IGraphics
             };
 
             var mtlInstancedModel = new MTLInstancedModel(model.ModelName);
-            mtlInstancedModel.Load(template, wrapperModel, MTLPrimitiveGroup.Camera);
+            mtlInstancedModel.Load(template, wrapperModel);
 
             // v2 picking:
             // inject the instanced GltfAsset so the node tree, animation, and bone palette stay aligned with instanced rendering.
@@ -2760,8 +2923,34 @@ internal unsafe partial class Graphics : IGraphics
         }
     }
 
-    public Season.Rendering.StorageBuffer CreateStorageBuffer(uint sizeInBytes)
-        => new MTLStorageBuffer(sizeInBytes);
+    public Season.Rendering.StorageBuffer CreateStorageBuffer(uint sizeInBytes,
+        Season.Rendering.StorageBufferUsage usage = Season.Rendering.StorageBufferUsage.Compute)
+        => new MTLStorageBuffer(sizeInBytes, usage);
+
+    // ── A0.1 间接绘制（契约在 IGraphics / Indirect.cs）──
+    // Metal 是四端里最轻的一端：既没有缓冲状态机，也不需要 MTLIndirectCommandBuffer——
+    // 单条间接绘制走 DrawIndexedPrimitives 的 indirectBuffer 重载即可，ICB 只在 A7 的 multi-draw 才需要。
+    // 所以 Prepare 阶段无事可做，只做与其他三端一致的准入校验；返回 true 代表“交接已完成”而非“已录制指令”。
+
+    public bool IndirectDrawSupported => ComputeSupported;
+
+    public bool TryPrepareIndirectArgs(Season.Rendering.StorageBuffer buffer)
+        => Metal.Device.GraphicsEncoder == null
+            && buffer is MTLStorageBuffer mtlBuffer && mtlBuffer.Buffer != null
+            && mtlBuffer.Usage == Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs
+            && mtlBuffer.SizeInBytes >= Season.Rendering.IndirectDrawIndexedArgs.SizeInBytes;
+
+    /// <summary>间接实例化四边形绘制管线。创建失败即返回 null，粒子效果据此整体不注册，画面退回改动前。</summary>
+    public Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline()
+    {
+        if (!IndirectDrawSupported) return null;
+        try { return new MTLParticleDrawPipeline(); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Particles] Metal 管线创建失败：{ex.Message}");
+            return null;
+        }
+    }
 
     /// <summary>In 1-8, constant-block upload uses StorageModeShared staging plus a blit encoder because MTLStorageBuffer is StorageModePrivate and has no CPU mapping.
     /// It must be recorded into the current-frame GraphicsCommandBuffer and must stay outside any pass.

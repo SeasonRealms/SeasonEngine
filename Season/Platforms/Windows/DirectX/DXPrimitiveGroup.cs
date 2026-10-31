@@ -22,9 +22,6 @@ namespace Season.Platforms.Windows.DirectX;
 /// </summary>
 internal unsafe abstract class DXPrimitiveGroup : IDisposable
 {
-    // === Globally shared: camera for all Pbr3D primitives ===
-    internal static Season.Basic.Camera Camera;
-
     // === Globally shared: lighting CB (N-buffered) ===
     // The Pbr3D path and the DXSpriteQuad/Sprite family all read the same CB
     // from here to avoid duplicate copies.
@@ -217,7 +214,7 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         // When MotionVectors are off, JitterNdc stays zero, and writing it is
         // harmless because shaders with VELOCITY_OUTPUT=0 do not read the field.
         var res = DeviceServices.BaseApp.DeviceResolution;
-        var jitter = DeviceServices.BaseApp.Camera.JitterNdc;
+        var jitter = RenderView.Current.JitterNdc;
         lightParams.VelocityParams = new Vector4(
             jitter.X, jitter.Y,
             res.X > 0 ? 1f / res.X : 0f,
@@ -283,8 +280,11 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
             ? DXTexture3D.Find(aerialName)
             : null;
 
-        FrameSchedule.CaptureLighting(lightParams, Camera.View, Camera.Projection,
-            DeviceServices.BaseApp.Camera.RenderViewProjection);
+        // The snapshot is read by fog / weather / particles, so it must come from the view that is actually
+        // being rendered, not from the legacy camera mirror.
+        var snapshotView = RenderView.Current;
+        FrameSchedule.CaptureLighting(lightParams, snapshotView.View, snapshotView.RenderProjection,
+            snapshotView.RenderViewProjection);
         Unsafe.Write(mappedLightConstantBuffers[fi], lightParams);
     }
 
@@ -302,8 +302,7 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         // FOV/near/far are still driven by BaseApp.Camera.
         // cameraPos/cameraTarget are forwarded from BaseApp.Camera.Position/Target
         // and kept in the signature for frame-loop compatibility.
-        var camera3D = DeviceServices.BaseApp.Camera;
-        var aspectRatio = DeviceServices.BaseApp.DeviceResolution.X / (float)DeviceServices.BaseApp.DeviceResolution.Y;
+        var res = DeviceServices.BaseApp.DeviceResolution;
 
         // DPI compensation, matching the 2D rendering rule 1/CompositionScale.X:
         // multiply NDC xy by n and translate toward the upper-left corner.
@@ -321,31 +320,17 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         dpiTransform.M41 = n - 1f;
         dpiTransform.M42 = 1f - n;
 
-        if (RenderQuality.Current.MotionVectors)
-        {
-            // 2-3 contract rule 4: this is the only jitter injection point.
-            // UpdateTemporal first snapshots the previous unjittered
-            // ViewProjection, rebuilds matrices, and then bakes jitter only into
-            // ProjectionJittered. Frustum culling and CSM cascades still use the
-            // unjittered camera3D.Projection/ViewProjection to avoid edge shimmer
-            // and shadow jitter.
-            var res = DeviceServices.BaseApp.DeviceResolution;
-            camera3D.UpdateTemporal(aspectRatio, res.X, res.Y);
-            Camera.View = camera3D.View;
-            Camera.Projection = Matrix4x4.Multiply(camera3D.ProjectionJittered, dpiTransform);
-            // Apply the same compensation to history matrices so prev/current
-            // stay aligned. Otherwise the TAA / MotionVectors velocity field drifts.
-            Camera.PrevViewProjection = Matrix4x4.Multiply(camera3D.PrevViewProjection, dpiTransform);
-        }
-        else
-        {
-            camera3D.UpdateIfChanged(aspectRatio);
-            Camera.View = camera3D.View;
-            Camera.Projection = Matrix4x4.Multiply(camera3D.Projection, dpiTransform);
-            // All-zero means no history. This prevents stale matrices from
-            // surviving when the feature is disabled mid-run.
-            Camera.PrevViewProjection = default;
-        }
+        // 2-3 contract rule 4: the main view is the only jitter injection point.
+        // Prepare snapshots the previous unjittered ViewProjection, rebuilds the
+        // camera matrices and bakes jitter only into the render projection.
+        // Frustum culling and CSM cascades keep the unjittered matrices. The DPI
+        // compensation is applied to the current and history render matrices
+        // alike, so the TAA / MotionVectors velocity field stays aligned; with
+        // MotionVectors off the history is all zero (no history).
+        var view = DeviceServices.BaseApp.MainView;
+        view.Prepare(res.X, res.Y, dpiTransform);
+        FrameSchedule.CurrentView = view;
+        Pipeline.WriteMainView(view.Constants);
 
         // 1-5: CPU shadow-matrix computation chain. It runs after the camera is
         // updated and before the lighting CB is written. When shadows are off or
@@ -360,7 +345,7 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
             if (dirIdx >= 0 && dirIdx < lightParams.LightCount)
             {
                 var dirType = lightParams.Lights[dirIdx].DirType;
-                CascadedShadow.ComputeSun(camera3D, new Vector3(dirType.X, dirType.Y, dirType.Z));
+                CascadedShadow.ComputeSun(view.Camera, new Vector3(dirType.X, dirType.Y, dirType.Z));
             }
             int spotIdx = (int)lightParams.Params0.W;
             if (spotIdx >= 0 && spotIdx < lightParams.LightCount
@@ -1215,10 +1200,7 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(world),
-            View = Matrix4x4.Transpose(Camera.View),
-            Projection = Matrix4x4.Transpose(Camera.Projection),
             PrevWorld = Matrix4x4.Transpose(box.PrevWorld),
-            PrevViewProjection = Matrix4x4.Transpose(Camera.PrevViewProjection),
         };
         Unsafe.Write(box.Face.MappedMatrixBuffers[fi], matrices);
         Unsafe.Write(box.Edges.MappedMatrixBuffers[fi], matrices);
@@ -1423,8 +1405,6 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(Camera.View),
-            Projection = Matrix4x4.Transpose(Camera.Projection),
         };
         for (int i = 0; i < Device.frameCount; i++)
         {
@@ -1463,26 +1443,11 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         var world = Matrix4x4.Transpose(matrices.World);
         var center = Vector3.Transform(primitiveData.LocalBoundsCenter, world);
 
-        var cameraPos = new Vector3(Camera.View.M41, Camera.View.M42, Camera.View.M43);
         if (DeviceServices.BaseApp != null)
-            cameraPos = DeviceServices.BaseApp.CameraPos;
+            return RenderView.Current.ViewDepth(center);
 
-        Vector3 cameraForward;
-        if (DeviceServices.BaseApp != null)
-        {
-            cameraForward = DeviceServices.BaseApp.CameraTarget - DeviceServices.BaseApp.CameraPos;
-        }
-        else
-        {
-            cameraForward = Vector3.UnitZ;
-        }
-
-        if (cameraForward.LengthSquared() < 1e-6f)
-            cameraForward = Vector3.UnitZ;
-        else
-            cameraForward = Vector3.Normalize(cameraForward);
-
-        return Vector3.Dot(center - cameraPos, cameraForward);
+        // No app (offline tooling): world Z, matching RenderView.SortDepth's fallback.
+        return center.Z;
     }
 
     static int CompareTransparentPrimitives(PrimitiveData a, PrimitiveData b)

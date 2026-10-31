@@ -75,7 +75,7 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
     /// <summary>
     /// Loads primitives from the shared model template. The caller must ensure template has already been loaded.
     /// </summary>
-    public void Load(MTLModel template, Season.Controls.Model model, Camera camera)
+    public void Load(MTLModel template, Season.Controls.Model model)
     {
         var nodeMap = new Dictionary<GltfNodeBase, GltfNodeBase>();
         CloneAnimationData(template.Asset, nodeMap);
@@ -92,7 +92,7 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
 
         foreach (var source in templatePrimitives)
         {
-            var clone = CloneForInstancing(source, model, camera);
+            var clone = CloneForInstancing(source, model);
             if (source.OwnerNode != null && nodeMap.TryGetValue(source.OwnerNode, out var clonedNode))
                 clone.OwnerNode = clonedNode;
             clone.InstanceStreamIndex = _primitives.Count;
@@ -115,7 +115,7 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
     /// - Material UBO is rebuilt locally because alpha may differ
     /// - Model-level material overrides such as MaterialColor and Unlit are applied
     /// </summary>
-    PrimitiveData CloneForInstancing(PrimitiveData source, Season.Controls.Model model, Camera camera)
+    PrimitiveData CloneForInstancing(PrimitiveData source, Season.Controls.Model model)
     {
         var clone = new PrimitiveData
         {
@@ -180,11 +180,8 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(camera.View),
-            Projection = Matrix4x4.Transpose(camera.Projection),
             // Contract clause 8(d) of 2-3:
             // PrevWorld in b0 stays all zeros on the instanced path because history comes from the double-buffered instance stream.
-            PrevViewProjection = Matrix4x4.Transpose(camera.PrevViewProjection),
         };
 
         for (int i = 0; i < Device.frameCount; i++)
@@ -699,13 +696,10 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(Camera.View),
-            Projection = Matrix4x4.Transpose(Camera.Projection),
             // Contract clause 8(d) of 2-3:
             // PrevWorld in b0 remains all zeros because per-instance history on the instanced path
             // comes from the opposite side of the double-buffered instance stream at VS buffer 9,
             // not from b0.
-            PrevViewProjection = Matrix4x4.Transpose(Camera.PrevViewProjection),
         };
         foreach (var primitive in _primitives)
             WriteStruct(primitive.MatrixBuffers[fi], matrices);

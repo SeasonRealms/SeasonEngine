@@ -103,7 +103,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
     internal readonly IJSInProcessRuntime _jsRuntime;
 
-    internal static readonly float[] _scratchMatrix48 = new float[48];
+    internal static readonly float[] _scratchWorldMatrix = new float[WebGPUUniformLayout.WorldFloats];
     internal static readonly float[] _scratchUniform = new float[WebGPUUniformLayout.TotalFloats];
 
     internal static byte[] ToByteArray(float[] source)
@@ -155,7 +155,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         return ToByteArray(floats);
     }
 
-    /// <summary>Aligned with <see cref="WebGPUPipeline.UniformBytes"/> (432 bytes) and defined uniformly by the shared layer.</summary>
+    /// <summary>Aligned with <see cref="WebGPUPipeline.UniformBytes"/> (240 bytes = per-object state only) and defined uniformly by the shared layer.</summary>
     const int BYTES_PER_UNIFORM = WebGPUPipeline.UniformBytes;
     // The Web backend previously uploaded only one primitive per frame, so complex skinned glTF assets
     // could remain in a "partially uploaded" state for a long time, which looked inconsistent with
@@ -176,9 +176,9 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     readonly Dictionary<string, PendingStaticMeshUpload> _pendingStaticMeshUploadLookup = new();
     readonly HashSet<string> _uploadedStaticMeshKeys = new();
 
-    // 1-5: Current quadrant light-space VP (written per quadrant by RenderShadowPass and placed into the
-    // Projection slot by the DrawShadow path; the View slot is Identity, so the WGSL chain
-    // u.projection*u.view*worldPos = LVP^T * v is equivalent to CPU-side pos * LVP).
+    // 1-5: Current quadrant light-space VP (written per quadrant by RenderShadowPass and published into that
+    // quadrant's view slot; the slot's View is Identity, so the WGSL chain
+    // uView.projection*uView.view*worldPos = LVP^T * v is equivalent to CPU-side pos * LVP).
     internal Matrix4x4 _shadowViewProj = Matrix4x4.Identity;
 
     public void Init()
@@ -186,9 +186,9 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
     }
 
-    internal void EnqueueDrawMesh3D(string cacheKey, float[] uniform100)
+    internal void EnqueueDrawMesh3D(string cacheKey, float[] uniformData)
     {
-        if (CaptureSceneMesh(cacheKey, uniform100, null)) return;
+        if (CaptureSceneMesh(cacheKey, uniformData, null)) return;
         int needed = (_batchCount + 1) * BYTES_PER_UNIFORM;
         if (needed > _batchUniformBytes.Length)
         {
@@ -197,7 +197,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             Array.Resize(ref _batchUniformBytes, newCap);
         }
 
-        Buffer.BlockCopy(uniform100, 0, _batchUniformBytes, _batchCount * BYTES_PER_UNIFORM, BYTES_PER_UNIFORM);
+        Buffer.BlockCopy(uniformData, 0, _batchUniformBytes, _batchCount * BYTES_PER_UNIFORM, BYTES_PER_UNIFORM);
 
         if (_batchCacheKeys.Count == _batchCount)
             _batchCacheKeys.Add(cacheKey);
@@ -220,12 +220,12 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             WebGPUInterop.UploadSkinnedBones(skinKey, boneMatricesBytes);
     }
 
-    internal void EnqueueDrawSkinnedMesh(string cacheKey, float[] uniform100)
+    internal void EnqueueDrawSkinnedMesh(string cacheKey, float[] uniformData)
     {
         if (string.IsNullOrEmpty(_currentSkinnedBatchSkinKey))
             throw new InvalidOperationException("Skinned batch requires BeginSkinnedModelDraw before enqueue.");
 
-        if (CaptureSceneMesh(cacheKey, uniform100, _currentSkinnedBatchSkinKey)) return;
+        if (CaptureSceneMesh(cacheKey, uniformData, _currentSkinnedBatchSkinKey)) return;
         int needed = (_skinnedBatchCount + 1) * BYTES_PER_UNIFORM;
         if (needed > _skinnedBatchUniformBytes.Length)
         {
@@ -234,7 +234,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             Array.Resize(ref _skinnedBatchUniformBytes, newCap);
         }
 
-        Buffer.BlockCopy(uniform100, 0, _skinnedBatchUniformBytes, _skinnedBatchCount * BYTES_PER_UNIFORM, BYTES_PER_UNIFORM);
+        Buffer.BlockCopy(uniformData, 0, _skinnedBatchUniformBytes, _skinnedBatchCount * BYTES_PER_UNIFORM, BYTES_PER_UNIFORM);
 
         if (_skinnedBatchCacheKeys.Count == _skinnedBatchCount)
             _skinnedBatchCacheKeys.Add(cacheKey);
@@ -398,6 +398,22 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     readonly string _assetBasePath;
     bool _initialized;
 
+    public Season.Rendering.Effects.WeatherCompositePipeline? CreateWeatherCompositePipeline()
+    {
+        if (!ComputeSupported) return null;
+        var pipeline = new WGPUFogCompositePipeline(true);
+        try
+        {
+            if (pipeline.Initialize()) return new(pipeline);
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherComposite] 创建失败：{ex.Message}");
+        }
+        pipeline.Dispose();
+        return null;
+    }
+
     public Season.Rendering.FogCompositePipeline? CreateFogCompositePipeline()
     {
         if (!ComputeSupported) return null;
@@ -414,11 +430,26 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         return null;
     }
 
-    internal static Season.Basic.Camera Camera3D;
+    /// <summary>间接实例化四边形绘制管线。创建失败即返回 null，粒子效果据此整体不注册，画面退回改动前。</summary>
+    public Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline()
+    {
+        if (!IndirectDrawSupported || !ComputeSupported) return null;
+        var pipeline = new WGPUParticleDrawPipeline();
+        try
+        {
+            if (pipeline.Initialize()) return pipeline;
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Particles] WebGPU 管线创建失败：{ex.Message}");
+        }
+        pipeline.Dispose();
+        return null;
+    }
 
     // 1-2 Contract 8: mirrored scene lighting (SceneLightParams, 976B after the 2-3 expansion). After
     // UpdateCamera3D injects exposure and jitter each frame, the whole block is uploaded into the shared
-    // UBO at JS binding(10). It is no longer inlined into each 108-float draw uniform
+    // UBO at JS binding(10). It is no longer inlined into each per-object draw uniform
     // (those slots are reused for prev-data starting at 2-3; see WebGPUUniformLayout.PrevWorld).
     internal static SceneLightParams Light3D;
 
@@ -439,6 +470,9 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     Dictionary<(string, long), WGPUInstancedMesh3D> DictionaryInstancedMesh3D = new();
     Dictionary<(string, long), WGPUInstancedModel> DictionaryInstancedModel = new();
     readonly HashSet<WGPURenderTarget> _renderTargets = new();
+    // P3: names published through RegisterViewSurface, mapped to the target that owns them. Kept apart from
+    // DictionaryWGPUTexture so UnregisterViewSurface can never remove a real texture's entry.
+    readonly Dictionary<string, WGPURenderTarget> _viewSurfaces = new();
     int _instancedDiagPollCounter = 0;
     string? _lastInstancedDiagSignature;
 
@@ -523,6 +557,12 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         if (velocityOutput)
             meshShader = meshShader.Replace(
                 "const VELOCITY_OUTPUT : bool = false;", "const VELOCITY_OUTPUT : bool = true;");
+        // A0.2: NORMAL_OUTPUT rides on the velocity variant (EffectiveSceneNormals implies MotionVectors), so the JS
+        // side swaps the velocity table for fs_main_mrtn + three targets instead of baking a fourth table.
+        bool normalOutput = velocityOutput && RenderQuality.Current.EffectiveSceneNormals;
+        if (normalOutput)
+            meshShader = meshShader.Replace(
+                "const NORMAL_OUTPUT : bool = false;", "const NORMAL_OUTPUT : bool = true;");
 
         // 2-4 Clause 10: DDGI consumer-side variant switch (mirrors DDGI_ENABLED on DX/VK/Metal and is
         // fixed at initialization time).
@@ -558,8 +598,15 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             // 2-6 clause 6: clamped here rather than in JS so all four backends resolve the count through the same
             // helper; the JS side re-clamps only because a stale host mirror could otherwise pass an illegal value.
             RenderQuality.ClampAnisotropy(RenderQuality.Current.TextureMaxAnisotropy),
-            RenderQuality.Current.RequiresFogSceneDepth(HdrSceneColor, true, Season.Rendering.Immediate2DMode.Enabled));
+            RenderQuality.Current.RequiresAtmosphereSceneDepth(HdrSceneColor, true, Season.Rendering.Immediate2DMode.Enabled),
+            normalOutput);
         _initialized = true;
+
+        // P2: 2D sprites / text draw in clip space, so their slot holds identity View/Projection and is uploaded
+        // once here. Per-view 3D slots are published by OnPrepareView, once per view per frame.
+        PublishViewConstants(WebGPUViewUniformLayout.ScreenSpaceSlot, ViewConstants.ScreenSpace);
+        FrameSchedule.PrepareView = OnPrepareView;
+        FrameSchedule.AfterViews = OnAfterViews;
     }
 
     string ResolveAssetPath(string assetName)
@@ -682,7 +729,9 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             desc.ClearDepthEnable,
             desc.StoreDepth,
             depthTarget?.Name,
-            (desc.VelocityTarget as WGPURenderTarget)?.Name);
+            (desc.VelocityTarget as WGPURenderTarget)?.Name,
+            // A0.2: slot 2 only exists next to slot 1, matching the other three backends.
+            desc.VelocityTarget is WGPURenderTarget ? (desc.NormalTarget as WGPURenderTarget)?.Name : null);
     }
 
     public void EndPass()
@@ -742,6 +791,59 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
     void UnregisterRenderTarget(WGPURenderTarget target) => _renderTargets.Remove(target);
 
+    // ── P3 secondary views (contract in IGraphics) ──
+
+    /// <summary>
+    /// WebGPU already renders every pass into a named offscreen target and writes per-view constants into a slot of
+    /// its own, so an additional view needs no tier restriction: the presentation target is simply samplable.
+    /// </summary>
+    public bool SecondaryViewSupported => _initialized;
+
+    /// <summary>
+    /// Publishes the presentation target into the JS texture dictionary, which is the dictionary every 2D draw path
+    /// resolves a name through. The C# entry is metadata only (name-as-handle), and its single job is making
+    /// <see cref="LoadSprite2D"/> early-return instead of trying to fetch a name that was never a file.
+    /// </summary>
+    public bool RegisterViewSurface(string name, Season.Rendering.RenderTarget target)
+    {
+        if (name.IsNullOrWhiteSpace() || !_initialized || target is not WGPURenderTarget rt) return false;
+
+        lock (DictionaryWGPUTexture)
+        {
+            // Re-registering the same target keeps the entry: controls already hold the wrapper, and its identity is
+            // what they sample through.
+            if (_viewSurfaces.TryGetValue(name, out var published)) return ReferenceEquals(published, rt);
+            // A name that belongs to a real texture keeps answering for it.
+            if (DictionaryWGPUTexture.TryGetValue(name, out var existing) && existing != null) return false;
+            if (!WebGPUInterop.PublishViewSurface(name, rt.Name)) return false;
+
+            _viewSurfaces.Add(name, rt);
+            DictionaryWGPUTexture[name] = new WGPUTexture
+            {
+                Name = name,
+                Width = rt.Desc.Width,
+                Height = rt.Desc.Height,
+            };
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Drops a publication made by <see cref="RegisterViewSurface"/>. Only published surfaces are removed: a name
+    /// owned by a real texture is left to its loader.
+    /// </summary>
+    public bool UnregisterViewSurface(string name)
+    {
+        if (name.IsNullOrWhiteSpace()) return false;
+        lock (DictionaryWGPUTexture)
+        {
+            if (!_viewSurfaces.Remove(name)) return false;
+            DictionaryWGPUTexture.Remove(name);
+            WebGPUInterop.UnpublishViewSurface(name);
+            return true;
+        }
+    }
+
     public void SynchronizeRenderTargetSizes()
     {
         if (!_initialized) return;
@@ -771,9 +873,21 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             return DictionaryWGPUTexture.ContainsKey(sceneName) ? sceneName : null;
     }
 
+    /// <summary>
+    /// P3: a secondary view presents into its own LDR surface, while every publication passed on the paths below
+    /// (bloom chain, AO chain, TAA resolve) is a product of the main view's frame. Compositing another view's
+    /// history onto this one would show the main camera's bloom in the minimap, so that path stays plain, exactly
+    /// as on Windows.
+    /// </summary>
     public void BlitToBackbuffer(Season.Rendering.RenderTarget src)
     {
         if (!_initialized) return;
+        if (!ReferenceEquals(Season.Rendering.FrameSchedule.ActiveTargets, Season.Rendering.FrameSchedule.PrimaryTargets))
+        {
+            WebGPUInterop.BlitToBackbuffer(((WGPURenderTarget)src).Name, RenderQuality.Current.HdrExposure, null, 0f,
+                resolve: (int)Season.Rendering.PostResolve.Copy, sharpness: 0f, null, 0f, null, null, 0f);
+            return;
+        }
         // 2-1 Step D: when the source is the LDR PostColor produced by the post uber pass
         // (luma stored in alpha), switch to the resolve variant of the tier that registered the slot. This is
         // mutually exclusive with tonemap/bloom because composition has already completed in Post, matching
@@ -909,12 +1023,27 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
     }
 
-    public Season.Rendering.StorageBuffer CreateStorageBuffer(uint sizeInBytes)
+    public Season.Rendering.StorageBuffer CreateStorageBuffer(uint sizeInBytes,
+        Season.Rendering.StorageBufferUsage usage = Season.Rendering.StorageBufferUsage.Compute)
     {
-        var buffer = new WGPUStorageBuffer(sizeInBytes);
-        WebGPUInterop.CreateStorageBuffer(buffer.Id, (int)sizeInBytes);
+        var buffer = new WGPUStorageBuffer(sizeInBytes, usage);
+        WebGPUInterop.CreateStorageBuffer(buffer.Id, (int)sizeInBytes,
+            usage == Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs);
         return buffer;
     }
+
+    // ── A0.1 间接绘制（契约在 IGraphics / Indirect.cs）──
+    // WebGPU 没有显式 barrier，dispatch 与后续间接读取的先后关系由同一 encoder 的编码顺序保证，
+    // 所以 Prepare 此处只做准入校验。真正的约束在参数内容上：firstInstance 必须为 0，
+    // 否则需要可选 indirect-first-instance 特性；该约束由写入方（compute kernel）承担，见 IndirectDrawIndexedArgs。
+
+    public bool IndirectDrawSupported => _initialized;
+
+    public bool TryPrepareIndirectArgs(Season.Rendering.StorageBuffer buffer)
+        => _initialized
+            && buffer is WGPUStorageBuffer wgpuBuffer
+            && wgpuBuffer.Usage == Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs
+            && wgpuBuffer.SizeInBytes >= Season.Rendering.IndirectDrawIndexedArgs.SizeInBytes;
 
     /// <summary>1-8: 3D storage textures are registered only into the dedicated JS-side <c>_textures3d</c>
     /// dictionary and **not** into <c>DictionaryWGPUTexture</c>. The latter is the name-based lookup source
@@ -1911,7 +2040,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         var template = new WGPUModel(modelName);
         template.SetGlbBytes(glbBytes);
         var parseStopwatch = System.Diagnostics.Stopwatch.StartNew();
-        template.Load(templateModel, Camera3D);
+        template.Load(templateModel);
 
         DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [ModelLoad] {modelName} parse={parseStopwatch.ElapsedMilliseconds}ms total={totalStopwatch.ElapsedMilliseconds}ms");
 
@@ -2118,7 +2247,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     // ── Material overrides ──
         ProcessModelOverridesWebGPU(model);
 
-        wgpuModel.Update(model, time, Camera3D);
+        wgpuModel.Update(model, time);
     }
 
     /// <summary>Consume material overrides from the Model.</summary>
@@ -2292,8 +2421,10 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             ReplaceSprite3DTexture(wgpuSprite3D, source);
         }
 
-        var cameraView = Camera3D.View;
-        var cameraProjection = Camera3D.Projection;
+        // Billboard orientation is built from the view actually being rendered; the draw site then reads
+        // View/Projection from that view's slot in the per-view UBO.
+        var view = Season.Rendering.RenderView.Current;
+        var cameraView = view.View;
 
         Matrix4x4.Invert(cameraView, out var viewInv);
         Vector3 cameraPosition = viewInv.Translation;
@@ -2327,8 +2458,6 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             wgpuSprite3D.PrevWorldMatrix = wgpuSprite3D.World;
 
         wgpuSprite3D.World = worldMatrix;
-        wgpuSprite3D.View = cameraView;
-        wgpuSprite3D.Projection = cameraProjection;
         wgpuSprite3D.TransformInitialized = true;
     }
 
@@ -2350,17 +2479,15 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             return;
         }
 
-        var matrixData = _scratchMatrix48;
+        var matrixData = _scratchWorldMatrix;
         CopyMatrixTransposed(wgpuSprite3D.World, matrixData, 0);
-        CopyMatrixTransposed(wgpuSprite3D.View, matrixData, 16);
-        CopyMatrixTransposed(wgpuSprite3D.Projection, matrixData, 32);
 
         Vector4 color = sprite.Color;
         float finalAlpha = color.W * sprite.Alpha;
 
         var uniformData = _scratchUniform;
-        Array.Clear(uniformData, 48, WebGPUUniformLayout.TotalFloats - 48);
-        Array.Copy(matrixData, 0, uniformData, 0, 48);
+        Array.Clear(uniformData, WebGPUUniformLayout.PrevWorld, WebGPUUniformLayout.TotalFloats - WebGPUUniformLayout.PrevWorld);
+        Array.Copy(matrixData, 0, uniformData, WebGPUUniformLayout.World, WebGPUUniformLayout.WorldFloats);
         // 2-3 Contract Clause 6: the prev slot must be written after Clear.
         WritePrevMatrices(uniformData, wgpuSprite3D.PrevWorldMatrix);
         var w = new WebGPUUniformWriter(uniformData);
@@ -2554,8 +2681,6 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             wgpuMesh.PrevWorldMatrix = wgpuMesh.World;
 
         wgpuMesh.World = world;
-        wgpuMesh.View = Camera3D.View;
-        wgpuMesh.Projection = Camera3D.Projection;
         wgpuMesh.TransformInitialized = true;
         wgpuMesh.MeshAlpha = mesh.Alpha;
         // Mirror Mesh3D.ColorTint (used to adjust skybox brightness/color temperature over the day-night cycle):
@@ -2633,10 +2758,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             return;
         }
 
-        var matrixData = _scratchMatrix48;
+        var matrixData = _scratchWorldMatrix;
         CopyMatrixTransposed(wgpuMesh.World, matrixData, 0);
-        CopyMatrixTransposed(wgpuMesh.View, matrixData, 16);
-        CopyMatrixTransposed(wgpuMesh.Projection, matrixData, 32);
 
         foreach (var surface in mesh.Surfaces)
         {
@@ -2646,7 +2769,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         // Unified highlight (host Bounds box): face uses BLEND translucency and edges use OPAQUE depth-writing.
         // Flush after all surfaces have finished.
         if (wgpuMesh.BoundsActive && wgpuMesh.BoundsBox != null)
-            DrawBoundsBox(wgpuMesh.BoundsBox, wgpuMesh.View, wgpuMesh.Projection);
+            DrawBoundsBox(wgpuMesh.BoundsBox);
 
         // Unified highlight (wireframe shell): one shell box per surface, with BLEND translucent faces and
         // OPAQUE depth-writing edges. Flush after Bounds.
@@ -2656,7 +2779,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             {
                 var shell = wgpuMesh.ShellBoxes[i];
                 if (shell != null)
-                    DrawShellBox(shell, wgpuMesh.View, wgpuMesh.Projection);
+                    DrawShellBox(shell);
             }
         }
     }
@@ -2794,8 +2917,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
     void BuildSurfaceUniform(float[] uniformData, float[] matrixData, Surface surface, float meshAlpha, bool isInstanced = false, int prevDataFlags = 0, Vector4 colorTint = default, bool excludeFromAo = false, WGPUMesh3D.ResolvedTextureSet resolvedTextures = null)
     {
-        Array.Clear(uniformData, 48, WebGPUUniformLayout.TotalFloats - 48);
-        Array.Copy(matrixData, 0, uniformData, 0, 48);
+        Array.Clear(uniformData, WebGPUUniformLayout.PrevWorld, WebGPUUniformLayout.TotalFloats - WebGPUUniformLayout.PrevWorld);
+        Array.Copy(matrixData, 0, uniformData, WebGPUUniformLayout.World, WebGPUUniformLayout.WorldFloats);
 
         float finalAlpha = surface.BaseColor.W * surface.Alpha * meshAlpha;
         // Mesh-level color multiplier: multiply RGB component-wise into BaseColor.
@@ -2850,18 +2973,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
     static float ComputeTransparentDepth(Matrix4x4 world, Vector3 localCenter)
     {
-        var center = Vector3.Transform(localCenter, world);
-        var app = DeviceServices.BaseApp;
-        if (app == null)
-            return center.Z;
-
-        var forward = app.CameraTarget - app.CameraPos;
-        if (forward.LengthSquared() < 1e-6f)
-            forward = Vector3.UnitZ;
-        else
-            forward = Vector3.Normalize(forward);
-
-        return Vector3.Dot(center - app.CameraPos, forward);
+        return RenderView.SortDepth(Vector3.Transform(localCenter, world));
     }
 
     void DrawMesh3DSurface(WGPUMesh3D wgpuMesh, Surface surface, float[] matrixData)
@@ -2918,22 +3030,20 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     /// writes so the solid thin bars cover both the face and inner geometry. The world matrix is baked into
     /// the uniform and drawn per box. PrevWorld comes from the CPU-side shadow copy rolled in Update
     /// (first-frame Identity acts as the zero-velocity sentinel).</summary>
-    internal void DrawBoundsBox(WebBoundsBox box, Matrix4x4 view, Matrix4x4 projection)
+    internal void DrawBoundsBox(WebBoundsBox box)
     {
         EnsureBoundsBoxUploaded(box);
 
-        var matrixData = _scratchMatrix48;
+        var matrixData = _scratchWorldMatrix;
         CopyMatrixTransposed(box.World, matrixData, 0);
-        CopyMatrixTransposed(view, matrixData, 16);
-        CopyMatrixTransposed(projection, matrixData, 32);
 
         if (box.FaceAlpha > 0f)
         {
             var uniformData = _scratchUniform;
-            Array.Clear(uniformData, 48, WebGPUUniformLayout.TotalFloats - 48);
-            Array.Copy(matrixData, 0, uniformData, 0, 48);
+            Array.Clear(uniformData, WebGPUUniformLayout.PrevWorld, WebGPUUniformLayout.TotalFloats - WebGPUUniformLayout.PrevWorld);
+            Array.Copy(matrixData, 0, uniformData, WebGPUUniformLayout.World, WebGPUUniformLayout.WorldFloats);
             // 2-3 Contract Clause 6: the prev slot must be written after Clear
-            // (Clear overwrites the whole history region starting at float 48).
+            // (Clear overwrites the whole history region starting at PrevWorld / float 16).
             WritePrevMatrices(uniformData, box.PrevWorld);
             new WebGPUUniformWriter(uniformData).SetBaseColor(box.FaceColor);
             WriteLightUniform(uniformData,
@@ -2949,8 +3059,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
         {
             var uniformData = _scratchUniform;
-            Array.Clear(uniformData, 48, WebGPUUniformLayout.TotalFloats - 48);
-            Array.Copy(matrixData, 0, uniformData, 0, 48);
+            Array.Clear(uniformData, WebGPUUniformLayout.PrevWorld, WebGPUUniformLayout.TotalFloats - WebGPUUniformLayout.PrevWorld);
+            Array.Copy(matrixData, 0, uniformData, WebGPUUniformLayout.World, WebGPUUniformLayout.WorldFloats);
             WritePrevMatrices(uniformData, box.PrevWorld);
             new WebGPUUniformWriter(uniformData).SetBaseColor(box.EdgeColor);
             WriteLightUniform(uniformData,
@@ -2967,10 +3077,10 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
     /// <summary>Unified highlight: draw all instance boxes whose Bounds highlight is enabled this frame
     /// (DrawBoundsBox per box, then flush the batch).</summary>
-    void DrawInstanceBoundsBoxes(List<WebBoundsBox> boxes, List<int> drawList, Matrix4x4 view, Matrix4x4 projection)
+    void DrawInstanceBoundsBoxes(List<WebBoundsBox> boxes, List<int> drawList)
     {
         for (int i = 0; i < drawList.Count; i++)
-            DrawBoundsBox(boxes[drawList[i]], view, projection);
+            DrawBoundsBox(boxes[drawList[i]]);
     }
 
     /// <summary>Unified highlight (wireframe shell): lazily create GPU resources for face/edge primitives.
@@ -3010,22 +3120,20 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     /// morphWeights through the uniform every frame; the delta buffers are already prepared during
     /// UploadStaticMesh. The world matrix is baked into the uniform and drawn per box. PrevWorld comes from
     /// the CPU-side shadow copy rolled in Update (first-frame Identity acts as the zero-velocity sentinel).</summary>
-    internal void DrawShellBox(WebShellBox box, Matrix4x4 view, Matrix4x4 projection, Vector4? morphWeights = null)
+    internal void DrawShellBox(WebShellBox box, Vector4? morphWeights = null)
     {
         EnsureShellBoxUploaded(box);
 
-        var matrixData = _scratchMatrix48;
+        var matrixData = _scratchWorldMatrix;
         CopyMatrixTransposed(box.World, matrixData, 0);
-        CopyMatrixTransposed(view, matrixData, 16);
-        CopyMatrixTransposed(projection, matrixData, 32);
 
         if (box.FaceAlpha > 0f)
         {
             var uniformData = _scratchUniform;
-            Array.Clear(uniformData, 48, WebGPUUniformLayout.TotalFloats - 48);
-            Array.Copy(matrixData, 0, uniformData, 0, 48);
+            Array.Clear(uniformData, WebGPUUniformLayout.PrevWorld, WebGPUUniformLayout.TotalFloats - WebGPUUniformLayout.PrevWorld);
+            Array.Copy(matrixData, 0, uniformData, WebGPUUniformLayout.World, WebGPUUniformLayout.WorldFloats);
             // 2-3 Contract Clause 6: the prev slot must be written after Clear
-            // (Clear overwrites the whole history region starting at float 48).
+            // (Clear overwrites the whole history region starting at PrevWorld / float 16).
             WritePrevMatrices(uniformData, box.PrevWorld);
             new WebGPUUniformWriter(uniformData).SetBaseColor(box.FaceColor);
             WriteLightUniform(uniformData,
@@ -3044,8 +3152,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
         {
             var uniformData = _scratchUniform;
-            Array.Clear(uniformData, 48, WebGPUUniformLayout.TotalFloats - 48);
-            Array.Copy(matrixData, 0, uniformData, 0, 48);
+            Array.Clear(uniformData, WebGPUUniformLayout.PrevWorld, WebGPUUniformLayout.TotalFloats - WebGPUUniformLayout.PrevWorld);
+            Array.Copy(matrixData, 0, uniformData, WebGPUUniformLayout.World, WebGPUUniformLayout.WorldFloats);
             WritePrevMatrices(uniformData, box.PrevWorld);
             new WebGPUUniformWriter(uniformData).SetBaseColor(box.EdgeColor);
             WriteLightUniform(uniformData,
@@ -3084,7 +3192,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     /// Each ShellDrawEntry already bakes the world/prev/color captured during Update, so Draw only writes
     /// uniforms and does not mutate box state. Shared box geometry is reused per instance, then the batch is
     /// flushed. This is the non-skinned / rigid InstancedMesh3D path.</summary>
-    void DrawInstanceShells(WebShellBox shell, List<ShellDrawEntry> drawList, Matrix4x4 view, Matrix4x4 projection)
+    void DrawInstanceShells(WebShellBox shell, List<ShellDrawEntry> drawList)
     {
         for (int i = 0; i < drawList.Count; i++)
         {
@@ -3094,7 +3202,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             shell.FaceColor = entry.FaceColor;
             shell.FaceAlpha = entry.FaceColor.W;
             shell.EdgeColor = entry.EdgeColor;
-            DrawShellBox(shell, view, projection);
+            DrawShellBox(shell);
         }
     }
 
@@ -3105,7 +3213,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     /// instanceIndex×100, exactly mirroring the per-slot OutlineMask path. world/prev both come from the
     /// instance byte stream, so the uniform world slot stays Identity. Flush the two batches before the
     /// direct JS call, matching the ordering discipline at the start of DrawInstancedModel.</summary>
-    void DrawInstancedModelShells(WGPUInstancedModel wgpuModel, Matrix4x4 view, Matrix4x4 projection)
+    void DrawInstancedModelShells(WGPUInstancedModel wgpuModel)
     {
         var drawList = wgpuModel.ShellDrawList;
         if (drawList.Count == 0)
@@ -3128,14 +3236,12 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
 
         // Skinned-shell world matrices come from the instance byte stream, so the uniform world slot stays
-        // Identity. _scratchMatrix48 is overwritten by Bounds / rigid-shell paths, so rebuild into a
+        // Identity. _scratchWorldMatrix is overwritten by Bounds / rigid-shell paths, so rebuild into a
         // separate array to avoid cross-draw interference.
-        var skinnedMatrixData = new float[48];
+        var skinnedMatrixData = new float[WebGPUUniformLayout.WorldFloats];
         if (isSkinned)
         {
             CopyMatrixTransposed(Matrix4x4.Identity, skinnedMatrixData, 0);
-            CopyMatrixTransposed(view, skinnedMatrixData, 16);
-            CopyMatrixTransposed(projection, skinnedMatrixData, 32);
         }
 
         // [ShellDiag] One-time diagnostics at the draw entry point (for wireframe-not-visible investigation;
@@ -3196,7 +3302,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
                     shell.FaceColor = entry.FaceColor;
                     shell.FaceAlpha = entry.FaceColor.W;
                     shell.EdgeColor = entry.EdgeColor;
-                    DrawShellBox(shell, view, projection);
+                    DrawShellBox(shell);
                 }
             }
         }
@@ -3211,10 +3317,10 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     static float[] BuildShellUniform(float[] matrixData, Vector4 color, float alpha, WebGPUAlphaMode alphaMode, int prevDataFlags)
     {
         var uniformData = new float[WebGPUUniformLayout.TotalFloats];
-        Array.Copy(matrixData, 0, uniformData, 0, 48);
-        Array.Clear(uniformData, 48, WebGPUUniformLayout.TotalFloats - 48);
+        Array.Copy(matrixData, 0, uniformData, WebGPUUniformLayout.World, WebGPUUniformLayout.WorldFloats);
+        Array.Clear(uniformData, WebGPUUniformLayout.PrevWorld, WebGPUUniformLayout.TotalFloats - WebGPUUniformLayout.PrevWorld);
         // 2-3 Contract Clause 6: the prev slot must be written after Clear
-        // (Clear overwrites the whole history region starting at float 48).
+        // (Clear overwrites the whole history region starting at PrevWorld / float 16).
         WritePrevMatrices(uniformData);
         new WebGPUUniformWriter(uniformData).SetBaseColor(color);
         WriteLightUniform(uniformData,
@@ -3324,7 +3430,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             DictionaryInstancedMesh3D.TryGetValue((mesh.Name, mesh.ID), out wgpuMesh);
         }
 
-        wgpuMesh?.Update(mesh, Camera3D);
+        wgpuMesh?.Update(mesh);
     }
 
     public void DrawInstancedMesh3D(InstancedMesh3D mesh)
@@ -3360,10 +3466,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         FlushDrawMesh3DBatch();
         FlushDrawSkinnedMeshBatch();
 
-        var matrixData = _scratchMatrix48;
+        var matrixData = _scratchWorldMatrix;
         CopyMatrixTransposed(Matrix4x4.Identity, matrixData, 0);
-        CopyMatrixTransposed(wgpuMesh.View, matrixData, 16);
-        CopyMatrixTransposed(wgpuMesh.Projection, matrixData, 32);
         PrepareSceneDraw();
 
         foreach (var surface in mesh.Surfaces)
@@ -3423,12 +3527,12 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         // Unified highlight (per-instance Bounds boxes): for instances enabled this frame, use BLEND faces +
         // OPAQUE edges, and flush after all surfaces.
         if (wgpuMesh.BoundsActive)
-            DrawInstanceBoundsBoxes(wgpuMesh.InstanceBoundsBoxes, wgpuMesh.BoundsBoxDrawList, wgpuMesh.View, wgpuMesh.Projection);
+            DrawInstanceBoundsBoxes(wgpuMesh.InstanceBoundsBoxes, wgpuMesh.BoundsBoxDrawList);
 
         // Unified highlight (per-instance wireframe shells): for instances enabled this frame, use BLEND
         // faces + OPAQUE edges, and flush after Bounds.
         if (wgpuMesh.WireframeActive && wgpuMesh.ShellGeometry != null)
-            DrawInstanceShells(wgpuMesh.ShellGeometry, wgpuMesh.ShellDrawList, wgpuMesh.View, wgpuMesh.Projection);
+            DrawInstanceShells(wgpuMesh.ShellGeometry, wgpuMesh.ShellDrawList);
     }
 
     public void DisposeInstancedMesh3D(InstancedMesh3D mesh)
@@ -3471,8 +3575,6 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
         var wgpuInstancedModel = new WGPUInstancedModel(model.ModelName);
         wgpuInstancedModel.Load(template, model);
-        wgpuInstancedModel.View = Camera3D.View;
-        wgpuInstancedModel.Projection = Camera3D.Projection;
 
         // v2 picking: inject the instanced GltfAsset. The cloned node tree / animation / bone palette comes
         // from the same source as instance rendering, matching the runtime-asset injection model on VK/Metal/DX.
@@ -3506,7 +3608,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             DictionaryInstancedModel.TryGetValue((model.ModelName, model.ID), out wgpuModel);
         }
 
-        wgpuModel?.Update(model, time, Camera3D);
+        wgpuModel?.Update(model, time);
     }
 
     public void DrawInstancedModel(InstancedModel model)
@@ -3526,10 +3628,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         FlushDrawMesh3DBatch();
         FlushDrawSkinnedMeshBatch();
 
-        var matrixData = _scratchMatrix48;
+        var matrixData = _scratchWorldMatrix;
         CopyMatrixTransposed(Matrix4x4.Identity, matrixData, 0);
-        CopyMatrixTransposed(wgpuModel.View, matrixData, 16);
-        CopyMatrixTransposed(wgpuModel.Projection, matrixData, 32);
 
         PrepareSceneDraw();
         var opaquePrimitives = new List<WGPUPrimitiveData>();
@@ -3611,20 +3711,20 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         // Unified highlight (per-instance Bounds boxes): for instances enabled this frame, use BLEND faces +
         // OPAQUE edges, and flush after all surfaces.
         if (wgpuModel.BoundsActive)
-            DrawInstanceBoundsBoxes(wgpuModel.InstanceBoundsBoxes, wgpuModel.BoundsBoxDrawList, wgpuModel.View, wgpuModel.Projection);
+            DrawInstanceBoundsBoxes(wgpuModel.InstanceBoundsBoxes, wgpuModel.BoundsBoxDrawList);
 
         // Unified highlight (per-instance wireframe shells): for instances enabled this frame, use BLEND
         // faces + OPAQUE edges, and flush after Bounds.
         if (wgpuModel.WireframeActive && wgpuModel.ShellGeometries.Count > 0)
-            DrawInstancedModelShells(wgpuModel, wgpuModel.View, wgpuModel.Projection);
+            DrawInstancedModelShells(wgpuModel);
     }
 
     /// <summary>Build the primitive uniform data used for instanced drawing.</summary>
     static float[] BuildModelPrimitiveUniform(float[] matrixData, WGPUPrimitiveData prim, float modelAlpha, bool isSkinned = false, int prevDataFlags = 0)
     {
         var uniformData = new float[WebGPUUniformLayout.TotalFloats];
-        Array.Copy(matrixData, 0, uniformData, 0, 48);
-        Array.Clear(uniformData, 48, WebGPUUniformLayout.TotalFloats - 48);
+        Array.Copy(matrixData, 0, uniformData, WebGPUUniformLayout.World, WebGPUUniformLayout.WorldFloats);
+        Array.Clear(uniformData, WebGPUUniformLayout.PrevWorld, WebGPUUniformLayout.TotalFloats - WebGPUUniformLayout.PrevWorld);
 
         float finalAlpha = prim.OriginalBaseColorAlpha * modelAlpha;
         var w = new WebGPUUniformWriter(uniformData);
@@ -3778,10 +3878,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         if (wgpuMesh == null || !wgpuMesh.TransformInitialized)
             return;
 
-        var matrixData = _scratchMatrix48;
+        var matrixData = _scratchWorldMatrix;
         CopyMatrixTransposed(wgpuMesh.World, matrixData, 0);
-        CopyMatrixTransposed(Matrix4x4.Identity, matrixData, 16);
-        CopyMatrixTransposed(_shadowViewProj, matrixData, 32);
 
         foreach (var surface in mesh.Surfaces)
         {
@@ -3818,10 +3916,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         FlushDrawMesh3DBatch();
         FlushDrawSkinnedMeshBatch();
 
-        var matrixData = _scratchMatrix48;
+        var matrixData = _scratchWorldMatrix;
         CopyMatrixTransposed(Matrix4x4.Identity, matrixData, 0);
-        CopyMatrixTransposed(Matrix4x4.Identity, matrixData, 16);
-        CopyMatrixTransposed(_shadowViewProj, matrixData, 32);
 
         foreach (var surface in mesh.Surfaces)
         {
@@ -3856,10 +3952,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         FlushDrawMesh3DBatch();
         FlushDrawSkinnedMeshBatch();
 
-        var matrixData = _scratchMatrix48;
+        var matrixData = _scratchWorldMatrix;
         CopyMatrixTransposed(Matrix4x4.Identity, matrixData, 0);
-        CopyMatrixTransposed(Matrix4x4.Identity, matrixData, 16);
-        CopyMatrixTransposed(_shadowViewProj, matrixData, 32);
 
         float modelAlpha = wgpuModel.ModelAlpha;
         bool isSkinned = !string.IsNullOrEmpty(wgpuModel.SkinKey);
@@ -3912,6 +4006,9 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
                 // and this must not be bypassed.
                 // Culling is decided during app.DrawShadow() enqueue time and is independent of the two flushes at the end of the quadrant.
                 _shadowViewProj = Season.Rendering.CascadedShadow.BeginSlot(slot);
+                // P2: the light-space matrix leaves the per-draw uniform; each quadrant owns its own view slot, so the
+                // deferred batch submission below still sees the quadrant it was recorded for.
+                PublishShadowView(WebGPUViewUniformLayout.ShadowSlotBase + slot, _shadowViewProj);
                 app.DrawShadow();
                 FlushDrawMesh3DBatch();
                 FlushDrawSkinnedMeshBatch();
@@ -3923,12 +4020,18 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             Season.Rendering.CascadedShadow.GetAtlasViewport(Season.Rendering.CascadedShadow.SpotSlot, out int sx, out int sy, out int ssize);
             WebGPUInterop.SetShadowViewport(sx, sy, ssize);
             _shadowViewProj = Season.Rendering.CascadedShadow.BeginSlot(Season.Rendering.CascadedShadow.SpotSlot);
+            PublishShadowView(
+                WebGPUViewUniformLayout.ShadowSlotBase + Season.Rendering.CascadedShadow.SpotSlot, _shadowViewProj);
             app.DrawShadow();
             FlushDrawMesh3DBatch();
             FlushDrawSkinnedMeshBatch();
         }
 
         Season.Rendering.CascadedShadow.EndPass();
+
+        // The quadrants repointed the JS-side current slot, so 3D draws outside a view's own collection (overlay
+        // billboards) get the scene view back. The view slot itself is re-published by PrepareView per view anyway.
+        PublishViewConstants(RenderView.Current);
     }
 
     // ============================================================
@@ -4057,10 +4160,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         if (!wgpuMesh.TransformInitialized || !wgpuMesh.Outline2DActive)
             return;
 
-        var matrixData = _scratchMatrix48;
+        var matrixData = _scratchWorldMatrix;
         CopyMatrixTransposed(wgpuMesh.World, matrixData, 0);
-        CopyMatrixTransposed(wgpuMesh.View, matrixData, 16);
-        CopyMatrixTransposed(wgpuMesh.Projection, matrixData, 32);
 
         foreach (var pair in wgpuMesh.SurfaceCaches)
         {
@@ -4081,7 +4182,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             BuildSurfaceUniform(uniformData, matrixData, surface, wgpuMesh.MeshAlpha, resolvedTextures: resolvedTextures);
             // Outline color is carried through the hdrParams slot for the mask fragment shader to read.
             // This must run after BuildSurfaceUniform because its internal Array.Clear overwrites the whole
-            // region starting at 48, including this slot.
+            // history region starting at PrevWorld, including this slot.
             new WebGPUUniformWriter(uniformData).SetOutlineMaskColor(wgpuMesh.Outline2DMaskColor);
             EnqueueDrawMesh3D(cache.CacheKey, uniformData);
         }
@@ -4095,10 +4196,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         FlushDrawMesh3DBatch();
         FlushDrawSkinnedMeshBatch();
 
-        var matrixData = _scratchMatrix48;
+        var matrixData = _scratchWorldMatrix;
         CopyMatrixTransposed(Matrix4x4.Identity, matrixData, 0);
-        CopyMatrixTransposed(wgpuMesh.View, matrixData, 16);
-        CopyMatrixTransposed(wgpuMesh.Projection, matrixData, 32);
 
         foreach (var pair in wgpuMesh.SurfaceCaches)
         {
@@ -4145,10 +4244,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         FlushDrawMesh3DBatch();
         FlushDrawSkinnedMeshBatch();
 
-        var matrixData = _scratchMatrix48;
+        var matrixData = _scratchWorldMatrix;
         CopyMatrixTransposed(Matrix4x4.Identity, matrixData, 0);
-        CopyMatrixTransposed(wgpuModel.View, matrixData, 16);
-        CopyMatrixTransposed(wgpuModel.Projection, matrixData, 32);
 
         float modelAlpha = wgpuModel.ModelAlpha;
         bool isSkinned = !string.IsNullOrEmpty(wgpuModel.SkinKey);
@@ -4198,29 +4295,16 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         // (Changed-gated, zero rebuild for a still camera; FOV/near/far are driven by BaseApp.Camera).
         // The cameraPos/cameraTarget parameters are simply forwarded from BaseApp.Camera.Position/Target,
         // and the signature is kept for frame-loop compatibility.
-        var camera3D = DeviceServices.BaseApp.Camera;
         var res = DeviceServices.BaseApp.DeviceResolution;
-        var aspectRatio = res.X / (float)res.Y;
 
-        // 2-3 Contract Clauses 4/6 (mirroring the dual-branch flow in MTLPrimitiveGroup.Update):
-        // when enabled, use UpdateTemporal. Jitter is injected once into ProjectionJittered
-        // (the main chain uses the jittered matrix, while historical VP remains non-jittered), and
-        // PrevViewProjection is forwarded into Camera3D each frame for draw sites to source the prev slots.
-        // When disabled, keep the original 1-3 path and zero the history (sentinel = no history).
-        if (RenderQuality.Current.MotionVectors)
-        {
-            camera3D.UpdateTemporal(aspectRatio, res.X, res.Y);
-            Camera3D.View = camera3D.View;
-            Camera3D.Projection = camera3D.ProjectionJittered;
-            Camera3D.PrevViewProjection = camera3D.PrevViewProjection;
-        }
-        else
-        {
-            camera3D.UpdateIfChanged(aspectRatio);
-            Camera3D.View = camera3D.View;
-            Camera3D.Projection = camera3D.Projection;
-            Camera3D.PrevViewProjection = default;
-        }
+        // 2-3 Contract Clauses 4/6 (mirroring MTLPrimitiveGroup.Update): the main view is the single jitter
+        // injection point. Prepare bakes jitter into the render projection only (historical VP remains
+        // non-jittered) and forwards the history for draw sites to source the prev slots; with MotionVectors
+        // off the history is zeroed (sentinel = no history).
+        var view = DeviceServices.BaseApp.MainView;
+        view.Prepare(res.X, res.Y);
+        Season.Rendering.FrameSchedule.CurrentView = view;
+        var camera3D = view.Camera;
 
         // 1-5: shadow-matrix chain (mirrors MTLPrimitiveGroup.Update):
         // BeginFrame reset → directional/spot light computation → Apply writes shadow fields into
@@ -4251,7 +4335,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         // with xy = current-frame jitter in NDC and zw = 1 / screen size. The fragment shader uses it to
         // reconstruct NDC from @builtin(position). When disabled, JitterNdc stays zero, and writing it is harmless
         // because shaders with VELOCITY_OUTPUT=false do not read the field. App-side writes are ineffective.
-        var jitter = camera3D.JitterNdc;
+        var jitter = view.JitterNdc;
         sceneLights.VelocityParams = new Vector4(
             jitter.X, jitter.Y,
             res.X > 0 ? 1f / res.X : 0f,
@@ -4296,8 +4380,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         WebGPUInterop.SetCloudNoise(Season.Rendering.FrameSchedule.CloudNoiseTexture);
         WebGPUInterop.SetAerialLut(Season.Rendering.FrameSchedule.AerialLutTexture);
 
-        FrameSchedule.CaptureLighting(sceneLights, Camera3D.View, Camera3D.Projection,
-            camera3D.ViewProjection);
+        FrameSchedule.CaptureLighting(sceneLights, view.View, view.RenderProjection,
+            view.RenderViewProjection);
         Light3D = sceneLights;
         WebGPUInterop.UpdateSceneLights(MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref sceneLights, 1)));
 
@@ -4311,11 +4395,68 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
                 $"SkyViewTex={Season.Rendering.FrameSchedule.SkyViewTexture ?? "null"}");
     }
 
+    /// <summary>Staging block for one <see cref="ViewConstants"/> upload (256B, exactly one slot).</summary>
+    static readonly byte[] _viewSlotBytes = new byte[ViewConstants.SizeInBytes];
+
     /// <summary>
-    /// 2-3 Contract Clause 6: inject history matrices into the prev-data region of the 432B uniform,
-    /// reusing the retired 1-2 slots.
-    /// This must be called after <c>Array.Clear(uniformData, 48, ...)</c> at each draw site, because Clear
-    /// zeros the prev slots.
+    /// P2: publishes one 256B view slot into the per-view UBO (binding 22). View / Projection /
+    /// PrevViewProjection leave the per-draw uniform entirely and are uploaded once per view (once per shadow
+    /// quadrant) through <see cref="WebGPUInterop.SetViewConstants"/> instead.
+    /// Row-major bytes go up unchanged: JS hands the block to WGSL, which reads columns, so the shader sees the
+    /// transpose - the same convention the old per-draw <see cref="CopyMatrixTransposed"/> produced.
+    /// </summary>
+    internal void PublishViewConstants(int slot, in ViewConstants constants)
+    {
+        MemoryMarshal.Write(_viewSlotBytes, in constants);
+        WebGPUInterop.SetViewConstants(slot, _viewSlotBytes);
+    }
+
+    /// <summary>
+    /// FrameSchedule.AfterViews hook: the per-view loop left the last secondary view's slot current, which is the slot
+    /// 3D overlay draws (billboards) would bind. Publishing the main view again puts slot 0 back, mirroring
+    /// Windows' Pipeline.ResetActiveView. 2D sprites and text are unaffected either way: they bind the dedicated
+    /// screen-space slot.
+    /// </summary>
+    static void OnAfterViews(IGraphics g)
+    {
+        if (g is Graphics web) web.PublishViewConstants(RenderView.Current);
+    }
+
+    /// <summary>Publishes <paramref name="view"/> into its own slot (clamped to the render-view range, so an
+    /// out-of-range index degrades to the main slot instead of writing over the shadow / screen-space slots).</summary>
+    internal void PublishViewConstants(in RenderView view)
+    {
+        int slot = view.Index;
+        if ((uint)slot >= WebGPUViewUniformLayout.ViewSlotCount) slot = 0;
+        PublishViewConstants(slot, view.Constants);
+    }
+
+    /// <summary>
+    /// Shadow-pass slot: the light-space VP goes into the Projection field with an identity View, so the WGSL chain
+    /// <c>uView.projection * uView.view * worldPos</c> collapses to <c>LVP^T * v</c>, identical to the CPU-side
+    /// <c>pos * LVP</c> the DX/VK/Metal shadow passes use. History stays all-zero, i.e. no motion vectors.
+    /// </summary>
+    internal void PublishShadowView(int slot, in Matrix4x4 lightViewProjection)
+    {
+        var constants = ViewConstants.ScreenSpace;
+        constants.Projection = lightViewProjection;
+        PublishViewConstants(slot, constants);
+    }
+
+    /// <summary>
+    /// FrameSchedule.PrepareView hook: runs inside <see cref="FrameSchedule.ExecuteView"/> after the view's targets
+    /// are current and before its draws are collected, which is why a collected scene draw always replays with the
+    /// slot that was published for its own view.
+    /// </summary>
+    static void OnPrepareView(IGraphics g, RenderView view)
+    {
+        if (g is Graphics web) web.PublishViewConstants(view);
+    }
+
+    /// <summary>
+    /// 2-3 Contract Clause 6: inject the history world matrix into the prev-data region of the per-draw uniform.
+    /// This must be called after <c>Array.Clear(uniformData, PrevWorld, ...)</c> at each draw site, because Clear
+    /// zeros the prev slots. The history view-projection itself lives in the per-view UBO now.
     /// When MotionVectors is disabled, return immediately and leave the prev slots all-zero, so the shader's
     /// sentinel outputs zero velocity.
     /// Passing default prevWorld (all-zero, M44==0) falls back to the current-frame world. Instanced paths
@@ -4328,7 +4469,6 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             return;
         // All-zero data (no history, such as the first frame) can be written as-is. The shader-side
         // prevViewProjection[3] all-zero test handles the fallback.
-        CopyMatrixTransposed(Camera3D.PrevViewProjection, uniformData, WebGPUUniformLayout.PrevViewProjection);
         CopyMatrixTransposed(prevWorld, uniformData, WebGPUUniformLayout.PrevWorld);
     }
 

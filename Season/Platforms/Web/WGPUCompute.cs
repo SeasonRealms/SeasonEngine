@@ -82,9 +82,10 @@ internal sealed class WGPUStorageBuffer : Season.Rendering.StorageBuffer
 
     internal readonly string Id;
 
-    internal WGPUStorageBuffer(uint sizeInBytes)
+    internal WGPUStorageBuffer(uint sizeInBytes, Season.Rendering.StorageBufferUsage usage)
     {
         SizeInBytes = sizeInBytes;
+        Usage = usage;
         Id = $"sb_{_nextId++}";
     }
 
@@ -92,7 +93,7 @@ internal sealed class WGPUStorageBuffer : Season.Rendering.StorageBuffer
 }
 
 /// <summary>独立 HDR 雾合成句柄；原生 PSO、资源身份与同帧参数槽由 JS 管理。</summary>
-internal sealed class WGPUFogCompositePipeline : Season.Rendering.FogCompositePipeline
+internal sealed class WGPUFogCompositePipeline(bool weather = false) : Season.Rendering.FogCompositePipeline
 {
     static int _nextId;
     readonly string _name = $"fog_composite_{_nextId++}";
@@ -100,7 +101,7 @@ internal sealed class WGPUFogCompositePipeline : Season.Rendering.FogCompositePi
 
     internal bool Initialize() => WebGPUInterop.CreateFogCompositePipeline(_name,
         Season.Rendering.Effects.VolumetricFogEffect.CompositeVertexWgsl,
-        Season.Rendering.Effects.VolumetricFogEffect.CompositeWgsl);
+        weather ? Season.Rendering.Effects.WeatherShaders.CompositeWgsl : Season.Rendering.Effects.VolumetricFogEffect.CompositeWgsl, weather);
 
     public override bool Prepare(in Season.Rendering.FogCompositeInputs inputs, Season.Rendering.RenderTarget destination)
     {
@@ -127,5 +128,49 @@ internal sealed class WGPUFogCompositePipeline : Season.Rendering.FogCompositePi
         if (_disposed) return;
         _disposed = true; _prepared = false;
         WebGPUInterop.DisposeFogCompositePipeline(_name);
+    }
+}
+
+/// <summary>
+/// A0.1 粒子间接绘制句柄。原生 PSO、绑定组与 Pass 身份校对全在 JS 侧，这边只做类型下转与一次性消费。
+/// Depth 为空是合法输入：场景 Pass 此时跑在默认深度缓冲上，JS 侧改为只要求深度附件存在。
+/// </summary>
+internal sealed class WGPUParticleDrawPipeline : Season.Rendering.ParticleDrawPipeline
+{
+    static int _nextId;
+    readonly string _name = $"particle_draw_{_nextId++}";
+    bool _disposed, _prepared;
+
+    internal bool Initialize() => WebGPUInterop.CreateParticleDrawPipeline(_name,
+        Season.Rendering.Effects.ParticleSystemEffect.DrawVertexWgsl,
+        Season.Rendering.Effects.ParticleSystemEffect.DrawFragmentWgsl,
+        Season.Rendering.Effects.ParticleSystemEffect.DrawFragmentVelocityWgsl);
+
+    public override bool Prepare(in Season.Rendering.ParticleDrawInputs inputs)
+    {
+        _prepared = false;
+        if (_disposed || inputs.Color is not WGPURenderTarget color
+            || inputs.Instances is not WGPUStorageBuffer instances
+            || inputs.IndirectArgs is not WGPUStorageBuffer args
+            || inputs.Frame is not WGPUStorageBuffer frame) return false;
+        // Depth 为空要走通，但类型不对不能当空处理：那是后端混用，不是质量档差异。
+        if (inputs.Depth != null && inputs.Depth is not WGPURenderTarget) return false;
+        _prepared = WebGPUInterop.PrepareParticleDraw(_name, color.Name,
+            (inputs.Depth as WGPURenderTarget)?.Name, instances.Id, args.Id, frame.Id);
+        return _prepared;
+    }
+
+    public override bool Draw()
+    {
+        if (_disposed || !_prepared) return false;
+        _prepared = false;
+        return WebGPUInterop.DrawParticles(_name);
+    }
+
+    public override void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true; _prepared = false;
+        WebGPUInterop.DisposeParticleDrawPipeline(_name);
     }
 }

@@ -386,6 +386,27 @@ internal class CelestialLighting
         JumpToHour(hour);
     }
 
+    internal void UpdateWeatherBackground()
+    {
+        float phase = DayPhase / ReferenceDayNightSpeed / WeatherCycleSeconds;
+        float t = phase - MathF.Floor(phase);
+        if (WorldSettings.Current.WeatherMode != WeatherMode.Showcase)
+        {
+            Atmosphere.Clouds = SkyState.Lerp(SkyState.Clear, SkyState.Fair, 0.5f - 0.5f * MathF.Cos(t * 2 * MathF.PI));
+            return;
+        }
+        float segment = t * 4;
+        int index = Math.Min((int)segment, 3);
+        var (from, to) = index switch
+        {
+            0 => (SkyState.Clear, SkyState.Fair),
+            1 => (SkyState.Fair, SkyState.Overcast),
+            2 => (SkyState.Overcast, SkyState.Storm),
+            _ => (SkyState.Storm, SkyState.Clear),
+        };
+        Atmosphere.Clouds = SkyState.Lerp(from, to, segment - index);
+    }
+
     public void Update(float time)
     {
         // Advance the day-night clock. Phase is integrated from the frame delta rather than recomputed as elapsed time
@@ -457,19 +478,7 @@ internal class CelestialLighting
             // the weather cycling and the wind offset integrating, which is precisely the case a frozen sky is meant to
             // rule out. Dividing by ReferenceDayNightSpeed keeps WeatherCycleSeconds readable as seconds at that rate.
             float cycleTime = DayPhase / ReferenceDayNightSpeed;
-            float weatherPhase = cycleTime / WeatherCycleSeconds;
-            float weatherT = weatherPhase - MathF.Floor(weatherPhase);
-            float segment = weatherT * 4f;
-            int segIndex = Math.Min((int)segment, 3);
-            float segT = segment - segIndex;
-            var (weatherFrom, weatherTo) = segIndex switch
-            {
-                0 => (Season.Rendering.SkyState.Clear, Season.Rendering.SkyState.Fair),
-                1 => (Season.Rendering.SkyState.Fair, Season.Rendering.SkyState.Overcast),
-                2 => (Season.Rendering.SkyState.Overcast, Season.Rendering.SkyState.Storm),
-                _ => (Season.Rendering.SkyState.Storm, Season.Rendering.SkyState.Clear),
-            };
-            Season.Rendering.Atmosphere.Clouds = Season.Rendering.SkyState.Lerp(weatherFrom, weatherTo, segT);
+            UpdateWeatherBackground();
 
             // Advance cloud motion after writing the new cloud state, on the same derived clock. AdvanceClouds
             // integrates frame-to-frame motion and expects a delta rather than total elapsed time, and it already

@@ -11,10 +11,10 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
     // 0..3 inverseVP，4..7 previousVP，8 camera/D，9 forward/g，10 grid/history，
     // 11 density/height/falloff/noise，12 albedo/scale，13 wind/count，14 environment/PCF，
     // 15 previousCamera/valid，16 previousForward/cloudReady，18..21 inverseJitteredVP，22..25 currentVP，
-    // 32..117 最终 SceneLightParams，128..383 最多 32 个局部体，每体 8 个 float4。
-    public const int FrameVectorCount = 384;
+    // 32..183 最终 SceneLightParams（含区域天气），192..447 为 32 个局部体。
+    public const int FrameVectorCount = 448;
     public const int LightingOffset = 32;
-    public const int VolumeOffset = 128;
+    public const int VolumeOffset = 192;
     public const int VolumeStride = 8;
     public const string NoiseTexture = "compute3d://fog/noise";
     public const string InjectionTexture = "compute3d://fog/injection";
@@ -45,6 +45,11 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
 
     public override string Name => "volumetricFog";
     public override ComputePhase Phase => ComputePhase.AfterOpaque;
+
+    /// <summary>Per view: injection and integration read one view's depth and scene color and publish on that view's
+    /// targets (<see cref="FrameSchedule.FogCompositeTarget"/> / <see cref="FrameSchedule.FogOutputReady"/>).</summary>
+    public override ComputeScope Scope => ComputeScope.View;
+    public override ViewFeature RequiredFeature => ViewFeature.Fog;
     public (int Width, int Height, int Slices) Grid { get; private set; }
     public string? FilteredTexture { get; private set; }
     public StorageBuffer? SamplingBuffer => _frameBuffer;
@@ -218,7 +223,7 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
         { ResetOutput(); return false; }
         // 此时 GTAO 已完成，不受 AfterOpaque 注册先后次序影响。
         string? ao = FrameSchedule.PostAoTexture;
-        var inputs = new FogCompositeInputs(FrameSchedule.SceneColor, FrameSchedule.SceneDepth, _frameBuffer!,
+        var inputs = new FogCompositeInputs(FrameSchedule.EffectiveSceneColor!, FrameSchedule.SceneDepth, _frameBuffer!,
             IntegratedTexture, FilteredTexture, new ComputeResourceRef { TextureName = ao }, RenderQuality.Current.AoIntensity, ao != null);
         try
         {
@@ -234,7 +239,7 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
 
     FogCompositeResult DrawComposite(IGraphics g, RenderTarget source)
     {
-        if (!Ready || !ReferenceEquals(g, _graphics) || !ReferenceEquals(source, FrameSchedule.SceneColor))
+        if (!Ready || !ReferenceEquals(g, _graphics) || !ReferenceEquals(source, FrameSchedule.EffectiveSceneColor))
         { ResetOutput(); return default; }
         try
         {

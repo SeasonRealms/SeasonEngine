@@ -16,14 +16,10 @@ namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 ///   - Each instance owns its 6-vertex VB
 ///     (preserving the extension point for quad UV/position transforms used by text rendering and similar paths)
 ///   - renderMode = 0 (Sprite path), and the shader outputs BaseColor x texture directly
-///   - Global shared static field for the 2D orthographic camera
-///     (equivalent to DXSprite2D.Camera)
+///   - 2D draws take their matrices from <see cref="ViewConstants.ScreenSpace"/> on the GPU, so no CPU-side 2D camera is kept here
 /// </summary>
 internal unsafe class VKSprite2D : VKSpriteQuad
 {
-    // 2D orthographic camera (static, aligned with DXSprite2D.Camera)
-    internal static Season.Basic.Camera Camera;
-
     // Per-instance vertex buffer
     private BufferResource _vertexBuffer;
 
@@ -40,39 +36,13 @@ internal unsafe class VKSprite2D : VKSpriteQuad
     internal Season.Controls.SpriteBase? SpriteRef;
 
     // ============================================================
-    // Static initialization / camera update
+    // Static lifecycle. 2D matrices live in the ScreenSpace ViewConstants on the GPU.
     // ============================================================
 
     public static void Init()
     {
         // The lighting UBO has already been initialized by LinuxAndroidApp through
-        // VKPrimitiveGroup.InitLights(); this path only handles the 2D camera.
-        Init2DCamera();
-    }
-
-    static void Init2DCamera()
-    {
-        // Orthographic camera used for 2D rendering; left-handed coordinate system, Z in 0..1
-        Camera.View = Matrix4x4.Identity;
-        Camera.Projection = Matrix4x4.CreateOrthographicOffCenterLeftHanded(
-            -1f, 1f,   // left, right (NDC space)
-            -1f, 1f,   // bottom, top (NDC space)
-            0.1f, 10f); // near, far
-    }
-
-    public static void UpdateCamera(float time, Vector3 cameraPos, Vector3 cameraTarget, SceneLightParams lightParams)
-    {
-        // 1-3: shares the same source as VKPrimitiveGroup.Update -
-        // matrix construction is unified through the shared Camera3D layer
-        // to avoid inconsistent matrices from a second hardcoded parameter path.
-        var camera3D = DeviceServices.BaseApp.Camera;
-        var aspectRatio = DeviceServices.BaseApp.DeviceResolution.X / (float)DeviceServices.BaseApp.DeviceResolution.Y;
-        camera3D.UpdateIfChanged(aspectRatio);
-        Camera.View = camera3D.View;
-        Camera.Projection = camera3D.Projection;
-
-        // Write the lighting UBO
-        VKPrimitiveGroup.SetLighting(lightParams);
+        // VKPrimitiveGroup.InitLights(); 2D draws read ViewConstants.ScreenSpace, so nothing to prepare.
     }
 
     public static void InitDispose()
@@ -308,7 +278,7 @@ internal unsafe class VKSprite2D : VKSpriteQuad
         };
 
         // Matrix UBO: 2D orthographic path using NDC directly
-        // (View/Projection are both identity matrices)
+        // (bound to the screen-space view set, whose View/Projection are identity)
         var scaleMatrix = Matrix4x4.CreateScale(scaleVec);
         var translationMatrix = Matrix4x4.CreateTranslation(position);
         var worldMatrix = scaleMatrix * translationMatrix;
@@ -316,8 +286,6 @@ internal unsafe class VKSprite2D : VKSpriteQuad
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(worldMatrix),
-            View = Matrix4x4.Identity,
-            Projection = Matrix4x4.Identity
         };
 
         // Static sprites only need one logical write:

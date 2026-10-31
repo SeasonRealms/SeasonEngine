@@ -286,18 +286,7 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup
 
     protected static float ComputeTransparentDepth(Matrix4x4 world, Vector3 localCenter)
     {
-        var center = Vector3.Transform(localCenter, world);
-        var app = DeviceServices.BaseApp;
-        if (app == null)
-            return center.Z;
-
-        var forward = app.CameraTarget - app.CameraPos;
-        if (forward.LengthSquared() < 1e-6f)
-            forward = Vector3.UnitZ;
-        else
-            forward = Vector3.Normalize(forward);
-
-        return Vector3.Dot(center - app.CameraPos, forward);
+        return RenderView.SortDepth(Vector3.Transform(localCenter, world));
     }
 
     /// <summary>Return the owned Primitives collection

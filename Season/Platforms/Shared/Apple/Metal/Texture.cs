@@ -25,6 +25,13 @@ internal sealed class Texture : IDisposable
 
     public IMTLTexture Image = null!;
 
+    /// <summary>
+    /// True when <see cref="Image"/> belongs to a render target instead of this object. That is how a secondary
+    /// view's presentation image is published as a sampleable texture (see Graphics.RegisterViewSurface).
+    /// Such a texture only unlinks its cache entry when released: the image dies with the render target.
+    /// </summary>
+    public bool Borrowed;
+
     public uint Width;
 
     public uint Height;
@@ -211,7 +218,8 @@ internal sealed class Texture : IDisposable
 
     public void Dispose()
     {
-        if (Image != null)
+        // A borrowed image lives in the render target, so dropping the wrapper must not free it.
+        if (!Borrowed && Image != null)
         {
             Image.Dispose();
             Image = null!;
@@ -221,6 +229,32 @@ internal sealed class Texture : IDisposable
         if (!string.IsNullOrEmpty(key) &&
             Device.DictionaryTexture.TryGetValue(key, out var current) && ReferenceEquals(current, this))
             Device.DictionaryTexture.Remove(key);
+    }
+
+    /// <summary>
+    /// Wraps a render target's color texture so Sprite2D can sample a secondary view's output through the ordinary
+    /// texture dictionary, mirroring VK Texture.WrapRenderTarget and DX DXTexture.WrapRenderTarget. The target keeps
+    /// ownership: disposal only removes this wrapper.
+    /// </summary>
+    internal static Texture WrapRenderTarget(string name, MTLRenderTarget target) => new()
+    {
+        Name = name,
+        Borrowed = true,
+        Ready = true,
+        Image = target.ColorTexture!,
+        Width = (uint)target.Width,
+        Height = (uint)target.Height,
+        Format = target.ColorTexture!.PixelFormat,
+    };
+
+    /// <summary>Re-points a wrapper at its target's current texture after a resize, keeping the identity controls hold.</summary>
+    internal void RefreshFromTarget(MTLRenderTarget target)
+    {
+        if (target.ColorTexture == null) return;
+        Image = target.ColorTexture;
+        Width = (uint)target.Width;
+        Height = (uint)target.Height;
+        Format = target.ColorTexture.PixelFormat;
     }
 
     /// <summary>

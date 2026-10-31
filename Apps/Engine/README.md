@@ -65,6 +65,7 @@ Current effect coverage in the sample includes:
 - `DepthViewEffect`
 - `GtaoEffect`
 - `VelocityViewEffect`
+- `NormalViewEffect`
 - `TaaEffect`
 - `Sdf3DViewEffect`
 - `DdgiEffect`
@@ -267,7 +268,7 @@ Apps/Engine/
 
 Notable panel groups include:
 
-- world panels such as `Ground`, `Sea`, `Sky`, `Mountains`, `Rocks`, `House`, `Room`, `Birds`, and `Robots`
+- world panels such as `Ground`, `Sea`, `Sky`, `Mountains`, `Rocks`, `House`, `Room`, `Pond`, `Birds`, and `Robots`
 - interaction panels such as `Direction`, `Skill`, and `Setting`
 - tooling panels such as `Views` and `Painting`
 

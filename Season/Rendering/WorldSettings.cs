@@ -123,6 +123,12 @@ public class WorldSettings
     /// </summary>
     public bool FogWeatherLink { get; set; } = DefaultFogWeatherLink;
 
+    /// <summary>空间天气配置。旧设置缺失此项时为空，由应用补齐场景默认区域。</summary>
+    public WeatherRegionSettings[] WeatherRegions { get; set; } = [];
+
+    /// <summary>区域模式不再让背景天空自动进入全局风暴；展示模式保留原循环。</summary>
+    public WeatherMode WeatherMode { get; set; } = WeatherMode.Regional;
+
     static WorldSettings? _currentFallback;
 
     /// <summary>Runtime access entry point. Consumers should always read this property instead of the static Default* fields.</summary>

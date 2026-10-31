@@ -8,9 +8,6 @@ namespace Season.Platforms.Windows.DirectX;
 
 internal unsafe class DXSprite2D : DXSpriteQuad
 {
-    // === Static 2D orthographic camera ===
-    internal static Season.Basic.Camera Camera;
-
     // === Per-instance exclusive vertex buffer ===
     // 2D vertices may be flipped or rotated by font rendering through QuadVerts,
     // so each instance keeps its own buffer.
@@ -30,35 +27,8 @@ internal unsafe class DXSprite2D : DXSpriteQuad
 
     public static void Init()
     {
-        // The lighting CB has already been initialized by WindowsApp through
-        // DXPrimitiveGroup.InitLights(). Only the 2D camera is handled here.
-        Init2DCamera();
-    }
-
-    static void Init2DCamera()
-    {
-        // Orthographic camera for 2D rendering. Left-handed coordinate system,
-        // with Z ranging from 0 to 1.
-        Camera.View = Matrix4x4.Identity;
-        Camera.Projection = Matrix4x4.CreateOrthographicOffCenterLeftHanded(
-            -1f, 1f,   // left, right (NDC space)
-            -1f, 1f,   // bottom, top (NDC space)
-            0.1f, 10f); // near, far
-    }
-
-    public static void UpdateCamera(float time, Vector3 cameraPos, Vector3 cameraTarget, SceneLightParams lightParams)
-    {
-        // 1-3: same source of truth as DXPrimitiveGroup.Update. Matrix building
-        // is centralized in the shared Camera3D layer to avoid inconsistencies
-        // from a second set of hard-coded parameters.
-        var camera3D = DeviceServices.BaseApp.Camera;
-        var aspectRatio = DeviceServices.BaseApp.DeviceResolution.X / (float)DeviceServices.BaseApp.DeviceResolution.Y;
-        camera3D.UpdateIfChanged(aspectRatio);
-        Camera.View = camera3D.View;
-        Camera.Projection = camera3D.Projection;
-
-        // Write the lighting CB.
-        DXPrimitiveGroup.SetLighting(lightParams);
+        // The lighting CB has already been initialized by WindowsApp through DXPrimitiveGroup.InitLights().
+        // 2D draws read ViewConstants.ScreenSpace on the GPU, so there is no CPU-side 2D camera to prepare.
     }
 
     public static void InitDispose()
@@ -298,8 +268,6 @@ internal unsafe class DXSprite2D : DXSpriteQuad
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(worldMatrix),
-            View = Matrix4x4.Identity,
-            Projection = Matrix4x4.Identity
         };
 
         int nFrames = (int)Device.frameCount;

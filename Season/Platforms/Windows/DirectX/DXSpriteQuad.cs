@@ -53,6 +53,10 @@ internal unsafe abstract class DXSpriteQuad : ITextureHolder, IDisposable
     // avoid misalignment from identity matrices ===
     protected bool _transformInitialized;
 
+    /// <summary>Whether this quad is drawn through the screen-space view (identity View/Projection, b8) rather
+    /// than the main 3D view. Sprite2D positions are already in NDC; Sprite3D overrides this.</summary>
+    protected virtual bool ScreenSpaceView => true;
+
     // === Static lighting-CB lifetime is now managed by DXPrimitiveGroup;
     // DXSpriteQuad only reads it in DrawQuad. ===
 
@@ -72,8 +76,6 @@ internal unsafe abstract class DXSpriteQuad : ITextureHolder, IDisposable
         var identity = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Identity,
-            Projection = Matrix4x4.Identity
         };
         for (int i = 0; i < n; i++)
             Unsafe.Write(_mappedMatrixBuffers[i], identity);
@@ -235,7 +237,7 @@ internal unsafe abstract class DXSpriteQuad : ITextureHolder, IDisposable
         if (DXSceneDrawCollection.Active is { } collection)
         {
             int frame = (int)Device.FrameIndex;
-            collection.CaptureQuad(vertexBuffer, *vbv, _matrixBuffers[frame], _materialBuffers[frame],
+            collection.CaptureQuad(vertexBuffer, *vbv, _matrixBuffers[frame], ScreenSpaceView, _materialBuffers[frame],
                 DXTexture, NormalMap, MetallicRoughnessMap, OcclusionMap, EmissiveMap);
             return;
         }
@@ -249,7 +251,7 @@ internal unsafe abstract class DXSpriteQuad : ITextureHolder, IDisposable
 
         // Set the transparent rendering pipeline.
         Pipeline.SetPipeline(PipelineMode.Transparent);
-        Pipeline.BindQuadSceneResources();
+        Pipeline.BindQuadSceneResources(ScreenSpaceView ? Pipeline.ScreenViewGpuAddress : Pipeline.ActiveViewGpuAddress);
 
         // Bind vertex buffers: slot 0 = quad, slot 1 = identity instance
         // placeholder. The non-instanced shader path does not read slot 1, but

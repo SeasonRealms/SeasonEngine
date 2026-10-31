@@ -137,8 +137,17 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
 
     void CreateColorRenderPass()
     {
-        RenderPass = CreateColorRenderPassForFormat(_colorFormat, Desc.NoImplicitDepth);
+        RenderPass = CreateColorRenderPassForFormat(_colorFormat, colorOnly: !OwnsDepth);
     }
+
+    /// <summary>
+    /// 是否带私有深度图。Vulkan 把附件列表烘进 render pass，而所有能写后缓冲兼容表面的管线
+    /// （FinalBlit/Post 的 blit 家族、场景 PSO）都是对着 Display.RenderPass 烘的，
+    /// 即颜色 + 深度两附件；颜色格式为后缓冲格式却只有单个附件的 render pass 与它们不兼容，
+    /// 所以 <see cref="Season.Rendering.RenderTargetDesc.NoImplicitDepth"/> 的呈现目标仍然带深度，
+    /// 以保持与后缓冲 pass 同构。纯 MRT 槽位（速度/法线，非后缓冲格式）不受影响。
+    /// </summary>
+    bool OwnsDepth => !Desc.NoImplicitDepth || (HasColor && _colorFormat == Device.BackBufferFormat);
 
     /// <summary>
     /// Create the offscreen color RP for a given color format
@@ -249,9 +258,11 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
     /// - depth uses Store + finalLayout=ShaderReadOnlyOptimal
     ///   (same as DualTarget, for DepthTexture consumption);
     /// - the subpass has 2 color attachments (slot 0 = color, slot 1 = velocity).
+    /// A0.2: withNormal inserts the R16G16B16A16Float SceneNormal as slot 2 (same Clear/Store/finalLayout as velocity),
+    /// pushing depth to attachment 3. Normals only ever ride on top of velocity, so this is the single four-target shape.
     /// </summary>
     internal static RenderPass CreateVelocityRenderPassForFormat(Format colorFormat,
-        bool clearColor = true, bool clearDepth = true, bool storeDepth = true)
+        bool clearColor = true, bool clearDepth = true, bool storeDepth = true, bool withNormal = false)
     {
         var colorAttachment = new AttachmentDescription
         {
@@ -289,23 +300,32 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
             FinalLayout = ImageLayout.ShaderReadOnlyOptimal
         };
 
+        var normalAttachment = velocityAttachment;
+        normalAttachment.Format = Format.R16G16B16A16Sfloat;
+
         ConfigureSceneAttachment(ref colorAttachment, clearColor, true);
         ConfigureSceneAttachment(ref velocityAttachment, clearColor, true);
+        ConfigureSceneAttachment(ref normalAttachment, clearColor, true);
         ConfigureSceneAttachment(ref depthAttachment, clearDepth, storeDepth);
-        var attachments = stackalloc AttachmentDescription[3]
-            { colorAttachment, velocityAttachment, depthAttachment };
+        uint colorCount = withNormal ? 3u : 2u;
+        var attachments = stackalloc AttachmentDescription[4];
+        attachments[0] = colorAttachment;
+        attachments[1] = velocityAttachment;
+        if (withNormal) attachments[2] = normalAttachment;
+        attachments[colorCount] = depthAttachment;
 
-        var colorRefs = stackalloc AttachmentReference[2]
+        var colorRefs = stackalloc AttachmentReference[3]
         {
             new(0, ImageLayout.ColorAttachmentOptimal),
-            new(1, ImageLayout.ColorAttachmentOptimal)
+            new(1, ImageLayout.ColorAttachmentOptimal),
+            new(2, ImageLayout.ColorAttachmentOptimal)
         };
-        var depthRef = new AttachmentReference(2, ImageLayout.DepthStencilAttachmentOptimal);
+        var depthRef = new AttachmentReference(colorCount, ImageLayout.DepthStencilAttachmentOptimal);
 
         var subpass = new SubpassDescription
         {
             PipelineBindPoint = PipelineBindPoint.Graphics,
-            ColorAttachmentCount = 2,
+            ColorAttachmentCount = colorCount,
             PColorAttachments = colorRefs,
             PDepthStencilAttachment = &depthRef
         };
@@ -337,7 +357,7 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
         var rpInfo = new RenderPassCreateInfo
         {
             SType = StructureType.RenderPassCreateInfo,
-            AttachmentCount = 3,
+            AttachmentCount = colorCount + 1,
             PAttachments = attachments,
             SubpassCount = 1,
             PSubpasses = &subpass,
@@ -653,7 +673,7 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
 
             // depth: owned by the offscreen target
             // (Vulkan framebuffer attachment sizes must match, so it cannot share Display depth)
-            if (!Desc.NoImplicitDepth)
+            if (OwnsDepth)
             {
                 (DepthImage, _depthMemory, DepthView) = CreateImage(
                     width, height, Device.DepthBufferFormat,
@@ -677,7 +697,7 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
         {
             SType = StructureType.FramebufferCreateInfo,
             RenderPass = RenderPass,
-            AttachmentCount = HasColor && !Desc.NoImplicitDepth ? 2u : 1u,
+            AttachmentCount = HasColor && OwnsDepth ? 2u : 1u,
             PAttachments = attachments,
             Width = width,
             Height = height,

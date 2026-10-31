@@ -135,6 +135,14 @@ public abstract class BaseApp : Panel
     /// </summary>
     public Camera3D Camera { get; } = new Camera3D();
 
+    /// <summary>
+    /// Main render view looking through <see cref="Camera"/>. Owns all per-view state (render size, TAA jitter
+    /// phase, previous-frame history and the matrices handed to the GPU); each backend advances it once per frame
+    /// via <see cref="RenderView.Prepare(float, float, in Matrix4x4)"/>. Extra views (minimap, rear mirror, XR eyes)
+    /// will be separate <see cref="RenderView"/> instances so their temporal history never mixes with this one.
+    /// </summary>
+    public RenderView MainView => field ??= new RenderView(Camera);
+
     /// <summary>Camera position (forwarded to <see cref="Camera"/>.Position for legacy field compatibility).</summary>
     public Vector3 CameraPos
     {
@@ -167,6 +175,10 @@ public abstract class BaseApp : Panel
 
     /// <summary>场景自己的近地雾介质及局部雾体注册表，类库默认关闭。</summary>
     public Season.Rendering.SceneFog Fog { get; } = new();
+
+    /// <summary>D1 场景贴花注册表；实际绘制还需要 <see cref="Season.Rendering.RenderQuality"/>.Decals
+    /// 与后端实现同时到位，否则贴花只是数据，不会出现在画面上。</summary>
+    public Season.Rendering.SceneDecals Decals { get; } = new();
 
     /// <summary>The effective scene lighting consumed by each platform frame loop (single convergence point;
     /// hdrExposure is still injected by each backend via SetLighting).</summary>
@@ -325,6 +337,11 @@ public abstract class BaseApp : Panel
         try
         {
             Graphics.Instance.Init();
+
+            // D1: 贴花的 PSO 必须在第一帧之前建好。各平台在调用 Create 之前就已经按 RenderQuality 建完了
+            // SceneColor/SceneDepth，所以这里是唯一一个五端都经过、且目标已就位的时机；
+            // 后端没有实现的平台由 CreateDecalPipeline 返回 null，RegisterDecals 自己不注册、不留残留。
+            Season.Rendering.FrameSchedule.RegisterDecals(Graphics.Instance);
 
             // On Web, consume the channel from the main-thread render loop; on native platforms, start a background consumer.
             if (DeviceServices.Core.Platform is not Platform.Web)

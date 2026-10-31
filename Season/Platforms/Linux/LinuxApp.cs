@@ -251,12 +251,12 @@ public static class LinuxApp
         // Fallback order is Taa -> Fxaa -> Off, mirroring WindowsApp and AndroidApp.
         // The whole tier normalization is skipped in immediate-2D mode: no AA path exists to
         // configure, and the values stay unused because no pass ever consults them.
-        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
+        if (!immediate2D && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
         {
-            RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Fxaa;
+            RenderQuality.Current.EffectiveAntiAliasing = Season.Rendering.AaMode.Fxaa;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] AaMode.Msaa4x is only supported on D3D12, falling back to Fxaa");
         }
-        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa)
+        if (!immediate2D && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Taa)
         {
             // Contract 2-3 clause 1:
             // selecting Taa forces motion-vector infrastructure to be enabled,
@@ -273,15 +273,21 @@ public static class LinuxApp
             // The image then falls back to non-TAA SceneColor without jitter, per clauses 14 and 15.
             if (!VkDevice.HdrSceneColor)
             {
-                RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Fxaa;
+                RenderQuality.Current.EffectiveAntiAliasing = Season.Rendering.AaMode.Fxaa;
                 DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] Taa depends on the HDR offscreen path, which is currently disabled, falling back to Fxaa; MotionVectors remains enabled");
             }
         }
-        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa && !VkDevice.HdrSceneColor)
+        if (!immediate2D && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Fxaa && !VkDevice.HdrSceneColor)
         {
-            RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Off;
+            RenderQuality.Current.EffectiveAntiAliasing = Season.Rendering.AaMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] Fxaa depends on the HDR offscreen path, which is currently disabled, falling back to Off");
         }
+
+        // Contract A0.2 clause 1: scene normals only exist as an extension of the velocity shape,
+        // so requesting them forces velocity on, mirroring WindowsApp.
+        // VkDevice.Init may still drop velocity when independentBlend is missing, and the normals go with it.
+        if (!immediate2D && RenderQuality.Current.SceneNormals)
+            RenderQuality.Current.MotionVectors = true;
 
         // 1) Resolve instance extensions reported by SDL.
         IntPtr extArray = SDL.Vulkan_GetInstanceExtensions(out uint extCount);
@@ -369,6 +375,21 @@ public static class LinuxApp
             });
         }
 
+        // Contract A0.2 clause 2:
+        // SceneNormal uses full-size Rgba16Float as MRT slot 2 and is only ever created next to SceneVelocity,
+        // mirroring WindowsApp.
+        if (!immediate2D && RenderQuality.Current.EffectiveSceneNormals && Season.Rendering.FrameSchedule.SceneVelocity != null)
+        {
+            Season.Rendering.FrameSchedule.SceneNormal = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
+            {
+                ColorFormat = Season.Rendering.RtFormat.Rgba16Float,
+                MatchBackbufferSize = true,
+                SampleCount = 1,
+                NoImplicitDepth = true,
+                ClearColor = System.Numerics.Vector4.Zero,
+            });
+        }
+
         // Step D of contract 2-1 clause 4:
         // under the FXAA tier, activate the Post slot by creating PostColor,
         // which is LDR and matches the backbuffer in format and size,
@@ -383,8 +404,8 @@ public static class LinuxApp
         // phase, so it reads the resolve output of the current frame rather than SceneColor.
         // Under tiers that ask for neither, both remain null, leaving no residual path,
         // mirroring WindowsApp.
-        if ((RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
-                || (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa
+        if ((RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Fxaa
+                || (RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Taa
                     && RenderQuality.Current.TaaSharpness > 0f))
             && Season.Rendering.FrameSchedule.SceneColor != null)
         {
@@ -435,7 +456,7 @@ public static class LinuxApp
         }
         if (!immediate2D
             && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off
-            && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
+            && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
         {
             RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] AO is incompatible with Msaa4x because MSAA depth cannot be used as compute input, falling back to Off");
@@ -456,8 +477,9 @@ public static class LinuxApp
         // When AO is disabled, SceneDepth may be null, but MotionVectors still needs a depth attachment,
         // so fill it in here.
         if (!immediate2D && Season.Rendering.FrameSchedule.SceneDepth == null
-            && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresFogSceneDepth(
-                VkDevice.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)))
+            && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresAtmosphereSceneDepth(
+                VkDevice.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)
+                || RenderQuality.Current.RequiresDecalSceneDepth(VkDevice.HdrSceneColor, immediate2D)))
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -470,7 +492,7 @@ public static class LinuxApp
         // One-shot tier report: the desktop-class defaults (HDR + TAA tier + GTAO + shadows + bloom)
         // are what the frame would pay for, so this line is what a terminal session needs to tell
         // which pipeline the frame actually pays for, and whether the validation layer activated.
-        Diag($"[RenderQuality] tier: {width}x{height} validation={(VkDevice.ValidationEnabled ? "on" : "off")} hdr={VkDevice.HdrSceneColor} aa={RenderQuality.Current.AntiAliasing} mv={RenderQuality.Current.MotionVectors} ao={RenderQuality.Current.AmbientOcclusion} shadows={RenderQuality.Current.ShadowsEnabled} bloom={RenderQuality.Current.BloomEnabled} taaSharpness={RenderQuality.Current.TaaSharpness} immediate2D={immediate2D}");
+        Diag($"[RenderQuality] tier: {width}x{height} validation={(VkDevice.ValidationEnabled ? "on" : "off")} hdr={VkDevice.HdrSceneColor} aa={RenderQuality.Current.EffectiveAntiAliasing} mv={RenderQuality.Current.MotionVectors} ao={RenderQuality.Current.AmbientOcclusion} shadows={RenderQuality.Current.ShadowsEnabled} bloom={RenderQuality.Current.BloomEnabled} taaSharpness={RenderQuality.Current.TaaSharpness} immediate2D={immediate2D}");
 
         // Extra line when the mode is on: this is what a terminal session needs to tell that the
         // frame is Overlay-only and that the tier line right above is inert.

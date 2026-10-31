@@ -29,7 +29,33 @@ public static class Picking
         if (camera == null || width <= 0f || height <= 0f)
             return false;
 
-        var viewProjection = camera.RenderViewProjection;
+        return ScreenPointToRay(px, py, camera.RenderViewProjection, camera.Position, width, height,
+            out origin, out direction);
+    }
+
+    /// <summary>
+    /// Screen point → world-space picking ray through <paramref name="view"/>, i.e. the view actually being
+    /// rendered. Prefer this overload inside the engine: with several views in a frame, the camera alone no
+    /// longer identifies which pixels the pointer is over.
+    /// </summary>
+    public static bool ScreenPointToRay(float px, float py, RenderView view, float width, float height,
+        out Vector3 origin, out Vector3 direction)
+    {
+        origin = default;
+        direction = default;
+
+        if (view == null || width <= 0f || height <= 0f)
+            return false;
+
+        return ScreenPointToRay(px, py, view.RenderViewProjection, view.Position, width, height,
+            out origin, out direction);
+    }
+
+    static bool ScreenPointToRay(float px, float py, in Matrix4x4 viewProjection, Vector3 cameraPosition,
+        float width, float height, out Vector3 origin, out Vector3 direction)
+    {
+        origin = default;
+        direction = default;
 
         // Before the first rendered frame, the matrix has not yet been rebuilt because UpdateIfChanged runs during backend rendering.
         // Under the identity sentinel, unprojection degenerates into a constant +Z ray through the camera position and causes false hits, so reject it outright.
@@ -58,9 +84,80 @@ public static class Picking
         if (delta.LengthSquared() < 1e-12f)
             return false;
 
-        origin = camera.Position;
+        origin = cameraPosition;
         direction = Vector3.Normalize(delta);
 
+        return true;
+    }
+
+    /// <summary>
+    /// View-local 0..1 coordinates → world-space ray for a specific view. This is the multi-view picking entry: a
+    /// pointer that landed on a minimap or rear mirror rectangle is first converted into that view's fraction, and
+    /// every view then unprojects through its own <see cref="RenderView.RenderViewProjection"/>.
+    ///
+    /// No composition-scale division happens here, and that is deliberate. Layout coordinates enter NDC as
+    /// <c>ndc = 2u - 1</c> where <c>u</c> is already a fraction of the view rectangle, so the DPI compensation baked
+    /// into the render matrix cancels out; dividing again would shrink picks toward the top-left corner on high-DPI
+    /// desktops. The naive NDC is therefore mapped back through <see cref="RenderView.NdcTransformInverse"/> first,
+    /// which is exactly identity on every backend that has no compensation and on every secondary view.
+    /// </summary>
+    public static bool ViewPointToRay(float u, float v, RenderView view, out Vector3 origin, out Vector3 direction)
+    {
+        origin = default;
+        direction = default;
+
+        if (view == null || !view.Prepared)
+            return false;
+
+        var viewProjection = view.RenderViewProjection;
+        if (viewProjection == Matrix4x4.Identity)
+            return false;
+
+        if (!Matrix4x4.Invert(viewProjection, out var invViewProjection))
+            return false;
+
+        var adjusted = Vector4.Transform(new Vector4(2f * u - 1f, 1f - 2f * v, 0f, 1f), view.NdcTransformInverse);
+        float ndcX = adjusted.X;
+        float ndcY = adjusted.Y;
+
+        var near = Unproject(ndcX, ndcY, 0f, invViewProjection);
+        var far = Unproject(ndcX, ndcY, 1f, invViewProjection);
+
+        var delta = far - near;
+        if (delta.LengthSquared() < 1e-12f)
+            return false;
+
+        // A perspective ray starts at the eye. An orthographic one does not: all its rays are parallel, so the eye is
+        // only on the centre ray and every other pixel owns a ray shifted across the view plane - an eye-origin ray
+        // there would collapse the whole map onto its centre point. The unprojected near-plane point is on the right
+        // ray in both modes, but keeping the eye for perspective leaves existing distances exactly as they were.
+        origin = view.Camera.Mode is CameraProjectionMode.Orthographic ? near : view.Position;
+        direction = Vector3.Normalize(delta);
+
+        return true;
+    }
+
+    /// <summary>World point → view-local 0..1 coordinates; inverse of <see cref="ViewPointToRay"/>.
+    /// Returns false for points behind the camera (clip.w ≤ 0).</summary>
+    public static bool ProjectToViewFraction(Vector3 worldPoint, RenderView view, out float u, out float v)
+    {
+        u = default;
+        v = default;
+
+        if (view == null || !view.Prepared)
+            return false;
+
+        var viewProjection = view.RenderViewProjection;
+        if (viewProjection == Matrix4x4.Identity)
+            return false;
+
+        var clip = Vector4.Transform(new Vector4(worldPoint, 1f), viewProjection);
+        if (clip.W <= 1e-6f)
+            return false;
+
+        // RenderViewProjection already includes the NDC adjustment, so this NDC is the on-screen one.
+        u = (clip.X / clip.W + 1f) * 0.5f;
+        v = (1f - clip.Y / clip.W) * 0.5f;
         return true;
     }
 
@@ -322,7 +419,28 @@ public static class Picking
         if (camera == null || width <= 0f || height <= 0f)
             return false;
 
-        var viewProjection = camera.RenderViewProjection;
+        return ProjectToScreen(worldPoint, camera.RenderViewProjection, width, height, out screenX, out screenY);
+    }
+
+    /// <summary>World point → screen logical pixels through the view actually being rendered.</summary>
+    public static bool ProjectToScreen(Vector3 worldPoint, RenderView view, float width, float height,
+        out float screenX, out float screenY)
+    {
+        screenX = default;
+        screenY = default;
+
+        if (view == null || width <= 0f || height <= 0f)
+            return false;
+
+        return ProjectToScreen(worldPoint, view.RenderViewProjection, width, height, out screenX, out screenY);
+    }
+
+    static bool ProjectToScreen(Vector3 worldPoint, in Matrix4x4 viewProjection, float width, float height,
+        out float screenX, out float screenY)
+    {
+        screenX = default;
+        screenY = default;
+
         if (viewProjection == Matrix4x4.Identity)
             return false;
 

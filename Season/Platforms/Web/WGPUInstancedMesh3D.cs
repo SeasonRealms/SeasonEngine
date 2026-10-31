@@ -13,8 +13,6 @@ internal sealed class WGPUInstancedMesh3D
     /// <summary>Snapshot of resolved five-slot texture names taken during Load, with the same semantics as WGPUMesh3D.ResolvedTextures.</summary>
     public readonly Dictionary<Surface, WGPUMesh3D.ResolvedTextureSet> ResolvedTextures = new();
 
-    public Matrix4x4 View { get; set; } = Matrix4x4.Identity;
-    public Matrix4x4 Projection { get; set; } = Matrix4x4.Identity;
     public Matrix4x4[] InstanceWorlds { get; private set; } = Array.Empty<Matrix4x4>();
     public byte[] InstanceBytes { get; private set; } = Array.Empty<byte>();
 
@@ -60,7 +58,7 @@ internal sealed class WGPUInstancedMesh3D
         Name = name;
     }
 
-    public void Update(Season.Controls.InstancedMesh3D mesh, Season.Basic.Camera camera)
+    public void Update(Season.Controls.InstancedMesh3D mesh)
     {
         // Unified highlight: clear the per-instance bounds draw list for this frame
         // (rebuilt every frame; BoundsActive is set by the per-instance hook below).
@@ -88,8 +86,6 @@ internal sealed class WGPUInstancedMesh3D
             InstanceBytes = Array.Empty<byte>();
             // 2-3 Step C: all instances are disabled, so previous-frame history is discarded.
             PrevInstanceBytes = Array.Empty<byte>();
-            View = camera.View;
-            Projection = camera.Projection;
             TransformInitialized = true;
             MeshAlpha = mesh.Alpha;
             // Reset Outline2D aggregate state (all instances disabled -> no outline).
@@ -203,8 +199,6 @@ internal sealed class WGPUInstancedMesh3D
         }
 
         InstanceBytes = FillInstanceBytes(writeTarget, InstanceWorlds);
-        View = camera.View;
-        Projection = camera.Projection;
         TransformInitialized = true;
         MeshAlpha = mesh.Alpha;
     }

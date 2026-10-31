@@ -44,6 +44,7 @@ internal enum PipelineMode
 ///   VS: buffer(0)=vertex stream ([[stage_in]]), buffer(1)=Matrices(b0), buffer(2)=instance stream ([[stage_in]])
 ///       buffer(3)=BoneMatrices(b3), buffer(4)=MaterialParams(b2), buffer(5)=MorphDeltas, buffer(6)=InstanceBoneMatrices
 ///       buffer(7)=TextDrawParams for Text GPU Instancing, matching VK binding 11
+///       buffer(11)=ViewConstants, matching DX b8 and VK set 2
 ///   FS: buffer(1)=SceneLights(b1), buffer(2)=MaterialParams(b2), buffer(3)=TextDrawParams
 ///       texture(0..4)=BaseColor / Normal / MR / AO / Emissive
 ///       texture(5)=shadow atlas for 1-5 when SHADOW_ENABLED, texture(6)=environment radiance cube for 1-7
@@ -172,6 +173,103 @@ internal static class Pipeline
     /// It is bound once whenever a frame encoder is created.</summary>
     public static IMTLBuffer DefaultTextDrawParamsBuffer = null!;
 
+    // -- 工作包 D 透明阶段体积雾采样。
+    //    Metal 没有描述符集也没有根签名，一切都落在 encoder 上，换 Pass 后全部归零；
+    //    因此这三件套必须是每条命令自带、重放时整份重绑的静态推送状态，
+    //    与 VK 的 set 1 binding 0/1/2 + push constant、DX 的 FogFrameRoot/FogIntegratedRoot/FogLocalRoot 一一对应。 --
+
+    /// <summary>本帧雾常量数组（<see cref="Season.Rendering.Effects.VolumetricFogEffect.FrameVectorCount"/> 个 float4）在 FS buffer(4)。</summary>
+    internal const int SceneFogFrameSlot = 4;
+
+    /// <summary>运行时门控 float4 在 FS buffer(5)，用 SetFragmentBytes 逐条命令推送；x &gt; 0.5 才真正采样。</summary>
+    internal const int SceneFogParamsSlot = 5;
+
+    /// <summary>积分列体积（read-only 3D）在 texture(11)，紧接 texture(10) 的 AP LUT。</summary>
+    internal const int SceneFogIntegratedSlot = 11;
+
+    /// <summary>局部列体积（read-only 3D）在 texture(12)。</summary>
+    internal const int SceneFogLocalSlot = 12;
+
+    /// <summary>只有透明阶段会把它置为 (1,0,0,0)；其余时刻保持零值，于是 MSL 的门控始终关闭。</summary>
+    internal static Vector4 SceneFogParams;
+
+    /// <summary>本帧雾帧常量缓冲；为空时退回 <see cref="DefaultFogFrameBuffer"/> 全零页。</summary>
+    internal static IMTLBuffer? SceneFogFrame;
+
+    internal static IMTLTexture? SceneFogIntegrated;
+
+    internal static IMTLTexture? SceneFogLocal;
+
+    /// <summary>与 VK SceneFogSamplingBaked / DX _fogSamplingEnabled 同源：
+    /// 档位在初始化前已经锁定，此后不会翻转，因此这是一次性求值的能力开关。</summary>
+    internal static bool SceneFogSamplingBaked;
+
+    /// <summary>雾采样关闭时的占位帧常量页：全零，<c>F(8).w</c> 与 <c>F(10).xyz</c> 都是 0，
+    /// 即使误采样也只会得到退化的零累积，而门控保证根本不会进入采样分支。</summary>
+    public static IMTLBuffer DefaultFogFrameBuffer = null!;
+
+    // -- 每视图常量（ViewConstants，256 字节）在 VS buffer(11)，与 DX b8、VK set 2 一一对应。
+    //    MatrixBuffer 只剩物体级 World/PrevWorld；View/Projection/PrevViewProjection 由视图提供。
+    //    主视图按帧槽 N 缓冲，每帧由 MTLPrimitiveGroup.Update 写一次；屏幕空间视图（单位阵）常驻只读，
+    //    供 Sprite2D 与文字使用，于是它们不再需要在各自的 MatrixBuffer 里写单位 View/Projection。 --
+
+    /// <summary>ViewConstants 所在的 VS buffer 槽。</summary>
+    internal const int ViewConstantsSlot = 11;
+
+    /// <summary>视图槽上限，与共享调度器的 <see cref="Season.Rendering.FrameSchedule.MaxViews"/> 同源。</summary>
+    internal const int MaxViews = Season.Rendering.FrameSchedule.MaxViews;
+
+    /// <summary>
+    /// 每视图常量（视图槽 × 帧槽，2D 数组）。槽 0 是主视图，由 MTLPrimitiveGroup.Update 每帧写一次；
+    /// 其余槽位由 FrameSchedule.PrepareView 钩子在该视图绘制收集之前写入。
+    /// 视图常量本来就是一条独立缓冲，同一条绘制命令只要带上不同缓冲就能在多个视图之间复用。
+    /// </summary>
+    static IMTLBuffer[][] _viewBuffers = [];
+
+    /// <summary>屏幕空间视图：View/Projection 为单位阵，无历史。</summary>
+    public static IMTLBuffer ScreenViewBuffer = null!;
+
+    /// <summary>当前帧槽的主视图常量缓冲。</summary>
+    internal static IMTLBuffer MainViewBuffer => _viewBuffers[0][Device.FrameIndex];
+
+    /// <summary>
+    /// 正在收集/重放的视图槽。由 <see cref="SetActiveView"/> 在该视图的绘制收集之前设定，
+    /// 视图循环结束后由 <see cref="ResetActiveView"/> 复原成主视图，
+    /// 于是 Overlay 与直绘路径仍然绑到主视图常量。
+    /// </summary>
+    internal static int ActiveViewIndex;
+
+    /// <summary>当前视图槽本帧槽的常量缓冲：绘制项在收集时记下的就是这个缓冲。</summary>
+    internal static IMTLBuffer ActiveViewBuffer => _viewBuffers[ActiveViewIndex][Device.FrameIndex];
+
+    /// <summary>选定后续绘制的视图槽；越界回落到主视图。</summary>
+    internal static void SetActiveView(int index)
+        => ActiveViewIndex = (uint)index < MaxViews ? index : 0;
+
+    internal static void ResetActiveView() => ActiveViewIndex = 0;
+
+    /// <summary>写入当前帧槽的主视图常量；转置约定与 MatrixBuffer 相同。</summary>
+    internal static void WriteMainView(in ViewConstants constants) => WriteViewConstants(0, constants);
+
+    /// <summary>写入某个视图槽本帧槽的常量；槽位越界即忽略，调用方不必预先校验。</summary>
+    internal static unsafe void WriteViewConstants(int index, in ViewConstants constants)
+    {
+        if ((uint)index >= MaxViews) return;
+        *(ViewConstants*)_viewBuffers[index][Device.FrameIndex].Contents = constants.Transposed();
+    }
+
+    /// <summary>把视图常量推上 VS buffer(11)。Metal 换 Pass 后绑定归零，所以每条绘制都要自带。</summary>
+    internal static void BindView(IMTLRenderCommandEncoder enc, IMTLBuffer view)
+        => enc.SetVertexBuffer(view, 0, ViewConstantsSlot);
+
+    static unsafe IMTLBuffer CreateViewBuffer()
+    {
+        var buffer = Device.MtlDevice.CreateBuffer((nuint)Unsafe.SizeOf<ViewConstants>(), MTLResourceOptions.CpuCacheModeDefault);
+        // 未写过的帧槽（例如即时 2D 模式从不调用 Update）也必须是可用的单位视图，而不是全零投影。
+        *(ViewConstants*)buffer.Contents = ViewConstants.ScreenSpace.Transposed();
+        return buffer;
+    }
+
     public static void Init(MTLPixelFormat colorFormat, MTLPixelFormat depthFormat)
     {
         // HDR-chain switch for 1-4 step A, matching rule 7-3 in the Device class header:
@@ -197,7 +295,7 @@ internal static class Pipeline
             // This matches the gate used by DdgiEffect.Initialize,
             // ensuring the main shader variant and atlas resources are created in sync.
             + ((Season.Basic.DeviceServices.BaseApp?.Settings?.RenderQuality?.GlobalIllumination ?? RenderQuality.DefaultGlobalIllumination) == Season.Rendering.GiMode.Ddgi ? "#define DDGI_ENABLED 1\n" : "#define DDGI_ENABLED 0\n")
-            + "#define SHADOW_PASS 0\n#define VELOCITY_OUTPUT 0\n" + lodBiasDefine + MetalShaderSource;
+            + "#define SHADOW_PASS 0\n#define VELOCITY_OUTPUT 0\n#define NORMAL_OUTPUT 0\n" + lodBiasDefine + MetalShaderSource;
         Library = MTLShaderCompiler.Compile(Device.MtlDevice, msl);
         VertexFunction = Library.CreateFunction("vertex_main")
             ?? throw new Exception("MSL function 'vertex_main' not found");
@@ -241,6 +339,33 @@ internal static class Pipeline
             *(MTLTextDrawParams*)DefaultTextDrawParamsBuffer.Contents = defaultTdp;
         }
 
+        // 工作包 D：透明阶段体积雾采样的能力开关与占位帧常量页。
+        // 与 VK CreateDefaultFogFrameBuffers + SceneFogSamplingBaked 同源：
+        // 档位在图形初始化前已锁定，此后不会翻转，所以只求值一次。
+        SceneFogSamplingBaked = RenderQuality.Current.RequiresAtmosphereSceneDepth(
+            Device.HdrSceneColor, true, Season.Rendering.Immediate2DMode.Enabled);
+        DefaultFogFrameBuffer = Device.MtlDevice.CreateBuffer(
+            (nuint)(Season.Rendering.Effects.VolumetricFogEffect.FrameVectorCount * 16), MTLResourceOptions.CpuCacheModeDefault);
+        unsafe
+        {
+            new Span<byte>((void*)DefaultFogFrameBuffer.Contents,
+                Season.Rendering.Effects.VolumetricFogEffect.FrameVectorCount * 16).Clear();
+        }
+        SceneFogParams = default;
+        SceneFogFrame = null;
+        SceneFogIntegrated = null;
+        SceneFogLocal = null;
+
+        // 视图槽整池一次建满：每个视图只有 256B 常量，而视图首次出现（小地图上线）不该在帧内触发分配。
+        _viewBuffers = new IMTLBuffer[MaxViews][];
+        for (int v = 0; v < MaxViews; v++)
+        {
+            _viewBuffers[v] = new IMTLBuffer[Device.frameCount];
+            for (int i = 0; i < _viewBuffers[v].Length; i++)
+                _viewBuffers[v][i] = CreateViewBuffer();
+        }
+        ScreenViewBuffer = CreateViewBuffer();
+
         OpaqueDepthState = CreateDepthState(write: true, MTLCompareFunction.Less);
         TransparentDepthState = CreateDepthState(write: false, MTLCompareFunction.LessEqual);
         // Contract clause 7 of 2-2:
@@ -260,7 +385,7 @@ internal static class Pipeline
         if (RenderQuality.Current.ShadowsEnabled)
         {
             var shadowMsl = (Device.HdrSceneColor ? "#define HDR_CHAIN 1\n" : "#define HDR_CHAIN 0\n")
-                + "#define SHADOW_ENABLED 1\n#define SHADOW_PASS 1\n#define VELOCITY_OUTPUT 0\n#define DDGI_ENABLED 0\n" + lodBiasDefine + MetalShaderSource;
+                + "#define SHADOW_ENABLED 1\n#define SHADOW_PASS 1\n#define VELOCITY_OUTPUT 0\n#define NORMAL_OUTPUT 0\n#define DDGI_ENABLED 0\n" + lodBiasDefine + MetalShaderSource;
             ShadowLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, shadowMsl);
             ShadowVertexFunction = ShadowLibrary.CreateFunction("vertex_main")
                 ?? throw new Exception("MSL function 'vertex_main' (shadow) not found");
@@ -281,6 +406,8 @@ internal static class Pipeline
                 // Step 6:
                 // same rule as above, preferring Settings.RenderQuality and sharing the same gate as DdgiEffect.
                 + ((Season.Basic.DeviceServices.BaseApp?.Settings?.RenderQuality?.GlobalIllumination ?? RenderQuality.DefaultGlobalIllumination) == Season.Rendering.GiMode.Ddgi ? "#define DDGI_ENABLED 1\n" : "#define DDGI_ENABLED 0\n")
+                // A0.2: the normal slot only ever rides on the velocity library, so the library count stays at five.
+                + (RenderQuality.Current.EffectiveSceneNormals ? "#define NORMAL_OUTPUT 1\n" : "#define NORMAL_OUTPUT 0\n")
                 + "#define SHADOW_PASS 0\n#define VELOCITY_OUTPUT 1\n" + lodBiasDefine + MetalShaderSource;
             VelocityLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, velocityMsl);
             VelocityVertexFunction = VelocityLibrary.CreateFunction("vertex_main")
@@ -308,7 +435,7 @@ internal static class Pipeline
         var overlayMsl = "#define HDR_CHAIN 0\n"
             + (RenderQuality.Current.ShadowsEnabled ? "#define SHADOW_ENABLED 1\n" : "#define SHADOW_ENABLED 0\n")
             + ((Season.Basic.DeviceServices.BaseApp?.Settings?.RenderQuality?.GlobalIllumination ?? RenderQuality.DefaultGlobalIllumination) == Season.Rendering.GiMode.Ddgi ? "#define DDGI_ENABLED 1\n" : "#define DDGI_ENABLED 0\n")
-            + "#define SHADOW_PASS 0\n#define VELOCITY_OUTPUT 0\n" + lodBiasDefine + MetalShaderSource;
+            + "#define SHADOW_PASS 0\n#define VELOCITY_OUTPUT 0\n#define NORMAL_OUTPUT 0\n" + lodBiasDefine + MetalShaderSource;
         OverlayLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, overlayMsl);
         OverlayVertexFunction = OverlayLibrary.CreateFunction("vertex_main")
             ?? throw new Exception("MSL function 'vertex_main' (overlay) not found");
@@ -332,7 +459,7 @@ internal static class Pipeline
             // Step 6:
             // same rule as above, preferring Settings.RenderQuality and sharing the same gate as DdgiEffect.
             + ((Season.Basic.DeviceServices.BaseApp?.Settings?.RenderQuality?.GlobalIllumination ?? RenderQuality.DefaultGlobalIllumination) == Season.Rendering.GiMode.Ddgi ? "#define DDGI_ENABLED 1\n" : "#define DDGI_ENABLED 0\n")
-            + "#define SHADOW_PASS 0\n#define VELOCITY_OUTPUT 0\n#define OUTLINE_MASK 1\n" + lodBiasDefine + MetalShaderSource;
+            + "#define SHADOW_PASS 0\n#define VELOCITY_OUTPUT 0\n#define NORMAL_OUTPUT 0\n#define OUTLINE_MASK 1\n" + lodBiasDefine + MetalShaderSource;
         OutlineMaskLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, maskMsl);
         OutlineMaskVertexFunction = OutlineMaskLibrary.CreateFunction("vertex_main")
             ?? throw new Exception("MSL function 'vertex_main' (outline mask) not found");
@@ -376,6 +503,17 @@ internal static class Pipeline
         WrapSampler?.Dispose(); WrapSampler = null!;
         IdentityInstanceBuffer?.Dispose(); IdentityInstanceBuffer = null!;
         DefaultTextDrawParamsBuffer?.Dispose(); DefaultTextDrawParamsBuffer = null!;
+        DefaultFogFrameBuffer?.Dispose(); DefaultFogFrameBuffer = null!;
+        foreach (var viewSlot in _viewBuffers)
+            foreach (var view in viewSlot) view?.Dispose();
+        _viewBuffers = [];
+        ActiveViewIndex = 0;
+        ScreenViewBuffer?.Dispose(); ScreenViewBuffer = null!;
+        SceneFogParams = default;
+        SceneFogFrame = null;
+        SceneFogIntegrated = null;
+        SceneFogLocal = null;
+        SceneFogSamplingBaked = false;
         VertexFunction?.Dispose(); VertexFunction = null!;
         FragmentFunction?.Dispose(); FragmentFunction = null!;
         Library?.Dispose(); Library = null!;
@@ -390,6 +528,14 @@ internal static class Pipeline
     /// </summary>
     public static void SetPipeline(IMTLRenderCommandEncoder enc, PipelineMode mode, bool doubleSided = false, bool depthWrite = true)
     {
+        // 工作包 D：收集期一个 encoder 都不存在（Metal 只有 BeginPass 之后才有 encoder），
+        // 这里只记下状态；PSO 与 DSS 由重放所在的 Pass 决定（主场景 / 速度 MRT / Overlay / OutlineMask）。
+        if (MTLSceneDrawCollection.Active is { } collecting)
+        {
+            collecting.RecordPipeline(mode, doubleSided, depthWrite);
+            return;
+        }
+
         // Overlay-pass routing, mirroring the first ActivePassId==Overlay check on VK:
         // Overlay renders directly to the backbuffer.
         // In HDR tiers the main PSO RGBA16Float attachment format breaks compatibility with the BGRA8Unorm backbuffer,
@@ -463,6 +609,46 @@ internal static class Pipeline
     }
 
     /// <summary>
+    /// Metal 的面剔除是 encoder 动态状态，<see cref="SetPipeline"/> 只能表达 None 与 Back 两种，
+    /// 而双面两遍的正面那一遍要单独设 Front，所以必须有一个可被收集期拦截的包装。
+    /// 收集期只记录，重放时再落到 encoder 上。
+    /// </summary>
+    internal static void SetCullMode(IMTLRenderCommandEncoder enc, MTLCullMode cull)
+    {
+        if (MTLSceneDrawCollection.Active is { } collecting)
+        {
+            collecting.RecordCull(cull);
+            return;
+        }
+        enc.SetCullMode(cull);
+    }
+
+    /// <summary>
+    /// 把本帧透明阶段的雾采样三件套推上 encoder：
+    /// 帧常量数组在 FS buffer(4)，门控 float4 在 FS buffer(5)，两张只读体积在 texture(11)/texture(12)。
+    ///
+    /// 关闭时写的是零门控加占位资源，于是 MSL 里的 <c>if (fogParams.x &gt; 0.5)</c> 永不进入，
+    /// 也就不会去读尚未合成的体积纹理（占位体虽然是 1x1x1 黑体，但代码路径根本不采样）。
+    ///
+    /// 每条命令都必须调一次：Metal 换 Pass 后所有绑定归零，
+    /// 没有可跨命令复用的描述符集，这也正是重放不需要“补写”纪律的原因。
+    /// </summary>
+    internal static unsafe void BindSceneFog(IMTLRenderCommandEncoder enc)
+    {
+        bool sampling = SceneFogParams.X > 0.5f && SceneFogFrame != null
+            && SceneFogIntegrated != null && SceneFogLocal != null;
+        // 栈上落一份再推送：SetFragmentBytes 会立刻把字节拷进命令流，栈页生命周期足够。
+        Vector4* p = stackalloc Vector4[1];
+        *p = new Vector4(sampling ? 1 : 0, Device.ActivePassId == RenderPassId.SceneTransparent
+            && FrameSchedule.WeatherComposited ? 1 : 0, 0, 0);
+        enc.SetFragmentBytes((IntPtr)p, 16, SceneFogParamsSlot);
+        enc.SetFragmentBuffer(sampling ? SceneFogFrame! : DefaultFogFrameBuffer, 0, SceneFogFrameSlot);
+        var dummy = MTLTexture3D.DummyBlack.Image;
+        enc.SetFragmentTexture(sampling ? SceneFogIntegrated! : dummy, SceneFogIntegratedSlot);
+        enc.SetFragmentTexture(sampling ? SceneFogLocal! : dummy, SceneFogLocalSlot);
+    }
+
+    /// <summary>
     /// Unified draw entry.
     /// Bind the vertex buffer at slot 0 and the instance buffer at slot 2,
     /// then call DrawIndexedPrimitives according to instanceCount, where 1 means non-instanced and N means instanced.
@@ -489,11 +675,25 @@ internal static class Pipeline
         nuint instanceBoneBufferOffset,
         IMTLBuffer? prevInstanceBuffer = null,
         IMTLBuffer? prevBoneBuffer = null,
-        nuint prevBoneBufferOffset = 0)
+        nuint prevBoneBufferOffset = 0,
+        IMTLBuffer? viewBuffer = null)
     {
+        // 工作包 D：这是全部 3D 路径（模型 / 实例模型 / 实例网格 / 高亮壳体 / 精灵壳盒）的唯一出口，
+        // 拦截一次就覆盖了所有 PrimitiveData 绘制。收集期不提交任何绘制，只把不可变句柄交给重放队列。
+        if (MTLSceneDrawCollection.Active is { } collecting)
+        {
+            collecting.CapturePrimitive(primitiveData, primitiveVertexBuffer, primitiveIndexBuffer,
+                matrixBuffer, materialBuffer, lightBuffer, boneBuffer, morphBuffer, instanceBoneBuffer,
+                indexType, indexCount, indexBufferOffset, instanceBuffer, instanceBufferOffset, instanceCount,
+                instanceBoneBufferOffset, prevInstanceBuffer, prevBoneBuffer, prevBoneBufferOffset,
+                viewBuffer ?? ActiveViewBuffer);
+            return;
+        }
+
         // VS: buffer(0)=[[stage_in]] from vertex descriptor
         enc.SetVertexBuffer(primitiveVertexBuffer, 0, 0); // VB slot 0
         enc.SetVertexBuffer(matrixBuffer, 0, 1);          // b1 Matrices
+        BindView(enc, viewBuffer ?? ActiveViewBuffer);     // b11 ViewConstants
         enc.SetVertexBuffer(boneBuffer, 0, 3);            // b3 BoneMatrices
         enc.SetVertexBuffer(materialBuffer, 0, 4);        // b2 MaterialParams（VS 读取）
         enc.SetVertexBuffer(morphBuffer, 0, 5);           // b4 MorphDeltas
@@ -604,7 +804,8 @@ internal static class Pipeline
         bool bindMaterial = true)
     {
         enc.SetVertexBuffer(primitiveVertexBuffer, 0, 0); // VB slot 0
-        enc.SetVertexBuffer(matrixBuffer, 0, 1);          // b1 Matrices（shadow 不读 view/proj，保留占位）
+        enc.SetVertexBuffer(matrixBuffer, 0, 1);          // b1 Matrices
+        BindView(enc, MainViewBuffer);                    // b11 ViewConstants（shadow 不读 view/proj，保留占位）
         enc.SetVertexBuffer(boneBuffer, 0, 3);            // b3 BoneMatrices
         if (bindMaterial)
         {
@@ -774,6 +975,15 @@ internal static class Pipeline
             vatt.PixelFormat = MTLPixelFormat.RG16Float;
             vatt.BlendingEnabled = false;
             vatt.WriteMask = mode == PipelineMode.Opaque ? MTLColorWriteMask.All : MTLColorWriteMask.None;
+
+            // A0.2: SceneNormal at slot 2 follows the velocity rules exactly (no blend, Opaque-only writes).
+            if (RenderQuality.Current.EffectiveSceneNormals)
+            {
+                var natt = psd.ColorAttachments[2];
+                natt.PixelFormat = MTLPixelFormat.RGBA16Float;
+                natt.BlendingEnabled = false;
+                natt.WriteMask = vatt.WriteMask;
+            }
         }
 
         var pso = Device.MtlDevice.CreateRenderPipelineState(psd, out NSError? err);
@@ -837,24 +1047,40 @@ internal static class Pipeline
     // Embedded MSL source aligned one to one with Vulkan VertexGlsl and FragmentGlsl
     // ============================================================
 
-    const string MetalShaderSource = @"
+    /// <summary>
+    /// 主场景 MSL。工作包 D 把雾采样胶水拼在文件最前，
+    /// 于是 fragment_main 的四个出口（文字 / 天空 / Sprite2D / PBR）与 VK、DX 共用同一份 ApplySceneFog 形状，
+    /// 而 FogSampler 的结构与数学直接来自 <see cref="Season.Rendering.Effects.VolumetricFogEffect.SamplingMsl"/>，不存在第二份副本。
+    /// 因为要拼接，这里从 const 改成 static readonly；所有使用点都只是运行时字符串拼接，语义不变。
+    /// </summary>
+    static readonly string MetalShaderSource = @"
 #include <metal_stdlib>
 #include <simd/simd.h>
 
 using namespace metal;
 
+" + Season.Rendering.Effects.WeatherShaders.ContextMsl
+  + Season.Rendering.Effects.VolumetricFogEffect.SceneSamplingMsl + @"
 struct Matrices {
     float4x4 world;
-    float4x4 view;
-    float4x4 projection;
     // Contract clause 6 of 2-3:
-    // previous matrices live at offsets 192 and 256 and follow the same transpose contract as world, view, and projection.
+    // the previous world matrix lives at offset 64 and follows the same transpose contract as world.
     // The CPU uploads Transpose(M), and MSL reads column-major data back as the engine row-major M,
     // so post-multiplication with v * M remains correct everywhere.
     // All-zero means not written, because the C# MatrixBuffer default is zero and Transpose(zero) is still zero.
-    // The regular variants also declare these fields because MatrixBuffer is always 320 bytes on the C# side, so there is no out-of-bounds risk.
     float4x4 prevWorld;
+};
+
+// Per-view constants (256 bytes, byte-aligned with C# ViewConstants), VS buffer(11).
+// Same transpose contract as Matrices; an all-zero prevViewProjection means no history.
+struct ViewConstants {
+    float4x4 view;
+    float4x4 projection;
     float4x4 prevViewProjection;
+    float4 cameraPos;
+    float4 velocityParams;
+    float4 params0;
+    float4 reserved0;
 };
 
 struct BoneMatrices {
@@ -910,8 +1136,8 @@ struct SceneLights {
     float4 irradianceSH9[9];       // offset 960，尾部 1104B
     // DDGI clause 10 of 2-4, starting at offset 1104:
     // giParams0=probeGridMin.xyz and spacing,
-    // giParams1=gridXYZ as float and GiIntensity,
-    // giParams2=normalBias, chebyshev, atlasReady, and an unused slot.
+    // giParams1=gridXYZ as float and GiIntensity (blend weight, never a scale on probeIrr),
+    // giParams2=normalBias, chebyshev, atlasReady, and fadeBandCells.
     float4 giParams0;              // offset 1104
     float4 giParams1;              // offset 1120
     float4 giParams2;              // offset 1136，尾部 1152B
@@ -938,7 +1164,11 @@ struct SceneLights {
     // aerial-perspective 3D LUT consumption parameters.
     // x=maxDistanceKm, where values greater than 0 enable AP and act as the only gate.
     // y=Intensity, where 0 means identity composition.
-    float4 apParams0;              // offset 1360，尾部 1376B
+    float4 apParams0;                      // offset 1360
+    // 区域天气：头两行后每区域八行；前缀 1376B 保持，总长 2432B。
+    float4 weatherParams0;                 // offset 1376
+    float4 weatherParams1;                 // offset 1392
+    float4 weatherRegions[64];             // offset 1408，尾部 2432B
 };
 
 struct MaterialParams {
@@ -1007,6 +1237,7 @@ vertex VertexOut vertex_main(
     uint vertexId                   [[vertex_id]],
     uint instanceId                 [[instance_id]],
     constant Matrices& mat           [[buffer(1)]],
+    constant ViewConstants& viewc    [[buffer(11)]],
     constant BoneMatrices& bones     [[buffer(3)]],
     constant MaterialParams& mparams [[buffer(4)]],
     const device float* morphDeltas  [[buffer(5)]],
@@ -1104,8 +1335,8 @@ vertex VertexOut vertex_main(
     o.position = lightViewProj * worldPos;
     o.vViewDepth = 0.0;
 #else
-    float4 viewPos  = worldPos * mat.view;
-    o.position = viewPos * mat.projection;
+    float4 viewPos  = worldPos * viewc.view;
+    o.position = viewPos * viewc.projection;
     o.vViewDepth = viewPos.z;
 #endif
 
@@ -1115,7 +1346,7 @@ vertex VertexOut vertex_main(
     // A non-zero fourth column in prevViewProjection means valid history.
     // For perspective and orthographic matrices that column is always non-zero.
     float4 prevClip_ = float4(0.0);
-    if (any(mat.prevViewProjection[3] != float4(0.0))) {
+    if (any(viewc.prevViewProjection[3] != float4(0.0))) {
         // Per-instance history on the instanced path, world rows 0 through 3 plus morph weights,
         // comes uniformly from the previous-instance stream.
         // r3.w == 0 means that slot has not been written yet, such as the first frame or after growth clear,
@@ -1193,7 +1424,7 @@ vertex VertexOut vertex_main(
             prevWorldMatrix = mat.prevWorld;
         }
 
-        prevClip_ = prevLocalPos * prevWorldMatrix * mat.prevViewProjection;
+        prevClip_ = prevLocalPos * prevWorldMatrix * viewc.prevViewProjection;
     }
     o.vPrevClip = prevClip_;
 #endif
@@ -1312,7 +1543,7 @@ inline float3 EvaluateIrradianceSH9(constant SceneLights& lights, float3 n) {
 // worldPos is biased along the normal by giParams2.x, the normal bias, then locates the 8 neighboring probes.
 // Trilinear weights are multiplied by cosine-direction weights.
 // texSampler with Linear filtering bilinearly samples each probe octahedral core, and the gutter absorbs seam overflow.
-// The result is then multiplied by GiIntensity.
+// The result replaces the SH9/ambient term as a blend, and giParams1.w is the weight of that blend rather than a scale on the probe value: see the return statement for why the difference matters.
 // When giParams2.y is greater than 0.5, each probe also runs a Chebyshev variance test from the depth-moment atlas,
 // and the visibility factor multiplies into the weight to suppress wall-gap, contact, and back-face light leaks.
 // Starting from step 5, probes with tile alpha below 0.5 are treated as invalid and removed from the weights.
@@ -1342,18 +1573,26 @@ inline float3 SampleProbeIrradiance(constant SceneLights& lights, texture2d<floa
     float3 base = floor(gc);
     float3 f = gc - base;
 
-    // 2-4 clause 9: fade back to fallback outside the probe volume. gc is in probe-index units, so trilinear
+    // 2-4 clause 9: fade the probe contribution out beyond the last probe row. gc is in probe-index units, so trilinear
     // interpolation is only defined over [0, dims-1]; past that the clamp below collapses all eight corners onto a
     // single boundary probe, which hands a distant surface one near-camera probe's irradiance as if it were its own.
     // That reads as a whole surface lit uniformly by an unrelated probe, wobbling with that probe's amortized R2 ray
     // rotation and hysteresis rather than with anything in the scene, and it is the only lighting a face turned away
     // from every light has. The grid is camera-centred and re-snapped every frame in Ddgi.Record, so this covers
-    // everything past GiVolumeSize/2, not just distant scenery. Fading across the one spacing beyond the last probe
-    // keeps the edge from popping as the volume slides with the camera - within that band the clamped probe is still
-    // the nearest one, no further away than an interior interpolation reaches - and past it the result is exactly the
-    // pre-DDGI 1-7/1-2 diffuse term.
+    // everything past GiVolumeSize/2, not just distant scenery.
+    // Three decisions here, about the seam rather than its silhouette:
+    // 1. The band is giParams2.w cells wide, not one. One cell of linear ramp is already a hard-edged ring: it breaks the
+    //    gradient at both ends, and once the interior and the exterior differ by any amount that ring is what the eye
+    //    locks onto while the volume slides with the camera. Widen it and curve it - s(t)=t*t*(3-2t) is C1 at both ends.
+    // 2. The metric stays the axis-aligned max of the per-axis excess, not a radial length. A round band would only
+    //    redraw the same seam as a circle, because the shape is not what makes it visible - the step in the blend at the
+    //    end of this function is. Clauses 9/13 remove that step, so the band has nothing left to outline.
+    // 3. The fade never moves the result to a *different* amount of light: both ends settle on fallback, and an
+    //    unoccluded interior produces fallback term for term as well, so inside the band the two sides agree exactly.
     float3 outside = max(max(-gc, gc - (dims - 1.0)), float3(0.0));
-    float boundsFade = saturate(1.0 - max(max(outside.x, outside.y), outside.z));
+    float band = max(lights.giParams2.w, 1.0);
+    float boundsFade = saturate(1.0 - max(max(outside.x, outside.y), outside.z) / band);
+    boundsFade = boundsFade * boundsFade * (3.0 - 2.0 * boundsFade);
 
     float3 sum = float3(0.0);
     float wsum = 0.0;
@@ -1396,14 +1635,23 @@ inline float3 SampleProbeIrradiance(constant SceneLights& lights, texture2d<floa
         sum += ddgiAtlas.sample(s, uv, level(0.0)).rgb * w;
         wsum += w;
     }
-    // Step 5:
-    // wsum divided by wraw is the fraction of interpolation weight contributed by valid probes at this shading point.
-    // That ratio linearly blends between probe irradiance and fallback, the diffuse result without DDGI.
-    // When all 8 neighbors are invalid, including the initial zero atlas before the first update,
-    // the path naturally falls back to pure fallback with a continuous transition and no threshold pop or flicker.
+    // Step 5 + clause 9 energy contract. wsum/wraw is the fraction of this shading point's interpolation weight that
+    // lands on valid probes; boundsFade is the coverage envelope; giParams1.w is how much of the probe field's deviation
+    // from the environment the application wants to show. All three scale the *blend*, never the probe value:
+    //     result = mix(fallback, probeIrr, valid * boundsFade * GiIntensity)
+    // That distinction is the whole of clause 9. A probe stores irradiance in the same units as EvaluateIrradianceSH9:
+    // a ray that misses multiplies the same SH radiance coefficients by the same cosine kernel the surface samples them
+    // with, and the update divides by the accumulated cosine weight, so the quotient is E(n)/pi. In an unoccluded, empty
+    // volume probeIrr therefore equals fallback term for term. Scaling probeIrr would turn any gain into a uniform
+    // brightness step between the inside and the outside of a camera-following box - at GiIntensity 0.4 the interior
+    // sits at 40% of the exterior, which in an ambient-only frame is the entire visible difference. Scaling the blend
+    // instead leaves that case identical for every gain, applies the same gain to real occlusion (probeIrr < fallback)
+    // and to real bounce (probeIrr > fallback), and still returns pure fallback at gain 0.
+    // If all 8 neighbors are invalid, including the zero-initialized atlas before the first update, wsum is zero and the
+    // result is pure fallback with a continuous transition and no threshold jumps or flicker.
     float3 probeIrr = wsum > 1e-6 ? sum / wsum : float3(0.0);
     float vfrac = saturate(wsum / max(wraw, 1e-6)) * boundsFade;
-    return mix(fallback, probeIrr * lights.giParams1.w, vfrac);
+    return mix(fallback, probeIrr, vfrac * lights.giParams1.w);
 }
 #endif
 
@@ -1416,6 +1664,15 @@ inline float msdfMedian(float r, float g, float b) {
 // The value is 0 to 1 and already includes coverage remapping and high-frequency erosion.
 // It mirrors DX HLSL CloudDensityAt literally, including lerp to mix and SampleLevel to sample level zero.
 // The noise texture must use wrap sampling, as noted on wrapSampler in fragment_main, or the edge stretches into a stripe.
+float4 ApplySceneWeather(float4 color,float3 worldPos,constant SceneLights& lights,float4 fogParams) {
+    if(fogParams.y>0.5) {
+        WeatherRainContext<constant float4*> weather{lights.weatherParams0,lights.weatherParams1,lights.weatherRegions};
+        float3 ray=worldPos-lights.cameraPos.xyz; float distance=length(ray);
+        float4 rain=weather.WeatherRain(lights.cameraPos.xyz,ray/max(distance,1e-8f),distance);
+        color.rgb=color.rgb*rain.w+rain.rgb;
+    }
+    return color;
+}
 inline float CloudDensityAt(constant SceneLights& lights, texture2d<float> cloudNoise, sampler wrapSampler, float2 posKm, int layer) {
     float2 uv = (posKm + lights.cloudLayerB[layer].xy) * lights.cloudLayerB[layer].z;
     float4 n = cloudNoise.sample(wrapSampler, uv, level(0.0));
@@ -1450,7 +1707,8 @@ inline float ComputeCloudShadow(constant SceneLights& lights, texture2d<float> c
         }
         result = 1.0 - lights.cloudParams1.x * saturate(1.0 - exp(-tau));
     }
-    return result;
+    WeatherCloudContext<constant float4*> weather{lights.weatherParams0,lights.weatherParams1,lights.weatherRegions,cloudNoise};
+    return result*weather.WeatherCloudShadow(worldPos,toLight);
 }
 
 // Step B of 2-5:
@@ -1928,15 +2186,31 @@ inline float ComputeSpotShadow(constant SceneLights& lights, depth2d<float> shad
 // so a macro provides a unified exit.
 // Every return path carries the velocity computed unconditionally at function entry,
 // which preserves the original control flow and never depends on remembering to write velocity in each branch.
+#if NORMAL_OUTPUT
+// A0.2: octahedral encoding of the unit world normal into [-1,1]^2, literally the same as OctEncodeNormal on DX / VK / WebGPU.
+float2 OctEncodeNormal(float3 n) {
+    n /= (fabs(n.x) + fabs(n.y) + fabs(n.z));
+    float2 s = float2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return n.z >= 0.0 ? n.xy : (1.0 - fabs(n.yx)) * s;
+}
+#endif
 struct FragmentOut {
     float4 color    [[color(0)]];
     float2 velocity [[color(1)]];
+#if NORMAL_OUTPUT
+    float4 normal   [[color(2)]];   // A0.2: octahedral world normal xy, roughness, metallic
+#endif
 };
 #define SEASON_FS_OUT FragmentOut
-#define SEASON_RETURN_COLOR(col_) { FragmentOut fsOut_; fsOut_.color = (col_); fsOut_.velocity = velocity_; return fsOut_; }
+#if NORMAL_OUTPUT
+#define SEASON_WRITE_NORMAL_ fsOut_.normal = normal_;
+#else
+#define SEASON_WRITE_NORMAL_
+#endif
+#define SEASON_RETURN_COLOR(col_) { FragmentOut fsOut_; fsOut_.color = ApplySceneFog(ApplySceneWeather((col_), in.vWorldPos, lights, fogParams), in.vWorldPos, sceneFog, fogParams); fsOut_.velocity = velocity_; SEASON_WRITE_NORMAL_ return fsOut_; }
 #else
 #define SEASON_FS_OUT float4
-#define SEASON_RETURN_COLOR(col_) return (col_);
+#define SEASON_RETURN_COLOR(col_) return ApplySceneFog(ApplySceneWeather((col_), in.vWorldPos, lights, fogParams), in.vWorldPos, sceneFog, fogParams);
 #endif
 
 fragment SEASON_FS_OUT fragment_main(
@@ -1950,6 +2224,11 @@ fragment SEASON_FS_OUT fragment_main(
     constant SceneLights& lights [[buffer(1)]],
     constant MaterialParams& mat [[buffer(2)]],
     constant TextDrawParams& textParams [[buffer(3)]],
+    // 工作包 D：透明阶段的雾采样三件套，与 VK 的 set 1 binding 0/1/2、DX 的 FogFrameRoot/FogIntegratedRoot/FogLocalRoot 一一对应。
+    // 三者恒被声明，不靠编译期宏变体，所以 PSO 家族数量不因此变化，
+    // 真正决定“是否采样”的是逐条命令推送的 fogParams.x。
+    const device float4* fogFrameData      [[buffer(4)]],
+    constant float4& fogParams             [[buffer(5)]],
     texture2d<float> albedoMap            [[texture(0)]],
     texture2d<float> normalMap            [[texture(1)]],
     texture2d<float> metallicRoughnessMap [[texture(2)]],
@@ -2010,12 +2289,19 @@ fragment SEASON_FS_OUT fragment_main(
     // All three axes use Clamp, and trilinear sampling reuses texSampler at sampler(0).
     , texture3d<float> apLut               [[texture(10)]]
     , sampler wrapSampler                  [[sampler(2)]]
+    // 工作包 D：两张只读体积纹理紧接 texture(10) 的 AP LUT。
+    // 片元阶段的 texture3d 默认是 access::sample，正好能直接交给 FogSampler 的形参。
+    , texture3d<float> fogIntegratedVolume [[texture(11)]]
+    , texture3d<float> fogLocalVolume      [[texture(12)]]
 #if SHADOW_ENABLED
     , depth2d<float> shadowAtlas          [[texture(5)]]
     , sampler shadowSampler               [[sampler(1)]]
 #endif
     )
 {
+    // 工作包 D：只组装只读句柄，不读任何数据。
+    // 门控在 ApplySceneFog 内部，关闭时 fogFrameData 与两张体积纹理会一次也不被访问。
+    FogSampler sceneFog{fogFrameData, fogIntegratedVolume, fogLocalVolume};
 #if OUTLINE_MASK
     // Phase 4 mask path, mirroring DX PSOutlineMask:
     // alpha follows the material transparency chain, including the albedo alpha.
@@ -2047,6 +2333,10 @@ fragment SEASON_FS_OUT fragment_main(
         float2 prevNdc = in.vPrevClip.xy / in.vPrevClip.w;
         velocity_ = (curNdc - prevNdc) * float2(0.5, -0.5);
     }
+#endif
+#if NORMAL_OUTPUT
+    // A0.2: zero for every non-PBR exit; the PBR path overwrites it once N and roughness are final.
+    float4 normal_ = float4(0.0);
 #endif
     float3 albedo = mat.materialColor.rgb;
     float alpha = mat.materialColor.a;
@@ -2137,6 +2427,8 @@ fragment SEASON_FS_OUT fragment_main(
         // The body only uses explicit level zero sampling, so this non-uniform branch involves no implicit derivatives.
         if (lights.cloudParams0.w > 0.0 && skyDir.y > 0.0)
             skyRadiance = CloudComposite(lights, cloudNoise, wrapSampler, skyRadiance, skyDir, lights.cameraPos.xz * 0.001);
+        WeatherCloudContext<constant float4*> weather{lights.weatherParams0,lights.weatherParams1,lights.weatherRegions,cloudNoise};
+        skyRadiance=weather.WeatherCloudComposite(skyRadiance,lights.cameraPos.xyz,skyDir,lights.skyParams0.xyz);
 #if HDR_CHAIN
         // The LUT already stores linear HDR radiance,
         // so output it directly and let the full FinalBlit exposure plus ACES plus gamma chain close the loop, matching the 1-4 contract.
@@ -2235,6 +2527,10 @@ fragment SEASON_FS_OUT fragment_main(
         roughness = min(1.0, sqrt(sqrt(ggxAlpha * ggxAlpha + twoOverKappa)));
     }
 
+#if NORMAL_OUTPUT
+    normal_ = float4(OctEncodeNormal(N), roughness, metallic);
+#endif
+
     float3 V = normalize(lights.cameraPos.xyz - in.vWorldPos);
     float3 F0 = float3(0.04);
     F0 = mix(F0, albedo, metallic);
@@ -2310,7 +2606,7 @@ fragment SEASON_FS_OUT fragment_main(
     // because they have the same units and summing them would double-count.
     // Both share the same one-minus-metallic gate because metals have no diffuse term.
     // Clause 9 of 2-4 turns the diffuse term into a three-way choice, never additive:
-    // when DDGI is ready and GiIntensity is greater than 0, probe irradiance replaces the SH9-versus-constant result;
+    // when DDGI is ready and GiIntensity is greater than 0, probe irradiance is blended over the SH9-versus-constant result by that weight;
     // otherwise the path falls back fully to 1-7 or 1-2.
     // The specular term does not move.
     // Clause 13 makes probes blend continuously back toward giDiffuse by validity,

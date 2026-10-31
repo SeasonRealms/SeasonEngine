@@ -32,6 +32,13 @@ public class MovePanel : Panel
 
     public bool EnableEndMoving { get; set; }
 
+    /// <summary>
+    /// When false the panel stops consuming drags and wheel input, so an owner can hand a region
+    /// of its surface to another control (for example a 3D viewport that rotates under the finger)
+    /// without the page scrolling at the same time. The release/rebound state machine keeps running.
+    /// </summary>
+    public bool TouchEnabled { get; set; } = true;
+
     public Vector4 Color { get; set; }
 
     float MoveDistance;
@@ -58,7 +65,7 @@ public class MovePanel : Panel
 
         bool move = false;
 
-        if (TouchService.PoZ != null && TouchService.PoZ != 0)
+        if (TouchEnabled && TouchService.PoZ != null && TouchService.PoZ != 0)
         {
             if (PosX <= TouchService.PoX && TouchService.PoX <= PosX + Width && PosY <= TouchService.PoY && TouchService.PoY <= PosY + Height)
             {
@@ -72,7 +79,7 @@ public class MovePanel : Panel
 
         if (Status is null or "")
         {
-            bool inPanel = PosX < TouchService.PoX && TouchService.PoX < PosX + Width && PosY < TouchService.PoY && TouchService.PoY < PosY + Height;
+            bool inPanel = TouchEnabled && PosX < TouchService.PoX && TouchService.PoX < PosX + Width && PosY < TouchService.PoY && TouchService.PoY < PosY + Height;
 
             if (inPanel)
             {

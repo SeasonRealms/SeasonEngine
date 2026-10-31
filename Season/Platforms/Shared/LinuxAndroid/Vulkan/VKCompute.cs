@@ -269,15 +269,21 @@ internal sealed unsafe class VKStorageBuffer : Season.Rendering.StorageBuffer
     /// Capacity always matches the target buffer, so no rebuild is needed after creation.</summary>
     BufferResource[]? _staging;
 
-    internal VKStorageBuffer(uint sizeInBytes)
+    internal VKStorageBuffer(uint sizeInBytes, Season.Rendering.StorageBufferUsage usage)
     {
         // Round capacity up to 16 bytes
         // to match the D3D12 raw-view alignment granularity and keep cross-backend behavior consistent
         uint alignedSize = (sizeInBytes + 15u) & ~15u;
         SizeInBytes = sizeInBytes;
+        Usage = usage;
+        // A0.1：IndirectBufferBit 必须在创建时就要，之后无法追加，这是 StorageBufferUsage
+        // 做成创建期参数而不是提交期参数的原因。
+        var usageFlags = BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferDstBit;
+        if (usage == Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs)
+            usageFlags |= BufferUsageFlags.IndirectBufferBit;
         Buffer = Device.ResourceManager.CreateBuffer(
             alignedSize,
-            BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferDstBit,
+            usageFlags,
             MemoryPropertyFlags.DeviceLocalBit);
     }
 

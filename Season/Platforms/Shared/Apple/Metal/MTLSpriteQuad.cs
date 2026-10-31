@@ -50,6 +50,11 @@ internal abstract class MTLSpriteQuad : ITextureHolder, IDisposable
     // === First-frame guard: skip Draw until the first Update has finished ===
     protected bool _transformInitialized;
 
+    /// <summary>屏幕空间精灵（Sprite2D）绑定单位视图；3D 公告板重写为 false，改用当前活动视图。</summary>
+    protected virtual bool ScreenSpaceView => true;
+
+    IMTLBuffer ViewBuffer => ScreenSpaceView ? Pipeline.ScreenViewBuffer : Pipeline.ActiveViewBuffer;
+
     // ============================================================
     // Per-instance UBO creation and release.
     // ============================================================
@@ -65,8 +70,6 @@ internal abstract class MTLSpriteQuad : ITextureHolder, IDisposable
         var identity = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Identity,
-            Projection = Matrix4x4.Identity
         };
         for (int i = 0; i < n; i++) WriteStruct(_matrixBuffers[i], identity);
     }
@@ -219,6 +222,17 @@ internal abstract class MTLSpriteQuad : ITextureHolder, IDisposable
 
     protected void DrawQuad(IMTLBuffer vb)
     {
+        // 工作包 D：收集期一个 encoder 都没有，SetVertexBuffer 无处可落，必须在这里先分流。
+        // 精灵固定走透明混合，与直绘路径的 SetPipeline(Transparent, doubleSided: false) 对齐。
+        if (MTLSceneDrawCollection.Active is { } collecting)
+        {
+            int cf = Device.FrameIndex;
+            collecting.CaptureQuad(vb, _matrixBuffers[cf], _materialBuffers[cf],
+                MTLPrimitiveGroup.LightConstantBuffers[cf], MTLPrimitiveGroup.IdentityBoneBuffers[cf],
+                AlbedoTexture, NormalMap, MetallicRoughnessMap, OcclusionMap, EmissiveMap, ViewBuffer);
+            return;
+        }
+
         var enc = Device.GraphicsEncoder;
 
         // Transparent PSO plus DSS, static sampler, and cull/winding state.
@@ -231,6 +245,7 @@ internal abstract class MTLSpriteQuad : ITextureHolder, IDisposable
         // 0 = vertex stream, 1 = Matrices(b0), 2 = Instance(buff2), 3 = BoneMatrices(b3 using shared IdentityBone).
         enc.SetVertexBuffer(vb, 0, 0);
         enc.SetVertexBuffer(_matrixBuffers[fi], 0, 1);
+        Pipeline.BindView(enc, ViewBuffer);
         enc.SetVertexBuffer(Pipeline.IdentityInstanceBuffer, 0, 2);
         enc.SetVertexBuffer(MTLPrimitiveGroup.IdentityBoneBuffers[fi], 0, 3);
         // VS buffer(4) carries MaterialParams because the vertex shader depends on isInstanced and renderMode

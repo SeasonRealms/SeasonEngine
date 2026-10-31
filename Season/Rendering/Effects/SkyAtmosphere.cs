@@ -524,7 +524,7 @@ public sealed class SkyAtmosphereEffect : ComputeEffect
         var sunRadiance = Atmosphere.SunColor * Atmosphere.SunIrradiance;
         var moonRadiance = Atmosphere.MoonColor * Atmosphere.MoonIrradiance;
 
-        var camera = DeviceServices.BaseApp.Camera;
+        var camera = RenderView.Current.Camera;
         var fwd = SafeNormalize(camera.Target - camera.Position, Vector3.UnitZ);
         var right = SafeNormalize(Vector3.Cross(camera.Up, fwd), Vector3.UnitX);
         var up = Vector3.Cross(fwd, right);

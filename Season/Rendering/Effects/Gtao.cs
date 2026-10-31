@@ -79,6 +79,11 @@ public sealed class GtaoEffect : ComputeEffect
 
     public override ComputePhase Phase => ComputePhase.AfterOpaque;
 
+    /// <summary>Per view: occlusion is computed from one view's depth and consumed by that view's composite.
+    /// <see cref="FrameSchedule.AoReady"/> stays app-level, so a second view would need per-view AO names first.</summary>
+    public override ComputeScope Scope => ComputeScope.View;
+    public override ViewFeature RequiredFeature => ViewFeature.AmbientOcclusion;
+
     public override bool Initialize(IGraphics g)
     {
         // Quality gating plus shape dependency: AO mode must be GTAO and SceneDepth must
@@ -166,7 +171,7 @@ public sealed class GtaoEffect : ComputeEffect
             || _width != Math.Max(8u, (uint)resolution.X / 2)
             || _height != Math.Max(8u, (uint)resolution.Y / 2))
             return;
-        var camera = DeviceServices.BaseApp.Camera;
+        var camera = RenderView.Current.Camera;
         uint gx = (_width + 7) / 8;
         uint gy = (_height + 7) / 8;
 

@@ -29,9 +29,6 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
     /// </summary>
     public const int MaxBones = 100;
 
-    // Global shared state: camera for all Pbr3D primitives
-    internal static Season.Basic.Camera Camera;
-
     // Global shared state: lighting UBOs (N-buffered)
     internal static BufferResource[] LightConstantBuffers = null!;
 
@@ -424,7 +421,7 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         // When MotionVectors are disabled, JitterNdc stays zero,
         // and writing it is harmless because shaders with VELOCITY_OUTPUT=0 do not read this field.
         var res = DeviceServices.BaseApp.DeviceResolution;
-        var jitter = DeviceServices.BaseApp.Camera.JitterNdc;
+        var jitter = RenderView.Current.JitterNdc;
         lightParams.VelocityParams = new Vector4(
             jitter.X, jitter.Y,
             res.X > 0 ? 1f / res.X : 0f,
@@ -489,8 +486,11 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
             ? VKTexture3D.Find(aerialName)
             : null;
 
-        FrameSchedule.CaptureLighting(lightParams, Camera.View, Camera.Projection,
-            DeviceServices.BaseApp.Camera.ViewProjection);
+        // The snapshot is read by fog / weather / particles, so it must come from the view that is actually
+        // being rendered, not from the legacy camera mirror.
+        var snapshotView = RenderView.Current;
+        FrameSchedule.CaptureLighting(lightParams, snapshotView.View, snapshotView.RenderProjection,
+            snapshotView.RenderViewProjection);
         Unsafe.Write(_mappedLightConstantBuffers[fi], lightParams);
     }
 
@@ -502,31 +502,17 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         // (Changed-gated, zero rebuild for a stationary camera; FOV/near/far are driven by BaseApp.Camera).
         // The cameraPos/cameraTarget parameters are forwarded from BaseApp.Camera.Position/Target;
         // the signature is kept for frame-loop compatibility.
-        var camera3D = DeviceServices.BaseApp.Camera;
-        var aspectRatio = DeviceServices.BaseApp.DeviceResolution.X / (float)DeviceServices.BaseApp.DeviceResolution.Y;
+        var res = DeviceServices.BaseApp.DeviceResolution;
 
-        if (RenderQuality.Current.MotionVectors)
-        {
-            // 2-3 contract clause 4: the only injection point for jitter.
-            // UpdateTemporal first snapshots the previous frame's unjittered ViewProjection,
-            // then rebuilds matrices and bakes jitter only into ProjectionJittered.
-            // Frustum culling and CSM cascades still use the unjittered
-            // camera3D.Projection/ViewProjection to avoid edge flicker and shadow jitter.
-            var res = DeviceServices.BaseApp.DeviceResolution;
-            camera3D.UpdateTemporal(aspectRatio, res.X, res.Y);
-            Camera.View = camera3D.View;
-            Camera.Projection = camera3D.ProjectionJittered;
-            Camera.PrevViewProjection = camera3D.PrevViewProjection;
-        }
-        else
-        {
-            camera3D.UpdateIfChanged(aspectRatio);
-            Camera.View = camera3D.View;
-            Camera.Projection = camera3D.Projection;
-            // All zero = no history; even if the feature is turned off mid-run,
-            // no stale matrix is left behind
-            Camera.PrevViewProjection = default;
-        }
+        // 2-3 contract clause 4: the main view is the only injection point for jitter.
+        // Prepare snapshots the previous frame's unjittered ViewProjection,
+        // then rebuilds matrices and bakes jitter only into the render projection.
+        // Frustum culling and CSM cascades keep the unjittered matrices
+        // to avoid edge flicker and shadow jitter; with MotionVectors off the history is all zero.
+        var view = DeviceServices.BaseApp.MainView;
+        view.Prepare(res.X, res.Y);
+        FrameSchedule.CurrentView = view;
+        Pipeline.WriteMainView(view.Constants);
 
         // 1-5: CPU shadow-matrix computation chain
         // (after the camera update and before writing the lighting UBO;
@@ -541,7 +527,7 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
             if (dirIdx >= 0 && dirIdx < lightParams.LightCount)
             {
                 var dirType = lightParams.Lights[dirIdx].DirType;
-                CascadedShadow.ComputeSun(camera3D, new Vector3(dirType.X, dirType.Y, dirType.Z));
+                CascadedShadow.ComputeSun(view.Camera, new Vector3(dirType.X, dirType.Y, dirType.Z));
             }
             int spotIdx = (int)lightParams.Params0.W;
             if (spotIdx >= 0 && spotIdx < lightParams.LightCount
@@ -1570,13 +1556,10 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(Camera.View),
-            Projection = Matrix4x4.Transpose(Camera.Projection),
             // 2-3 Step C (track C-a): per-instance previous world matrices already come from
             // the prev instance world SB,
             // so b0.PrevWorld stays all zero
             // because the instanced-path shader does not read b0 prevWorld.
-            PrevViewProjection = Matrix4x4.Transpose(Camera.PrevViewProjection),
         };
         for (int i = 0; i < Device.frameCount; i++)
         {
@@ -1592,11 +1575,8 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
     /// (current frame fi only), and record this frame's face alpha.
     /// World stays identity
     /// (per-instance world matrices are addressed by instance-stream writeIndex slot),
-    /// but View/Projection/PrevViewProjection must be rewritten every frame with the current camera.
-    /// Writing them only once at creation time (CreateSharedShellPrimitive) would lock the shell
-    /// to the camera-space VP transform at creation time,
-    /// making Wireframe move with the camera instead of staying attached to the character
-    /// (found on real Metal hardware; Vulkan shares the same fix).
+    /// and View/Projection/PrevViewProjection come from the per-view set 2 (ViewConstants),
+    /// so the shell always follows the current camera without per-box rewrites.
     /// PrevWorld stays all zero
     /// (2-3 Step C track C-a: instanced-path per-instance historical world matrices come from
     /// the prev instance world SB, and the shader does not read b0 prevWorld).</summary>
@@ -1606,9 +1586,6 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(Camera.View),
-            Projection = Matrix4x4.Transpose(Camera.Projection),
-            PrevViewProjection = Matrix4x4.Transpose(Camera.PrevViewProjection),
         };
         Unsafe.Write(box.Face.MappedMatrixBuffers[fi], matrices);
         Unsafe.Write(box.Edges.MappedMatrixBuffers[fi], matrices);
@@ -1800,8 +1777,6 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(Camera.View),
-            Projection = Matrix4x4.Transpose(Camera.Projection),
         };
         for (int i = 0; i < Device.frameCount; i++)
         {
@@ -1829,10 +1804,7 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(world),
-            View = Matrix4x4.Transpose(Camera.View),
-            Projection = Matrix4x4.Transpose(Camera.Projection),
             PrevWorld = Matrix4x4.Transpose(box.PrevWorld),
-            PrevViewProjection = Matrix4x4.Transpose(Camera.PrevViewProjection),
         };
         Unsafe.Write(box.Face.MappedMatrixBuffers[fi], matrices);
         Unsafe.Write(box.Edges.MappedMatrixBuffers[fi], matrices);

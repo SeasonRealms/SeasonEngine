@@ -93,6 +93,12 @@ public abstract class BaseControl
         set { if (_name != value) { _name = value; Changed = true; } }
     }
 
+    /// <summary>
+    /// P3 cull layer (0..31), matched against the executing view's LayerMask. Default 0, which every view sees unless
+    /// it deliberately narrows its mask, so existing scenes are unaffected. A panel gates its whole subtree.
+    /// </summary>
+    public uint CullLayer { get; set; }
+
     float _alpha = 1f;
     public float Alpha
     {
@@ -431,16 +437,9 @@ internal static class TransparentSortUtils
 {
     public static float GetDepth(ITransparentSortable sortable)
     {
-        var app = DeviceServices.BaseApp;
-        if (app == null)
+        if (DeviceServices.BaseApp == null)
             return sortable.TransparentSortPosition.Z;
 
-        var forward = app.CameraTarget - app.CameraPos;
-        if (forward.LengthSquared() < 1e-6f)
-            forward = System.Numerics.Vector3.UnitZ;
-        else
-            forward = System.Numerics.Vector3.Normalize(forward);
-
-        return System.Numerics.Vector3.Dot(sortable.TransparentSortPosition - app.CameraPos, forward);
+        return Season.Rendering.RenderView.Current.ViewDepth(sortable.TransparentSortPosition);
     }
 }

@@ -29,8 +29,9 @@ public static class WebGPUPipeline
     public const int InstanceStrideBytes = InstanceStrideFloats * 4;
 
     /// <summary>
-    /// Per-frame uniform-buffer size (108 floats = 432 bytes, with hdrParams vec4 added at the end in 1-4 Step B).
-    /// Precisely aligned with <see cref="WebGPUUniformLayout"/> and WGSL Uniforms.
+    /// Per-draw uniform-buffer size (60 floats = 240 bytes). View state is no longer part of it: the three view
+    /// matrices live in the per-view UBO at binding 22. Precisely aligned with <see cref="WebGPUUniformLayout"/> and
+    /// the WGSL <c>Uniforms</c> struct.
     /// </summary>
     public const int UniformBytes = WebGPUUniformLayout.TotalBytes;
 
@@ -46,9 +47,16 @@ struct FogMaterialFrame { values:array<vec4f> }
 """ + Season.Rendering.Effects.VolumetricFogEffect.SamplingWgsl + """
 
 fn ApplySceneFog(color:vec4f,world:vec3f)->vec4f {
-    if(fogSamplingParams.x<0.5) { return color; }
-    let fog=FogAtWorld(world);
-    return vec4f(color.xyz*fog.w+fog.xyz,color.w);
+    var rgb=color.xyz;
+    if(fogSamplingParams.y>0.5) {
+        let ray=world-uLights.cameraPos.xyz; let distance=length(ray);
+        let rain=WeatherRain(uLights.cameraPos.xyz,ray/max(distance,1e-8),distance);
+        rgb=rgb*rain.w+rain.xyz;
+    }
+    if(fogSamplingParams.x>0.5) {
+        let fog=FogAtWorld(world); rgb=rgb*fog.w+fog.xyz;
+    }
+    return vec4f(rgb,color.w);
 }
 """;
 
@@ -71,6 +79,11 @@ const HDR_CHAIN : bool = false;
 // fs_main = single target, fs_main_mrt = color + velocity. The JS side builds the extra MRT pipeline variant only when enabled.
 // Mutually exclusive with SHADOW_PASS, since shadow uses a vertex-only pipeline with no fragment stage.
 const VELOCITY_OUTPUT : bool = false;
+
+// ── A0.2: SceneNormal output (MRT slot 2, rgba16float: xy = octahedral world normal, z = Toksvig roughness, w = metallic),
+// mirroring NORMAL_OUTPUT on DX/VK/Metal. Only ever true together with VELOCITY_OUTPUT (RenderQuality.EffectiveSceneNormals),
+// so the Scene pass keeps three shapes. Same two-entry reasoning as above: fs_main_mrtn = color + velocity + normal.
+const NORMAL_OUTPUT : bool = false;
 
 // ── 2-4 Clause 10 (the only compile-time switch on the DDGI consumer side, mirroring DDGI_ENABLED on DX/VK/Metal):
 // when true, the fragment shader replaces ambient diffuse with probe-atlas sampling.
@@ -118,26 +131,33 @@ struct VertexOutput {
     @location(6) prevClip: vec4f, // 2-3: previous-frame non-jittered clip-space position (used by FS to compute velocity; w<=0 = no history)
 };
 
+// Per-object state only (60 floats = 240B). View / Projection / PrevViewProjection come from the per-view UBO at
+// binding 22 (ViewUniforms), so one object buffer serves every view of the frame.
 struct Uniforms {
-    world: mat4x4f,
-    view: mat4x4f,
-    projection: mat4x4f,
-    // ── 2-3 Contract Clause 6: history-data region (reuses the 9 retired vec4 slots from 1-2; see WebGPUUniformLayout.PrevWorld).
-    // Follows the same transpose convention as world/view/projection (uploaded row-major, read column-major -> pre-multiply).
+    world: mat4x4f,              // float 0
+    // ── 2-3 Contract Clause 6: history-data region (per object; see WebGPUUniformLayout.PrevWorld).
+    // Follows the same byte convention as world (uploaded row-major, read column-major -> pre-multiply).
     // All zero means not written, and vs_main gracefully falls back through the sentinel path (Clause 9).
-    prevWorld: mat4x4f,          // float 48: previous-frame world matrix ([3][3]==C# M44==0 -> fall back to current-frame world)
-    prevViewProjection: mat4x4f, // float 64: previous-frame non-jittered View×Projection (all-zero block -> prevClip stays 0)
-    prevMorphWeights: vec4f,     // float 80: previous-frame morph weights (non-instanced path; driven by hasPrevMorph bit)
-    baseColor: vec4f,
-    emissive: vec4f,
-    material: vec4f,    // x=metallic, y=roughness, z=alpha, w=alphaCutoff
+    prevWorld: mat4x4f,          // float 16: previous-frame world matrix ([3][3]==C# M44==0 -> fall back to current-frame world)
+    prevMorphWeights: vec4f,     // float 32: previous-frame morph weights (non-instanced path; driven by hasPrevMorph bit)
+    baseColor: vec4f,            // float 36
+    emissive: vec4f,             // float 40
+    material: vec4f,             // float 44  x=metallic, y=roughness, z=alpha, w=alphaCutoff
     // x = sentinel bitfield for prev data in 2-3 Step C
-    // (bit0=hasPrevBones, bit1=hasPrevInstanceWorld, bit2=hasPrevMorph;
-    // aligned with the three uints in native MaterialParams. On this backend, the 432B UBO is already full,
-    // so the bits are packed into the retired lightCount slot from 1-2.)
-    flags: vec4<i32>,   // y=renderMode, z=alphaMode, w=textureFlags
-    morphWeights: vec4f, // Morph weights for the non-instanced path (aligned with native MaterialParams.MorphWeights)
-    hdrParams: vec4f,   // Reserved retired slot from 1-2 (exposure now reads uLights.params0.y, Contract 7); reused in Phase 4 as the per-draw outline color carrier for OutlineMask
+    // (bit0=hasPrevBones, bit1=hasPrevInstanceWorld, bit2=hasPrevMorph; aligned with the three uints in native MaterialParams)
+    flags: vec4<i32>,            // float 48  y=renderMode, z=alphaMode, w=textureFlags
+    morphWeights: vec4f,         // float 52  Morph weights for the non-instanced path (aligned with native MaterialParams.MorphWeights)
+    hdrParams: vec4f,            // float 56  retired 1-2 slot (exposure reads uLights.params0.y); Phase 4 outline color carrier
+};
+
+// ── P2: per-view uniform (binding 22), one 256B slot per view / shadow quadrant.
+// Byte layout matches Season.Rendering.ViewConstants: 0 View, 64 Projection, 128 PrevViewProjection.
+// The rows are uploaded row-major, so WGSL reads the transpose of the CPU matrix - the same convention as world,
+// i.e. a row-vector multiply on the CPU side.
+struct ViewUniforms {
+    view: mat4x4f,               // float 0
+    projection: mat4x4f,         // float 16 (jitter already baked in)
+    prevViewProjection: mat4x4f, // float 32 (all zero = no history)
 };
 
 // ── 1-2 lighting system (Contract 8): dedicated shared lighting UBO uploaded once per frame (updateSceneLights),
@@ -179,8 +199,8 @@ struct SceneLights {
     // byte-aligned with C# SceneLightParams.IrradianceSH9 ([InlineArray(9)] Sh9Array).
     irradianceSH9: array<vec4f, 9>,      // offset 960
     // 2-4 DDGI Clause 10 (starting at offset 1104, expanding to 1152B): JS-side SCENE_LIGHT_BYTES must stay synchronized.
-    // giParams0=probeGridMin.xyz/spacing，giParams1=gridXYZ(as float)/GiIntensity，
-    // giParams2=normalBias/chebyshev/atlasReady/_。
+    // giParams0=probeGridMin.xyz/spacing，giParams1=gridXYZ(as float)/GiIntensity（blend weight, never a scale on probeIrr），
+    // giParams2=normalBias/chebyshev/atlasReady/fadeBandCells。
     giParams0: vec4f,                    // offset 1104
     giParams1: vec4f,                    // offset 1120
     giParams2: vec4f,                    // offset 1136, end of 1152B block
@@ -202,11 +222,16 @@ struct SceneLights {
     cloudParams1: vec4f,                 // offset 1344
     // 2-5 Step E (starting at offset 1360): consumption parameters for the aerial-perspective 3D LUT.
     // x=max distance in km (>0 enables AP; the only gate), y=Intensity (0 = identity blend).
-    // JS-side SCENE_LIGHT_BYTES=1376 is already synchronized.
-    apParams0: vec4f,                    // offset 1360, end of 1376B block
+    // JS-side SCENE_LIGHT_BYTES must stay synchronized.
+    apParams0: vec4f,               // offset 1360
+    // 区域天气：头两行后每区域八行；前缀 1376B 保持，总长 2432B。
+    weatherParams0: vec4f,          // offset 1376
+    weatherParams1: vec4f,          // offset 1392
+    weatherRegions: array<vec4f, 64>, // offset 1408
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(22) var<uniform> uView: ViewUniforms;
 @group(0) @binding(1) var uSampler: sampler;
 @group(0) @binding(2) var uTexture: texture_2d<f32>;
 @group(0) @binding(3) var uNormalTexture: texture_2d<f32>;
@@ -258,6 +283,12 @@ struct SceneLights {
 // Sampler uWrapSampler (binding 20, Repeat): the noise is tileable with a fixed period, and wind offsets can push UV outside [0,1].
 // Clamp would stretch the outermost texel into a fixed horizontal stripe across the sky, matching the same rationale as DX s2 wrapSampler.
 @group(0) @binding(18) var uCloudNoise: texture_2d<f32>;
+fn WeatherH(i: i32) -> vec4f { return select(uLights.weatherParams1,uLights.weatherParams0,i==0); }
+fn WeatherR(i: i32,row: i32) -> vec4f { return uLights.weatherRegions[i*8+row]; }
+fn WeatherNoise(uv: vec2f) -> vec4f { return textureSampleLevel(uCloudNoise,uWrapSampler,uv,0.0); }
+""" + Season.Rendering.Effects.WeatherShaders.CommonWgsl
+    + Season.Rendering.Effects.WeatherShaders.CloudWgsl
+    + Season.Rendering.Effects.WeatherShaders.RainWgsl + """
 // 2-5 Step E: aerial-perspective froxel volume (binding 19, 32^3 rgba16float:
 // rgb=accumulated in-scattered radiance from the camera to that distance in linear HDR, a=accumulated opacity).
 // Always declared; when not ready, JS falls back to a 1x1x1 all-zero texture.
@@ -409,8 +440,8 @@ fn vs_main(input: VertexInput, @builtin(instance_index) instanceIndex: u32, @bui
         worldMatrix = u.world;
     }
     let worldPos = worldMatrix * localPosition;
-    output.position = u.projection * u.view * worldPos;
-    output.viewDepth = (u.view * worldPos).z;  // 1-5: V^T·v is the view-space coordinate, equivalent to Metal viewPos.z
+    output.position = uView.projection * uView.view * worldPos;
+    output.viewDepth = (uView.view * worldPos).z;  // 1-5: view-space z, equivalent to Metal viewPos.z
 
     // 2-3 Contract Clauses 6/9: rebuild prevClip (constant folding removes the whole block when VELOCITY_OUTPUT is disabled).
     // Outer sentinel: WGSL reads row-major bytes as column-major, so prevViewProjection[3] corresponds to row 4 in C#.
@@ -423,7 +454,7 @@ fn vs_main(input: VertexInput, @builtin(instance_index) instanceIndex: u32, @bui
     // Local position is rebuilt from rest pose by computePrevLocalPosition
     // (previous morph + previous bones, filling Clause 8(c)) instead of reusing current-frame localPosition.
     if (VELOCITY_OUTPUT) {
-        if (any(u.prevViewProjection[3] != vec4f(0.0))) {
+        if (any(uView.prevViewProjection[3] != vec4f(0.0))) {
             var prevWorldMatrix = worldMatrix;
             if ((u.flags.x & 2) != 0) {
                 let pb = instanceIndex * 5u;
@@ -433,7 +464,7 @@ fn vs_main(input: VertexInput, @builtin(instance_index) instanceIndex: u32, @bui
                 prevWorldMatrix = u.prevWorld;
             }
             let prevLocalPosition = computePrevLocalPosition(input, instanceIndex, vertexIndex);
-            output.prevClip = u.prevViewProjection * (prevWorldMatrix * prevLocalPosition);
+            output.prevClip = uView.prevViewProjection * (prevWorldMatrix * prevLocalPosition);
         }
     }
 
@@ -796,7 +827,8 @@ fn EvaluateIrradianceSH9(n: vec3f) -> vec3f {
 // (tile 8^2 = 6^2 inner core + 1px gutter. The absolute center texel is tile*8+1+oct*6, so normalized UV divides directly by atlas size).
 // worldPos is offset along the normal by giParams2.x (normalBias), then the 8 neighboring probes are sampled and mixed by trilinear weights
 // multiplied by cosine-direction weights. uSampler(filtering) bilinearly samples the inner octahedral core of each probe,
-// with the gutter handling seam overflow. The result is multiplied by GiIntensity.
+// with the gutter handling seam overflow. The result replaces the SH9/ambient term as a blend, and giParams1.w is the
+// weight of that blend rather than a scale on the probe value: see the return statement for why the difference matters.
 // When uLights.giParams2.y>0.5, a Chebyshev variance test is performed per probe using the depth-moment atlas,
 // and the resulting visibility factor is multiplied into the weight to suppress wall-gap, contact-area, and backside light leaks.
 // Since Step 5, invalid probes with tile alpha<0.5 (backface hit rate above the threshold, Clause 13) are removed from the weighting.
@@ -826,18 +858,26 @@ fn SampleProbeIrradiance(worldPos: vec3f, N: vec3f, fallback: vec3f) -> vec3f {
     let base = floor(gc);
     let f = gc - base;
 
-    // 2-4 clause 9: fade back to fallback outside the probe volume. gc is in probe-index units, so trilinear
+    // 2-4 clause 9: fade the probe contribution out beyond the last probe row. gc is in probe-index units, so trilinear
     // interpolation is only defined over [0, dims-1]; past that the clamp below collapses all eight corners onto a
     // single boundary probe, which hands a distant surface one near-camera probe's irradiance as if it were its own.
     // That reads as a whole surface lit uniformly by an unrelated probe, wobbling with that probe's amortized R2 ray
     // rotation and hysteresis rather than with anything in the scene, and it is the only lighting a face turned away
     // from every light has. The grid is camera-centred and re-snapped every frame in Ddgi.Record, so this covers
-    // everything past GiVolumeSize/2, not just distant scenery. Fading across the one spacing beyond the last probe
-    // keeps the edge from popping as the volume slides with the camera - within that band the clamped probe is still
-    // the nearest one, no further away than an interior interpolation reaches - and past it the result is exactly the
-    // pre-DDGI 1-7/1-2 diffuse term.
+    // everything past GiVolumeSize/2, not just distant scenery.
+    // Three decisions here, about the seam rather than its silhouette:
+    // 1. The band is giParams2.w cells wide, not one. One cell of linear ramp is already a hard-edged ring: it breaks the
+    //    gradient at both ends, and once the interior and the exterior differ by any amount that ring is what the eye
+    //    locks onto while the volume slides with the camera. Widen it and curve it - s(t)=t*t*(3-2t) is C1 at both ends.
+    // 2. The metric stays the axis-aligned max of the per-axis excess, not a radial length. A round band would only
+    //    redraw the same seam as a circle, because the shape is not what makes it visible - the step in the blend at the
+    //    end of this function is. Clauses 9/13 remove that step, so the band has nothing left to outline.
+    // 3. The fade never moves the result to a *different* amount of light: both ends settle on fallback, and an
+    //    unoccluded interior produces fallback term for term as well, so inside the band the two sides agree exactly.
     let outside = max(max(-gc, gc - (dims - vec3f(1.0))), vec3f(0.0));
-    let boundsFade = clamp(1.0 - max(max(outside.x, outside.y), outside.z), 0.0, 1.0);
+    let band = max(uLights.giParams2.w, 1.0);
+    var boundsFade = clamp(1.0 - max(max(outside.x, outside.y), outside.z) / band, 0.0, 1.0);
+    boundsFade = boundsFade * boundsFade * (3.0 - 2.0 * boundsFade);
 
     var sum = vec3f(0.0);
     var wsum = 0.0;
@@ -845,6 +885,8 @@ fn SampleProbeIrradiance(worldPos: vec3f, N: vec3f, fallback: vec3f) -> vec3f {
     for (var i: i32 = 0; i < 8; i = i + 1) {
         let off = vec3f(f32(i & 1), f32((i >> 1) & 1), f32((i >> 2) & 1));
         let tri = mix(vec3f(1.0) - f, f, off);
+        // 方向项是在几何权之上一路累乘的，所以必须是 var：let 在 WGSL 里不可赋值，
+        // 而这条错误只在浏览器首次建管线时才报，四端的文本契约都抓不到它。
         var w = tri.x * tri.y * tri.z;
         let pi = clamp(base + off, vec3f(0.0), dims - vec3f(1.0));
         let probePos = gridMin + (pi + vec3f(0.5)) * spacing;
@@ -883,16 +925,26 @@ fn SampleProbeIrradiance(worldPos: vec3f, N: vec3f, fallback: vec3f) -> vec3f {
         sum = sum + textureSampleLevel(uDdgiAtlas, uSampler, uv, 0.0).rgb * w;
         wsum = wsum + w;
     }
-    // Step 5: wsum/wraw gives the fraction of this shaded point's interpolation weight covered by valid probes.
-    // Use it to linearly blend between probe irradiance and fallback
-    // (the diffuse term that would exist without DDGI). If all 8 neighbors are invalid, including the atlas's zero-initialized state
-    // before the first update, the result naturally becomes pure fallback, and the transition stays continuous without threshold pops or flicker.
+    // Step 5 + clause 9 energy contract. wsum/wraw is the fraction of this shading point's interpolation weight that
+    // lands on valid probes; boundsFade is the coverage envelope; giParams1.w is how much of the probe field's deviation
+    // from the environment the application wants to show. All three scale the *blend*, never the probe value:
+    //     result = mix(fallback, probeIrr, valid * boundsFade * GiIntensity)
+    // That distinction is the whole of clause 9. A probe stores irradiance in the same units as EvaluateIrradianceSH9:
+    // a ray that misses multiplies the same SH radiance coefficients by the same cosine kernel the surface samples them
+    // with, and the update divides by the accumulated cosine weight, so the quotient is E(n)/pi. In an unoccluded, empty
+    // volume probeIrr therefore equals fallback term for term. Scaling probeIrr would turn any gain into a uniform
+    // brightness step between the inside and the outside of a camera-following box - at GiIntensity 0.4 the interior
+    // sits at 40% of the exterior, which in an ambient-only frame is the entire visible difference. Scaling the blend
+    // instead leaves that case identical for every gain, applies the same gain to real occlusion (probeIrr < fallback)
+    // and to real bounce (probeIrr > fallback), and still returns pure fallback at gain 0.
+    // If all 8 neighbors are invalid, including the zero-initialized atlas before the first update, wsum is zero and the
+    // result is pure fallback with a continuous transition and no threshold jumps or flicker.
     var probeIrr = vec3f(0.0);
     if (wsum > 1e-6) {
         probeIrr = sum / wsum;
     }
     let vfrac = clamp(wsum / max(wraw, 1e-6), 0.0, 1.0) * boundsFade;
-    return mix(fallback, probeIrr * uLights.giParams1.w, vec3f(vfrac));
+    return mix(fallback, probeIrr, vec3f(vfrac * uLights.giParams1.w));
 }
 
 fn HasTexture(flagMask: i32) -> bool {
@@ -1135,6 +1187,25 @@ struct FragmentOutput {
     @location(1) velocity: vec2f,
 };
 
+// A0.2: MRT slot 2 = SceneNormal. shade() leaves the encoded value in a private, which keeps its signature and every
+// existing caller unchanged; the initializer gives early-returning paths (text/2D) the zero clear value. Transparent
+// modes zero slot 2 through the PSO write mask, exactly as slot 1.
+struct FragmentOutputN {
+    @location(0) color: vec4f,
+    @location(1) velocity: vec2f,
+    @location(2) normal: vec4f,
+};
+
+var<private> gSceneNormal : vec4f = vec4f(0.0);
+
+// Octahedral encoding, textually identical to the other three backends. xy = 0 is a legal code (+Z), so consumers detect
+// no-surface pixels from SceneDepth at the far plane, not from this target.
+fn OctEncodeNormal(nIn: vec3f) -> vec2f {
+    let n = nIn / (abs(nIn.x) + abs(nIn.y) + abs(nIn.z));
+    let s = select(vec2f(-1.0), vec2f(1.0), n.xy >= vec2f(0.0));
+    return select((1.0 - abs(n.yx)) * s, n.xy, n.z >= 0.0);
+}
+
 fn shade(input: ShadeInput) -> vec4f {
     let texColor = textureSampleBias(uTexture, uSampler, input.uv, TEXTURE_LOD_BIAS);
     let albedo = texColor.rgb * u.baseColor.rgb;
@@ -1211,6 +1282,7 @@ fn shade(input: ShadeInput) -> vec4f {
         if (uLights.cloudParams0.w > 0.0 && skyDir.y > 0.0) {
             skyRadiance = CloudComposite(skyRadiance, skyDir, uLights.cameraPos.xz * 0.001);
         }
+        skyRadiance=WeatherCloudComposite(skyRadiance,uLights.cameraPos.xyz,skyDir,uLights.skyParams0.xyz);
 
         if (HDR_CHAIN) {
             // The LUT already stores linear HDR radiance, so output it directly and let the full FinalBlit
@@ -1292,6 +1364,11 @@ fn shade(input: ShadeInput) -> vec4f {
         roughness = min(1.0, sqrt(sqrt(ggxAlpha * ggxAlpha + twoOverKappa)));
     }
 
+    // A0.2: the final shading normal and the Toksvig-adjusted roughness, i.e. what SSR / decals must see.
+    if (NORMAL_OUTPUT) {
+        gSceneNormal = vec4f(OctEncodeNormal(N), roughness, metallic);
+    }
+
     let V = normalize(uLights.cameraPos.xyz - input.worldPos);
     var F0 = vec3f(0.04);
     F0 = mix(F0, albedo, metallic);
@@ -1321,7 +1398,7 @@ fn shade(input: ShadeInput) -> vec4f {
             // This differs from CSM, which only uses dirShadowIdx, because cloud shadows do not consume shadow-atlas slots and are not limited to one light.
             // Intentionally do not gate this by ShadowsEnabled, because that switch controls only CSM / the shadow atlas.
             // Cloud shadows should still sweep across the ground even when CSM is disabled, since that is a major lighting cue on overcast days.
-            radiance = radiance * computeCloudShadow(input.worldPos, L);
+            radiance = radiance * computeCloudShadow(input.worldPos, L) * WeatherCloudShadow(input.worldPos, L);
         } else {
             let toLight = uLights.lights[i].posRange.xyz - input.worldPos;
             let dist = length(toLight);
@@ -1358,7 +1435,7 @@ fn shade(input: ShadeInput) -> vec4f {
     // 1-7 Contract Clause 5: choose exactly one of SH9 ambient diffuse or constant ambient, since they share units and would double-count if added.
     // Both are gated by (1-metallic), because metallic surfaces have no diffuse term.
     // 2-4 Contract Clause 9: choose exactly one of three diffuse sources, never add them together.
-    // When DDGI is ready and GiIntensity>0, probe irradiance replaces the SH9/constant-ambient choice; otherwise the path fully falls back to 1-7/1-2.
+    // When DDGI is ready and GiIntensity>0, probe irradiance is blended over the SH9/constant-ambient choice by that weight; otherwise the path is exactly 1-7/1-2.
     // When DDGI_ENABLED is const false, the compiler removes that branch as dead code.
     // Clause 13: the probe path fades continuously back to giDiffuse based on validity, so giDiffuse also serves as the Step-5 fallback.
     let envDiffuse = EvaluateIrradianceSH9(N) * uLights.envParams.y;
@@ -1436,6 +1513,16 @@ fn fs_main_mrt(input: VertexOutput) -> FragmentOutput {
     return shadeVertexMrt(input);
 }
 
+// A0.2: gSceneNormal is read after shadeVertexMrt has run shade() for this invocation.
+fn withSceneNormal(output: FragmentOutput) -> FragmentOutputN {
+    return FragmentOutputN(output.color, output.velocity, gSceneNormal);
+}
+
+@fragment
+fn fs_main_mrtn(input: VertexOutput) -> FragmentOutputN {
+    return withSceneNormal(shadeVertexMrt(input));
+}
+
 // ── Phase 4 Outline2D mask entry (mirrors VK OUTLINE_MASK / DX PSOutlineMask semantics) ──
 // Alpha follows the material transparency chain (albedo alpha * material alpha; on Web, albedo is always sampled with White as fallback).
 // In MASK mode, fragments below the threshold are discarded. Color passes through the group color and alpha is always 1,
@@ -1459,6 +1546,11 @@ fn fs_main_outline_mask(input: VertexOutput) -> @location(0) vec4f {
     var output=shadeVertexMrt(input);
     output.color=ApplySceneFog(output.color,input.worldPos);
     return output;
+}
+@fragment fn fs_main_mrtn_fog(input:VertexOutput)->FragmentOutputN {
+    var output=shadeVertexMrt(input);
+    output.color=ApplySceneFog(output.color,input.worldPos);
+    return withSceneNormal(output);
 }
 """;
 

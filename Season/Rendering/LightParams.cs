@@ -112,8 +112,7 @@ public struct CloudLayerArray
 
 /// <summary>
 /// 1-2 lighting system: C#-side mirror of the main-pipeline lighting UBO, with contract layout defined by the 1-2, 1-5, and 1-7 sections in the RenderQuality header.
-/// The structure uses only vec4 and mat4 layout and has a total size of 1376 bytes
-/// (=48 + 8×64 + 4×64 + 64 + 4×16 + 16 + 9×16 + 3×16 + 5×16 + 9×16).
+/// 布局仅使用 vec4/mat4；原 1376 字节前缀不变，区域天气追加 1056 字节，共 2432 字节。
 /// The SceneLights UBO declared in shaders on all four backends must match it byte for byte.
 /// Byte offsets are:
 /// CameraPos=0, Ambient=16, Params0=32, Lights[i]=48+64i,
@@ -207,7 +206,11 @@ public struct SceneLightParams
     public System.Numerics.Vector4 GiParams0;
 
     /// <summary>Offset 1120, 2-4 DDGI: xyz = probe-grid dimensions gridX/gridY/gridZ, stored as float integers and recovered by int() in shaders;
-    /// w = GiIntensity, the diffuse indirect-light multiplier on the consumer side, where 0 means the A-side falls back to the old image.
+    /// w = GiIntensity, the **blend weight** between the pre-DDGI diffuse term and the probe result on the consumer side:
+    /// the shader evaluates lerp(fallback, probeIrr, valid·boundsFade·w), so 0 falls back to the old image and 1 uses the
+    /// probes in full, while an unoccluded point evaluates to the same value for every setting in between.
+    /// It is deliberately not a multiplier on probeIrr: probe irradiance is stored in the same units as EvaluateIrradianceSH9
+    /// (E/pi), so scaling it would be a uniform brightness step across the camera-centred volume instead of a gain on GI.
     /// Atlas pixel size is derived in the shader from these dimensions, with atlasW=gridX·gridZ·8, atlasH=gridY·8, tile=8, inner core=6, and border=1 pixel.</summary>
     public System.Numerics.Vector4 GiParams1;
 
@@ -215,9 +218,10 @@ public struct SceneLightParams
     /// x = normalBias for probe sampling;
     /// y = Chebyshev visibility switch, enabled when &gt;0.5. It is a runtime knob, on by default, and injected every frame by Apply from GiChebyshevOcclusion;
     /// z = atlasReady, meaning the real probe atlas is bound this frame when &gt;0.5, otherwise a fallback is bound;
-    /// w reserved as 0.
-    /// Consumer-side selection is a three-way gate:
-    /// DDGI_ENABLED &amp;&amp; GiParams2.z&gt;0.5 &amp;&amp; GiParams1.w&gt;0 ? probe : (EnvParams.z&gt;0.5 ? SH9 : Ambient).</summary>
+    /// w = width of the coverage fade band in probe cells (DdgiEffect.FadeBandCells), consumed by the consumer to fade the
+    /// probe contribution out beyond the last probe row. Values below 1 are clamped to 1 so a zeroed block cannot divide by zero.
+    /// Consumer-side selection is a four-way product:
+    /// DDGI_ENABLED &amp;&amp; GiParams2.z&gt;0.5 &amp;&amp; GiParams1.w&gt;0 ? blend toward probe : (EnvParams.z&gt;0.5 ? SH9 : Ambient).</summary>
     public System.Numerics.Vector4 GiParams2;
 
     /// <summary>Offset 1152, 2-5 Step B (b11), for analytic celestial disks:
@@ -300,6 +304,13 @@ public struct SceneLightParams
     /// zw are reserved.
     /// Non-procedural sky, disabled AerialPerspective, and a missing 3D texture all force this field to zero, see <c>SkyLighting.ApplyAerial</c>.</summary>
     public System.Numerics.Vector4 ApParams0;
+
+    /// <summary>偏移 1376：区域数、云可用性、区域层数、雨幕采样预算。</summary>
+    public Vector4 WeatherParams0;
+    /// <summary>偏移 1392：雨幕近端渐入起止（米）、最大距离、是否存在降雨。</summary>
+    public Vector4 WeatherParams1;
+    /// <summary>偏移 1408：8 个区域，每区域 8 行；详见 WeatherVisualState。</summary>
+    public WeatherVisualArray WeatherRegions;
 
     /// <summary>Convenience accessor for lightCount, wrapping the float-as-integer semantic of Params0.X and clamping writes into [0, MaxLights].</summary>
     public int LightCount

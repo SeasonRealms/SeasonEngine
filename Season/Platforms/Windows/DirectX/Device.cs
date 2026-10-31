@@ -503,7 +503,7 @@ internal unsafe static class Device
             // Immediate-2D mode (Season.Rendering.Immediate2DMode) never runs the Scene pass, so the
             // MSAA target is suppressed outright. The tier value itself stays untouched - it is inert
             // in this mode and may be persisted in settings.
-            uint msaaSampleCount = !Season.Rendering.Immediate2DMode.Enabled && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x ? 4u : 1u;
+            uint msaaSampleCount = !Season.Rendering.Immediate2DMode.Enabled && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x ? 4u : 1u;
             Display = new Display(D3dDevice, BackBufferFormat, DepthBufferFormat, msaaSampleCount);
             Display.SetClearColor(BackgroundColor);
             Display.Initialize(width, height);
@@ -1321,6 +1321,16 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     internal static DXRenderTarget? ActiveTarget => _activePass;
     internal static DXRenderTarget? ActiveDepthTarget { get; private set; }
 
+    /// <summary>Velocity target actually bound as MRT slot 1 by the current pass, or null when the
+    /// pass bound a single render target. Side pipelines that record their own draws inside the scene
+    /// pass must bake a PSO with the matching render-target count, and the PassDesc they were prepared
+    /// against is not enough to know it: only the scene passes bind slot 1 at all.</summary>
+    internal static DXRenderTarget? ActiveVelocityTarget { get; private set; }
+
+    /// <summary>A0.2: normal target actually bound as MRT slot 2 by the current pass, or null. Only ever non-null while
+    /// <see cref="ActiveVelocityTarget"/> is, so side pipelines bake 1, 2 or 3 render targets from the pair.</summary>
+    internal static DXRenderTarget? ActiveNormalTarget { get; private set; }
+
     /// <summary>Identifier of the current pass (set by BeginPass / restored by
     /// EndPass, default is Scene).
     /// Overlay uses this so Pipeline.SetPipeline can switch to a dedicated PSO
@@ -1360,8 +1370,12 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     // rebuilt in the same slot and on the same wrapper object so external
     // references such as FrameSchedule.SceneColor / ShadowMap stay valid.
 
-    const uint OffscreenRtvCapacity = 8;
-    const uint OffscreenDsvCapacity = 4;
+    // Capacity covers the main view's targets (SceneColor / SceneVelocity / SceneNormal / PostColor), the
+    // fixed-size effect targets (fog and weather composite, outline mask) and every secondary view's own set
+    // (SceneColor + UiColor, plus velocity/normal when the process bakes the MRT shape). Descriptors are cheap;
+    // running out would throw at view creation time, so the reserve is generous rather than tight.
+    const uint OffscreenRtvCapacity = 24;
+    const uint OffscreenDsvCapacity = 8;
     static readonly Stack<uint> _freeOffscreenRtvSlots = new();
     static uint _nextOffscreenRtvSlot;
     static readonly Stack<int> _freeOffscreenDsvSlots = new();
@@ -1670,6 +1684,7 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         "SceneOpaque\0"u8.ToArray(),
         "FogComposite\0"u8.ToArray(),
         "SceneTransparent\0"u8.ToArray(),
+        "WeatherComposite\0"u8.ToArray(),
         "Pass\0"u8.ToArray(),
     ];
 
@@ -1732,6 +1747,8 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     {
         ActivePassId = desc.Id;
         ActiveDepthTarget = null;
+        ActiveVelocityTarget = null;
+        ActiveNormalTarget = null;
         if (desc.Id is RenderPassId.Scene or RenderPassId.SceneOpaque or RenderPassId.Shadow)
             DXFogCompositePipeline.ResetTransparent();
         int passIndex = (int)desc.Id;
@@ -1818,7 +1835,10 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         }
 
         bool scenePass = desc.Id is RenderPassId.Scene or RenderPassId.SceneOpaque or RenderPassId.SceneTransparent;
-        if (scenePass || desc.Id == RenderPassId.OutlineMask)
+        // D1: 贴花 Pass 不带深度附件（深度是采样源），但 s9 的粗糙度写入要把 SceneNormal 挂成第二个颜色附件。
+        // 这是唯一一种「法线不跟速度同时出现」的挂法：贴花不写速度，也不会动到不透明阶段写下的值。
+        bool decalPass = desc.Id == RenderPassId.SceneDecal;
+        if (scenePass || decalPass || desc.Id == RenderPassId.OutlineMask)
         {
             // Scene / OutlineMask bind depth. Post/FinalBlit are single-sampled
             // fullscreen passes and do not read or write depth. When MSAA is
@@ -1842,6 +1862,7 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
                 ActiveDepthTarget = sceneDepth;
             }
             bool bindDepth = desc.Id != RenderPassId.OutlineMask || _msaaSampleCount <= 1 || desc.DepthTarget is DXRenderTarget;
+            if (decalPass) bindDepth = false;
 
             // 2-3 contract rule 2: Scene uses three targets
             // (slot 0=color, slot 1=velocity, plus depth).
@@ -1850,9 +1871,20 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
             // MotionVectors and Msaa4x are already mutually exclusive after
             // initialization fallback, so this path never sees multisampled
             // color mixed with single-sampled velocity.
-            if (scenePass && desc.VelocityTarget is DXRenderTarget velocityRT)
+            if (decalPass && desc.NormalTarget is DXRenderTarget decalNormal)
+            {
+                decalNormal.TransitionTo(GraphicsCommandList, ResourceStates.RenderTarget);
+                ActiveNormalTarget = decalNormal;
+
+                // 不清除：贴花只在已有几何上混合，写掩码也只开 B 通道（粗糙度）。
+                var decalNormalRtv = RtvHeapManager.GetCpuHandle(decalNormal.RtvIndex);
+                CpuDescriptorHandle* rtvs2 = stackalloc CpuDescriptorHandle[2] { rtvHandle, decalNormalRtv };
+                GraphicsCommandList->OMSetRenderTargets(2, rtvs2, 0, null);
+            }
+            else if (scenePass && desc.VelocityTarget is DXRenderTarget velocityRT)
             {
                 velocityRT.TransitionTo(GraphicsCommandList, ResourceStates.RenderTarget);
+                ActiveVelocityTarget = velocityRT;
 
                 var velocityRtvHandle = RtvHeapManager.GetCpuHandle(velocityRT.RtvIndex);
 
@@ -1865,8 +1897,28 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
                     GraphicsCommandList->ClearRenderTargetView(velocityRtvHandle, velocityClear, 0, null);
                 }
 
-                CpuDescriptorHandle* rtvs = stackalloc CpuDescriptorHandle[2] { rtvHandle, velocityRtvHandle };
-                GraphicsCommandList->OMSetRenderTargets(2, rtvs, 0, bindDepth ? &dsvHandle : null);
+                // A0.2 contract clause 2: slot 2 = normal, bound only on top of velocity. Same zero clear (the optimized
+                // clear value baked from RenderTargetDesc.ClearColor = 0) and the same load-in-transparent rule.
+                if (desc.NormalTarget is DXRenderTarget normalRT)
+                {
+                    normalRT.TransitionTo(GraphicsCommandList, ResourceStates.RenderTarget);
+                    ActiveNormalTarget = normalRT;
+
+                    var normalRtvHandle = RtvHeapManager.GetCpuHandle(normalRT.RtvIndex);
+                    if (desc.ClearColorEnable)
+                    {
+                        float* normalClear = stackalloc float[4] { 0f, 0f, 0f, 0f };
+                        GraphicsCommandList->ClearRenderTargetView(normalRtvHandle, normalClear, 0, null);
+                    }
+
+                    CpuDescriptorHandle* rtvs3 = stackalloc CpuDescriptorHandle[3] { rtvHandle, velocityRtvHandle, normalRtvHandle };
+                    GraphicsCommandList->OMSetRenderTargets(3, rtvs3, 0, bindDepth ? &dsvHandle : null);
+                }
+                else
+                {
+                    CpuDescriptorHandle* rtvs = stackalloc CpuDescriptorHandle[2] { rtvHandle, velocityRtvHandle };
+                    GraphicsCommandList->OMSetRenderTargets(2, rtvs, 0, bindDepth ? &dsvHandle : null);
+                }
             }
             else
             {

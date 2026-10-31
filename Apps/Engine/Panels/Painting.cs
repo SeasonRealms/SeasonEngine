@@ -208,14 +208,14 @@ internal class Painting : Panel
         float slotY = border.PosY + (border.Height ?? 0f) / 2f;
         float rowX = select.PosX + (select.Width ?? 0f); // Row start, flush with the right edge of select.
 
-        var camera = App.Instance.Camera;
+        var view = Season.Rendering.RenderView.Current;
         float resX = App.Instance.ExtendResolution.X;
         float resY = App.Instance.ExtendResolution.Y;
 
         // Use a ray pair each frame to estimate the world-space width of one preview cell at PreviewDistance.
         float cellWorld = 0f;
-        if (Season.Rendering.Picking.ScreenPointToRay(rowX, slotY, camera, resX, resY, out var originL, out var dirL)
-            && Season.Rendering.Picking.ScreenPointToRay(rowX + size, slotY, camera, resX, resY, out var originR, out var dirR))
+        if (Season.Rendering.Picking.ScreenPointToRay(rowX, slotY, view, resX, resY, out var originL, out var dirL)
+            && Season.Rendering.Picking.ScreenPointToRay(rowX + size, slotY, view, resX, resY, out var originR, out var dirR))
         {
             cellWorld = Vector3.Distance(originL + dirL * PreviewDistance, originR + dirR * PreviewDistance);
         }
@@ -233,7 +233,7 @@ internal class Painting : Panel
 
             if (mesh3D.Ready
                 && cellWorld > 0f
-                && Season.Rendering.Picking.ScreenPointToRay(mesh3DX, slotY, camera, resX, resY, out var origin, out var dir))
+                && Season.Rendering.Picking.ScreenPointToRay(mesh3DX, slotY, view, resX, resY, out var origin, out var dir))
             {
                 var pos = origin + dir * PreviewDistance;
                 mesh3D.PosX = pos.X;
@@ -480,7 +480,7 @@ internal class Painting : Panel
         bool rayValid = false;
         Vector3 rayOrigin = default, rayDirection = default;
         if (pointerValid && !overBar && simplePicker == null
-            && Season.Rendering.Picking.ScreenPointToRay(pointerX, pointerY, app.Camera,
+            && Season.Rendering.Picking.ScreenPointToRay(pointerX, pointerY, Season.Rendering.RenderView.Current,
                 app.ExtendResolution.X, app.ExtendResolution.Y, out rayOrigin, out rayDirection))
         {
             rayValid = true;

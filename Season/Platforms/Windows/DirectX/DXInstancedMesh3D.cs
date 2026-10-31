@@ -35,9 +35,9 @@ internal unsafe class DXInstancedMesh3D : DXInstancedPrimitiveGroup
     {
     }
 
-    public void Load(InstancedMesh3D mesh, Season.Basic.Camera camera, Func<Season.Controls.Surface, TextureSlot, DXTexture> resolveTexture)
+    public void Load(InstancedMesh3D mesh, Func<Season.Controls.Surface, TextureSlot, DXTexture> resolveTexture)
     {
-        CreateSharedMatrixBuffers(camera);
+        CreateSharedMatrixBuffers();
 
         foreach (var surface in mesh.Surfaces)
             _primitives.Add(CreatePrimitiveData(surface, resolveTexture));

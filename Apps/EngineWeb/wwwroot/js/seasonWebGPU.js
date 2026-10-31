@@ -91,6 +91,9 @@ window.seasonWebGPU = (() => {
     // It shares the same bindGroupLayout as the main table,
     // so bind groups can be reused across tables.
     let _mesh3DPipelineVelocity = null, _velocityOutput = false;
+    // A0.2: SceneNormal (MRT slot 2, rgba16float). Fixed at initialize and only ever true with _velocityOutput, so
+    // it does not add a table: it changes the velocity table itself to fs_main_mrtn + three targets.
+    let _normalOutput = false;
     // Overlay PSO family (backbuffer format + depth off):
     // the Overlay pass (passId===5) renders directly to the backbuffer.
     // In HDR mode, attachment state is incompatible with _sceneFormat (rgba16float),
@@ -153,7 +156,7 @@ window.seasonWebGPU = (() => {
 
     function _clearActivePass() {
         _activePassId = -1; _activeColorTarget = _activeColorView = _activeDepthView = null;
-        _passDepthOnly = _passVelocity = _passOutlineMask = _passOverlay = false;
+        _passDepthOnly = _passVelocity = _passNormal = _passOutlineMask = _passOverlay = false;
     }
 
     // Buffer pools: grouped by usage and reused by resetting cursors each frame
@@ -727,7 +730,7 @@ window.seasonWebGPU = (() => {
     // the Overlay family and passes it here, while this backend still bakes the overlay PSOs from the main module.
     // The parameter is declared so the positional slot is visible rather than silently dropped, which is what let the
     // trailing maxAnisotropy argument be added safely behind it.
-    async function initialize(canvasId, shaderSource, blitShaderSource, hdrSceneColor, shadowDepthBias, shadowSlopeBias, velocityOutput, overlayShaderSource, maxAnisotropy = 1, fogSampling = false) {
+    async function initialize(canvasId, shaderSource, blitShaderSource, hdrSceneColor, shadowDepthBias, shadowSlopeBias, velocityOutput, overlayShaderSource, maxAnisotropy = 1, fogSampling = false, normalOutput = false) {
         if (_device) throw new Error('Reload the page before starting a second WebGPU host');
         _mesh3DShader = shaderSource;
         _blitShaderWGSL = blitShaderSource;
@@ -743,6 +746,8 @@ window.seasonWebGPU = (() => {
         // The WGSL VELOCITY_OUTPUT constant has already been injected in sync
         // through C# string replacement.
         _velocityOutput = !!velocityOutput;
+        // A0.2: the WGSL NORMAL_OUTPUT constant has been injected in sync by the same C# substitution.
+        _normalOutput = _velocityOutput && !!normalOutput;
         if (!navigator.gpu) throw new Error('WebGPU not supported.');
         const adapter = await navigator.gpu.requestAdapter();
         if (!adapter) throw new Error('WebGPU adapter unavailable.');
@@ -1351,6 +1356,11 @@ window.seasonWebGPU = (() => {
         return { format: 'rg16float', writeMask: modeKey.startsWith('opaque') ? GPUColorWrite.ALL : 0 };
     }
 
+    // A0.2: slot 2 follows slot 1's rule - only opaque surfaces are what SSR / decals should see.
+    function _createNormalTarget(modeKey) {
+        return { format: 'rgba16float', writeMask: modeKey.startsWith('opaque') ? GPUColorWrite.ALL : 0 };
+    }
+
     function _createUnifiedPipelineVariant(shaderModule, bindGroupLayout, modeKey, cullModeKey = 'back', vertexEntryPoint = 'vs_main', vertexBuffers = null, velocity = false, overlay = false) {
         // 2-2 contract clause 7:
         // suffix Nd = GTAO-exempt mode, routed from the flags.w NoDepthWrite bit.
@@ -1382,6 +1392,11 @@ window.seasonWebGPU = (() => {
         // 复用现有透明 PSO 档位；不为雾再创建一套材质变体矩阵。
         const sampleFog = !!_fogSampling && !overlay && !modeKey.startsWith('opaque');
         const layouts = sampleFog ? [bindGroupLayout, _fogSampling.layout] : [bindGroupLayout];
+        const normal = velocity && _normalOutput;
+        const targets = velocity
+            ? [_createColorTarget(modeKey), _createVelocityTarget(modeKey)]
+            : [_createColorTarget(modeKey, overlay ? _format : null)];
+        if (normal) targets.push(_createNormalTarget(modeKey));
         const pipeline = _device.createRenderPipeline({
             layout: _device.createPipelineLayout({ bindGroupLayouts: layouts }),
             vertex: {
@@ -1397,10 +1412,9 @@ window.seasonWebGPU = (() => {
                 // Both share the same shade() body.
                 // WGSL has no preprocessor, so entry-point dispatch is used instead of
                 // #ifdef output-struct branching.
-                entryPoint: (velocity ? 'fs_main_mrt' : 'fs_main') + (sampleFog ? '_fog' : ''),
-                targets: velocity
-                    ? [_createColorTarget(modeKey), _createVelocityTarget(modeKey)]
-                    : [_createColorTarget(modeKey, overlay ? _format : null)],
+                // A0.2: fs_main_mrtn adds slot 2 (SceneNormal) when the process baked NORMAL_OUTPUT.
+                entryPoint: (velocity ? (normal ? 'fs_main_mrtn' : 'fs_main_mrt') : 'fs_main') + (sampleFog ? '_fog' : ''),
+                targets,
             },
             primitive: {
                 topology: 'triangle-list',
@@ -1431,6 +1445,10 @@ window.seasonWebGPU = (() => {
     // draw sites implicitly route to the MRT variant table,
     // with zero new draw API on the C# side.
     let _passVelocity = false;
+    // A0.2: set by beginPass when the SceneNormal attachment (slot 2) is present, reset by endPass. Draw sites do not
+    // route on it - the velocity table already carries slot 2 when _normalOutput - it only lets them refuse a pass
+    // whose attachment set disagrees with what was baked.
+    let _passNormal = false;
     // Phase 4 Outline2D:
     // OutlineMask pass flag
     // set by beginPass when passId===3 and reset by endPass.
@@ -1457,6 +1475,8 @@ window.seasonWebGPU = (() => {
         // The overlay family bakes _format + depth off,
         // avoiding HDR backbuffer attachment-state incompatibility (rule 3).
         if (_passOverlay && _mesh3DPipelineOverlay) return _mesh3DPipelineOverlay;
+        // A0.2: a velocity pass without slot 2 under _normalOutput (or vice versa) is a caller bug; it falls through
+        // to WebGPU validation exactly like the missing-table case above.
         return (_passVelocity && _mesh3DPipelineVelocity) ? _mesh3DPipelineVelocity : _mesh3DPipeline;
     }
 
@@ -2450,6 +2470,7 @@ window.seasonWebGPU = (() => {
         _poolCursor.vertex = _poolCursor.index = _poolCursor.uniform = _poolCursor.storage = 0;
         _computeFrameId++;
         _fogSamplingFrame = null;
+        _weatherSamplingFrame = null;
         // 2-3 Step C: frame serial
         // gate for the "roll prev bone shadow copy exactly once per frame" rule
         _frameSerial++;
@@ -2468,15 +2489,15 @@ window.seasonWebGPU = (() => {
     // Offscreen targets are introduced in Step 2.
     // passId order matches the C# RenderPassId enum,
     // and the debug group is attached at the encoder level to wrap the whole pass (Step 0).
-    const _passLabels = ['Shadow', 'Scene', 'Post', 'OutlineMask', 'FinalBlit', 'Overlay', 'SceneOpaque', 'FogComposite', 'SceneTransparent'];
+    const _passLabels = ['Shadow', 'Scene', 'Post', 'OutlineMask', 'FinalBlit', 'Overlay', 'SceneOpaque', 'FogComposite', 'SceneTransparent', 'WeatherComposite'];
 
-    function beginPass(passId, targetName, clearColorEnable, clearR, clearG, clearB, clearA, clearDepthEnable, storeDepth, depthTargetName, velocityTargetName) {
+    function beginPass(passId, targetName, clearColorEnable, clearR, clearG, clearB, clearA, clearDepthEnable, storeDepth, depthTargetName, velocityTargetName, normalTargetName) {
         if (!_frameStarted || !_commandEncoder) return;
         if (_passEncoder) throw new Error('不能嵌套 WebGPU 渲染 Pass');
         if (_isSceneCollecting()) throw new Error('场景收集封存之前不能开始渲染 Pass');
         const fogTarget = targetName ? _renderTargets[targetName] : null;
-        if (passId === 7 && (!fogTarget || fogTarget.depthOnly || !fogTarget.noImplicitDepth
-            || fogTarget.colorFormat !== 'rgba16float' || depthTargetName || velocityTargetName))
+        if ((passId === 7 || passId === 9) && (!fogTarget || fogTarget.depthOnly || !fogTarget.noImplicitDepth
+            || fogTarget.colorFormat !== 'rgba16float' || depthTargetName || velocityTargetName || normalTargetName))
             throw new Error('雾合成必须使用独立 HDR 颜色目标，不能挂载深度或速度');
         _clearActivePass();
 
@@ -2528,6 +2549,18 @@ window.seasonWebGPU = (() => {
         }
         const velocityView = vrt ? vrt.colorView : null;
 
+        // A0.2: SceneNormal attachment (MRT slot 2, formatKind 5 = rgba16float without companion depth), only ever next to
+        // slot 1. Cleared to (0,0,0,0) and loaded/stored exactly like velocity.
+        const nrt = (velocityView && normalTargetName) ? _renderTargets[normalTargetName] : null;
+        if (nrt) {
+            if (nrt.depthOnly || nrt.colorFormat !== 'rgba16float')
+                throw new Error('SceneNormal 必须是 rgba16float 颜色目标');
+            if (nrt.matchBackbuffer && (nrt.width !== _canvas.width || nrt.height !== _canvas.height)) {
+                _resizeRenderTargetResources(nrt, _canvas.width, _canvas.height);
+            }
+        }
+        const normalView = nrt ? nrt.colorView : null;
+
         const colorAttachments = depthOnly ? [] : [{
             view: colorView,
             clearValue: { r: clearR, g: clearG, b: clearB, a: clearA },
@@ -2542,13 +2575,21 @@ window.seasonWebGPU = (() => {
                 storeOp: 'store',
             });
         }
+        if (normalView) {
+            colorAttachments.push({
+                view: normalView,
+                clearValue: { r: 0, g: 0, b: 0, a: 0 },
+                loadOp: clearColorEnable ? 'clear' : 'load',
+                storeOp: 'store',
+            });
+        }
 
         _passEncoder = _commandEncoder.beginRenderPass({
             // Depth-only passes (shadow maps) use a depth-only attachment set,
             // and contents must be rendered through the dedicated depth32float pipeline (1-5)
             colorAttachments,
             // FogComposite=7 只写颜色，不挂载也不清除原场景深度。
-            depthStencilAttachment: passId === 7 ? undefined : {
+            depthStencilAttachment: (passId === 7 || passId === 9) ? undefined : {
                 view: depthView,
                 depthClearValue: 1.0,
                 depthLoadOp: clearDepthEnable ? 'clear' : 'load',
@@ -2564,6 +2605,7 @@ window.seasonWebGPU = (() => {
         // 2-3: the velocity flag drives draw sites to switch to the MRT variant table
         // attachment set and pipeline must match exactly, per rule 3
         _passVelocity = !!velocityView;
+        _passNormal = !!normalView;
         // Phase 4: OutlineMask pass (RenderPassId.OutlineMask=3)
         // routes draw sites to the mask pipeline
         _passOutlineMask = (passId === 3);
@@ -2574,7 +2616,7 @@ window.seasonWebGPU = (() => {
         _activePassId = passId;
         _activeColorTarget = rt;
         _activeColorView = colorView;
-        _activeDepthView = passId === 7 ? null : depthView;
+        _activeDepthView = (passId === 7 || passId === 9) ? null : depthView;
     }
 
     function endPass() {
@@ -2792,7 +2834,7 @@ window.seasonWebGPU = (() => {
     // semantically identical to SetLighting on the other three backends.
     // Length must exactly match C# SceneLightParams.Bytes,
     // or updateSceneLights silently drops the upload.
-    const SCENE_LIGHT_BYTES = 1376;
+    const SCENE_LIGHT_BYTES = 2432;
     let _sceneLightBuffer = null;
 
     function _ensureSceneLightBuffer() {
@@ -3653,7 +3695,7 @@ window.seasonWebGPU = (() => {
     // This is zero-allocation in steady state.
 
     // group(1) 与共享光照 UBO 分离。启停参数创建后不再写入，避免同帧覆盖。
-    let _fogSampling = null, _fogSamplingFrame = null;
+    let _fogSampling = null, _fogSamplingFrame = null, _weatherSamplingFrame = null;
     const _fogMaterialPipelines = new WeakSet();
 
     function _initializeFogSampling() {
@@ -3670,11 +3712,11 @@ window.seasonWebGPU = (() => {
             const frame = _device.createBuffer({ label: 'fog_disabled_frame', size: _fogFrameBytes,
                 usage: GPUBufferUsage.STORAGE });
             buffers.push(frame);
-            const params = [0, 1].map(value => {
+            const params = [0, 1, 2, 3].map(value => {
                 const buffer = _device.createBuffer({ label: `fog_sampling_${value}`, size: 16,
                     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
                 buffers.push(buffer);
-                _device.queue.writeBuffer(buffer, 0, new Float32Array([value, 0, 0, 0]));
+                _device.queue.writeBuffer(buffer, 0, new Float32Array([value & 1, value >> 1, 0, 0]));
                 return buffer;
             });
             // 关闭分支不会查询介质；复用已有 AP 哨兵，不分配额外雾体积。
@@ -3684,7 +3726,13 @@ window.seasonWebGPU = (() => {
                 { binding: 2, resource: _defaultAerialLutView },
                 { binding: 3, resource: { buffer: params[0], size: 16 } },
             ] });
-            _fogSampling = { layout, disabled, enabledParams: params[1], buffers };
+            const weatherOnly = _device.createBindGroup({ layout, entries: [
+                { binding: 0, resource: { buffer: frame, size: _fogFrameBytes } },
+                { binding: 1, resource: _defaultAerialLutView },
+                { binding: 2, resource: _defaultAerialLutView },
+                { binding: 3, resource: { buffer: params[2], size: 16 } },
+            ] });
+            _fogSampling = { layout, disabled, weatherOnly, enabledParams: params[1], combinedParams: params[3], buffers };
         } catch (error) {
             for (const buffer of buffers) _queueComputeRetirement(buffer);
             throw error;
@@ -3692,13 +3740,16 @@ window.seasonWebGPU = (() => {
     }
 
     function _fogMaterialGroup() {
-        const frame = _fogSamplingFrame;
-        if (!_sceneFogAllowed || !frame || !_frameStarted || !_passEncoder || _instancedDiag.deviceLost || _activePassId !== 8
-            || frame.command !== _commandEncoder || frame.frameId !== _computeFrameId
-            || _activeColorTarget !== frame.refs[13] || _activeColorView !== frame.refs[12]
-            || _activeDepthView !== frame.refs[10]
-            || !_sameFogResources(frame.refs, _resolveFogComposite(frame.input))) return _fogSampling.disabled;
-        return frame.samplingGroup;
+        if (!_frameStarted || !_passEncoder || _instancedDiag.deviceLost || _activePassId !== 8) return _fogSampling.disabled;
+        const frame = _fogSamplingFrame, rain = _weatherSamplingFrame;
+        const fog = _sceneFogAllowed && frame && frame.command === _commandEncoder && frame.frameId === _computeFrameId
+            && _activeColorTarget === frame.refs[13] && _activeColorView === frame.refs[12]
+            && _activeDepthView === frame.refs[10] && _sameFogResources(frame.refs, _resolveFogComposite(frame.input));
+        const weather = rain && rain.command === _commandEncoder && rain.frameId === _computeFrameId
+            && _activeDepthView === rain.refs[10] && _sameFogResources(rain.refs, _resolveFogComposite(rain.input))
+            && (fog || (_activeColorTarget === rain.refs[13] && _activeColorView === rain.refs[12]));
+        if (fog) return weather ? frame.weatherSamplingGroup : frame.samplingGroup;
+        return weather ? _fogSampling.weatherOnly : _fogSampling.disabled;
     }
 
     function _setMeshPipeline(value) {
@@ -3708,23 +3759,25 @@ window.seasonWebGPU = (() => {
 
     // 独立雾合成：生产 WGSL 由 C# 提供；异步编译完成前 Prepare 明确回退。
     const _fogComposites = Object.create(null);
-    const _fogFrameBytes = 384 * 16;
+    const _fogFrameBytes = 448 * 16;
+    const _weatherFrameBytes = 160 * 16;
     const _fogAoFormats = new Set(['r8unorm', 'r16float', 'rg16float', 'rgba16float',
         'rgba8unorm', 'bgra8unorm']);
 
-    function createFogCompositePipeline(name, vertex, fragment) {
+    function createFogCompositePipeline(name, vertex, fragment, weather = false) {
         if (!_device || _instancedDiag.deviceLost || !name) return false;
         if (_fogComposites[name]) return !_fogComposites[name].failed;
         const device = _device;
-        const state = { device, pipeline: null, slots: [], cursor: 0, frameId: -1, prepared: null, failed: false };
+        const state = { device, weather, frameBytes: weather ? _weatherFrameBytes : _fogFrameBytes,
+            pipeline: null, slots: [], cursor: 0, frameId: -1, prepared: null, failed: false };
         let scopeOpen = false;
         try {
             device.pushErrorScope('validation'); scopeOpen = true;
             const visibility = GPUShaderStage.FRAGMENT;
             state.layout = device.createBindGroupLayout({ label: `${name}_layout`, entries: [
-                { binding: 0, visibility, buffer: { type: 'read-only-storage', minBindingSize: _fogFrameBytes } },
-                { binding: 1, visibility, texture: { sampleType: 'float', viewDimension: '3d' } },
-                { binding: 2, visibility, texture: { sampleType: 'float', viewDimension: '3d' } },
+                { binding: 0, visibility, buffer: { type: 'read-only-storage', minBindingSize: state.frameBytes } },
+                { binding: 1, visibility, texture: { sampleType: 'float', viewDimension: weather ? '2d' : '3d' } },
+                { binding: 2, visibility, texture: { sampleType: 'float', viewDimension: weather ? '2d' : '3d' } },
                 { binding: 3, visibility, texture: { sampleType: 'float', viewDimension: '2d' } },
                 { binding: 4, visibility, texture: { sampleType: 'depth', viewDimension: '2d' } },
                 { binding: 5, visibility, texture: { sampleType: 'float', viewDimension: '2d' } },
@@ -3769,7 +3822,7 @@ window.seasonWebGPU = (() => {
         const destination = _renderTargets[input.destination], frame = _storageBuffers[input.frame];
         if (!color || !depth || !destination || color.depthOnly || !depth.depthOnly || destination.depthOnly
             || !destination.noImplicitDepth || destination.depthTex || destination.depthView
-            || !frame || frame.size < _fogFrameBytes || !(frame.usage & GPUBufferUsage.STORAGE)
+            || !frame || frame.size < (input.weather ? _weatherFrameBytes : _fogFrameBytes) || !(frame.usage & GPUBufferUsage.STORAGE)
             || !Number.isFinite(input.aoIntensity) || input.aoIntensity < 0) return null;
         // 输入绝不在此重建；过期尺寸代表本帧数据不完整，必须回退。
         for (const rt of [color, depth, destination])
@@ -3785,11 +3838,11 @@ window.seasonWebGPU = (() => {
             || c.width !== color.width || c.height !== color.height
             || d.width !== depth.width || d.height !== depth.height
             || out.width !== destination.width || out.height !== destination.height) return null;
-        const integrated = _textures3d[input.integrated], local = _textures3d[input.local];
-        if (!_fogTexture(integrated, '3d', sampled) || !_fogTexture(local, '3d', sampled)
+        const integrated = input.weather ? c : _textures3d[input.integrated], local = input.weather ? c : _textures3d[input.local];
+        if (!input.weather && (!_fogTexture(integrated, '3d', sampled) || !_fogTexture(local, '3d', sampled)
             || integrated.format !== 'rgba16float' || local.format !== 'rgba16float'
             || integrated.width !== local.width || integrated.height !== local.height
-            || integrated.depthOrArrayLayers !== local.depthOrArrayLayers + 1) return null;
+            || integrated.depthOrArrayLayers !== local.depthOrArrayLayers + 1)) return null;
         let ao = c, aoView = color.colorView;
         if (input.applyAo) {
             if (input.aoTarget) {
@@ -3803,8 +3856,10 @@ window.seasonWebGPU = (() => {
             if (!_fogTexture(ao, '2d', sampled) || ao.depthOrArrayLayers !== 1
                 || !_fogAoFormats.has(ao.format) || ao === out) return null;
         }
-        const refs = [frame, integrated, local, c, d, ao, out, _textureViews3d[input.integrated],
-            _textureViews3d[input.local], color.colorView, depth.depthView, aoView, destination.colorView, destination];
+        const refs = [frame, integrated, local, c, d, ao, out,
+            input.weather ? color.colorView : _textureViews3d[input.integrated],
+            input.weather ? color.colorView : _textureViews3d[input.local],
+            color.colorView, depth.depthView, aoView, destination.colorView, destination];
         return refs.every(Boolean) ? refs : null;
     }
 
@@ -3815,12 +3870,12 @@ window.seasonWebGPU = (() => {
     function prepareFogComposite(name, color, depth, frame, integrated, local, aoTexture, aoTarget,
         aoIntensity, applyAo, destination) {
         const state = _fogComposites[name];
-        _fogSamplingFrame = null;
         if (!state) return false;
+        if (state.weather) _weatherSamplingFrame = null; else _fogSamplingFrame = null;
         state.prepared = null;
         if (!_frameStarted || !_commandEncoder || _passEncoder || _instancedDiag.deviceLost
             || state.device !== _device || !state.pipeline || state.failed) return false;
-        const input = { color, depth, frame, integrated, local, aoTexture, aoTarget, aoIntensity, applyAo, destination };
+        const input = { color, depth, frame, integrated, local, aoTexture, aoTarget, aoIntensity, applyAo, destination, weather: state.weather };
         // 输出尚未用作本帧附件，可以在 Pass 外按当前画布重建。
         const target = _renderTargets[destination];
         try {
@@ -3841,21 +3896,23 @@ window.seasonWebGPU = (() => {
             _device.queue.writeBuffer(slot.buffer, 0, slot.params);
             if (!_sameFogResources(slot.refs, refs)) {
                 slot.group = _device.createBindGroup({ layout: state.layout, entries: [
-                    { binding: 0, resource: { buffer: refs[0], size: _fogFrameBytes } },
+                    { binding: 0, resource: { buffer: refs[0], size: state.frameBytes } },
                     { binding: 1, resource: refs[7] }, { binding: 2, resource: refs[8] },
                     { binding: 3, resource: refs[9] }, { binding: 4, resource: refs[10] },
                     { binding: 5, resource: refs[11] }, { binding: 6, resource: { buffer: slot.buffer, size: 16 } },
                     { binding: 7, resource: state.sampler },
                 ] });
-                slot.samplingGroup = _fogSampling ? _device.createBindGroup({ layout: _fogSampling.layout, entries: [
+                const sampleGroup = params => _device.createBindGroup({ layout: _fogSampling.layout, entries: [
                     { binding: 0, resource: { buffer: refs[0], size: _fogFrameBytes } },
                     { binding: 1, resource: refs[7] }, { binding: 2, resource: refs[8] },
-                    { binding: 3, resource: { buffer: _fogSampling.enabledParams, size: 16 } },
-                ] }) : null;
+                    { binding: 3, resource: { buffer: params, size: 16 } },
+                ] });
+                slot.samplingGroup = _fogSampling && !state.weather ? sampleGroup(_fogSampling.enabledParams) : null;
+                slot.weatherSamplingGroup = _fogSampling && !state.weather ? sampleGroup(_fogSampling.combinedParams) : null;
                 slot.refs = refs;
             }
             state.prepared = { input, refs, group: slot.group, samplingGroup: slot.samplingGroup,
-                owner: state, command: _commandEncoder, frameId: _computeFrameId };
+                weatherSamplingGroup: slot.weatherSamplingGroup, owner: state, command: _commandEncoder, frameId: _computeFrameId };
             return true;
         } catch (error) {
             console.error(`雾合成 '${name}' 准备失败：${error}`);
@@ -3869,13 +3926,14 @@ window.seasonWebGPU = (() => {
         state.prepared = null;
         if (!_frameStarted || !_passEncoder || _instancedDiag.deviceLost || state.device !== _device
             || prepared.command !== _commandEncoder || prepared.frameId !== _computeFrameId
-            || _activePassId !== 7 || _passDepthOnly || _passVelocity
+            || _activePassId !== (state.weather ? 9 : 7) || _passDepthOnly || _passVelocity
             || _activeColorTarget !== prepared.refs[13] || _activeColorView !== prepared.refs[12]
             || !_sameFogResources(prepared.refs, _resolveFogComposite(prepared.input))) return 0;
         _passEncoder.setPipeline(state.pipeline);
         _passEncoder.setBindGroup(0, prepared.group);
         _passEncoder.draw(3);
-        _fogSamplingFrame = prepared.samplingGroup ? prepared : null;
+        if (state.weather) _weatherSamplingFrame = prepared;
+        else _fogSamplingFrame = prepared.samplingGroup ? prepared : null;
         return prepared.input.applyAo ? 3 : 1;
     }
 
@@ -3884,8 +3942,204 @@ window.seasonWebGPU = (() => {
         if (!state) return;
         delete _fogComposites[name]; state.prepared = null;
         if (_fogSamplingFrame?.owner === state) _fogSamplingFrame = null;
+        if (_weatherSamplingFrame?.owner === state) _weatherSamplingFrame = null;
         for (const slot of state.slots) _queueComputeRetirement(slot.buffer);
         state.slots.length = 0;
+    }
+
+    // A0.1 粒子间接绘制：WGSL 全部由 C# 下发，JS 只负责 PSO、绑定与那一条 drawIndexedIndirect。
+    // PSO 按本帧真实附件形状异步烘焙；未就绪时 Prepare 明确回退，和雾合成同一回退语义。
+    const _particleDraws = Object.create(null);
+    // 必须与 ParticleDraw.FrameBytes 一致：绑定组声明的 size 若小于着色器读到的下标，
+    // WebGPU 校验器会直接判非法，而报错点只出现在首次 draw 那一帧。
+    const _particleFrameBytes = 192;
+    const _particleInstanceStride = 32;
+    const _particleArgsBytes = 20;
+    let _particleQuadIndex = null;
+
+    // 四个角按 0,1,2,1,3,2 展开成两个三角形，与其它三端共用的单位四边形索引一致；
+    // reset kernel 写进 indexCount 的 6 就是这里的长度。粒子关闭剔除，绕序只决定顶点序。
+    // 索引内容与任何效果实例无关，所以按设备共享一只，随设备一起消亡。
+    function _particleQuadIndexBuffer() {
+        if (_particleQuadIndex && _particleQuadIndex.device === _device) return _particleQuadIndex.buffer;
+        const data = new Uint16Array([0, 1, 2, 1, 3, 2]);
+        const buffer = _device.createBuffer({ label: 'particle_quad_index', size: data.byteLength,
+            usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+        _device.queue.writeBuffer(buffer, 0, data);
+        _particleQuadIndex = { device: _device, buffer };
+        return buffer;
+    }
+
+    function createParticleDrawPipeline(name, vertex, fragment, fragmentVelocity) {
+        if (!_device || _instancedDiag.deviceLost || !name) return false;
+        if (_particleDraws[name]) return !_particleDraws[name].failed;
+        const device = _device;
+        const state = { device, variants: Object.create(null), prepared: null, failed: false,
+            refs: null, group: null };
+        try {
+            // 实例与帧数据都是顶点阶段只读。可写 storage 在顶点阶段不可见，而绘制侧也不需要写回：
+            // 计数由 compute 写进间接参数，顶点阶段只按 instance_index 取第 slot 条记录。
+            const visibility = GPUShaderStage.VERTEX;
+            state.layout = device.createBindGroupLayout({ label: `${name}_layout`, entries: [
+                { binding: 0, visibility, buffer: { type: 'read-only-storage', minBindingSize: _particleInstanceStride } },
+                { binding: 1, visibility, buffer: { type: 'read-only-storage', minBindingSize: _particleFrameBytes } },
+            ] });
+            state.pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [state.layout] });
+            state.vertex = device.createShaderModule({ label: `${name}_vs`, code: vertex });
+            state.fragment = device.createShaderModule({ label: `${name}_ps`, code: fragment });
+            state.fragmentVelocity = device.createShaderModule({ label: `${name}_ps_mrt`, code: fragmentVelocity });
+            _particleDraws[name] = state;
+            return true;
+        } catch (error) {
+            console.error(`粒子管线 '${name}' 创建失败：${error}`);
+            return false;
+        }
+    }
+
+    // 颜色与深度格式由本帧真实附件决定，但速度槽的有无只有进了 Pass 才知道（_passVelocity）。
+    // 所以同一附件形状下两个变体一起烘焙，Draw 时按标志取用，绝不在 Pass 内创建管线。
+    function _particleVariant(state, colorFormat, depthFormat) {
+        const key = `${colorFormat}|${depthFormat}`;
+        let variant = state.variants[key];
+        if (variant) return variant;
+        variant = { color: null, velocity: null };
+        state.variants[key] = variant;
+        const device = state.device;
+        // 预乘 alpha：片元已经把 rgb 乘进 alpha，所以源因子是 one，而不是主管线透明档的 src-alpha。
+        const blend = {
+            color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+        };
+        const common = {
+            layout: state.pipelineLayout,
+            // 没有顶点缓冲也没有顶点属性：角点来自 vertex_index，每实例数据来自 storage buffer。
+            vertex: { module: state.vertex, entryPoint: 'VSMain' },
+            primitive: { topology: 'triangle-list', cullMode: 'none' },
+            // 粒子是最后一层透明：测试但不写深度，与主管线透明档的 less-equal 一致。
+            depthStencil: { depthWriteEnabled: false, depthCompare: 'less-equal', format: depthFormat },
+            multisample: { count: 1 },
+        };
+        let scopeOpen = false;
+        try {
+            device.pushErrorScope('validation'); scopeOpen = true;
+            const pendingColor = device.createRenderPipelineAsync({ ...common, label: `particle_${key}`,
+                fragment: { module: state.fragment, entryPoint: 'PSMain',
+                    targets: [{ format: colorFormat, blend }] } });
+            // 速度槽 writeMask 置零，和主管线让透明体不污染速度的做法一致（2-3 条款 7）。
+            // A0.2：法线槽同理；它是否存在由进程级 _normalOutput 决定，所以仍只烘这两个变体。
+            // writeMask 为零的槽不要求片元有对应输出，所以沿用速度版片元模块。
+            const velocityTargets = [{ format: colorFormat, blend }, { format: 'rg16float', writeMask: 0 }];
+            if (_normalOutput) velocityTargets.push({ format: 'rgba16float', writeMask: 0 });
+            const pendingVelocity = device.createRenderPipelineAsync({ ...common, label: `particle_${key}_mrt`,
+                fragment: { module: state.fragmentVelocity, entryPoint: 'PSMain',
+                    targets: velocityTargets } });
+            const validation = device.popErrorScope(); scopeOpen = false;
+            Promise.all([pendingColor, pendingVelocity, validation]).then(([color, velocity, error]) => {
+                if (error) throw new Error(error.message);
+                if (state.variants[key] !== variant || _device !== device || _instancedDiag.deviceLost) return;
+                variant.color = color; variant.velocity = velocity;
+            }).catch(error => {
+                state.failed = true; state.prepared = null;
+                console.error(`粒子管线变体 '${key}' 编译失败：${error}`);
+            });
+        } catch (error) {
+            if (scopeOpen) device.popErrorScope().catch(() => {});
+            state.failed = true;
+            console.error(`粒子管线变体 '${key}' 创建失败：${error}`);
+        }
+        return variant;
+    }
+
+    function _resolveParticleDraw(input) {
+        const color = _renderTargets[input.color];
+        const depth = input.depth ? _renderTargets[input.depth] : null;
+        const instances = _storageBuffers[input.instances];
+        const args = _storageBuffers[input.args];
+        const frame = _storageBuffers[input.frame];
+        if (!color || color.depthOnly || !instances || !args || !frame) return null;
+        // depth 为空代表场景 Pass 跑在默认深度缓冲上，这是环境光遮蔽档之外的常态，不是失败。
+        if (input.depth && (!depth || !depth.depthOnly)) return null;
+        if (instances.size < _particleInstanceStride || frame.size < _particleFrameBytes
+            || args.size < _particleArgsBytes || !(args.usage & GPUBufferUsage.INDIRECT)
+            || !(instances.usage & GPUBufferUsage.STORAGE) || !(frame.usage & GPUBufferUsage.STORAGE)
+            || instances === args || instances === frame || args === frame) return null;
+        // 过期尺寸代表本帧附件不完整，只能回退而不能在此重建：颜色与深度已经是本帧 Pass 的附件。
+        for (const rt of depth ? [color, depth] : [color])
+            if (rt.matchBackbuffer && (!_canvas || rt.width !== _canvas.width || rt.height !== _canvas.height)) return null;
+        const colorFormat = color.colorFormat || _sceneFormat;
+        const depthFormat = depth ? depth.depthFormat : 'depth24plus';
+        if (!colorFormat || !depthFormat || !color.colorView) return null;
+        return { color, depth, instances, args, frame, colorFormat, depthFormat,
+            colorView: color.colorView, depthView: depth ? depth.depthView : null };
+    }
+
+    function _sameParticleRefs(a, b) {
+        return !!a && !!b && a.color === b.color && a.depth === b.depth
+            && a.instances === b.instances && a.args === b.args && a.frame === b.frame
+            && a.colorView === b.colorView && a.depthView === b.depthView
+            && a.colorFormat === b.colorFormat && a.depthFormat === b.depthFormat;
+    }
+
+    function prepareParticleDraw(name, color, depth, instances, args, frame) {
+        const state = _particleDraws[name];
+        if (!state) return false;
+        state.prepared = null;
+        if (!_frameStarted || !_commandEncoder || _passEncoder || _instancedDiag.deviceLost
+            || state.device !== _device || state.failed) return false;
+        const input = { color, depth: depth || null, instances, args, frame };
+        try {
+            const refs = _resolveParticleDraw(input);
+            if (!refs) return false;
+            const variant = _particleVariant(state, refs.colorFormat, refs.depthFormat);
+            // 首次见到这组附件形状时管线仍在异步编译：本帧明确不绘制，下一帧再试。
+            if (state.failed || !variant.color || !variant.velocity) return false;
+            if (!_sameParticleRefs(state.refs, refs)) {
+                state.group = _device.createBindGroup({ layout: state.layout, entries: [
+                    { binding: 0, resource: { buffer: refs.instances } },
+                    { binding: 1, resource: { buffer: refs.frame, size: _particleFrameBytes } },
+                ] });
+                state.refs = refs;
+            }
+            state.prepared = { input, refs, variant, group: state.group, args: refs.args,
+                indices: _particleQuadIndexBuffer(), command: _commandEncoder, frameId: _computeFrameId };
+            return true;
+        } catch (error) {
+            console.error(`粒子绘制 '${name}' 准备失败：${error}`);
+            return false;
+        }
+    }
+
+    function drawParticles(name) {
+        const state = _particleDraws[name], prepared = state?.prepared;
+        if (!prepared) return false;
+        // 一次 Prepare 只兑付一次提交，与其它三端同一约定。
+        state.prepared = null;
+        if (!_frameStarted || !_passEncoder || _instancedDiag.deviceLost || state.device !== _device
+            || prepared.command !== _commandEncoder || prepared.frameId !== _computeFrameId
+            // Scene=1 与 SceneTransparent=8 是粒子唯一的落点；两者都必然挂载深度附件。
+            || (_activePassId !== 1 && _activePassId !== 8)
+            || _passDepthOnly || _passOutlineMask || _passOverlay
+            // A0.2：速度变体是否带法线槽是按 _normalOutput 烘的，本 Pass 的附件集必须与之一致。
+            || (_passVelocity && _passNormal !== _normalOutput)
+            || _activeColorTarget !== prepared.refs.color || _activeColorView !== prepared.refs.colorView
+            // depth 为空时无法比对身份：默认深度视图每个 Pass 现建，只能要求它确实存在。
+            || !_activeDepthView || (prepared.refs.depthView && _activeDepthView !== prepared.refs.depthView)
+            || !_sameParticleRefs(prepared.refs, _resolveParticleDraw(prepared.input))) return false;
+        const pipeline = _passVelocity ? prepared.variant.velocity : prepared.variant.color;
+        if (!pipeline) return false;
+        _passEncoder.setPipeline(pipeline);
+        _passEncoder.setBindGroup(0, prepared.group);
+        _passEncoder.setIndexBuffer(prepared.indices, 'uint16');
+        // 实例数由 GPU 在参数块里决定；CPU 全程不回读，这正是间接绘制的意义。
+        _passEncoder.drawIndexedIndirect(prepared.args, 0);
+        return true;
+    }
+
+    function disposeParticleDrawPipeline(name) {
+        const state = _particleDraws[name];
+        if (!state) return;
+        delete _particleDraws[name];
+        state.prepared = null; state.refs = null; state.group = null;
     }
 
     const _computeKernels = {};
@@ -4097,9 +4351,10 @@ window.seasonWebGPU = (() => {
     // Resize is infrequent, so clearing everything has no practical performance impact.
     function _invalidateComputeBindGroups() {
         _fogSamplingFrame = null;
+        _weatherSamplingFrame = null;
         for (const state of Object.values(_fogComposites)) {
             state.prepared = null;
-            for (const slot of state.slots) { slot.refs = null; slot.group = null; slot.samplingGroup = null; }
+            for (const slot of state.slots) { slot.refs = null; slot.group = null; slot.samplingGroup = null; slot.weatherSamplingGroup = null; }
         }
         for (const kn in _computeKernels) {
             const k = _computeKernels[kn];
@@ -4128,11 +4383,15 @@ window.seasonWebGPU = (() => {
         _device.queue.onSubmittedWorkDone().then(dispose, dispose);
     }
 
-    function createStorageBuffer(id, sizeInBytes) {
+    // A0.1: indirect 为真时追加 GPUBufferUsage.INDIRECT。用途位只能在 createBuffer 时声明，
+    // 之后无法加宽，所以这个标志由 C# 侧的 StorageBufferUsage 一路传到这里。
+    function createStorageBuffer(id, sizeInBytes, indirect) {
         if (_storageBuffers[id]) return true;
+        let usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+        if (indirect) usage |= GPUBufferUsage.INDIRECT;
         _storageBuffers[id] = _device.createBuffer({
             size: Math.max(4, Math.ceil(sizeInBytes / 4) * 4),
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+            usage,
         });
         return true;
     }
@@ -4561,6 +4820,8 @@ window.seasonWebGPU = (() => {
         createComputeKernel,
         disposeComputeKernel,
         createFogCompositePipeline, prepareFogComposite, drawFogComposite, disposeFogCompositePipeline,
+        // A0.1 粒子间接绘制
+        createParticleDrawPipeline, prepareParticleDraw, drawParticles, disposeParticleDrawPipeline,
         createComputeTexture,
         createStorageBuffer,
         disposeStorageBuffer,

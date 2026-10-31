@@ -28,9 +28,6 @@ internal abstract class MTLPrimitiveGroup : IDisposable
     /// <summary>Each bone matrix occupies 64 bytes. Matching DX and VK, the UBO holds up to 100 bones.</summary>
     public const int MaxBones = 100;
 
-    // === Globally shared camera for all Pbr3D primitives ===
-    internal static Camera Camera;
-
     // === Globally shared lighting UBOs, N-buffered at FS slot 1 ===
     internal static IMTLBuffer[] LightConstantBuffers = null!;
 
@@ -264,7 +261,7 @@ internal abstract class MTLPrimitiveGroup : IDisposable
         // When MotionVectors is disabled, JitterNdc remains zero,
         // and writing it is harmless because shaders with VELOCITY_OUTPUT = 0 do not read the field.
         var res = DeviceServices.BaseApp.DeviceResolution;
-        var jitter = DeviceServices.BaseApp.Camera.JitterNdc;
+        var jitter = RenderView.Current.JitterNdc;
         lightParams.VelocityParams = new Vector4(
             jitter.X, jitter.Y,
             res.X > 0 ? 1f / res.X : 0f,
@@ -318,8 +315,11 @@ internal abstract class MTLPrimitiveGroup : IDisposable
             : null;
         AerialLutActive = MTLTexture3D.Find(Season.Rendering.FrameSchedule.AerialLutTexture);
 
-        FrameSchedule.CaptureLighting(lightParams, Camera.View, Camera.Projection,
-            DeviceServices.BaseApp.Camera.ViewProjection);
+        // The snapshot is read by fog / weather / particles, so it must come from the view that is actually
+        // being rendered, not from the legacy camera mirror.
+        var snapshotView = RenderView.Current;
+        FrameSchedule.CaptureLighting(lightParams, snapshotView.View, snapshotView.RenderProjection,
+            snapshotView.RenderViewProjection);
         WriteStruct(LightConstantBuffers[fi], lightParams);
     }
 
@@ -331,31 +331,18 @@ internal abstract class MTLPrimitiveGroup : IDisposable
         // while FOV and near/far are driven by BaseApp.Camera.
         // cameraPos and cameraTarget are forwarded from BaseApp.Camera.Position and Target,
         // and the method keeps them in the signature for frame-loop compatibility.
-        var camera3D = DeviceServices.BaseApp.Camera;
-        var aspectRatio = DeviceServices.BaseApp.DeviceResolution.X / (float)DeviceServices.BaseApp.DeviceResolution.Y;
+        var res = DeviceServices.BaseApp.DeviceResolution;
 
-        if (RenderQuality.Current.MotionVectors)
-        {
-            // Contract clause 4 of 2-3:
-            // this is the only injection point for jitter.
-            // UpdateTemporal first snapshots the previous-frame non-jittered ViewProjection and then rebuilds matrices,
-            // baking jitter only into ProjectionJittered.
-            // Frustum culling and CSM cascades still use the non-jittered camera3D.Projection and ViewProjection,
-            // avoiding edge flicker and shadow shimmer.
-            var res = DeviceServices.BaseApp.DeviceResolution;
-            camera3D.UpdateTemporal(aspectRatio, res.X, res.Y);
-            Camera.View = camera3D.View;
-            Camera.Projection = camera3D.ProjectionJittered;
-            Camera.PrevViewProjection = camera3D.PrevViewProjection;
-        }
-        else
-        {
-            camera3D.UpdateIfChanged(aspectRatio);
-            Camera.View = camera3D.View;
-            Camera.Projection = camera3D.Projection;
-            // All zeros means no history, and even when a quality tier is disabled mid-run no stale matrices remain.
-            Camera.PrevViewProjection = default;
-        }
+        // Contract clause 4 of 2-3:
+        // the main view is the only injection point for jitter.
+        // Prepare snapshots the previous-frame non-jittered ViewProjection and then rebuilds matrices,
+        // baking jitter only into the render projection.
+        // Frustum culling and CSM cascades keep the non-jittered matrices, avoiding edge flicker and shadow shimmer;
+        // with MotionVectors off the history is all zeros.
+        var view = DeviceServices.BaseApp.MainView;
+        view.Prepare(res.X, res.Y);
+        FrameSchedule.CurrentView = view;
+        Pipeline.WriteMainView(view.Constants);
 
         // For 1-5, compute the CPU shadow-matrix chain after the camera update and before writing the lighting UBO.
         // When the feature is disabled or no light is active, Apply writes zeros.
@@ -368,7 +355,7 @@ internal abstract class MTLPrimitiveGroup : IDisposable
             if (dirIdx >= 0 && dirIdx < lightParams.LightCount)
             {
                 var dirType = lightParams.Lights[dirIdx].DirType;
-                CascadedShadow.ComputeSun(camera3D, new Vector3(dirType.X, dirType.Y, dirType.Z));
+                CascadedShadow.ComputeSun(view.Camera, new Vector3(dirType.X, dirType.Y, dirType.Z));
             }
             int spotIdx = (int)lightParams.Params0.W;
             if (spotIdx >= 0 && spotIdx < lightParams.LightCount
@@ -823,8 +810,6 @@ internal abstract class MTLPrimitiveGroup : IDisposable
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(Camera.View),
-            Projection = Matrix4x4.Transpose(Camera.Projection),
         };
         for (int i = 0; i < Device.frameCount; i++)
         {
@@ -849,10 +834,7 @@ internal abstract class MTLPrimitiveGroup : IDisposable
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(world),
-            View = Matrix4x4.Transpose(Camera.View),
-            Projection = Matrix4x4.Transpose(Camera.Projection),
             PrevWorld = Matrix4x4.Transpose(box.PrevWorld),
-            PrevViewProjection = Matrix4x4.Transpose(Camera.PrevViewProjection),
         };
         WriteStruct(box.Face.MatrixBuffers[fi], matrices);
         WriteStruct(box.Edges.MatrixBuffers[fi], matrices);
@@ -881,11 +863,11 @@ internal abstract class MTLPrimitiveGroup : IDisposable
         if (box.FaceAlpha > 0f)
         {
             Pipeline.SetPipeline(enc, PipelineMode.Transparent, false);
-            enc.SetCullMode(MTLCullMode.Front);
+            Pipeline.SetCullMode(enc, MTLCullMode.Front);
             DrawPrimitive(enc, face);
 
             Pipeline.SetPipeline(enc, PipelineMode.Transparent, false);
-            enc.SetCullMode(MTLCullMode.Back);
+            Pipeline.SetCullMode(enc, MTLCullMode.Back);
             DrawPrimitive(enc, face);
         }
 
@@ -1236,11 +1218,8 @@ internal abstract class MTLPrimitiveGroup : IDisposable
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(Camera.View),
-            Projection = Matrix4x4.Transpose(Camera.Projection),
             // Contract clause 8(d) of 2-3:
             // PrevWorld in b0 stays all zeros on the instanced path because history comes from the double-buffered instance stream.
-            PrevViewProjection = Matrix4x4.Transpose(Camera.PrevViewProjection),
         };
         for (int i = 0; i < Device.frameCount; i++)
         {
@@ -1265,9 +1244,6 @@ internal abstract class MTLPrimitiveGroup : IDisposable
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(Camera.View),
-            Projection = Matrix4x4.Transpose(Camera.Projection),
-            PrevViewProjection = Matrix4x4.Transpose(Camera.PrevViewProjection),
         };
         WriteStruct(box.Face.MatrixBuffers[fi], matrices);
         WriteStruct(box.Edges.MatrixBuffers[fi], matrices);
@@ -1311,7 +1287,7 @@ internal abstract class MTLPrimitiveGroup : IDisposable
         if (box.FaceAlpha > 0f)
         {
             Pipeline.SetPipeline(enc, PipelineMode.Transparent, false);
-            enc.SetCullMode(MTLCullMode.Front);
+            Pipeline.SetCullMode(enc, MTLCullMode.Front);
             Pipeline.DrawPrimitive(enc, face, geo.Face.VertexBuffer, geo.Face.IndexBuffer,
                 face.MatrixBuffers[fi], face.MaterialBuffers[fi],
                 LightConstantBuffers[fi], IdentityBoneBuffers[fi], face.MorphDeltasBuffer ?? DefaultMorphDeltasBuffers[fi], instanceBones,
@@ -1320,7 +1296,7 @@ internal abstract class MTLPrimitiveGroup : IDisposable
                 instanceBuffer, instanceOffset, 1, boneOffset, prevInstanceBuffer, prevInstanceBones, boneOffset);
 
             Pipeline.SetPipeline(enc, PipelineMode.Transparent, false);
-            enc.SetCullMode(MTLCullMode.Back);
+            Pipeline.SetCullMode(enc, MTLCullMode.Back);
             Pipeline.DrawPrimitive(enc, face, geo.Face.VertexBuffer, geo.Face.IndexBuffer,
                 face.MatrixBuffers[fi], face.MaterialBuffers[fi],
                 LightConstantBuffers[fi], IdentityBoneBuffers[fi], face.MorphDeltasBuffer ?? DefaultMorphDeltasBuffers[fi], instanceBones,
@@ -1526,11 +1502,11 @@ internal abstract class MTLPrimitiveGroup : IDisposable
             if (p.DoubleSided)
             {
                 Pipeline.SetPipeline(enc, PipelineMode.Transparent, false);
-                enc.SetCullMode(MTLCullMode.Front);
+                Pipeline.SetCullMode(enc, MTLCullMode.Front);
                 DrawPrimitive(enc, p);
 
                 Pipeline.SetPipeline(enc, PipelineMode.Transparent, false);
-                enc.SetCullMode(MTLCullMode.Back);
+                Pipeline.SetCullMode(enc, MTLCullMode.Back);
                 pipelineSet = true;
                 currentDoubleSided = false;
                 DrawPrimitive(enc, p);
@@ -1677,46 +1653,22 @@ internal abstract class MTLPrimitiveGroup : IDisposable
             null, 0, 1, 0, bindMaterial);
     }
 
+    /// <summary>
+    /// 图元绘制的统一出口，工作包 D 之后直接转交 <see cref="Pipeline.DrawPrimitive"/>。
+    /// 参数与旧的逐行绑定逐项等价：slot 2/9 用恒等实例流、slot 10 用上一帧骨骼环（PrevFrameIndex）、
+    /// 索引类型与偏移不变。
+    /// 这样收集期只需在 Pipeline.DrawPrimitive 一处拦截，非实例模型的全部 3D 绘制（含高亮壳体与壳盒）就都进了分段队列。
+    /// </summary>
     void DrawPrimitive(IMTLRenderCommandEncoder enc, PrimitiveData p)
     {
         int fi = Device.FrameIndex;
         var bones = BoneMatrixBuffers;
-        var fallback = Device.White;
-        var morphBuffer = p.MorphDeltasBuffer ?? DefaultMorphDeltasBuffers[fi];
-
-        // VS buffer slots:
-        // 0 = vertex stream, 1 = Matrices(b0), 2 = Instance(buff2), 3 = BoneMatrices(b3), 4 = MaterialParams, 5 = Morph, 6 = InstanceBones.
-        // Contract clause 8(b) of 2-3 adds:
-        // 9 = previous instance stream, using an identity placeholder for non-instanced paths,
-        // and 10 = previous bone palette from frame-ring slot [fi - 1].
-        enc.SetVertexBuffer(p.VertexBuffer, 0, 0);
-        enc.SetVertexBuffer(p.MatrixBuffers[fi], 0, 1);
-        enc.SetVertexBuffer(Pipeline.IdentityInstanceBuffer, 0, 2);
-        enc.SetVertexBuffer(bones[fi], 0, 3);
-        enc.SetVertexBuffer(p.MaterialBuffers[fi], 0, 4);
-        enc.SetVertexBuffer(morphBuffer, 0, 5);
-        enc.SetVertexBuffer(IdentityInstanceBoneBuffers[fi], 0, 6);
-        enc.SetVertexBuffer(Pipeline.IdentityInstanceBuffer, 0, 9);
-        enc.SetVertexBuffer(bones[PrevFrameIndex], 0, 10);
-
-        // FS buffer slots: 1=SceneLights(b1), 2=MaterialParams(b2)
-        enc.SetFragmentBuffer(LightConstantBuffers[fi], 0, 1);
-        enc.SetFragmentBuffer(p.MaterialBuffers[fi], 0, 2);
-
-        // FS texture slots: 0=BaseColor, 1=Normal, 2=MR, 3=AO, 4=Emissive
-        enc.SetFragmentTexture((p.BaseColorTexture ?? fallback).Image, 0);
-        enc.SetFragmentTexture((p.NormalTexture ?? fallback).Image, 1);
-        enc.SetFragmentTexture((p.MetallicRoughnessTexture ?? fallback).Image, 2);
-        enc.SetFragmentTexture((p.OcclusionTexture ?? fallback).Image, 3);
-        enc.SetFragmentTexture((p.EmissiveTexture ?? fallback).Image, 4);
-
-        // Indexed draw, where the index type matches PrimitiveData.Indices.
-        enc.DrawIndexedPrimitives(
-            primitiveType: MTLPrimitiveType.Triangle,
-            indexCount: (nuint)p.Indices.Length,
-            indexType: p.Use32BitIndices ? MTLIndexType.UInt32 : MTLIndexType.UInt16,
-            indexBuffer: p.IndexBuffer,
-            indexBufferOffset: 0);
+        Pipeline.DrawPrimitive(enc, p, p.VertexBuffer, p.IndexBuffer,
+            p.MatrixBuffers[fi], p.MaterialBuffers[fi], LightConstantBuffers[fi], bones[fi],
+            p.MorphDeltasBuffer ?? DefaultMorphDeltasBuffers[fi], IdentityInstanceBoneBuffers[fi],
+            MTLPrimitiveType.Triangle, (nuint)p.Indices.Length,
+            p.Use32BitIndices ? MTLIndexType.UInt32 : MTLIndexType.UInt16, 0,
+            null, 0, 1, 0, null, bones[PrevFrameIndex], 0);
     }
 
     // ============================================================

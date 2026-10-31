@@ -122,6 +122,10 @@ public interface IGraphics
 
     /// <summary>缺少独立 HDR 雾合成能力时返回 null，不注册不完整的效果。</summary>
     Season.Rendering.FogCompositePipeline? CreateFogCompositePipeline() => null;
+    Season.Rendering.Effects.WeatherCompositePipeline? CreateWeatherCompositePipeline() => null;
+
+    /// <summary>D1: 缺少屏幕空间贴花能力时返回 null，<see cref="Season.Rendering.FrameSchedule.RegisterDecals"/> 据此保持零残留。</summary>
+    Season.Rendering.DecalPipeline? CreateDecalPipeline() => null;
 
     void BeginPass(in Season.Rendering.PassDesc desc)
         => throw new NotImplementedException("BeginPass: this platform has not integrated pass scheduling yet");
@@ -134,6 +138,26 @@ public interface IGraphics
 
     /// <summary>Currently used by Windows DX for the Outline2D object mask pass; other platforms default to a no-op implementation.</summary>
     void RenderOutlineMask() { }
+
+    // Contract P3 secondary views (minimap / rear mirror).
+    // - SecondaryViewSupported tells the shared layer whether this backend can render a second view into a fixed-size
+    //   offscreen target at all. It is false by default and each backend lifts it only once its per-view constants,
+    //   per-view attachments and offscreen presentation actually work; <c>SecondaryView</c> then declines to build the
+    //   view and the app keeps its single-view look instead of rendering garbage.
+    // - RegisterViewSurface publishes a rendered target into the platform texture dictionary under a name, so an
+    //   ordinary Sprite2D can display a view without knowing it is not a file (the same bridge CreateComputeTexture
+    //   uses). The wrapper must not take ownership of the target: it is released by the backend, not by the control.
+
+    /// <summary>Whether this backend can render an additional offscreen view. False by default.</summary>
+    bool SecondaryViewSupported => false;
+
+    /// <summary>Publishes <paramref name="target"/> under <paramref name="name"/> so 2D controls can sample it.
+    /// Returns false when the backend has no bridge or the name is already taken by a real texture.</summary>
+    bool RegisterViewSurface(string name, Season.Rendering.RenderTarget target) => false;
+
+    /// <summary>Revokes a publication made by <see cref="RegisterViewSurface"/>. The wrapper is dropped, the target
+    /// itself is untouched (the caller still owns and disposes it). Names that were never published are ignored.</summary>
+    bool UnregisterViewSurface(string name) => false;
 
     // Contract 1-5 shadow projection dispatch (clauses 3/7).
     // Per-control entry point for the shadow pass. Control.DrawShadow dispatches through the shared layer into the platform dictionaries.
@@ -182,7 +206,8 @@ public interface IGraphics
         Season.Rendering.ComputeStorageFormat format = Season.Rendering.ComputeStorageFormat.Rgba8Unorm)
         => throw new NotImplementedException("CreateComputeTexture3D: this platform has not integrated the 1-8 compute 3D extension yet");
 
-    Season.Rendering.StorageBuffer CreateStorageBuffer(uint sizeInBytes)
+    Season.Rendering.StorageBuffer CreateStorageBuffer(uint sizeInBytes,
+        Season.Rendering.StorageBufferUsage usage = Season.Rendering.StorageBufferUsage.Compute)
         => throw new NotImplementedException("CreateStorageBuffer: this platform has not integrated the 1-6 compute foundation yet");
 
     void UpdateStorageBuffer(Season.Rendering.StorageBuffer buffer, ReadOnlySpan<byte> data)
@@ -203,6 +228,32 @@ public interface IGraphics
 
     /// <summary>注销效果独占的三维纹理，并按后端在飞资源契约延迟释放。</summary>
     void ReleaseComputeTexture3D(string name) { }
+
+    // Contract A0.1 indirect draw.
+    // - IndirectDrawSupported means this backend can source an indexed draw's arguments from a
+    //   StorageBufferUsage.ComputeAndIndirectArgs buffer. It does not add a pass, a render target, or a shader variant:
+    //   indirect only moves the five DrawIndexedInstanced arguments from CPU registers into GPU memory,
+    //   so PSO, root signature, vertex layout, attachments, blend and depth test are all the ordinary ones.
+    // - The argument producer is a compute kernel, so the write happens in a ComputeEffect.Record and therefore outside
+    //   any render pass, which is already the existing ComputePhase contract.
+    // - TryPrepareIndirectArgs is the write-to-read handoff and must also be called outside a render pass.
+    //   This is not a stylistic preference: PassDesc forbids resource state switches inside a pass body because a Vulkan
+    //   render-pass instance cannot contain barriers. So the submit itself splits into a Prepare step outside the pass and
+    //   a Draw step inside it, exactly like FogCompositePipeline.
+    // - Arguments are never read back. A readback would stall the frame and remove the only reason to do this at all.
+    // - The submit entry point is deliberately absent from this interface. It lives on the backend pipeline object that
+    //   owns the matching PSO and index buffer, which can downcast the buffer handle itself, the same way
+    //   FogCompositePipeline consumes a StorageBuffer through FogCompositeInputs.
+
+    /// <summary>后端是否已接通间接索引绘制；为 false 时消费者应改走固定实例数的退化路径或整体不注册。</summary>
+    bool IndirectDrawSupported => false;
+
+    /// <summary>把间接参数缓冲从 compute 写入状态交接到间接读取状态，返回是否已录制。必须在 Pass 之外调用；
+    /// 传入非 ComputeAndIndirectArgs 缓冲、或后端未接通时返回 false，调用方据此放弃本帧的间接提交。</summary>
+    bool TryPrepareIndirectArgs(Season.Rendering.StorageBuffer buffer) => false;
+
+    /// <summary>缺少间接实例化四边形绘制能力时返回 null，粒子效果据此整体不注册；返回非 null 即表示 ExecuteIndirect 等效原语已接通。</summary>
+    Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline() => null;
 
     // Contract 1-7 cubemap type + environment IBL.
     // - On platforms with TextureCubeSupported=false, EnvironmentMap.LoadFromFacesAsync returns null,

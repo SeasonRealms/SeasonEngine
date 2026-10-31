@@ -31,11 +31,11 @@ internal unsafe class DXMesh3D : DXPrimitiveGroup
     /// color / default texture. Pixel-source textures are uploaded to the GPU
     /// before Load.
     /// </summary>
-    public void Load(Season.Controls.Mesh3D mesh, Season.Basic.Camera camera, Func<Season.Controls.Surface, TextureSlot, DXTexture> resolveTexture)
+    public void Load(Season.Controls.Mesh3D mesh, Func<Season.Controls.Surface, TextureSlot, DXTexture> resolveTexture)
     {
         foreach (var surface in mesh.Surfaces)
         {
-            var primitive = CreatePrimitiveData(surface, resolveTexture, camera);
+            var primitive = CreatePrimitiveData(surface, resolveTexture);
             // 2-2 contract rule 7: GTAO exemption bit
             // (can be switched at runtime during Update, see Update)
             primitive.AoExempt = mesh.ExcludeFromAo;
@@ -43,7 +43,7 @@ internal unsafe class DXMesh3D : DXPrimitiveGroup
         }
     }
 
-    PrimitiveData CreatePrimitiveData(Season.Controls.Surface surface, Func<Season.Controls.Surface, TextureSlot, DXTexture> resolveTexture, Season.Basic.Camera camera)
+    PrimitiveData CreatePrimitiveData(Season.Controls.Surface surface, Func<Season.Controls.Surface, TextureSlot, DXTexture> resolveTexture)
     {
         var primitiveData = new PrimitiveData();
 
@@ -73,8 +73,6 @@ internal unsafe class DXMesh3D : DXPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = System.Numerics.Matrix4x4.Transpose(System.Numerics.Matrix4x4.Identity),
-            View = System.Numerics.Matrix4x4.Transpose(camera.View),
-            Projection = System.Numerics.Matrix4x4.Transpose(camera.Projection)
         };
         for (int i = 0; i < Device.frameCount; i++)
             Unsafe.Write(primitiveData.MappedMatrixBuffers[i], matrices);
@@ -160,11 +158,6 @@ internal unsafe class DXMesh3D : DXPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = System.Numerics.Matrix4x4.Transpose(world),
-            View = System.Numerics.Matrix4x4.Transpose(Camera.View),
-            Projection = System.Numerics.Matrix4x4.Transpose(Camera.Projection),
-            // 2-3 contract rule 6: all-zero data makes the shader output zero
-            // velocity, which is also the shape used when MotionVectors are off
-            PrevViewProjection = System.Numerics.Matrix4x4.Transpose(Camera.PrevViewProjection),
         };
 
         int fi = (int)Device.FrameIndex;

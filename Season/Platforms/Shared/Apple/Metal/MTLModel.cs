@@ -54,13 +54,13 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         _asset.ProcessPrimitiveCallback = ProcessPrimitive;
     }
 
-    public void Load(Season.Controls.Model model, Season.Basic.Camera camera)
+    public void Load(Season.Controls.Model model)
     {
         // Animation queries and switching belong to the glTF parsing domain and do not go through IGraphics.
         // On the direct-load path, inject the asset reference into the control.
         model.Asset = _asset;
 
-        _asset.Load(model, camera);
+        _asset.Load(model);
 
         // Create the bone-matrix buffers, matching DX and VK with N UBOs for 100 bones each.
         CreateBoneMatrixBuffer();
@@ -68,7 +68,7 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         _asset.ValidateSkinData();
     }
 
-    public MTLModel CreateInstance(Season.Controls.Model model, Season.Basic.Camera camera)
+    public MTLModel CreateInstance(Season.Controls.Model model)
     {
         if (_asset.Model != null)
         {
@@ -96,7 +96,7 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
 
         var nodeMap = new Dictionary<GltfNodeBase, GltfNodeBase>();
         foreach (var nodeBase in _asset.gltfNodes)
-            instance.EnsureClonedNode(nodeMap, nodeBase, model, camera);
+            instance.EnsureClonedNode(nodeMap, nodeBase, model);
 
         var skinMap = new Dictionary<GLTFSkin, GLTFSkin>();
         foreach (var sourceSkin in _asset.GetAllSkins())
@@ -109,13 +109,13 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
             };
 
             foreach (var joint in sourceSkin.Joints)
-                instance.EnsureClonedNode(nodeMap, joint, model, camera);
+                instance.EnsureClonedNode(nodeMap, joint, model);
 
             if (sourceSkin.SkeletonRoot != null)
-                instance.EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model, camera);
+                instance.EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model);
 
             if (sourceSkin.BindNode != null)
-                instance.EnsureClonedNode(nodeMap, sourceSkin.BindNode, model, camera);
+                instance.EnsureClonedNode(nodeMap, sourceSkin.BindNode, model);
         }
 
         foreach (var animation in _asset._animations)
@@ -123,7 +123,7 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
             foreach (var channel in animation.Channels)
             {
                 if (channel.Target?.Node != null)
-                    instance.EnsureClonedNode(nodeMap, channel.Target.Node, model, camera);
+                    instance.EnsureClonedNode(nodeMap, channel.Target.Node, model);
             }
         }
 
@@ -131,7 +131,7 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         {
             var sourceNode = nodeBase;
             var clonedNode = nodeMap[sourceNode];
-            clonedNode.Children = sourceNode.Children.Select(child => instance.EnsureClonedNode(nodeMap, child, model, camera)).ToList();
+            clonedNode.Children = sourceNode.Children.Select(child => instance.EnsureClonedNode(nodeMap, child, model)).ToList();
 
             if (sourceNode.Skin != null && skinMap.TryGetValue(sourceNode.Skin, out var clonedSkin))
                 clonedNode.Skin = clonedSkin;
@@ -141,9 +141,9 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         {
             var sourceSkin = pair.Key;
             var clonedSkin = pair.Value;
-            clonedSkin.Joints = sourceSkin.Joints.Select(joint => instance.EnsureClonedNode(nodeMap, joint, model, camera)).ToList();
-            clonedSkin.SkeletonRoot = sourceSkin.SkeletonRoot != null ? instance.EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model, camera) : null;
-            clonedSkin.BindNode = sourceSkin.BindNode != null ? instance.EnsureClonedNode(nodeMap, sourceSkin.BindNode, model, camera) : null;
+            clonedSkin.Joints = sourceSkin.Joints.Select(joint => instance.EnsureClonedNode(nodeMap, joint, model)).ToList();
+            clonedSkin.SkeletonRoot = sourceSkin.SkeletonRoot != null ? instance.EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model) : null;
+            clonedSkin.BindNode = sourceSkin.BindNode != null ? instance.EnsureClonedNode(nodeMap, sourceSkin.BindNode, model) : null;
         }
 
         instance._asset.gltfNodes = _asset.gltfNodes.Select(node => nodeMap[node]).ToList();
@@ -173,7 +173,7 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         return instance;
     }
 
-    GltfNodeBase EnsureClonedNode(Dictionary<GltfNodeBase, GltfNodeBase> nodeMap, GltfNodeBase sourceNode, Season.Controls.Model model, Season.Basic.Camera camera)
+    GltfNodeBase EnsureClonedNode(Dictionary<GltfNodeBase, GltfNodeBase> nodeMap, GltfNodeBase sourceNode, Season.Controls.Model model)
     {
         if (nodeMap.TryGetValue(sourceNode, out var existing))
             return existing;
@@ -201,7 +201,7 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
             };
 
             foreach (var primitive in sourceMtlNode.Primitives)
-                mtlNode.Primitives.Add(ClonePrimitiveData(primitive, mtlNode, model, camera));
+                mtlNode.Primitives.Add(ClonePrimitiveData(primitive, mtlNode, model));
 
             clonedNode = mtlNode;
         }
@@ -231,7 +231,7 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         return clonedNode;
     }
 
-    PrimitiveData ClonePrimitiveData(PrimitiveData source, GLTFNode ownerNode, Season.Controls.Model model, Season.Basic.Camera camera)
+    PrimitiveData ClonePrimitiveData(PrimitiveData source, GLTFNode ownerNode, Season.Controls.Model model)
     {
         var clone = new PrimitiveData
         {
@@ -286,8 +286,6 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(camera.View),
-            Projection = Matrix4x4.Transpose(camera.Projection)
         };
 
         for (int i = 0; i < Device.frameCount; i++)
@@ -387,15 +385,15 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         }
     }
 
-    void ProcessPrimitive(MeshPrimitive meshPrimitive, GltfNodeBase node, Season.Controls.Model model, Season.Basic.Camera camera)
+    void ProcessPrimitive(MeshPrimitive meshPrimitive, GltfNodeBase node, Season.Controls.Model model)
     {
-        var primitiveData = CreatePrimitiveData(meshPrimitive, node, model, camera);
+        var primitiveData = CreatePrimitiveData(meshPrimitive, node, model);
 
         var gltfNode = (GLTFNode)node;
         gltfNode.Primitives.Add(primitiveData);
     }
 
-    PrimitiveData CreatePrimitiveData(MeshPrimitive primitive, GltfNodeBase node, Season.Controls.Model model, Season.Basic.Camera camera)
+    PrimitiveData CreatePrimitiveData(MeshPrimitive primitive, GltfNodeBase node, Season.Controls.Model model)
     {
         var p = new PrimitiveData();
 
@@ -458,8 +456,6 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(camera.View),
-            Projection = Matrix4x4.Transpose(camera.Projection)
         };
         for (int i = 0; i < Device.frameCount; i++)
             WriteStruct(p.MatrixBuffers[i], matrices);
@@ -748,7 +744,7 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         }
     }
 
-    void ApplyUserTransformToNodeTree(GltfNodeBase nodeBase, Matrix4x4 userTransform, Season.Basic.Camera camera)
+    void ApplyUserTransformToNodeTree(GltfNodeBase nodeBase, Matrix4x4 userTransform)
     {
         // Apply the user transform to the current node.
         var finalWorldMatrix = nodeBase.WorldTransform * userTransform;
@@ -761,13 +757,10 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
             var matrices = new MatrixBuffer
             {
                 World = Matrix4x4.Transpose(finalWorldMatrix),
-                View = Matrix4x4.Transpose(camera.View),
-                Projection = Matrix4x4.Transpose(camera.Projection),
                 // Contract clause 6 of 2-3:
                 // history always comes from the CPU shadow copy.
                 // Transpose of all zeros remains all zeros, so the first frame naturally uses the unwritten sentinel.
                 PrevWorld = Matrix4x4.Transpose(primitive.PrevWorldMatrix),
-                PrevViewProjection = Matrix4x4.Transpose(camera.PrevViewProjection),
             };
             int fi = Device.FrameIndex;
             WriteStruct(primitive.MatrixBuffers[fi], matrices);
@@ -780,7 +773,7 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         // Important: recurse into child nodes while carrying the same userTransform forward.
         foreach (var child in nodeBase.Children)
         {
-            ApplyUserTransformToNodeTree(child, userTransform, camera);
+            ApplyUserTransformToNodeTree(child, userTransform);
         }
     }
 
@@ -800,7 +793,7 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         var rootNodes = _asset._animationPlayer.GetRootNodes(_asset.gltfNodes);
 
         foreach (var rootNode in rootNodes)
-            ApplyUserTransformToNodeTree(rootNode, userTransform, Camera);
+            ApplyUserTransformToNodeTree(rootNode, userTransform);
 
         // Update bone matrices.
         UploadBoneMatricesToGpu();

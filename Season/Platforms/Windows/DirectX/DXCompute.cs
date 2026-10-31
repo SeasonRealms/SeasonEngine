@@ -240,14 +240,18 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
 
     readonly uint _alignedSize;
 
-    internal DXStorageBuffer(uint sizeInBytes)
+    internal DXStorageBuffer(uint sizeInBytes, Season.Rendering.StorageBufferUsage usage)
     {
         // Raw views are addressed in 4-byte elements, so round capacity up to
         // 16 bytes to match Params alignment granularity and avoid tail overruns.
         uint alignedSize = (sizeInBytes + 15u) & ~15u;
         SizeInBytes = sizeInBytes;
+        Usage = usage;
         _alignedSize = alignedSize;
 
+        // A0.1：D3D12 不需要额外创建标志。任何缓冲都可转入 INDIRECT_ARGUMENT，
+        // AllowUnorderedAccess 已经允许 compute 写入，所以 usage 在这一端只影响
+        // TryPrepareIndirectArgs 的准入判定，不影响资源描述。
         var heapProps = new HeapProperties(HeapType.Default);
         var bufferDesc = new ResourceDesc
         {

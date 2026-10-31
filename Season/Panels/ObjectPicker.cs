@@ -197,7 +197,7 @@ public class ObjectPicker : Panel
         if (app != null
             && TouchService.PoX is int pointerX
             && TouchService.PoY is int pointerY
-            && Season.Rendering.Picking.ScreenPointToRay(pointerX, pointerY, app.Camera,
+            && Season.Rendering.Picking.ScreenPointToRay(pointerX, pointerY, Season.Rendering.RenderView.Current,
                 app.ExtendResolution.X, app.ExtendResolution.Y, out var rayOrigin, out rayDirection))
         {
             rayReady = true;
@@ -307,7 +307,7 @@ public class ObjectPicker : Panel
 
                 string proj = "-";
                 if (!hit.IsEmpty
-                    && Season.Rendering.Picking.ProjectToScreen(GetFocusWorldBoundsRaw(hit).Center, app.Camera,
+                    && Season.Rendering.Picking.ProjectToScreen(GetFocusWorldBoundsRaw(hit).Center, Season.Rendering.RenderView.Current,
                         app.ExtendResolution.X, app.ExtendResolution.Y, out var projX, out var projY))
                     proj = $"({projX:F0},{projY:F0})";
 
@@ -368,7 +368,7 @@ public class ObjectPicker : Panel
                         ((i >> 1) & 1) == 0 ? bMin.Y : bMax.Y,
                         ((i >> 2) & 1) == 0 ? bMin.Z : bMax.Z);
 
-                    if (Season.Rendering.Picking.ProjectToScreen(corner, app.Camera, app.ExtendResolution.X, app.ExtendResolution.Y, out var sx, out var sy))
+                    if (Season.Rendering.Picking.ProjectToScreen(corner, Season.Rendering.RenderView.Current, app.ExtendResolution.X, app.ExtendResolution.Y, out var sx, out var sy))
                     {
                         if (sx < sMinX) sMinX = sx;
                         if (sx > sMaxX) sMaxX = sx;

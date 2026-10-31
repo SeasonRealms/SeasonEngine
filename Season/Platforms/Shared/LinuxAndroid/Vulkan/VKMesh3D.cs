@@ -31,11 +31,11 @@ internal unsafe class VKMesh3D : VKPrimitiveGroup
     /// null means the slot has no texture source and falls back to solid color / default behavior;
     /// pixel-source textures have already been uploaded directly to the GPU before Load.
     /// </summary>
-    public void Load(Season.Controls.Mesh3D mesh, Season.Basic.Camera camera, Func<Season.Controls.Surface, TextureSlot, Texture> resolveTexture)
+    public void Load(Season.Controls.Mesh3D mesh, Func<Season.Controls.Surface, TextureSlot, Texture> resolveTexture)
     {
         foreach (var surface in mesh.Surfaces)
         {
-            var primitive = CreatePrimitiveData(surface, resolveTexture, camera);
+            var primitive = CreatePrimitiveData(surface, resolveTexture);
             // 2-2 contract clause 7: GTAO exemption flag
             // (can be toggled at runtime during Update, see Update)
             primitive.AoExempt = mesh.ExcludeFromAo;
@@ -43,7 +43,7 @@ internal unsafe class VKMesh3D : VKPrimitiveGroup
         }
     }
 
-    PrimitiveData CreatePrimitiveData(Season.Controls.Surface surface, Func<Season.Controls.Surface, TextureSlot, Texture> resolveTexture, Season.Basic.Camera camera)
+    PrimitiveData CreatePrimitiveData(Season.Controls.Surface surface, Func<Season.Controls.Surface, TextureSlot, Texture> resolveTexture)
     {
         var p = new PrimitiveData();
 
@@ -75,8 +75,6 @@ internal unsafe class VKMesh3D : VKPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(camera.View),
-            Projection = Matrix4x4.Transpose(camera.Projection)
         };
         for (int i = 0; i < Device.frameCount; i++)
             Unsafe.Write(p.MappedMatrixBuffers[i], matrices);
@@ -159,11 +157,6 @@ internal unsafe class VKMesh3D : VKPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(world),
-            View = Matrix4x4.Transpose(Camera.View),
-            Projection = Matrix4x4.Transpose(Camera.Projection),
-            // 2-3 contract clause 6: when all zero, the shader outputs zero velocity
-            // (this is also the form used when MotionVectors are disabled)
-            PrevViewProjection = Matrix4x4.Transpose(Camera.PrevViewProjection),
         };
 
         int fi = (int)Device.FrameIndex;

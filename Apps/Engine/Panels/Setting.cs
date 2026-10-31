@@ -46,10 +46,14 @@ internal class SettingPanel : BoardPanel
     SimplePicker simplePicker;
 
     Texts title;
+    Texts textsIslandWeather, textsOffshoreWeather, textsWeatherMode;
+    Input inputIslandWeather, inputOffshoreWeather, inputWeatherMode;
+    Input inputPage;
+    int page, pageCount = 1;
 
-    Texts textsMode, textsMovement, textsFov, textsDayNightSpeed, textsStartHour, textsStep, textsAntiAliasing, textsGi, textsShadows, textsAo, textsFog, textsFogPreset, textsFogDensity, textsFogQuality, textsFogHistory, textsFogInfo, textsShadowOffset, textsShadowSoftness, textsShadowContact, textsNormalVariance, textsLog;
+    Texts textsMode, textsMovement, textsFov, textsDayNightSpeed, textsStartHour, textsStep, textsAntiAliasing, textsGi, textsShadows, textsAo, textsFog, textsFogPreset, textsFogDensity, textsFogQuality, textsFogHistory, textsFogInfo, textsShadowOffset, textsShadowSoftness, textsShadowContact, textsNormalVariance, textsSceneNormals, textsLog;
 
-    Input inputMode, inputMovement, inputFov, inputDayNightSpeed, inputStartHour, inputStep, inputAntiAliasing, inputGi, inputShadows, inputAo, inputFog, inputFogPreset, inputFogDensity, inputFogQuality, inputFogHistory, inputFogInfo, inputShadowOffset, inputShadowSoftness, inputShadowContact, inputNormalVariance, inputLog;
+    Input inputMode, inputMovement, inputFov, inputDayNightSpeed, inputStartHour, inputStep, inputAntiAliasing, inputGi, inputShadows, inputAo, inputFog, inputFogPreset, inputFogDensity, inputFogQuality, inputFogHistory, inputFogInfo, inputShadowOffset, inputShadowSoftness, inputShadowContact, inputNormalVariance, inputSceneNormals, inputLog;
 
     BaseControl current = null;
 
@@ -78,6 +82,12 @@ internal class SettingPanel : BoardPanel
             Scale = Vector2.One * 1.2f
         };
         AddControl(title);
+        inputPage = new Input
+        {
+            WidthMin = 220,
+            OnAction = () => page = (page + 1) % pageCount,
+        };
+        AddPanel(inputPage);
 
         textsMode = new Texts()
         {
@@ -233,6 +243,18 @@ internal class SettingPanel : BoardPanel
             Scale = Vector2.One * 1f
         };
         AddControl(textsNormalVariance);
+
+        // A0.2 clause 1. Next-launch like the AA row and for the same reason: the NORMAL_OUTPUT variant and the third MRT
+        // attachment are baked while pipelines are built. Turning it on also forces motion vectors on, so under MSAA 4x - which
+        // excludes velocity - it stays marked with * however many restarts follow. The same picker also chooses what the
+        // NormalView thumbnail shows, which is live, since that is the only consumer until SSR and decals read the target.
+        textsSceneNormals = new Texts()
+        {
+            Content = "Scene normals",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsSceneNormals);
 
         textsLog = new Texts()
         {
@@ -536,6 +558,27 @@ internal class SettingPanel : BoardPanel
             }
         };
         AddPanel(inputStartHour);
+
+        // 第一阶段为配置入口，百分比显示实际过渡进度；视觉配方在下一阶段接入。
+        textsIslandWeather = new Texts { Content = "岛上天气配置", Color = Season.Basic.Colors.Black };
+        textsOffshoreWeather = new Texts { Content = "东侧海域配置", Color = Season.Basic.Colors.Black };
+        AddControl(textsIslandWeather);
+        AddControl(textsOffshoreWeather);
+        inputIslandWeather = new Input { WidthMin = WidthMin, Abbreviate = true,
+            OnAction = () => PickWeather(WeatherController.IslandId, inputIslandWeather) };
+        inputOffshoreWeather = new Input { WidthMin = WidthMin, Abbreviate = true,
+            OnAction = () => PickWeather(WeatherController.OffshoreId, inputOffshoreWeather) };
+        AddPanel(inputIslandWeather);
+        AddPanel(inputOffshoreWeather);
+        textsWeatherMode = new Texts { Content = "天气模式", Color = Season.Basic.Colors.Black };
+        AddControl(textsWeatherMode);
+        inputWeatherMode = new Input { WidthMin = WidthMin, Abbreviate = true, OnAction = () =>
+        {
+            var world = WorldSettings.Current;
+            world.WeatherMode = world.WeatherMode == WeatherMode.Showcase ? WeatherMode.Regional : WeatherMode.Showcase;
+            App.Instance.RequestSaveSettings();
+        }};
+        AddPanel(inputWeatherMode);
 
         inputStep = new Input()
         {
@@ -1257,6 +1300,58 @@ internal class SettingPanel : BoardPanel
         };
         AddPanel(inputNormalVariance);
 
+        inputSceneNormals = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                var sources = new List<Season.Entities.EData>
+                {
+                    new Season.Entities.EData() { Key = "0", Title = "Off (no normal target)" },
+                    new Season.Entities.EData() { Key = "1", Title = "On, view normals" },
+                    new Season.Entities.EData() { Key = "2", Title = "On, view roughness/metallic" }
+                };
+
+                current = inputSceneNormals;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null)
+                        {
+                            RenderQuality.Current.SceneNormals = picked.Key != "0";
+                            Season.Rendering.Effects.NormalViewEffect.Mode = picked.Key == "2" ? 1 : 0;
+
+                            // Persisted here for the launch it applies to. Only the request is written: MotionVectors is left
+                            // alone because the platform init forces it from SceneNormals on the next start anyway.
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+
+                            bool running = Season.Rendering.FrameSchedule.SceneNormal != null;
+                            App.Instance.AddLog(LogType.Backend,
+                                $"{DateTime.UtcNow} [Setting] SceneNormals={RenderQuality.Current.SceneNormals} saved, " +
+                                $"in force this session={running}, view mode={Season.Rendering.Effects.NormalViewEffect.Mode}" +
+                                (RenderQuality.Current.SceneNormals == running ? "" : " (restart to apply)"));
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputSceneNormals);
+
         inputLog = new Input()
         {
             WidthMin = WidthMin,
@@ -1318,13 +1413,9 @@ internal class SettingPanel : BoardPanel
         var paddingH = 100;
         var width0 = 180; var inputLeft = 350; var height0 = 70;
 
-        // Rows wrap into columns rather than running straight down. Fifteen of them at this pitch want about 1560px, and a
-        // 1080p window leaves the panel 880, so a single column would simply hide everything past the shadow rows - the
-        // failure would be silent, since a control positioned off the panel still updates and still answers hit tests.
-        //
-        // The column count is derived from the space rather than fixed, because the caller sizes this panel from the window
-        // (see App.settingPanel.Update): one column on a tall window, three on a short one, with no size hardcoded here.
-        const int rowCount = 21;
+        // 同时限制列宽和行高，避免新增天气行后越出面板。短窗口压缩行距，放不下时分页。
+        // 非当前页的输入停用且透明，防止看不见的旧位置仍参与命中。
+        const int rowCount = 25;
         var rowTop = (int)(title.PosY + padding + paddingH);
         var rowWidth = inputLeft + width0 + 100;
         var panelWidth = (int)(width ?? App.Instance.ExtendResolution.X - 200);
@@ -1333,9 +1424,20 @@ internal class SettingPanel : BoardPanel
         var usableH = panelHeight - (rowTop - (int)PosY) - padding;
 
         var rowsPerColumn = Math.Max(1, usableH / paddingH);
-        var columns = Math.Max(1, (rowCount + rowsPerColumn - 1) / rowsPerColumn);
+        var columns = Math.Min(Math.Max(1, usableW / rowWidth),
+            Math.Max(1, (rowCount + rowsPerColumn - 1) / rowsPerColumn));
         // Re-divide once the column count is known so the last column is not left holding a single row.
-        rowsPerColumn = (rowCount + columns - 1) / columns;
+        rowsPerColumn = Math.Min((rowCount + columns - 1) / columns, Math.Max(1, usableH / 55));
+        paddingH = Math.Min(paddingH, Math.Max(55, usableH / rowsPerColumn));
+        height0 = Math.Min(height0, paddingH - 5);
+        int rowsPerPage = rowsPerColumn * columns;
+        pageCount = (rowCount + rowsPerPage - 1) / rowsPerPage;
+        page = Math.Min(page, pageCount - 1);
+        inputPage.Enable = pageCount > 1;
+        inputPage.Text = $"{page + 1}/{pageCount} 下一页";
+        inputPage.Color = inputPage.MouseOver ? Season.Basic.Colors.Red : Season.Basic.Colors.Black;
+        result |= inputPage.Update(time, alpha: pageCount > 1 ? Alpha : 0,
+            posX: PosX + panelWidth - padding - 220, posY: title.PosY, width: 220, height: 50);
         var columnStride = columns > 1
             ? rowWidth + Math.Clamp((usableW - columns * rowWidth) / (columns - 1), 0, 120)
             : 0;
@@ -1344,15 +1446,21 @@ internal class SettingPanel : BoardPanel
 
         void Place(Texts label, Input input, string text)
         {
-            var x = (int)PosX + padding + row / rowsPerColumn * columnStride;
-            var y = rowTop + row % rowsPerColumn * paddingH;
+            bool visible = row / rowsPerPage == page;
+            int localRow = row % rowsPerPage;
+            var x = (int)PosX + padding + localRow / rowsPerColumn * columnStride;
+            var y = rowTop + localRow % rowsPerColumn * paddingH;
             row++;
 
-            label.Update(time, posX: x, posY: y);
+            label.WidthRequest = inputLeft - 15;
+            label.HeightRequest = label.LineHeight;
+            label.Update(time, alpha: visible ? Alpha : 0, posX: x, posY: y);
 
+            input.Enable = visible;
+            input.WidthMin = width0;
             input.Text = text;
             input.Color = input.MouseOver ? Season.Basic.Colors.Red : Season.Basic.Colors.Black;
-            if (input.Update(time, posX: x + inputLeft, posY: y, width: width0, height: height0))
+            if (input.Update(time, alpha: visible ? Alpha : 0, posX: x + inputLeft, posY: y, width: width0, height: height0))
             {
                 result = true;
             }
@@ -1371,6 +1479,9 @@ internal class SettingPanel : BoardPanel
         // happened to be - so the field would quietly rewrite itself just by being opened.
         Place(textsStartHour, inputStartHour, Season.Rendering.WorldSettings.Current.StartHour.ToString("0.##",
             System.Globalization.CultureInfo.InvariantCulture));
+        Place(textsWeatherMode, inputWeatherMode, WorldSettings.Current.WeatherMode == WeatherMode.Showcase ? "自动天空展示" : "区域天气");
+        Place(textsIslandWeather, inputIslandWeather, App.Instance.weather?.Status(WeatherController.IslandId) ?? "晴");
+        Place(textsOffshoreWeather, inputOffshoreWeather, App.Instance.weather?.Status(WeatherController.OffshoreId) ?? "晴");
         Place(textsStep, inputStep, App.Instance.step.ToString());
 
         // The trailing * on the four rows below means "this is what will be used, but not what is running". Each of them
@@ -1415,9 +1526,38 @@ internal class SettingPanel : BoardPanel
             System.Globalization.CultureInfo.InvariantCulture) + " texel");
         Place(textsShadowContact, inputShadowContact, RenderQuality.Current.ShadowContactHardening ? "On" : "Off");
         Place(textsNormalVariance, inputNormalVariance, RenderQuality.Current.TextureNormalVariance ? "On" : "Off");
+        // Same * convention as the rows above, with SceneNormal as the witness. Off * is the one extra state: the request was
+        // withdrawn but this session still writes the target until the restart.
+        Place(textsSceneNormals, inputSceneNormals, RenderQuality.Current.SceneNormals
+            ? (Season.Rendering.Effects.NormalViewEffect.Mode == 1 ? "On R/M" : "On")
+                + (Season.Rendering.FrameSchedule.SceneNormal != null ? "" : " *")
+            : Season.Rendering.FrameSchedule.SceneNormal != null ? "Off *" : "Off");
         Place(textsLog, inputLog, App.Instance.Logs.Count.ToString());
 
         return result;
+    }
+
+    Task PickWeather(string id, Input input)
+    {
+        if (simplePicker != null) return Task.CompletedTask;
+        current = input;
+        var sources = Enum.GetValues<WeatherKind>().Select(kind => new Season.Entities.EData
+        {
+            Key = kind.ToString(), Title = WeatherController.Text(kind),
+        }).ToList();
+        simplePicker = new SimplePicker(sources, new List<Season.Entities.EData>())
+        {
+            OnSelect = () =>
+            {
+                var picked = simplePicker.Results?.FirstOrDefault();
+                if (picked != null && Enum.TryParse<WeatherKind>(picked.Key, out var kind))
+                    App.Instance.weather?.Request(id, kind);
+                simplePicker.OnClose?.Invoke();
+            },
+            OnClose = () => { RemovePanel(simplePicker); simplePicker = null; },
+        };
+        AddPanel(simplePicker);
+        return Task.CompletedTask;
     }
 
     // Display spellings for the AA tier. Kept apart from the picker's own titles because those carry a parenthetical that

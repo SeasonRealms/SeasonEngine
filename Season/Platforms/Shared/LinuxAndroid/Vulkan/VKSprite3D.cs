@@ -13,11 +13,13 @@ namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 /// Vulkan backend 3D billboard sprite aligned 1:1 with DXSprite3D:
 ///   - All instances share one static quad VB (reference-counted)
 ///   - The World matrix is determined by BillboardMode (Spherical/Cylindrical/None)
-///   - View/Projection reuse VKPrimitiveGroup.Camera (kept in sync with the PBR3D path)
+///   - View/Projection come from the main view set (same RenderView as the PBR3D path)
 ///   - renderMode = 0: Sprite path (no PBR lighting)
 /// </summary>
 internal unsafe class VKSprite3D : VKSpriteQuad
 {
+    protected override bool ScreenSpaceView => false;
+
     // Shared static quad VB for all VKSprite3D instances (reference-counted)
     static BufferResource _sharedVertexBuffer;
     static int _sharedRefCount;
@@ -110,11 +112,8 @@ internal unsafe class VKSprite3D : VKSpriteQuad
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(worldMatrix),
-            View = Matrix4x4.Transpose(VKPrimitiveGroup.Camera.View),
-            Projection = Matrix4x4.Transpose(VKPrimitiveGroup.Camera.Projection),
             // 2-3 contract clause 6: write the historical matrix into MatrixBuffer
             PrevWorld = Matrix4x4.Transpose(prevWorldMatrix),
-            PrevViewProjection = Matrix4x4.Transpose(VKPrimitiveGroup.Camera.PrevViewProjection),
         };
 
         // Material UBO: color x alpha is expressed through BaseColor.W

@@ -13,13 +13,10 @@ namespace Season.Platforms.Shared.Apple.Metal;
 ///   while View and Projection remain Identity
 /// - each instance owns its own 6-vertex VB, leaving room for future quad UV and position transforms used by text rendering and similar paths
 /// - renderMode = 0 selects the Sprite path, where the shader outputs BaseColor multiplied by the texture directly
-/// - the globally shared static 2D orthographic camera matches DXSprite2D.Camera and VKSprite2D.Camera
+/// - 2D draws take their matrices from <see cref="ViewConstants.ScreenSpace"/> on the GPU, so no CPU-side 2D camera is kept here
 /// </summary>
 internal sealed class MTLSprite2D : MTLSpriteQuad
 {
-    // === Static 2D orthographic camera aligned with DXSprite2D.Camera and VKSprite2D.Camera ===
-    internal static Camera Camera;
-
     // === Per-instance vertex buffer with 6 vertices ===
     IMTLBuffer _vertexBuffer = null!;
 
@@ -36,38 +33,13 @@ internal sealed class MTLSprite2D : MTLSpriteQuad
     internal Season.Controls.SpriteBase? SpriteRef;
 
     // ============================================================
-    // Static initialization and camera updates.
+    // Static lifecycle. 2D matrices live in the ScreenSpace ViewConstants on the GPU.
     // ============================================================
 
     public static void Init()
     {
-        // The lighting UBO is already initialized by AppDelegate through MTLPrimitiveGroup.InitLights.
-        // Only the 2D camera is handled here.
-        Init2DCamera();
-    }
-
-    static void Init2DCamera()
-    {
-        // Use an orthographic camera for 2D rendering in a left-handed coordinate system with Z ranging from 0 to 1.
-        Camera.View = Matrix4x4.Identity;
-        Camera.Projection = Matrix4x4.CreateOrthographicOffCenterLeftHanded(
-            -1f, 1f,   // left, right (NDC space)
-            -1f, 1f,   // bottom, top (NDC space)
-            0.1f, 10f); // near, far
-    }
-
-    public static void UpdateCamera(float time, Vector3 cameraPos, Vector3 cameraTarget, SceneLightParams lightParams)
-    {
-        // For 1-3, keep matrix construction aligned with MTLPrimitiveGroup.Update
-        // by using shared Camera3D instead of introducing a second hard-coded matrix path.
-        var camera3D = DeviceServices.BaseApp.Camera;
-        var aspectRatio = DeviceServices.BaseApp.DeviceResolution.X / (float)DeviceServices.BaseApp.DeviceResolution.Y;
-        camera3D.UpdateIfChanged(aspectRatio);
-        Camera.View = camera3D.View;
-        Camera.Projection = camera3D.Projection;
-
-        // Write the lighting UBO.
-        MTLPrimitiveGroup.SetLighting(lightParams);
+        // The lighting UBO is already initialized by AppDelegate through MTLPrimitiveGroup.InitLights;
+        // 2D draws read ViewConstants.ScreenSpace, so there is nothing to prepare here.
     }
 
     public static void InitDispose()
@@ -308,7 +280,8 @@ internal sealed class MTLSprite2D : MTLSpriteQuad
             Padding1 = factor
         };
 
-        // Matrix UBO: 2D orthographic path using NDC directly, with View and Projection both set to identity.
+        // Matrix UBO: 2D orthographic path using NDC directly
+        // (bound to the screen-space view constants, whose View/Projection are identity).
         var scaleMatrix = Matrix4x4.CreateScale(scaleVec);
         var translationMatrix = Matrix4x4.CreateTranslation(position);
         var worldMatrix = scaleMatrix * translationMatrix;
@@ -316,8 +289,6 @@ internal sealed class MTLSprite2D : MTLSpriteQuad
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(worldMatrix),
-            View = Matrix4x4.Identity,
-            Projection = Matrix4x4.Identity
         };
 
         // A static sprite only needs one logical write, but mirror it into all frames

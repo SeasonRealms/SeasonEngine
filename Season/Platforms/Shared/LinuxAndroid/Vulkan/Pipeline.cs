@@ -163,6 +163,47 @@ public static VkPipeline TransparentBackFacePipelineState;
     public static DescriptorSetLayout FogSetLayout;
 
     /// <summary>
+    /// 每视图常量 set 2 的布局：binding 0 = ViewConstants UBO（与 DX b8 同布局）。
+    /// 视图数据独立成 set，是为了让同一个物体的 set 0 能在多个视图之间复用，只换 set 2。
+    /// </summary>
+    public static DescriptorSetLayout ViewSetLayout;
+
+    /// <summary>视图槽上限，与共享调度器的 <see cref="Season.Rendering.FrameSchedule.MaxViews"/> 同源。</summary>
+    internal const int MaxViews = Season.Rendering.FrameSchedule.MaxViews;
+
+    /// <summary>
+    /// 每视图常量（视图槽 × 帧槽，2D 数组），槽 0 是主视图，由图元组 Update 每帧写入一次；
+    /// 其余槽位由 FrameSchedule.PrepareView 钩子在该视图绘制收集之前写入。
+    /// 视图数据独立成 set 2，同一个物体的 set 0 才能在多个视图之间复用，只换 set 2。
+    /// </summary>
+    static BufferResource[][] _viewBuffers = null!;
+    static byte*[][] _mappedViewBuffers = null!;
+    static DescriptorSet[][] _viewSets = null!;
+
+    /// <summary>屏幕空间视图（单位 View/Projection，无历史），2D 精灵与文字使用，创建后不再改写。</summary>
+    static BufferResource _screenViewBuffer;
+    public static DescriptorSet ScreenViewSet;
+
+    /// <summary>本帧槽的主视图 set 2。</summary>
+    internal static DescriptorSet MainViewSet => _viewSets[0][Device.FrameIndex];
+
+    /// <summary>
+    /// 正在收集/重放的视图槽。由 <see cref="SetActiveView"/> 在该视图的绘制收集之前设定，
+    /// 视图循环结束后由 <see cref="ResetActiveView"/> 复原成主视图，
+    /// 于是 Overlay 与直绘路径仍然绑到主视图常量。
+    /// </summary>
+    internal static int ActiveViewIndex;
+
+    /// <summary>当前视图槽的 set 2：3D 绘制项在收集时记下的就是这个句柄。</summary>
+    internal static DescriptorSet ActiveViewSet => _viewSets[ActiveViewIndex][Device.FrameIndex];
+
+    /// <summary>选定后续绘制的视图槽；越界回落到主视图。</summary>
+    internal static void SetActiveView(int index)
+        => ActiveViewIndex = (uint)index < MaxViews ? index : 0;
+
+    internal static void ResetActiveView() => ActiveViewIndex = 0;
+
+    /// <summary>
     /// 每帧槽一个的雾采样集。透明阶段的开头写一次、随后全帧复用：
     /// 同一帧里所有透明绘制项拿到的是同一份雾资源（雾合成按帧产出，与绘制项无关），
     /// 所以不必逐项一份集合，“写完再绑”的顺序也天然成立。
@@ -275,7 +316,7 @@ public static VkPipeline TransparentBackFacePipelineState;
 
         // 与 DX CreateRootSignature 中的 _fogSamplingEnabled 同源：
         // 档位刚在初始化前锁定，此后不会翻转，因此 FOG_SAMPLING 是一次性注入的编译期开关。
-        SceneFogSamplingBaked = RenderQuality.Current.RequiresFogSceneDepth(
+        SceneFogSamplingBaked = RenderQuality.Current.RequiresAtmosphereSceneDepth(
             Device.HdrSceneColor, true, Immediate2DMode.Enabled);
 
         // -- Text GPU Instancing: shared unit-quad VB plus IB for all Texts --
@@ -305,8 +346,10 @@ public static VkPipeline TransparentBackFacePipelineState;
         // 雾采样 set 1 的布局要先于 PipelineLayout 建好（它参与 set 0/1 的双集布局），
         // 默认集与每槽集合则要在 PSO 烘焙之前就位。
         FogSetLayout = CreateFogSetLayout();
+        ViewSetLayout = CreateViewSetLayout();
         PipelineLayout = CreatePipelineLayout();
         CreateFogSets();
+        CreateViewSets();
 
         OpaquePipelineState = CreatePipelineState(PipelineMode.Opaque);
         OpaqueDoubleSidedPipelineState = CreatePipelineState(PipelineMode.Opaque, true);
@@ -339,10 +382,12 @@ public static VkPipeline TransparentBackFacePipelineState;
         // when MotionVectors=1, create velocity MRT PSOs, 8 variants plus one velocity render pass.
         // The velocity render pass uses the same color format as the main render pass,
         // with render-pass compatibility guaranteed by the code path.
+        // A0.2: with EffectiveSceneNormals the anchor carries the SceneNormal slot as well,
+        // so the whole Vel* table bakes against the four-target shape that BeginPass binds.
         if (RenderQuality.Current.MotionVectors)
         {
             _velocityRenderPass = VKRenderTarget.CreateVelocityRenderPassForFormat(
-                Device.SceneColorFormat);
+                Device.SceneColorFormat, withNormal: RenderQuality.Current.EffectiveSceneNormals);
             VelOpaquePipelineState = CreatePipelineState(PipelineMode.Opaque, CullModeFlags.BackBit, velocity: true);
             VelOpaqueDoubleSidedPipelineState = CreatePipelineState(PipelineMode.Opaque, CullModeFlags.None, velocity: true);
             VelTransparentPipelineState = CreatePipelineState(PipelineMode.Transparent, CullModeFlags.BackBit, velocity: true);
@@ -411,6 +456,7 @@ public static VkPipeline TransparentBackFacePipelineState;
         if (PipelineLayout.Handle != 0) vk.DestroyPipelineLayout(d, PipelineLayout, null);
         if (SetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(d, SetLayout, null);
         if (FogSetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(d, FogSetLayout, null);
+        if (ViewSetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(d, ViewSetLayout, null);
         if (StaticSampler.Handle != 0) vk.DestroySampler(d, StaticSampler, null);
         if (StaticPointSampler.Handle != 0) vk.DestroySampler(d, StaticPointSampler, null);
         if (ShadowComparisonSampler.Handle != 0) vk.DestroySampler(d, ShadowComparisonSampler, null);
@@ -437,10 +483,34 @@ public static VkPipeline TransparentBackFacePipelineState;
         PipelineLayout = default;
         SetLayout = default;
         FogSetLayout = default;
+        ViewSetLayout = default;
         // 描述符集随描述符池整体销毁，这里只丢句柄。
         DefaultFogSet = default;
         CurrentFogSet = default;
         _fogSets = null!;
+        ScreenViewSet = default;
+        _viewSets = null!;
+        if (_viewBuffers != null)
+        {
+            for (int v = 0; v < _viewBuffers.Length; v++)
+            {
+                for (int i = 0; i < _viewBuffers[v].Length; i++)
+                {
+                    if (_viewBuffers[v][i].Memory.Handle == 0) continue;
+                    if (_mappedViewBuffers[v][i] != null) vk.UnmapMemory(d, _viewBuffers[v][i].Memory);
+                    rm.DestroyBuffer(_viewBuffers[v][i]);
+                }
+            }
+            _viewBuffers = null!;
+            _mappedViewBuffers = null!;
+        }
+        ActiveViewIndex = 0;
+        if (_screenViewBuffer.Memory.Handle != 0)
+        {
+            vk.UnmapMemory(d, _screenViewBuffer.Memory);
+            rm.DestroyBuffer(_screenViewBuffer);
+            _screenViewBuffer = default;
+        }
         StaticSampler = default;
         StaticPointSampler = default;
         if (IdentityInstanceBuffer.Memory.Handle != 0) rm.DestroyBuffer(IdentityInstanceBuffer);
@@ -673,6 +743,70 @@ public static VkPipeline TransparentBackFacePipelineState;
             WriteFogSet(_fogSets[i], DefaultFogFrameBuffers[i].Buffer, FogFrameByteSize, dummy.View, dummy.View);
         }
     }
+
+    /// <summary>
+    /// 建立视图常量 set 2：每帧槽一个主视图集合 + 一个屏幕空间集合。
+    /// 集合只在这里写一次描述符，此后只改写映射的 UBO 内容（帧槽独占，不与在飞帧冲突）。
+    /// 初值均为屏幕空间：Immediate2D 等不走图元组 Update 的路径也能读到有定义的数据。
+    /// </summary>
+    static void CreateViewSets()
+    {
+        int n = (int)Device.frameCount;
+        uint size = (uint)Unsafe.SizeOf<ViewConstants>();
+        var initial = ViewConstants.ScreenSpace.Transposed();
+
+        _screenViewBuffer = Device.ResourceManager.CreateConstantBuffer(size, out var screenMapped);
+        Unsafe.Write(screenMapped, initial);
+        ScreenViewSet = Device.DescriptorAllocator.AllocateSet(ViewSetLayout);
+        WriteViewSet(ScreenViewSet, _screenViewBuffer.Buffer, size);
+
+        // 视图槽整池一次建满：每个视图只有 256B 常量，而视图首次出现（小地图上线）不该在帧内触发分配。
+        _viewBuffers = new BufferResource[MaxViews][];
+        _mappedViewBuffers = new byte*[MaxViews][];
+        _viewSets = new DescriptorSet[MaxViews][];
+        for (int v = 0; v < MaxViews; v++)
+        {
+            _viewBuffers[v] = new BufferResource[n];
+            _mappedViewBuffers[v] = new byte*[n];
+            _viewSets[v] = new DescriptorSet[n];
+            for (int i = 0; i < n; i++)
+            {
+                _viewBuffers[v][i] = Device.ResourceManager.CreateConstantBuffer(size, out _mappedViewBuffers[v][i]);
+                Unsafe.Write(_mappedViewBuffers[v][i], initial);
+                _viewSets[v][i] = Device.DescriptorAllocator.AllocateSet(ViewSetLayout);
+                WriteViewSet(_viewSets[v][i], _viewBuffers[v][i].Buffer, size);
+            }
+        }
+    }
+
+    static void WriteViewSet(DescriptorSet set, Silk.NET.Vulkan.Buffer buffer, ulong range)
+    {
+        var info = new DescriptorBufferInfo { Buffer = buffer, Offset = 0, Range = range };
+        var write = new WriteDescriptorSet
+        {
+            SType = StructureType.WriteDescriptorSet,
+            DstSet = set,
+            DstBinding = 0,
+            DescriptorCount = 1,
+            DescriptorType = DescriptorType.UniformBuffer,
+            PBufferInfo = &info
+        };
+        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 1, &write, 0, null);
+    }
+
+    /// <summary>写入本帧槽的主视图常量（内部转置，与 MatrixBuffer 同一约定）。</summary>
+    internal static void WriteMainView(in ViewConstants constants) => WriteViewConstants(0, constants);
+
+    /// <summary>写入某个视图槽本帧槽的常量；槽位越界即忽略，调用方不必预先校验。</summary>
+    internal static void WriteViewConstants(int index, in ViewConstants constants)
+    {
+        if ((uint)index >= MaxViews) return;
+        Unsafe.Write(_mappedViewBuffers[index][Device.FrameIndex], constants.Transposed());
+    }
+
+    /// <summary>绑定视图 set 2。与 set 0 一样逐绘制绑定：中间穿插的其他管线布局会扰动高位 set。</summary>
+    internal static void BindViewSet(CommandBuffer cmd, DescriptorSet set)
+        => Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 2, 1, &set, 0, null);
 
     /// <summary>往雾采样集里写三段描述符。调用方保证此刻这个集合没有被任何正在录制的命令缓冲引用。</summary>
     static void WriteFogSet(DescriptorSet set, Silk.NET.Vulkan.Buffer frame, ulong frameRange,
@@ -1031,7 +1165,8 @@ public static VkPipeline TransparentBackFacePipelineState;
         VkBuffer instanceBuffer,
         uint instanceCount,
         uint firstInstance,
-        bool prepared)
+        bool prepared,
+        DescriptorSet viewSet = default)
     {
         var vk = Device.Vk;
 
@@ -1063,6 +1198,7 @@ public static VkPipeline TransparentBackFacePipelineState;
         var set = descriptorSet;
         var pipelineLayout = PipelineLayout;
         vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, pipelineLayout, 0, 1, &set, 0, null);
+        BindViewSet(cmd, viewSet.Handle != 0 ? viewSet : ActiveViewSet);
 
         vk.CmdDrawIndexed(cmd, indexCount, instanceCount, 0, 0, firstInstance);
     }
@@ -1160,6 +1296,8 @@ public static VkPipeline TransparentBackFacePipelineState;
 
         var set = descriptorSet;
         vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 0, 1, &set, 0, null);
+        // 阴影 VS 不读视图矩阵（光空间矩阵走 push constant），但 set 2 被同一份 VS 源码静态声明。
+        BindViewSet(cmd, MainViewSet);
 
         vk.CmdDrawIndexed(cmd, indexCount, instanceCount, 0, 0, firstInstance);
     }
@@ -1570,13 +1708,34 @@ public static VkPipeline TransparentBackFacePipelineState;
         return layout;
     }
 
+    static DescriptorSetLayout CreateViewSetLayout()
+    {
+        var binding = new DescriptorSetLayoutBinding
+        {
+            Binding = 0,
+            DescriptorType = DescriptorType.UniformBuffer,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit
+        };
+        var info = new DescriptorSetLayoutCreateInfo
+        {
+            SType = StructureType.DescriptorSetLayoutCreateInfo,
+            BindingCount = 1,
+            PBindings = &binding
+        };
+        if (Device.Vk.CreateDescriptorSetLayout(Device.LogicalDevice, in info, null, out var layout) != Result.Success)
+            throw new Exception("vkCreateDescriptorSetLayout (view set) failed");
+        return layout;
+    }
+
     static PipelineLayout CreatePipelineLayout()
     {
         // set 0 = 场景集，set 1 = 雾采样集。拆成两个 set 不是风格选择，是硬性要求：
         // 阴影 pass 会绑定 set 0，而透明阶段要给本帧补写雾绑定；
         // 未声明 UPDATE_AFTER_BIND 的 set 一旦被正在录制的命令缓冲引用就不能再改写，
         // 两者落在同一个 set 上就必然让整条命令缓冲失效。分开之后阴影只碰 set 0、透明阶段只碰 set 1。
-        var setLayouts = stackalloc DescriptorSetLayout[2] { SetLayout, FogSetLayout };
+        // set 2 = 每视图常量（View/Projection/历史 VP 等），与物体级 set 0 解耦。
+        var setLayouts = stackalloc DescriptorSetLayout[3] { SetLayout, FogSetLayout, ViewSetLayout };
 
         // 1-5:
         // VS push constant, 64 bytes, holding light-space ViewProj and written per quadrant in the shadow pass.
@@ -1604,7 +1763,7 @@ public static VkPipeline TransparentBackFacePipelineState;
         var info = new PipelineLayoutCreateInfo
         {
             SType = StructureType.PipelineLayoutCreateInfo,
-            SetLayoutCount = 2,
+            SetLayoutCount = 3,
             PSetLayouts = setLayouts,
             PushConstantRangeCount = 2,
             PPushConstantRanges = pushRanges
@@ -1638,9 +1797,13 @@ public static VkPipeline TransparentBackFacePipelineState;
         // Outline2D mask uses a single color attachment plus the mask FS variant, OUTLINE_MASK,
         // so velocityOutput always stays 0 even when MotionVectors=1.
         bool velocityOutput = RenderQuality.Current.MotionVectors && !shadowPass && !outlineMask && !overlay;
+        // A0.2: NORMAL_OUTPUT adds slot2 = SceneNormal (oct normal xy, roughness, metallic) on top of velocity,
+        // mirroring the DX normalOutput gate.
+        bool normalOutput = velocityOutput && RenderQuality.Current.EffectiveSceneNormals;
         string shadowDefs = (RenderQuality.Current.ShadowsEnabled ? "#define SHADOW_ENABLED 1\n" : "#define SHADOW_ENABLED 0\n")
             + (shadowPass ? "#define SHADOW_PASS 1\n" : "#define SHADOW_PASS 0\n")
-            + (velocityOutput ? "#define VELOCITY_OUTPUT 1\n" : "#define VELOCITY_OUTPUT 0\n");
+            + (velocityOutput ? "#define VELOCITY_OUTPUT 1\n" : "#define VELOCITY_OUTPUT 0\n")
+            + (normalOutput ? "#define NORMAL_OUTPUT 1\n" : "#define NORMAL_OUTPUT 0\n");
         var vertexSrc = VertexGlsl.Replace("#version 460", "#version 460\n" + shadowDefs);
         var vsModule = ShaderCompiler.CreateShaderModule(
             Device.Vk, Device.LogicalDevice, vertexSrc, ShaderStageFlags.VertexBit, "main", "pipeline.vert", debug);
@@ -1694,15 +1857,7 @@ public static VkPipeline TransparentBackFacePipelineState;
                 // 使用 FogAtWorld（世界坐标直接采样）而不是 FogTransparent：
                 // 当前材质 PSO 是 straight alpha，混合阶段统一乘 alpha，这里只把消光与内散射叠在颜色上。
                 + @"
-vec4 ApplySceneFog(vec4 color, vec3 worldPos) {
-#if FOG_SAMPLING
-    if (fogParams.x > 0.5) {
-        vec4 fog = FogAtWorld(worldPos);
-        color.rgb = color.rgb * fog.w + fog.rgb;
-    }
-#endif
-    return color;
-}
+vec4 ApplySceneFog(vec4 color, vec3 worldPos);
 ");
             fsModule = ShaderCompiler.CreateShaderModule(
                 Device.Vk, Device.LogicalDevice, fragmentSrc, ShaderStageFlags.FragmentBit, "main", "pipeline.frag", debug);
@@ -1875,6 +2030,13 @@ vec4 ApplySceneFog(vec4 color, vec3 worldPos) {
                 blendAttachmentCount = 0;
                 blendAttachments = null;
             }
+            else if (velocity && RenderQuality.Current.EffectiveSceneNormals)
+            {
+                // A0.2: slot2 (SceneNormal) shares velocity's no-blend / Opaque-only write mask.
+                blendAttachmentCount = 3;
+                var arr = stackalloc PipelineColorBlendAttachmentState[3] { colorAttachment, velocityAttachment, velocityAttachment };
+                blendAttachments = arr;
+            }
             else if (velocity)
             {
                 blendAttachmentCount = 2;
@@ -1974,13 +2136,21 @@ layout(location = 6) out vec4 vPrevClip;       // 2-3: previous-frame non-jitter
 
 layout(std140, binding = 0) uniform Matrices {
     mat4 world;
-    mat4 view;
-    mat4 projection;
     // Contract clause 6 of 2-3:
     // history matrices follow the same transpose contract as world, view, and projection.
     // All-zero means not written yet, and the VS falls back from that sentinel.
     mat4 prevWorld;
+};
+
+// Per-view constants (set 2), same layout as DX b8 / C# ViewConstants.
+layout(std140, set = 2, binding = 0) uniform ViewConstants {
+    mat4 view;
+    mat4 projection;
     mat4 prevViewProjection;
+    vec4 viewCameraPos;
+    vec4 viewVelocityParams;
+    vec4 viewParams0;
+    vec4 viewReserved0;
 };
 
 layout(std140, binding = 2) uniform MaterialParams {
@@ -2238,6 +2408,17 @@ layout(location = 0) out vec4 outColor;
 #if VELOCITY_OUTPUT
 layout(location = 1) out vec2 outVelocity;    // 2-3: MRT slot 1 = velocity in UV space
 #endif
+#if NORMAL_OUTPUT
+// A0.2: MRT slot 2 = SceneNormal (xy = octahedral world normal, z = roughness after Toksvig, w = metallic).
+// Zero is written by every non-PBR exit; consumers detect no-surface through SceneDepth, since xy = 0 encodes +Z.
+layout(location = 2) out vec4 outNormal;
+
+vec2 OctEncodeNormal(vec3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    vec2 s = vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return n.z >= 0.0 ? n.xy : (1.0 - abs(n.yx)) * s;
+}
+#endif
 
 // 1-2 lighting system:
 // unified light structure, 64 bytes, matching C# GpuLight byte for byte.
@@ -2286,8 +2467,8 @@ layout(std140, binding = 1) uniform SceneLights {
     vec4 irradianceSH9[9];     // offset 960, ends at 1104 bytes
     // Clause 10 of 2-4, starting at offset 1104:
     // giParams0 = probeGridMin.xyz and spacing,
-    // giParams1 = gridXYZ as float and GiIntensity,
-    // giParams2 = normalBias, chebyshev, atlasReady, and unused.
+    // giParams1 = gridXYZ as float and GiIntensity (blend weight, never a scale on probeIrr),
+    // giParams2 = normalBias, chebyshev, atlasReady, and fadeBandCells.
     vec4 giParams0;            // offset 1104
     vec4 giParams1;            // offset 1120
     vec4 giParams2;            // offset 1136, ends at 1152 bytes
@@ -2314,7 +2495,11 @@ layout(std140, binding = 1) uniform SceneLights {
     // aerial-perspective 3D LUT consumption parameters.
     // x = farthest distance in km, >0 enables AP and is the only gate.
     // y = Intensity, where 0 means identity composition.
-    vec4 apParams0;            // offset 1360, ends at 1376 bytes
+    vec4 apParams0;            // offset 1360
+    // 区域天气：头两行后每区域八行；前缀 1376B 保持，总长 2432B。
+    vec4 weatherParams0;       // offset 1376
+    vec4 weatherParams1;       // offset 1392
+    vec4 weatherRegions[64];   // offset 1408, ends at 2432 bytes
 };
 
 layout(std140, binding = 2) uniform MaterialParams {
@@ -2390,6 +2575,26 @@ layout(binding = 18) uniform sampler2D ddgiDepth;
 // noise tiles at a fixed period, while wind offsets can push uv outside [0,1].
 // Clamp would stretch the outermost column into a motionless stripe across the sky, just like DX s2 wrapSampler avoids.
 layout(binding = 19) uniform sampler2D cloudNoise;
+vec4 WeatherH(int i) { return i==0?weatherParams0:weatherParams1; }
+vec4 WeatherR(int i,int row) { return weatherRegions[i*8+row]; }
+vec4 WeatherNoise(vec2 uv) { return textureLod(cloudNoise,uv,0.0); }
+" + Season.Rendering.Effects.WeatherShaders.CommonGlsl
+  + Season.Rendering.Effects.WeatherShaders.CloudGlsl
+  + Season.Rendering.Effects.WeatherShaders.RainGlsl + @"
+vec4 ApplySceneFog(vec4 color, vec3 worldPos) {
+#if FOG_SAMPLING
+    if(fogParams.y > 0.5) {
+        vec3 ray=worldPos-cameraPos.xyz; float distance=length(ray);
+        vec4 rain=WeatherRain(cameraPos.xyz,ray/max(distance,1e-8),distance);
+        color.rgb=color.rgb*rain.w+rain.rgb;
+    }
+    if(fogParams.x > 0.5) {
+        vec4 fog=FogAtWorld(worldPos);
+        color.rgb=color.rgb*fog.w+fog.rgb;
+    }
+#endif
+    return color;
+}
 
 // Step E of 2-5:
 // aerial-perspective froxel volume on binding 20, 32^3 rgba16float.
@@ -2437,7 +2642,7 @@ vec3 EvaluateIrradianceSH9(vec3 n) {
 // The absolute center texel is tile*8 + 1 + oct*6, so normalized uv divides directly by atlas size.
 // worldPos is offset along the normal by giParams2.x, normalBias, then the 8 neighboring probes are gathered and blended by trilinear weights times cosine-direction weights.
 // StaticSampler bilinearly samples each probe's octahedral inner core, with the gutter absorbing seam overflow.
-// The result is multiplied by GiIntensity.
+// The result replaces the SH9/ambient term as a blend, and giParams1.w is the weight of that blend rather than a scale on the probe value: see the return statement for why the difference matters.
 // Starting from step 3, giParams2.y > 0.5 enables a Chebyshev variance test per probe by sampling the depth-moment atlas.
 // The resulting visibility factor multiplies the weight to suppress light leaks through wall seams, contact regions, and back faces.
 // Starting from step 5, invalid probes, tile alpha < 0.5 and back-face hit rate above the threshold in clause 13, are removed from the weighting.
@@ -2466,18 +2671,26 @@ vec3 SampleProbeIrradiance(vec3 worldPos, vec3 N, vec3 fallback) {
     vec3 base = floor(gc);
     vec3 f = gc - base;
 
-    // 2-4 clause 9: fade back to fallback outside the probe volume. gc is in probe-index units, so trilinear
+    // 2-4 clause 9: fade the probe contribution out beyond the last probe row. gc is in probe-index units, so trilinear
     // interpolation is only defined over [0, dims-1]; past that the clamp below collapses all eight corners onto a
     // single boundary probe, which hands a distant surface one near-camera probe's irradiance as if it were its own.
     // That reads as a whole surface lit uniformly by an unrelated probe, wobbling with that probe's amortized R2 ray
     // rotation and hysteresis rather than with anything in the scene, and it is the only lighting a face turned away
     // from every light has. The grid is camera-centred and re-snapped every frame in Ddgi.Record, so this covers
-    // everything past GiVolumeSize/2, not just distant scenery. Fading across the one spacing beyond the last probe
-    // keeps the edge from popping as the volume slides with the camera - within that band the clamped probe is still
-    // the nearest one, no further away than an interior interpolation reaches - and past it the result is exactly the
-    // pre-DDGI 1-7/1-2 diffuse term.
+    // everything past GiVolumeSize/2, not just distant scenery.
+    // Three decisions here, about the seam rather than its silhouette:
+    // 1. The band is giParams2.w cells wide, not one. One cell of linear ramp is already a hard-edged ring: it breaks the
+    //    gradient at both ends, and once the interior and the exterior differ by any amount that ring is what the eye
+    //    locks onto while the volume slides with the camera. Widen it and curve it - s(t)=t*t*(3-2t) is C1 at both ends.
+    // 2. The metric stays the axis-aligned max of the per-axis excess, not a radial length. A round band would only
+    //    redraw the same seam as a circle, because the shape is not what makes it visible - the step in the blend at the
+    //    end of this function is. Clauses 9/13 remove that step, so the band has nothing left to outline.
+    // 3. The fade never moves the result to a *different* amount of light: both ends settle on fallback, and an
+    //    unoccluded interior produces fallback term for term as well, so inside the band the two sides agree exactly.
     vec3 outside = max(max(-gc, gc - (dims - 1.0)), vec3(0.0));
-    float boundsFade = clamp(1.0 - max(max(outside.x, outside.y), outside.z), 0.0, 1.0);
+    float band = max(giParams2.w, 1.0);
+    float boundsFade = clamp(1.0 - max(max(outside.x, outside.y), outside.z) / band, 0.0, 1.0);
+    boundsFade = boundsFade * boundsFade * (3.0 - 2.0 * boundsFade);
 
     vec3 sum = vec3(0.0);
     float wsum = 0.0;
@@ -2519,15 +2732,23 @@ vec3 SampleProbeIrradiance(vec3 worldPos, vec3 N, vec3 fallback) {
         sum += textureLod(ddgiAtlas, uv, 0.0).rgb * w;
         wsum += w;
     }
-    // Step 5:
-    // wsum / wraw is the proportion of this shaded point's interpolated weight that lands on valid probes.
-    // It is used to linearly blend between probe irradiance and fallback,
-    // which is the diffuse result that would have been used without DDGI.
-    // If all 8 neighbors are invalid, including the initial zero-initialized atlas before the first update, the code naturally lands on pure fallback.
-    // The transition stays continuous, with no threshold pop or flicker.
+    // Step 5 + clause 9 energy contract. wsum/wraw is the fraction of this shading point's interpolation weight that
+    // lands on valid probes; boundsFade is the coverage envelope; giParams1.w is how much of the probe field's deviation
+    // from the environment the application wants to show. All three scale the *blend*, never the probe value:
+    //     result = mix(fallback, probeIrr, valid * boundsFade * GiIntensity)
+    // That distinction is the whole of clause 9. A probe stores irradiance in the same units as EvaluateIrradianceSH9:
+    // a ray that misses multiplies the same SH radiance coefficients by the same cosine kernel the surface samples them
+    // with, and the update divides by the accumulated cosine weight, so the quotient is E(n)/pi. In an unoccluded, empty
+    // volume probeIrr therefore equals fallback term for term. Scaling probeIrr would turn any gain into a uniform
+    // brightness step between the inside and the outside of a camera-following box - at GiIntensity 0.4 the interior
+    // sits at 40% of the exterior, which in an ambient-only frame is the entire visible difference. Scaling the blend
+    // instead leaves that case identical for every gain, applies the same gain to real occlusion (probeIrr < fallback)
+    // and to real bounce (probeIrr > fallback), and still returns pure fallback at gain 0.
+    // If all 8 neighbors are invalid, including the zero-initialized atlas before the first update, wsum is zero and the
+    // result is pure fallback with a continuous transition and no threshold jumps or flicker.
     vec3 probeIrr = wsum > 1e-6 ? sum / wsum : vec3(0.0);
     float vfrac = clamp(wsum / max(wraw, 1e-6), 0.0, 1.0) * boundsFade;
-    return mix(fallback, probeIrr * giParams1.w, vfrac);
+    return mix(fallback, probeIrr, vfrac * giParams1.w);
 }
 #endif
 
@@ -3162,6 +3383,9 @@ void main() {
         outVelocity = (curNdc - prevNdc) * vec2(0.5, -0.5);
     }
 #endif
+#if NORMAL_OUTPUT
+    outNormal = vec4(0.0);
+#endif
     vec3 albedo = materialColor.rgb;
     float alpha = materialColor.a;
     vec3 metallicRoughness = vec3(0.0, 0.5, 0.0);
@@ -3243,6 +3467,7 @@ void main() {
         // The code inside uses only textureLod, explicit LOD 0, so this non-uniform branch does not involve implicit derivatives.
         if (cloudParams0.w > 0.0 && skyDir.y > 0.0)
             skyRadiance = CloudComposite(skyRadiance, skyDir, cameraPos.xz * 0.001);
+        skyRadiance = WeatherCloudComposite(skyRadiance, cameraPos.xyz, skyDir, skyParams0.xyz);
 #if HDR_CHAIN
         // The LUT already stores linear HDR radiance.
         // Output it directly and let the full FinalBlit chain, exposure plus ACES plus gamma, close the path under the 1-4 contract.
@@ -3345,6 +3570,10 @@ void main() {
         roughness = min(1.0, sqrt(sqrt(ggxAlpha * ggxAlpha + twoOverKappa)));
     }
 
+#if NORMAL_OUTPUT
+    outNormal = vec4(OctEncodeNormal(N), roughness, metallic);
+#endif
+
     vec3 V = normalize(cameraPos.xyz - vWorldPos);
     vec3 F0 = vec3(0.04);
     F0 = mix(F0, albedo, metallic);
@@ -3378,7 +3607,7 @@ void main() {
             // They are intentionally not gated by SHADOW_ENABLED:
             // that switch belongs to CSM and the shadow atlas, while cloud shadows are independent of the atlas.
             // Disabling CSM should still let cloud shadows sweep across the ground, which is one of the main lighting features of an overcast sky.
-            radiance *= ComputeCloudShadow(vWorldPos, L);
+            radiance *= ComputeCloudShadow(vWorldPos, L) * WeatherCloudShadow(vWorldPos, L);
         } else {
             vec3 toLight = lights[i].posRange.xyz - vWorldPos;
             float dist = length(toLight);
@@ -3421,7 +3650,7 @@ void main() {
     // Both paths are gated by (1 - metallic), since metals have no diffuse term.
     // Contract clause 9 of 2-4:
     // choose exactly one diffuse source out of three and never accumulate them.
-    // When DDGI is ready and GiIntensity > 0, probe irradiance replaces the SH9-or-constant result.
+    // When DDGI is ready and GiIntensity > 0, probe irradiance is blended over the SH9-or-constant result by that weight.
     // Otherwise the shader fully falls back to the 1-7 and 1-2 path.
     // The specular term is untouched.
     // Clause 13:

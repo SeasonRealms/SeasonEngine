@@ -23,8 +23,11 @@ namespace Engine.Management;
 /// or roofs do not block ground movement, and whether a long jump clears a low obstacle is
 /// determined naturally by the jump arc height.
 /// This class also provides step and floor height queries through FloorHeightUnder, using the
-/// layout of the registered Room. When the player's footprint touches a step or indoor floor,
+/// layout of the registered Room and Pond. When the player's footprint touches a step or indoor floor,
 /// the player is lifted to that top surface and steps back down level by level when leaving.
+/// Walkable surfaces are climbed one riser at a time: a move whose target floor rises more than
+/// StepLimit above the feet is retracted, so raised slabs such as the pond rim are reached only
+/// through their steps, while stepping down is always allowed. The pond water area blocks entry the same way.
 /// Consumed by Direction.MovePlayer and UpdateLongJump.
 /// </summary>
 internal sealed class PlayerCollider
@@ -41,11 +44,18 @@ internal sealed class PlayerCollider
     /// <summary>Registered room used as the data source for step lifting and indoor floor height. Null means all grassland and a floor height of zero.</summary>
     internal Room Room;
 
+    /// <summary>Registered raised pond: its rim and steps add walkable heights, and its water area blocks entry. Null means no pond.</summary>
+    internal Pond Pond;
+
     /// <summary>Contact margin: stop 1 mm before intersection to avoid jitter from floating-point boundary ambiguity.</summary>
     const float ContactEpsilon = 1e-3f;
 
     /// <summary>Terrain blocking threshold: movement is blocked when the footprint cell height exceeds the current floor baseline by more than this value. Flat ground cells are zero, and cells on the mountain's outer shell that stay below ground level do not block.</summary>
     const float TerrainStepLimit = 0.5f;
+
+    /// <summary>Largest rise of walkable floor that can be climbed in one move, relative to the current feet height.
+    /// It sits above the scaled Room riser (about 0.23) and the Pond riser (0.125), and below the 0.5 pond rim face.</summary>
+    const float StepLimit = 0.3f;
 
     // Reusable cache of obstacle world boxes for the current query. TryMove clears and reuses it
     // each time, which keeps queries allocation-free for scenes with only dozens of boxes.
@@ -69,9 +79,11 @@ internal sealed class PlayerCollider
         var center = player.Center;
 
         float moveX = Sweep(player.Extents, ref center, dx, alongX: true);
+        moveX = RetractLedge(player.Extents, ref center, moveX, alongX: true);
         moveX = RetractTerrain(player.Extents, ref center, moveX, alongX: true);
 
         float moveZ = Sweep(player.Extents, ref center, dz, alongX: false);
+        moveZ = RetractLedge(player.Extents, ref center, moveZ, alongX: false);
         moveZ = RetractTerrain(player.Extents, ref center, moveZ, alongX: false);
 
         return new Vector2(moveX, moveZ);
@@ -192,22 +204,85 @@ internal sealed class PlayerCollider
     }
 
     /// <summary>
+    /// Retracts motion against walkable floors after Sweep, in the same binary-search form as RetractTerrain.
+    /// A position is blocked when its floor rises more than StepLimit above the starting baseline, or when the footprint
+    /// overlaps the pond water more than it did at the start. The baseline is the higher of the starting floor and the feet height,
+    /// so a long jump that is high enough can land on the rim, while walking reaches it only through the steps.
+    /// Comparing against the starting overlap blocks entering the water and still lets an overlapping footprint back out.
+    /// </summary>
+    float RetractLedge(Vector3 half, ref Vector3 center, float allowed, bool alongX)
+    {
+        if (MathF.Abs(allowed) < 1e-6f)
+            return allowed;
+
+        var start = center;
+        if (alongX) start.X -= allowed;
+        else start.Z -= allowed;
+
+        float baseH = MathF.Max(FloorHeightUnder(start, half), start.Y - half.Y);
+        float baseWater = Pond != null ? Pond.WaterOverlap(start, half) : 0f;
+
+        if (!LedgeBlocked(center, half, baseH, baseWater))
+            return allowed;   // Target is reachable, so no retraction is needed.
+
+        // lo always stays reachable, hi always stays blocked.
+        float dist = MathF.Abs(allowed);
+        float dir = MathF.Sign(allowed);
+        float lo = 0f, hi = dist;
+
+        for (int i = 0; i < 10; i++)
+        {
+            float mid = (lo + hi) * 0.5f;
+
+            var probe = start;
+            if (alongX) probe.X += dir * mid;
+            else probe.Z += dir * mid;
+
+            if (LedgeBlocked(probe, half, baseH, baseWater))
+                hi = mid;
+            else
+                lo = mid;
+        }
+
+        float retained = MathF.Max(0f, lo - ContactEpsilon) * dir;
+
+        if (alongX) center.X = start.X + retained;
+        else center.Z = start.Z + retained;
+
+        return retained;
+    }
+
+    bool LedgeBlocked(in Vector3 center, in Vector3 half, float baseH, float baseWater)
+    {
+        if (FloorHeightUnder(center, half) - baseH > StepLimit)
+            return true;
+
+        return Pond != null && Pond.WaterOverlap(center, half) > baseWater + 1e-6f;
+    }
+
+    /// <summary>
     /// Floor height under the footprint: sample the center plus the four corners and take the maximum.
     /// As soon as the footprint touches a step or indoor floor, the player is lifted to that top surface,
     /// preventing feet from sinking into a higher step ahead. Stepping off lowers symmetrically level by level.
-    /// Without a registered Room, the floor height is always zero.
+    /// Without a registered Room or Pond, the floor height is always zero.
     /// </summary>
     internal float FloorHeightUnder(in Vector3 center, in Vector3 half)
     {
-        if (Room == null)
+        if (Room == null && Pond == null)
             return 0f;
 
-        float h = Room.FloorHeightAtWorld(center.X, center.Z);
-        h = MathF.Max(h, Room.FloorHeightAtWorld(center.X - half.X, center.Z - half.Z));
-        h = MathF.Max(h, Room.FloorHeightAtWorld(center.X - half.X, center.Z + half.Z));
-        h = MathF.Max(h, Room.FloorHeightAtWorld(center.X + half.X, center.Z - half.Z));
-        h = MathF.Max(h, Room.FloorHeightAtWorld(center.X + half.X, center.Z + half.Z));
+        float h = FloorHeightAt(center.X, center.Z);
+        h = MathF.Max(h, FloorHeightAt(center.X - half.X, center.Z - half.Z));
+        h = MathF.Max(h, FloorHeightAt(center.X - half.X, center.Z + half.Z));
+        h = MathF.Max(h, FloorHeightAt(center.X + half.X, center.Z - half.Z));
+        h = MathF.Max(h, FloorHeightAt(center.X + half.X, center.Z + half.Z));
         return h;
+    }
+
+    float FloorHeightAt(float x, float z)
+    {
+        float h = Room != null ? Room.FloorHeightAtWorld(x, z) : 0f;
+        return Pond != null ? MathF.Max(h, Pond.FloorHeightAtWorld(x, z)) : h;
     }
 
     /// <summary>

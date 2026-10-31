@@ -97,6 +97,40 @@ public unsafe class DXTexture : IDisposable
 
     public int RefCount => _refCount;
 
+    /// <summary>
+    /// The offscreen render target this texture is a view of, or null for an ordinary texture. A wrapped texture owns
+    /// no GPU resource: sampling-state transitions are delegated to the target, and <see cref="Dispose"/> tears nothing
+    /// down because the resource, its SRV slot and its RTV slot all belong to <c>Device</c>.
+    /// </summary>
+    internal DXRenderTarget? TargetSource;
+
+    /// <summary>
+    /// Wraps an already-created offscreen color target as a sampleable texture, which is how a rendered view (rear
+    /// mirror, minimap) becomes a 2D control's source: the control names the texture and never learns it is not a file.
+    /// The wrapper shares the target's resource pointer and SRV slot instead of copying pixels, so it is only valid for
+    /// targets that are never rebuilt: fixed-size targets survive resize, which is why secondary views are fixed-size.
+    /// </summary>
+    internal static DXTexture WrapRenderTarget(string name, DXRenderTarget target)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        if (target.Color == null || target.SrvIndex < 0)
+            throw new InvalidOperationException($"[WrapRenderTarget] '{name}' has no color resource or SRV to sample.");
+
+        return new DXTexture
+        {
+            Name = name,
+            TargetSource = target,
+            Width = target.Width,
+            Height = target.Height,
+            Ready = true,
+            _textureResource = target.Color,
+            DescriptorID = target.SrvIndex,
+            CpuDescriptorHandle = Device.SrvHeapManager.GetCpuHandle(target.SrvIndex),
+            GpuDescriptorHandle = target.GpuSrvHandle,
+            _format = target.ColorNativeFormat,
+        };
+    }
+
     public void AddRef() => System.Threading.Interlocked.Increment(ref _refCount);
 
     public void Release()
@@ -561,6 +595,13 @@ public unsafe class DXTexture : IDisposable
 
     public void EnsureReadyForRendering(ID3D12GraphicsCommandList* commandList)
     {
+        // A wrapped render target keeps its state on the target, and only the target knows where the resource is.
+        if (TargetSource is DXRenderTarget target)
+        {
+            target.TransitionTo(commandList, ResourceStates.PixelShaderResource);
+            return;
+        }
+
         // This Volatile read pairs with the upload thread's Volatile.Write(Ready).
         // It guarantees that once Ready==true is observed, UploadFenceValue is
         // also visible. Without that guarantee, CopyFence waiting could be
@@ -916,6 +957,16 @@ public unsafe class DXTexture : IDisposable
 
     public void Dispose()
     {
+        if (TargetSource != null)
+        {
+            // The wrapped target is owned by Device: dropping this view must not release the resource, blank the SRV
+            // descriptor or recycle the descriptor slot, or the next frame samples a dead view.
+            TargetSource = null;
+            _textureResource = null;
+            DescriptorID = -1;
+            return;
+        }
+
         if (_textureResource != null)
         {
             // Overwrite the SRV descriptor with a null descriptor first, so the

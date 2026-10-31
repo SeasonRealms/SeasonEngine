@@ -53,13 +53,13 @@ internal class WGPUModel
 
     public void SetGlbBytes(byte[] bytes) { _asset.SetGlbBytes(bytes); }
 
-    public void Load(Season.Controls.Model model, Season.Basic.Camera camera)
+    public void Load(Season.Controls.Model model)
     {
         // Animation queries and switching belong to the glTF parsing domain rather than IGraphics,
         // so the direct-load path injects the asset reference into the control.
         model.Asset = _asset;
 
-        _asset.Load(model, camera);
+        _asset.Load(model);
     }
 
     /// <summary>Shared-template instancing: clones the node tree.
@@ -353,14 +353,14 @@ internal class WGPUModel
     }
 
 
-    void ProcessPrimitive(SharpGLTF.Schema2.MeshPrimitive meshPrimitive, GltfNodeBase node, Season.Controls.Model model, Season.Basic.Camera camera)
+    void ProcessPrimitive(SharpGLTF.Schema2.MeshPrimitive meshPrimitive, GltfNodeBase node, Season.Controls.Model model)
     {
-        var primData = CreatePrimitiveData(meshPrimitive, node, model, camera);
+        var primData = CreatePrimitiveData(meshPrimitive, node, model);
         var gltfNode = (WGPUGLTFNode)node;
         gltfNode.Primitives.Add(primData);
     }
 
-    WGPUPrimitiveData CreatePrimitiveData(SharpGLTF.Schema2.MeshPrimitive primitive, GltfNodeBase node, Season.Controls.Model model, Season.Basic.Camera camera)
+    WGPUPrimitiveData CreatePrimitiveData(SharpGLTF.Schema2.MeshPrimitive primitive, GltfNodeBase node, Season.Controls.Model model)
     {
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         var primData = new WGPUPrimitiveData();
@@ -634,7 +634,7 @@ internal class WGPUModel
     /// <summary>2-3 Step C: deformation history (bone palette + morph weights) has been ready for two consecutive frames.</summary>
     public bool PrevDeformReady => _prevDeformReady;
 
-    public void Update(Season.Controls.Model model, float time, Season.Basic.Camera camera)
+    public void Update(Season.Controls.Model model, float time)
     {
         // Mirroring VK: being initialized at the start of this Update means the previous frame already produced
         // a complete set of bone and morph data.
@@ -659,7 +659,7 @@ internal class WGPUModel
         var rootNodes = _asset._animationPlayer.GetRootNodes(_asset.gltfNodes);
 
         foreach (var rootNode in rootNodes)
-            ApplyUserTransformToNodeTree(rootNode, userTransform, camera);
+            ApplyUserTransformToNodeTree(rootNode, userTransform);
 
         _transformInitialized = true;
         _prevDeformReady = wasInitialized;
@@ -717,7 +717,7 @@ internal class WGPUModel
         _outline2DWidth = model.Highlight.OutlineWidth;
     }
 
-    void ApplyUserTransformToNodeTree(GltfNodeBase nodeBase, Matrix4x4 userTransform, Season.Basic.Camera camera)
+    void ApplyUserTransformToNodeTree(GltfNodeBase nodeBase, Matrix4x4 userTransform)
     {
         var finalWorldMatrix = nodeBase.WorldTransform * userTransform;
 
@@ -739,14 +739,12 @@ internal class WGPUModel
                 }
                 primitive.World = finalWorldMatrix;
                 primitive.MorphWeights = ExtractMorphWeights(primitive.OwnerNode);
-                primitive.View = camera.View;
-                primitive.Projection = camera.Projection;
             }
 
         }
 
         foreach (var child in nodeBase.Children)
-            ApplyUserTransformToNodeTree(child, userTransform, camera);
+            ApplyUserTransformToNodeTree(child, userTransform);
     }
 
     // Non-instanced morph path: take the first 4 node weights
@@ -829,7 +827,7 @@ internal class WGPUModel
         if (_boundsActive && _boundsBox != null)
         {
             graphics.FlushDrawSkinnedMeshBatch();
-            graphics.DrawBoundsBox(_boundsBox, Graphics.Camera3D.View, Graphics.Camera3D.Projection);
+            graphics.DrawBoundsBox(_boundsBox);
         }
 
         // Unified highlight (wireframe shell): per-primitive shell boxes with translucent BLEND faces and OPAQUE depth-writing edges.
@@ -843,7 +841,7 @@ internal class WGPUModel
                 if (shell != null)
                 {
                     Vector4? morphWeights = shell.MorphTargetCount > 0 ? _allPrimitives![i].MorphWeights : null;
-                    graphics.DrawShellBox(shell, Graphics.Camera3D.View, Graphics.Camera3D.Projection, morphWeights);
+                    graphics.DrawShellBox(shell, morphWeights);
                 }
             }
         }
@@ -871,24 +869,22 @@ internal class WGPUModel
         if (prim.VertexData == null || prim.IndexData == null || prim.VertexData.Length == 0) return;
         if (prim.CurrentAlpha <= 0 && prim.AlphaMode != 1u) return;
 
-        var matrixData = Graphics._scratchMatrix48;
+        var matrixData = Graphics._scratchWorldMatrix;
         Graphics.CopyMatrixTransposed(prim.World, matrixData, 0);
-        Graphics.CopyMatrixTransposed(prim.View, matrixData, 16);
-        Graphics.CopyMatrixTransposed(prim.Projection, matrixData, 32);
 
         var uniformData = Graphics._scratchUniform;
-        Array.Clear(uniformData, 48, WebGPUUniformLayout.TotalFloats - 48);
+        Array.Clear(uniformData, WebGPUUniformLayout.PrevWorld, WebGPUUniformLayout.TotalFloats - WebGPUUniformLayout.PrevWorld);
 
-        Array.Copy(matrixData, 0, uniformData, 0, 48);
+        Array.Copy(matrixData, 0, uniformData, WebGPUUniformLayout.World, WebGPUUniformLayout.WorldFloats);
 
         // 2-3 contract clause 6: previous-data slots must be written after Clear,
-        // because Clear overwrites the full history range starting at float 48.
+        // because Clear overwrites the full history range starting at PrevWorld / float 16.
         Graphics.WritePrevMatrices(uniformData, prim.PrevWorldMatrix);
 
-        uniformData[84] = prim.BaseColor.X;
-        uniformData[85] = prim.BaseColor.Y;
-        uniformData[86] = prim.BaseColor.Z;
-        uniformData[87] = prim.BaseColor.W;
+        uniformData[WebGPUUniformLayout.BaseColor] = prim.BaseColor.X;
+        uniformData[WebGPUUniformLayout.BaseColor + 1] = prim.BaseColor.Y;
+        uniformData[WebGPUUniformLayout.BaseColor + 2] = prim.BaseColor.Z;
+        uniformData[WebGPUUniformLayout.BaseColor + 3] = prim.BaseColor.W;
 
         int textureFlags = 0;
         if (!string.IsNullOrEmpty(prim.MetallicRoughnessTextureName)) textureFlags |= 1;
@@ -1025,19 +1021,19 @@ internal class WGPUModel
         // and uploads are not triggered from the shadow pass (missing a shadow on the first frame is acceptable).
         if (prim.IsTransparent || !prim.Uploaded) return;
 
-        var matrixData = Graphics._scratchMatrix48;
+        // The light-space matrix no longer rides in the per-draw uniform: RenderShadowPass publishes it into this
+        // quadrant's shadow view slot, which the depth-only bind group references through binding 22.
+        var matrixData = Graphics._scratchWorldMatrix;
         Graphics.CopyMatrixTransposed(prim.World, matrixData, 0);
-        Graphics.CopyMatrixTransposed(Matrix4x4.Identity, matrixData, 16);
-        Graphics.CopyMatrixTransposed(graphics._shadowViewProj, matrixData, 32);
 
         var uniformData = Graphics._scratchUniform;
-        Array.Clear(uniformData, 48, WebGPUUniformLayout.TotalFloats - 48);
-        Array.Copy(matrixData, 0, uniformData, 0, 48);
+        Array.Clear(uniformData, WebGPUUniformLayout.PrevWorld, WebGPUUniformLayout.TotalFloats - WebGPUUniformLayout.PrevWorld);
+        Array.Copy(matrixData, 0, uniformData, WebGPUUniformLayout.World, WebGPUUniformLayout.WorldFloats);
 
-        uniformData[84] = prim.BaseColor.X;
-        uniformData[85] = prim.BaseColor.Y;
-        uniformData[86] = prim.BaseColor.Z;
-        uniformData[87] = prim.BaseColor.W;
+        uniformData[WebGPUUniformLayout.BaseColor] = prim.BaseColor.X;
+        uniformData[WebGPUUniformLayout.BaseColor + 1] = prim.BaseColor.Y;
+        uniformData[WebGPUUniformLayout.BaseColor + 2] = prim.BaseColor.Z;
+        uniformData[WebGPUUniformLayout.BaseColor + 3] = prim.BaseColor.W;
 
         // Non-instanced morph path: use the same weights as the main pass so animated shadows stay consistent with the visible model (contract 3).
         bool hasMorph = prim.MorphTargetCount > 0;
@@ -1116,19 +1112,17 @@ internal class WGPUModel
         // and uploads are not triggered from the mask pass (missing outlines on the first frame is acceptable).
         if (prim.IsTransparent || !prim.Uploaded) return;
 
-        var matrixData = Graphics._scratchMatrix48;
+        var matrixData = Graphics._scratchWorldMatrix;
         Graphics.CopyMatrixTransposed(prim.World, matrixData, 0);
-        Graphics.CopyMatrixTransposed(prim.View, matrixData, 16);
-        Graphics.CopyMatrixTransposed(prim.Projection, matrixData, 32);
 
         var uniformData = Graphics._scratchUniform;
-        Array.Clear(uniformData, 48, WebGPUUniformLayout.TotalFloats - 48);
-        Array.Copy(matrixData, 0, uniformData, 0, 48);
+        Array.Clear(uniformData, WebGPUUniformLayout.PrevWorld, WebGPUUniformLayout.TotalFloats - WebGPUUniformLayout.PrevWorld);
+        Array.Copy(matrixData, 0, uniformData, WebGPUUniformLayout.World, WebGPUUniformLayout.WorldFloats);
 
-        uniformData[84] = prim.BaseColor.X;
-        uniformData[85] = prim.BaseColor.Y;
-        uniformData[86] = prim.BaseColor.Z;
-        uniformData[87] = prim.BaseColor.W;
+        uniformData[WebGPUUniformLayout.BaseColor] = prim.BaseColor.X;
+        uniformData[WebGPUUniformLayout.BaseColor + 1] = prim.BaseColor.Y;
+        uniformData[WebGPUUniformLayout.BaseColor + 2] = prim.BaseColor.Z;
+        uniformData[WebGPUUniformLayout.BaseColor + 3] = prim.BaseColor.W;
 
         // Non-instanced morph path: use the same weights as the main pass so the outline mask matches the animated model exactly.
         bool hasMorph = prim.MorphTargetCount > 0;
@@ -1178,8 +1172,6 @@ internal class WGPUSprite3D
     public string TextureName { get; set; }
 
     public Matrix4x4 World { get; set; } = Matrix4x4.Identity;
-    public Matrix4x4 View { get; set; } = Matrix4x4.Identity;
-    public Matrix4x4 Projection { get; set; } = Matrix4x4.Identity;
 
     /// <summary>
     /// 2-3 contract clause 6: CPU shadow copy of the previous-frame world matrix
@@ -1199,8 +1191,6 @@ internal class WGPUMesh3D
     public Mesh3D Mesh { get; }
 
     public Matrix4x4 World { get; set; } = Matrix4x4.Identity;
-    public Matrix4x4 View { get; set; } = Matrix4x4.Identity;
-    public Matrix4x4 Projection { get; set; } = Matrix4x4.Identity;
 
     /// <summary>
     /// 2-3 contract clause 6: CPU shadow copy of the previous-frame world matrix

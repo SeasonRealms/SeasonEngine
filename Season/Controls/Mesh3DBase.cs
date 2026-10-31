@@ -339,6 +339,6 @@ public abstract class Mesh3DBase : Control, ITransparentSortable
         if (LocalBounds.Extents == Vector3.Zero)
             return false;
 
-        return !DeviceServices.BaseApp.Camera.Frustum.Intersects(GetWorldBounds());
+        return !Season.Rendering.RenderView.Current.Frustum.Intersects(GetWorldBounds());
     }
 }

@@ -115,12 +115,12 @@ public static class WebApp
             // If that is unavailable, fall back to Off. Mirrors LinuxApp.
             // The whole tier normalization is skipped in immediate-2D mode: no AA path exists to
             // configure, and the values stay unused because no pass ever consults them.
-            if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
+            if (!immediate2D && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
             {
-                RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Fxaa;
+                RenderQuality.Current.EffectiveAntiAliasing = Season.Rendering.AaMode.Fxaa;
                 DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] AaMode.Msaa4x is supported only on D3D12; falling back to Fxaa");
             }
-            if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa)
+            if (!immediate2D && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Taa)
             {
                 // 2-3 Contract Clause 1: selecting Taa forces the velocity infrastructure to be enabled,
                 // because TAA is invalid without velocity.
@@ -136,15 +136,20 @@ public static class WebApp
                 // non-TAA SceneColor without jitter (Clauses 14/15). Mirrors Apple/Linux.
                 if (!Graphics.HdrSceneColor)
                 {
-                    RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Fxaa;
+                    RenderQuality.Current.EffectiveAntiAliasing = Season.Rendering.AaMode.Fxaa;
                     DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] Taa depends on the HDR offscreen chain (currently disabled); falling back to Fxaa while keeping MotionVectors enabled");
                 }
             }
-            if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa && !Graphics.HdrSceneColor)
+            if (!immediate2D && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Fxaa && !Graphics.HdrSceneColor)
             {
-                RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Off;
+                RenderQuality.Current.EffectiveAntiAliasing = Season.Rendering.AaMode.Off;
                 DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] Fxaa depends on the HDR offscreen chain (currently disabled); falling back to Off");
             }
+
+            // A0.2 Contract Clause 1: scene normals only exist as an extension of the velocity shape, so requesting
+            // them forces velocity on before InitializeAsync bakes the VELOCITY_OUTPUT variant. Mirrors WindowsApp.
+            if (!immediate2D && RenderQuality.Current.SceneNormals)
+                RenderQuality.Current.MotionVectors = true;
 
             _graphics = new Graphics(_jsRuntime, canvasId, httpClient, _assetBasePath);
             
@@ -181,8 +186,8 @@ public static class WebApp
             // phase, so it reads the resolve output of the current frame rather than SceneColor.
             // In tiers that ask for neither, both stay null so the chain leaves no residue. Mirrors LinuxApp.
             if (!immediate2D
-                && (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
-                    || (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa
+                && (RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Fxaa
+                    || (RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Taa
                         && RenderQuality.Current.TaaSharpness > 0f))
                 && Season.Rendering.FrameSchedule.SceneColor != null)
             {
@@ -228,7 +233,7 @@ public static class WebApp
             }
             if (!immediate2D
                 && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off
-                && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
+                && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
             {
                 RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
                 DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] AO is incompatible with Msaa4x (MSAA depth cannot be used as compute input); falling back to Off");
@@ -260,14 +265,29 @@ public static class WebApp
                 });
             }
 
+            // A0.2 Contract Clause 2: SceneNormal (full-size Rgba16Float, MRT slot 2, cleared to zero), only ever
+            // created next to SceneVelocity so the Scene pass keeps exactly three shapes. Mirrors WindowsApp.
+            if (!immediate2D && RenderQuality.Current.EffectiveSceneNormals && Season.Rendering.FrameSchedule.SceneVelocity != null)
+            {
+                Season.Rendering.FrameSchedule.SceneNormal = _graphics.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
+                {
+                    ColorFormat = Season.Rendering.RtFormat.Rgba16Float,
+                    MatchBackbufferSize = true,
+                    SampleCount = 1,
+                    NoImplicitDepth = true,
+                    ClearColor = System.Numerics.Vector4.Zero,
+                });
+            }
+
             // Supplement to contract 2-3 clause 2: the velocity path also needs SceneDepth to be explicit,
             // so TAA can read the current frame's depth and dilate velocity towards the closest neighbour
             // (clause 10). Mirrors WindowsApp/LinuxApp/AndroidApp/AppDelegate. SampleCount 1 needs no guard
             // here for a different reason than on D3D12: this backend has no MSAA offscreen chain at all and
             // rewrote Msaa4x to Fxaa during tier finalization, so a multisampled scene is unreachable.
             if (!immediate2D && Season.Rendering.FrameSchedule.SceneDepth == null
-                && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresFogSceneDepth(
-                    Graphics.HdrSceneColor, _graphics.ComputeSupported, immediate2D)))
+                && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresAtmosphereSceneDepth(
+                    Graphics.HdrSceneColor, _graphics.ComputeSupported, immediate2D)
+                    || RenderQuality.Current.RequiresDecalSceneDepth(Graphics.HdrSceneColor, immediate2D)))
             {
                 Season.Rendering.FrameSchedule.SceneDepth = _graphics.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
                 {

@@ -42,6 +42,11 @@ internal class Views : Panel
     // and color only on independently moving objects.
     Sprite2D velocityView;
 
+    // A0.2 first validation target for the scene-normal MRT slot: decoded world normal as n * 0.5 + 0.5, or roughness/metallic
+    // when NormalViewEffect.Mode is 1. Black where nothing opaque was drawn. Stays empty unless SceneNormals is on and
+    // survived initialization, so a blank thumbnail here means the normal target does not exist this session.
+    Sprite2D normalView;
+
     // 2-3 Step B visualization of the TAA resolve output.
     // It shows one side of the taa0 ping-pong buffer, so it refreshes every other frame.
     // This control is created only when TaaEffect registers successfully, so the presence or absence
@@ -152,6 +157,18 @@ internal class Views : Panel
         };
         AddControl(velocityView);
 
+        normalView = new Sprite2D()
+        {
+            Name = Season.Rendering.Effects.NormalViewEffect.TextureName,
+            Color = Season.Basic.Colors.White,
+            PosX = 1300,
+            PosY = 280,
+            Width = 240,
+            Height = 135,
+            Alpha = 1f
+        };
+        AddControl(normalView);
+
         sdf3dView = new Sprite2D()
         {
             Name = Season.Rendering.Effects.Sdf3DViewEffect.TextureName,
@@ -208,6 +225,8 @@ internal class Views : Panel
         aoView?.Update(time, alpha: Alpha);
 
         velocityView?.Update(time, alpha: Alpha);
+
+        normalView?.Update(time, alpha: Alpha);
 
         taaView?.Update(time, alpha: Alpha);
 

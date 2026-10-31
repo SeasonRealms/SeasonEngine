@@ -45,6 +45,17 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public void DrawCollectedTransparent(bool sampleFog) => _sceneCollection.DrawTransparent(sampleFog);
     public void ReleaseSceneCollection() => _sceneCollection.Release();
 
+    public Season.Rendering.Effects.WeatherCompositePipeline? CreateWeatherCompositePipeline()
+    {
+        if (!ComputeSupported) return null;
+        try { return new(new VKFogCompositePipeline(DictionaryVKTexture, true)); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherComposite] 创建失败：{ex.Message}");
+            return null;
+        }
+    }
+
     public Season.Rendering.FogCompositePipeline? CreateFogCompositePipeline()
     {
         if (!ComputeSupported) return null;
@@ -85,6 +96,10 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     }
 
     Dictionary<string, VkTexture> DictionaryVKTexture = new();
+
+    // P3: names published through RegisterViewSurface, mapped to the target that owns them. Kept apart from
+    // DictionaryVKTexture so UnregisterViewSurface can never remove a real texture's entry.
+    readonly Dictionary<string, VKRenderTarget> _viewSurfaces = new();
 
     Dictionary<(string, long), VKSprite2D> DictionarySprite = new();
 
@@ -171,8 +186,6 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         var identityMatrix = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(Matrix4x4.Identity),
-            Projection = Matrix4x4.Transpose(Matrix4x4.Identity),
         };
         Unsafe.Write(_mappedTextMatrix, identityMatrix);
 
@@ -206,6 +219,12 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         // Get or create the 1x1 white placeholder texture
         // (Vulkan requires a valid ImageView for every binding)
         _whiteTexture = Vulkan.Device.White;
+
+        // P3: per-view constants are uploaded through the frame scheduler's hook, which runs for the main view as
+        // well. Registering it is what turns the single-view shape into the multi-view one; without it every draw
+        // keeps binding the main view's set 2, which is exactly the pre-P3 behaviour.
+        Season.Rendering.FrameSchedule.PrepareView = OnPrepareView;
+        Season.Rendering.FrameSchedule.AfterViews = OnAfterViews;
     }
 
     public async Task<bool> LoadSprite2D(Sprite2D sprite2D)
@@ -1040,6 +1059,8 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             var pipelineLayout = Pipeline.PipelineLayout;
 
             Vulkan.Device.Vk.CmdBindDescriptorSets(cmd, VkPipelineBindPoint.Graphics, pipelineLayout, 0, 1, &set, 0, null);
+            // 文字走屏幕空间视图 set 2（单位 View/Projection）。
+            Pipeline.BindViewSet(cmd, Pipeline.ScreenViewSet);
             // 雾采样三件套在独立的 set 1：文字变体与 Sprite2D 共用同一个 FS，静态引用了它，
             // 而布局里 set 1 参与兼容性检查，缺绑会被校验层报未绑定。
             Pipeline.BindFogSet(cmd);
@@ -1560,12 +1581,12 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             try
             {
                 var template = task.GetAwaiter().GetResult();
-                vkModel = template.CreateInstance(model, VKPrimitiveGroup.Camera);
+                vkModel = template.CreateInstance(model);
             }
             catch
             {
                 vkModel = new VKModel(model.Name);
-                vkModel.Load(model, VKPrimitiveGroup.Camera);
+                vkModel.Load(model);
                 ExecuteUpload();
             }
 
@@ -1617,7 +1638,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         };
 
         var template = new VKModel(modelName);
-        template.Load(templateModel, VKPrimitiveGroup.Camera);
+        template.Load(templateModel);
         ExecuteUpload();
         return Task.FromResult(template);
     }
@@ -1892,12 +1913,15 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
                     replacePending = true;
                 }
 
+                // Billboard orientation must be built from the view actually being rendered (not the legacy
+                // camera mirror), so a second view billboards toward its own camera.
+                var view = Season.Rendering.RenderView.Current;
                 vkSprite3D.Update(
                     new Vector3(sprite.PosX, sprite.PosY, sprite.PosZ),
                     new Vector2(sprite.Width ?? 1f, sprite.Height ?? 1f),
                     sprite.Rotation,
-                    VKPrimitiveGroup.Camera.View,
-                    VKPrimitiveGroup.Camera.Projection,
+                    view.View,
+                    view.RenderProjection,
                     sprite.Mode,
                     sprite.Color,
                     sprite.Alpha);
@@ -2212,7 +2236,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         // 2. Build VKMesh3D: resolve cached VkTextures by slot
         //    and use solid-color fallback when missing
         var vkMesh = new VKMesh3D(mesh.Name);
-        vkMesh.Load(mesh, VKPrimitiveGroup.Camera, BuildSurfaceTextureResolver(mesh.Name, mesh.ID, mesh.Surfaces));
+        vkMesh.Load(mesh, BuildSurfaceTextureResolver(mesh.Name, mesh.ID, mesh.Surfaces));
 
         // 3. Clear TextureOverride after Load completes
         //    under the one-shot consumption contract
@@ -2296,7 +2320,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         // 2. Build VKInstancedMesh3D: resolve cached VkTextures by slot
         //    and use solid-color fallback when missing
         var vkMesh = new VKInstancedMesh3D(mesh.Name);
-        vkMesh.Load(mesh, VKPrimitiveGroup.Camera, BuildSurfaceTextureResolver(mesh.Name, mesh.ID, mesh.Surfaces));
+        vkMesh.Load(mesh, BuildSurfaceTextureResolver(mesh.Name, mesh.ID, mesh.Surfaces));
 
         // 3. Clear TextureOverride after Load completes
         //    under the one-shot consumption contract
@@ -2389,7 +2413,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             };
 
             var vkInstancedModel = new VKInstancedModel(model.ModelName);
-            vkInstancedModel.Load(template, wrapperModel, VKPrimitiveGroup.Camera);
+            vkInstancedModel.Load(template, wrapperModel);
 
             // v2 picking: inject the instanced GltfAsset
             // so the node tree / animation / bone palette share the same source as instanced rendering
@@ -2836,6 +2860,97 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         EndPass();
     }
 
+    // ── P3 secondary views (contract in IGraphics) ──
+
+    /// <summary>
+    /// Vulkan renders a secondary view through its own attachments plus its own set 2, and those targets are created
+    /// by the same VKRenderTarget path the main view uses, so the main PSO family stays render-pass compatible.
+    /// There is no MSAA tier to decline here, so the capability is unconditional.
+    /// </summary>
+    public bool SecondaryViewSupported => true;
+
+    /// <summary>
+    /// Publishes an offscreen target as a sampleable texture: a <see cref="VkTexture"/> that borrows the target's
+    /// color image and view. Sprite2D then resolves the name through <see cref="LoadSprite2D"/> like any other
+    /// texture, so displaying a rendered view needs no new control type and no readback.
+    /// </summary>
+    public bool RegisterViewSurface(string name, Season.Rendering.RenderTarget target)
+    {
+        if (name.IsNullOrWhiteSpace() || target is not VKRenderTarget vkTarget) return false;
+        if (!vkTarget.HasColor || vkTarget.ColorView.Handle == 0) return false;
+
+        lock (DictionaryVKTexture)
+        {
+            if (_viewSurfaces.TryGetValue(name, out var published))
+            {
+                // Same target re-registered: refresh the borrowed view in place, keeping the wrapper the controls hold.
+                if (!ReferenceEquals(published, vkTarget)) return false;
+                if (DictionaryVKTexture.TryGetValue(name, out var same) && same != null)
+                    same.RefreshFromTarget(vkTarget);
+                return true;
+            }
+
+            // The name belongs to a real texture file: never steal it.
+            if (DictionaryVKTexture.TryGetValue(name, out var existing) && existing != null) return false;
+            // A failed earlier load can leave a null entry behind; registering over it is the recovery path.
+            DictionaryVKTexture.Remove(name);
+
+            DictionaryVKTexture.Add(name, VkTexture.WrapRenderTarget(name, vkTarget));
+            _viewSurfaces.Add(name, vkTarget);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Drops a publication made by <see cref="RegisterViewSurface"/>. The wrapper is unlinked from the texture
+    /// dictionary, and because it borrows the target's image the render target itself is left untouched.
+    /// </summary>
+    public bool UnregisterViewSurface(string name)
+    {
+        if (name.IsNullOrWhiteSpace()) return false;
+        lock (DictionaryVKTexture)
+        {
+            if (!_viewSurfaces.Remove(name)) return false;
+            // Only a borrowed wrapper is ours to unlink; anything else under this name belongs to its loader.
+            if (DictionaryVKTexture.TryGetValue(name, out var existing) && existing != null && existing.Borrowed)
+            {
+                DictionaryVKTexture.Remove(name);
+                existing.Dispose();
+            }
+            return true;
+        }
+    }
+
+    /// <summary>Uploads a view's constants and selects it for the draws that follow.</summary>
+    static void OnPrepareView(IGraphics g, Season.Rendering.RenderView view)
+    {
+        if (g is not Graphics) return;
+
+        Vulkan.Pipeline.SetActiveView(view.Index);
+        if (view.Index == 0)
+        {
+            // The main view was already prepared (and its constants written) at the camera update point, before the
+            // shadow pass needed its cascades. Rewriting the same values keeps a harness that skips that update sane.
+            if (view.Prepared) Vulkan.Pipeline.WriteViewConstants(0, view.Constants);
+            return;
+        }
+
+        // A secondary view renders into a fixed-size offscreen target and is sampled on screen by a 2D control, so
+        // no DPI compensation applies here: the control's layout already handles composition scaling, and
+        // compensating twice would shrink the view into the top-left corner of its own texture.
+        Season.Rendering.ViewTargets? targets = view.Targets;
+        float width = targets?.Width ?? 0u;
+        float height = targets?.Height ?? 0u;
+        if (width <= 0f || height <= 0f) return;
+
+        view.Prepare(width, height);
+        Vulkan.Pipeline.WriteViewConstants(view.Index, view.Constants);
+    }
+
+    /// <summary>FrameSchedule.AfterViews hook: the view loop left a secondary view selected, so put the main view
+    /// back before the Overlay pass binds anything of its own.</summary>
+    static void OnAfterViews(IGraphics g) => Vulkan.Pipeline.ResetActiveView();
+
     /// <summary>2-3 contract clause 12:
     /// the scene source is resolved and forwarded through FrameSchedule.SceneColorOverride
     /// (the resolve output under the TAA tier).
@@ -2846,6 +2961,15 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     /// and the frame-level maximum width for on-screen composition inside FinalBlit.</summary>
     public void BlitToBackbuffer(Season.Rendering.RenderTarget src)
     {
+        // P3: a secondary view's FinalBlit presents that view's own image only. Bloom, AO and the scene override are
+        // frame-wide products of the *main* view; letting them through would paint the main camera's bloom onto the
+        // minimap and its TAA resolve into the rear mirror. Plain tonemap copy, no resolve filter, no outline composite.
+        if (!ReferenceEquals(Season.Rendering.FrameSchedule.ActiveTargets, Season.Rendering.FrameSchedule.PrimaryTargets))
+        {
+            Vulkan.Device.BlitToBackbuffer(src);
+            return;
+        }
+
         // 2-1 Step D: when the source is the LDR PostColor produced by the post uber pass
         // (luma stored in alpha), present through the resolve variant of the tier that owns the slot
         // (FXAA for 2-1, RCAS for clause 17 of 2-3).
@@ -3158,8 +3282,55 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
     }
 
-    public Season.Rendering.StorageBuffer CreateStorageBuffer(uint sizeInBytes)
-        => new VKStorageBuffer(sizeInBytes);
+    public Season.Rendering.StorageBuffer CreateStorageBuffer(uint sizeInBytes,
+        Season.Rendering.StorageBufferUsage usage = Season.Rendering.StorageBufferUsage.Compute)
+        => new VKStorageBuffer(sizeInBytes, usage);
+
+    // ── A0.1 间接绘制（契约在 IGraphics / Indirect.cs）──
+    // Vulkan 是四端里约束最严的：TryDispatchCompute 尾部的 buffer barrier 只把 dstStage 开到
+    // ComputeShader|VertexShader，并不覆盖 DrawIndirect 阶段，所以这里必须补一道独立 barrier。
+    // 它也解释了为何提交要拆成 Prepare/Draw：render pass instance 内部不得包含 barrier。
+
+    public bool IndirectDrawSupported => ComputeSupported;
+
+    public unsafe bool TryPrepareIndirectArgs(Season.Rendering.StorageBuffer buffer)
+    {
+        var cmd = Vulkan.Device.GraphicsCommandBuffer;
+        if (cmd.Handle == 0 || Vulkan.Device.InRenderPass
+            || buffer is not VKStorageBuffer vkBuffer || vkBuffer.Buffer.Buffer.Handle == 0
+            || vkBuffer.Usage != Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs
+            || vkBuffer.SizeInBytes < Season.Rendering.IndirectDrawIndexedArgs.SizeInBytes)
+            return false;
+
+        var barrier = new VkBufferMemoryBarrier
+        {
+            SType = VkStructureType.BufferMemoryBarrier,
+            SrcAccessMask = VkAccessFlags.ShaderWriteBit,
+            DstAccessMask = VkAccessFlags.IndirectCommandReadBit,
+            SrcQueueFamilyIndex = SVk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = SVk.QueueFamilyIgnored,
+            Buffer = vkBuffer.Buffer.Buffer,
+            Offset = 0,
+            Size = SVk.WholeSize,
+        };
+        Vulkan.Device.Vk.CmdPipelineBarrier(cmd,
+            VkPipelineStageFlags.ComputeShaderBit,
+            VkPipelineStageFlags.DrawIndirectBit,
+            0, 0, null, 1, &barrier, 0, null);
+        return true;
+    }
+
+    /// <summary>间接实例化四边形绘制管线。创建失败即返回 null，粒子效果据此整体不注册，画面退回改动前。</summary>
+    public Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline()
+    {
+        if (!IndirectDrawSupported || Vulkan.Device.LogicalDevice.Handle == 0) return null;
+        try { return new VKParticleDrawPipeline(); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Particles] Vulkan 管线创建失败：{ex.Message}");
+            return null;
+        }
+    }
 
     /// <summary>1-8: upload constant blocks.
     /// VKStorageBuffer is DEVICE_LOCAL and unmapped,

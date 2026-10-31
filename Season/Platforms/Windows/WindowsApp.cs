@@ -691,9 +691,9 @@ public static class WindowsApp
 
         // D3D12 必然支持 Compute；在交换链、MRT 和 PSO 创建之前确定雾的单采样路径。
         var fogAa = RenderQuality.Current.ResolveFogAntiAliasing(DirectX.Device.HdrSceneColor, immediate2D);
-        if (fogAa != RenderQuality.Current.AntiAliasing)
+        if (fogAa != RenderQuality.Current.EffectiveAntiAliasing)
         {
-            RenderQuality.Current.AntiAliasing = fogAa;
+            RenderQuality.Current.EffectiveAntiAliasing = fogAa;
             DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] 体积雾需要单采样场景，Msaa4x 降为 {fogAa}");
         }
 
@@ -704,7 +704,7 @@ public static class WindowsApp
         // Taa fallback -> Fxaa, and Fxaa fallback -> Off.
         // The whole tier normalization is skipped in immediate-2D mode: no AA path exists to
         // configure, and the values stay unused because no pass ever consults them.
-        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa)
+        if (!immediate2D && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Taa)
         {
             // 2-3 contract clause 1: selecting Taa forces the velocity path to be enabled
             // because TAA is invalid without velocity.
@@ -723,15 +723,20 @@ public static class WindowsApp
             // image falls back to non-TAA SceneColor without jitter (clauses 14/15).
             if (!DirectX.Device.HdrSceneColor)
             {
-                RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Fxaa;
+                RenderQuality.Current.EffectiveAntiAliasing = Season.Rendering.AaMode.Fxaa;
                 DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] Taa requires the HDR offscreen path (currently disabled), falling back to Fxaa; MotionVectors remains enabled");
             }
         }
-        if (!immediate2D && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa && !DirectX.Device.HdrSceneColor)
+        if (!immediate2D && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Fxaa && !DirectX.Device.HdrSceneColor)
         {
-            RenderQuality.Current.AntiAliasing = Season.Rendering.AaMode.Off;
+            RenderQuality.Current.EffectiveAntiAliasing = Season.Rendering.AaMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] Fxaa requires the HDR offscreen path (currently disabled), falling back to Off");
         }
+
+        // A0.2 contract clause 1: scene normals only exist as an extension of the velocity shape, so requesting them forces
+        // velocity on here, before the Msaa4x exclusion below gets a chance to drop both together.
+        if (!immediate2D && RenderQuality.Current.SceneNormals)
+            RenderQuality.Current.MotionVectors = true;
 
         // 2-3 contract clauses 1/8: finalize the MotionVectors tier during initialization,
         // before Pipeline.Init. The main shader's VELOCITY_OUTPUT variant and the PSO's
@@ -740,10 +745,10 @@ public static class WindowsApp
         // sample count, and multisampled color cannot be bound together with single-sampled velocity.
         if (!immediate2D
             && RenderQuality.Current.MotionVectors
-            && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
+            && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
         {
             RenderQuality.Current.MotionVectors = false;
-            DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] MotionVectors is mutually exclusive with Msaa4x (all MRT attachments must use the same sample count), falling back to false");
+            DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] MotionVectors is mutually exclusive with Msaa4x (all MRT attachments must use the same sample count), falling back to false" + (RenderQuality.Current.SceneNormals ? "; SceneNormals goes with it" : ""));
         }
 
         DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [Init] Device.Init begin");
@@ -843,6 +848,22 @@ public static class WindowsApp
             });
         }
 
+        // A0.2 contract clause 2: SceneNormal (full-size rgba16float, MRT slot 2). Only ever created next to SceneVelocity, so the
+        // Scene pass has exactly three shapes. The explicit zero clear matters on D3D12: the optimized clear value is baked here and
+        // must match the per-frame clear, which for this slot is zero rather than the background color.
+        if (!immediate2D && RenderQuality.Current.EffectiveSceneNormals && Season.Rendering.FrameSchedule.SceneVelocity != null)
+        {
+            Season.Rendering.FrameSchedule.SceneNormal = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
+            {
+                ColorFormat = Season.Rendering.RtFormat.Rgba16Float,
+                MatchBackbufferSize = true,
+                SampleCount = 1,
+                // Only ever an MRT slot next to SceneColor's explicit SceneDepth, never a standalone pass target.
+                NoImplicitDepth = true,
+                ClearColor = Vector4.Zero,
+            });
+        }
+
         // 2-1 Step C (contract clause 4): enable the Post slot for the FXAA tier.
         // Once PostColor (LDR, same format and size as the backbuffer) and RenderPost
         // (uber pass: tonemap + bloom composition, luma written into alpha) are registered as a pair,
@@ -854,8 +875,8 @@ public static class WindowsApp
         // phase, so it reads the resolve output of the current frame rather than SceneColor.
         // In tiers that ask for neither, both remain null, leaving no residue in the pipeline.
         if (!immediate2D
-            && (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Fxaa
-                || (RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Taa
+            && (RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Fxaa
+                || (RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Taa
                     && RenderQuality.Current.TaaSharpness > 0f))
             && Season.Rendering.FrameSchedule.SceneColor != null)
         {
@@ -899,7 +920,7 @@ public static class WindowsApp
         }
         if (!immediate2D
             && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off
-            && RenderQuality.Current.AntiAliasing == Season.Rendering.AaMode.Msaa4x)
+            && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
         {
             RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] AO is mutually exclusive with Msaa4x (MSAA depth cannot be used as compute input), falling back to Off");
@@ -923,8 +944,9 @@ public static class WindowsApp
         // SampleCount 1 is unconditionally correct here: MotionVectors and Msaa4x were already made
         // mutually exclusive above, so this branch is never reached with a multisampled scene.
         if (!immediate2D && Season.Rendering.FrameSchedule.SceneDepth == null
-            && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresFogSceneDepth(
-                DirectX.Device.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)))
+            && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresAtmosphereSceneDepth(
+                DirectX.Device.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)
+                || RenderQuality.Current.RequiresDecalSceneDepth(DirectX.Device.HdrSceneColor, immediate2D)))
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {
@@ -937,7 +959,7 @@ public static class WindowsApp
         // One-shot tier report: the app ships with the desktop-class defaults (HDR + TAA tier +
         // GTAO + shadows + bloom), so this line is what a device log needs to tell which pipeline the
         // frame actually pays for, and whether immediate-2D mode is active.
-        DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] tier: {(int)DeviceServices.BaseApp.DeviceResolution.X}x{(int)DeviceServices.BaseApp.DeviceResolution.Y} hdr={DirectX.Device.HdrSceneColor} aa={RenderQuality.Current.AntiAliasing} mv={RenderQuality.Current.MotionVectors} ao={RenderQuality.Current.AmbientOcclusion} shadows={RenderQuality.Current.ShadowsEnabled} bloom={RenderQuality.Current.BloomEnabled} taaSharpness={RenderQuality.Current.TaaSharpness} immediate2D={immediate2D}");
+        DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] tier: {(int)DeviceServices.BaseApp.DeviceResolution.X}x{(int)DeviceServices.BaseApp.DeviceResolution.Y} hdr={DirectX.Device.HdrSceneColor} aa={RenderQuality.Current.EffectiveAntiAliasing} mv={RenderQuality.Current.MotionVectors} ao={RenderQuality.Current.AmbientOcclusion} shadows={RenderQuality.Current.ShadowsEnabled} bloom={RenderQuality.Current.BloomEnabled} taaSharpness={RenderQuality.Current.TaaSharpness} immediate2D={immediate2D}");
 
         // Extra line when the mode is on: this is what a device log needs to tell that the frame is
         // Overlay-only and that the tier line right above is inert.

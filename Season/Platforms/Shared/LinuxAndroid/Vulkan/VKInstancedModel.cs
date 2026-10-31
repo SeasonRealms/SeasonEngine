@@ -81,7 +81,7 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
     /// Load primitives from the shared model template.
     /// The caller must ensure the template has already been loaded.
     /// </summary>
-    public void Load(VKModel template, Season.Controls.Model model, Season.Basic.Camera camera)
+    public void Load(VKModel template, Season.Controls.Model model)
     {
         var nodeMap = new Dictionary<GltfNodeBase, GltfNodeBase>();
         CloneAnimationData(template.Asset, nodeMap);
@@ -98,7 +98,7 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
 
         foreach (var source in templatePrimitives)
         {
-            var clone = CloneForInstancing(source, model, camera);
+            var clone = CloneForInstancing(source, model);
             if (source.OwnerNode != null && nodeMap.TryGetValue(source.OwnerNode, out var clonedNode))
                 clone.OwnerNode = clonedNode;
             clone.InstanceStreamIndex = _primitives.Count;
@@ -121,7 +121,7 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
     /// - Material UBO -> created locally (because Alpha may differ)
     /// - Apply model-level material overrides (MaterialColor / Unlit)
     /// </summary>
-    PrimitiveData CloneForInstancing(PrimitiveData source, Season.Controls.Model model, Season.Basic.Camera camera)
+    PrimitiveData CloneForInstancing(PrimitiveData source, Season.Controls.Model model)
     {
         var clone = new PrimitiveData
         {
@@ -171,11 +171,7 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(camera.View),
-            Projection = Matrix4x4.Transpose(camera.Projection),
-            // 2-3 Step C: in the instanced path, PrevWorld stays all zero;
-            // PrevViewProjection follows the same convention as DX
-            PrevViewProjection = Matrix4x4.Transpose(camera.PrevViewProjection),
+            // 2-3 Step C: in the instanced path, PrevWorld stays all zero
         };
 
         for (int i = 0; i < Device.frameCount; i++)
@@ -933,12 +929,9 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(Camera.View),
-            Projection = Matrix4x4.Transpose(Camera.Projection),
             // 2-3 Step C (track C-a): the per-instance previous world matrices now come from
             // the prev instance world SB (binding 14),
             // so b0.PrevWorld stays all zero because the instanced shader path does not read it.
-            PrevViewProjection = Matrix4x4.Transpose(Camera.PrevViewProjection),
         };
 
         foreach (var primitive in _primitives)

@@ -5,69 +5,104 @@
 namespace Season.Platforms.Web;
 
 /// <summary>
-/// Uniform buffer layout definition. Precisely aligned with the WGSL <c>Uniforms</c> struct (GLSL std140 layout).
-/// Both vec4 and mat4 are aligned to 16 bytes, for a total size of 108 floats = 432 bytes.
+/// Per-draw uniform buffer layout, precisely aligned with the WGSL <c>Uniforms</c> struct (std140 layout).
+/// Only per-object state lives here: 60 floats = 240 bytes.
+///
+/// View / Projection / PrevViewProjection used to be copied into every draw (432B). They now live in one shared
+/// per-view uniform buffer (<see cref="WebGPUViewUniformLayout"/>, binding 22) addressed by slot, so a single object
+/// buffer is valid for any number of views and every 3D draw uploads 44% fewer bytes.
 /// </summary>
 public static class WebGPUUniformLayout
 {
-    // Matrix section (16 floats per matrix, stored in transposed row-major order).
-    /// <summary>mat4x4f world</summary>
+    /// <summary>mat4x4f world (row-major bytes; <see cref="WorldFloats"/> is the copy length used at each draw site)</summary>
     public const int World = 0;
-    /// <summary>mat4x4f view</summary>
-    public const int View = 16;
-    /// <summary>mat4x4f projection</summary>
-    public const int Projection = 32;
+    /// <summary>Floats occupied by the world matrix.</summary>
+    public const int WorldFloats = 16;
 
-    // 2-3 history section (contract clause 6): the 9 retired vec4 slots from 1-2
-    // (old cameraPos + 4 light positions + 4 light colors; lighting now comes from the shared UBO at binding(10))
-    // are repurposed here for previous-frame data. Those 36 floats exactly fill the retired area.
-    // 48*4=192 / 64*4=256 / 80*4=320 all satisfy the 16-byte alignment requirement for mat4x4f.
-    // The full 432-byte layout, JS-side STRIDE=108, and pipeline selection offsets (float[94] / int[98]) all stay unchanged.
-    // All zeros means "not written" (MotionVectors disabled or previous data not ready), and the shader degrades gracefully based on the sentinel (clause 9).
-    /// <summary>mat4x4f prevWorld (previous-frame world matrix, using the same transposed row-major convention as World;
+    // 2-3 history section (contract clause 6): per-object previous-frame data.
+    // Every offset below stays a multiple of 4 floats, i.e. 16-byte aligned, so the WGSL struct keeps std140
+    // vec4/mat4 layout without implicit padding.
+    // All zeros means "not written" (MotionVectors disabled or previous data not ready); the shader degrades
+    // gracefully through the sentinel (clause 9).
+    /// <summary>mat4x4f prevWorld (previous-frame world matrix, using the same row-major byte convention as World;
     /// M44 == 0 means no history, so the shader falls back to the current-frame world matrix)</summary>
-    public const int PrevWorld = 48;
-
-    /// <summary>mat4x4f prevViewProjection (previous-frame non-jittered View x Projection; an all-zero block means no history,
-    /// so the shader outputs zero velocity)</summary>
-    public const int PrevViewProjection = 64;
+    public const int PrevWorld = 16;
 
     /// <summary>vec4f prevMorphWeights (previous-frame morph weights; consumed by Step C and kept at 0 in Step A)</summary>
-    public const int PrevMorphWeights = 80;
+    public const int PrevMorphWeights = 32;
 
     // Material parameters (each item is a vec4f).
     /// <summary>vec4f baseColor</summary>
-    public const int BaseColor = 84;
+    public const int BaseColor = 36;
     /// <summary>vec4f emissive（xyz=color, w=ao）</summary>
-    public const int Emissive = 88;
+    public const int Emissive = 40;
     /// <summary>vec4f material（x=metallic, y=roughness, z=alpha, w=alphaCutoff）</summary>
-    public const int Material = 92;
+    public const int Material = 44;
 
     // Flags (vec4&lt;i32&gt;, written into float slots using int bit patterns).
     /// <summary>vec4&lt;i32&gt; flags (x = previous-data sentinel bitfield for 2-3 Step C, see <see cref="WebGPUPrevDataFlags"/>;
-    /// reuses the retired 1-2 lightCount slot, while punctual light count now reads from uLights.params0.x;
-    /// y = renderMode, z = alphaMode, w = textureFlags). JS pipeline selection depends on int[98] (= z), so this offset cannot move.</summary>
-    public const int Flags = 96;
+    /// y = renderMode, z = alphaMode, w = textureFlags). JS pipeline selection reads int[Flags + 2] (= z), so this
+    /// offset cannot move without touching seasonWebGPU.js.</summary>
+    public const int Flags = 48;
 
     // Morph weights (non-instanced path, aligned with native MaterialParams.MorphWeights).
     /// <summary>vec4f morphWeights (up to 4 morph target weights)</summary>
-    public const int MorphWeights = 100;
+    public const int MorphWeights = 52;
 
     // HDR parameters (1-4 Step B -> retired in 1-2).
     /// <summary>vec4f hdrParams (retired reserved slot: exposure now reads from uLights.params0.y while keeping the single injection point from contract 7;
     /// in Phase 4 it is repurposed as the per-draw outline color carrier for the OutlineMask pass, see <see cref="WebGPUUniformWriter.SetOutlineMaskColor"/>)</summary>
-    public const int HdrParams = 104;
+    public const int HdrParams = 56;
 
     /// <summary>Total float count in the uniform buffer.</summary>
-    public const int TotalFloats = 108;
+    public const int TotalFloats = 60;
     /// <summary>Total byte size of the uniform buffer.</summary>
     public const int TotalBytes = TotalFloats * 4;
 }
 
 /// <summary>
+/// Per-view uniform buffer layout (binding 22): one slot per view / shadow quadrant, 256 bytes each
+/// (<see cref="Season.Rendering.ViewConstants.SizeInBytes"/>, which is both the D3D12 CBV stride and the WebGPU
+/// <c>minUniformBufferOffsetAlignment</c> unit).
+///
+/// Slot map: 0..7 = render views (<see cref="Season.Rendering.RenderView.Index"/>),
+/// 8..11 = shadow quadrants (3 cascades + spotlight), 13 = screen space (2D sprites / MSDF text), 12/14/15 reserved.
+///
+/// The full 256-byte ViewConstants block is uploaded verbatim: its first <see cref="StructBytes"/> bytes are exactly
+/// the three matrices the vertex shader reads, already in the row-major byte order that WGSL reinterprets as the
+/// transposed matrix, so no per-backend transpose step is needed.
+/// </summary>
+public static class WebGPUViewUniformLayout
+{
+    /// <summary>mat4x4f view at byte offset 0 (matches <see cref="Season.Rendering.ViewConstants.View"/>).</summary>
+    public const int View = 0;
+    /// <summary>mat4x4f projection at byte offset 64 (jitter and backend NDC adjustment already baked in).</summary>
+    public const int Projection = 64;
+    /// <summary>mat4x4f prevViewProjection at byte offset 128 (all zero = no history sentinel).</summary>
+    public const int PrevViewProjection = 128;
+    /// <summary>Bytes read by the WGSL <c>ViewUniforms</c> struct (three mat4x4f).</summary>
+    public const int StructBytes = 192;
+    /// <summary>Bytes per slot: one whole ViewConstants block.</summary>
+    public const int SlotBytes = Season.Rendering.ViewConstants.SizeInBytes;
+    /// <summary>Number of render-view slots.</summary>
+    public const int ViewSlotCount = 8;
+    /// <summary>First shadow-quadrant slot (cascade 0).</summary>
+    public const int ShadowSlotBase = 8;
+    /// <summary>Shadow slots: <see cref="Season.Rendering.CascadedShadow.MaxCascades"/> cascades + one spotlight.</summary>
+    public const int ShadowSlotCount = 4;
+    /// <summary>Slot used by identity screen-space geometry (2D sprites, MSDF text).</summary>
+    public const int ScreenSpaceSlot = 13;
+    /// <summary>Total number of slots in the shared buffer.</summary>
+    public const int TotalSlots = 16;
+    /// <summary>Size of the shared per-view buffer (4 KiB).</summary>
+    public const int BufferBytes = TotalSlots * SlotBytes;
+}
+
+/// <summary>
 /// 2-3 Step C: previous-data validity sentinel bitfield stored in <c>flags.x</c>. It matches the three native
 /// MaterialParams uints HasPrevBones@112 / HasPrevInstanceWorld@116 / HasPrevMorph@120, but this backend packs them into
-/// the retired 1-2 reserved <c>flags.x</c> slot because the 432-byte UBO is already fully occupied by 108 floats.
+/// the retired 1-2 reserved <c>flags.x</c> slot because the per-object UBO already spends every float of
+/// <see cref="WebGPUUniformLayout.TotalFloats"/>.
 /// The layout and STRIDE remain unchanged. Semantics are identical across all backends: bit = 0 means that previous data path
 /// is not ready or not applicable, so the VS falls back to the current-frame source data for that path and produces zero velocity there.
 /// On the first frame, the all-zero state naturally matches the behavior before Step C. <see cref="WebGPUUniformWriter.SetFlags"/>
@@ -148,7 +183,7 @@ public enum WebGPUAlphaMode
 
 /// <summary>
 /// Helper for uniform buffer reads and writes. Provides type-safe float[] indexed access
-/// instead of hardcoded patterns such as <c>uniformData[84] = ...</c>.
+/// instead of hardcoded patterns such as <c>uniformData[36] = ...</c>.
 /// </summary>
 public ref struct WebGPUUniformWriter
 {
@@ -159,10 +194,8 @@ public ref struct WebGPUUniformWriter
         _data = data;
     }
 
-    /// <summary>Writes a mat4x4 using the same transposed row-major convention used to match WGSL and CopyMatrixTransposed.</summary>
+    /// <summary>Writes a mat4x4 using the same row-major byte convention used to match WGSL and CopyMatrixTransposed.</summary>
     public void SetWorld(Matrix4x4 m) => CopyTransposed(m, WebGPUUniformLayout.World);
-    public void SetView(Matrix4x4 m) => CopyTransposed(m, WebGPUUniformLayout.View);
-    public void SetProjection(Matrix4x4 m) => CopyTransposed(m, WebGPUUniformLayout.Projection);
 
     void CopyTransposed(Matrix4x4 m, int offset)
     {
@@ -172,16 +205,13 @@ public ref struct WebGPUUniformWriter
         _data[offset + 12] = m.M41; _data[offset + 13] = m.M42; _data[offset + 14] = m.M43; _data[offset + 15] = m.M44;
     }
 
-    // Contract 8 in 1-2: SetCameraPos / SetLightPosition / SetLightColor / SetHdrExposure were removed.
-    // Lighting and exposure now come from the shared UBO at binding(10) (Graphics.UpdateCamera3D uploads SceneLightParams as a whole each frame),
-    // and those slots are reused as the previous-data section starting in 2-3 (see WebGPUUniformLayout.PrevWorld).
+    // Contract 8 in 1-2: SetCameraPos / SetLightPosition / SetLightColor / SetHdrExposure were removed and, with
+    // them, SetView / SetProjection / SetPrevViewProjection: view state now comes from the per-view UBO at
+    // binding 22 (see WebGPUViewUniformLayout), so a draw site only ever uploads per-object state.
 
     /// <summary>2-3 contract clause 6: writes the previous-frame world matrix using the same transpose convention as SetWorld.
     /// If not called, the slot stays all-zero (each draw site already clears via Array.Clear), so the shader falls back to the current-frame world matrix.</summary>
     public void SetPrevWorld(Matrix4x4 m) => CopyTransposed(m, WebGPUUniformLayout.PrevWorld);
-
-    /// <summary>2-3 contract clause 6: writes the previous-frame non-jittered View x Projection matrix (all-zero means no history and therefore zero velocity).</summary>
-    public void SetPrevViewProjection(Matrix4x4 m) => CopyTransposed(m, WebGPUUniformLayout.PrevViewProjection);
 
     /// <summary>2-3: writes previous-frame morph weights (consumed by Step C; Step A leaves them at 0 by not writing).</summary>
     public void SetPrevMorphWeights(Vector4 v)
@@ -241,8 +271,9 @@ public ref struct WebGPUUniformWriter
         _data[WebGPUUniformLayout.Flags + 3] = BitConverter.Int32BitsToSingle(textureFlags);
     }
 
-    /// <summary>Phase 4: per-draw outline color for the OutlineMask pass. Writes into the retired hdrParams slot 104-107,
-    /// which WGSL <c>fs_main_outline_mask</c> reads through <c>u.hdrParams.rgb</c>, with zero layout or STRIDE changes.
+    /// <summary>Phase 4: per-draw outline color for the OutlineMask pass. Writes into the retired hdrParams slot
+    /// (<see cref="WebGPUUniformLayout.HdrParams"/>), which WGSL <c>fs_main_outline_mask</c> reads through
+    /// <c>u.hdrParams.rgb</c>, with zero layout or STRIDE changes.
     /// Non-mask draw sites do not write this slot, so leaving it at 0 has no side effects.</summary>
     public void SetOutlineMaskColor(Vector4 color)
     {

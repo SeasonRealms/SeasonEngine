@@ -97,7 +97,7 @@ public sealed class DepthViewEffect : ComputeEffect
 
     public override void Record(IGraphics g)
     {
-        var camera = DeviceServices.BaseApp.Camera;
+        var camera = RenderView.Current.Camera;
 
         Span<float> p = stackalloc float[4];
         p[0] = camera.Near;

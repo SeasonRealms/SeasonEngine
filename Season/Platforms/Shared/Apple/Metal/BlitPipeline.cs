@@ -744,7 +744,9 @@ fragment float4 blit_fs_outline_composite(BlitVSOut vsOut [[stage_in]],
 /// <summary>单颜色、无深度的 HDR 雾合成；每次 Draw 重绑资源并快照小参数。</summary>
 internal sealed class MTLFogCompositePipeline : FogCompositePipeline
 {
-    const uint FrameBytes = VolumetricFogEffect.FrameVectorCount * 16;
+    readonly bool _weather;
+    uint FrameBytes => (uint)(_weather ? WeatherCurtainEffect.FrameVectorCount : VolumetricFogEffect.FrameVectorCount) * 16;
+    RenderPassId CompositePass => _weather ? RenderPassId.WeatherComposite : RenderPassId.FogComposite;
     readonly Dictionary<string, Texture> _textures;
     IMTLRenderPipelineState? _pipeline;
     IMTLDepthStencilState? _depthState;
@@ -765,20 +767,23 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
             && ReferenceEquals(Ao, other.Ao) && ReferenceEquals(Destination, other.Destination);
     }
 
-    internal MTLFogCompositePipeline(Dictionary<string, Texture> textures)
+    internal MTLFogCompositePipeline(Dictionary<string, Texture> textures) : this(textures, false) { }
+
+    internal MTLFogCompositePipeline(Dictionary<string, Texture> textures, bool weather)
     {
+        _weather = weather;
         _textures = textures;
         try
         {
             var vsLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, VolumetricFogEffect.CompositeVertexMsl);
-            var fsLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, VolumetricFogEffect.CompositeMsl);
+            var fsLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, _weather ? WeatherShaders.CompositeMsl : VolumetricFogEffect.CompositeMsl);
             using var vs = vsLibrary.CreateFunction("VSMain")
                 ?? throw new InvalidOperationException("未找到雾合成顶点入口。");
             using var fs = fsLibrary.CreateFunction("PSMain")
                 ?? throw new InvalidOperationException("未找到雾合成片元入口。");
             using var desc = new MTLRenderPipelineDescriptor
             {
-                Label = "Season-FogComposite", VertexFunction = vs, FragmentFunction = fs,
+                Label = _weather ? "Season-WeatherComposite" : "Season-FogComposite", VertexFunction = vs, FragmentFunction = fs,
                 DepthAttachmentPixelFormat = MTLPixelFormat.Invalid,
                 StencilAttachmentPixelFormat = MTLPixelFormat.Invalid, RasterSampleCount = 1,
             };
@@ -794,6 +799,36 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
                 ?? throw new InvalidOperationException("雾合成深度状态创建失败。");
         }
         catch { Dispose(); throw; }
+        if (!_weather) Current = this;
+    }
+
+    /// <summary>本进程唯一的雾合成管线。透明阶段要靠它拿到本帧刚积分出的体积纹理，
+    /// 与 VK/DX “合成成功后才发布颜色源”的时序一致。
+    /// 帧调度层只会创建一个雾效果，因此这里不需要列表。</summary>
+    internal static MTLFogCompositePipeline? Current { get; private set; }
+
+    // 本帧已成功合成的体积资源。它们只在 Draw 成功之后写入，并且在 Prepare 与 Draw 的入口处清空：
+    // 于是“合成没发生”或“合成失败”两种情况下它都是空的，透明阶段就不会去采样一张过期的体积。
+    IMTLBuffer? _transparentFrame;
+    IMTLTexture? _transparentIntegrated;
+    IMTLTexture? _transparentLocal;
+
+    /// <summary>取本帧已成功合成的雾采样三件套；返回 false 时透明阶段保持零门控。
+    /// 调用方（MTLSceneDrawCollection.DrawTransparent）只在帧调度器宣告合成成功时才会走到这里，
+    /// 两重条件必须同时成立才采样，避免把上一帧的体积当成这一帧的。</summary>
+    internal static bool TryGetTransparentBinding(out IMTLBuffer? frame, out IMTLTexture? integrated, out IMTLTexture? local)
+    {
+        var pipeline = Current;
+        if (pipeline != null && pipeline._transparentFrame != null
+            && pipeline._transparentIntegrated != null && pipeline._transparentLocal != null)
+        {
+            frame = pipeline._transparentFrame;
+            integrated = pipeline._transparentIntegrated;
+            local = pipeline._transparentLocal;
+            return true;
+        }
+        frame = null; integrated = null; local = null;
+        return false;
     }
 
     static bool Readable(IMTLTexture? texture, MTLTextureType type) => texture != null
@@ -828,13 +863,13 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
             || (nuint)depth.Width != sceneDepth.Width || (nuint)depth.Height != sceneDepth.Height)
             return false;
 
-        var integrated = MTLTexture3D.Find(inputs.IntegratedVolume);
-        var local = MTLTexture3D.Find(inputs.LocalVolume);
-        if (integrated == null || local == null || !Volatile.Read(ref integrated.Ready) || !Volatile.Read(ref local.Ready)
+        var integrated = _weather ? null : MTLTexture3D.Find(inputs.IntegratedVolume);
+        var local = _weather ? null : MTLTexture3D.Find(inputs.LocalVolume);
+        if (!_weather && (integrated == null || local == null || !Volatile.Read(ref integrated.Ready) || !Volatile.Read(ref local.Ready)
             || !Readable(integrated.Image, MTLTextureType.k3D) || !Readable(local.Image, MTLTextureType.k3D)
             || integrated.Image.PixelFormat != MTLPixelFormat.RGBA16Float || local.Image.PixelFormat != MTLPixelFormat.RGBA16Float
             || integrated.Image.Width != local.Image.Width || integrated.Image.Height != local.Image.Height
-            || local.Image.Depth == 0 || integrated.Image.Depth != local.Image.Depth + 1)
+            || local.Image.Depth == 0 || integrated.Image.Depth != local.Image.Depth + 1))
             return false;
 
         IMTLTexture? ao = src;
@@ -854,7 +889,7 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
                     or MTLPixelFormat.RG16Float or MTLPixelFormat.RGBA16Float
                     or MTLPixelFormat.RGBA8Unorm or MTLPixelFormat.BGRA8Unorm)) return false;
         }
-        resources = new(frame.Buffer, integrated.Image, local.Image, src, sceneDepth, ao!, dst);
+        resources = new(frame.Buffer, _weather ? src : integrated!.Image, _weather ? src : local!.Image, src, sceneDepth, ao!, dst);
         return true;
     }
 
@@ -864,6 +899,10 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
         _command = null;
         _inputs = default;
         _prepared = default;
+        // 透明阶段的采样资源跟 Prepare/Draw 走：入口清空，只有 Draw 成功才重新发布。
+        _transparentFrame = null;
+        _transparentIntegrated = null;
+        _transparentLocal = null;
     }
 
     public override bool Prepare(in FogCompositeInputs inputs, RenderTarget destination)
@@ -891,7 +930,7 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
         var encoder = Device.GraphicsEncoder;
         if (_disposed || destination == null || encoder == null || encoder.Handle == IntPtr.Zero
             || command == null || command.Handle == IntPtr.Zero || !ReferenceEquals(command, Device.GraphicsCommandBuffer)
-            || _frame != Device.FrameIndex || Device.ActivePassId != RenderPassId.FogComposite
+            || _frame != Device.FrameIndex || Device.ActivePassId != CompositePass
             || !ReferenceEquals(destination, Device.ActiveColorTarget)
             || !Resolve(inputs, destination, out var resources) || !prepared.Same(resources)
             || Device.ActiveColorTexture?.Handle != resources.Destination.Handle) return default;
@@ -908,6 +947,16 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
         encoder.SetFragmentTexture(resources.Depth, 3);
         encoder.SetFragmentTexture(resources.Ao, 4);
         encoder.DrawPrimitives(MTLPrimitiveType.Triangle, 0, 3);
+
+        // 本帧合成已成功：把体积资源交给紧随其后的透明阶段。
+        // 颜色源已经发布给 FrameSchedule，透明阶段的颜色附件就是这张合成目标，
+        // 而两张体积只读，不构成对附件的同时读写。
+        if (!_weather)
+        {
+            _transparentFrame = resources.Frame;
+            _transparentIntegrated = resources.Integrated;
+            _transparentLocal = resources.Local;
+        }
         return new(true, inputs.ApplyAo);
     }
 
@@ -916,6 +965,7 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
         if (_disposed) return;
         _disposed = true;
         ClearPrepared();
+        if (ReferenceEquals(Current, this)) Current = null;
         // 已编码资源由 command buffer 持有；未编码的准备结果已经失效。
         _pipeline?.Dispose(); _pipeline = null;
         _depthState?.Dispose(); _depthState = null;

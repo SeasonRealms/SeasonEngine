@@ -35,7 +35,7 @@ internal class GltfAsset
     internal Func<SharpGLTF.Schema2.Node, GltfNodeBase> CreateGLTFNodeCallback;
 
     /// <summary>Injected by DXModel to process a single MeshPrimitive and attach the generated PrimitiveData to the node.</summary>
-    internal Action<MeshPrimitive, GltfNodeBase, Model, Season.Basic.Camera> ProcessPrimitiveCallback;
+    internal Action<MeshPrimitive, GltfNodeBase, Model> ProcessPrimitiveCallback;
 
     // The skins set does not change after loading, so cache the first collected result
     // to avoid per-frame new List allocations and Contains scans.
@@ -93,7 +93,7 @@ internal class GltfAsset
     /// <summary>v2 picking: per-instance shadow copy of the bone palette, indexed as [instance][flattened joint index], including palette-offset semantics.</summary>
     internal Matrix4x4[][] InstancePickBones = Array.Empty<Matrix4x4[]>();
 
-    public virtual void Load(Season.Controls.Model model, Season.Basic.Camera camera)
+    public virtual void Load(Season.Controls.Model model)
     {
         Model = model;
 
@@ -142,7 +142,7 @@ internal class GltfAsset
 
         foreach (var node in sceneRootNodes)
         {
-            ProcessNode(node, System.Numerics.Matrix4x4.Identity, camera, model);
+            ProcessNode(node, System.Numerics.Matrix4x4.Identity, model);
         }
 
         BindSkins(glb);
@@ -798,7 +798,7 @@ internal class GltfAsset
         return -1;
     }
 
-    internal void ProcessNode(SharpGLTF.Schema2.Node node, System.Numerics.Matrix4x4 parentWorldMatrix, Season.Basic.Camera camera, Season.Controls.Model model, GltfNodeBase parentGltfNode = null)
+    internal void ProcessNode(SharpGLTF.Schema2.Node node, System.Numerics.Matrix4x4 parentWorldMatrix, Season.Controls.Model model, GltfNodeBase parentGltfNode = null)
     {
         // Compute the current node's world transform matrix.
         var transform = node.LocalMatrix;
@@ -885,25 +885,25 @@ internal class GltfAsset
         // Process primitives when the node has a mesh.
         if (node.Mesh != null)
         {
-            ProcessMesh(node.Mesh, gltfNode, model, camera);
+            ProcessMesh(node.Mesh, gltfNode, model);
         }
 
         // Recursively process child nodes, passing the current node as parent.
         foreach (var childNode in node.VisualChildren)
         {
-            ProcessNode(childNode, gltfNode.WorldTransform, camera, model, gltfNode);
+            ProcessNode(childNode, gltfNode.WorldTransform, model, gltfNode);
         }
 
         gltfNodes.Add(gltfNode);
     }
 
-    void ProcessMesh(Mesh mesh, GltfNodeBase node, Model model, Season.Basic.Camera camera)
+    void ProcessMesh(Mesh mesh, GltfNodeBase node, Model model)
     {
         for (var primIndex = 0; primIndex < mesh.Primitives.Count; primIndex++)
         {
             var primitive = mesh.Primitives[primIndex];
 
-            ProcessPrimitiveCallback?.Invoke(primitive, node, model, camera);
+            ProcessPrimitiveCallback?.Invoke(primitive, node, model);
 
             // v2 picking validation: keep a compact picking mesh and reuse LoadMeshPrimitive
             // so the transform pipeline stays identical to rendering.

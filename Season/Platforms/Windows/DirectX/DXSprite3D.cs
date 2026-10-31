@@ -23,6 +23,8 @@ internal unsafe class DXSprite3D : DXSpriteQuad
     // "no history" sentinel.
     private Matrix4x4 _lastWorldMatrix;
 
+    protected override bool ScreenSpaceView => false;
+
     public DXSprite3D(DXTexture dxTexture)
     {
         Texture = new Texture();
@@ -109,12 +111,9 @@ internal unsafe class DXSprite3D : DXSpriteQuad
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(worldMatrix),
-            View = Matrix4x4.Transpose(DXPrimitiveGroup.Camera.View),
-            Projection = Matrix4x4.Transpose(DXPrimitiveGroup.Camera.Projection),
             // 2-3 contract rule 6: capture history first, then roll forward.
             // Previous state always comes from the CPU shadow copy.
             PrevWorld = Matrix4x4.Transpose(prevWorldMatrix),
-            PrevViewProjection = Matrix4x4.Transpose(DXPrimitiveGroup.Camera.PrevViewProjection),
         };
 
         // Material CB: color x alpha is encoded through BaseColor.W.

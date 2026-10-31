@@ -59,6 +59,26 @@ float4 FogTransparent(float4 premultiplied,float4 fog,bool additive) {
 float4 FogOpaque(float4 color,float4 fog,float ao) { return float4(color.xyz*ao*fog.w+fog.xyz,color.w); }
 """;
 
+    /// <summary>
+    /// 主着色器入口的雾合成胶水，四个出口（文字 / 天空 / Sprite2D / PBR）共用同一份形状，
+    /// 与 VK ApplySceneFog、DX ApplySceneFog 逐行对应。
+    /// 它直接拼接 <see cref="SamplingMsl"/>，所以主场景着色器里的体积采样数学与合成 Pass 是同一个来源，不存在第二份副本。
+    /// 门控是运行期参数而不是编译期宏：
+    /// 天空与不透明几何在同一 Pass 里绘制却不能吃透射采样，只有逐条命令推送的 fogParams 才能表达这一点，
+    /// 共享 UBO 会让整帧统一读取。
+    /// </summary>
+    public const string SceneSamplingMsl = SamplingMsl + """
+
+float4 ApplySceneFog(float4 color,float3 worldPos,FogSampler fog,float4 fogParams) {
+    if(fogParams.x>0.5) {
+        float4 sampled=fog.AtWorld(worldPos);
+        color.rgb=color.rgb*sampled.w+sampled.rgb;
+    }
+    return color;
+}
+
+""";
+
     public const string CompositeVertexMsl = """
 #include <metal_stdlib>
 using namespace metal;
@@ -91,6 +111,7 @@ fragment float4 PSMain(float4 position [[position]],const device float4* data [[
     const string CommonMsl = """
 #include <metal_stdlib>
 using namespace metal;
+""" + WeatherShaders.ContextMsl + """
 struct FogFrame {
     const device float4* data;
     float4 F(uint i) const { return data[i]; }
@@ -151,7 +172,9 @@ kernel void CSMain(constant float4& params [[buffer(0)]],texture3d<float,access:
                 d*=saturate(1.0-b.w*0.5*(n.y+n.z)); tau+=d*a.w*a.y*invY;
             }
         }
-        return 1.0-F(116).x*saturate(1.0-exp(-tau));
+        float4 header=F(118); if(F(16).w<0.5) header.y=0;
+        WeatherCloudContext<const device float4*> weather{header,F(119),data+120,cloudNoise};
+        return (1.0-F(116).x*saturate(1.0-exp(-tau)))*weather.WeatherCloudShadow(p,l);
     }
     float ShadowTile(float3 p,uint matrixIndex,int tile) const {
         float4 clip=Transform(float4(p,1),matrixIndex); float result=1;
@@ -193,7 +216,7 @@ kernel void CSMain(constant float4& params [[buffer(0)]],texture3d<float,access:
         float sigma=global.x*exp(-global.z*max(p.y-global.y,0.0f))*Noise(windP,F(12).w,global.w);
         float3 scattering=F(12).xyz*sigma; float exclude=1;
         for(int i=0;i<min(int(F(13).w),32);i++) {
-            uint base=128+i*8; float3 local=Transform(float4(p,1),base).xyz; float4 shape=F(base+5),medium=F(base+4);
+            uint base=192+i*8; float3 local=Transform(float4(p,1),base).xyz; float4 shape=F(base+5),medium=F(base+4);
             float r=shape.x>0.5?length(local):max(abs(local.x),max(abs(local.y),abs(local.z)));
             float edge=saturate((1.0-r)/max(shape.z,1e-6f)),weight=r<1?edge*edge*(3.0-2.0*edge):0;
             if(shape.y>0.5) exclude*=1.0-weight;

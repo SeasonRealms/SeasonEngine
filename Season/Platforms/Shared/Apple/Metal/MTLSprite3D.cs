@@ -11,11 +11,13 @@ namespace Season.Platforms.Shared.Apple.Metal;
 /// Metal backend 3D billboard sprite aligned one to one with DXSprite3D and VKSprite3D:
 /// - all instances share one static quad VB managed through reference counting
 /// - the World matrix is determined by BillboardMode, meaning Spherical, Cylindrical, or None
-/// - View and Projection come from MTLPrimitiveGroup.Camera and stay in sync with the PBR3D path
+/// - View and Projection come from the main view constants (VS buffer 11) and stay in sync with the PBR3D path
 /// - renderMode = 0 selects the Sprite path, with no PBR lighting and direct BaseColor times texture output
 /// </summary>
 internal sealed class MTLSprite3D : MTLSpriteQuad
 {
+    protected override bool ScreenSpaceView => false;
+
     // === Static quad VB shared by all MTLSprite3D instances, managed through reference counting ===
     static IMTLBuffer? _sharedVertexBuffer;
     static int _sharedRefCount;
@@ -107,11 +109,8 @@ internal sealed class MTLSprite3D : MTLSpriteQuad
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(worldMatrix),
-            View = Matrix4x4.Transpose(MTLPrimitiveGroup.Camera.View),
-            Projection = Matrix4x4.Transpose(MTLPrimitiveGroup.Camera.Projection),
             // Contract clause 6 of 2-3: write the history matrix into MatrixBuffer.
             PrevWorld = Matrix4x4.Transpose(prevWorldMatrix),
-            PrevViewProjection = Matrix4x4.Transpose(MTLPrimitiveGroup.Camera.PrevViewProjection),
         };
 
         // Material UBO: color times alpha is expressed through BaseColor.W.

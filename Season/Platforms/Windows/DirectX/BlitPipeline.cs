@@ -827,7 +827,9 @@ float4 PSMainOutlineComposite(PSInput input) : SV_TARGET
 /// <summary>独立 RGBA16F 雾合成；每次准备均保留独立描述符与原生资源引用。</summary>
 internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
 {
-    const uint FrameBytes = VolumetricFogEffect.FrameVectorCount * 16;
+    readonly bool _weather;
+    uint FrameBytes => (uint)(_weather ? WeatherCurtainEffect.FrameVectorCount : VolumetricFogEffect.FrameVectorCount) * 16;
+    RenderPassId CompositePass => _weather ? RenderPassId.WeatherComposite : RenderPassId.FogComposite;
     readonly Dictionary<string, DXTexture> _textures;
     readonly List<BindingSlot>[] _slots = new List<BindingSlot>[(int)Device.frameCount];
     readonly int[] _cursors = new int[(int)Device.frameCount];
@@ -898,8 +900,11 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
         }
     }
 
-    internal DXFogCompositePipeline(Dictionary<string, DXTexture> textures)
+    internal DXFogCompositePipeline(Dictionary<string, DXTexture> textures) : this(textures, false) { }
+
+    internal DXFogCompositePipeline(Dictionary<string, DXTexture> textures, bool weather)
     {
+        _weather = weather;
         _textures = textures;
         for (int i = 0; i < _slots.Length; i++) _slots[i] = new();
         try { Initialize(); }
@@ -937,7 +942,7 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
         try
         {
             vertex = ShaderCompiler.CompileShaderFromSource(VolumetricFogEffect.CompositeVertexHlsl, "VSMain", "vs_5_0");
-            fragment = ShaderCompiler.CompileShaderFromSource(VolumetricFogEffect.CompositeHlsl, "PSMain", "ps_5_0");
+            fragment = ShaderCompiler.CompileShaderFromSource(_weather ? WeatherShaders.CompositeHlsl : VolumetricFogEffect.CompositeHlsl, "PSMain", "ps_5_0");
             var stencil = new DepthStencilopDesc { StencilFailOp = StencilOp.Keep, StencilDepthFailOp = StencilOp.Keep,
                 StencilPassOp = StencilOp.Keep, StencilFunc = ComparisonFunc.Always };
             var desc = new GraphicsPipelineStateDesc {
@@ -986,12 +991,13 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
             || color.ColorNativeFormat != Format.FormatR16G16B16A16Float
             || destination.ColorNativeFormat != Format.FormatR16G16B16A16Float
             || !float.IsFinite(input.AoIntensity) || input.AoIntensity < 0) return false;
-        var integrated = DXTexture3D.Find(input.IntegratedVolume); var local = DXTexture3D.Find(input.LocalVolume);
-        if (integrated == null || local == null || !integrated.Ready || !local.Ready
+        var integrated = _weather ? null : DXTexture3D.Find(input.IntegratedVolume);
+        var local = _weather ? null : DXTexture3D.Find(input.LocalVolume);
+        if (!_weather && (integrated == null || local == null || !integrated.Ready || !local.Ready
             || integrated.NativeResource == null || local.NativeResource == null || local.Depth == 0
             || local.Width == 0 || local.Height == 0 || integrated.Width != local.Width || integrated.Height != local.Height
             || integrated.Depth != local.Depth + 1 || integrated.NativeFormat != Format.FormatR16G16B16A16Float
-            || local.NativeFormat != Format.FormatR16G16B16A16Float) return false;
+            || local.NativeFormat != Format.FormatR16G16B16A16Float)) return false;
         DXRenderTarget? aoTarget = null; DXTexture? aoTexture = null;
         ID3D12Resource* aoResource = color.Color;
         Format aoFormat = color.ColorNativeFormat;
@@ -1014,20 +1020,23 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
             if (aoResource == destination.Color || aoFormat is not (Format.FormatR8Unorm or Format.FormatR16Float
                 or Format.FormatR16G16Float or Format.FormatR16G16B16A16Float or Format.FormatR8G8B8A8Unorm)) return false;
         }
-        resources[0] = (nint)frame.Resource; resources[1] = (nint)integrated.NativeResource;
-        resources[2] = (nint)local.NativeResource; resources[3] = (nint)color.Color;
+        resources[0] = (nint)frame.Resource;
+        // 雨幕 shader 不引用 t1/t2；使用输入颜色的合法视图保留描述符快照布局。
+        resources[1] = (nint)(_weather ? color.Color : integrated!.NativeResource);
+        resources[2] = (nint)(_weather ? color.Color : local!.NativeResource); resources[3] = (nint)color.Color;
         resources[4] = (nint)depth.Depth; resources[5] = (nint)aoResource; resources[6] = (nint)destination.Color;
         views[0] = new() { Format = Format.FormatR32Typeless, Shader4ComponentMapping = 0x1688,
             ViewDimension = SrvDimension.Buffer, Buffer = new() { NumElements = FrameBytes / 4, Flags = BufferSrvFlags.Raw } };
-        views[1] = TextureView(integrated.NativeFormat, true); views[2] = TextureView(local.NativeFormat, true);
+        views[1] = _weather ? TextureView(color.ColorNativeFormat) : TextureView(integrated!.NativeFormat, true);
+        views[2] = _weather ? TextureView(color.ColorNativeFormat) : TextureView(local!.NativeFormat, true);
         views[3] = TextureView(color.ColorNativeFormat); views[4] = TextureView(Format.FormatR32Float);
         views[5] = TextureView(aoFormat);
         if (transition)
         {
             var command = Device.GraphicsCommandList;
             frame.TransitionTo(command, ResourceStates.AllShaderResource);
-            integrated.TransitionTo(command, ResourceStates.AllShaderResource);
-            local.TransitionTo(command, ResourceStates.AllShaderResource);
+            integrated?.TransitionTo(command, ResourceStates.AllShaderResource);
+            local?.TransitionTo(command, ResourceStates.AllShaderResource);
             color.TransitionTo(command, ResourceStates.AllShaderResource);
             depth.TransitionDepthTo(command, ResourceStates.AllShaderResource);
             aoTarget?.TransitionTo(command, ResourceStates.AllShaderResource);
@@ -1040,7 +1049,8 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
         else
         {
             const ResourceStates read = ResourceStates.PixelShaderResource;
-            if ((frame.CurrentState & read) == 0 || (integrated.CurrentState & read) == 0 || (local.CurrentState & read) == 0
+            if ((frame.CurrentState & read) == 0
+                || (!_weather && ((integrated!.CurrentState & read) == 0 || (local!.CurrentState & read) == 0))
                 || (color.CurrentState & read) == 0 || (depth.DepthCurrentState & read) == 0
                 || (aoTarget != null && (aoTarget.CurrentState & read) == 0)
                 || (aoTexture != null && (aoTexture.CurrentState & read) == 0)
@@ -1051,7 +1061,7 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
 
     public override bool Prepare(in FogCompositeInputs inputs, RenderTarget destination)
     {
-        ResetTransparent();
+        if (!_weather) ResetTransparent();
         _destination = null; _prepared = null; _inputs = default;
         if (_disposed || Device.ActiveTarget != null || Device.FrameContexts == null
             || Device.FrameIndex >= _slots.Length || Device.GraphicsCommandList == null
@@ -1079,7 +1089,7 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
     {
         var destination = _destination; var inputs = _inputs; var slot = _prepared;
         _destination = null; _inputs = default; _prepared = null;
-        if (_disposed || destination == null || slot == null || Device.ActivePassId != RenderPassId.FogComposite
+        if (_disposed || destination == null || slot == null || Device.ActivePassId != CompositePass
             || !ReferenceEquals(Device.ActiveTarget, destination) || Device.GraphicsCommandList != _command
             || Device.FrameIndex != _frameIndex || Device.GetCurrentRetireFenceValue() != _stamp) return default;
         Span<nint> resources = stackalloc nint[7];
@@ -1096,10 +1106,13 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
         var parameters = new Vector4(inputs.AoIntensity, inputs.ApplyAo ? 1 : 0, 0, 0);
         _command->SetGraphicsRoot32BitConstants(6, 4, &parameters, 0);
         _command->DrawInstanced(3, 1, 0, 0);
-        _transparentOwner = this;
-        _transparentSlot = slot;
-        _transparentInputs = inputs;
-        _transparentDestination = destination;
+        if (!_weather)
+        {
+            _transparentOwner = this;
+            _transparentSlot = slot;
+            _transparentInputs = inputs;
+            _transparentDestination = destination;
+        }
         return new(true, inputs.ApplyAo);
     }
 
@@ -1143,7 +1156,7 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
         command->SetGraphicsRootShaderResourceView(Pipeline.FogFrameRoot, frame.Resource->GetGPUVirtualAddress());
         command->SetGraphicsRootDescriptorTable(Pipeline.FogIntegratedRoot, Device.SrvHeapManager.GetGpuHandle(slot.Ids[1]));
         command->SetGraphicsRootDescriptorTable(Pipeline.FogLocalRoot, Device.SrvHeapManager.GetGpuHandle(slot.Ids[2]));
-        var parameters = new Vector4(1, 0, 0, 0);
+        var parameters = new Vector4(1, FrameSchedule.WeatherComposited ? 1 : 0, 0, 0);
         command->SetGraphicsRoot32BitConstants(Pipeline.FogParamsRoot, 4, &parameters, 0);
         return true;
     }

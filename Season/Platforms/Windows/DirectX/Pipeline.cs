@@ -36,7 +36,51 @@ internal static unsafe class Pipeline
 {
     internal static ID3D12RootSignature* RootSignature;
     internal const uint FogFrameRoot = 23, FogIntegratedRoot = 24, FogLocalRoot = 25, FogParamsRoot = 26;
+
+    /// <summary>Per-view constants (b8, <see cref="ViewConstants"/>): View / Projection / history ViewProjection of
+    /// the view being drawn. Split out of the per-object b0 so one set of object buffers can be drawn into several
+    /// views; b0 now carries only World / PrevWorld.</summary>
+    internal const uint ViewConstantsRoot = 27;
     static bool _fogSamplingEnabled;
+
+    // Per-view constants: one CB per view slot per frame slot, rewritten by WriteViewConstants (N-buffered like every
+    // other per-frame CB). Slot 0 is the main view and keeps its pre-P3 lifetime (written once per frame at the camera
+    // update point); slots 1..MaxViews-1 are written by the FrameSchedule.PrepareView hook right before that view's
+    // draws are collected. Screen view: immutable identity view for Sprite2D and text, which used to carry identity
+    // View/Projection in their own b0. Every slot starts out as ScreenSpace so a frame that never prepares a 3D view
+    // (Immediate2D) still binds well-defined data.
+    internal const int MaxViews = Season.Rendering.FrameSchedule.MaxViews;
+    static ID3D12Resource*[][] _viewBuffers;
+    static byte*[][] _mappedViewBuffers;
+    static ID3D12Resource* _screenViewBuffer;
+    internal static ulong ScreenViewGpuAddress;
+
+    /// <summary>View slot whose constants every scene draw binds. Set by <see cref="SetActiveView"/> before a view's
+    /// draws are collected, and reset to 0 once the view loop ends.</summary>
+    internal static int ActiveViewIndex;
+
+    internal static ID3D12Resource* MainViewConstantBuffer => _viewBuffers[0][Device.FrameIndex];
+    internal static ulong MainViewGpuAddress => MainViewConstantBuffer->GetGPUVirtualAddress();
+
+    /// <summary>Constant buffer of the view being drawn: what every collected scene command replays with.</summary>
+    internal static ID3D12Resource* ActiveViewConstantBuffer => _viewBuffers[ActiveViewIndex][Device.FrameIndex];
+    internal static ulong ActiveViewGpuAddress => ActiveViewConstantBuffer->GetGPUVirtualAddress();
+
+    /// <summary>Selects the view slot for the draws that follow. Out-of-range slots clamp to the main view.</summary>
+    internal static void SetActiveView(int index)
+        => ActiveViewIndex = (uint)index < MaxViews ? index : 0;
+
+    internal static void ResetActiveView() => ActiveViewIndex = 0;
+
+    /// <summary>Uploads the main view for the current frame slot (transposed for the HLSL column-major default).</summary>
+    internal static void WriteMainView(in ViewConstants constants) => WriteViewConstants(0, constants);
+
+    /// <summary>Uploads one view slot's constants for the current frame slot.</summary>
+    internal static void WriteViewConstants(int index, in ViewConstants constants)
+    {
+        if ((uint)index >= MaxViews) return;
+        Unsafe.Write(_mappedViewBuffers[index][Device.FrameIndex], constants.Transposed());
+    }
 
     internal static ID3D12PipelineState* OpaquePipelineState;
     internal static ID3D12PipelineState* OpaqueDoubleSidedPipelineState;
@@ -408,6 +452,24 @@ internal static unsafe class Pipeline
         Unsafe.Write(defaultTextDrawParamsPtr, defaultTextDrawParams);
         DefaultTextDrawParamsGpuAddress = DefaultTextDrawParamsBuffer->GetGPUVirtualAddress();
 
+        var screenView = ViewConstants.ScreenSpace.Transposed();
+        _screenViewBuffer = Device.ResourceManager.CreateConstantBuffer((uint)ViewConstants.SizeInBytes, out var screenViewPtr);
+        Unsafe.Write(screenViewPtr, screenView);
+        ScreenViewGpuAddress = _screenViewBuffer->GetGPUVirtualAddress();
+        _viewBuffers = new ID3D12Resource*[MaxViews][];
+        _mappedViewBuffers = new byte*[MaxViews][];
+        for (int v = 0; v < MaxViews; v++)
+        {
+            _viewBuffers[v] = new ID3D12Resource*[Device.frameCount];
+            _mappedViewBuffers[v] = new byte*[Device.frameCount];
+            for (int i = 0; i < Device.frameCount; i++)
+            {
+                _viewBuffers[v][i] = Device.ResourceManager.CreateConstantBuffer(
+                    (uint)ViewConstants.SizeInBytes, out _mappedViewBuffers[v][i]);
+                Unsafe.Write(_mappedViewBuffers[v][i], screenView);
+            }
+        }
+
         // FinalBlit pipeline (Step 2): independent RootSig + PSO, initialized once together with the main pipeline
         BlitPipeline.Init();
 
@@ -426,9 +488,10 @@ internal static unsafe class Pipeline
         // + 1-7 envCube t11 + 2-4 ddgiAtlas t12 + 2-4 ddgiDepth t13 + 2-5 cloudNoise t14
         // + 2-5 apLut t15 + 1-5 shadow root constants b5 + Outline2D mask color root constants b6)
         // 新增独立雾绑定占 8 DWORD，总计 58，不改写已经提交的光照 CBV。
-        _fogSamplingEnabled = RenderQuality.Current.RequiresFogSceneDepth(
+        // 每视图常量 b8 再占 2 DWORD，总计 60（上限 64）。
+        _fogSamplingEnabled = RenderQuality.Current.RequiresAtmosphereSceneDepth(
             Device.HdrSceneColor, true, Immediate2DMode.Enabled);
-        var rootParameters = new RootParameter[27];
+        var rootParameters = new RootParameter[28];
 
         // Constant buffer (b0)
         rootParameters[0] = new RootParameter
@@ -436,6 +499,14 @@ internal static unsafe class Pipeline
             ParameterType = RootParameterType.TypeCbv,
             Descriptor = new RootDescriptor { ShaderRegister = 0 },
             ShaderVisibility = ShaderVisibility.Vertex
+        };
+
+        // Per-view constants (b8)
+        rootParameters[ViewConstantsRoot] = new RootParameter
+        {
+            ParameterType = RootParameterType.TypeCbv,
+            Descriptor = new RootDescriptor { ShaderRegister = 8 },
+            ShaderVisibility = ShaderVisibility.All
         };
 
         rootParameters[1] = new RootParameter
@@ -893,6 +964,10 @@ internal static unsafe class Pipeline
         // dual-target bake would make the OM/PSO combination invalid at draw time.
         var velocityOutput = !overlay && RenderQuality.Current.MotionVectors && !shadowPass;
 
+        // A0.2 contract clause 3: NORMAL_OUTPUT only ever rides on top of VELOCITY_OUTPUT (SV_Target2 = octahedral normal,
+        // roughness, metallic), so the shapes stay at three per process. OutlineMask binds a single RTV and is excluded.
+        var normalOutput = velocityOutput && !outlineMask && RenderQuality.Current.EffectiveSceneNormals;
+
         // HDR chain switch (1-4 Step A): injected at compile time, with zero runtime branch cost.
         // When HDR_CHAIN=1, gamma encoding moves to the FinalBlit tonemap variant and Scene output stays
         // in pre-encoding space. Overlay renders directly to the backbuffer and does not go through FinalBlit,
@@ -907,6 +982,7 @@ internal static unsafe class Pipeline
             + (RenderQuality.Current.ShadowsEnabled ? "#define SHADOW_ENABLED 1\n" : "#define SHADOW_ENABLED 0\n")
             + (shadowPass ? "#define SHADOW_PASS 1\n" : "#define SHADOW_PASS 0\n")
             + (velocityOutput ? "#define VELOCITY_OUTPUT 1\n" : "#define VELOCITY_OUTPUT 0\n")
+            + (normalOutput ? "#define NORMAL_OUTPUT 1\n" : "#define NORMAL_OUTPUT 0\n")
             // Step 6: DDGI tiering now prioritizes Settings.RenderQuality (persistable; null falls back to the
             // static default source), using the same gate as DdgiEffect.Initialize so the main shader variants
             // and atlas resources are created in sync.
@@ -924,26 +1000,27 @@ internal static unsafe class Pipeline
             + "cbuffer FogParams:register(b7) { float4 fogParams; };\n"
             + Season.Rendering.Effects.VolumetricFogEffect.SamplingHlsl + "\n#endif\n"
             + @"
-float4 ApplySceneFog(float4 color, float3 worldPos) {
-#if FOG_SAMPLING
-    [branch] if(fogParams.x > 0.5) {
-        float4 fog = FogAtWorld(worldPos);
-        // 当前材质 PSO 使用 straight alpha，混合阶段统一乘 alpha。
-        color.rgb = color.rgb * fog.w + fog.rgb;
-    }
-#endif
-    return color;
-}
+float4 ApplySceneFog(float4 color, float3 worldPos);
 cbuffer Matrices : register(b0)
 {
     float4x4 world;
-    float4x4 view;
-    float4x4 projection;
     // 2-3 contract clause 6: history matrices (same transpose convention as world/view/projection).
     // _m33 == 0 means the field was never written (all zero), and the VS degrades based on that sentinel;
     // see the end of VSMain.
     float4x4 prevWorld;
+};
+
+// Per-view constants (byte-for-byte ViewConstants). view/projection/prevViewProjection keep their old names, so
+// the shader body is unchanged by the split; camera position and velocity params are still read from SceneLights.
+cbuffer ViewConstants : register(b8)
+{
+    float4x4 view;
+    float4x4 projection;
     float4x4 prevViewProjection;
+    float4 viewCameraPos;
+    float4 viewVelocityParams;
+    float4 viewParams0;
+    float4 viewReserved0;
 };
 
 // Legacy bone-matrix CBV (kept for compatibility binding; both regular and instanced skinned paths now use t6 StructuredBuffer)
@@ -994,7 +1071,8 @@ cbuffer SceneLights : register(b1)
     float4 irradianceSH9[9];
     // 2-4 DDGI clause 10 (starting at offset 1104):
     // giParams0=probeGridMin.xyz/spacing,
-    // giParams1=gridXYZ(as float)/GiIntensity, giParams2=normalBias/chebyshev/atlasReady/_.
+    // giParams1=gridXYZ(as float)/GiIntensity(blend weight, never a scale on probeIrr),
+    // giParams2=normalBias/chebyshev/atlasReady/fadeBandCells.
     float4 giParams0;
     float4 giParams1;
     float4 giParams2;
@@ -1030,6 +1108,9 @@ cbuffer SceneLights : register(b1)
     // When the LUT has not been built or the tier is disabled, the CPU writes all zero
     // (see FrameSchedule.AerialLutTexture), so zero-residue semantics apply here as well.
     float4 apParams0;
+    float4 weatherParams0;
+    float4 weatherParams1;
+    float4 weatherRegions[64];
 };
 
 #if SHADOW_PASS
@@ -1443,6 +1524,27 @@ Texture2D cloudNoise : register(t14);
 // wrapped by the octave lattice count), while wind offset can push uv outside [0,1].
 // Using s0 Clamp instead would stretch the outermost column into a stationary stripe in the sky.
 SamplerState wrapSampler : register(s2);
+float4 WeatherH(int i) { return i==0?weatherParams0:weatherParams1; }
+float4 WeatherR(int i,int row) { return weatherRegions[i*8+row]; }
+float4 WeatherNoise(float2 uv) { return cloudNoise.SampleLevel(wrapSampler,uv,0.0); }
+" + Season.Rendering.Effects.WeatherShaders.CommonHlsl
+  + Season.Rendering.Effects.WeatherShaders.CloudHlsl
+  + Season.Rendering.Effects.WeatherShaders.RainHlsl + @"
+float4 ApplySceneFog(float4 color, float3 worldPos) {
+#if FOG_SAMPLING
+    [branch] if(fogParams.y > 0.5) {
+        float3 ray=worldPos-cameraPos.xyz; float distance=length(ray);
+        float4 rain=WeatherRain(cameraPos.xyz,ray/max(distance,1e-8),distance);
+        color.rgb=color.rgb*rain.w+rain.rgb;
+    }
+    [branch] if(fogParams.x > 0.5) {
+        float4 fog = FogAtWorld(worldPos);
+        // 当前材质 PSO 使用 straight alpha，混合阶段统一乘 alpha。
+        color.rgb = color.rgb * fog.w + fog.rgb;
+    }
+#endif
+    return color;
+}
 
 // 2-5 Step E: aerial-perspective froxel volume (t15, 32^3 rgba16float: rgb=accumulated in-scattered
 // radiance from the camera to that distance in linear HDR, a=accumulated opacity). This is the only
@@ -1477,7 +1579,9 @@ float3 EvaluateIrradianceSH9(float3 n)
 // simply divides by atlas size).
 // worldPos is offset along the normal by giParams2.x (normalBias), then the 8 neighboring probes are
 // blended with trilinear weights multiplied by cosine-direction weights. linearSampler bilinearly samples
-// the octahedral core of each probe, with the gutter absorbing seam spill. The result is scaled by GiIntensity.
+// the octahedral core of each probe, with the gutter absorbing seam spill. The result replaces the SH9/ambient
+// term as a blend, and giParams1.w is the weight of that blend rather than a scale on the probe value: see the return
+// statement for why the difference matters.
 // From Step 3 onward, when giParams2.y>0.5, each probe also runs a Chebyshev variance test using the
 // depth-moment atlas, multiplying visibility into the weight to suppress light leakage through wall cracks,
 // contact regions, and back faces. From Step 5 onward, invalid probes with tile alpha<0.5
@@ -1508,18 +1612,26 @@ float3 SampleProbeIrradiance(float3 worldPos, float3 N, float3 fallback)
     float3 base = floor(gc);
     float3 f = gc - base;
 
-    // 2-4 clause 9: fade back to fallback outside the probe volume. gc is in probe-index units, so trilinear
+    // 2-4 clause 9: fade the probe contribution out beyond the last probe row. gc is in probe-index units, so trilinear
     // interpolation is only defined over [0, dims-1]; past that the clamp below collapses all eight corners onto a
     // single boundary probe, which hands a distant surface one near-camera probe's irradiance as if it were its own.
     // That reads as a whole surface lit uniformly by an unrelated probe, wobbling with that probe's amortized R2 ray
     // rotation and hysteresis rather than with anything in the scene, and it is the only lighting a face turned away
     // from every light has. The grid is camera-centred and re-snapped every frame in Ddgi.Record, so this covers
-    // everything past GiVolumeSize/2, not just distant scenery. Fading across the one spacing beyond the last probe
-    // keeps the edge from popping as the volume slides with the camera - within that band the clamped probe is still
-    // the nearest one, no further away than an interior interpolation reaches - and past it the result is exactly the
-    // pre-DDGI 1-7/1-2 diffuse term.
+    // everything past GiVolumeSize/2, not just distant scenery.
+    // Three decisions here, about the seam rather than its silhouette:
+    // 1. The band is giParams2.w cells wide, not one. One cell of linear ramp is already a hard-edged ring: it breaks the
+    //    gradient at both ends, and once the interior and the exterior differ by any amount that ring is what the eye
+    //    locks onto while the volume slides with the camera. Widen it and curve it - s(t)=t*t*(3-2t) is C1 at both ends.
+    // 2. The metric stays the axis-aligned max of the per-axis excess, not a radial length. A round band would only
+    //    redraw the same seam as a circle, because the shape is not what makes it visible - the step in the blend at the
+    //    end of this function is. Clauses 9/13 remove that step, so the band has nothing left to outline.
+    // 3. The fade never moves the result to a *different* amount of light: both ends settle on fallback, and an
+    //    unoccluded interior produces fallback term for term as well, so inside the band the two sides agree exactly.
     float3 outside = max(max(-gc, gc - (dims - 1.0)), 0.0);
-    float boundsFade = saturate(1.0 - max(max(outside.x, outside.y), outside.z));
+    float band = max(giParams2.w, 1.0);
+    float boundsFade = saturate(1.0 - max(max(outside.x, outside.y), outside.z) / band);
+    boundsFade = boundsFade * boundsFade * (3.0 - 2.0 * boundsFade);
 
     float3 sum = float3(0.0, 0.0, 0.0);
     float wsum = 0.0;
@@ -1563,14 +1675,23 @@ float3 SampleProbeIrradiance(float3 worldPos, float3 N, float3 fallback)
         sum += ddgiAtlas.SampleLevel(linearSampler, uv, 0).rgb * w;
         wsum += w;
     }
-    // Step 5: wsum/wraw is the fraction of this shading point's interpolation weight that lands on valid probes.
-    // Use it to linearly blend between probe irradiance and fallback
-    // (= the diffuse term that would be used without DDGI, either SH9 or constant ambient).
-    // If all 8 neighbors are invalid, including the zero-initialized atlas before the first update,
-    // the result naturally falls back to pure fallback, with a continuous transition and no threshold jumps or flicker.
+    // Step 5 + clause 9 energy contract. wsum/wraw is the fraction of this shading point's interpolation weight that
+    // lands on valid probes; boundsFade is the coverage envelope; giParams1.w is how much of the probe field's deviation
+    // from the environment the application wants to show. All three scale the *blend*, never the probe value:
+    //     result = lerp(fallback, probeIrr, valid * boundsFade * GiIntensity)
+    // That distinction is the whole of clause 9. A probe stores irradiance in the same units as EvaluateIrradianceSH9:
+    // a ray that misses multiplies the same SH radiance coefficients by the same cosine kernel the surface samples them
+    // with, and the update divides by the accumulated cosine weight, so the quotient is E(n)/pi. In an unoccluded, empty
+    // volume probeIrr therefore equals fallback term for term. Scaling probeIrr would turn any gain into a uniform
+    // brightness step between the inside and the outside of a camera-following box - at GiIntensity 0.4 the interior
+    // sits at 40% of the exterior, which in an ambient-only frame is the entire visible difference. Scaling the blend
+    // instead leaves that case identical for every gain, applies the same gain to real occlusion (probeIrr < fallback)
+    // and to real bounce (probeIrr > fallback), and still returns pure fallback at gain 0.
+    // If all 8 neighbors are invalid, including the zero-initialized atlas before the first update, wsum is zero and the
+    // result is pure fallback with a continuous transition and no threshold jumps or flicker.
     float3 probeIrr = wsum > 1e-6 ? sum / wsum : float3(0.0, 0.0, 0.0);
     float vfrac = saturate(wsum / max(wraw, 1e-6)) * boundsFade;
-    return lerp(fallback, probeIrr * giParams1.w, vfrac);
+    return lerp(fallback, probeIrr, vfrac * giParams1.w);
 }
 #endif
 
@@ -2212,12 +2333,31 @@ float ComputeCloudShadow(float3 worldPos, float3 toLight)
 // Therefore the velocity path uses an entry-point out parameter (SV_Target1). PSMain remains the entry point,
 // keeping the multi-exit tolerance, and outVelocity is definitely assigned before any early return,
 // so there is no uninitialized warning.
-#if VELOCITY_OUTPUT
+//
+// A0.2 contract clause 3: the normal output follows the same rule as a second out parameter (SV_Target2). It is zeroed
+// at entry like outVelocity, so Text / Sky / Sprite exits leave the cleared value, and written once on the PBR path after
+// the normal map and the Toksvig correction have settled N and roughness.
+#if NORMAL_OUTPUT
+// Octahedral encoding (Cigolle et al. 2014) of a unit vector into [-1,1]^2. Single exit and branch-free so it can be called
+// from PSMain without X4000; N is unit length, so the L1 norm is at least 1 and the division is safe.
+float2 OctEncodeNormal(float3 n)
+{
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    float2 s = float2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return n.z >= 0.0 ? n.xy : (1.0 - abs(n.yx)) * s;
+}
+#endif
+#if NORMAL_OUTPUT
+float4 PSMain(PSInput input, out float2 outVelocity : SV_Target1, out float4 outNormal : SV_Target2) : SV_Target0
+#elif VELOCITY_OUTPUT
 float4 PSMain(PSInput input, out float2 outVelocity : SV_Target1) : SV_Target0
 #else
 float4 PSMain(PSInput input) : SV_TARGET
 #endif
 {
+#if NORMAL_OUTPUT
+    outNormal = float4(0, 0, 0, 0);
+#endif
 #if VELOCITY_OUTPUT
     // 2-3 contract clause 5: this must be unconditionally initialized before any early return.
     // cur is reconstructed from SV_Position back to NDC and then de-jittered by subtracting this frame's jitter.
@@ -2327,6 +2467,7 @@ float4 PSMain(PSInput input) : SV_TARGET
         // involve implicit derivatives.
         [branch] if (cloudParams0.w > 0.0 && skyDir.y > 0.0)
             skyRadiance = CloudComposite(skyRadiance, skyDir, cameraPos.xz * 0.001);
+        skyRadiance = WeatherCloudComposite(skyRadiance, cameraPos.xyz, skyDir, skyParams0.xyz);
 #if HDR_CHAIN
         // The LUT already stores linear HDR radiance, so output it directly and let the
         // FinalBlit exposure + ACES + gamma chain close it out (1-4 contract).
@@ -2473,6 +2614,12 @@ float4 PSMain(PSInput input) : SV_TARGET
         //return float4(debug, 1.0);
     }
 
+#if NORMAL_OUTPUT
+    // A0.2 contract clause 2: world-space shading normal (after the normal map) and the roughness the lobe is actually
+    // evaluated with (after Toksvig), so SSR and decals see the same surface the lighting below does.
+    outNormal = float4(OctEncodeNormal(N), roughness, metallic);
+#endif
+
     // Compute the view direction
     float3 V = normalize(cameraPos.xyz - input.worldPos);
 
@@ -2508,7 +2655,7 @@ float4 PSMain(PSInput input) : SV_TARGET
             // cloud shadows do not consume atlas quadrants and are not restricted to a single light.
             // This is deliberately not gated by SHADOW_ENABLED: that switch controls the CSM/shadow atlas,
             // while cloud shadows are independent of the atlas and should remain visible even when CSM is disabled.
-            radiance *= ComputeCloudShadow(input.worldPos, L);
+            radiance *= ComputeCloudShadow(input.worldPos, L) * WeatherCloudShadow(input.worldPos, L);
         }
         else
         {
@@ -2558,8 +2705,8 @@ float4 PSMain(PSInput input) : SV_TARGET
     // Without it, metals would always be washed out by ambient light. At constant 0.1 this is subtle, but once
     // 1-7 SH9 landed with DC~=0.45, metallic=1 surfaces would turn into solid white blobs.
     // 2-4 contract clause 9: diffuse has three mutually exclusive choices, never additive. When DDGI is ready
-    // and GiIntensity>0, probe irradiance replaces the SH9/constant-ambient either-or result; otherwise the
-    // path fully falls back to 1-7/1-2. The specular term is unchanged.
+    // and GiIntensity>0, probe irradiance is blended over the SH9/constant-ambient either-or result by that weight;
+    // otherwise the path is exactly 1-7/1-2. The specular term is unchanged.
     // Clause 13: the probe side continuously blends back to giDiffuse based on validity, so giDiffuse also
     // serves as the Step 5 fallback.
     float3 envDiffuse = EvaluateIrradianceSH9(N) * envParams.y;
@@ -2755,6 +2902,8 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         var velocityBlend = defaultRenderTargetBlend;
         velocityBlend.RenderTargetWriteMask = (byte)(mode == PipelineMode.Opaque ? ColorWriteEnable.All : 0);
         var slot1Blend = velocityOutput ? velocityBlend : rtBlend;
+        // A0.2 contract clause 3: the normal slot shares velocity's rule - never blended, write mask 0 outside Opaque.
+        var slot2Blend = normalOutput ? velocityBlend : rtBlend;
 
         GraphicsPipelineStateDesc psoDesc = new GraphicsPipelineStateDesc
         {
@@ -2787,7 +2936,7 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
                 {
                     [0] = rtBlend,
                     [1] = slot1Blend,
-                    [2] = rtBlend,
+                    [2] = slot2Blend,
                     [3] = rtBlend,
                     [4] = rtBlend,
                     [5] = rtBlend,
@@ -2810,7 +2959,7 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
             },
             SampleMask = uint.MaxValue,
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle,
-            NumRenderTargets = shadowPass ? 0u : (velocityOutput ? 2u : 1u),
+            NumRenderTargets = shadowPass ? 0u : (normalOutput ? 3u : (velocityOutput ? 2u : 1u)),
             SampleDesc = (overlay || shadowPass || outlineMask) ? new SampleDesc(count: 1, quality: 0) : new SampleDesc(count: sampleCount, quality: sampleQuality),
         };
         if (shadowPass)
@@ -2842,6 +2991,9 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
             // 2-3 contract clause 2: slot 1 = SceneVelocity (rg16float), matching Device.ToNativeColorFormat
             if (velocityOutput)
                 psoDesc.RTVFormats[1] = Format.FormatR16G16Float;
+            // A0.2 contract clause 2: slot 2 = SceneNormal (rgba16float)
+            if (normalOutput)
+                psoDesc.RTVFormats[2] = Format.FormatR16G16B16A16Float;
             psoDesc.DSVFormat = DirectX.Device.DepthBufferFormat;
         }
 
@@ -2942,7 +3094,8 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         command->SetGraphicsRootShaderResourceView(FogFrameRoot, DefaultInstanceBoneBuffer->GetGPUVirtualAddress());
         command->SetGraphicsRootDescriptorTable(FogIntegratedRoot, dummy.GpuDescriptorHandle);
         command->SetGraphicsRootDescriptorTable(FogLocalRoot, dummy.GpuDescriptorHandle);
-        var parameters = Vector4.Zero;
+        var parameters = new Vector4(0, Device.ActivePassId == RenderPassId.SceneTransparent
+            && FrameSchedule.WeatherComposited ? 1 : 0, 0, 0);
         command->SetGraphicsRoot32BitConstants(FogParamsRoot, 4, &parameters, 0);
     }
 
@@ -2992,6 +3145,7 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
 
         int fi = (int)Device.FrameIndex;
         cmdList->SetGraphicsRootConstantBufferView(0, matrixBuffer->GetGPUVirtualAddress());
+        cmdList->SetGraphicsRootConstantBufferView(ViewConstantsRoot, ActiveViewGpuAddress);
         cmdList->SetGraphicsRootConstantBufferView(1, lightConstantBuffer->GetGPUVirtualAddress());
         cmdList->SetGraphicsRootConstantBufferView(2, primitiveData.MaterialBuffers[fi]->GetGPUVirtualAddress());
         cmdList->SetGraphicsRootConstantBufferView(11, DefaultTextDrawParamsGpuAddress);
@@ -3031,9 +3185,10 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
     }
 
     // 精灵与文字也使用完整场景 Shader；合成切换根签名后不能依赖上一次图元的残留绑定。
-    internal static void BindQuadSceneResources()
+    internal static void BindQuadSceneResources(ulong view)
     {
         var command = Device.GraphicsCommandList;
+        command->SetGraphicsRootConstantBufferView(ViewConstantsRoot, view);
         command->SetGraphicsRootConstantBufferView(8, DefaultTextDrawParamsGpuAddress);
         command->SetGraphicsRootDescriptorTable(9, DefaultMorphDeltasSrvHandle);
         command->SetGraphicsRootDescriptorTable(10, DefaultInstanceBoneSrvHandle);
@@ -3047,7 +3202,11 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
     {
         var arena = DXSceneDrawCollection.Arena;
         var cmd = Device.GraphicsCommandList;
-        if (FrameSchedule.ShadowMap is DXRenderTarget shadow && shadow.Depth != null)
+        // P3 ShadowPolicy.Off: this view renders without the frame-wide atlas. Binding the 1x1 white fallback is a
+        // complete substitute: white stores depth 1.0, so no receiver ever compares as occluded and the shading comes
+        // out unshadowed even though the (shared) lighting snapshot still carries the main view's shadow matrices.
+        if (FrameSchedule.ActiveShadowPolicy != ViewShadowPolicy.Off
+            && FrameSchedule.ShadowMap is DXRenderTarget shadow && shadow.Depth != null)
         {
             shadow.TransitionDepthTo(cmd, ResourceStates.AllShaderResource);
             draw.Textures[12] = arena.CaptureView(shadow.Depth, new ShaderResourceViewDesc {
@@ -3075,8 +3234,10 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         var cmdList = Device.GraphicsCommandList;
         Device.White.EnsureReadyForRendering(cmdList);
         // 阴影未注册时也绑定合法哨兵，阴影参数为零时不会采样。
+        // P3 ShadowPolicy.Off: a view that opted out of shadows binds the 1x1 white fallback instead of the atlas.
         cmdList->SetGraphicsRootDescriptorTable(12,
-            FrameSchedule.ShadowMap is DXRenderTarget shadowRT && shadowRT.GpuSrvHandle.Ptr != 0
+            FrameSchedule.ActiveShadowPolicy != ViewShadowPolicy.Off
+                && FrameSchedule.ShadowMap is DXRenderTarget shadowRT && shadowRT.GpuSrvHandle.Ptr != 0
                 ? shadowRT.GpuSrvHandle : Device.White.GpuDescriptorHandle);
 
         // 1-7: environment radiance cube (t11). The shader statically references envCube, so this table must
@@ -3140,6 +3301,8 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         cmdList->SetPipelineState(ShadowPipelineState);
         cmdList->IASetPrimitiveTopology(D3DPrimitiveTopology.D3DPrimitiveTopologyTrianglelist);
         cmdList->SetGraphicsRootConstantBufferView(11, DefaultTextDrawParamsGpuAddress);
+        // The shadow VS projects with b5, but the root signature stays complete with the main view bound.
+        cmdList->SetGraphicsRootConstantBufferView(ViewConstantsRoot, MainViewGpuAddress);
     }
 
     /// <summary>

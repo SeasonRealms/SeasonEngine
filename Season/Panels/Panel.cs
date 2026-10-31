@@ -251,6 +251,10 @@ public abstract class Panel : BaseControl, IRenderOrder
         if (Alpha <= 0f)
             return;
 
+        // P3: a panel that the executing view cannot see drops its entire subtree, not just its own draw.
+        if (!VisibleInCurrentView(this))
+            return;
+
         if (Season.Rendering.FrameSchedule.SceneCollectionActive && renderDomain == Season.Controls.RenderDomain.Scene)
         {
             CollectScene(inheritedDomain, Layer, Order);
@@ -268,7 +272,8 @@ public abstract class Panel : BaseControl, IRenderOrder
             {
                 var control = Controls[i];
 
-                if (control.Alpha > 0 && ResolveControlRenderDomain(control, effectiveDomain) == renderDomain)
+                if (control.Alpha > 0 && VisibleInCurrentView(control)
+                    && ResolveControlRenderDomain(control, effectiveDomain) == renderDomain)
                 {
                     int layer = 0;
                     int order = 0;
@@ -299,7 +304,7 @@ public abstract class Panel : BaseControl, IRenderOrder
             {
                 var panel = Panels[i];
 
-                if (panel.Alpha > 0f)
+                if (panel.Alpha > 0f && VisibleInCurrentView(panel))
                 {
                     int layer = 0;
                     int order = 0;
@@ -323,6 +328,19 @@ public abstract class Panel : BaseControl, IRenderOrder
         }
     }
 
+    // P3 layer culling: the executing view's mask decides whether a control (or a whole panel subtree) is drawn at
+    // all. Outside a view the mask is all ones, so every existing single-view traversal is unchanged.
+    static bool VisibleInCurrentView(BaseControl control)
+        => Season.Rendering.RenderView.IsLayerVisible(control.CullLayer);
+
+    // The leaf list is typed IControl, and a leaf that is not a BaseControl has no layer of its own, so it counts as
+    // layer 0: visible to every view that still draws anything. Panels do not implement IControl on purpose, which is
+    // why this is an overload rather than one wider parameter.
+    static bool VisibleInCurrentView(IControl control)
+        => control is BaseControl baseControl
+            ? VisibleInCurrentView(baseControl)
+            : Season.Rendering.RenderView.IsLayerVisible(0u);
+
     // 收集只调用一次叶子 Draw；材质分类与深度排序由后端图元队列完成。
     // 复用成员列表固定本次成员与显式优先级，不在回放时访问控件或容器。
     void CollectScene(Season.Controls.RenderDomain inheritedDomain, int layer, int order)
@@ -338,7 +356,8 @@ public abstract class Panel : BaseControl, IRenderOrder
             for (int i = 0; i < Controls.Count; i++)
             {
                 var control = Controls[i];
-                if (control.Alpha <= 0 || ResolveControlRenderDomain(control, effectiveDomain) != Season.Controls.RenderDomain.Scene)
+                if (control.Alpha <= 0 || !VisibleInCurrentView(control)
+                    || ResolveControlRenderDomain(control, effectiveDomain) != Season.Controls.RenderDomain.Scene)
                     continue;
                 var sorting = control as IRenderOrder;
                 controls.Add(new ControlItem(control, sorting?.Layer ?? 0, sorting?.Order ?? 0, i, false, 0));
@@ -346,7 +365,7 @@ public abstract class Panel : BaseControl, IRenderOrder
             for (int i = 0; i < Panels.Count; i++)
             {
                 var panel = Panels[i];
-                if (panel.Alpha > 0)
+                if (panel.Alpha > 0 && VisibleInCurrentView(panel))
                     panels.Add(new PanelItem(panel, panel.Layer, panel.Order, i, false, 0));
             }
             controls.Sort(ControlItemComparer.Instance);
@@ -386,6 +405,9 @@ public abstract class Panel : BaseControl, IRenderOrder
         if (Alpha <= 0f)
             return;
 
+        if (!VisibleInCurrentView(this))
+            return;
+
         var effectiveDomain = ResolveRenderDomain(inheritedDomain);
 
         if (Controls.Count > 0)
@@ -394,7 +416,8 @@ public abstract class Panel : BaseControl, IRenderOrder
             for (int i = 0; i < count; i++)
             {
                 var control = Controls[i];
-                if (control.Alpha > 0 && ResolveControlRenderDomain(control, effectiveDomain) == Season.Controls.RenderDomain.Scene)
+                if (control.Alpha > 0 && VisibleInCurrentView(control)
+                    && ResolveControlRenderDomain(control, effectiveDomain) == Season.Controls.RenderDomain.Scene)
                     control.DrawShadow();
             }
         }
@@ -405,7 +428,7 @@ public abstract class Panel : BaseControl, IRenderOrder
             for (int i = 0; i < count; i++)
             {
                 var panel = Panels[i];
-                if (panel.Alpha > 0f)
+                if (panel.Alpha > 0f && VisibleInCurrentView(panel))
                     panel.DrawShadow(effectiveDomain);
             }
         }

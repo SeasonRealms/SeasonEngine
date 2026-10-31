@@ -101,9 +101,9 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
     /// Phase 4 clones the template animation data (nodes / skins / animations)
     /// and creates the bone-matrix buffer.
     /// </summary>
-    public void Load(DXModel template, Season.Controls.Model model, Season.Basic.Camera camera)
+    public void Load(DXModel template, Season.Controls.Model model)
     {
-        CreateSharedMatrixBuffers(camera);
+        CreateSharedMatrixBuffers();
 
         // Step 1: clone the template animation data
         // (node tree, skins, animations)
@@ -864,12 +864,9 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(DXPrimitiveGroup.Camera.View),
-            Projection = Matrix4x4.Transpose(DXPrimitiveGroup.Camera.Projection),
             // 2-3 Step C (tier C-a): previous per-instance world matrices now
             // live in the prev instance-world SB (t9), so b0.PrevWorld stays all
             // zero. The instanced shader path does not read b0 prevWorld.
-            PrevViewProjection = Matrix4x4.Transpose(DXPrimitiveGroup.Camera.PrevViewProjection),
         };
         Unsafe.Write(_mappedMatrixBuffers[fi], matrices);
 
@@ -1146,19 +1143,7 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
 
     static float ComputeTransparentDepth(Matrix4x4 world, Vector3 localCenter)
     {
-        var center = Vector3.Transform(localCenter, world);
-
-        var app = DeviceServices.BaseApp;
-        if (app == null)
-            return center.Z;
-
-        var forward = app.CameraTarget - app.CameraPos;
-        if (forward.LengthSquared() < 1e-6f)
-            forward = Vector3.UnitZ;
-        else
-            forward = Vector3.Normalize(forward);
-
-        return Vector3.Dot(center - app.CameraPos, forward);
+        return RenderView.SortDepth(Vector3.Transform(localCenter, world));
     }
 
     /// <summary>

@@ -17,7 +17,7 @@ internal unsafe struct DXSceneDrawCommand : ISceneDrawCommand
     internal bool DepthWrite, Indexed;
     internal VertexBufferView Vertex, Instances;
     internal IndexBufferView Indices;
-    internal ulong Matrix, Light, Material, Bones, Text;
+    internal ulong Matrix, View, Light, Material, Bones, Text;
     internal uint Count, InstanceCount, StartInstance, BoneBase;
 
     public void Draw()
@@ -28,6 +28,7 @@ internal unsafe struct DXSceneDrawCommand : ISceneDrawCommand
         var vertices = stackalloc VertexBufferView[2] { Vertex, Instances };
         cmd->IASetVertexBuffers(0, 2, vertices);
         cmd->SetGraphicsRootConstantBufferView(0, Matrix);
+        cmd->SetGraphicsRootConstantBufferView(Pipeline.ViewConstantsRoot, View);
         cmd->SetGraphicsRootConstantBufferView(1, Light);
         cmd->SetGraphicsRootConstantBufferView(2, Material);
         cmd->SetGraphicsRootConstantBufferView(8, Bones);
@@ -183,14 +184,7 @@ internal unsafe sealed class DXSceneDrawCollection
     }
 
     internal static float Depth(Vector3 center, Matrix4x4 world)
-    {
-        var point = Vector3.Transform(center, world);
-        var app = DeviceServices.BaseApp;
-        if (app == null) return point.Z;
-        var forward = app.CameraTarget - app.CameraPos;
-        forward = forward.LengthSquared() < 1e-6f ? Vector3.UnitZ : Vector3.Normalize(forward);
-        return Vector3.Dot(point - app.CameraPos, forward);
-    }
+        => RenderView.SortDepth(Vector3.Transform(center, world));
 
     internal void Add(in DXSceneDrawCommand command, float depth)
         => _queue.Add(command, command.Mode != PipelineMode.Opaque, FrameSchedule.SceneDrawOrder.Current, depth);
@@ -203,6 +197,7 @@ internal unsafe sealed class DXSceneDrawCollection
         var draw = State;
         int fi = (int)Device.FrameIndex;
         draw.Matrix = ConstantRef(matrix);
+        draw.View = ConstantRef(Pipeline.ActiveViewConstantBuffer);
         draw.Light = ConstantRef(light);
         draw.Material = ConstantRef(primitive.MaterialBuffers[fi]);
         var geometry = primitive.SharedGeometrySource ?? primitive;
@@ -240,11 +235,12 @@ internal unsafe sealed class DXSceneDrawCollection
         }
     }
 
-    internal void CaptureQuad(ID3D12Resource* vertex, VertexBufferView view, ID3D12Resource* matrix,
+    internal void CaptureQuad(ID3D12Resource* vertex, VertexBufferView view, ID3D12Resource* matrix, bool screenSpace,
         ID3D12Resource* material, DXTexture albedo, DXTexture? normal, DXTexture? metallic, DXTexture? occlusion, DXTexture? emissive)
     {
         var draw = new DXSceneDrawCommand { Mode = PipelineMode.Transparent, Cull = PipelineCullVariant.Back,
             Matrix = Constant(matrix, (uint)sizeof(MatrixBuffer)), Material = Constant(material, (uint)sizeof(MaterialParams)),
+            View = screenSpace ? Pipeline.ScreenViewGpuAddress : ConstantRef(Pipeline.ActiveViewConstantBuffer),
             Light = Constant(DXPrimitiveGroup.lightConstantBuffers[Device.FrameIndex], (uint)sizeof(SceneLightParams)),
             Bones = Pipeline.DefaultTextDrawParamsGpuAddress, Text = Pipeline.DefaultTextDrawParamsGpuAddress,
             Vertex = Vertex(vertex, view), Instances = Pipeline.IdentityInstanceBufferView, Count = 6, InstanceCount = 1 };
@@ -259,6 +255,7 @@ internal unsafe sealed class DXSceneDrawCollection
     {
         var draw = new DXSceneDrawCommand { Mode = PipelineMode.Transparent, Cull = PipelineCullVariant.None,
             Matrix = Constant(matrix, (uint)sizeof(MatrixBuffer)), Material = Pipeline.DefaultTextMaterialGpuAddress,
+            View = Pipeline.ScreenViewGpuAddress,
             Light = Constant(DXPrimitiveGroup.lightConstantBuffers[Device.FrameIndex], (uint)sizeof(SceneLightParams)),
             Bones = Pipeline.DefaultTextDrawParamsGpuAddress,
             Text = Arena.CaptureBytes(MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref Unsafe.AsRef(in parameters), 1))).GpuAddress,

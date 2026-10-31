@@ -67,6 +67,11 @@ public sealed class BloomEffect : ComputeEffect
 
     public override ComputePhase Phase => ComputePhase.AfterScene;
 
+    /// <summary>Per view: the chain is built from one view's resolved scene color and published for that view's
+    /// composite. Command order guarantees view N's chain is recorded before view N+1 touches the shared names.</summary>
+    public override ComputeScope Scope => ComputeScope.View;
+    public override ViewFeature RequiredFeature => ViewFeature.Bloom;
+
     static string DownName(int i) => TextureNamePrefix + "down" + i;
 
     static string UpName(int i) => TextureNamePrefix + "up" + i;

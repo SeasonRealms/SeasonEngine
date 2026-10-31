@@ -13,16 +13,16 @@ internal sealed class MTLInstancedMesh3D : MTLInstancedPrimitiveGroup
     {
     }
 
-    public void Load(Season.Controls.InstancedMesh3D mesh, Camera camera, Func<Season.Controls.Surface, TextureSlot, MTLTexture> resolveTexture)
+    public void Load(Season.Controls.InstancedMesh3D mesh, Func<Season.Controls.Surface, TextureSlot, MTLTexture> resolveTexture)
     {
         foreach (var surface in mesh.Surfaces)
-            _primitives.Add(CreatePrimitiveData(surface, resolveTexture, camera));
+            _primitives.Add(CreatePrimitiveData(surface, resolveTexture));
 
         RebuildPrimitiveBuckets();
         SyncAlpha(mesh.Alpha);
     }
 
-    PrimitiveData CreatePrimitiveData(Season.Controls.Surface surface, Func<Season.Controls.Surface, TextureSlot, MTLTexture> resolveTexture, Camera camera)
+    PrimitiveData CreatePrimitiveData(Season.Controls.Surface surface, Func<Season.Controls.Surface, TextureSlot, MTLTexture> resolveTexture)
     {
         var localBounds = Season.Rendering.Bounds3D.FromVertices(surface.Vertices);
         var p = new PrimitiveData
@@ -44,11 +44,8 @@ internal sealed class MTLInstancedMesh3D : MTLInstancedPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(camera.View),
-            Projection = Matrix4x4.Transpose(camera.Projection),
             // Contract clause 8(d) of 2-3:
             // PrevWorld in b0 stays all zeros on the instanced path because history comes from the double-buffered instance stream.
-            PrevViewProjection = Matrix4x4.Transpose(camera.PrevViewProjection),
         };
         for (int i = 0; i < Device.frameCount; i++)
             WriteStruct(p.MatrixBuffers[i], matrices);
@@ -247,13 +244,10 @@ internal sealed class MTLInstancedMesh3D : MTLInstancedPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(Camera.View),
-            Projection = Matrix4x4.Transpose(Camera.Projection),
             // Contract clause 8(d) of 2-3:
             // PrevWorld in b0 remains all zeros because per-instance history on the instanced path
             // comes from the opposite side of the double-buffered instance stream at VS buffer 9,
             // not from b0.
-            PrevViewProjection = Matrix4x4.Transpose(Camera.PrevViewProjection),
         };
         foreach (var primitive in _primitives)
             WriteStruct(primitive.MatrixBuffers[fi], matrices);

@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 // https://github.com/SeasonRealms/SeasonEngine
 
+using Season.Rendering.Effects;
+
 namespace Engine;
 
 internal enum Mode
@@ -44,6 +46,16 @@ internal class App : BaseApp
     // for the diagnostics row in the settings panel (grid size, history weight), which is the one place that needs to
     // report what was actually built rather than what was asked for.
     internal Season.Rendering.Effects.VolumetricFogEffect fogEffect;
+
+    // 后端拒绝 compute/indirect 时为空；晴天不会提交原先无区域约束的演示粒子。
+    internal WeatherPrecipitationEffect precipitation;
+
+    internal WeatherController weather;
+    readonly WeatherVisualState weatherVisuals = new();
+    WeatherCurtainEffect weatherCurtain;
+
+    // 最后一次同步给天气场的房间内腔；房间被缩放或移动后才会重建遮挡区域记录。
+    Vector3 weatherCoverMin, weatherCoverMax;
 
     internal Ground ground;
 
@@ -123,6 +135,8 @@ internal class App : BaseApp
 
     internal Room room;
 
+    internal Pond pond;
+
     internal Robots robots;
 
     internal Birds birds;
@@ -142,6 +156,12 @@ internal class App : BaseApp
     internal List<Mesh3D> meshes = new List<Mesh3D>();
 
     internal Views views;
+
+    // P3 acceptance: two secondary views over this scene - a rear-view mirror and a minimap - drawn into their own
+    // fixed-size attachments and displayed as ordinary overlay sprites. Created once in Create so both view slots and
+    // their published textures live for the whole session; a backend that declines them leaves this null and the app
+    // keeps its single-view look.
+    internal RearViews mirrors;
 
     Setting setting;
     internal SettingPanel settingPanel;
@@ -209,6 +229,8 @@ internal class App : BaseApp
         // then copied back here once the final default is chosen.
         // Only the sample default is overridden; the engine-level DefaultAerialIntensity remains 1.
         RenderQuality.DefaultAerialIntensity = 12f;
+        RenderQuality.DefaultRegionalWeather = OperatingSystem.IsAndroid() || OperatingSystem.IsIOS() || OperatingSystem.IsBrowser()
+            ? RegionalWeatherQuality.Low : RegionalWeatherQuality.High;
 
         // Volumetric fog is a tier, so the decision has to happen here: this constructor runs before platform graphics
         // initialization, and RequiresFogSceneDepth is what makes the backends allocate SceneDepth for it and what makes
@@ -222,6 +244,11 @@ internal class App : BaseApp
         RenderQuality.DefaultVolumetricFog = OperatingSystem.IsAndroid() || OperatingSystem.IsBrowser()
             ? FogQuality.Low
             : FogQuality.Medium;
+
+        // D1 贴花同样是初始化期档位：它决定后端要不要为贴花把场景打散成不透明/透明两段，也决定
+        // SceneDepth 会不会被补出来 —— 两件事都无法在运行期补救，所以在这里开。
+        // 没有这个开关时贴花只是数据，不会出现在画面上。
+        RenderQuality.DefaultDecals = true;
 
         ResetCamera();
     }
@@ -374,6 +401,16 @@ internal class App : BaseApp
 
         }
 
+        // A0.2 first acceptance: register NormalViewEffect.
+        // In AfterScene it downsamples full-resolution SceneNormal into a 480x270 world-normal (or roughness/metallic) view.
+        // SceneNormals Off, or velocity dropped during initialization (which drops the normals with it), degrades gracefully
+        // at registration time. Acceptance criteria are documented in NormalViewEffect.
+        if (Season.Rendering.FrameSchedule.RegisterCompute(
+                Season.Basic.Graphics.Instance, new Season.Rendering.Effects.NormalViewEffect()))
+        {
+
+        }
+
         // 1-8 acceptance: register Sdf3DViewEffect.
         // In FrameStart it runs a three-dispatch chain that covers 3D texture read/write,
         // the R16Float format, 4x4x4 and 64x1x1 workgroups, and four constant-buffer expansions in UpdateStorageBuffer.
@@ -428,6 +465,20 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             // and nothing holds it.
             fogEffect = null;
         }
+
+        // 第二阶段：区域雨雪替换无约束演示；仍作为最后一层透明间接绘制，不改动旧天空或树林雾。
+        // 每区域桌面预算为雨 8192 / 雪 4096，移动端及 Web 减半，晴天和远离窗口的系统不派发。
+        precipitation = new WeatherPrecipitationEffect(weather.Field,
+            OperatingSystem.IsAndroid() || OperatingSystem.IsIOS() || OperatingSystem.IsBrowser());
+        if (!FrameSchedule.RegisterCompute(Season.Basic.Graphics.Instance, precipitation))
+            precipitation = null;
+        weatherCurtain = new WeatherCurtainEffect();
+        if (!FrameSchedule.RegisterCompute(Season.Basic.Graphics.Instance, weatherCurtain))
+            weatherCurtain = null;
+
+        // D1: 屏幕空间贴花。它不在 Compute 相位里，而是一个固定位置的独立 Pass（雾合成之前），
+        // 所以注册顺序与上面的相位无关；后端没有实现时这里返回 false 并留下零残留。
+        Season.Rendering.FrameSchedule.RegisterDecals(Season.Basic.Graphics.Instance);
     }
 
     /// <summary>
@@ -467,6 +518,9 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     {
         base.Create();
 
+        weather = new WeatherController(WorldSettings.Current);
+        FrameSchedule.WeatherVisuals = weatherVisuals;
+        RequestSaveSettings();
         RegisterEffects();
 
         var musics = new string[] { @"Musics/Cozy.wav", @"Musics/Forest.wav", @"Musics/Sweel.wav" };
@@ -556,6 +610,17 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         room.Depth = 12;
         AddPanel(room);
 
+        // Raised pond on the open grass southeast of the spawn: water test bed for the normal target, SSR, refraction,
+        // and depth absorption. PosY stays at the grass, the rim top is 0.5m and the water surface 0.4m above it,
+        // and the steps face north toward the spawn. See Pond.cs.
+        pond = new Pond();
+        pond.PosX = 14;
+        pond.PosY = 0;
+        pond.PosZ = -12;
+        AddPanel(pond);
+
+        CreatePondDecals();
+
         robots = new Robots();
         // Robots contains Sprite3D controls that use the Transparent pipeline and do not write depth,
         // so correct occlusion depends on draw order.
@@ -567,6 +632,12 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
 
         birds = new Birds();
         AddPanel(birds);
+
+        // P3 acceptance: the island scene's two extra cameras. Created here because platform initialization has already
+        // registered the main view's offscreen attachments, so the mirror can copy its SceneColor format and MRT shape.
+        // Its slots therefore exist before the first frame and the sensor textures do not appear a frame late.
+        mirrors = new RearViews();
+        AddPanel(mirrors);
 
         //billboard = new Billboard();
         //AddPanel(billboard);
@@ -665,6 +736,9 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // Unloaded controls with zero boxes are skipped automatically, so registration can happen before assets are ready.
         collider = new PlayerCollider();
         collider.Room = room;
+        // The pond rim and steps are walkable surfaces rather than obstacles: PlayerCollider lifts the player onto them,
+        // refuses rises above one step, and keeps the footprint out of the water. See PlayerCollider.RetractLedge.
+        collider.Pond = pond;
         collider.Obstacles.Add(ball.model);
         collider.Obstacles.Add(ball.bee);
         collider.Obstacles.Add(streetLight.lightsPunctualLamp);
@@ -774,6 +848,33 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         });
     }
 
+    /// <summary>
+    /// 把房间内腔交给天气场作为遮挡区域。降水区先消耗覆盖权重，因此室内棱柱内雨雪归零，
+    /// 纵向只到天花板，屋顶以上仍按自身区域降水。
+    /// </summary>
+    void RefreshWeatherCover()
+    {
+        if (weather == null || room == null) return;
+        var (min, max) = room.InteriorBounds;
+        if (min == weatherCoverMin && max == weatherCoverMax) return;
+        weatherCoverMin = min;
+        weatherCoverMax = max;
+        float halfX = (max.X - min.X) * 0.5f, halfZ = (max.Z - min.Z) * 0.5f;
+        float centerX = (min.X + max.X) * 0.5f, centerZ = (min.Z + max.Z) * 0.5f;
+        // 房间是方形、屋顶是双坡，内切椭圆会漏掉四角；这里用外接圆加过渡带，沿对角恰好盖住墙角，
+        // 于是墙外只多出半个屋檐宽的干燥带，看上去就是屋檐本身的雨影。
+        float corner = MathF.Sqrt(halfX * halfX + halfZ * halfZ);
+        float feather = MathF.Max(1f, MathF.Max(halfX, halfZ) * 0.2f);
+        weather.Cover = new WeatherRegionSettings
+        {
+            Id = "room-cover", Weather = WeatherKind.Clear, Shelter = true,
+            CenterX = centerX, CenterZ = centerZ, RadiusX = corner + feather, RadiusZ = corner + feather,
+            EdgeFeather = feather, Bottom = min.Y, Top = max.Y,
+            // 云范围收到亚米级：遮挡区只压制雨雪，不能在天上的云层里开洞。
+            CloudRadiusX = 0.001f, CloudRadiusZ = 0.001f, CloudBase = 0,
+        };
+    }
+
     public override bool Update(float time, float? alpha = null, float? posX = null, float? posY = null, float? width = null, float? height = null, float? posZ = null, float? depth = null)
     {
         base.Update(time, alpha: alpha, posX: posX, posY: posY, width: width, height: height);
@@ -786,6 +887,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             painting?.Alpha = 0f;
             picker?.Alpha = 0f;
             views?.Alpha = 0f;
+            mirrors?.Alpha = 0f;
         }
         else if (Mode is Mode.Play)
         {
@@ -795,6 +897,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             painting?.Alpha = 0f;
             picker?.Alpha = 0f;
             views?.Alpha = 0f;
+            mirrors?.Alpha = 1f;
         }
         else if (Mode is Mode.Edit)
         {
@@ -804,6 +907,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             painting?.Alpha = 1f;
             picker?.Alpha = 1f;
             views?.Alpha = 0f;
+            mirrors?.Alpha = 1f;
 
             Time -= time;
         }
@@ -815,6 +919,21 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             painting?.Alpha = 0f;
             picker?.Alpha = 1f;
             views?.Alpha = 1f;
+            mirrors?.Alpha = 1f;
+        }
+
+        // 在所有面板早退前消费请求，打开设置也能预览天气。time 本身是帧秒数，与昼夜倍率无关。
+        RefreshWeatherCover();
+        if (weather?.Update(WorldSettings.Current, time) == true)
+            RequestSaveSettings();
+        celestial?.UpdateWeatherBackground();
+        bool regionalWeather = WorldSettings.Current.WeatherMode != WeatherMode.Showcase;
+        if (weather != null) weatherVisuals.Update(weather.Field, time, regionalWeather, Camera.Far);
+        if (precipitation != null)
+        {
+            precipitation.Enabled = regionalWeather;
+            DayNightCycle.Evaluate(celestial?.DayPhase ?? 0, out _, out float daylight, out _, out _, out _, out _);
+            precipitation.Advance(time, daylight);
         }
 
         if (settingPanel != null)
@@ -960,6 +1079,11 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
 
         views?.Update(time);
 
+        // The two extra cameras read the main camera's pose from the drag block above, so they track a mouse look in the
+        // same frame. Their own sprites and picking also run here, before the clickable panels below get a chance to
+        // consume the release that a click inside a sensor needs.
+        mirrors?.Update(time);
+
         setting?.Update(time);
 
         direction?.Update(time);
@@ -1018,6 +1142,8 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
 
         room?.Update(time);
 
+        pond?.Update(time);
+
         sphere?.Update(time);
 
         meshes?.ForEach(me =>
@@ -1032,6 +1158,16 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         //debugPanel?.Update(time);
 
         return false;
+    }
+
+    public override void Dispose()
+    {
+        if (IsDisposed) return;
+        if (ReferenceEquals(FrameSchedule.WeatherVisuals, weatherVisuals)) FrameSchedule.WeatherVisuals = null;
+        if (weatherCurtain != null) FrameSchedule.UnregisterCompute(weatherCurtain);
+        if (precipitation != null) FrameSchedule.UnregisterCompute(precipitation);
+        Dispose(true);
+        base.Dispose();
     }
 
     protected void Dispose(bool disposing)
@@ -1064,6 +1200,62 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     void OnVideoPlaybackEnded()
     {
         System.Diagnostics.Debug.WriteLine("Video playback ended.");
+    }
+
+    /// <summary>
+    /// D1 贴花演示（s2 验证）：三块贴花全部不写纹理，靠像素着色器里的程序化图案工作，
+    /// 因此这里的验收不依赖任何资源，只看三件事：
+    /// 1) 图案跟着草地/台阶起伏 —— 深度重建正确；
+    /// 2) 从侧面看图案不往池沿侧壁上拉丝 —— 掠射淡出生效；
+    /// 3) 池底那块 Additive 被水面盖住却不被水染 —— 贴花排在透明之前。
+    /// 后续 s3 接纹理时把 Texture 填上名字即可，其余参数不用改。
+    /// </summary>
+    void CreatePondDecals()
+    {
+        // 池外西北侧的湿草：Modulate 且写粗糙度（水洼），这是 s9 的验证点。
+        var wetGrass = new Season.Rendering.DecalVolume
+        {
+            Mode = Season.Rendering.DecalMode.Modulate,
+            Position = new(9f, 0.02f, -16f),
+            Size = new(10f, 0.06f, 8f),
+            Tint = new(0.55f, 0.60f, 0.62f),
+            Opacity = 0.9f,
+            AngleFade = 0f,
+            EdgeFade = 0.35f,
+            AffectRoughness = true,
+            Roughness = 0.04f,
+            SortOrder = 0,
+        };
+        Decals.Add(wetGrass);
+
+        // 北侧池沿顶面的苔藓：只调制颜色，盒子很薄，好看出掠射淡出。
+        var moss = new Season.Rendering.DecalVolume
+        {
+            Mode = Season.Rendering.DecalMode.Modulate,
+            Position = new(14f, 0.53f, -7f),
+            Size = new(9f, 0.06f, 1.6f),
+            Tint = new(0.36f, 0.52f, 0.30f),
+            Opacity = 0.85f,
+            AngleFade = 0.25f,
+            EdgeFade = 0.2f,
+            SortOrder = 1,
+        };
+        Decals.Add(moss);
+
+        // 池底的焦散：Additive，透明度 0.35 的池水会盖在它上面，同时验证“贴花在透明之前”。
+        var caustics = new Season.Rendering.DecalVolume
+        {
+            Mode = Season.Rendering.DecalMode.Additive,
+            Position = new(14f, 0.03f, -12f),
+            Size = new(9f, 0.06f, 7.2f),
+            Tint = new(0.30f, 0.55f, 0.62f),
+            Opacity = 0.55f,
+            AngleFade = 0.1f,
+            EdgeFade = 0.45f,
+            Intensity = 1.2f,
+            SortOrder = 2,
+        };
+        Decals.Add(caustics);
     }
 
 }

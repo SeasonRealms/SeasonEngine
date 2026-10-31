@@ -136,6 +136,10 @@ fn CloudSample(uv: vec2f) -> vec4f {
     } }
     return n;
 }
+fn WeatherH(i: i32) -> vec4f { var h=F(u32(118+i)); if(i==0 && F(16u).w<0.5) { h.y=0.0; } return h; }
+fn WeatherR(i: i32,row: i32) -> vec4f { return F(u32(120+i*8+row)); }
+fn WeatherNoise(uv: vec2f) -> vec4f { return CloudSample(uv); }
+""" + WeatherShaders.CommonWgsl + WeatherShaders.CloudWgsl + """
 fn CloudShadow(p: vec3f,l: vec3f) -> f32 {
     var tau=0.0;
     if(F(16u).w>0.5 && F(116u).x>0 && l.y>0) {
@@ -147,7 +151,7 @@ fn CloudShadow(p: vec3f,l: vec3f) -> f32 {
             d*=Sat(1.0-b.w*0.5*(n.y+n.z)); tau+=d*a.w*a.y*invY;
         }
     }
-    return 1.0-F(116u).x*Sat(1.0-exp(-tau));
+    return (1.0-F(116u).x*Sat(1.0-exp(-tau)))*WeatherCloudShadow(p,l);
 }
 fn ShadowTile(p: vec3f,matrixIndex: u32,tile: i32) -> f32 {
     let clip=Transform(vec4f(p,1),matrixIndex); var result=1.0;
@@ -190,7 +194,7 @@ fn Visibility(p: vec3f,depth: f32,light: i32) -> f32 {
         var sigma=density.x*exp(-density.z*max(p.y-density.y,0.0))*Noise(windP,F(12u).w,density.w);
         var scattering=F(12u).xyz*sigma; var exclusion=1.0;
         for(var i=0u;i<min(u32(F(13u).w),32u);i++) {
-            let base=128u+i*8u; let local=Transform(vec4f(p,1),base).xyz; let shape=F(base+5u); let medium=F(base+4u);
+            let base=192u+i*8u; let local=Transform(vec4f(p,1),base).xyz; let shape=F(base+5u); let medium=F(base+4u);
             let r=select(max(abs(local.x),max(abs(local.y),abs(local.z))),length(local),shape.x>0.5);
             let edge=Sat((1.0-r)/max(shape.z,1e-6)); let weight=select(0.0,edge*edge*(3.0-2.0*edge),r<1);
             if(shape.y>0.5) { exclusion*=1.0-weight; }

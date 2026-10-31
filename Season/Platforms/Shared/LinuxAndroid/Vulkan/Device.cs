@@ -605,8 +605,8 @@ internal unsafe static class Device
         if (!pickedFeatures.IndependentBlend)
         {
             RenderQuality.Current.MotionVectors = false;
-            if (RenderQuality.Current.AntiAliasing == AaMode.Taa)
-                RenderQuality.Current.AntiAliasing = HdrSceneColor ? AaMode.Fxaa : AaMode.Off;
+            if (RenderQuality.Current.EffectiveAntiAliasing == AaMode.Taa)
+                RenderQuality.Current.EffectiveAntiAliasing = HdrSceneColor ? AaMode.Fxaa : AaMode.Off;
             DeviceServices.BaseApp?.AddLog(LogType.Backend, "Vulkan independentBlend unavailable; velocity/TAA disabled.");
         }
 
@@ -916,6 +916,18 @@ internal unsafe static class Device
     /// <summary>用于独立全屏管线核对实际输出附件；仅在当前 Pass 内有效。</summary>
     internal static VKRenderTarget? ActiveColorTarget;
 
+    /// <summary>本 Pass 真正绑成深度附件的显式深度 RT，没有显式深度时为 null，与 DX Device.ActiveDepthTarget 同语义。
+    /// 侧路管线据此确认准备期看到的深度语义没有变。</summary>
+    internal static VKRenderTarget? ActiveDepthTarget;
+
+    /// <summary>本 Pass 真正绑成颜色附件 1 的速度 RT，单目标形状时为 null。
+    /// 在 Pass 内自行录制绘制的侧路管线必须烘出附件数匹配的 PSO，而它们准备期持有的 PassDesc 不足以推断这一点：
+    /// 显式深度缺席时三目标分支根本不会走到，速度槽也就不存在。</summary>
+    internal static VKRenderTarget? ActiveVelocityTarget;
+
+    /// <summary>A0.2：本 Pass 真正绑成颜色附件 2 的法线 RT，只在速度也成为附件时才可能非空。侧路管线据此烘四附件 PSO。</summary>
+    internal static VKRenderTarget? ActiveNormalTarget;
+
     // Pending texture layout transitions.
     // When requested inside a render pass they are queued here and drained outside passes during the next frame.
     // Accessed only by the render thread.
@@ -1180,6 +1192,7 @@ internal unsafe static class Device
         "SceneOpaque\0"u8.ToArray(),
         "FogComposite\0"u8.ToArray(),
         "SceneTransparent\0"u8.ToArray(),
+        "WeatherComposite\0"u8.ToArray(),
     ];
 
     internal static void PushDebugGroup(byte[] utf8LabelZ)
@@ -1331,7 +1344,7 @@ internal unsafe static class Device
     // 每个附件组合及 Load/Store 意图各有缓存；同帧切换雾合成目标不能销毁前一阶段的 framebuffer。
     // RT 在 Resize/Dispose 之前主动失效缓存，不依赖可复用的原生 view 句柄。
     readonly record struct ScenePassKey(VKRenderTarget Color, VKRenderTarget? Depth,
-        VKRenderTarget? Velocity, bool ClearColor, bool ClearDepth, bool StoreDepth);
+        VKRenderTarget? Velocity, VKRenderTarget? Normal, bool ClearColor, bool ClearDepth, bool StoreDepth);
     static readonly Dictionary<ScenePassKey, (RenderPass Pass, Framebuffer Framebuffer)> _sceneTargetPasses = new();
 
     // -- Phase 4: Outline2D mask pass, with mask RT color=BackbufferCompatible plus shared SceneDepth.
@@ -1488,6 +1501,12 @@ internal unsafe static class Device
         uint attachmentCount;
         bool hasVelocity = desc.VelocityTarget is VKRenderTarget;
         var target = (desc.ColorTarget ?? desc.DepthTarget) as VKRenderTarget;
+        // 这两个字段记录的是“真的成了附件”，而不是 PassDesc 请求了什么：
+        // 下面只有三目标分支会把速度绑成颜色附件 1。
+        ActiveDepthTarget = null;
+        ActiveVelocityTarget = null;
+        ActiveNormalTarget = null;
+        var normalTarget = hasVelocity ? desc.NormalTarget as VKRenderTarget : null;
         if (desc.Id == Season.Rendering.RenderPassId.OutlineMask)
         {
             // Phase 4:
@@ -1501,6 +1520,7 @@ internal unsafe static class Device
             {
                 renderPass = EnsureOutlineMaskPass(maskRT, depthRT);
                 framebuffer = _outlineMaskFramebuffer;
+                ActiveDepthTarget = depthRT;
             }
             else
             {
@@ -1522,18 +1542,23 @@ internal unsafe static class Device
             extent = new Extent2D(maskRT.Width, maskRT.Height);
             attachmentCount = 2u;
         }
-        else if (desc.ColorTarget is VKRenderTarget compositeRT && desc.Id == Season.Rendering.RenderPassId.FogComposite)
+        else if (desc.ColorTarget is VKRenderTarget compositeRT
+            && desc.Id is Season.Rendering.RenderPassId.FogComposite or Season.Rendering.RenderPassId.WeatherComposite)
         {
-            (renderPass, framebuffer) = EnsureSceneTargetPass(compositeRT, null, null, true, false, false);
+            (renderPass, framebuffer) = EnsureSceneTargetPass(compositeRT, null, null, null, true, false, false);
             extent = new Extent2D(compositeRT.Width, compositeRT.Height);
             attachmentCount = 1;
         }
         else if (desc.ColorTarget is VKRenderTarget colorRT && desc.DepthTarget is VKRenderTarget depthRT)
         {
             (renderPass, framebuffer) = EnsureSceneTargetPass(colorRT, depthRT,
-                desc.VelocityTarget as VKRenderTarget, desc.ClearColorEnable, desc.ClearDepthEnable, desc.StoreDepth);
+                desc.VelocityTarget as VKRenderTarget, normalTarget,
+                desc.ClearColorEnable, desc.ClearDepthEnable, desc.StoreDepth);
             extent = new Extent2D(colorRT.Width, colorRT.Height);
-            attachmentCount = hasVelocity ? 3u : 2u;
+            attachmentCount = hasVelocity ? (normalTarget != null ? 4u : 3u) : 2u;
+            ActiveDepthTarget = depthRT;
+            ActiveVelocityTarget = desc.VelocityTarget as VKRenderTarget;
+            ActiveNormalTarget = normalTarget;
         }
         else if (target != null)
         {
@@ -1541,6 +1566,9 @@ internal unsafe static class Device
             framebuffer = target.Framebuffer;
             extent = new Extent2D(target.Width, target.Height);
             attachmentCount = 2u; // color + depth
+            // 颜色缺席时 target 就是那张深度图（Shadow），它确实是本 Pass 的深度附件；
+            // 否则用的是该 RT 自带的隐式深度，没有显式深度 RT 可记。
+            if (desc.ColorTarget == null) ActiveDepthTarget = target;
         }
         else
         {
@@ -1563,7 +1591,8 @@ internal unsafe static class Device
         // 2-3:
         // the triple-target render pass has 3 attachments, color, velocity, and depth, so it needs 3 clear values.
         // Velocity is always cleared to zero, meaning pixels not covered by geometry are treated as a static background.
-        var clearValues = stackalloc ClearValue[3];
+        // A0.2: the four-target shape inserts the normal attachment at index 2, also cleared to zero.
+        var clearValues = stackalloc ClearValue[4];
         uint clearCount;
         if (depthOnly)
         {
@@ -1574,8 +1603,11 @@ internal unsafe static class Device
         {
             clearValues[0] = new ClearValue { Color = new ClearColorValue(cc.X, cc.Y, cc.Z, cc.W) };
             clearValues[1] = new ClearValue { Color = new ClearColorValue(0f, 0f, 0f, 0f) };
-            clearValues[2] = new ClearValue { DepthStencil = new ClearDepthStencilValue(1f, 0) };
-            clearCount = 3u;
+            uint depthIndex = 2u;
+            if (attachmentCount == 4u)
+                clearValues[depthIndex++] = new ClearValue { Color = new ClearColorValue(0f, 0f, 0f, 0f) };
+            clearValues[depthIndex] = new ClearValue { DepthStencil = new ClearDepthStencilValue(1f, 0) };
+            clearCount = depthIndex + 1;
         }
         else
         {
@@ -1612,29 +1644,34 @@ internal unsafe static class Device
     }
 
     static (RenderPass, Framebuffer) EnsureSceneTargetPass(VKRenderTarget color, VKRenderTarget? depth,
-        VKRenderTarget? velocity, bool clearColor, bool clearDepth, bool storeDepth)
+        VKRenderTarget? velocity, VKRenderTarget? normal, bool clearColor, bool clearDepth, bool storeDepth)
     {
         if (color.ColorView.Handle == 0 || color.Width == 0 || color.Height == 0
             || (depth != null && (depth.DepthView.Handle == 0 || depth.Width != color.Width || depth.Height != color.Height))
             || (velocity != null && (depth == null || velocity.ColorView.Handle == 0
                 || velocity.Width != color.Width || velocity.Height != color.Height
-                || velocity.ColorFormat != Format.R16G16Sfloat)))
+                || velocity.ColorFormat != Format.R16G16Sfloat))
+            || (normal != null && (velocity == null || normal.ColorView.Handle == 0
+                || normal.Width != color.Width || normal.Height != color.Height
+                || normal.ColorFormat != Format.R16G16B16A16Sfloat)))
             throw new InvalidOperationException("场景附件无效或尺寸/格式不匹配。");
 
-        var key = new ScenePassKey(color, depth, velocity, clearColor, clearDepth, storeDepth);
+        var key = new ScenePassKey(color, depth, velocity, normal, clearColor, clearDepth, storeDepth);
         if (_sceneTargetPasses.TryGetValue(key, out var cached)) return cached;
         var rp = depth == null
             ? VKRenderTarget.CreateColorRenderPassForFormat(color.ColorFormat, colorOnly: true)
             : velocity != null
-                ? VKRenderTarget.CreateVelocityRenderPassForFormat(color.ColorFormat, clearColor, clearDepth, storeDepth)
+                ? VKRenderTarget.CreateVelocityRenderPassForFormat(color.ColorFormat, clearColor, clearDepth, storeDepth,
+                    withNormal: normal != null)
                 : VKRenderTarget.CreateDualTargetRenderPassForFormat(color.ColorFormat, clearColor, clearDepth, storeDepth);
         Framebuffer framebuffer = default;
         try
         {
-            var attachments = stackalloc Silk.NET.Vulkan.ImageView[3];
+            var attachments = stackalloc Silk.NET.Vulkan.ImageView[4];
             attachments[0] = color.ColorView;
             uint count = 1;
             if (velocity != null) attachments[count++] = velocity.ColorView;
+            if (normal != null) attachments[count++] = normal.ColorView;
             if (depth != null) attachments[count++] = depth.DepthView;
             var info = new FramebufferCreateInfo
             {
@@ -1666,7 +1703,7 @@ internal unsafe static class Device
         {
             var key = entry.Key;
             if (!ReferenceEquals(key.Color, target) && !ReferenceEquals(key.Depth, target)
-                && !ReferenceEquals(key.Velocity, target)) continue;
+                && !ReferenceEquals(key.Velocity, target) && !ReferenceEquals(key.Normal, target)) continue;
             _sceneTargetPasses.Remove(key);
             var (rp, fb) = entry.Value;
             var vk = Vk;
@@ -1774,6 +1811,9 @@ internal unsafe static class Device
         InRenderPass = false;
         ActivePassId = default;
         ActiveColorTarget = null;
+        ActiveDepthTarget = null;
+        ActiveVelocityTarget = null;
+        ActiveNormalTarget = null;
         PopDebugGroup();
     }
 

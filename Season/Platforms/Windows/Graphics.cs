@@ -16,6 +16,17 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public void DrawCollectedTransparent(bool sampleFog) => _sceneCollection.DrawTransparent(sampleFog);
     public void ReleaseSceneCollection() => _sceneCollection.Release();
 
+    public Season.Rendering.Effects.WeatherCompositePipeline? CreateWeatherCompositePipeline()
+    {
+        if (!ComputeSupported) return null;
+        try { return new(new DXFogCompositePipeline(DictionaryDXTexture, true)); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherComposite] 创建失败：{ex.Message}");
+            return null;
+        }
+    }
+
     public Season.Rendering.FogCompositePipeline? CreateFogCompositePipeline()
     {
         if (!ComputeSupported) return null;
@@ -23,6 +34,17 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         catch (Exception ex)
         {
             DeviceServices.BaseApp.AddLog(LogType.Error, $"[FogComposite] 创建失败：{ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>D1 屏幕空间贴花：只依赖图形阶段的深度采样，不需要 compute，所以没有 ComputeSupported 门控。</summary>
+    public Season.Rendering.DecalPipeline? CreateDecalPipeline()
+    {
+        try { return new DXDecalPipeline(); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] 创建失败：{ex.Message}");
             return null;
         }
     }
@@ -167,14 +189,17 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         DirectX.Device.White = DXTexture.GetOrCreate("White", null);
         ExecuteUpload();
 
+        // P3: the per-view constant upload is a frame-schedule hook rather than a camera-update side effect, so a
+        // secondary view is prepared at the point where its draws are about to be collected.
+        Season.Rendering.FrameSchedule.PrepareView = OnPrepareView;
+        Season.Rendering.FrameSchedule.AfterViews = OnAfterViews;
+
         // ── Shared draw resources for Text GPU Instancing ──
         _textMatrixBuffer = DirectX.Device.ResourceManager.CreateConstantBuffer(
             (uint)Unsafe.SizeOf<MatrixBuffer>(), out _mappedTextMatrixBuffer);
         var identityMatrix = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Identity,
-            Projection = Matrix4x4.Identity
         };
         Unsafe.Write(_mappedTextMatrixBuffer, identityMatrix);
 
@@ -184,6 +209,36 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             _textFrameResources[i].Init(drawParamsCapacity: 2048);
         }
     }
+
+    /// <summary>Uploads an offscreen view's constants and selects it for the draws that follow.</summary>
+    static void OnPrepareView(IGraphics g, Season.Rendering.RenderView view)
+    {
+        if (g is not Graphics) return;
+
+        DirectX.Pipeline.SetActiveView(view.Index);
+        if (view.Index == 0)
+        {
+            // The main view was already prepared (and its constants written) at the camera update point, before the
+            // shadow pass needed its cascades. Rewriting the same values keeps a harness that skips that update sane.
+            if (view.Prepared) DirectX.Pipeline.WriteViewConstants(0, view.Constants);
+            return;
+        }
+
+        // Secondary views render into a fixed-size offscreen target and are sampled 1:1 by a 2D control, so the desktop
+        // DPI compensation is deliberately not applied here: the control's layout already handles composition scaling,
+        // and compensating twice would shrink the view into the top-left corner of its own texture.
+        var targets = view.Targets;
+        float width = targets?.Width ?? 0u;
+        float height = targets?.Height ?? 0u;
+        if (width <= 0f || height <= 0f) return;
+
+        view.Prepare(width, height);
+        DirectX.Pipeline.WriteViewConstants(view.Index, view.Constants);
+    }
+
+    /// <summary>FrameSchedule.AfterViews hook: the view loop left the last secondary view selected, so put the main
+    /// view back before the Overlay pass binds anything of its own.</summary>
+    static void OnAfterViews(IGraphics g) => DirectX.Pipeline.ResetActiveView();
 
     internal void BeginTextFrame()
     {
@@ -426,8 +481,94 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             return DictionaryDXTexture.TryGetValue(name, out tex);
     }
 
-    public Season.Rendering.StorageBuffer CreateStorageBuffer(uint sizeInBytes)
-        => new DXStorageBuffer(sizeInBytes);
+    // ── P3 secondary views (contract in IGraphics) ──
+
+    /// <summary>
+    /// D3D12 renders a secondary view correctly only below Msaa4x: BeginPass routes every Scene pass through the
+    /// full-screen MsaaSceneRT when multisampling is on, which would silently ignore the view's own attachments.
+    /// Rather than rendering garbage, the tier declines the view and the app keeps its single-view look.
+    /// </summary>
+    public bool SecondaryViewSupported => DirectX.Device._msaaSampleCount <= 1;
+
+    /// <summary>
+    /// Publishes an offscreen target as a sampleable texture: a real <see cref="DXTexture"/> whose resource pointer and
+    /// SRV slot are borrowed from the target. Sprite2D then resolves the name through <see cref="LoadSprite2D"/> like any
+    /// other texture, so displaying a rendered view needs no new control type and no readback.
+    /// </summary>
+    public bool RegisterViewSurface(string name, Season.Rendering.RenderTarget target)
+    {
+        if (name.IsNullOrWhiteSpace() || target is not DXRenderTarget dxTarget) return false;
+        if (dxTarget.Color == null || dxTarget.SrvIndex < 0) return false;
+
+        lock (DictionaryDXTexture)
+        {
+            if (DictionaryDXTexture.TryGetValue(name, out var existing))
+            {
+                // Same target re-registered (resize, re-layout): keep the wrapper, its identity is what the controls hold.
+                if (existing != null && ReferenceEquals(existing.TargetSource, dxTarget)) return true;
+                // The name belongs to a real texture file: never steal it.
+                if (existing != null && existing.TargetSource == null) return false;
+                // A failed earlier load can leave a null entry behind; registering over it is the recovery path.
+                existing?.Dispose();
+                DictionaryDXTexture.Remove(name);
+            }
+
+            DictionaryDXTexture.Add(name, DXTexture.WrapRenderTarget(name, dxTarget));
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Drops a publication made by <see cref="RegisterViewSurface"/>. Only wrappers are removed: a name that resolves
+    /// to a real texture belongs to its loader and is left alone.
+    /// </summary>
+    public bool UnregisterViewSurface(string name)
+    {
+        if (name.IsNullOrWhiteSpace()) return false;
+        lock (DictionaryDXTexture)
+        {
+            if (!DictionaryDXTexture.TryGetValue(name, out var existing) || existing?.TargetSource == null) return false;
+            existing.Dispose();
+            return DictionaryDXTexture.Remove(name);
+        }
+    }
+
+    public Season.Rendering.StorageBuffer CreateStorageBuffer(uint sizeInBytes,
+        Season.Rendering.StorageBufferUsage usage = Season.Rendering.StorageBufferUsage.Compute)
+        => new DXStorageBuffer(sizeInBytes, usage);
+
+    // ── A0.1 间接绘制（契约在 IGraphics / Indirect.cs）──
+    // D3D12 是四端里唯一需要显式状态转换的：compute 写完后缓冲停在 UnorderedAccess，
+    // 而 ExecuteIndirect 要求 INDIRECT_ARGUMENT。转换只能在 Pass 外做，所以它单独成为一个入口，
+    // 而不是藏在提交里。回程（IndirectArgument -> UnorderedAccess）由 TryDispatchCompute 里的
+    // 门控 TransitionTo 自动完成，状态机因此跨帧自洽。
+
+    public bool IndirectDrawSupported => ComputeSupported;
+
+    public bool TryPrepareIndirectArgs(Season.Rendering.StorageBuffer buffer)
+    {
+        var cmd = DirectX.Device.GraphicsCommandList;
+        // ActiveTarget 非空即处于 Pass 内，此时录制 barrier 违反 PassDesc 契约，宁可放弃本帧间接提交。
+        if (cmd == null || DirectX.Device.ActiveTarget != null
+            || buffer is not DXStorageBuffer dxBuffer || dxBuffer.Resource == null
+            || dxBuffer.Usage != Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs
+            || dxBuffer.SizeInBytes < Season.Rendering.IndirectDrawIndexedArgs.SizeInBytes)
+            return false;
+        dxBuffer.TransitionTo(cmd, ResourceStates.IndirectArgument);
+        return true;
+    }
+
+    /// <summary>间接实例化四边形绘制管线。创建失败即返回 null，粒子效果据此整体不注册，画面退回改动前。</summary>
+    public Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline()
+    {
+        if (!IndirectDrawSupported || DirectX.Device.D3dDevice == null) return null;
+        try { return new DXParticleDrawPipeline(); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Particles] D3D12 管线创建失败：{ex.Message}");
+            return null;
+        }
+    }
 
     // ── 1-8 Compute 3D resource expansion (contract in IGraphics / Compute.cs) ──
     // 3D textures are registered by name in DXTexture3D's own static dictionary
@@ -1536,7 +1677,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
             // Set the pipeline (Transparent + DoubleSided -> no back-face culling).
             Pipeline.SetPipeline(PipelineMode.Transparent, doubleSided: true);
-            Pipeline.BindQuadSceneResources();
+            Pipeline.BindQuadSceneResources(Pipeline.ScreenViewGpuAddress);
 
             // Bind VB slot 0 (unit quad) + slot 1 (instance transforms).
             var vertexViews = stackalloc VertexBufferView[2];
@@ -1707,12 +1848,12 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             try
             {
                 var template = task.GetAwaiter().GetResult();
-                dxModel = template.CreateInstance(model, DXPrimitiveGroup.Camera);
+                dxModel = template.CreateInstance(model);
             }
             catch
             {
                 dxModel = new DXModel(model.Name);
-                dxModel.Load(model, DXPrimitiveGroup.Camera);
+                dxModel.Load(model);
             }
 
             lock (DictionaryModel)
@@ -1763,7 +1904,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         };
 
         var template = new DXModel(modelName);
-        template.Load(templateModel, DXPrimitiveGroup.Camera);
+        template.Load(templateModel);
         ExecuteUpload();
         return Task.FromResult(template);
     }
@@ -2035,12 +2176,15 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
                     ReplaceSpriteTexture(sprite.Name, dxSprite3D, source);
                 }
 
+                // Billboard orientation must be built from the view actually being rendered (not the legacy
+                // camera mirror), so a second view billboards toward its own camera.
+                var view = Season.Rendering.RenderView.Current;
                 dxSprite3D.Update(
                     new Vector3(sprite.PosX, sprite.PosY, sprite.PosZ),
                     new Vector2(sprite.Width ?? 1f, sprite.Height ?? 1f),
                     sprite.Rotation,
-                    DXPrimitiveGroup.Camera.View,
-                    DXPrimitiveGroup.Camera.Projection,
+                    view.View,
+                    view.RenderProjection,
                     sprite.Mode,
                     sprite.Color,
                     sprite.Alpha);
@@ -2349,7 +2493,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
         // 2. Construct DXMesh3D: resolve cached DXTexture per slot (fall back to solid color when missing).
         var dxMesh = new DXMesh3D(mesh.Name);
-        dxMesh.Load(mesh, DXPrimitiveGroup.Camera, BuildSurfaceTextureResolver(mesh.Name, mesh.ID, mesh.Surfaces));
+        dxMesh.Load(mesh, BuildSurfaceTextureResolver(mesh.Name, mesh.ID, mesh.Surfaces));
 
         // 3. Pixel sources have been consumed: clear each slot's Override (single-consumption contract).
         foreach (var surface in mesh.Surfaces)
@@ -2432,7 +2576,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         ExecuteUpload();
 
         var dxMesh = new DXInstancedMesh3D(mesh.Name);
-        dxMesh.Load(mesh, DXPrimitiveGroup.Camera, BuildSurfaceTextureResolver(mesh.Name, mesh.ID, mesh.Surfaces));
+        dxMesh.Load(mesh, BuildSurfaceTextureResolver(mesh.Name, mesh.ID, mesh.Surfaces));
 
         // Pixel sources have been consumed: clear each slot's Override (single-consumption contract).
         foreach (var surface in mesh.Surfaces)
@@ -2526,7 +2670,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             };
 
             var dxInstancedModel = new DXInstancedModel(model.ModelName);
-            dxInstancedModel.Load(template, wrapperModel, DXPrimitiveGroup.Camera);
+            dxInstancedModel.Load(template, wrapperModel);
 
             // v2 picking: inject the instantiated GltfAsset so the node tree, animation, and bone
             // palette share the same source as instanced rendering.
@@ -2961,6 +3105,15 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     /// finished in Post, so overrides only take effect in RenderPostPass.</summary>
     public void BlitToBackbuffer(Season.Rendering.RenderTarget src)
     {
+        // P3: a secondary view presents into its own LDR surface, and the bloom / AO / TAA-resolve publications resolved
+        // below are the main view's frame products. Compositing another view's history onto this one would show the
+        // main camera's bloom in the minimap (and its jittered resolve in the mirror), so that path stays plain.
+        if (!ReferenceEquals(Season.Rendering.FrameSchedule.ActiveTargets, Season.Rendering.FrameSchedule.PrimaryTargets))
+        {
+            DirectX.Device.BlitToBackbuffer(src);
+            return;
+        }
+
         if (ReferenceEquals(src, Season.Rendering.FrameSchedule.PostColor))
         {
             DirectX.Device.BlitToBackbuffer(src, null, RenderQuality.PostResolveFilter(),

@@ -69,13 +69,13 @@ internal unsafe class VKModel : VKPrimitiveGroup
         _asset.ProcessPrimitiveCallback = ProcessPrimitive;
     }
 
-    public void Load(Season.Controls.Model model, Season.Basic.Camera camera)
+    public void Load(Season.Controls.Model model)
     {
         // Animation querying/switching belongs to the glTF parsing domain and does not go through IGraphics:
         // inject the asset reference into the control in the direct-load path.
         model.Asset = _asset;
 
-        _asset.Load(model, camera);
+        _asset.Load(model);
         _asset.PlayAnimation();
 
         // Create the bone-matrix buffers
@@ -98,7 +98,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
         foreach (var p in all) AllocateAndWriteDescriptorSets(p);
     }
 
-    public VKModel CreateInstance(Season.Controls.Model model, Season.Basic.Camera camera)
+    public VKModel CreateInstance(Season.Controls.Model model)
     {
         if (_asset.Model != null)
         {
@@ -130,7 +130,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
 
         var nodeMap = new Dictionary<GltfNodeBase, GltfNodeBase>();
         foreach (var nodeBase in _asset.gltfNodes)
-            instance.EnsureClonedNode(nodeMap, nodeBase, model, camera);
+            instance.EnsureClonedNode(nodeMap, nodeBase, model);
 
         var skinMap = new Dictionary<GLTFSkin, GLTFSkin>();
         foreach (var sourceSkin in _asset.GetAllSkins())
@@ -143,13 +143,13 @@ internal unsafe class VKModel : VKPrimitiveGroup
             };
 
             foreach (var joint in sourceSkin.Joints)
-                instance.EnsureClonedNode(nodeMap, joint, model, camera);
+                instance.EnsureClonedNode(nodeMap, joint, model);
 
             if (sourceSkin.SkeletonRoot != null)
-                instance.EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model, camera);
+                instance.EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model);
 
             if (sourceSkin.BindNode != null)
-                instance.EnsureClonedNode(nodeMap, sourceSkin.BindNode, model, camera);
+                instance.EnsureClonedNode(nodeMap, sourceSkin.BindNode, model);
         }
 
         foreach (var animation in _asset._animations)
@@ -157,7 +157,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
             foreach (var channel in animation.Channels)
             {
                 if (channel.Target?.Node != null)
-                    instance.EnsureClonedNode(nodeMap, channel.Target.Node, model, camera);
+                    instance.EnsureClonedNode(nodeMap, channel.Target.Node, model);
             }
         }
 
@@ -165,7 +165,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
         {
             var sourceNode = nodeBase;
             var clonedNode = nodeMap[sourceNode];
-            clonedNode.Children = sourceNode.Children.Select(child => instance.EnsureClonedNode(nodeMap, child, model, camera)).ToList();
+            clonedNode.Children = sourceNode.Children.Select(child => instance.EnsureClonedNode(nodeMap, child, model)).ToList();
 
             if (sourceNode.Skin != null && skinMap.TryGetValue(sourceNode.Skin, out var clonedSkin))
                 clonedNode.Skin = clonedSkin;
@@ -175,9 +175,9 @@ internal unsafe class VKModel : VKPrimitiveGroup
         {
             var sourceSkin = pair.Key;
             var clonedSkin = pair.Value;
-            clonedSkin.Joints = sourceSkin.Joints.Select(joint => instance.EnsureClonedNode(nodeMap, joint, model, camera)).ToList();
-            clonedSkin.SkeletonRoot = sourceSkin.SkeletonRoot != null ? instance.EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model, camera) : null;
-            clonedSkin.BindNode = sourceSkin.BindNode != null ? instance.EnsureClonedNode(nodeMap, sourceSkin.BindNode, model, camera) : null;
+            clonedSkin.Joints = sourceSkin.Joints.Select(joint => instance.EnsureClonedNode(nodeMap, joint, model)).ToList();
+            clonedSkin.SkeletonRoot = sourceSkin.SkeletonRoot != null ? instance.EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model) : null;
+            clonedSkin.BindNode = sourceSkin.BindNode != null ? instance.EnsureClonedNode(nodeMap, sourceSkin.BindNode, model) : null;
         }
 
         instance._asset.gltfNodes = _asset.gltfNodes.Select(node => nodeMap[node]).ToList();
@@ -208,7 +208,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
         return instance;
     }
 
-    GltfNodeBase EnsureClonedNode(Dictionary<GltfNodeBase, GltfNodeBase> nodeMap, GltfNodeBase sourceNode, Season.Controls.Model model, Season.Basic.Camera camera)
+    GltfNodeBase EnsureClonedNode(Dictionary<GltfNodeBase, GltfNodeBase> nodeMap, GltfNodeBase sourceNode, Season.Controls.Model model)
     {
         if (nodeMap.TryGetValue(sourceNode, out var existing))
             return existing;
@@ -236,7 +236,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
             };
 
             foreach (var primitive in sourceVkNode.Primitives)
-                vkNode.Primitives.Add(ClonePrimitiveData(primitive, vkNode, model, camera));
+                vkNode.Primitives.Add(ClonePrimitiveData(primitive, vkNode, model));
 
             clonedNode = vkNode;
         }
@@ -266,7 +266,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
         return clonedNode;
     }
 
-    PrimitiveData ClonePrimitiveData(PrimitiveData source, GLTFNode ownerNode, Season.Controls.Model model, Season.Basic.Camera camera)
+    PrimitiveData ClonePrimitiveData(PrimitiveData source, GLTFNode ownerNode, Season.Controls.Model model)
     {
         var clone = new PrimitiveData
         {
@@ -317,8 +317,6 @@ internal unsafe class VKModel : VKPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(camera.View),
-            Projection = Matrix4x4.Transpose(camera.Projection)
         };
 
         for (int i = 0; i < Device.frameCount; i++)
@@ -523,15 +521,15 @@ internal unsafe class VKModel : VKPrimitiveGroup
         }
     }
 
-    void ProcessPrimitive(MeshPrimitive meshPrimitive, GltfNodeBase node, Season.Controls.Model model, Season.Basic.Camera camera)
+    void ProcessPrimitive(MeshPrimitive meshPrimitive, GltfNodeBase node, Season.Controls.Model model)
     {
-        var primitiveData = CreatePrimitiveData(meshPrimitive, node, model, camera);
+        var primitiveData = CreatePrimitiveData(meshPrimitive, node, model);
 
         var gltfNode = (GLTFNode)node;
         gltfNode.Primitives.Add(primitiveData);
     }
 
-    PrimitiveData CreatePrimitiveData(MeshPrimitive primitive, GltfNodeBase node, Season.Controls.Model model, Season.Basic.Camera camera)
+    PrimitiveData CreatePrimitiveData(MeshPrimitive primitive, GltfNodeBase node, Season.Controls.Model model)
     {
         var p = new PrimitiveData();
 
@@ -591,8 +589,6 @@ internal unsafe class VKModel : VKPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(camera.View),
-            Projection = Matrix4x4.Transpose(camera.Projection)
         };
         for (int i = 0; i < Device.frameCount; i++)
             Unsafe.Write(p.MappedMatrixBuffers[i], matrices);
@@ -888,7 +884,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
         }
     }
 
-    void ApplyUserTransformToNodeTree(GltfNodeBase nodeBase, Matrix4x4 userTransform, Season.Basic.Camera camera)
+    void ApplyUserTransformToNodeTree(GltfNodeBase nodeBase, Matrix4x4 userTransform)
     {
         // Apply the user transform to the current node
         var finalWorldMatrix = nodeBase.WorldTransform * userTransform;
@@ -901,12 +897,9 @@ internal unsafe class VKModel : VKPrimitiveGroup
             var matrices = new MatrixBuffer
             {
                 World = Matrix4x4.Transpose(finalWorldMatrix),
-                View = Matrix4x4.Transpose(camera.View),
-                Projection = Matrix4x4.Transpose(camera.Projection),
                 // 2-3 contract clause 6: history always comes from the CPU shadow copy
                 // (Transpose(all-zero) == all-zero, so the first frame naturally uses the unwritten sentinel)
                 PrevWorld = Matrix4x4.Transpose(primitive.PrevWorldMatrix),
-                PrevViewProjection = Matrix4x4.Transpose(camera.PrevViewProjection),
             };
             int fi = (int)Device.FrameIndex;
             Unsafe.Write(primitive.MappedMatrixBuffers[fi], matrices);
@@ -920,7 +913,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
         // Key point: recurse into child nodes and keep passing the same userTransform
         foreach (var child in nodeBase.Children)
         {
-            ApplyUserTransformToNodeTree(child, userTransform, camera);
+            ApplyUserTransformToNodeTree(child, userTransform);
         }
     }
 
@@ -942,7 +935,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
         var rootNodes = _asset._animationPlayer.GetRootNodes(_asset.gltfNodes);
 
         foreach (var rootNode in rootNodes)
-            ApplyUserTransformToNodeTree(rootNode, userTransform, Camera);
+            ApplyUserTransformToNodeTree(rootNode, userTransform);
 
         // Update bone matrices
         UploadBoneMatricesToGpu();

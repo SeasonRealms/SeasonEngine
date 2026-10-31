@@ -35,7 +35,7 @@ namespace Season.Rendering.Effects;
 /// sdfGather   [0] Params(volumeMin.xyz, voxelSize | resolution, proxyCount, far, _) 32B
 ///             [1] StorageBufferRead(proxies 4KB) [2] StorageTexture3DWrite(R16Float)
 /// probeUpdate [0] Params(probeGridMin/spacing, volumeMin/voxel, res/count/rays/steps,
-///                 hyst/normalBias/skyInt/frame, gridXYZ/divisor, extent/extent/backfaceHyst/validityOn,
+///                 hyst/normalBias/envDiffuse/frame, gridXYZ/divisor, extent/extent/backfaceHyst/validityOn,
 ///                 shadowSteps/bounceGain/punctualShadow/backfaceThr) 112B
 ///             [1] StorageBufferRead(proxies) [2] SampledTexture3D(sdf)
 ///             [3] StorageBufferRead(sh9 radiance 144B) [4] SampledTexture(previous irradiance atlas, texelLoad)
@@ -131,16 +131,16 @@ public sealed class DdgiEffect : ComputeEffect
     /// <summary>Snapshot of runtime DDGI knobs used for change detection and logging.</summary>
     readonly struct GiKnobSnapshot
     {
-        public readonly float Hyst, BackHyst, NormalBias, Intensity, Bounce, Threshold, Sky;
+        public readonly float Hyst, BackHyst, NormalBias, Intensity, Bounce, Threshold, EnvDiffuse;
         public readonly int Rays, MaxSteps, ShadowSteps, Divisor;
         public readonly bool Cheb, Punctual, Validity;
 
         public GiKnobSnapshot(float hyst, float backHyst, float normalBias, float intensity,
-            float bounce, float threshold, float sky, int rays, int maxSteps, int shadowSteps,
+            float bounce, float threshold, float envDiffuse, int rays, int maxSteps, int shadowSteps,
             int divisor, bool cheb, bool punctual, bool validity)
         {
             Hyst = hyst; BackHyst = backHyst; NormalBias = normalBias; Intensity = intensity;
-            Bounce = bounce; Threshold = threshold; Sky = sky;
+            Bounce = bounce; Threshold = threshold; EnvDiffuse = envDiffuse;
             Rays = rays; MaxSteps = maxSteps; ShadowSteps = shadowSteps; Divisor = divisor;
             Cheb = cheb; Punctual = punctual; Validity = validity;
         }
@@ -148,7 +148,7 @@ public sealed class DdgiEffect : ComputeEffect
         public bool Equals(in GiKnobSnapshot o) =>
             Hyst == o.Hyst && BackHyst == o.BackHyst && NormalBias == o.NormalBias &&
             Intensity == o.Intensity && Bounce == o.Bounce && Threshold == o.Threshold &&
-            Sky == o.Sky && Rays == o.Rays && MaxSteps == o.MaxSteps && ShadowSteps == o.ShadowSteps &&
+            EnvDiffuse == o.EnvDiffuse && Rays == o.Rays && MaxSteps == o.MaxSteps && ShadowSteps == o.ShadowSteps &&
             Divisor == o.Divisor && Cheb == o.Cheb && Punctual == o.Punctual && Validity == o.Validity;
 
         /// <summary>Captures a snapshot from GiSettings once per Record call without allocating.</summary>
@@ -159,7 +159,7 @@ public sealed class DdgiEffect : ComputeEffect
             q.GiIntensity,
             q.GiBounceGain,
             q.GiBackfaceThreshold,
-            DeviceServices.BaseApp?.SceneEnvironment?.SkyIntensity ?? 1f,
+            DeviceServices.BaseApp?.SceneEnvironment?.DiffuseIntensity ?? 1f,
             Math.Max(1, q.GiRaysPerProbe),
             q.GiTraceMaxSteps,
             Math.Max(1, q.GiShadowSteps),
@@ -241,6 +241,16 @@ public sealed class DdgiEffect : ComputeEffect
     /// <summary>True once DDGI has initialized and produced the first probe atlas.</summary>
     public static bool Ready => s_ready;
 
+    /// <summary>
+    /// 2-4 clause 9: width of the coverage fade band, in probe cells, handed to the consumer as giParams2.w.
+    /// A probe cell is <c>GiVolumeSize / GiProbeGridX</c> metres, so the default 32 m / 16 grid gives a 4 m band.
+    /// One cell was the original value and it is the wrong shape for a seam: a linear ramp of that length already breaks
+    /// the gradient at both ends, which is visible as a hard-edged ring while the volume slides with the camera. The band
+    /// only carries real difference after clause 9's energy fix, because an unoccluded interior now evaluates to exactly
+    /// the same value as the exterior, so this is about removing the last visible edge rather than about hiding a step.
+    /// </summary>
+    public const float FadeBandCells = 2f;
+
     /// <summary>Applies GiParams0/1/2 to SceneLightParams once the atlases are ready.</summary>
     public static void Apply(ref SceneLightParams lp)
     {
@@ -248,12 +258,16 @@ public sealed class DdgiEffect : ComputeEffect
             return;
         GiSettings q = GiSettings.Resolve();
         lp.GiParams0 = new Vector4(s_gridMin.X, s_gridMin.Y, s_gridMin.Z, s_spacing);
+        // .w is a blend weight between the pre-DDGI diffuse term and the probe result, not a multiplier on the probe
+        // result. Probe irradiance is stored in the same units as EvaluateIrradianceSH9 (E/pi), so scaling it would be a
+        // uniform brightness step across the whole camera-centred volume; scaling the blend leaves 0 as "no GI" and 1 as
+        // "full GI" while an unoccluded point stays at the same value for every setting in between.
         lp.GiParams1 = new Vector4(s_gx, s_gy, s_gz, q.GiIntensity);
         lp.GiParams2 = new Vector4(
             q.GiNormalBias,
             q.GiChebyshevOcclusion ? 1f : 0f,
             1f,   // atlasReady: s_ready guarantees a real atlas is bound this frame
-            0f);
+            FadeBandCells);
     }
 
     public override string Name => "ddgi";
@@ -423,6 +437,9 @@ public sealed class DdgiEffect : ComputeEffect
         if (dumpDdgi)
             GiProxies.DumpOnce = true;
 
+        // Keep the probe grid centered on the same snapped point as the SDF volume; spacing is isotropic = extent / gridX.
+        float spacing = extent / _gridX;
+
         // Proxy list: traverse the panel tree, clear the tail, and upload the full block outside any render pass.
         GiProxies.BeginCollect(min, snapped + half);
         GiProxies.Collect();
@@ -463,8 +480,7 @@ public sealed class DdgiEffect : ComputeEffect
         MemoryMarshal.Cast<byte, float>(lightBytes)[0] = packed;
         g.UpdateStorageBuffer(_lights!, lightBytes);
 
-        // Keep the probe grid centered on the same snapped point as the SDF volume; spacing is isotropic = extent / gridX.
-        float spacing = extent / _gridX;
+        // Probe grid origin, on the same snapped point as the SDF volume.
         var probeGridMin = snapped - new Vector3(_gridX * spacing, _gridY * spacing, _gridZ * spacing) * 0.5f;
 
         // 1) Gather: take the minimum proxy distance per voxel and write it into the R16Float volume.
@@ -496,7 +512,7 @@ public sealed class DdgiEffect : ComputeEffect
         up[0] = probeGridMin.X; up[1] = probeGridMin.Y; up[2] = probeGridMin.Z; up[3] = spacing;
         up[4] = min.X; up[5] = min.Y; up[6] = min.Z; up[7] = voxel;
         up[8] = _resolution; up[9] = GiProxies.Count; up[10] = rays; up[11] = q.GiTraceMaxSteps;
-        up[12] = q.GiHysteresis; up[13] = q.GiNormalBias; up[14] = env?.SkyIntensity ?? 1f; up[15] = _frame;
+        up[12] = q.GiHysteresis; up[13] = q.GiNormalBias; up[14] = env?.DiffuseIntensity ?? 1f; up[15] = _frame;
         up[16] = _gridX; up[17] = _gridY; up[18] = _gridZ; up[19] = Math.Max(1, q.GiProbeUpdateDivisor);
         up[20] = extent; up[21] = extent;
         // Step 5 independent controls (uExtent.z/.w, clause 13): validity EMA window and validity toggle.
@@ -525,7 +541,7 @@ public sealed class DdgiEffect : ComputeEffect
                 $"probes={_probeCount} res={_resolution} voxel={voxel:F3} rays={rays} maxSteps={q.GiTraceMaxSteps} " +
                 $"shadowSteps={q.GiShadowSteps}");
             dbg?.AddLog(LogType.GI, $"[Ddgi] hysteresis={q.GiHysteresis:F3} normalBias={q.GiNormalBias:F3} " +
-                $"skyIntensity={(env?.SkyIntensity ?? 1f):F2} GiIntensity={q.GiIntensity:F2} " +
+                $"envDiffuse={(env?.DiffuseIntensity ?? 1f):F2} GiIntensity={q.GiIntensity:F2} " +
                 $"chebyshev={q.GiChebyshevOcclusion} divisor={Math.Max(1, q.GiProbeUpdateDivisor)} " +
                 $"backfaceThr={q.GiBackfaceThreshold:F2} backfaceHyst={q.GiBackfaceHysteresis:F3} " +
                 $"validity={q.GiProbeValidity} bounce={q.GiBounceGain:F2} punctualShadow={q.GiPunctualShadow}");
@@ -1432,6 +1448,10 @@ void CSMain(uint3 gid : SV_GroupID, uint li : SV_GroupIndex)
             }
             p += dir * max(d, voxel * 0.5);
         }
+        // A miss is sky radiance, scaled by uAccum.z. That scale has to be the same knob the pixel side multiplies its
+        // own SH9 fallback by (envParams.y, i.e. DiffuseIntensity), not SkyIntensity: probe irradiance and the fallback
+        // are the same quantity (E/pi), so any difference between the two gains becomes a brightness step at the volume
+        // boundary, which is exactly the seam the consumer's clause 9 blend is meant to have nothing to hide.
         if (!hit)
             radiance = max(EvalSh(dir), 0.0) * uAccum.z;
         gRad[li] = radiance;
@@ -1833,6 +1853,8 @@ void main()
             }
             p += dir * max(d, voxel * 0.5);
         }
+        // Same knob as the pixel side's envParams.y (DiffuseIntensity); see the HLSL variant for why it must not be
+        // SkyIntensity.
         if (!hit)
             radiance = max(EvalSh(dir), vec3(0.0)) * uAccum.z;
         gRad[li] = radiance;
@@ -2237,6 +2259,8 @@ kernel void CSMain(
             }
             p += dir * max(d, voxel * 0.5);
         }
+        // Same knob as the pixel side's envParams.y (DiffuseIntensity); see the HLSL variant for why it must not be
+        // SkyIntensity.
         if (!hit)
             radiance = max(EvalSh(uSh, dir), float3(0.0)) * params.uAccum.z;
         gRad[li] = radiance;
@@ -2524,7 +2548,7 @@ fn SampleBouncePrev(p : vec3<f32>, N : vec3<f32>) -> vec3<f32>
     for (var i : i32 = 0; i < 8; i = i + 1)
     {
         let off = vec3<f32>(f32(i & 1), f32((i >> 1) & 1), f32((i >> 2) & 1));
-        let tri = mix(vec3<f32>(1.0) - f, f, off);
+        var tri = mix(vec3<f32>(1.0) - f, f, off);
         var w = tri.x * tri.y * tri.z;
         let pidx = clamp(base + off, vec3<f32>(0.0), dims - vec3<f32>(1.0));
         let probePos = gridMin + (pidx + vec3<f32>(0.5)) * spacing;
@@ -2689,6 +2713,8 @@ fn CSMain(@builtin(workgroup_id) gid : vec3<u32>, @builtin(local_invocation_inde
             }
             p = p + dir * max(d, voxel * 0.5);
         }
+        // Same knob as the pixel side's envParams.y (DiffuseIntensity); see the HLSL variant for why it must not be
+        // SkyIntensity.
         if (!hit)
         {
             radiance = max(EvalSh(dir), vec3<f32>(0.0)) * params.uAccum.z;

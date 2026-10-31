@@ -24,7 +24,14 @@ public struct GiProxy
     /// <summary>xyz = world-space center; w is reserved and always 0. It is not used as a validity bit, because the active count comes from Params.proxyCount.</summary>
     public Vector4 CenterPad;
 
-    /// <summary>xyz = world-space half extents of the AABB; w = rounded corner radius or sphere radius, with 0 for box proxies.</summary>
+    /// <summary>
+    /// xyz = half extents of the box; w = corner radius, or the sphere radius when xyz are all zero.
+    /// The kernel applies the formula above directly, so the uploaded xyz are exactly the world AABB the control reported:
+    /// nothing is shrunk or grown on the CPU, because w stays 0 for every box proxy here.
+    /// Rounding small boxes was tried and reverted: it changes the silhouette by less than one probe spacing, so it cannot
+    /// move an artefact whose footprint is the consumer's interpolation support, and it costs one subtraction per proxy in
+    /// the gather loop for no measurable result. Boxes and spheres are both still representable; only the box case is used today.
+    /// </summary>
     public Vector4 ExtentsRound;
 
     /// <summary>rgb = diffuse reflectance, explicitly set by the App per signed-off decision (iii), defaulting to neutral gray; a is reserved.</summary>
@@ -40,7 +47,7 @@ public struct GiProxy
 ///
 /// Collection flow, driven by <see cref="Effects.DdgiEffect"/>.Record in the AfterScene phase and always outside render passes:
 /// <code>
-/// BeginCollect(volumeMin, volumeMax)   // Reset counters and remember this frame's volume range
+/// BeginCollect(volumeMin, volumeMax)  // Reset counters and remember the volume range
 ///   → Collect()                        // Recursively walk the BaseApp panel tree, zero-allocation, same shape as Panel.DrawShadow
 ///   → EndCollect()                     // Clear trailing stale entries so buffer contents match Count exactly
 ///   → AsBytes()                        // Upload the full 4 KB block
@@ -105,7 +112,7 @@ public static class GiProxies
     /// </summary>
     public static bool DumpOnce;
 
-    /// <summary>Begins collection: resets counters and records the world-space bounds of this frame's SDF volume for intersection filtering.</summary>
+    /// <summary>Begins collection: resets counters and records the world-space bounds of this frame's SDF volume.</summary>
     public static void BeginCollect(in Vector3 volumeMin, in Vector3 volumeMax)
     {
         Count = 0;
@@ -205,6 +212,7 @@ public static class GiProxies
 
         ref var slot = ref _items[Count];
         slot.CenterPad = new Vector4(worldBounds.Center, 0f);
+        // w stays 0: the proxy is the exact world AABB, see the contract on GiProxy.ExtentsRound.
         slot.ExtentsRound = new Vector4(worldBounds.Extents, 0f);
         slot.Albedo = new Vector4(albedo, 0f);
         slot.Emissive = new Vector4(emissive, 0f);

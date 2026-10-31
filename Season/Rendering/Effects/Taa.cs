@@ -59,32 +59,47 @@ public sealed class TaaEffect : ComputeEffect
 
     ComputeKernel? _kernel;
 
-    // Two resource arrays that alternate every frame. They are built once in Initialize
-    // and then reused. ComputeResourceRef arrays containing strings cannot use stackalloc.
-    // _res[p] points its history slot to [p^1] and its output slot to [p].
-    ComputeResourceRef[][]? _res;
+    /// <summary>
+    /// Everything a resolve needs that belongs to one view: the ping-pong writer index, the two scoped texture
+    /// names, the two resource arrays that alternate every frame, the size the textures were created at and the
+    /// history validity. Two views in one frame would otherwise overwrite each other's ping-pong index, and the
+    /// second view would reproject against the first view's history.
+    /// </summary>
+    sealed class ViewState
+    {
+        public string[] Names = [];
 
-    readonly string[] _names = { TextureName0, TextureName1 };
+        /// <summary>Built once per view; _res[p] points history at [p^1] and output at [p].</summary>
+        public ComputeResourceRef[][] Resources = [];
 
-    /// <summary>Index of the writer for the current frame (0/1). Record flips it before dispatch.</summary>
-    int _p;
+        /// <summary>Index of the writer for the current frame (0/1). Record flips it before dispatch.</summary>
+        public int Writer;
 
-    /// <summary>Creation size of the ping-pong textures (clause 15: resize should be handled in place; on mismatch the effect bypasses itself).</summary>
-    uint _width, _height;
+        /// <summary>Creation size of the ping-pong textures (clause 15: resize in place; on mismatch the view bypasses itself).</summary>
+        public uint Width, Height;
 
-    /// <summary>Whether the history contains valid data. It stays false on the first frame, when texture contents are undefined, and after any bypass; feedback is forced to zero based on this.</summary>
-    bool _historyValid;
-    RenderTarget? _previousSource;
+        /// <summary>Whether this view's history holds valid data.</summary>
+        public bool HistoryValid;
+
+        public RenderTarget? PreviousSource;
+    }
 
     public override string Name => "taa";
 
     public override ComputePhase Phase => ComputePhase.AfterScene;
 
+    /// <summary>
+    /// Per view: this effect reads that view's SceneColor / SceneVelocity / SceneDepth and publishes
+    /// SceneColorOverride + TaaActive, all of which now live on <see cref="ViewTargets"/>.
+    /// </summary>
+    public override ComputeScope Scope => ComputeScope.View;
+    public override ViewFeature RequiredFeature => ViewFeature.AntiAliasing;
+
     public override bool Initialize(IGraphics g)
     {
         // Quality mode and dependencies (clauses 1/10): TAA requires both velocity and
         // offscreen SceneColor. If either is missing, the whole effect stays inactive.
-        if (RenderQuality.Current.AntiAliasing != AaMode.Taa || !RenderQuality.Current.MotionVectors)
+        if (RenderQuality.Current.EffectiveAntiAliasing != AaMode.Taa || !RenderQuality.Current.MotionVectors)
             return false;
         // SceneDepth feeds velocity dilation. It is created by every platform app on the MotionVectors
         // condition, so with the check above this branch is unreachable in a correctly wired backend;
@@ -120,114 +135,141 @@ public sealed class TaaEffect : ComputeEffect
         });
         if (_kernel == null) return false;
 
-        // Clause 15: create the ping-pong textures at the current full backbuffer resolution.
-        // If size mismatches later, the effect falls back frame by frame to the original SceneColor.
-        var res = DeviceServices.BaseApp.DeviceResolution;
-        _width = Math.Max(8u, (uint)res.X);
-        _height = Math.Max(8u, (uint)res.Y);
-        g.CreateComputeTexture(TextureName0, _width, _height, ComputeStorageFormat.Rgba16Float);
-        g.CreateComputeTexture(TextureName1, _width, _height, ComputeStorageFormat.Rgba16Float);
-
-        _res = new ComputeResourceRef[2][];
-        for (int p = 0; p < 2; p++)
-        {
-            _res[p] = new ComputeResourceRef[]
-            {
-                FrameSchedule.SceneColor,
-                FrameSchedule.SceneVelocity,
-                _names[p ^ 1],  // History = previous frame's writer
-                FrameSchedule.SceneDepth,
-                _names[p],      // Output = current frame's writer
-            };
-        }
-
-        _p = 0;
-        _historyValid = false;
+        // Ping-pong textures are per view and are created lazily by EnsureState on the first frame that view
+        // actually renders, sized against that view's SceneColor (clause 15: full backbuffer resolution).
         return true;
     }
 
-    public override void OnResize(IGraphics g)
+    /// <summary>Per-view size the history must match: the view's own scene color, not the device resolution.</summary>
+    static void Measure(ViewTargets targets, out uint width, out uint height)
     {
-        // Clause 15 revision: recreate the ping-pong storage textures in place after resize
-        // while keeping the name and C# object identity unchanged. Update the captured size
-        // and invalidate history so convergence restarts on the next frame. The kernel itself
-        // does not need rebuilding. CreateComputeTexture handles the size-match guard.
+        width = Math.Max(8u, targets.Width);
+        height = Math.Max(8u, targets.Height);
+        if (targets.SceneColor != null) return;
         var res = DeviceServices.BaseApp.DeviceResolution;
-        uint w = Math.Max(8u, (uint)res.X);
-        uint h = Math.Max(8u, (uint)res.Y);
-        g.CreateComputeTexture(TextureName0, w, h, ComputeStorageFormat.Rgba16Float);
-        g.CreateComputeTexture(TextureName1, w, h, ComputeStorageFormat.Rgba16Float);
-        _width = w;
-        _height = h;
-        _historyValid = false;
+        width = Math.Max(8u, (uint)res.X);
+        height = Math.Max(8u, (uint)res.Y);
+    }
+
+    /// <summary>Creates this view's scoped ping-pong textures and the two alternating resource arrays.</summary>
+    ViewState EnsureState(IGraphics g, ViewTargets targets)
+    {
+        var state = ViewState<ViewState>(targets);
+        if (state.Names.Length != 0) return state;
+
+        state.Names = [targets.Scope(TextureName0), targets.Scope(TextureName1)];
+        Measure(targets, out state.Width, out state.Height);
+        g.CreateComputeTexture(state.Names[0], state.Width, state.Height, ComputeStorageFormat.Rgba16Float);
+        g.CreateComputeTexture(state.Names[1], state.Width, state.Height, ComputeStorageFormat.Rgba16Float);
+
+        state.Resources = new ComputeResourceRef[2][];
+        for (int p = 0; p < 2; p++)
+        {
+            state.Resources[p] = new ComputeResourceRef[]
+            {
+                targets.SceneColor!,
+                targets.SceneVelocity!,
+                state.Names[p ^ 1],  // History = previous frame's writer
+                targets.SceneDepth!,
+                state.Names[p],      // Output = current frame's writer
+            };
+        }
+        state.Writer = 0;
+        state.HistoryValid = false;
+        return state;
+    }
+
+    public override void OnViewResize(IGraphics g, ViewTargets targets)
+    {
+        // Clause 15 revision: recreate the ping-pong storage textures in place after resize while keeping the
+        // name and C# object identity unchanged. Update the captured size and invalidate history so convergence
+        // restarts on the next frame. The kernel itself does not need rebuilding; CreateComputeTexture handles
+        // the size-match guard. Views that never rendered yet have no state to resize.
+        if (targets.SceneColor == null) return;
+        var state = EnsureState(g, targets);
+        Measure(targets, out uint w, out uint h);
+        if (w == state.Width && h == state.Height) return;
+        g.CreateComputeTexture(state.Names[0], w, h, ComputeStorageFormat.Rgba16Float);
+        g.CreateComputeTexture(state.Names[1], w, h, ComputeStorageFormat.Rgba16Float);
+        state.Width = w;
+        state.Height = h;
+        state.HistoryValid = false;
     }
 
     public override void Record(IGraphics g)
     {
-        // Clause 15: OnResize should already have recreated the textures in place, so sizes
-        // normally match. This guard only handles degraded paths where OnResize was not called
-        // (for example, a platform path that missed the resize callback). In that case, downstream
-        // stages fall back to the original SceneColor, history is invalidated, and convergence
-        // restarts automatically once the size matches again.
-        var res = DeviceServices.BaseApp.DeviceResolution;
-        var source = FrameSchedule.EffectiveSceneColor;
-        if (source == null || RenderQuality.Current.AntiAliasing != AaMode.Taa
-            || (uint)res.X != _width || (uint)res.Y != _height)
+        var targets = FrameSchedule.ActiveTargets;
+        // Clause 15: OnViewResize should already have recreated the textures in place, so sizes normally match.
+        // This guard only handles degraded paths where the resize callback was missed: the view then falls back
+        // to its raw scene color, history is invalidated, and convergence restarts once the sizes match again.
+        var source = targets.EffectiveSceneColor;
+        if (source == null || RenderQuality.Current.EffectiveAntiAliasing != AaMode.Taa)
         {
-            FrameSchedule.SceneColorOverride = null;
-            FrameSchedule.TaaActive = false;
-            _historyValid = false;
+            targets.SceneColorOverride = null;
+            targets.TaaActive = false;
             return;
         }
 
-        if (!ReferenceEquals(source, _previousSource))
-            _historyValid = false;
-        _previousSource = source;
-        _p ^= 1;
-        _res![_p][0] = source;
+        var state = EnsureState(g, targets);
+        if (source.Desc.Width != state.Width || source.Desc.Height != state.Height)
+        {
+            targets.SceneColorOverride = null;
+            targets.TaaActive = false;
+            state.HistoryValid = false;
+            return;
+        }
+
+        if (!ReferenceEquals(source, state.PreviousSource))
+            state.HistoryValid = false;
+        state.PreviousSource = source;
+        state.Writer ^= 1;
+        state.Resources[state.Writer][0] = source;
 
         Span<float> p = stackalloc float[8];
-        p[0] = _width;
-        p[1] = _height;
-        p[2] = 1f / _width;
-        p[3] = 1f / _height;
-        p[4] = _historyValid ? RenderQuality.Current.TaaFeedback : 0f;
+        p[0] = state.Width;
+        p[1] = state.Height;
+        p[2] = 1f / state.Width;
+        p[3] = 1f / state.Height;
+        p[4] = state.HistoryValid ? RenderQuality.Current.TaaFeedback : 0f;
         p[5] = RenderQuality.Current.TaaVarianceClipGamma;
-        p[6] = _historyValid ? 1f : 0f;
+        p[6] = state.HistoryValid ? 1f : 0f;
         // Clause 10: static-pixel feedback. The shader interpolates between this and TaaFeedback
         // by reprojection length, so a still camera gets the longer accumulation window that
         // jitter convergence needs while moving pixels keep the original, ghost-free weight.
-        p[7] = _historyValid ? RenderQuality.Current.TaaStaticFeedback : 0f;
+        p[7] = state.HistoryValid ? RenderQuality.Current.TaaStaticFeedback : 0f;
 
         g.DispatchCompute(new ComputeDispatchArgs
         {
             Kernel = _kernel!,
             Params = MemoryMarshal.AsBytes(p),
-            Resources = _res![_p],
-            GroupsX = (_width + 7) / 8,
-            GroupsY = (_height + 7) / 8,
+            Resources = state.Resources[state.Writer],
+            GroupsX = (state.Width + 7) / 8,
+            GroupsY = (state.Height + 7) / 8,
             GroupsZ = 1,
         });
 
         // Clauses 12/13: publish the current frame's writer for bloom and the composition
         // entry point after dispatch, so downstream stages always read fully written content.
         // Clause 14: this flag also enables jitter injection.
-        FrameSchedule.SceneColorOverride = _names[_p];
-        FrameSchedule.TaaActive = true;
-        _historyValid = true;
+        targets.SceneColorOverride = state.Names[state.Writer];
+        targets.TaaActive = true;
+        state.HistoryValid = true;
     }
 
     public void Dispose()
     {
-        // Clause 12: clear the override only when it still points to one of our own outputs,
-        // so we do not accidentally clear another producer's override. After reset, the whole chain falls back to SceneColor.
-        if (FrameSchedule.SceneColorOverride == TextureName0 || FrameSchedule.SceneColorOverride == TextureName1)
-            FrameSchedule.SceneColorOverride = null;
+        // Clause 12: clear the override only where it still points at one of our own outputs, so we do not
+        // accidentally clear another producer's override. A scoped name is per view, so every view is checked.
+        FrameSchedule.ForEachTargets(targets =>
+        {
+            if (targets.SceneColorOverride == targets.Scope(TextureName0)
+                || targets.SceneColorOverride == targets.Scope(TextureName1))
+                targets.SceneColorOverride = null;
+        });
         FrameSchedule.TaaActive = false;
-        _historyValid = false;
+        ClearViewStates();
         _kernel?.Dispose();
         _kernel = null;
-        _previousSource = null;
     }
 
     // Shader sources (single source of truth; slots follow the class-level binding convention;

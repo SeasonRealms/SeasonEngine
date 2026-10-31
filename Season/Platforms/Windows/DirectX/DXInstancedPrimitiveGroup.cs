@@ -88,7 +88,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
     // Must be called by derived classes: create shared Matrix CBs and initialize primitives
     // ============================================================
 
-    protected void CreateSharedMatrixBuffers(Season.Basic.Camera camera)
+    protected void CreateSharedMatrixBuffers()
     {
         int n = (int)Device.frameCount;
         _matrixBuffers = new ID3D12Resource*[n];
@@ -97,8 +97,6 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(camera.View),
-            Projection = Matrix4x4.Transpose(camera.Projection)
         };
 
         for (int i = 0; i < n; i++)
@@ -362,12 +360,9 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(DXPrimitiveGroup.Camera.View),
-            Projection = Matrix4x4.Transpose(DXPrimitiveGroup.Camera.Projection),
             // 2-3 Step C (tier C-a): the previous instance world now lives in the
             // prev instance-world SB (t9), so b0.PrevWorld stays all zero.
             // The instanced shader path does not read b0 prevWorld.
-            PrevViewProjection = Matrix4x4.Transpose(DXPrimitiveGroup.Camera.PrevViewProjection),
         };
         Unsafe.Write(_mappedMatrixBuffers[fi], matrices);
 
@@ -575,19 +570,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
 
     static float ComputeTransparentDepth(Matrix4x4 world, Vector3 localCenter)
     {
-        var center = Vector3.Transform(localCenter, world);
-
-        var app = DeviceServices.BaseApp;
-        if (app == null)
-            return center.Z;
-
-        var forward = app.CameraTarget - app.CameraPos;
-        if (forward.LengthSquared() < 1e-6f)
-            forward = Vector3.UnitZ;
-        else
-            forward = Vector3.Normalize(forward);
-
-        return Vector3.Dot(center - app.CameraPos, forward);
+        return RenderView.SortDepth(Vector3.Transform(localCenter, world));
     }
 
     void DrawPrimitiveInstances(PrimitiveData primitiveData, ID3D12Resource* lightConstantBuffer, uint instanceCount, uint startInstanceLocation)

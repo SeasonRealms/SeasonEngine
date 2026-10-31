@@ -41,6 +41,9 @@ internal class Room : Panel
     // Top face of the interior ceiling in room-local Y, shared by wall layout and automatic lamp placement.
     const float InteriorCeilingY = 9.2f;
 
+    // Inner wall faces and interior floor, shared by the wall layout below and the weather shelter region.
+    const float InteriorFloorY = 1.2f, InteriorHalfX = 6.8f, InteriorHalfZ = 6.8f;
+
     internal Season.Controls.Model bottle;
 
     internal Season.Controls.Model busterDrone;
@@ -234,6 +237,14 @@ internal class Room : Panel
     }
 
     /// <summary>
+    /// World-space interior prism of the room: interior floor up to the interior ceiling, inside the wall faces.
+    /// Weather uses it as a shelter region, so precipitation stops at the ceiling while the roof above keeps its own
+    /// weather. The mapping is axis-aligned, so two corners are enough to describe it.
+    /// </summary>
+    internal (Vector3 Min, Vector3 Max) InteriorBounds => (RoomPointToWorld(new Vector3(-InteriorHalfX, InteriorFloorY, -InteriorHalfZ)),
+        RoomPointToWorld(new Vector3(InteriorHalfX, InteriorCeilingY, InteriorHalfZ)));
+
+    /// <summary>
     /// Returns the walkable floor height in world Y at a given world-space XZ point.
     /// The method tests RoomFloor and each RoomStair against their room-local layout bounds and takes the highest matching top face.
     /// Outside the room and stairs it returns 0, meaning the grass or road ground level.
@@ -279,7 +290,8 @@ internal class Room : Panel
         // DDGI and SDF test setup: wall thickness must stay above one SDF voxel, otherwise probe rays leak through
         // thin walls and sample sky radiance instead. The 2026-08 scale-up doubled the room axes and wall thickness.
         const float t = 1.2f;   // Wall thickness after the 2x scale-up.
-        const float x0 = -6.8f, x1 = 6.8f, y0 = 1.2f, y1 = InteriorCeilingY, z0 = -6.8f, z1 = 6.8f;
+        const float x0 = -InteriorHalfX, x1 = InteriorHalfX, y0 = InteriorFloorY, y1 = InteriorCeilingY,
+            z0 = -InteriorHalfZ, z1 = InteriorHalfZ;
 
         var white = new Vector4(0.85f, 0.85f, 0.85f, 1f);   // White walls with some headroom against HDR overexposure.
         var lightGray = new Vector4(0.7f, 0.7f, 0.7f, 1f); // Light gray floor and ceiling to separate them from the white walls.

@@ -38,6 +38,8 @@ internal unsafe struct VKSceneDrawCommand : ISceneDrawCommand
 
     // 三者共用：描述符集 + 顶点/索引/实例缓冲
     internal DescriptorSet Set;
+    // 视图 set 2（主视图帧槽集合或屏幕空间集合），收集时确定。
+    internal DescriptorSet View;
     internal VkBuffer Vertex;
     internal VkBuffer Index;
     internal VkBuffer Instances;
@@ -57,7 +59,7 @@ internal unsafe struct VKSceneDrawCommand : ISceneDrawCommand
                 // 纹理就绪与描述符刷新已在收集阶段完成：
                 // 那些操作包含布局转换，只能在渲染 Pass 之外调用。
                 Pipeline.DrawPrimitiveCore(cmd, Primitive!, Vertex, Index, Set, IndexCount,
-                    Instances, InstanceCount, FirstInstance, prepared: true);
+                    Instances, InstanceCount, FirstInstance, prepared: true, View);
                 break;
 
             case VKSceneDrawKind.Quad:
@@ -67,6 +69,7 @@ internal unsafe struct VKSceneDrawCommand : ISceneDrawCommand
                 Device.Vk.CmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
                 var set = Set;
                 Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, Pipeline.PipelineLayout, 0, 1, &set, 0, null);
+                Pipeline.BindViewSet(cmd, View);
                 if (Pipeline.SceneFogSamplingBaked && Mode != PipelineMode.Opaque)
                 {
                     Pipeline.PushSceneFog(cmd);
@@ -86,6 +89,7 @@ internal unsafe struct VKSceneDrawCommand : ISceneDrawCommand
                 Device.Vk.CmdBindIndexBuffer(cmd, Index, 0, IndexKind);
                 var set = Set;
                 Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, Pipeline.PipelineLayout, 0, 1, &set, 0, null);
+                Pipeline.BindViewSet(cmd, View);
                 if (Pipeline.SceneFogSamplingBaked && Mode != PipelineMode.Opaque)
                 {
                     Pipeline.PushSceneFog(cmd);
@@ -209,7 +213,7 @@ internal sealed unsafe class VKSceneDrawCollection
             fog = true;
         }
 
-        Pipeline.SceneFogParams = fog ? new Vector4(1, 0, 0, 0) : default;
+        Pipeline.SceneFogParams = new Vector4(fog ? 1 : 0, FrameSchedule.WeatherComposited ? 1 : 0, 0, 0);
         var app = DeviceServices.BaseApp;
         if (app != null && _reportedFog != fog)
         {
@@ -255,14 +259,7 @@ internal sealed unsafe class VKSceneDrawCollection
 
     /// <summary>沿相机前向的投影距离，与 DX 的 <c>DXSceneDrawCollection.Depth</c> 同式。</summary>
     internal static float Depth(Vector3 center, Matrix4x4 world)
-    {
-        var point = Vector3.Transform(center, world);
-        var app = DeviceServices.BaseApp;
-        if (app == null) return point.Z;
-        var forward = app.CameraTarget - app.CameraPos;
-        forward = forward.LengthSquared() < 1e-6f ? Vector3.UnitZ : Vector3.Normalize(forward);
-        return Vector3.Dot(point - app.CameraPos, forward);
-    }
+        => RenderView.SortDepth(Vector3.Transform(center, world));
 
     /// <summary>把实例流的行主序四行还原成世界矩阵，供透明排序求深度。</summary>
     internal static Matrix4x4 InstanceWorld(in InstanceTransformData instance) => new(
@@ -294,6 +291,8 @@ internal sealed unsafe class VKSceneDrawCollection
         draw.Kind = VKSceneDrawKind.Primitive;
         draw.Primitive = primitive;
         draw.Set = set;
+        // 视图槽在收集期已由 FrameSchedule.PrepareView 选好，所以这里记下的就是本视图的 set 2。
+        draw.View = Pipeline.ActiveViewSet;
         draw.Vertex = vertex;
         draw.Index = index;
         draw.Instances = instanceBuffer;
@@ -327,7 +326,7 @@ internal sealed unsafe class VKSceneDrawCollection
         }
     }
 
-    internal void CaptureQuad(DescriptorSet set, VkBuffer vertex, Matrix4x4 world)
+    internal void CaptureQuad(DescriptorSet set, VkBuffer vertex, Matrix4x4 world, bool screenSpace)
     {
         var draw = new VKSceneDrawCommand
         {
@@ -337,6 +336,7 @@ internal sealed unsafe class VKSceneDrawCollection
             // Transparent 变体本身就不写深度，与 DX 捕获时保持零值一致。
             DepthWrite = false,
             Set = set,
+            View = screenSpace ? Pipeline.ScreenViewSet : Pipeline.ActiveViewSet,
             Vertex = vertex,
             IndexCount = 6,
             InstanceCount = 1,
@@ -355,6 +355,7 @@ internal sealed unsafe class VKSceneDrawCollection
             Cull = CullModeFlags.None,
             DepthWrite = false,
             Set = set,
+            View = Pipeline.ScreenViewSet,
             Vertex = vertex,
             Index = index,
             Instances = instances,

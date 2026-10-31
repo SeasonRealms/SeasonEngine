@@ -347,6 +347,10 @@ public static class SkyLighting
         // If it were placed after the early return, a runtime downgrade of SkyMode (Procedural -> StaticCube) would leave consumers holding
         // the previous frame's non-zero ApParams0.x and sampling a volume that has already been released, matching the same "do not rely on early return alone" argument as ApplyClouds.
         ApplyAerial(ref lightParams);
+        lightParams.WeatherParams0 = lightParams.WeatherParams1 = default;
+        lightParams.WeatherRegions = default;
+        FrameSchedule.WeatherVisuals?.Apply(ref lightParams, RenderQuality.Current.RegionalWeather,
+            FrameSchedule.SkyViewTexture != null && FrameSchedule.CloudNoiseTexture != null);
 
         if (FrameSchedule.SkyViewTexture == null)
         {
@@ -501,6 +505,17 @@ public static class SkyLighting
             MathF.Max(0.01f, RenderQuality.Current.AerialMaxDistanceKm),
             MathF.Max(0f, RenderQuality.Current.AerialIntensity),
             0f, 0f);
+    }
+
+    /// <summary>区域云使用绝对海拔，不把相机高度再次加进云基。</summary>
+    public static Vector3 WeatherIllumination(float altitudeMeters)
+    {
+        float radius = Atmosphere.GroundRadiusKm + MathF.Max(0.001f, altitudeMeters * 0.001f);
+        var sun = SafeNormalize(Atmosphere.SunDirection, Vector3.UnitY);
+        var moon = SafeNormalize(Atmosphere.MoonDirection, -Vector3.UnitY);
+        return Vector3.Max(Vector3.Zero,
+            (Atmosphere.SunIrradiance * Atmosphere.SunColor * EvaluateTransmittance(radius, sun.Y)
+            + Atmosphere.MoonIrradiance * Atmosphere.MoonColor * EvaluateTransmittance(radius, moon.Y)) / MathF.PI);
     }
 
     // Lower bound for cloud-base altitude (km): the cloud shell must stay strictly above the observer,

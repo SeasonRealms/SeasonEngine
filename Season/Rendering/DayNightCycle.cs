@@ -210,7 +210,10 @@ public static class DayNightCycle
     /// sun elevation + moon elevation × lunar phase × nightBrightness, with the two terms added together just like <see cref="SkyTint"/>.
     /// Unlike the skybox, it includes a non-zero floor, because the skybox may go black while global indirect light should not;
     /// indoor and outdoor spaces still retain lamps and residual skylight.
-    /// Typical usage is Settings.RenderQuality.GiIntensity = baseline × AmbientScale(...), writing into Settings from Step 6 onward as a multiplier consumed by DDGI or SH9.
+    /// Typical usage is to scale SceneEnvironment.SkyIntensity / DiffuseIntensity by AmbientScale(...), which is what both the
+    /// SH9 fallback and the DDGI probe misses read, so the two stay in the same units and the baseline brightness is continuous
+    /// across the probe volume boundary. Do not scale GiIntensity by it: GiIntensity is the blend weight of the probe deviation
+    /// (0 = no GI, 1 = full GI), not a brightness multiplier, and scaling it would only change how much occlusion and bounce show.
     /// The intensity component of SceneLighting.Ambient can follow the same driver on degraded or fallback paths, while the RGB of Ambient carries the color temperature separately.
     /// </summary>
     /// <param name="phase">Accumulated day count, same convention as <see cref="Evaluate"/>.</param>

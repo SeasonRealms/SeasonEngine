@@ -71,14 +71,14 @@ internal unsafe class DXModel : DXPrimitiveGroup
         _asset.ProcessPrimitiveCallback = ProcessPrimitive;
     }
 
-    public void Load(Season.Controls.Model model, Season.Basic.Camera camera)
+    public void Load(Season.Controls.Model model)
     {
         // Animation query / switching belongs to the glTF parsing domain and
         // does not go through IGraphics. Inject the asset reference into the
         // control on the direct-load path.
         model.Asset = _asset;
 
-        _asset.Load(model, camera);
+        _asset.Load(model);
         _asset.PlayAnimation();
 
         InitializeBonePaletteResources();
@@ -87,7 +87,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
         _asset.ValidateSkinData();
     }
 
-    public DXModel CreateInstance(Season.Controls.Model model, Season.Basic.Camera camera)
+    public DXModel CreateInstance(Season.Controls.Model model)
     {
         if (_asset.Model != null)
         {
@@ -116,7 +116,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
 
         var nodeMap = new Dictionary<GltfNodeBase, GltfNodeBase>();
         foreach (var nodeBase in _asset.gltfNodes)
-            instance.EnsureClonedNode(nodeMap, nodeBase, model, camera);
+            instance.EnsureClonedNode(nodeMap, nodeBase, model);
 
         var skinMap = new Dictionary<GLTFSkin, GLTFSkin>();
         foreach (var sourceSkin in _asset.GetAllSkins())
@@ -129,13 +129,13 @@ internal unsafe class DXModel : DXPrimitiveGroup
             };
 
             foreach (var joint in sourceSkin.Joints)
-                instance.EnsureClonedNode(nodeMap, joint, model, camera);
+                instance.EnsureClonedNode(nodeMap, joint, model);
 
             if (sourceSkin.SkeletonRoot != null)
-                instance.EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model, camera);
+                instance.EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model);
 
             if (sourceSkin.BindNode != null)
-                instance.EnsureClonedNode(nodeMap, sourceSkin.BindNode, model, camera);
+                instance.EnsureClonedNode(nodeMap, sourceSkin.BindNode, model);
         }
 
         foreach (var animation in _asset._animations)
@@ -143,7 +143,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
             foreach (var channel in animation.Channels)
             {
                 if (channel.Target?.Node != null)
-                    instance.EnsureClonedNode(nodeMap, channel.Target.Node, model, camera);
+                    instance.EnsureClonedNode(nodeMap, channel.Target.Node, model);
             }
         }
 
@@ -151,7 +151,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
         {
             var sourceNode = nodeBase;
             var clonedNode = nodeMap[sourceNode];
-            clonedNode.Children = sourceNode.Children.Select(child => instance.EnsureClonedNode(nodeMap, child, model, camera)).ToList();
+            clonedNode.Children = sourceNode.Children.Select(child => instance.EnsureClonedNode(nodeMap, child, model)).ToList();
 
             if (sourceNode.Skin != null && skinMap.TryGetValue(sourceNode.Skin, out var clonedSkin))
                 clonedNode.Skin = clonedSkin;
@@ -161,9 +161,9 @@ internal unsafe class DXModel : DXPrimitiveGroup
         {
             var sourceSkin = pair.Key;
             var clonedSkin = pair.Value;
-            clonedSkin.Joints = sourceSkin.Joints.Select(joint => instance.EnsureClonedNode(nodeMap, joint, model, camera)).ToList();
-            clonedSkin.SkeletonRoot = sourceSkin.SkeletonRoot != null ? instance.EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model, camera) : null;
-            clonedSkin.BindNode = sourceSkin.BindNode != null ? instance.EnsureClonedNode(nodeMap, sourceSkin.BindNode, model, camera) : null;
+            clonedSkin.Joints = sourceSkin.Joints.Select(joint => instance.EnsureClonedNode(nodeMap, joint, model)).ToList();
+            clonedSkin.SkeletonRoot = sourceSkin.SkeletonRoot != null ? instance.EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model) : null;
+            clonedSkin.BindNode = sourceSkin.BindNode != null ? instance.EnsureClonedNode(nodeMap, sourceSkin.BindNode, model) : null;
         }
 
         instance._asset.gltfNodes = _asset.gltfNodes.Select(node => nodeMap[node]).ToList();
@@ -181,7 +181,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
         return instance;
     }
 
-    GltfNodeBase EnsureClonedNode(Dictionary<GltfNodeBase, GltfNodeBase> nodeMap, GltfNodeBase sourceNode, Season.Controls.Model model, Season.Basic.Camera camera)
+    GltfNodeBase EnsureClonedNode(Dictionary<GltfNodeBase, GltfNodeBase> nodeMap, GltfNodeBase sourceNode, Season.Controls.Model model)
     {
         if (nodeMap.TryGetValue(sourceNode, out var existing))
             return existing;
@@ -212,7 +212,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
             };
 
             foreach (var primitive in sourceDxNode.Primitives)
-                dxNode.Primitives.Add(ClonePrimitiveData(primitive, dxNode, model, camera));
+                dxNode.Primitives.Add(ClonePrimitiveData(primitive, dxNode, model));
 
             clonedNode = dxNode;
         }
@@ -245,7 +245,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
         return clonedNode;
     }
 
-    PrimitiveData ClonePrimitiveData(PrimitiveData source, GLTFNode ownerNode, Season.Controls.Model model, Season.Basic.Camera camera)
+    PrimitiveData ClonePrimitiveData(PrimitiveData source, GLTFNode ownerNode, Season.Controls.Model model)
     {
         var clone = new PrimitiveData
         {
@@ -304,8 +304,6 @@ internal unsafe class DXModel : DXPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = Matrix4x4.Transpose(Matrix4x4.Identity),
-            View = Matrix4x4.Transpose(camera.View),
-            Projection = Matrix4x4.Transpose(camera.Projection)
         };
 
         for (int i = 0; i < Device.frameCount; i++)
@@ -473,16 +471,16 @@ internal unsafe class DXModel : DXPrimitiveGroup
         }
     }
 
-    void ProcessPrimitive(MeshPrimitive meshPrimitive, GltfNodeBase node, Season.Controls.Model model, Season.Basic.Camera camera)
+    void ProcessPrimitive(MeshPrimitive meshPrimitive, GltfNodeBase node, Season.Controls.Model model)
     {
-        var primitiveData = CreatePrimitiveData(meshPrimitive, node, model, camera);
+        var primitiveData = CreatePrimitiveData(meshPrimitive, node, model);
 
         var gltfNode = node as GLTFNode;
 
         gltfNode.Primitives.Add(primitiveData);
     }
 
-    PrimitiveData CreatePrimitiveData(MeshPrimitive primitive, GltfNodeBase node, Season.Controls.Model model, Season.Basic.Camera camera)
+    PrimitiveData CreatePrimitiveData(MeshPrimitive primitive, GltfNodeBase node, Season.Controls.Model model)
     {
         var primitiveData = new PrimitiveData();
 
@@ -541,8 +539,6 @@ internal unsafe class DXModel : DXPrimitiveGroup
         var matrices = new MatrixBuffer
         {
             World = System.Numerics.Matrix4x4.Transpose(System.Numerics.Matrix4x4.Identity),
-            View = System.Numerics.Matrix4x4.Transpose(camera.View),
-            Projection = System.Numerics.Matrix4x4.Transpose(camera.Projection)
         };
 
         for (int i = 0; i < Device.frameCount; i++)
@@ -879,7 +875,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
 
     }
 
-    void ApplyUserTransformToNodeTree(GltfNodeBase nodeBase, System.Numerics.Matrix4x4 userTransform, Season.Basic.Camera camera)
+    void ApplyUserTransformToNodeTree(GltfNodeBase nodeBase, System.Numerics.Matrix4x4 userTransform)
     {
         // Apply the user transform to the current node.
         // Note that node.WorldTransform has already been computed by
@@ -897,13 +893,10 @@ internal unsafe class DXModel : DXPrimitiveGroup
             var matrices = new MatrixBuffer
             {
                 World = System.Numerics.Matrix4x4.Transpose(finalWorldMatrix),
-                View = System.Numerics.Matrix4x4.Transpose(camera.View),
-                Projection = System.Numerics.Matrix4x4.Transpose(camera.Projection),
                 // 2-3 contract rule 6: previous state always comes from the CPU
                 // shadow copy. Transpose(all-zero) is still all-zero, so the
                 // first frame naturally uses the unwritten sentinel.
                 PrevWorld = System.Numerics.Matrix4x4.Transpose(primitive.PrevWorldMatrix),
-                PrevViewProjection = System.Numerics.Matrix4x4.Transpose(camera.PrevViewProjection),
             };
             int fi = (int)Device.FrameIndex;
             Unsafe.Write(primitive.MappedMatrixBuffers[fi], matrices);
@@ -920,7 +913,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
         // user transform.
         foreach (var child in nodeBase.Children)
         {
-            ApplyUserTransformToNodeTree(child, userTransform, camera);
+            ApplyUserTransformToNodeTree(child, userTransform);
         }
     }
 
@@ -946,7 +939,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
 
         foreach (var rootNode in rootNodes)
         {
-            ApplyUserTransformToNodeTree(rootNode, userTransform, Camera);
+            ApplyUserTransformToNodeTree(rootNode, userTransform);
         }
 
         // Update bone matrices

@@ -193,6 +193,10 @@ public abstract class StorageBuffer
 {
     public uint SizeInBytes;
 
+    /// <summary>A0.1: usage declared at creation. Fixed for the lifetime of the buffer because the native usage flags cannot be widened after the fact;
+    /// the shared layer keeps a copy so TryPrepareIndirectArgs can reject a plain compute buffer before any backend sees it.</summary>
+    public StorageBufferUsage Usage;
+
     public abstract void Dispose();
 }
 
@@ -253,6 +257,36 @@ public enum ComputePhase
 }
 
 /// <summary>
+/// How often a compute effect runs, and therefore which state it is allowed to read.
+///
+/// The distinction exists because a frame can contain several views (main view + minimap / rear mirror / XR eye).
+/// An effect that touches <see cref="FrameSchedule.SceneColor"/>, <see cref="FrameSchedule.SceneDepth"/>,
+/// <see cref="FrameSchedule.EffectiveSceneColor"/> or publishes <see cref="FrameSchedule.SceneColorOverride"/>
+/// is by definition working on one view's image, so it has to run - and keep its history - once per view.
+/// An effect that only generates app-global input (procedural textures, SDF propagation, particle simulation)
+/// runs once and must not depend on which view is active.
+/// </summary>
+public enum ComputeScope
+{
+    /// <summary>
+    /// Once per frame, independent of the view count. FrameStart effects run before the view loop; AfterOpaque and
+    /// AfterScene effects run on the view that closes the frame (the last one), which in the single-view shape is
+    /// exactly where they always ran. This is the default: an effect that does not declare anything keeps its
+    /// pre-P2 behavior.
+    /// </summary>
+    App,
+
+    /// <summary>
+    /// Once per rendered view, inside that view's pass chain with the view's targets active
+    /// (<see cref="FrameSchedule.ActiveTargets"/>). Required for anything that reads or publishes per-view state,
+    /// and the only scope for which <see cref="ComputeEffect.OnViewResize"/> exists.
+    /// Named resources such an effect registers must go through <see cref="ViewTargets.Scope(string)"/> so that
+    /// each view owns its own copy in the backend texture dictionary.
+    /// </summary>
+    View,
+}
+
+/// <summary>
 /// Base class for compute effects, shared by built-in engine effects under Effects/ and third-party custom effects.
 /// Lifecycle: FrameSchedule.RegisterCompute → Initialize to compile kernels and create resources, with false meaning registration stops cleanly and leaves no backend residue on failure
 /// → per-frame Record called by phase, where only DispatchCompute is allowed and opening/closing passes, drawing, or issuing barriers is forbidden because synchronization is centralized inside backend DispatchCompute
@@ -260,15 +294,49 @@ public enum ComputePhase
 /// </summary>
 public abstract class ComputeEffect
 {
+    Dictionary<ViewTargets, object>? _viewStates;
+
     public abstract string Name { get; }
 
     public abstract ComputePhase Phase { get; }
 
+    /// <summary>
+    /// Execution scope. Defaults to <see cref="ComputeScope.App"/> so every existing effect keeps running exactly where
+    /// it did before; effects that consume or publish per-view state override this to <see cref="ComputeScope.View"/>.
+    /// </summary>
+    public virtual ComputeScope Scope => ComputeScope.App;
+
+    /// <summary>
+    /// View feature this effect belongs to. <see cref="ViewFeature.None"/> (the default) means the effect always runs;
+    /// a <see cref="ComputeScope.View"/> effect names its flag here so a view that switched the feature off is never
+    /// recorded - a minimap must not pay for bloom, GTAO or TAA.
+    /// </summary>
+    public virtual ViewFeature RequiredFeature => ViewFeature.None;
+
     /// <summary>Compiles kernels and creates resident resources. Returning false means the current backend has no source or compilation failed, so registration is aborted.</summary>
     public abstract bool Initialize(IGraphics g);
 
-    /// <summary>Records dispatch work every frame, called from the frame-loop thread. Only DispatchCompute is allowed here, with zero allocations.</summary>
+    /// <summary>Records dispatch work every frame, called from the frame-loop thread. Only DispatchCompute is allowed here, with zero allocations.
+    /// A <see cref="ComputeScope.View"/> effect is called once per view, with that view's targets active.</summary>
     public abstract void Record(IGraphics g);
+
+    /// <summary>
+    /// Per-view state slot keyed by the target set, created on first use. This is what keeps two views from sharing a
+    /// ping-pong index, a history-valid flag or a captured size: the state lives next to the targets it describes
+    /// instead of in fields that would otherwise be overwritten by the next view of the same frame.
+    /// </summary>
+    protected T ViewState<T>(ViewTargets targets) where T : class, new()
+    {
+        ArgumentNullException.ThrowIfNull(targets);
+        _viewStates ??= new Dictionary<ViewTargets, object>();
+        if (_viewStates.TryGetValue(targets, out var existing)) return (T)existing;
+        var created = new T();
+        _viewStates[targets] = created;
+        return created;
+    }
+
+    /// <summary>Drops every per-view state slot; call from Dispose so a re-registered effect starts from a clean history.</summary>
+    protected void ClearViewStates() => _viewStates = null;
 
     /// <summary>从注册表移除后通知效果撤销其附加帧路由；缺省保留原有手动释放契约。</summary>
     public virtual void OnUnregistered() { }
@@ -276,6 +344,15 @@ public abstract class ComputeEffect
     /// <summary>Window resize notification, driven by FrameSchedule.ResizeCompute after the GPU becomes idle.
     /// Effects override this to rebuild storage textures in place against the new DeviceResolution.
     /// CreateComputeTexture has been upgraded so a size mismatch triggers in-place recreation while preserving the C# object identity, which keeps Sprite2D AddRef references valid.
-    /// Kernels do not need rebuilding. Fixed-size effects such as DepthView, SceneColorCopy, and Plasma can keep the default no-op implementation.</summary>
+    /// Kernels do not need rebuilding. Fixed-size effects such as DepthView, SceneColorCopy, and Plasma can keep the default no-op implementation.
+    /// This is the callback for app-global storage and is delivered to every scope.</summary>
     public virtual void OnResize(IGraphics g) { }
+
+    /// <summary>
+    /// Per-view resize notification, driven by <see cref="FrameSchedule.ResizeCompute"/> once for the main view and once
+    /// for every registered view, in render order. The callback carries the target set so the effect sizes its per-view
+    /// resources from that view's SceneColor instead of the global device resolution (a minimap is not full-screen).
+    /// Only <see cref="ComputeScope.View"/> effects receive this callback; the default is a no-op.
+    /// </summary>
+    public virtual void OnViewResize(IGraphics g, ViewTargets targets) { }
 }

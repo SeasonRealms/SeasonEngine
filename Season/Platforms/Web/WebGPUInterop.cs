@@ -39,7 +39,9 @@ internal static partial class WebGPUInterop
     /// (formatKind 3 form).
     /// velocityTargetName != null means a 2-3 MRT Scene pass: append SceneVelocity as color attachment slot 1
     /// (formatKind 4), while the JS side also sets _passVelocity so draws are implicitly routed to the MRT
-    /// pipeline variant, following the same routing pattern as 1-5 _passDepthOnly.</summary>
+    /// pipeline variant, following the same routing pattern as 1-5 _passDepthOnly.
+    /// normalTargetName != null (A0.2, only together with velocityTargetName) appends SceneNormal as slot 2
+    /// (formatKind 5, rgba16float) and sets _passNormal.</summary>
     [JSImport("globalThis.seasonWebGPU.beginPass")]
     internal static partial void BeginPass(
         int passId,
@@ -49,7 +51,8 @@ internal static partial class WebGPUInterop
         bool clearDepthEnable,
         bool storeDepth,
         string? depthTargetName,
-        string? velocityTargetName);
+        string? velocityTargetName,
+        string? normalTargetName);
 
     [JSImport("globalThis.seasonWebGPU.endPass")]
     internal static partial void EndPass();
@@ -85,6 +88,16 @@ internal static partial class WebGPUInterop
 
     [JSImport("globalThis.seasonWebGPU.synchronizeRenderTargetSizes")]
     internal static partial int[] SynchronizeRenderTargetSizes();
+
+    /// <summary>P3: publishes an offscreen target's colour view under a texture name so drawSprite2D can sample it -
+    /// the same name-as-handle bridge <see cref="CreateComputeTexture"/> uses. False means nothing was published
+    /// (unknown target, or a target with no colour view to sample).</summary>
+    [JSImport("globalThis.seasonWebGPU.publishViewSurface")]
+    internal static partial bool PublishViewSurface(string surfaceName, string targetName);
+
+    /// <summary>P3: revokes a publication; the target itself keeps running under its own name.</summary>
+    [JSImport("globalThis.seasonWebGPU.unpublishViewSurface")]
+    internal static partial bool UnpublishViewSurface(string surfaceName);
 
     /// <summary>2-1 Step D expansion: pass exposure/bloomIntensity with the blit
     /// (HDR sources writeBuffer them into the params uniform, while LDR sources ignore them).
@@ -203,6 +216,13 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.setShadowAtlas")]
     internal static partial void SetShadowAtlas(string name);
 
+    /// <summary>P2: uploads one 256-byte <see cref="Season.Rendering.ViewConstants"/> block into the shared per-view UBO
+    /// (binding 22) at <paramref name="slot"/>. Slots are 256B aligned, so every view - and every shadow quadrant -
+    /// owns its own matrices and the vertex shader never sees a per-draw copy.</summary>
+    [JSImport("globalThis.seasonWebGPU.setViewConstants")]
+    internal static partial void SetViewConstants(int slot,
+        [JSMarshalAs<JSType.MemoryView>] Span<byte> viewConstants);
+
     /// <summary>
     /// 1-7: creates a six-layer rgba8unorm cube (viewDimension:'cube', single mip) and registers it by name in JS-side _textureCubes.
     /// faceBytes must be a tightly packed contiguous RGBA8 block, concatenated in CubeFace declaration order
@@ -315,7 +335,7 @@ internal static partial class WebGPUInterop
     internal static partial void DisposeComputeKernel(string name);
 
     [JSImport("globalThis.seasonWebGPU.createFogCompositePipeline")]
-    internal static partial bool CreateFogCompositePipeline(string name, string vertex, string fragment);
+    internal static partial bool CreateFogCompositePipeline(string name, string vertex, string fragment, bool weather);
 
     [JSImport("globalThis.seasonWebGPU.prepareFogComposite")]
     internal static partial bool PrepareFogComposite(string name, string color, string depth, string frame,
@@ -327,13 +347,30 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.disposeFogCompositePipeline")]
     internal static partial void DisposeFogCompositePipeline(string name);
 
+    // A0.1 粒子间接绘制。三段 WGSL 在创建期一次下发，JS 侧按本帧附件形状烘焙 PSO；
+    // depth 允许为空，代表场景 Pass 跑在默认深度缓冲上（见 ParticleDrawInputs）。
+    [JSImport("globalThis.seasonWebGPU.createParticleDrawPipeline")]
+    internal static partial bool CreateParticleDrawPipeline(string name, string vertex, string fragment,
+        string fragmentVelocity);
+
+    [JSImport("globalThis.seasonWebGPU.prepareParticleDraw")]
+    internal static partial bool PrepareParticleDraw(string name, string color, string? depth,
+        string instances, string args, string frame);
+
+    [JSImport("globalThis.seasonWebGPU.drawParticles")]
+    internal static partial bool DrawParticles(string name);
+
+    [JSImport("globalThis.seasonWebGPU.disposeParticleDrawPipeline")]
+    internal static partial void DisposeParticleDrawPipeline(string name);
+
     /// <summary>Registers a storage texture (write-only storage + sampleable) into the JS _textures dictionary.
     /// formatKind is aligned with ComputeStorageFormat (0=rgba8unorm, 1=rgba16float, used by the 2-1 bloom chain).</summary>
     [JSImport("globalThis.seasonWebGPU.createComputeTexture")]
     internal static partial void CreateComputeTexture(string name, int width, int height, int formatKind);
 
+    /// <summary>A0.1: indirect adds GPUBufferUsage.INDIRECT, which must be requested at creation time and cannot be widened later.</summary>
     [JSImport("globalThis.seasonWebGPU.createStorageBuffer")]
-    internal static partial bool CreateStorageBuffer(string id, int sizeInBytes);
+    internal static partial bool CreateStorageBuffer(string id, int sizeInBytes, bool indirect);
 
     [JSImport("globalThis.seasonWebGPU.disposeStorageBuffer")]
     internal static partial void DisposeStorageBuffer(string id);
