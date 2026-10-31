@@ -109,7 +109,13 @@ public sealed class DecalVolume
     /// <summary>同屏多个贴花重叠时的绘制次序，小值先画。相同值按注册顺序。</summary>
     public int SortOrder { get => _sortOrder; set => _sortOrder = value; }
 
-    /// <summary>贴图名（后端纹理字典的注册名）。null 表示程序化贴花，用于不依赖资源的冒烟验证。</summary>
+    /// <summary>
+    /// 贴图名（后端纹理字典的注册名）。null 表示程序化贴花，用于不依赖资源的冒烟验证。
+    ///
+    /// 贴花不会自己加载文件：名字没注册、或纹理还没上传完时，那一块贴花会被后端整个跳过（而不是画成占位色）。
+    /// 预注册走既有的命名纹理路径（例如把同一个名字交给一张不可见的 Sprite2D 加载），
+    /// 这样不需要为贴花开一条新的异步加载链。
+    /// </summary>
     public string? Texture
     {
         get => _texture;

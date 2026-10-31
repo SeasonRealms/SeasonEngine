@@ -70,7 +70,7 @@ float4 VSMain(uint id:SV_VertexID):SV_Position {
     /// <c>tint.w</c> 是不透明度，<c>shape.zw</c> 是羽化与掠射阈值。
     /// </summary>
     public const string PixelHlsl = """
-void DecalEval(float4 position,out float4 color,out float coverage,out float roughness) {
+void DecalEval(float4 position,out float4 color,out float coverage,out float roughness,out float roughWeight) {
     uint index=decalParams.x, offset=DecalOffset(index);
     int2 pixel=int2(position.xy);
     float depth=sceneDepth.Load(int3(pixel,0));
@@ -100,6 +100,9 @@ void DecalEval(float4 position,out float4 color,out float coverage,out float rou
         shade=saturate(edge*edge*(3.0-2.0*edge))*grazing*alpha;
     }
     coverage=shade*tint.w;
+    // 不改粗糙度的贴花必须把 RT1 的源 alpha 置 0：RT1 混合是 lerp(dst, src, src.a)，
+    // 源 alpha 不为 0 就会把“没要求改粗糙度”的区域白白拉向 src。
+    roughWeight=wrap.y>0.5?coverage:0.0;
     roughness=wrap.y>0.5?wrap.x:0.0;
     color=shape.x<0.5
         ? float4(lerp(1.0,albedo,coverage),1)
@@ -107,19 +110,19 @@ void DecalEval(float4 position,out float4 color,out float coverage,out float rou
 }
 
 float4 PSMain(float4 position:SV_Position):SV_Target {
-    float4 color; float coverage, roughness;
-    DecalEval(position,color,coverage,roughness);
+    float4 color; float coverage, roughness, roughWeight;
+    DecalEval(position,color,coverage,roughness,roughWeight);
     return color;
 }
 
 // s9：法线目标只开 B 通道写掩码，所以这里只需要把目标粗糙度送到 .z，
-// 八面体法线（.xy）与金属度（.w）由附件里的原值保留。混合用 coverage 在 B 通道上插值。
+// 八面体法线（.xy）与金属度（.w）由附件里的原值保留。混合用 roughWeight 在 B 通道上插值。
 struct PSRoughnessOut { float4 color:SV_Target0; float4 normal:SV_Target1; };
 
 PSRoughnessOut PSMainRoughness(float4 position:SV_Position) {
-    PSRoughnessOut o; float coverage, roughness;
-    DecalEval(position,o.color,coverage,roughness);
-    o.normal=float4(0,0,roughness,coverage);
+    PSRoughnessOut o; float coverage, roughness, roughWeight;
+    DecalEval(position,o.color,coverage,roughness,roughWeight);
+    o.normal=float4(0,0,roughness,roughWeight);
     return o;
 }
 """;

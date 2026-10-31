@@ -36,6 +36,10 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
     // [模式 0=Modulate/1=Additive, 是否带法线附件]。s9 的粗糙度写入要第二个颜色附件，
     // 而附件数量必须与 PSO 的 RT 数量一致，所以这里按两种附件形状各留一份。
     readonly ID3D12PipelineState*[,] _pipelines = new ID3D12PipelineState*[2, 2];
+    /// <summary>逐贴花的纹理解析器：只查后端纹理字典，不加载。名字 → 纹理为空时该 draw 被跳过。</summary>
+    readonly Func<string, DXTexture?> _resolve;
+    readonly DXTexture?[] _textures = new DXTexture?[DecalMath.MaxDecals];
+    readonly bool[] _skip = new bool[DecalMath.MaxDecals];
     ID3D12GraphicsCommandList* _command;
     DecalInputs _inputs;
     DXRenderTarget? _destination;
@@ -101,8 +105,9 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
         }
     }
 
-    internal DXDecalPipeline()
+    internal DXDecalPipeline(Func<string, DXTexture?> resolve)
     {
+        _resolve = resolve;
         for (int i = 0; i < _slots.Length; i++) _slots[i] = new();
         try { Initialize(); }
         catch { Dispose(); throw; }
@@ -284,6 +289,21 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
         slot.Capture(resources, views);
         _inputs = inputs; _destination = target; _frame = frame; _prepared = slot; _writeRoughness = roughness;
         _command = Device.GraphicsCommandList; _stamp = stamp; _frameIndex = Device.FrameIndex;
+
+        // s3 逐贴花纹理：只查字典，不在这里加载。名字未注册或还没上传完的贴花整个跳过。
+        Array.Clear(_textures); Array.Clear(_skip);
+        for (int i = 0; i < inputs.Count; i++)
+        {
+            string? name = inputs.Draws[i].Texture;
+            if (name == null) continue;
+            var texture = _resolve(name);
+            if (texture == null || !texture.Ready || texture._textureResource == null)
+            {
+                _skip[i] = true;
+                continue;
+            }
+            _textures[i] = texture;
+        }
         return true;
     }
 
@@ -291,6 +311,7 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
     {
         var destination = _destination; var inputs = _inputs; var slot = _prepared; var frame = _frame;
         bool roughness = _writeRoughness;
+        var textures = _textures; var skip = _skip;
         _destination = null; _prepared = null; _inputs = default; _frame = null; _writeRoughness = false;
         if (_disposed || destination == null || slot == null || frame == null
             || Device.ActivePassId != RenderPassId.SceneDecal
@@ -317,6 +338,8 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
         int shape = roughness ? 1 : 0;
         for (int i = 0; i < inputs.Count; i++)
         {
+            // 贴图没就绪的贴花整个跳过：采样一个占位纹理会把“还没加载完”画成一块错误颜色。
+            if (skip[i]) continue;
             var draw = inputs.Draws[i];
             int next = draw.Mode == DecalMode.Additive ? 1 : 0;
             if (next != mode)
@@ -324,6 +347,8 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
                 command->SetPipelineState(_pipelines[next, shape]);
                 mode = next;
             }
+            // 逐贴花纹理：直接借字典里已经建好的 SRV 句柄，不再重新分配描述符。
+            if (textures[i] != null) command->SetGraphicsRootDescriptorTable(TextureRoot, textures[i]!.GpuDescriptorHandle);
             var parameters = new Vector4(draw.Index, 0, 0, 0);
             command->SetGraphicsRoot32BitConstants(ParamsRoot, 4, &parameters, 0);
             command->DrawInstanced(36, 1, 0, 0);
@@ -346,6 +371,7 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
             }
         nint signature = (nint)_signature;
         _signature = null;
+        Array.Clear(_textures); Array.Clear(_skip);
         Device.EnqueueDeferredRelease(Device.GetCurrentRetireFenceValue(), () =>
         {
             foreach (var ring in _slots) foreach (var slot in ring) slot.Dispose();

@@ -137,6 +137,8 @@ internal class App : BaseApp
 
     internal Pond pond;
 
+    internal Campfire campfire;
+
     internal Robots robots;
 
     internal Birds birds;
@@ -592,6 +594,11 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         streetLight = new StreetLight();
         AddPanel(streetLight);
 
+        // Campfire on the south-west meadow: log teepee + ember bed + flame/spark/smoke particles +
+        // one flickering point light. See Campfire.cs for why this spot is empty.
+        campfire = new Campfire();
+        AddPanel(campfire);
+
         house = new House();
         AddPanel(house);
 
@@ -716,6 +723,11 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         picker.Targets.Add(ball.bee);
         picker.Targets.Add(streetLight.lightsPunctualLamp);
         picker.Targets.Add(house.model);
+        if (campfire != null)
+        {
+            picker.Targets.Add(campfire.logs);
+            picker.Targets.Add(campfire.bed);
+        }
         picker.Targets.Add(room.bottle);
         picker.Targets.Add(room.busterDrone);
         picker.Targets.Add(sphere.sphereRow);
@@ -743,6 +755,12 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         collider.Obstacles.Add(ball.bee);
         collider.Obstacles.Add(streetLight.lightsPunctualLamp);
         collider.Obstacles.Add(house.model);
+        // Only the teepee blocks; the ash bed is flat enough to walk over, and a 0.9 m disc of
+        // collision would feel like an invisible step around the fire.
+        if (campfire != null)
+        {
+            collider.Obstacles.Add(campfire.logs);
+        }
         collider.Obstacles.Add(sphere.sphereRow);
         collider.Obstacles.Add(room.bottle);
         collider.Obstacles.Add(room.busterDrone);
@@ -1127,6 +1145,8 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
 
         streetLight?.Update(time);
 
+        campfire?.Update(time);
+
         house?.Update(time);
 
         ball?.Update(time);
@@ -1212,12 +1232,12 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     /// </summary>
     void CreatePondDecals()
     {
-        // 池外西北侧的湿草：Modulate 且写粗糙度（水洼），这是 s9 的验证点。
+        // 池外西南侧的湿草：Modulate 且写粗糙度（水洼），这是 s9 的验证点。
         var wetGrass = new Season.Rendering.DecalVolume
         {
             Mode = Season.Rendering.DecalMode.Modulate,
-            Position = new(9f, 0.02f, -16f),
-            Size = new(10f, 0.06f, 8f),
+            Position = new(1f, 0.02f, -16f),
+            Size = new(8f, 0.06f, 8f),
             Tint = new(0.55f, 0.60f, 0.62f),
             Opacity = 0.9f,
             AngleFade = 0f,

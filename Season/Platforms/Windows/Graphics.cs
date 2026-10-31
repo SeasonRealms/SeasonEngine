@@ -41,7 +41,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     /// <summary>D1 屏幕空间贴花：只依赖图形阶段的深度采样，不需要 compute，所以没有 ComputeSupported 门控。</summary>
     public Season.Rendering.DecalPipeline? CreateDecalPipeline()
     {
-        try { return new DXDecalPipeline(); }
+        try { return new DXDecalPipeline(name => TryGetTexture(name, out var tex) ? tex : null); }
         catch (Exception ex)
         {
             DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] 创建失败：{ex.Message}");
