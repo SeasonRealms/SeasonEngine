@@ -63,13 +63,21 @@ internal class Campfire : Panel
     /// <summary>Upward acceleration of the flame in m/s^2. At FlameLifetime it lifts a tongue 0.87 m.</summary>
     const float FlameAcceleration = 2.4f;
 
-    /// <summary>Emission height of the point light: mid-flame, which is where the eye expects the source.</summary>
-    const float LightHeight = 0.42f;
+    /// <summary>
+    /// Emission height of the point light: two thirds up the flame column, which is where the eye expects the
+    /// source and far enough off the grass to stay in the same order of magnitude as the sun. Placing it just
+    /// above the ash put eighty times the sun's peak irradiance on the ground directly under the fire.
+    /// </summary>
+    const float LightHeight = 0.70f;
 
-    /// <summary>Base intensity, before flicker. The torch is 5 and the ceiling lamp test profile is 150.</summary>
-    const float LightIntensity = 14f;
+    /// <summary>
+    /// Base intensity, before flicker. Calibrated against the two lights already in the scene: the sun peaks at
+    /// 4 and the carried torch is 5 over 12 m, which lights the ground out to about 4 m. A campfire is a little
+    /// stronger than a torch and reads to roughly 5 m, so 6 keeps it in family instead of blowing out the grass.
+    /// </summary>
+    const float LightIntensity = 6f;
 
-    const float LightRange = 10f;
+    const float LightRange = 12f;
 
     internal Season.Controls.Model logs;
     internal Season.Controls.Model bed;
@@ -108,10 +116,10 @@ internal class Campfire : Panel
             PosZ = CenterZ,
             // The baked base color already carries the ember glow, so the bed is drawn unlit: at night
             // it must read as self-luminous instead of waiting for the sun. Unlit keeps the albedo
-            // texture and multiplies it by MaterialColor (renderMode 0 branch), it does not replace
-            // it, so the tint below pushes the coals hot without flattening the ash to one color.
+            // texture and multiplies it by MaterialColor (renderMode 0 branch), which here stays at
+            // the default white on purpose. Tinting it up to 1.7 pushed the whole 0.9 m disc past the
+            // tonemapper and it read as a flat light block rather than ash and coals.
             Unlit = true,
-            MaterialColor = new System.Numerics.Vector4(1.7f, 1.15f, 0.80f, 1f),
             CastShadows = false,
         };
 
@@ -284,8 +292,13 @@ internal class Campfire : Panel
         if (campfireLight != null)
             campfireLight.Intensity = LightIntensity * flicker;
 
-        logs?.Update(time);
-        bed?.Update(time);
+        // base.Update only flushes the optional arguments down onto this panel; it does not tick the
+        // sub-controls. Their Update result has to be folded into ours, or a resize/anchor change that
+        // lands on this frame never marks the panel dirty.
+        bool meshesChanged = (logs?.Update(time) ?? false) | (bed?.Update(time) ?? false);
+
+        if (meshesChanged)
+            result = true;
 
         return result;
     }

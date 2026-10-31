@@ -689,33 +689,70 @@ window.seasonWebGPU = (() => {
         -0.5, -0.5, 0,  0, 1,  0, 0, -1,  1, 0, 0, 1,  0, 0, 0, 0,  0, 0, 0, 0,
     ]);
 
+    // ── P2: per-view uniform buffer (binding 22) ──
+    // One 256-byte slot per view / shadow quadrant. Slot map mirrors WebGPUViewUniformLayout on the C# side:
+    // 0..7 = render views, 8..11 = shadow quadrants (3 cascades + spotlight), 13 = screen space (2D sprite / text).
+    // The slot is pinned into the bind group through a fixed buffer offset instead of a dynamic offset, so a
+    // collected scene draw replays with the view it was recorded with and setBindGroup(0, group) stays a two-argument
+    // call at every site.
+    const VIEW_SLOT_BYTES = 256;               // ViewConstants.SizeInBytes == minUniformBufferOffsetAlignment
+    const VIEW_SLOT_COUNT = 16;
+    const VIEW_SLOT_FLOATS = VIEW_SLOT_BYTES / 4;
+    const SCREEN_SPACE_VIEW_SLOT = 13;
+    let _viewSlotBuffer = null;
+    let _currentViewSlot = 0;
+    // z row of the current view matrix, used for transparent depth sorting.
+    // ViewConstants stores row-major matrices, so M13/M23/M33/M43 sit at floats 2/6/10/14.
+    const _viewSlotZRows = new Float32Array(VIEW_SLOT_COUNT * 4);
+    let _currentViewZRow = _viewSlotZRows.subarray(0, 4);
+
+    function _ensureViewSlotBuffer() {
+        if (!_viewSlotBuffer) {
+            _viewSlotBuffer = _device.createBuffer({
+                label: 'view_constants',
+                size: VIEW_SLOT_BYTES * VIEW_SLOT_COUNT,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+        }
+        return _viewSlotBuffer;
+    }
+
+    // C# upload of one RenderView.Constants block: View @ 0, Projection @ 64, PrevViewProjection @ 128.
+    // Each slot is written at most once per frame (shadow quadrants use one slot each) and every write is queued
+    // before the frame's single submit, so all draws bound to a slot observe that slot's final contents.
+    function setViewConstants(slot, bytes) {
+        if (!_device) return;
+        slot = slot | 0;
+        if (slot < 0 || slot >= VIEW_SLOT_COUNT) return;
+        const data = _interopToU8(bytes);
+        if (!data || data.byteLength !== VIEW_SLOT_BYTES) return;
+        _device.queue.writeBuffer(_ensureViewSlotBuffer(), slot * VIEW_SLOT_BYTES, data);
+        const floats = new Float32Array(data.buffer, data.byteOffset, VIEW_SLOT_FLOATS);
+        const row = _viewSlotZRows.subarray(slot * 4, slot * 4 + 4);
+        row[0] = floats[2]; row[1] = floats[6]; row[2] = floats[10]; row[3] = floats[14];
+        _currentViewSlot = slot;
+        _currentViewZRow = row;
+    }
+
     // Sprite2D scratch:
     // vertices + uniform are rewritten every frame
-    // (108 floats aligned to WGSL Uniforms;
-    // [48..83]/[104..107] are retired reserved slots from 1-2 -
-    // camera / lighting / exposure now come from the shared UBO at binding(10),
-    // so keeping them at 0 is sufficient)
+    // (60 floats aligned to WGSL Uniforms; view/projection now come from the per-view UBO, so only the identity
+    // world matrix has to be pre-seeded here)
     const _SPRITE2D_VERTEX_SCRATCH = new Float32Array(120);
-    const _SPRITE2D_UNIFORM_SCRATCH = new Float32Array(108);
-    const _SPRITE2D_UNIFORM_I32 = new Int32Array(_SPRITE2D_UNIFORM_SCRATCH.buffer, 96 * 4, 4);
+    const _SPRITE2D_UNIFORM_SCRATCH = new Float32Array(60);
+    const _SPRITE2D_UNIFORM_I32 = new Int32Array(_SPRITE2D_UNIFORM_SCRATCH.buffer, 48 * 4, 4);
     _SPRITE2D_UNIFORM_SCRATCH[0]=1; _SPRITE2D_UNIFORM_SCRATCH[5]=1; _SPRITE2D_UNIFORM_SCRATCH[10]=1; _SPRITE2D_UNIFORM_SCRATCH[15]=1;
-    _SPRITE2D_UNIFORM_SCRATCH[16]=1; _SPRITE2D_UNIFORM_SCRATCH[21]=1; _SPRITE2D_UNIFORM_SCRATCH[26]=1; _SPRITE2D_UNIFORM_SCRATCH[31]=1;
-    _SPRITE2D_UNIFORM_SCRATCH[32]=1; _SPRITE2D_UNIFORM_SCRATCH[37]=1; _SPRITE2D_UNIFORM_SCRATCH[42]=1; _SPRITE2D_UNIFORM_SCRATCH[47]=1;
-    _SPRITE2D_UNIFORM_SCRATCH[91]=1; _SPRITE2D_UNIFORM_SCRATCH[93]=1; _SPRITE2D_UNIFORM_SCRATCH[95]=0.5;
+    _SPRITE2D_UNIFORM_SCRATCH[43]=1; _SPRITE2D_UNIFORM_SCRATCH[45]=1; _SPRITE2D_UNIFORM_SCRATCH[47]=0.5;
     _SPRITE2D_UNIFORM_I32.fill(0); _SPRITE2D_UNIFORM_I32[2]=2;
 
     // Dedicated scratch for text GPU instancing:
     // separate from Sprite2D scratch so the instancing bit in flags.w
     // cannot leak into later sprite draws.
-    // 108 floats aligned to WGSL Uniforms;
-    // [104] is the retired hdrExposure slot
-    // (1-2 contract 8: text exposure now reads uLights.params0.y).
-    const _TEXT_UNIFORM_SCRATCH = new Float32Array(108);
-    const _TEXT_UNIFORM_I32 = new Int32Array(_TEXT_UNIFORM_SCRATCH.buffer, 96 * 4, 4);
+    // 60 floats aligned to WGSL Uniforms (identity world only; view state comes from the screen-space slot).
+    const _TEXT_UNIFORM_SCRATCH = new Float32Array(60);
+    const _TEXT_UNIFORM_I32 = new Int32Array(_TEXT_UNIFORM_SCRATCH.buffer, 48 * 4, 4);
     _TEXT_UNIFORM_SCRATCH[0]=1; _TEXT_UNIFORM_SCRATCH[5]=1; _TEXT_UNIFORM_SCRATCH[10]=1; _TEXT_UNIFORM_SCRATCH[15]=1;
-    _TEXT_UNIFORM_SCRATCH[16]=1; _TEXT_UNIFORM_SCRATCH[21]=1; _TEXT_UNIFORM_SCRATCH[26]=1; _TEXT_UNIFORM_SCRATCH[31]=1;
-    _TEXT_UNIFORM_SCRATCH[32]=1; _TEXT_UNIFORM_SCRATCH[37]=1; _TEXT_UNIFORM_SCRATCH[42]=1; _TEXT_UNIFORM_SCRATCH[47]=1;
-    _TEXT_UNIFORM_SCRATCH[91]=1; _TEXT_UNIFORM_SCRATCH[93]=1; _TEXT_UNIFORM_SCRATCH[95]=0.5;
+    _TEXT_UNIFORM_SCRATCH[43]=1; _TEXT_UNIFORM_SCRATCH[45]=1; _TEXT_UNIFORM_SCRATCH[47]=0.5;
     // flags:
     // x = reserved 0 (old lightCount, punctual count now reads uLights.params0.x),
     // y = renderMode=2 (TextMsdf),
@@ -1585,6 +1622,10 @@ window.seasonWebGPU = (() => {
                 // the texture is the one already at binding 11. Referenced statically only by fs_main, so
                 // _shadowBindGroupLayout is not expanded, same as binding 20 above.
                 { binding: 21, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'non-filtering' } },
+                // P2: per-view uniform (View / Projection / PrevViewProjection), one 256B slot per view.
+                // Referenced statically by vs_main, so _shadowBindGroupLayout must declare it as well
+                // (same reason as bindings 13/14).
+                { binding: 22, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 192 } },
             ]
         });
 
@@ -1710,6 +1751,9 @@ window.seasonWebGPU = (() => {
                 { binding: 9, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
                 { binding: 13, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
                 { binding: 14, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+                // P2: same reason as 13/14 - vs_main references the per-view UBO through a global const path, so
+                // the vertex-only shadow layout has to declare it too.
+                { binding: 22, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 192 } },
             ]
         });
         _shadowPipeline = _device.createRenderPipeline({
@@ -1774,6 +1818,68 @@ window.seasonWebGPU = (() => {
     // matching the _ensureDepthTexture pattern,
     // while the C# reference (name) remains valid.
     const _renderTargets = {};
+
+    // P3 secondary views: a rendered view presents into its own colour target, and that target is published as a
+    // sampleable texture under the name a 2D control was given, so a minimap or a rear mirror needs no new control
+    // and no readback. The surface map is kept beside the targets (surface name -> target name) instead of inside
+    // _textures: the sampled view identity changes whenever a target is rebuilt, and the name has to survive that
+    // while the published entry is refreshed from the mapping.
+    const _viewSurfaces = {};
+
+    function _refreshViewSurface(surfaceName) {
+        const rtName = _viewSurfaces[surfaceName];
+        const rt = rtName ? _renderTargets[rtName] : null;
+        if (!rt || rt.depthOnly || !rt.colorView) {
+            delete _textureViews[surfaceName];
+            delete _textureMeta[surfaceName];
+            return;
+        }
+        _textureViews[surfaceName] = rt.colorView;
+        // Recorded as a scene read source so a retirement queued while a sprite still samples it is deferred.
+        _sceneTextureSources.set(rt.colorView, rt.colorTex);
+        _textureMeta[surfaceName] = { width: rt.width, height: rt.height, mipLevelCount: 1 };
+    }
+
+    function _refreshViewSurfacesOf(rtName) {
+        for (const surfaceName of Object.keys(_viewSurfaces))
+            if (_viewSurfaces[surfaceName] === rtName) _refreshViewSurface(surfaceName);
+    }
+
+    // Publishes / revokes one presentation target. Both return false when the request cannot be honoured, which is
+    // the signal the C# side turns into "this backend refused the view surface" (the control is then not created).
+    function publishViewSurface(surfaceName, rtName) {
+        const rt = rtName ? _renderTargets[rtName] : null;
+        if (!surfaceName || !rt || rt.depthOnly || !rt.colorView) return false;
+        _viewSurfaces[surfaceName] = rtName;
+        _refreshViewSurface(surfaceName);
+        return true;
+    }
+
+    function unpublishViewSurface(surfaceName) {
+        if (!surfaceName || !(surfaceName in _viewSurfaces)) return false;
+        delete _viewSurfaces[surfaceName];
+        delete _textureViews[surfaceName];
+        delete _textureMeta[surfaceName];
+        return true;
+    }
+
+    function _unpublishSurfacesOf(rtName) {
+        for (const surfaceName of Object.keys(_viewSurfaces))
+            if (_viewSurfaces[surfaceName] === rtName) unpublishViewSurface(surfaceName);
+    }
+
+    // A presentation target carries no implicit depth yet every blit / overlay pipeline bakes a depth24plus
+    // attachment shape, so such a target gets a private plane of its own size, created once and retired with it.
+    function _ensureTargetDepth(rt) {
+        if (rt.auxDepthView) return rt.auxDepthView;
+        rt.auxDepthTex = _device.createTexture({
+            label: 'rt_auxdepth',
+            size: [rt.width, rt.height], format: 'depth24plus',
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        rt.auxDepthView = rt.auxDepthTex.createView();
+        return rt.auxDepthView;
+    }
 
     function _createRenderTargetResources(rt, width, height) {
         if (rt.depthOnly) {
@@ -1849,18 +1955,23 @@ window.seasonWebGPU = (() => {
     function _destroyRenderTargetResources(rt) {
         if (rt.colorTex) _queueComputeRetirement(rt.colorTex);
         if (rt.depthTex) _queueComputeRetirement(rt.depthTex);
+        if (rt.auxDepthTex) _queueComputeRetirement(rt.auxDepthTex);
         rt.colorTex = rt.depthTex = rt.colorView = rt.depthView = null;
+        rt.auxDepthTex = rt.auxDepthView = null;
         rt.blitBindGroup = rt.blitBindGroupLinear = rt.variantBindGroups = null;
         _invalidateComputeBindGroups();
     }
 
     function _resizeRenderTargetResources(rt, width, height) {
         // 完整分配成功才替换；旧命令引用在提交完成前继续有效。
-        const replacement = { ...rt, colorTex: null, depthTex: null, colorView: null, depthView: null };
+        const replacement = { ...rt, colorTex: null, depthTex: null, colorView: null, depthView: null,
+            auxDepthTex: null, auxDepthView: null };
         try { _createRenderTargetResources(replacement, width, height); }
         catch (error) { _destroyRenderTargetResources(replacement); throw error; }
         _destroyRenderTargetResources(rt);
         Object.assign(rt, replacement);
+        // The published surface sampled the old view, so it has to point at the rebuilt one.
+        if (rt.name) _refreshViewSurfacesOf(rt.name);
     }
 
     function synchronizeRenderTargetSizes() {
@@ -1891,6 +2002,7 @@ window.seasonWebGPU = (() => {
     //   and matches SceneVelocity format on the other three backends)
     function createRenderTarget(name, width, height, matchBackbuffer, formatKind) {
         const rt = {
+            name,
             matchBackbuffer: !!matchBackbuffer,
             depthOnly: formatKind === 2 || formatKind === 3,
             velocity: formatKind === 4,
@@ -1911,6 +2023,9 @@ window.seasonWebGPU = (() => {
         catch (error) { _destroyRenderTargetResources(rt); throw error; }
         if (_renderTargets[name]) _destroyRenderTargetResources(_renderTargets[name]);
         _renderTargets[name] = rt;
+        // A view surface published for this target samples the view created just now (the P3 publish order is
+        // target first, then surface, so this only matters when a name is reused).
+        _refreshViewSurfacesOf(name);
         // 把解析后的尺寸回传给 C#：matchBackbuffer 目标的描述符以 Width/Height = 0 申请，
         // 而后端之上的效果按 Desc 分配资源（雾的 froxel 网格在 0x0 时会直接放弃分配）。
         return [w, h];
@@ -1919,6 +2034,8 @@ window.seasonWebGPU = (() => {
     function disposeRenderTarget(name) {
         const rt = _renderTargets[name];
         if (!rt) return;
+        // Retiring a target that still answers a surface name would leave the controls sampling a destroyed view.
+        _unpublishSurfacesOf(name);
         _destroyRenderTargetResources(rt);
         delete _renderTargets[name];
     }
@@ -2526,13 +2643,22 @@ window.seasonWebGPU = (() => {
         // rebind the depth plane to explicit SceneDepth
         // (depth24plus shape, formatKind 3, matching the format already baked into pipelines).
         // Lazy-rebuild rules are the same as for color targets.
+        // P3: a secondary view supplies its own depth plane, but as a depth32float shadow-shaped target
+        // (formatKind 2), which no scene pipeline accepts. Only a depth24plus plane - or a colour target that has
+        // none of its own - is bound here; otherwise the colour target's implicit plane is kept, which is exactly
+        // the same size and format the view's attachments need.
         const drt = depthTargetName ? _renderTargets[depthTargetName] : null;
-        if (drt) {
+        if (drt && (!rt || !rt.depthView || drt.depthFormat === 'depth24plus')) {
             if (drt.matchBackbuffer && (drt.width !== _canvas.width || drt.height !== _canvas.height)) {
                 _resizeRenderTargetResources(drt, _canvas.width, _canvas.height);
             }
             depthView = drt.depthView;
         }
+
+        // P3: the presentation target of a secondary view has no implicit depth, yet the blit pipelines bake a
+        // depth24plus attachment. A private plane of the target's own size keeps the attachment set identical to
+        // the backbuffer one without paying for it on the targets that never present.
+        if (!depthOnly && !depthView && rt && passId !== 7 && passId !== 9) depthView = _ensureTargetDepth(rt);
 
         // 2-3 contract clause 2:
         // velocity attachment (MRT slot 1, formatKind 4 = rg16float with no companion depth).
@@ -2741,13 +2867,16 @@ window.seasonWebGPU = (() => {
         }
     }
 
+    // The view-space z row now comes from the per-view slot the draw will bind (set by setViewConstants),
+    // instead of being read out of the per-draw uniform.
     function _sceneDrawDepth(uniform, center = null, instanceData = null, firstInstance = 0) {
         const m = instanceData || uniform, offset = instanceData ? firstInstance * 20 : 0;
         const x = center?.[0] ?? 0, y = center?.[1] ?? 0, z = center?.[2] ?? 0;
         const wx = x*m[offset]+y*m[offset+4]+z*m[offset+8]+m[offset+12];
         const wy = x*m[offset+1]+y*m[offset+5]+z*m[offset+9]+m[offset+13];
         const wz = x*m[offset+2]+y*m[offset+6]+z*m[offset+10]+m[offset+14];
-        return wx*uniform[18]+wy*uniform[22]+wz*uniform[26]+uniform[30];
+        const row = _currentViewZRow;
+        return wx*row[0]+wy*row[1]+wz*row[2]+row[3];
     }
 
     function _meshBoundsCenter(vertices, stride) {
@@ -2792,7 +2921,7 @@ window.seasonWebGPU = (() => {
 
     function _isTransparentMode(uniformData) {
         const uniformI32 = _getUniformI32View(uniformData);
-        return _selectPipelineMode(uniformData[94], uniformI32[98], uniformI32[99]) === 'transparent';
+        return _selectPipelineMode(uniformData[46], uniformI32[50], uniformI32[51]) === 'transparent';
     }
 
     function _drawIndexedWithOptionalDoubleSidedTransparency(pipelineSet, modeKey, doubleSided, setStateAndDraw) {
@@ -2807,7 +2936,7 @@ window.seasonWebGPU = (() => {
 
     function _selectPipelineByUniform(pipelineSet, uniformData, doubleSided = false) {
         const uniformI32 = _getUniformI32View(uniformData);
-        const modeKey = _selectPipelineMode(uniformData[94], uniformI32[98], uniformI32[99]);
+        const modeKey = _selectPipelineMode(uniformData[46], uniformI32[50], uniformI32[51]);
         return pipelineSet[_getPipelineVariantKey(modeKey, doubleSided)];
     }
 
@@ -2861,7 +2990,10 @@ window.seasonWebGPU = (() => {
     // When the corresponding hasPrev* bits are 0, VS does not read them,
     // so contents are irrelevant
     // which is exactly the case for text / sprite paths.
-    function _createMeshBindGroup(layout, uniformBuffer, texView, normalView, mrView, aoView, emissiveView, boneBuffer, morphMetaBuffer, morphDataBuffer, prevBoneBuffer, prevInstanceBuffer) {
+    // viewSlot pins the per-view UBO (binding 22). 2D sprite / text call sites pass SCREEN_SPACE_VIEW_SLOT;
+    // everything derived from a RenderView passes _currentViewSlot, which setViewConstants established before the
+    // pass chain started.
+    function _createMeshBindGroup(layout, viewSlot, uniformBuffer, texView, normalView, mrView, aoView, emissiveView, boneBuffer, morphMetaBuffer, morphDataBuffer, prevBoneBuffer, prevInstanceBuffer) {
         return _device.createBindGroup({
             layout,
             entries: [
@@ -2914,6 +3046,9 @@ window.seasonWebGPU = (() => {
                 { binding: 20, resource: _samplers['repeat'] },
                 // 1-5 clause 15: same atlas as binding 11, reached non-comparatively so the blocker search can read depth.
                 { binding: 21, resource: _samplers['shadowPoint'] },
+                // P2: per-view uniform. A fixed 256B-aligned buffer offset replaces a dynamic offset: the slot is
+                // part of the bind group, which is what keeps a deferred scene draw bound to its own view.
+                { binding: 22, resource: { buffer: _ensureViewSlotBuffer(), offset: viewSlot * VIEW_SLOT_BYTES, size: VIEW_SLOT_BYTES } },
             ]
         });
     }
@@ -3007,6 +3142,8 @@ window.seasonWebGPU = (() => {
     // It does not include the atlas
     // because attachment binding and sampled binding are mutually exclusive under validation.
     // The depth path does not need prev data and always binds the default fallback sentinels.
+    // The shadow pass is the current view slot: RenderShadowPass publishes the quadrant's light-space
+    // ViewConstants before app.DrawShadow(), so _currentViewSlot already addresses that quadrant's matrix.
     function _createShadowBindGroup(uniformBuffer, boneBuffer, morphMetaBuffer, morphDataBuffer) {
         return _device.createBindGroup({
             layout: _shadowBindGroupLayout,
@@ -3017,6 +3154,7 @@ window.seasonWebGPU = (() => {
                 { binding: 9, resource: { buffer: _readSceneBuffer(morphDataBuffer || _defaultMorphDataBuffer) } },
                 { binding: 13, resource: { buffer: _defaultBoneBuffer } },
                 { binding: 14, resource: { buffer: _defaultPrevInstanceBuffer } },
+                { binding: 22, resource: { buffer: _ensureViewSlotBuffer(), offset: _currentViewSlot * VIEW_SLOT_BYTES, size: VIEW_SLOT_BYTES } },
             ]
         });
     }
@@ -3044,11 +3182,11 @@ window.seasonWebGPU = (() => {
         const whiteView = _textureViews['White'] || texView;
 
         const uni = _SPRITE2D_UNIFORM_SCRATCH;
-        uni[84] = colorR; uni[85] = colorG; uni[86] = colorB; uni[87] = colorA;
-        uni[94] = alpha;
+        uni[36] = colorR; uni[37] = colorG; uni[38] = colorB; uni[39] = colorA;
+        uni[46] = alpha;
 
         _SPRITE2D_UNIFORM_I32[1] = renderMode || 0;
-        uni[92] = pixelRange || 0;
+        uni[44] = pixelRange || 0;
 
         const uniformBuffer = _acquireBuffer('uniform', uni.byteLength, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
         _device.queue.writeBuffer(uniformBuffer, 0, uni);
@@ -3113,8 +3251,10 @@ window.seasonWebGPU = (() => {
         const vertexBuffer = _acquireBuffer('vertex', vd.byteLength, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
         _device.queue.writeBuffer(vertexBuffer, 0, vd);
 
+        // 2D sprite: identity view/projection comes from the dedicated screen-space slot.
         const bindGroup = _createMeshBindGroup(
             _mesh3DPipeline.bindGroupLayout,
+            SCREEN_SPACE_VIEW_SLOT,
             uniformBuffer,
             texView,
             whiteView,
@@ -3122,7 +3262,7 @@ window.seasonWebGPU = (() => {
             whiteView,
             whiteView);
 
-        _submitSceneDraw(_selectPipelineMode(uni[94], _getUniformI32View(uni)[98], _getUniformI32View(uni)[99]),
+        _submitSceneDraw(_selectPipelineMode(uni[46], _getUniformI32View(uni)[50], _getUniformI32View(uni)[51]),
             false, bindGroup, _identityInstanceBuffer, vertexBuffer, null, null, 6);
     }
 
@@ -3134,11 +3274,11 @@ window.seasonWebGPU = (() => {
         const whiteView = _textureViews['White'] || texView;
 
         const uni = _SPRITE2D_UNIFORM_SCRATCH;
-        uni[84] = colorR; uni[85] = colorG; uni[86] = colorB; uni[87] = colorA;
-        uni[94] = alpha;
+        uni[36] = colorR; uni[37] = colorG; uni[38] = colorB; uni[39] = colorA;
+        uni[46] = alpha;
 
         _SPRITE2D_UNIFORM_I32[1] = renderMode || 0;
-        uni[92] = pixelRange || 0;
+        uni[44] = pixelRange || 0;
 
         const uniformBuffer = _acquireBuffer('uniform', uni.byteLength, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
         _device.queue.writeBuffer(uniformBuffer, 0, uni);
@@ -3170,8 +3310,10 @@ window.seasonWebGPU = (() => {
         const vertexBuffer = _acquireBuffer('vertex', vd.byteLength, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
         _device.queue.writeBuffer(vertexBuffer, 0, vd);
 
+        // 2D text atlas quad: same screen-space slot as Sprite2D.
         const bindGroup = _createMeshBindGroup(
             _mesh3DPipeline.bindGroupLayout,
+            SCREEN_SPACE_VIEW_SLOT,
             uniformBuffer,
             texView,
             whiteView,
@@ -3179,7 +3321,7 @@ window.seasonWebGPU = (() => {
             whiteView,
             whiteView);
 
-        _submitSceneDraw(_selectPipelineMode(uni[94], _getUniformI32View(uni)[98], _getUniformI32View(uni)[99]),
+        _submitSceneDraw(_selectPipelineMode(uni[46], _getUniformI32View(uni)[50], _getUniformI32View(uni)[51]),
             false, bindGroup, _identityInstanceBuffer, vertexBuffer, null, null, 6);
     }
 
@@ -3227,9 +3369,9 @@ window.seasonWebGPU = (() => {
         _ensureSprite3DBuffer();
 
         const uni = _TEXT_UNIFORM_SCRATCH;
-        uni[84] = colorR; uni[85] = colorG; uni[86] = colorB; uni[87] = colorA;
-        uni[92] = pixelRange || 0;   // material.x = PxRange
-        uni[94] = alpha;             // material.z = GlobalAlpha
+        uni[36] = colorR; uni[37] = colorG; uni[38] = colorB; uni[39] = colorA;
+        uni[44] = pixelRange || 0;   // material.x = PxRange
+        uni[46] = alpha;             // material.z = GlobalAlpha
         // [104] old hdrExposure slot is retired
         // (1-2 contract 8: inverse-ACES compensation for text now reads uLights.params0.y)
 
@@ -3240,6 +3382,7 @@ window.seasonWebGPU = (() => {
         // reusing the morph-deltas slot and matching DX t5 / Vulkan binding 10
         const bindGroup = _createMeshBindGroup(
             _mesh3DPipeline.bindGroupLayout,
+            SCREEN_SPACE_VIEW_SLOT,
             uniformBuffer,
             texView,
             whiteView,
@@ -3269,7 +3412,7 @@ window.seasonWebGPU = (() => {
         if (!_frameStarted || (!_passEncoder && !_isSceneCollecting())) return;
         if (!ArrayBuffer.isView(uniformData)) uniformData = new Float32Array(uniformData);
         if (_debugLog && _drawSprite3DDiagCount < 3) {
-            _log(`[drawSprite3D] name=${name} billboard=${billboard} alpha=${uniformData?.[94]?.toFixed(2)}`);
+            _log(`[drawSprite3D] name=${name} billboard=${billboard} alpha=${uniformData?.[46]?.toFixed(2)}`);
             _drawSprite3DDiagCount++;
         }
 
@@ -3282,8 +3425,10 @@ window.seasonWebGPU = (() => {
         _ensureSprite3DBuffer();
 
         const whiteView = _textureViews['White'] || texView;
+        // Billboard sprite is 3D geometry, so it follows the render view rather than the screen-space slot.
         const bindGroup = _createMeshBindGroup(
             _mesh3DPipeline.bindGroupLayout,
+            _currentViewSlot,
             uniformBuffer,
             texView,
             whiteView,
@@ -3291,7 +3436,7 @@ window.seasonWebGPU = (() => {
             whiteView,
             whiteView);
 
-        _submitSceneDraw(_selectPipelineMode(uniformData[94], _getUniformI32View(uniformData)[98], _getUniformI32View(uniformData)[99]),
+        _submitSceneDraw(_selectPipelineMode(uniformData[46], _getUniformI32View(uniformData)[50], _getUniformI32View(uniformData)[51]),
             false, bindGroup, _identityInstanceBuffer, _sprite3DVertexBuffer, null, null, 6, 1, 0,
             _isSceneCollecting() ? _sceneDrawDepth(uniformData) : 0);
     }
@@ -3328,6 +3473,7 @@ window.seasonWebGPU = (() => {
 
         const bindGroup = _createMeshBindGroup(
             _mesh3DPipeline.bindGroupLayout,
+            _currentViewSlot,
             uBuffer,
             texView,
             normalView,
@@ -3335,7 +3481,7 @@ window.seasonWebGPU = (() => {
             aoView,
             emissiveView);
 
-        const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[94], _getUniformI32View(uniformData)[98], _getUniformI32View(uniformData)[99]);
+        const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[46], _getUniformI32View(uniformData)[50], _getUniformI32View(uniformData)[51]);
         _submitSceneDraw(modeKey, doubleSided, bindGroup, _identityInstanceBuffer, vBuffer, iBuffer,
             resolvedIndexFormat, indexData.length, 1, 0,
             _isSceneCollecting() ? _sceneDrawDepth(uniformData, _meshBoundsCenter(vertexData, 20)) : 0);
@@ -3361,6 +3507,7 @@ window.seasonWebGPU = (() => {
 
         const bindGroup = _createMeshBindGroup(
             _mesh3DPipeline.bindGroupLayout,
+            _currentViewSlot,
             uBuffer,
             texView,
             whiteView,
@@ -3368,7 +3515,7 @@ window.seasonWebGPU = (() => {
             whiteView,
             whiteView);
 
-        const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[94], _getUniformI32View(uniformData)[98], _getUniformI32View(uniformData)[99]);
+        const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[46], _getUniformI32View(uniformData)[50], _getUniformI32View(uniformData)[51]);
         _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, _identityInstanceBuffer, mesh.vBuffer, mesh.iBuffer,
             mesh.indexFormat || 'uint16', mesh.indexCount, 1, 0,
             _isSceneCollecting() ? _sceneDrawDepth(uniformData, mesh.boundsCenter) : 0);
@@ -3390,8 +3537,8 @@ window.seasonWebGPU = (() => {
         // because identity matrices would snap vertices back to rest pose.
         const prevBoneBuffer = skinKey ? (_prevSkinnedBoneBuffers[skinKey] || boneBuffer) : _defaultBoneBuffer;
 
-        const STRIDE = 108;  // Aligned with C# WebGPUUniformLayout.TotalFloats
-                             // including the hdrParams vec4 added at the end in 1-4 Step B
+        const STRIDE = 60;  // Aligned with C# WebGPUUniformLayout.TotalFloats (per-object state only;
+                            // the view matrices live in the per-view UBO at binding 22)
         const BYTES_PER_UNIFORM = STRIDE * 4;
 
         uniformBytes = _interopToU8(uniformBytes);
@@ -3419,8 +3566,8 @@ window.seasonWebGPU = (() => {
                 if (!mesh) continue;
 
                 const uniformBase = i * STRIDE;
-                const alphaMode = intView[uniformBase + 98];
-                const modeKey = _selectPipelineMode(floatView[uniformBase + 94], alphaMode, intView[uniformBase + 99]);
+                const alphaMode = intView[uniformBase + 50];
+                const modeKey = _selectPipelineMode(floatView[uniformBase + 46], alphaMode, intView[uniformBase + 51]);
                 if (batchMode !== null && modeKey !== batchMode) continue;
 
                 const uniformView = floatView.subarray(uniformBase, uniformBase + STRIDE);
@@ -3462,6 +3609,7 @@ window.seasonWebGPU = (() => {
                     _device.queue.writeBuffer(mBuffer, 0, uniformView);
                     const mBindGroup = _createMeshBindGroup(
                         _mesh3DPipeline.bindGroupLayout,
+                        _currentViewSlot,
                         mBuffer,
                         mTexView,
                         mNormalView,
@@ -3496,6 +3644,7 @@ window.seasonWebGPU = (() => {
 
                 const bindGroup = _createMeshBindGroup(
                     _mesh3DPipeline.bindGroupLayout,
+                    _currentViewSlot,
                     uBuffer,
                     texView,
                     normalView,
@@ -3607,6 +3756,7 @@ window.seasonWebGPU = (() => {
             if (_isTransparentMode(uniformData)) return;
             const mBindGroup = _createMeshBindGroup(
                 _mesh3DPipeline.bindGroupLayout,
+                _currentViewSlot,
                 uBuffer,
                 texView,
                 normalView,
@@ -3628,6 +3778,7 @@ window.seasonWebGPU = (() => {
 
         const bindGroup = _createMeshBindGroup(
             _mesh3DPipeline.bindGroupLayout,
+            _currentViewSlot,
             uBuffer,
             texView,
             normalView,
@@ -3640,7 +3791,7 @@ window.seasonWebGPU = (() => {
             prevBoneBuffer,
             prevInstanceBuffer);
 
-        const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[94], _getUniformI32View(uniformData)[98], _getUniformI32View(uniformData)[99]);
+        const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[46], _getUniformI32View(uniformData)[50], _getUniformI32View(uniformData)[51]);
         _instancedDiag.lastModeKey = modeKey;
         try {
             if (_isSceneCollecting()) {
@@ -4769,6 +4920,8 @@ window.seasonWebGPU = (() => {
         endPass,
         createRenderTarget,
         disposeRenderTarget,
+        publishViewSurface,
+        unpublishViewSurface,
         synchronizeRenderTargetSizes,
         blitToBackbuffer,
         renderPost,
@@ -4784,6 +4937,7 @@ window.seasonWebGPU = (() => {
         uploadStaticMeshInterop,
         uploadSkinnedBones,
         updateSceneLights,
+        setViewConstants,
         setShadowViewport,
         setShadowAtlas,
         // 1-7 Cubemap + environment IBL

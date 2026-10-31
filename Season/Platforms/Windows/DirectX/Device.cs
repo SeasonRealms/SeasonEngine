@@ -709,6 +709,24 @@ internal unsafe static class Device
     }
 
     /// <summary>
+    /// True when the device has been removed. GetDeviceRemovedReason is a raw vtable call and can raise
+    /// an SEH exception instead of returning its HRESULT once the device is gone, so a throw counts as
+    /// removed here rather than propagating out of a shutdown step that only wants to release resources.
+    /// </summary>
+    static bool IsDeviceGone()
+    {
+        if (D3dDevice == null) return true;
+        try
+        {
+            return D3dDevice->GetDeviceRemovedReason() != 0;
+        }
+        catch (Exception)
+        {
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Shutdown only: reset all command allocators so they release the internal
     /// GPU-resource references held by recorded command lists, allowing later
     /// ID3D12Resource::Release() calls in PumpDeferredReleases(force: true) to
@@ -717,14 +735,24 @@ internal unsafe static class Device
     /// </summary>
     internal static void ResetAllAllocatorsForShutdown()
     {
+        // A removed device services none of this: allocator Reset and list Close both fail and the debug
+        // layer breaks on each attempt, which buries the original fault under a cascade of EXECUTION
+        // ERROR entries. Only the release ordering matters at that point, and the driver drops the
+        // recording state on its own, so skip the whole step.
+        if (IsDeviceGone()) return;
+
         // 1) FrameContext allocators (per-frame render commands reference every
         // texture involved in drawing and PSO binding)
         if (FrameContexts != null)
         {
             for (int i = 0; i < frameCount; i++)
             {
-                // AfterRender leaves the command list closed, so Reset() is safe
-                FrameContexts[i].Reset();
+                var context = FrameContexts[i];
+                // AfterRender leaves the command list closed on the normal path, but it checks for device
+                // removal at the top, so a frame that threw before its Close() is still recording here and
+                // D3D12 then rejects the allocator Reset.
+                if (context.IsRecording && !context.CloseForShutdown()) continue;
+                context.Reset();
             }
         }
 
@@ -894,6 +922,7 @@ internal unsafe static class Device
         {
             FrameContexts[i].Reset();
             FrameContexts[i].CommandList->Close();
+            FrameContexts[i].MarkClosed();
         }
 
         // 3) Release the old backbuffer weak references stored by FrameContexts
@@ -2205,6 +2234,7 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         CaptureFinishedFrame();
 
         var result = GraphicsCommandList->Close();
+        CurrentFrame.MarkClosed();
         CheckResult(result);
 
         // Submit the command list

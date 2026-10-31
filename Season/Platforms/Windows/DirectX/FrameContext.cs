@@ -37,6 +37,28 @@ internal unsafe class FrameContext
     public ID3D12Resource* RenderTarget { get; set; }
     public ulong FenceValue { get; set; } = 1;
 
+    /// <summary>
+    /// Whether this frame's command list is currently recording. D3D12 rejects an allocator Reset while
+    /// any list created from it is still open, and the shutdown path cannot assume the normal close ran:
+    /// AfterRender checks for device removal before it closes anything.
+    /// </summary>
+    public bool IsRecording { get; private set; }
+
+    /// <summary>Called by the owner once this frame's list has been closed.</summary>
+    public void MarkClosed() => IsRecording = false;
+
+    /// <summary>
+    /// Shutdown only: closes a list that is still recording so its allocator becomes resettable.
+    /// Returns false when the close itself failed, in which case the caller must skip the Reset -
+    /// issuing it against an open list raises its own debug-layer error and hides the original fault.
+    /// </summary>
+    public bool CloseForShutdown()
+    {
+        if (CommandList == null) return false;
+        MarkClosed();
+        return CommandList->Close() >= 0;
+    }
+
     private readonly ID3D12Device* _device;
     DXDrawSnapshotArena? _drawSnapshots;
 
@@ -95,6 +117,7 @@ internal unsafe class FrameContext
 
         CommandAllocator->Reset();
         CommandList->Reset(CommandAllocator, pso);
+        IsRecording = true;
 
         // Snapshot and compare the pointer value after Reset
         var cmdListAfter = (IntPtr)CommandList;

@@ -4444,13 +4444,33 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     }
 
     /// <summary>
-    /// FrameSchedule.PrepareView hook: runs inside <see cref="FrameSchedule.ExecuteView"/> after the view's targets
-    /// are current and before its draws are collected, which is why a collected scene draw always replays with the
-    /// slot that was published for its own view.
+    /// Uploads a view's constants and selects it for the draws that follow. Runs inside
+    /// <see cref="FrameSchedule.ExecuteView"/> after the view's targets are current and before its draws are collected,
+    /// which is why a collected scene draw always replays with the slot that was published for its own view.
     /// </summary>
     static void OnPrepareView(IGraphics g, RenderView view)
     {
-        if (g is Graphics web) web.PublishViewConstants(view);
+        if (g is not Graphics web) return;
+
+        if (view.Index == 0)
+        {
+            // The main view was already prepared at the camera update point, before the shadow pass needed its
+            // cascades. Re-publishing the same values puts slot 0 back after the quadrants took the current slot.
+            if (view.Prepared) web.PublishViewConstants(0, view.Constants);
+            return;
+        }
+
+        // A secondary view renders into a fixed-size offscreen target and is sampled 1:1 by a 2D control, so the
+        // target size is the render size (this backend has no DPI compensation). Without this Prepare the view would
+        // keep the ViewConstants.ScreenSpace default - identity View/Projection - and every draw collected for it
+        // would land in clip space instead of its own camera.
+        var targets = view.Targets;
+        float width = targets?.Width ?? 0u;
+        float height = targets?.Height ?? 0u;
+        if (width <= 0f || height <= 0f) return;
+
+        view.Prepare(width, height);
+        web.PublishViewConstants(view.Index, view.Constants);
     }
 
     /// <summary>

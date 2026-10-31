@@ -286,9 +286,16 @@ public static class StorageService
         {
             var file = SubPath(directory, res);
 
-            stream = System.IO.File.OpenRead(file);
+            // A miss is the expected answer here, not a failure: every packaged asset probes this
+            // path first and falls back to LoadStream, so opening blind turned each of those probes
+            // into a first-chance FileNotFoundException. Debuggers surface that as a break and the
+            // throw/catch round trip ran on every model, texture and sprite load.
+            if (System.IO.File.Exists(file))
+            {
+                stream = System.IO.File.OpenRead(file);
 
-            result = true;
+                result = true;
+            }
         }
         catch (Exception ex)
         {
@@ -318,9 +325,14 @@ public static class StorageService
             //{
             var file = SubPath(directory, res);
 
-            bytes = System.IO.File.ReadAllBytes(file);
+            // Same probe-then-fallback contract as TryGetStream: a missing local copy is a normal
+            // answer, so it must not be reported through a thrown exception.
+            if (System.IO.File.Exists(file))
+            {
+                bytes = System.IO.File.ReadAllBytes(file);
 
-            result = true;
+                result = true;
+            }
             //}
         }
         catch (Exception ex)
