@@ -153,9 +153,12 @@ window.seasonWebGPU = (() => {
 
     let _commandEncoder = null, _passEncoder = null, _frameStarted = false;
     let _activePassId = -1, _activeColorTarget = null, _activeColorView = null, _activeDepthView = null;
+    // 法线附件的视图身份：贴花 Pass 要核对 SceneNormal 挂的到底是不是它准备的那一张，
+    // 而 _passNormal 只说得清「有没有」，说不清「是哪一张」。
+    let _activeNormalView = null;
 
     function _clearActivePass() {
-        _activePassId = -1; _activeColorTarget = _activeColorView = _activeDepthView = null;
+        _activePassId = -1; _activeColorTarget = _activeColorView = _activeDepthView = _activeNormalView = null;
         _passDepthOnly = _passVelocity = _passNormal = _passOutlineMask = _passOverlay = false;
     }
 
@@ -2606,7 +2609,7 @@ window.seasonWebGPU = (() => {
     // Offscreen targets are introduced in Step 2.
     // passId order matches the C# RenderPassId enum,
     // and the debug group is attached at the encoder level to wrap the whole pass (Step 0).
-    const _passLabels = ['Shadow', 'Scene', 'Post', 'OutlineMask', 'FinalBlit', 'Overlay', 'SceneOpaque', 'FogComposite', 'SceneTransparent', 'WeatherComposite'];
+    const _passLabels = ['Shadow', 'Scene', 'Post', 'OutlineMask', 'FinalBlit', 'Overlay', 'SceneOpaque', 'FogComposite', 'SceneTransparent', 'WeatherComposite', 'SceneDecal'];
 
     function beginPass(passId, targetName, clearColorEnable, clearR, clearG, clearB, clearA, clearDepthEnable, storeDepth, depthTargetName, velocityTargetName, normalTargetName) {
         if (!_frameStarted || !_commandEncoder) return;
@@ -2616,6 +2619,12 @@ window.seasonWebGPU = (() => {
         if ((passId === 7 || passId === 9) && (!fogTarget || fogTarget.depthOnly || !fogTarget.noImplicitDepth
             || fogTarget.colorFormat !== 'rgba16float' || depthTargetName || velocityTargetName || normalTargetName))
             throw new Error('雾合成必须使用独立 HDR 颜色目标，不能挂载深度或速度');
+        // D1 贴花（RenderPassId.SceneDecal=10）：深度在这一帧只是采样源，所以既不能挂深度附件也不能挂速度；
+        // 颜色目标必须是单采样 HDR —— 目标自带的隐式深度存在无妨，本 Pass 不挂它就行。
+        const decalPass = passId === 10;
+        if (decalPass && (!fogTarget || fogTarget.depthOnly || fogTarget.colorFormat !== 'rgba16float'
+            || depthTargetName || velocityTargetName))
+            throw new Error('贴花必须使用 HDR 颜色目标，且不能挂载深度或速度');
         _clearActivePass();
 
         _commandEncoder.pushDebugGroup(_passLabels[passId] || `Pass${passId}`);
@@ -2658,7 +2667,7 @@ window.seasonWebGPU = (() => {
         // P3: the presentation target of a secondary view has no implicit depth, yet the blit pipelines bake a
         // depth24plus attachment. A private plane of the target's own size keeps the attachment set identical to
         // the backbuffer one without paying for it on the targets that never present.
-        if (!depthOnly && !depthView && rt && passId !== 7 && passId !== 9) depthView = _ensureTargetDepth(rt);
+        if (!depthOnly && !depthView && rt && !decalPass && passId !== 7 && passId !== 9) depthView = _ensureTargetDepth(rt);
 
         // 2-3 contract clause 2:
         // velocity attachment (MRT slot 1, formatKind 4 = rg16float with no companion depth).
@@ -2677,7 +2686,9 @@ window.seasonWebGPU = (() => {
 
         // A0.2: SceneNormal attachment (MRT slot 2, formatKind 5 = rgba16float without companion depth), only ever next to
         // slot 1. Cleared to (0,0,0,0) and loaded/stored exactly like velocity.
-        const nrt = (velocityView && normalTargetName) ? _renderTargets[normalTargetName] : null;
+        // 贴花 Pass 也用法线槽（第 2 个颜色附件，写粗糙度），但它没有速度槽，
+        // 所以解析条件不能只看 velocityView。
+        const nrt = ((velocityView || decalPass) && normalTargetName) ? _renderTargets[normalTargetName] : null;
         if (nrt) {
             if (nrt.depthOnly || nrt.colorFormat !== 'rgba16float')
                 throw new Error('SceneNormal 必须是 rgba16float 颜色目标');
@@ -2715,7 +2726,7 @@ window.seasonWebGPU = (() => {
             // and contents must be rendered through the dedicated depth32float pipeline (1-5)
             colorAttachments,
             // FogComposite=7 只写颜色，不挂载也不清除原场景深度。
-            depthStencilAttachment: (passId === 7 || passId === 9) ? undefined : {
+            depthStencilAttachment: (decalPass || passId === 7 || passId === 9) ? undefined : {
                 view: depthView,
                 depthClearValue: 1.0,
                 depthLoadOp: clearDepthEnable ? 'clear' : 'load',
@@ -2742,7 +2753,8 @@ window.seasonWebGPU = (() => {
         _activePassId = passId;
         _activeColorTarget = rt;
         _activeColorView = colorView;
-        _activeDepthView = (passId === 7 || passId === 9) ? null : depthView;
+        _activeDepthView = (decalPass || passId === 7 || passId === 9) ? null : depthView;
+        _activeNormalView = normalView;
     }
 
     function endPass() {
@@ -4293,6 +4305,217 @@ window.seasonWebGPU = (() => {
         state.prepared = null; state.refs = null; state.group = null;
     }
 
+    // D1 屏幕空间贴花（RenderPassId.SceneDecal=10）：WGSL 全由 C# 下发，JS 只持有四条 PSO
+    // （Modulate/Additive × 是否写粗糙度）、两级绑定组与那一串 36 顶点的 draw。
+    // 本 Pass 没有深度附件：深度在这一帧只是采样源，同一资源不能既采样又当附件。
+    const _decals = Object.create(null);
+    // 必须与 DecalMath.ByteCount 一致：声明长度小于着色器实际读到的下标时，
+    // WebGPU 校验器只在首次 draw 报错，而那时已经很难看出是哪一侧算错了。
+    const _decalFrameBytes = 12544;
+
+    function createDecalPipeline(name, code) {
+        if (!_device || _instancedDiag.deviceLost || !name) return false;
+        if (_decals[name]) return !_decals[name].failed;
+        const device = _device;
+        const state = { device, pipelines: null, prepared: null, failed: false, refs: null, group: null,
+            textureGroups: new Map(), placeholder: null, placeholderView: null };
+        let scopeOpen = false;
+        try {
+            device.pushErrorScope('validation'); scopeOpen = true;
+            // group 0 是整个 Pass 恒定的部分（帧缓冲、场景深度、采样器）；group 1 只随贴图变化，
+            // 于是逐 draw 只换一组，同贴图的贴花还能共用同一个 bind group。
+            state.layout = device.createBindGroupLayout({ label: `${name}_layout`, entries: [
+                { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                    buffer: { type: 'read-only-storage', minBindingSize: _decalFrameBytes } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth', viewDimension: '2d' } },
+                { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+            ] });
+            state.textureLayout = device.createBindGroupLayout({ label: `${name}_tex_layout`, entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+            ] });
+            state.sampler = device.createSampler({ label: `${name}_sampler`, minFilter: 'linear', magFilter: 'linear',
+                addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
+            const layout = device.createPipelineLayout({ bindGroupLayouts: [state.layout, state.textureLayout] });
+            const module = device.createShaderModule({ label: `${name}_wgsl`, code });
+            // 1x1 占位贴图：程序化贴花没有纹理名，着色器不会采样，但绑定仍必须合法；
+            // 又不能拿本 Pass 的附件顶替 —— 同个资源不能既当附件又当采样源。
+            state.placeholder = device.createTexture({ label: `${name}_placeholder`, size: [1, 1],
+                format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+            state.placeholderView = state.placeholder.createView();
+            // 颜色目标的两档混合，与另外三端的固定功能混合逐项对应：
+            // Modulate = dst*src（源因子 dst、目标因子 zero），Additive = dst+src；alpha 一律保留目标值。
+            const colorBlend = additive => ({
+                color: { srcFactor: additive ? 'one' : 'dst', dstFactor: additive ? 'one' : 'zero', operation: 'add' },
+                alpha: { srcFactor: 'zero', dstFactor: 'one', operation: 'add' },
+            });
+            const combos = [];
+            for (let mode = 0; mode < 2; mode++) {
+                for (let roughness = 0; roughness < 2; roughness++) {
+                    const targets = [{ format: 'rgba16float', blend: colorBlend(mode === 1) }];
+                    if (roughness) targets.push({ format: 'rgba16float',
+                        // 用 coverage 在原值上 lerp；只写 .z，八面体法线在 .xy、金属度在 .w 必须保留。
+                        blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                            alpha: { srcFactor: 'one', dstFactor: 'zero', operation: 'add' } },
+                        writeMask: GPUColorWrite.BLUE });
+                    combos.push({ mode, roughness, pending: device.createRenderPipelineAsync({
+                        label: `${name}_${mode}_${roughness}`, layout,
+                        vertex: { module, entryPoint: 'VSMain' },
+                        fragment: { module, entryPoint: roughness ? 'PSMainRoughness' : 'PSMain', targets },
+                        // 只留背面：投影盒是凸体，背面在每个像素上恰好命中一次 —— 整个方案不用模板、
+                        // 不用逐 draw 排序的前提。'cw' 与 DX「屏幕空间顺时针为正面」的默认约定对齐。
+                        primitive: { topology: 'triangle-list', cullMode: 'front', frontFace: 'cw' },
+                        multisample: { count: 1 } }) });
+                }
+            }
+            const validation = device.popErrorScope(); scopeOpen = false;
+            _decals[name] = state;
+            Promise.all([validation, ...combos.map(c => c.pending)]).then(([error, ...pipelines]) => {
+                if (error) throw new Error(error.message);
+                if (_decals[name] !== state || _device !== device || _instancedDiag.deviceLost) return;
+                const table = [[null, null], [null, null]];
+                for (let i = 0; i < combos.length; i++)
+                    table[combos[i].mode][combos[i].roughness] = pipelines[i];
+                state.pipelines = table;
+            }).catch(error => {
+                state.failed = true; state.prepared = null;
+                console.error(`贴花管线 '${name}' 编译失败：${error}`);
+            });
+            return true;
+        } catch (error) {
+            if (scopeOpen) device.popErrorScope().catch(() => {});
+            console.error(`贴花管线 '${name}' 创建失败：${error}`);
+            return false;
+        }
+    }
+
+    // 形状核对：贴花只在「颜色是独立 HDR、深度与颜色同尺寸」这一种形状下成立，
+    // 其余情况宁可不出图也不出错图（与另外三端同一取舍）。
+    function _resolveDecal(input) {
+        const color = _renderTargets[input.color], depth = _renderTargets[input.depth];
+        const destination = _renderTargets[input.destination], frame = _storageBuffers[input.frame];
+        const normal = input.normal ? _renderTargets[input.normal] : null;
+        if (!color || !depth || !destination || !frame) return null;
+        // 颜色目标自带的隐式深度不是附件（本 Pass 不挂它），所以这里只校验颜色本身的形状。
+        if (color.depthOnly || color.velocity || color.colorFormat !== 'rgba16float') return null;
+        if (!depth.depthOnly || !['depth24plus', 'depth32float'].includes(depth.depthFormat)) return null;
+        // 本 Pass 把颜色目标同时当作混合底图，共享层因此必须交出同一张目标。
+        if (destination !== color) return null;
+        // 写粗糙度时法线是第 2 个颜色附件：形状不符只能整帧放弃，不能降级成单附件 PSO。
+        if (input.writeRoughness && (!normal || normal.depthOnly || normal.colorFormat !== 'rgba16float')) return null;
+        if (!(frame.usage & GPUBufferUsage.STORAGE) || frame.size < _decalFrameBytes) return null;
+        // 过期尺寸代表本帧数据不完整，只能回退而不能在此重建：颜色与深度已经是本帧的采样源。
+        for (const rt of [color, depth, normal])
+            if (rt && rt.matchBackbuffer && (!_canvas || rt.width !== _canvas.width || rt.height !== _canvas.height)) return null;
+        const sampled = GPUTextureUsage.TEXTURE_BINDING;
+        const c = color.colorTex, d = depth.depthTex, n = normal ? normal.colorTex : null;
+        if (!c || (c.usage & sampled) !== sampled || !d || (d.usage & sampled) !== sampled) return null;
+        if (c.width !== d.width || c.height !== d.height) return null;
+        if (n && ((n.usage & sampled) !== sampled || n.width !== c.width || n.height !== c.height)) return null;
+        let draws;
+        try { draws = JSON.parse(input.drawsJson || '[]'); } catch { return null; }
+        if (!Array.isArray(draws) || draws.length === 0 || draws.length > 64) return null;
+        const list = [];
+        for (const entry of draws) {
+            if (!Array.isArray(entry) || entry.length < 2) return null;
+            const slot = entry[0] | 0, mode = entry[1] | 0;
+            if (slot < 0 || slot >= 64 || (mode !== 0 && mode !== 1)) return null;
+            list.push({ slot, mode, texture: typeof entry[2] === 'string' ? entry[2] : null });
+        }
+        return { color, depth, normal, frame, colorView: color.colorView,
+            normalView: normal ? normal.colorView : null, draws: list };
+    }
+
+    function _sameDecalRefs(a, b) {
+        return !!a && !!b && a.color === b.color && a.depth === b.depth && a.normal === b.normal
+            && a.frame === b.frame && a.colorView === b.colorView && a.normalView === b.normalView;
+    }
+
+    function _decalTextureGroup(state, view) {
+        let group = state.textureGroups.get(view);
+        if (!group) {
+            group = _device.createBindGroup({ layout: state.textureLayout,
+                entries: [{ binding: 0, resource: view }] });
+            state.textureGroups.set(view, group);
+        }
+        return group;
+    }
+
+    function prepareDecal(name, color, depth, normal, frame, drawsJson, writeRoughness, destination) {
+        const state = _decals[name];
+        if (!state) return false;
+        state.prepared = null;
+        if (!_frameStarted || !_commandEncoder || _passEncoder || _instancedDiag.deviceLost
+            || state.device !== _device || state.failed || !state.pipelines) return false;
+        const input = { color, depth, normal: normal || null, frame, drawsJson,
+            writeRoughness: !!writeRoughness, destination };
+        try {
+            const refs = _resolveDecal(input);
+            if (!refs) return false;
+            const roughness = refs.normalView ? 1 : 0;
+            // 首次见到这个附件形状时四条 PSO 仍在异步编译：本帧明确不绘制，下一帧再试。
+            if (!state.pipelines[0][roughness] || !state.pipelines[1][roughness]) return false;
+            const draws = [];
+            for (const draw of refs.draws) {
+                // 纹理还没上传完的贴花整条跳过：采样占位贴图会把「还没加载」画成一块错误颜色。
+                const view = draw.texture ? _textureViews[draw.texture] : null;
+                if (draw.texture && !view) continue;
+                draws.push({ slot: draw.slot, mode: draw.mode,
+                    group: _decalTextureGroup(state, view || state.placeholderView) });
+            }
+            if (!draws.length) return false;
+            if (!_sameDecalRefs(state.refs, refs)) {
+                state.group = _device.createBindGroup({ layout: state.layout, entries: [
+                    { binding: 0, resource: { buffer: refs.frame, size: _decalFrameBytes } },
+                    { binding: 1, resource: refs.depth.depthView },
+                    { binding: 2, resource: state.sampler },
+                ] });
+                state.refs = refs;
+            }
+            state.prepared = { refs, pipelines: state.pipelines, group: state.group, draws, roughness,
+                command: _commandEncoder, frameId: _computeFrameId };
+            return true;
+        } catch (error) {
+            console.error(`贴花 '${name}' 准备失败：${error}`);
+            return false;
+        }
+    }
+
+    function drawDecal(name) {
+        const state = _decals[name], prepared = state?.prepared;
+        if (!prepared) return false;
+        // 一次 Prepare 只兑付一次提交，与其它三端同一约定。
+        state.prepared = null;
+        if (!_frameStarted || !_passEncoder || _instancedDiag.deviceLost || state.device !== _device
+            || prepared.command !== _commandEncoder || prepared.frameId !== _computeFrameId
+            || _activePassId !== 10 || _passDepthOnly || _passVelocity || _passOutlineMask || _passOverlay
+            // 附件集必须与烘好的 PSO 完全一致：本 Pass 只有颜色 0 与可选的 SceneNormal。
+            || _activeColorTarget !== prepared.refs.color || _activeColorView !== prepared.refs.colorView
+            || _passNormal !== !!prepared.refs.normalView || _activeNormalView !== prepared.refs.normalView) return false;
+        _passEncoder.setBindGroup(0, prepared.group);
+        let current = null;
+        for (const draw of prepared.draws) {
+            // 模式（Modulate/Additive）是烘进 PSO 的，逐 draw 切换。
+            const pipeline = prepared.pipelines[draw.mode][prepared.roughness];
+            if (!pipeline) return false;
+            if (pipeline !== current) { _passEncoder.setPipeline(pipeline); current = pipeline; }
+            _passEncoder.setBindGroup(1, draw.group);
+            // 36 个顶点在着色器里由 vertex_index 生成；贴花槽位走 first_instance ——
+            // WebGPU 没有 push constant，而 WGSL 的 instance_index 正是从 first_instance 起算。
+            _passEncoder.draw(36, 1, 0, draw.slot);
+        }
+        return true;
+    }
+
+    function disposeDecalPipeline(name) {
+        const state = _decals[name];
+        if (!state) return;
+        delete _decals[name];
+        state.prepared = null; state.refs = null; state.group = null; state.pipelines = null;
+        state.textureGroups.clear();
+        if (state.placeholder) _queueComputeRetirement(state.placeholder);
+        state.placeholder = state.placeholderView = null;
+    }
+
     const _computeKernels = {};
     const _storageBuffers = {};
     let _computeFrameId = 0;
@@ -4506,6 +4729,11 @@ window.seasonWebGPU = (() => {
         for (const state of Object.values(_fogComposites)) {
             state.prepared = null;
             for (const slot of state.slots) { slot.refs = null; slot.group = null; slot.samplingGroup = null; slot.weatherSamplingGroup = null; }
+        }
+        for (const state of Object.values(_decals)) {
+            state.prepared = null; state.refs = null; state.group = null;
+            // 贴图被重建后旧视图会变成悬空引用，逐贴图缓存绑定组必须一起清。
+            state.textureGroups.clear();
         }
         for (const kn in _computeKernels) {
             const k = _computeKernels[kn];
@@ -4976,6 +5204,8 @@ window.seasonWebGPU = (() => {
         createFogCompositePipeline, prepareFogComposite, drawFogComposite, disposeFogCompositePipeline,
         // A0.1 粒子间接绘制
         createParticleDrawPipeline, prepareParticleDraw, drawParticles, disposeParticleDrawPipeline,
+        // D1 屏幕空间贴花
+        createDecalPipeline, prepareDecal, drawDecal, disposeDecalPipeline,
         createComputeTexture,
         createStorageBuffer,
         disposeStorageBuffer,

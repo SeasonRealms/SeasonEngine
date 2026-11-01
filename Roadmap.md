@@ -249,18 +249,56 @@ existing depth target, shoreline blending from depth difference, and reflection 
 There is an existing `Sea.cs` in the island scene to migrate onto the engine-level system, which conveniently makes
 this the first test of whether "engine system" and "scene content" are cleanly separated.
 
-### A5. Decals — *needs A0.2, constrained by forward rendering*
+### A5. Decals — *screen-space pass; needs A0.2 and an explicit depth target*
 
-Deferred decals are the standard approach and this is a forward renderer, so be honest about the ceiling up front.
-Two viable options:
+Deferred decals need a G-buffer this renderer does not have. Forward projected decals — a decal list bound per object
+and evaluated inside every material shader — push the cost into every material, need a per-object list, and still do
+not scale to overlapping decals. The third option is the one that shipped: **a screen-space decal pass**, inserted
+between the opaque scene pass and the `AfterOpaque` composites so it lands on the resolved scene colour before fog or
+weather replaces it.
 
-- **Forward projected decals** — bind a decal list per draw and blend in the material shader. Works, costs shader
-  complexity and a per-object decal list, and does not scale to many overlapping decals.
-- **A deferred decal pass writing into a normal/albedo overlay** — requires more of a G-buffer than A0.2 alone
-  provides.
+Shape of the pass:
 
-Recommendation: ship the forward variant with a documented decal-count limit. Do not add a G-buffer for decals
-alone; that is a pipeline-shape decision that should be driven by more than one feature.
+- Each decal draws a programmatic 36-vertex box — six faces, two triangles each, positions derived from
+  `vertex_index`. No vertex buffer, no instance data, one draw per decal.
+- The pixel shader reconstructs world position from the scene depth at that pixel, transforms it into the box's local
+  space, and shades only where the result falls inside the unit cube. `local.xz * 0.5 + 0.5` is the UV, so the decal
+  projects along the box's own axis and the orientation of the surface underneath does not matter.
+- Depth is a sampled source, never an attachment. The pass carries no depth attachment at all and the box is neither
+  depth-tested nor depth-written.
+- One texture per decal, capped at 64 active decals. The frame header and the decal table (12 `float4` each) are
+  packed into one buffer and uploaded once per frame, so the draw loop carries nothing per decal except a slot index.
+
+Three trade-offs set the ceiling, and all three were taken deliberately:
+
+1. **No stencil, no per-draw sorting.** Every face is wound counter-clockwise as seen from outside the box and the
+   rasterizer culls *front* faces, so the back faces of a convex box cover each pixel at most once — the property a
+   stencil mask would otherwise buy, for free. Cost: overlapping decals are blended in draw order instead of being
+   resolved per pixel by depth, and there is no "nearest decal wins" rule.
+2. **v1 ships only Modulate and Additive.** Both are pure fixed-function blends (`dst * src`, `dst + src`) and the
+   pixel shader never reads the scene colour, so the colour target does not also have to be sampleable — no copy, no
+   extra target, and the same pipeline shape on all four backends. Alpha is preserved (`ZERO / ONE`), so the pass
+   cannot disturb later alpha-based decisions. Cost: no normal-blended or overwrite decals; those need a target that
+   can be sampled and written at the same time, which is a different pipeline shape.
+3. **The roughness write reuses `SceneNormal` as a second colour attachment with a blue-only write mask.**
+   `SceneNormal` already carries octahedral `.xy`, Toksvig roughness in `.z`, and metalness in `.w`. The decal pass
+   opens only the B channel and lerps by coverage (`SRC_ALPHA / ONE_MINUS_SRC_ALPHA`), so normals and metalness come
+   out untouched and no extra target is allocated. Cost: while any visible decal asks for roughness, `SceneNormal`
+   is an attachment for the pass and cannot be sampled inside it — which is why the grazing-angle fade is derived
+   from the depth-reconstructed normal rather than read from the normal target.
+
+Backend notes, because the same contract lands differently on each API:
+
+- Vulkan bakes clear/load into the render-pass object, so the decal pass is a dedicated render pass keyed by its own
+  `RenderPassId`; Metal and WebGPU only see an attachment list, and DX12 binds two RTVs.
+- Neither Metal nor WebGPU has push constants. Metal passes the slot as a small vertex/fragment constant; WebGPU
+  issues `draw(36, 1, 0, slot)` and reads `instance_index`, which is defined to start at `firstInstance`.
+- WebGPU must bake the attachment count into the pipeline object, so "write roughness" is a separate PSO rather than
+  a branch, and the pass refuses the frame outright instead of degrading to one attachment.
+
+Failure is deliberately boring: when a backend has no implementation (or the feature is off), the factory returns
+null and the decal effect never registers; when the visible table is empty, `Prepare` returns false and the pass is
+never begun. Either way the frame schedule is untouched, so a decal-free frame costs exactly what it did before.
 
 ### A6. GPU particles — *needs A0.1*
 

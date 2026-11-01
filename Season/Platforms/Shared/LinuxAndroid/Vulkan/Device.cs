@@ -1365,6 +1365,86 @@ internal unsafe static class Device
     /// <summary>Cached depth-view version for the mask framebuffer.</summary>
     static ulong _outlineMaskDepthVersion;
 
+    // -- D1 屏幕空间贴花 Pass。
+    //    render pass 只由「是否挂法线附件」决定，一共两种形态，创建一次永久复用，同时充当贴花 PSO 的烘制锚点；
+    //    framebuffer 绑定当帧的 SceneColor（与可选的 SceneNormal），view 版本变化时重建。
+    //    与 OutlineMask 一样按引用相等比较 RT 身份，因为窗口重建会换掉原生 view。
+    //    仅渲染线程访问。 --
+    static RenderPass _decalRenderPass;
+
+    static RenderPass _decalRenderPassNormal;
+
+    static Framebuffer _decalFramebuffer;
+
+    static VKRenderTarget? _decalColorRT;
+
+    static VKRenderTarget? _decalNormalRT;
+
+    static ulong _decalColorVersion;
+
+    static ulong _decalNormalVersion;
+
+    /// <summary>
+    /// 取贴花 Pass 的 render pass。后端在烘 PSO 时据此锚定，<see cref="BeginPass"/> 用同一个对象建 framebuffer；
+    /// 两个形态各自缓存，返回后不再销毁（与 OutlineMask 的锚点契约相同）。
+    /// </summary>
+    internal static RenderPass GetDecalRenderPass(bool withNormal)
+    {
+        if (withNormal)
+        {
+            if (_decalRenderPassNormal.Handle == 0)
+                _decalRenderPassNormal = VKRenderTarget.CreateDecalRenderPassForFormat(Format.R16G16B16A16Sfloat, true);
+            return _decalRenderPassNormal;
+        }
+        if (_decalRenderPass.Handle == 0)
+            _decalRenderPass = VKRenderTarget.CreateDecalRenderPassForFormat(Format.R16G16B16A16Sfloat, false);
+        return _decalRenderPass;
+    }
+
+    /// <summary>
+    /// 备好贴花 Pass 的 render pass 与 framebuffer。颜色附件是当帧 SceneColor，
+    /// 法线附件按本帧是否写粗糙度决定 —— 它是颜色附件 1，不是采样源。
+    /// </summary>
+    static (RenderPass, Framebuffer) EnsureDecalPass(VKRenderTarget color, VKRenderTarget? normal)
+    {
+        if (color.ColorView.Handle == 0 || color.Width == 0 || color.Height == 0
+            || (normal != null && (normal.ColorView.Handle == 0
+                || normal.Width != color.Width || normal.Height != color.Height
+                || normal.ColorFormat != Format.R16G16B16A16Sfloat)))
+            throw new InvalidOperationException("贴花 Pass 的附件无效或尺寸/格式不匹配。");
+
+        bool withNormal = normal != null;
+        var renderPass = GetDecalRenderPass(withNormal);
+        ulong normalVersion = normal?.ColorViewVersion ?? 0;
+        if (_decalFramebuffer.Handle == 0 || !ReferenceEquals(_decalColorRT, color)
+            || !ReferenceEquals(_decalNormalRT, normal)
+            || _decalColorVersion != color.ColorViewVersion || _decalNormalVersion != normalVersion)
+        {
+            if (_decalFramebuffer.Handle != 0)
+                Vk.DestroyFramebuffer(LogicalDevice, _decalFramebuffer, null);
+
+            var attachments = stackalloc Silk.NET.Vulkan.ImageView[2] { color.ColorView, normal?.ColorView ?? color.ColorView };
+            var fbInfo = new FramebufferCreateInfo
+            {
+                SType = StructureType.FramebufferCreateInfo,
+                RenderPass = renderPass,
+                AttachmentCount = withNormal ? 2u : 1u,
+                PAttachments = attachments,
+                Width = color.Width,
+                Height = color.Height,
+                Layers = 1
+            };
+            if (Vk.CreateFramebuffer(LogicalDevice, in fbInfo, null, out var fb) != Result.Success)
+                throw new Exception("vkCreateFramebuffer (decal) failed");
+            _decalFramebuffer = fb;
+            _decalColorRT = color;
+            _decalNormalRT = normal;
+            _decalColorVersion = color.ColorViewVersion;
+            _decalNormalVersion = normalVersion;
+        }
+        return (renderPass, _decalFramebuffer);
+    }
+
     /// <summary>
     /// Create an offscreen RenderTarget.
     /// Two shapes are supported, step 3 and aligned with DX Device.CreateRenderTarget:
@@ -1549,6 +1629,17 @@ internal unsafe static class Device
             extent = new Extent2D(compositeRT.Width, compositeRT.Height);
             attachmentCount = 1;
         }
+        else if (desc.Id == Season.Rendering.RenderPassId.SceneDecal && desc.ColorTarget is VKRenderTarget decalColor)
+        {
+            // D1: 贴花 Pass 没有深度附件（深度是采样源），也不清颜色 —— 它乘/加到上一段场景 Pass 的结果上。
+            // s9 只在确实要写粗糙度时才把 SceneNormal 挂成颜色附件 1，这是全工程唯一一种
+            // 「法线出现但不跟速度同时出现」的挂法；贴花不写速度，也不会动到不透明阶段写下的值。
+            var decalNormal = desc.NormalTarget as VKRenderTarget;
+            (renderPass, framebuffer) = EnsureDecalPass(decalColor, decalNormal);
+            extent = new Extent2D(decalColor.Width, decalColor.Height);
+            attachmentCount = decalNormal != null ? 2u : 1u;
+            ActiveNormalTarget = decalNormal;
+        }
         else if (desc.ColorTarget is VKRenderTarget colorRT && desc.DepthTarget is VKRenderTarget depthRT)
         {
             (renderPass, framebuffer) = EnsureSceneTargetPass(colorRT, depthRT,
@@ -1594,7 +1685,12 @@ internal unsafe static class Device
         // A0.2: the four-target shape inserts the normal attachment at index 2, also cleared to zero.
         var clearValues = stackalloc ClearValue[4];
         uint clearCount;
-        if (depthOnly)
+        if (desc.Id == Season.Rendering.RenderPassId.SceneDecal)
+        {
+            // 两个附件都是 Load，ClearValue 一个都不需要。
+            clearCount = 0u;
+        }
+        else if (depthOnly)
         {
             clearValues[0] = new ClearValue { DepthStencil = new ClearDepthStencilValue(1f, 0) };
             clearCount = 1u;
@@ -1699,6 +1795,24 @@ internal unsafe static class Device
     /// <summary>RT 销毁时按 fence 退休；只有 Resize 的 GPU 空闲点允许立即清理。</summary>
     internal static void ReleaseSceneTargetPasses(VKRenderTarget target, bool immediate = false)
     {
+        // 贴花 Pass 的 framebuffer 直接引用 RT 的 view，重建前必须先释放，否则会留下悬空的附件。
+        if (ReferenceEquals(_decalColorRT, target) || ReferenceEquals(_decalNormalRT, target))
+        {
+            var decalFramebuffer = _decalFramebuffer;
+            _decalFramebuffer = default;
+            _decalColorRT = null;
+            _decalNormalRT = null;
+            _decalColorVersion = 0;
+            _decalNormalVersion = 0;
+            if (decalFramebuffer.Handle != 0)
+            {
+                var vk = Vk;
+                var device = LogicalDevice;
+                void ReleaseDecal() => vk.DestroyFramebuffer(device, decalFramebuffer, null);
+                if (immediate) ReleaseDecal();
+                else EnqueueDeferredRelease(ReleaseDecal);
+            }
+        }
         foreach (var entry in _sceneTargetPasses.ToArray())
         {
             var key = entry.Key;

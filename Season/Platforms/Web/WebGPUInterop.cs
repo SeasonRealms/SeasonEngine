@@ -363,6 +363,22 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.disposeParticleDrawPipeline")]
     internal static partial void DisposeParticleDrawPipeline(string name);
 
+    // D1 屏幕空间贴花。WGSL 一次性下发（三个入口同一份源码），JS 侧只烘四条 PSO
+    // （Modulate/Additive × 是否写粗糙度）；本 Pass 不挂深度附件，深度只是采样源。
+    // drawsJson 是 [[slot, mode, "textureName"], ...]，纹理名为 null 表示用程序化图案。
+    [JSImport("globalThis.seasonWebGPU.createDecalPipeline")]
+    internal static partial bool CreateDecalPipeline(string name, string wgsl);
+
+    [JSImport("globalThis.seasonWebGPU.prepareDecal")]
+    internal static partial bool PrepareDecal(string name, string color, string depth, string? normal,
+        string frame, string drawsJson, bool writeRoughness, string destination);
+
+    [JSImport("globalThis.seasonWebGPU.drawDecal")]
+    internal static partial bool DrawDecal(string name);
+
+    [JSImport("globalThis.seasonWebGPU.disposeDecalPipeline")]
+    internal static partial void DisposeDecalPipeline(string name);
+
     /// <summary>Registers a storage texture (write-only storage + sampleable) into the JS _textures dictionary.
     /// formatKind is aligned with ComputeStorageFormat (0=rgba8unorm, 1=rgba16float, used by the 2-1 bloom chain).</summary>
     [JSImport("globalThis.seasonWebGPU.createComputeTexture")]

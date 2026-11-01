@@ -63,6 +63,17 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         }
     }
 
+    /// <summary>D1 屏幕空间贴花：只依赖图形阶段的深度采样，不需要 compute，所以没有 ComputeSupported 门控。</summary>
+    public Season.Rendering.DecalPipeline? CreateDecalPipeline()
+    {
+        try { return new MTLDecalPipeline(DictionaryMtlTexture); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] 创建失败：{ex.Message}");
+            return null;
+        }
+    }
+
     readonly GlyphAtlasManager<MTLTexture> _glyphAtlas = new(
         2048, 2048,
         createAtlasTexture: (w, h) => MTLTexture.CreateEmpty((uint)w, (uint)h, "TextAtlas"),

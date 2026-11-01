@@ -573,6 +573,92 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
     }
 
     /// <summary>
+    /// D1 屏幕空间贴花的颜色-only render pass。
+    ///
+    /// <para>两个与场景 Pass 不同的关键点：</para>
+    /// <list type="number">
+    /// <item>没有任何 Clear：贴花是把颜色乘/加到已经画完的不透明结果上，Load 是唯一的正确选择。
+    /// 因此 <c>InitialLayout</c> 必须是 <c>ShaderReadOnlyOptimal</c>（上一段场景 Pass 的 finalLayout），
+    /// 不能用 <c>Undefined</c>，否则 Load 的内容未定义；</item>
+    /// <item>没有深度附件：本 Pass 的深度是采样源，同一个资源不能同时是附件。贴花的可见性完全来自
+    /// 深度重建与盒内裁剪，不做深度测试。</item>
+    /// </list>
+    ///
+    /// <para><paramref name="withNormal"/> 为真时挂第二个颜色附件（SceneNormal），供 s9 写粗糙度；
+    /// 两个形态的附件格式、采样数一致，但附件数量不同，是两个互不兼容的 render pass，
+    /// 后端必须按本帧的选择烘对应的 PSO。</para>
+    /// </summary>
+    internal static RenderPass CreateDecalRenderPassForFormat(Format colorFormat, bool withNormal)
+    {
+        var colorAttachment = new AttachmentDescription
+        {
+            Format = colorFormat,
+            Samples = SampleCountFlags.Count1Bit,
+            LoadOp = AttachmentLoadOp.Load,
+            StoreOp = AttachmentStoreOp.Store,
+            StencilLoadOp = AttachmentLoadOp.DontCare,
+            StencilStoreOp = AttachmentStoreOp.DontCare,
+            InitialLayout = ImageLayout.ShaderReadOnlyOptimal,
+            FinalLayout = ImageLayout.ShaderReadOnlyOptimal
+        };
+
+        var attachments = stackalloc AttachmentDescription[2] { colorAttachment, colorAttachment };
+        var colorRefs = stackalloc AttachmentReference[2]
+        {
+            new(0, ImageLayout.ColorAttachmentOptimal),
+            new(1, ImageLayout.ColorAttachmentOptimal)
+        };
+
+        var subpass = new SubpassDescription
+        {
+            PipelineBindPoint = PipelineBindPoint.Graphics,
+            ColorAttachmentCount = withNormal ? 2u : 1u,
+            PColorAttachments = colorRefs
+        };
+
+        var dependencies = stackalloc SubpassDependency[2]
+        {
+            // EXTERNAL -> 0: 上一段场景 Pass 的颜色与法线写入必须先可见，本段的 Load 才能读到它们；
+            // 贴花着色器还要采样深度，所以源阶段同时覆盖片元与计算采样。
+            new SubpassDependency
+            {
+                SrcSubpass = Vk.SubpassExternal,
+                DstSubpass = 0,
+                SrcStageMask = PipelineStageFlags.ColorAttachmentOutputBit | PipelineStageFlags.FragmentShaderBit
+                    | PipelineStageFlags.ComputeShaderBit | PipelineStageFlags.EarlyFragmentTestsBit | PipelineStageFlags.LateFragmentTestsBit,
+                SrcAccessMask = AccessFlags.ColorAttachmentWriteBit | AccessFlags.ShaderReadBit,
+                DstStageMask = PipelineStageFlags.ColorAttachmentOutputBit | PipelineStageFlags.FragmentShaderBit,
+                DstAccessMask = AccessFlags.ColorAttachmentWriteBit | AccessFlags.ShaderReadBit
+            },
+            // 0 -> EXTERNAL: 贴花写颜色完成 -> 本帧后续的雾/雨幕合成与透明阶段读该颜色（RAW）。
+            new SubpassDependency
+            {
+                SrcSubpass = 0,
+                DstSubpass = Vk.SubpassExternal,
+                SrcStageMask = PipelineStageFlags.ColorAttachmentOutputBit,
+                SrcAccessMask = AccessFlags.ColorAttachmentWriteBit,
+                DstStageMask = PipelineStageFlags.FragmentShaderBit | PipelineStageFlags.ComputeShaderBit,
+                DstAccessMask = AccessFlags.ShaderReadBit
+            }
+        };
+
+        var rpInfo = new RenderPassCreateInfo
+        {
+            SType = StructureType.RenderPassCreateInfo,
+            AttachmentCount = withNormal ? 2u : 1u,
+            PAttachments = attachments,
+            SubpassCount = 1,
+            PSubpasses = &subpass,
+            DependencyCount = 2,
+            PDependencies = dependencies
+        };
+
+        if (Device.Vk.CreateRenderPass(Device.LogicalDevice, in rpInfo, null, out var rp) != Result.Success)
+            throw new Exception("vkCreateRenderPass (decal) failed");
+        return rp;
+    }
+
+    /// <summary>
     /// Depth-only RP (shadow map): a single D32 attachment with Clear/Store
     /// (StoreDepth=true, so depth is itself the output),
     /// and finalLayout=ShaderReadOnlyOptimal for direct sampling by later passes.

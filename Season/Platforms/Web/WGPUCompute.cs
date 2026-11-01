@@ -174,3 +174,63 @@ internal sealed class WGPUParticleDrawPipeline : Season.Rendering.ParticleDrawPi
         WebGPUInterop.DisposeParticleDrawPipeline(_name);
     }
 }
+
+/// <summary>
+/// D1 屏幕空间贴花句柄。四条 PSO、两级绑定组与 Pass 身份校对全在 JS 侧，这边只做类型下转与一次性消费。
+/// 与雾/粒子不同的是：它不依赖 compute（深度只做采样源），所以没有 ComputeSupported 门控。
+/// 顶点端靠 draw(36,1,0,slot) 的 firstInstance 携带贴花槽位 —— WebGPU 没有 push constant。
+/// </summary>
+internal sealed class WGPUDecalPipeline : Season.Rendering.DecalPipeline
+{
+    static int _nextId;
+    readonly string _name = $"decal_{_nextId++}";
+    readonly StringBuilder _draws = new(256);
+    bool _disposed, _prepared;
+
+    internal bool Initialize() => WebGPUInterop.CreateDecalPipeline(_name, Season.Rendering.DecalShaders.Wgsl);
+
+    public override bool Prepare(in Season.Rendering.DecalInputs inputs, Season.Rendering.RenderTarget destination)
+    {
+        _prepared = false;
+        if (_disposed || inputs.Color is not WGPURenderTarget color || inputs.Depth is not WGPURenderTarget depth
+            || inputs.FrameBuffer is not WGPUStorageBuffer frame || destination is not WGPURenderTarget target)
+            return false;
+        // 法线是可选输入（不改粗糙度时为 null），但类型不对不能当空处理：那是后端混用。
+        if (inputs.Normal != null && inputs.Normal is not WGPURenderTarget) return false;
+        if (inputs.Count <= 0 || inputs.Count > Season.Rendering.DecalMath.MaxDecals) return false;
+        _prepared = WebGPUInterop.PrepareDecal(_name, color.Name, depth.Name,
+            (inputs.Normal as WGPURenderTarget)?.Name, frame.Id, BuildDrawsJson(inputs.Draws, inputs.Count),
+            inputs.WriteRoughness, target.Name);
+        return _prepared;
+    }
+
+    /// <summary>按绘制次序把 [槽位, 模式, 纹理名] 编成 JSON；纹理名为 null 表示着色器走程序化图案。</summary>
+    string BuildDrawsJson(Season.Rendering.DecalDraw[] draws, int count)
+    {
+        _draws.Clear().Append('[');
+        for (int i = 0; i < count; i++)
+        {
+            var draw = draws[i];
+            if (i > 0) _draws.Append(',');
+            _draws.Append('[').Append(draw.Index).Append(',').Append((int)draw.Mode).Append(',');
+            if (draw.Texture == null) _draws.Append("null");
+            else _draws.Append('"').Append(draw.Texture).Append('"');
+            _draws.Append(']');
+        }
+        return _draws.Append(']').ToString();
+    }
+
+    public override bool Draw()
+    {
+        if (_disposed || !_prepared) return false;
+        _prepared = false;
+        return WebGPUInterop.DrawDecal(_name);
+    }
+
+    public override void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true; _prepared = false;
+        WebGPUInterop.DisposeDecalPipeline(_name);
+    }
+}

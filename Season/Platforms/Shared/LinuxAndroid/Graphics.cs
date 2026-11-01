@@ -67,6 +67,16 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
     }
 
+    public Season.Rendering.DecalPipeline? CreateDecalPipeline()
+    {
+        try { return new VKDecalPipeline(DictionaryVKTexture); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] 创建失败：{ex.Message}");
+            return null;
+        }
+    }
+
     readonly GlyphAtlasManager<VkTexture> _glyphAtlas = new(
         2048, 2048,
         createAtlasTexture: (w, h) => VkTexture.CreateEmpty((uint)w, (uint)h, "TextAtlas"),

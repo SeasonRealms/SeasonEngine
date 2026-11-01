@@ -154,7 +154,7 @@ internal static class Device
     static MTLRenderPassDescriptor? _backbufferRpd;
 
     /// <summary>Pass debug labels used for encoder.Label and Xcode GPU capture markers in step 0. The index matches RenderPassId.</summary>
-    static readonly string[] _passLabels = { "Shadow", "Scene", "Post", "OutlineMask", "FinalBlit", "Overlay", "SceneOpaque", "FogComposite", "SceneTransparent", "WeatherComposite" };
+    static readonly string[] _passLabels = { "Shadow", "Scene", "Post", "OutlineMask", "FinalBlit", "Overlay", "SceneOpaque", "FogComposite", "SceneTransparent", "WeatherComposite", "SceneDecal" };
 
     /// <summary>Phase 4 current pass id, written by BeginPass and reset by EndPass.
     /// Pipeline.SetPipeline uses it to route OutlineMask passes to the mask PSO,
@@ -437,9 +437,11 @@ internal static class Device
             velocityRT = vrt;
         }
 
-        // A0.2: SceneNormal only ever rides on velocity (RenderQuality.EffectiveSceneNormals), at ColorAttachments[2].
+        // A0.2: SceneNormal normally rides on velocity (RenderQuality.EffectiveSceneNormals), at ColorAttachments[2].
+        // D1 例外：贴花 Pass 没有速度附件，SceneNormal 直接占颜色附件 1（见下面的绑定分支）。
         MTLRenderTarget? normalRT = null;
-        if (velocityRT != null && desc.NormalTarget is MTLRenderTarget nrt)
+        if ((velocityRT != null || desc.Id == Season.Rendering.RenderPassId.SceneDecal)
+            && desc.NormalTarget is MTLRenderTarget nrt)
         {
             if (nrt.Desc.MatchBackbufferSize)
                 nrt.EnsureSize(Display.Width, Display.Height);
@@ -449,6 +451,8 @@ internal static class Device
         MTLRenderPassDescriptor rpd;
         double vpWidth, vpHeight;
         bool depthOnly = false;
+        // D1：贴花只叠加不清屏，无论 PassDesc 怎么写都不允许 Clear —— 清掉的正是刚画完的不透明结果。
+        bool decalPass = desc.Id == Season.Rendering.RenderPassId.SceneDecal;
         var c = desc.ClearColor;
 
         if ((desc.ColorTarget ?? desc.DepthTarget) is MTLRenderTarget rt)
@@ -470,7 +474,9 @@ internal static class Device
             if (!depthOnly)
                 rpd.ColorAttachments[0].Texture = rt.ColorTexture;
             // 雾合成使用独立的无深度全屏管线；透明阶段再挂载原场景深度。
-            rpd.DepthAttachment.Texture = desc.Id is Season.Rendering.RenderPassId.FogComposite or Season.Rendering.RenderPassId.WeatherComposite
+            // D1 贴花的深度是采样源而不是附件：同一资源不能既采样又当深度附件。
+            rpd.DepthAttachment.Texture = desc.Id is Season.Rendering.RenderPassId.FogComposite
+                or Season.Rendering.RenderPassId.WeatherComposite or Season.Rendering.RenderPassId.SceneDecal
                 ? null : explicitDepth?.DepthTexture ?? rt.DepthTexture;
             // 颜色缺席时 rt 本身就是那张深度图（Shadow），它确实是本 Pass 的深度附件；
             // 否则只有显式深度 RT 算数，用的是 RT 自带的隐式深度时没有 RT 可记。
@@ -484,6 +490,10 @@ internal static class Device
                 if (normalRT != null && normalRT.ColorTexture != null)
                     rpd.ColorAttachments[2].Texture = normalRT.ColorTexture;
             }
+            // D1 贴花没有速度附件，SceneNormal 直接占颜色附件 1：附件下标必须从 0 起连续，
+            // 否则写 [[color(1)]] 的 PSO 与实际 Pass 不匹配。
+            else if (normalRT != null && normalRT.ColorTexture != null)
+                rpd.ColorAttachments[1].Texture = normalRT.ColorTexture;
 
             // Offscreen color and shadow depth will be sampled later by blit, Post, or 1-5,
             // so store behavior is expressed explicitly by PassDesc.
@@ -501,7 +511,7 @@ internal static class Device
         // which is important for tiler GPU bandwidth efficiency.
         if (!depthOnly)
         {
-            rpd.ColorAttachments[0].LoadAction = desc.ClearColorEnable ? MTLLoadAction.Clear : MTLLoadAction.Load;
+            rpd.ColorAttachments[0].LoadAction = desc.ClearColorEnable && !decalPass ? MTLLoadAction.Clear : MTLLoadAction.Load;
             rpd.ColorAttachments[0].StoreAction = MTLStoreAction.Store;
             rpd.ColorAttachments[0].ClearColor = new MTLClearColor(c.X, c.Y, c.Z, c.W);
 
@@ -515,9 +525,11 @@ internal static class Device
             }
             if (normalRT != null)
             {
-                rpd.ColorAttachments[2].LoadAction = desc.ClearColorEnable ? MTLLoadAction.Clear : MTLLoadAction.Load;
-                rpd.ColorAttachments[2].StoreAction = MTLStoreAction.Store;
-                rpd.ColorAttachments[2].ClearColor = new MTLClearColor(0, 0, 0, 0);
+                // 法线附件在双目标形状里是 2，贴花这种单目标加附件的形状里是 1。
+                int normalSlot = velocityRT != null ? 2 : 1;
+                rpd.ColorAttachments[normalSlot].LoadAction = desc.ClearColorEnable && !decalPass ? MTLLoadAction.Clear : MTLLoadAction.Load;
+                rpd.ColorAttachments[normalSlot].StoreAction = MTLStoreAction.Store;
+                rpd.ColorAttachments[normalSlot].ClearColor = new MTLClearColor(0, 0, 0, 0);
             }
         }
         rpd.DepthAttachment.LoadAction = desc.ClearDepthEnable ? MTLLoadAction.Clear : MTLLoadAction.Load;
@@ -533,8 +545,9 @@ internal static class Device
         ActiveColorTexture = rpd.ColorAttachments[0].Texture;
         // 从 rpd 回读而不是从 PassDesc 推断：雾合成会把深度置空，后备缓冲路径的深度又不来自任何 RT。
         ActiveDepthTexture = rpd.DepthAttachment.Texture;
-        ActiveVelocityTexture = rpd.ColorAttachments[1].Texture;
-        ActiveNormalTexture = normalRT != null ? rpd.ColorAttachments[2].Texture : null;
+        ActiveVelocityTexture = velocityRT != null ? rpd.ColorAttachments[1].Texture : null;
+        // 速度缺席时法线改占附件 1（D1 贴花 Pass），所以槽位只能从实际绑定反推。
+        ActiveNormalTexture = normalRT != null ? rpd.ColorAttachments[velocityRT != null ? 2 : 1].Texture : null;
 
         // Baseline binding replay:
         // each new pass encoder starts with cleared bindings,

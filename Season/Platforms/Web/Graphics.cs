@@ -447,6 +447,25 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         return null;
     }
 
+    /// <summary>
+    /// D1 屏幕空间贴花。只依赖图形阶段的深度采样（本 Pass 不挂深度附件），所以不像雾/粒子那样要求
+    /// compute/间接绘制能力；创建失败即返回 null，贴花效果整体不注册。
+    /// </summary>
+    public Season.Rendering.DecalPipeline? CreateDecalPipeline()
+    {
+        var pipeline = new WGPUDecalPipeline();
+        try
+        {
+            if (pipeline.Initialize()) return pipeline;
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] WebGPU 管线创建失败：{ex.Message}");
+        }
+        pipeline.Dispose();
+        return null;
+    }
+
     // 1-2 Contract 8: mirrored scene lighting (SceneLightParams, 976B after the 2-3 expansion). After
     // UpdateCamera3D injects exposure and jitter each frame, the whole block is uploaded into the shared
     // UBO at JS binding(10). It is no longer inlined into each per-object draw uniform
@@ -731,7 +750,10 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             depthTarget?.Name,
             (desc.VelocityTarget as WGPURenderTarget)?.Name,
             // A0.2: slot 2 only exists next to slot 1, matching the other three backends.
-            desc.VelocityTarget is WGPURenderTarget ? (desc.NormalTarget as WGPURenderTarget)?.Name : null);
+            // D1: 贴花 Pass 是例外 —— 它没有速度槽，SceneNormal 作为颜色附件 1 用来写粗糙度，
+            // 所以这里必须把“没有速度”与“不要法线槽”分开判断。
+            desc.VelocityTarget is WGPURenderTarget || desc.Id == Season.Rendering.RenderPassId.SceneDecal
+                ? (desc.NormalTarget as WGPURenderTarget)?.Name : null);
     }
 
     public void EndPass()
