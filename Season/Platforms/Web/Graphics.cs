@@ -462,7 +462,10 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         {
             DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] WebGPU 管线创建失败：{ex.Message}");
         }
-        pipeline.Dispose();
+        // 失败路径也要能安全收尾：JS 导出缺失时 Dispose 会再次抛绑定异常，
+        // 放任它冒泡就把「贴花不画」升级成「BaseApp.Create 失败」。
+        try { pipeline.Dispose(); }
+        catch (Exception ex) { DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] 失败句柄释放异常：{ex.Message}"); }
         return null;
     }
 
@@ -481,7 +484,10 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         {
             DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] WebGPU 管线创建失败：{ex.Message}");
         }
-        pipeline.Dispose();
+        // 同上：创建失败只是在数据层面降级（有水面但不画），不能让 Dispose 的绑定异常
+        // 把整个 Create 打断 —— 旧日志里的「Create exception」就是这么来的。
+        try { pipeline.Dispose(); }
+        catch (Exception ex) { DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] 失败句柄释放异常：{ex.Message}"); }
         return null;
     }
 

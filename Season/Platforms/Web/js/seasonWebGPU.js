@@ -4386,6 +4386,17 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         state.prepared = null; state.refs = null; state.group = null;
     }
 
+    // WGSL 编译错误只会以 "[Invalid ShaderModule ...] is invalid due to a previous error" 的形式
+    // 冒到管线校验里，真正的行列信息只在 getCompilationInfo 里；不主动取就等于把诊断丢掉。
+    function _logShaderErrors(label, module) {
+        if (typeof module.getCompilationInfo !== 'function') return;
+        module.getCompilationInfo().then(info => {
+            for (const message of info.messages)
+                if (message.type === 'error')
+                    console.error(`着色器编译失败 '${label}' ${message.lineNum}:${message.linePos} ${message.message}`);
+        }).catch(() => {});
+    }
+
     // D1 屏幕空间贴花（RenderPassId.SceneDecal=10）：WGSL 全由 C# 下发，JS 只持有四条 PSO
     // （Modulate/Additive × 是否写粗糙度）、两级绑定组与那一串 36 顶点的 draw。
     // 本 Pass 没有深度附件：深度在这一帧只是采样源，同一资源不能既采样又当附件。
@@ -4418,6 +4429,7 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
                 addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
             const layout = device.createPipelineLayout({ bindGroupLayouts: [state.layout, state.textureLayout] });
             const module = device.createShaderModule({ label: `${name}_wgsl`, code });
+            _logShaderErrors(`${name}_wgsl`, module);
             // 1x1 占位贴图：程序化贴花没有纹理名，着色器不会采样，但绑定仍必须合法；
             // 又不能拿本 Pass 的附件顶替 —— 同个资源不能既当附件又当采样源。
             state.placeholder = device.createTexture({ label: `${name}_placeholder`, size: [1, 1],
@@ -4638,6 +4650,7 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
                 addressModeU: 'repeat', addressModeV: 'repeat' });
             const layout = device.createPipelineLayout({ bindGroupLayouts: [state.layout, state.textureLayout] });
             const module = device.createShaderModule({ label: `${name}_wgsl`, code });
+            _logShaderErrors(`${name}_wgsl`, module);
             // 1x1 占位：没有法线贴图的水面、以及天空 LUT 缺席（StaticCube 档）时都靠它顶位；
             // 又不能拿本 Pass 的附件顶替 —— 同个资源不能既当附件又当采样源。
             state.placeholder = device.createTexture({ label: `${name}_placeholder`, size: [1, 1],

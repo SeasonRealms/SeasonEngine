@@ -136,7 +136,9 @@ fn decalEval(pixel : vec2<f32>, slot : u32) -> DecalEvalResult {
             alpha = texel.a;
         } else {
             // 无纹理时的程序化图案：验证深度重建用，图案跟着地形起伏就说明重建对了。
-            let checker = select(0.45, 1.0, fmod(floor(uv.x * 4.0) + floor(uv.y * 4.0), 2.0) < 0.5);
+            // WGSL 没有 fmod：浮点取余只有 `%`（e1 - e2*trunc(e1/e2)，与另外三端 fmod 同号），
+            // 写成 fmod(...) 会让整个模块编译失败，连顶点入口一起被判无效。
+            let checker = select(0.45, 1.0, ((floor(uv.x * 4.0) + floor(uv.y * 4.0)) % 2.0) < 0.5);
             albedo = albedo * checker * (0.55 + 0.45 * sin(length(local.xz) * 18.0));
         }
         shade = clamp(edge * edge * (3.0 - 2.0 * edge), 0.0, 1.0) * grazing * alpha;
