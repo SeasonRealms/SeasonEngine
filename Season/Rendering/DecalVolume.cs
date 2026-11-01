@@ -126,11 +126,22 @@ public sealed class DecalVolume
     internal Matrix4x4 WorldMatrix =>
         Matrix4x4.CreateScale(Size) * Matrix4x4.CreateFromQuaternion(Rotation) * Matrix4x4.CreateTranslation(Position);
 
-    /// <summary>世界→局部的归一化变换，贴花着色器用它把世界点折到 [-1,1]³ 里取 UV。</summary>
+    /// <summary>
+    /// 世界→局部的归一化变换，贴花着色器用它把世界点折到 [-1,1]³ 里取 UV。
+    ///
+    /// 它是 <see cref="WorldMatrix"/> 的逆再乘一个统一的 2 倍缩放（逆把偏移折到 [-0.5,0.5]³，乘 2 才是
+    /// [-1,1]³），所以乘法次序必须倒过来：先减去中心、再撤销旋转、最后把「边长」缩成「半宽 1」。
+    /// System.Numerics 是行向量约定（<c>p * A * B</c> 表示先应用 A），
+    /// 写成 <c>Scale * Rot^-1 * Translate(-P)</c> 会把「先缩放再平移」作用到世界坐标上，
+    /// 映射出来的 local 与世界位置无关（等于 <c>p * 2/Size - P</c>），盒内判定于是整体错位：
+    /// 本该贴在水池上的贴花会跑到 <c>P * Size / 2</c> 附近的草地上，Additive 的那块就是一个
+    /// 与水池无关的发光方块。着色器的 <c>all(abs(local)&lt;=1)</c> 与 <see cref="SceneDecals.Contains"/> 共用
+    /// 这个矩阵，写错不会报错，只会静默错位。
+    /// </summary>
     internal Matrix4x4 WorldToLocalMatrix =>
-        Matrix4x4.CreateScale(new Vector3(2f) / Size)
+        Matrix4x4.CreateTranslation(-Position)
         * Matrix4x4.CreateFromQuaternion(Quaternion.Conjugate(Rotation))
-        * Matrix4x4.CreateTranslation(-Position);
+        * Matrix4x4.CreateScale(new Vector3(2f) / Size);
 
     /// <summary>保守的世界 AABB（旋转盒的轴对齐包围），用于视锥剔除；比 OBB 精确测试多留一点误收，对剔除无害。</summary>
     internal void GetBounds(out Vector3 center, out Vector3 extents)

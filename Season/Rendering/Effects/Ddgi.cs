@@ -1246,7 +1246,11 @@ float3 EvalLights(float3 p, float3 N, float voxel, float ext, uint steps, float 
             float3 toLight = posRange.xyz - p;
             float dist = length(toLight);
             L = toLight / max(dist, 0.0001);
-            attenuation = 1.0 / max(dist * dist, 0.0001);
+            // Near-field softening. Probe spacing is far larger than the light itself, so a hit point
+            // right next to a punctual light (the 0.7 m campfire) makes 1/d^2 reach 150, and a 2 m probe
+            // grid can only smear that spike into a grid-aligned square. 0.25 means the nearest 0.5 m,
+            // i.e. the light behaves like a 0.5 m sphere, capping the spike at 4.
+            attenuation = 1.0 / max(dist * dist, 0.25);
             float range = posRange.w;
             if (range > 0.0)
             {
@@ -1654,7 +1658,8 @@ vec3 EvalLights(vec3 p, vec3 N, float voxel, float ext, uint steps, float punctu
             vec3 toLight = posRange.xyz - p;
             float dist = length(toLight);
             L = toLight / max(dist, 0.0001);
-            attenuation = 1.0 / max(dist * dist, 0.0001);
+            // Same near-field softening as the HLSL variant: 0.25 means the nearest 0.5 m.
+            attenuation = 1.0 / max(dist * dist, 0.25);
             float range = posRange.w;
             if (range > 0.0)
             {
@@ -2043,7 +2048,8 @@ static float3 EvalLights(const device float4* lights, texture3d<float> sdf, samp
             float3 toLight = posRange.xyz - p;
             float dist = length(toLight);
             L = toLight / max(dist, 0.0001);
-            attenuation = 1.0 / max(dist * dist, 0.0001);
+            // Same near-field softening as the HLSL variant: 0.25 means the nearest 0.5 m.
+            attenuation = 1.0 / max(dist * dist, 0.25);
             float range = posRange.w;
             if (range > 0.0)
             {
@@ -2462,7 +2468,8 @@ fn EvalLights(p : vec3<f32>, N : vec3<f32>, voxel : f32, ext : f32, steps : u32,
             let toLight = posRange.xyz - p;
             let dist = length(toLight);
             L = toLight / max(dist, 0.0001);
-            attenuation = 1.0 / max(dist * dist, 0.0001);
+            // Same near-field softening as the HLSL variant: 0.25 means the nearest 0.5 m.
+            attenuation = 1.0 / max(dist * dist, 0.25);
             let range = posRange.w;
             if (range > 0.0)
             {

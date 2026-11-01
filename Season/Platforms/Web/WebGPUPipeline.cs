@@ -224,10 +224,13 @@ struct SceneLights {
     // x=max distance in km (>0 enables AP; the only gate), y=Intensity (0 = identity blend).
     // JS-side SCENE_LIGHT_BYTES must stay synchronized.
     apParams0: vec4f,               // offset 1360
-    // 区域天气：头两行后每区域八行；前缀 1376B 保持，总长 2432B。
+    // 区域天气：头两行后每区域八行；前缀 1376B 保持，总长 2448B。
     weatherParams0: vec4f,          // offset 1376
     weatherParams1: vec4f,          // offset 1392
     weatherRegions: array<vec4f, 64>, // offset 1408
+    // 2-7 雷电 (offset 2432)：xyz = 当前主导雷击在云内的世界坐标 / w = 回击包络亮度 0~1。
+    // w 是唯一总开关；非雷暴天气、区域质量 Off、Showcase 模式下整个字段为零。
+    weatherFlash: vec4f,            // offset 2432，尾部 2448B
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -285,6 +288,7 @@ struct SceneLights {
 @group(0) @binding(18) var uCloudNoise: texture_2d<f32>;
 fn WeatherH(i: i32) -> vec4f { return select(uLights.weatherParams1,uLights.weatherParams0,i==0); }
 fn WeatherR(i: i32,row: i32) -> vec4f { return uLights.weatherRegions[i*8+row]; }
+fn WeatherFlash() -> vec4f { return uLights.weatherFlash; }
 fn WeatherNoise(uv: vec2f) -> vec4f { return textureSampleLevel(uCloudNoise,uWrapSampler,uv,0.0); }
 """ + Season.Rendering.Effects.WeatherShaders.CommonWgsl
     + Season.Rendering.Effects.WeatherShaders.CloudWgsl
@@ -301,6 +305,24 @@ fn WeatherNoise(uv: vec2f) -> vec4f { return textureSampleLevel(uCloudNoise,uWra
 // texture to be sampled non-comparatively only through a non-filtering sampler, which is also what the blocker search wants
 // - a filtered depth across a silhouette lies on no surface. This is a sampler slot only; the texture is unchanged.
 @group(0) @binding(21) var uShadowPointSampler: sampler;
+// 2-7 P0: 程序化天空的 Sky-View LUT（binding 23），PBR 的环境镜面源。
+// 与 binding 15 的 uEnvCube 并行而不是替换：两者互斥，由 skyParams0.w 在 uniform 分支里二选一，
+// 所以两张图都必须有合法绑定（未就绪时 JS 绑 1x1 白）。
+// 白衣不会被采到：写入 skyParams0.w 的前提正是 SkyViewTexture 非空。
+// 与 uAerialLut 一样复用 binding 1 的 uSampler（线性 Clamp），不另占采样器槽。
+@group(0) @binding(23) var uSkyView: texture_2d<f32>;
+
+// 2-7 P0：采样 Sky-View LUT 取反射方向的辐射度。
+// 参数化与 renderMode == 3 的天空球、以及 skyView 计算内核的反解逐字节对齐：
+// u 接缝在 +Z，v 用 sqrt 折叠把分辨率往地平线集中。LUT 无 mip，只能采 level 0——
+// 接缝两侧的 fwidth 会选出错误的 level。
+fn SampleSkyViewRadiance(d: vec3f) -> vec3f {
+    // 1/(2*PI) 写成字面量，避开与常量重名。
+    var uv: vec2f;
+    uv.x = atan2(d.x, -d.z) * 0.15915494309 + 0.5;
+    uv.y = 0.5 - 0.5 * sign(d.y) * sqrt(abs(d.y));
+    return textureSampleLevel(uSkyView, uSampler, uv, 0.0).rgb;
+}
 
 fn getMorphWeight(weights: vec4f, index: u32) -> f32 {
     switch (index) {
@@ -1449,10 +1471,30 @@ fn shade(input: ShadeInput) -> vec4f {
     // 1-7 Contract Clause 6: use mirrored reflection from the radiance cube at LOD0 for the specular term.
     // There is no mip chain and no GGX prefiltering, so it is masked by (1-roughness)^2.
     // The ambient energy of rough surfaces is carried by the SH9 diffuse term above.
+    // 2-7 P0：程序化天空下 EnvironmentMap 停在 Diffuse 档（没有 radiance cube），环境镜面改由 Sky-View LUT 提供。
+    // 两者互斥，且 skyParams0.w 是 UBO 常量，所以这里是一个 uniform 分支，只采一次；
+    // 同时它也蕴含了 envParams.w，不必再查环境图是否就绪。
+    // LUT 是没有任何预滤波的全分辨率天空，只适合接近镜面的表面，因此再叠一次 (1-roughness)^2，
+    // 总权重退化为 (1-r)^4；粗糙面的环境能量仍由 SH9 漫反射承担。
     let R = reflect(-V, N);
-    let envSpecular = textureSampleLevel(uEnvCube, uSampler, R, 0.0).rgb * uLights.envParams.x;
-    let specMask = (1.0 - roughness) * (1.0 - roughness);
-    ambient += envSpecular * F0 * specMask * ao * step(0.5, uLights.envParams.w);
+    var specMask = (1.0 - roughness) * (1.0 - roughness);
+    var reflectionRadiance: vec3f;
+    var specGate: f32;
+    if (uLights.skyParams0.w > 0.0) {
+        reflectionRadiance = SampleSkyViewRadiance(R);
+        specMask *= specMask;
+        specGate = 1.0;
+    } else {
+        reflectionRadiance = textureSampleLevel(uEnvCube, uSampler, R, 0.0).rgb;
+        specGate = step(0.5, uLights.envParams.w);
+    }
+    ambient += reflectionRadiance * uLights.envParams.x * F0 * specMask * ao * specGate;
+
+    // 2-7：雷击对地面的均匀照亮。走环境项而不是瞬时点光：云底到地面的距离让 1/d² 退化成
+    // 一成不变的亮度，还会在 8 盏光的预算里挤掉场景灯。
+    if (uLights.weatherFlash.w > 0.0) {
+        ambient += albedo * ao * (1.0 - metallic) * uLights.weatherFlash.w * vec3f(0.55, 0.62, 0.85) * 0.8;
+    }
 
     var color = ambient + Lo + emissive;
     // 2-5 Step E: add aerial perspective.

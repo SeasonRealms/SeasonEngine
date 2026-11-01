@@ -4,7 +4,7 @@
 
 namespace Season.Platforms.Web;
 
-internal sealed class WGPUInstancedMesh3D
+internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
 {
     public string Name { get; }
 
@@ -53,6 +53,31 @@ internal sealed class WGPUInstancedMesh3D
     Vector4 _outline2DInstanceColor;
     float _outline2DInstanceWidth;
 
+    // === A7 逐实例 GPU 剔除 ===
+    // Web 这一端没有"group"对象，剔除目标只能挂在网格实例宿主上；C# 侧只持有 StorageBuffer 的 JS 句柄，
+    // 真正的 GPUBuffer 在 JS 的 _storageBuffers[Id] 里。与另外三端的一处结构差异是本类的实例流
+    // 每帧由 C# 逐字节下发，所以 _cullSource 的上传点与 InstanceBytes 共用同一个时点，不需要额外挂勾。
+
+    Season.Rendering.StorageBuffer? _cullSource;
+    Season.Rendering.StorageBuffer? _cullSorted;
+    Season.Rendering.StorageBuffer? _cullArgs;
+    Season.Rendering.StorageBuffer? _cullVisible;
+    Season.Rendering.StorageBuffer? _cullPrimInfo;
+    int _cullCapacity = -1;
+    int _cullPrimitiveCount = -1;
+    bool _cullRegistered;
+    Vector3 _cullLocalCenter;
+    Vector3 _cullLocalExtents;
+    bool _cullDrawReady;
+
+    /// <summary>
+    /// 参数表签名：一位一个 surface，取与 <c>DrawInstancedMesh3DShadow</c> 完全相同的谓词（非透明 + 有几何 + 已上传）。
+    /// 用位掩码而不是计数是因为只比个数会把"少一个 surface、多一个 surface"当成没变，
+    /// 而 indexCount 一旦错位画出来就是错的。
+    /// </summary>
+    int _cullPrimMask = -1;
+    readonly int[] _cullPrimIndexCounts = new int[Season.Rendering.InstanceCull.MaxPrimitives];
+
     public WGPUInstancedMesh3D(string name)
     {
         Name = name;
@@ -93,6 +118,7 @@ internal sealed class WGPUInstancedMesh3D
             Outline2DHostActive = false;
             Outline2DMaskColor = default;
             Outline2DMaskWidth = 0f;
+            _cullDrawReady = false;
             return;
         }
 
@@ -201,6 +227,10 @@ internal sealed class WGPUInstancedMesh3D
         InstanceBytes = FillInstanceBytes(writeTarget, InstanceWorlds);
         TransformInitialized = true;
         MeshAlpha = mesh.Alpha;
+
+        // A7：剔除输入与 IA 实例流逐位相同（都是 20 floats = 80B，与 InstanceCull.WorldStride 一致），
+        // 所以直接复用 InstanceBytes，不多存一份副本。
+        UpdateCullUpload(mesh);
     }
 
     /// <summary>Unified highlight (wireframe shell): lazily builds merged template shell geometry.
@@ -243,6 +273,263 @@ internal sealed class WGPUInstancedMesh3D
             InstanceBoundsBoxes.Add(WebBoundsBox.Create($"{Name}:INST:{InstanceBoundsBoxes.Count}"));
         return InstanceBoundsBoxes[index];
     }
+
+    // ============================================================
+    // A7 逐实例 GPU 剔除
+    // ============================================================
+
+    int Season.Rendering.IInstanceCullTarget.CullInstanceCount => EnabledInstanceCount;
+
+    int Season.Rendering.IInstanceCullTarget.CullCapacity => _cullCapacity;
+
+    /// <summary>参数表尚未与绘制端对齐时回落为 0，于是共享层早退、本网格退回 CPU 整批剔除，
+    /// 而不是拿错位的索引区间去画。</summary>
+    int Season.Rendering.IInstanceCullTarget.CullPrimitiveCount => _cullPrimitiveCount;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSourceWorlds => _cullSource;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSortedWorlds => _cullSorted;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullPrimitiveInfo => _cullPrimInfo;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullArgs => _cullArgs;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullVisible => _cullVisible;
+
+    Vector3 Season.Rendering.IInstanceCullTarget.CullLocalCenter => _cullLocalCenter;
+
+    Vector3 Season.Rendering.IInstanceCullTarget.CullLocalExtents => _cullLocalExtents;
+
+    /// <summary>本帧能否直接走间接阴影绘制：容量、句柄、参数表三项任一不就绪就为 false。</summary>
+    internal bool TryGetCullDrawHandles(out string sortedId, out string argsId, out int capacity)
+    {
+        sortedId = string.Empty;
+        argsId = string.Empty;
+        capacity = 0;
+        if (!_cullDrawReady || _cullCapacity <= 0 || _cullCapacity < EnabledInstanceCount)
+            return false;
+        if (_cullPrimitiveCount <= 0)
+            return false;
+        if (_cullSorted is not WGPUStorageBuffer sorted || _cullArgs is not WGPUStorageBuffer args)
+            return false;
+        sortedId = sorted.Id;
+        argsId = args.Id;
+        capacity = _cullCapacity;
+        return true;
+    }
+
+    /// <summary>每帧 Update 末尾调用一次，与 InstanceBytes 的上传同居一个时点。</summary>
+    void UpdateCullUpload(Season.Controls.InstancedMesh3D mesh)
+    {
+        _cullDrawReady = false;
+        if (EnabledInstanceCount <= 0)
+            return;
+
+        EnsureCullResources(EnabledInstanceCount, mesh);
+        if (_cullSource == null)
+            return;
+
+        int bytes = EnabledInstanceCount * (int)Season.Rendering.InstanceCull.WorldStride;
+        Season.Basic.Graphics.Instance.TryUpdateStorageBuffer(_cullSource,
+            new ReadOnlySpan<byte>(InstanceBytes, 0, bytes));
+    }
+
+    /// <summary>
+    /// 按实例数准备剔除资源。容量按 64 对齐，于是实例数小幅抖动不会每帧重建五个缓冲；
+    /// 但接口上报的容量必须是真实容量，否则序号表会按本帧实例数寻址而与内核写入错位。
+    /// </summary>
+    void EnsureCullResources(int count, Season.Controls.InstancedMesh3D mesh)
+    {
+        if (!Season.Rendering.InstanceCull.Enabled)
+        {
+            ReleaseCullResources();
+            return;
+        }
+        // 实例数掉到 0 不等于要释放：隐藏再显示会因此每帧重建五个缓冲。
+        if (count <= 0)
+            return;
+
+        int capacity = (count + 63) / 64 * 64;
+        if (_cullCapacity != capacity || _cullSorted == null)
+        {
+            ReleaseCullResources();
+            try
+            {
+                var g = Season.Basic.Graphics.Instance;
+                _cullSource = g.CreateStorageBuffer((uint)capacity * Season.Rendering.InstanceCull.WorldStride);
+                _cullSorted = g.CreateStorageBuffer(Season.Rendering.InstanceCull.SortedBytes(capacity),
+                    Season.Rendering.StorageBufferUsage.ComputeAndVertexInput);
+                _cullVisible = g.CreateStorageBuffer((uint)(Season.Rendering.InstanceCull.MaxSlots * capacity) * 4u);
+                _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsBytes,
+                    Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs);
+                _cullPrimInfo = g.CreateStorageBuffer(
+                    (uint)Season.Rendering.InstanceCull.MaxPrimitives * Season.Rendering.InstanceCull.PrimitiveInfoStride);
+            }
+            catch (Exception ex)
+            {
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] 缓冲创建失败：{ex.Message}");
+            }
+
+            if (_cullSource == null || _cullSorted == null || _cullVisible == null
+                || _cullArgs == null || _cullPrimInfo == null)
+            {
+                ReleaseCullResources();
+                return;
+            }
+
+            _cullCapacity = capacity;
+            _cullPrimitiveCount = -1;
+            _cullPrimMask = -1;
+        }
+
+        EnsureCullPrimitiveInfo(mesh);
+        UpdateCullLocalBounds(mesh);
+
+        if (!_cullRegistered)
+        {
+            Season.Rendering.InstanceCull.Register(this);
+            _cullRegistered = true;
+        }
+    }
+
+    /// <summary>
+    /// 参数表的索引区间必须与 <c>DrawInstancedMesh3DShadow</c> 的迭代顺序逐位对齐，
+    /// 所以谓词取完全相同的一份：非透明 + 有几何 + 已上传。
+    /// </summary>
+    void EnsureCullPrimitiveInfo(Season.Controls.InstancedMesh3D mesh)
+    {
+        if (_cullPrimInfo == null)
+            return;
+
+        int surfaces = mesh.Surfaces.Count;
+        if (surfaces > 31)
+        {
+            // 一位一个 surface 才装得下；装不下就明确放弃本网格的 GPU 剔除，而不是取前 16 个就当完事。
+            _cullPrimitiveCount = 0;
+            _cullPrimMask = -1;
+            return;
+        }
+
+        int mask = 0;
+        int n = 0;
+        for (int i = 0; i < surfaces; i++)
+        {
+            var surface = mesh.Surfaces[i];
+            if (surface.Vertices == null || surface.Indices == null || surface.Vertices.Length == 0)
+                continue;
+            if (surface.Mode == SurfaceBlendMode.Blend)
+                continue;
+            if (!SurfaceCaches.TryGetValue(surface, out var cache) || !cache.Uploaded)
+                continue;
+            if (n >= Season.Rendering.InstanceCull.MaxPrimitives)
+            {
+                _cullPrimitiveCount = 0;
+                _cullPrimMask = -1;
+                return;
+            }
+
+            _cullPrimIndexCounts[n] = surface.Indices.Length;
+            mask |= 1 << i;
+            n++;
+        }
+
+        if (mask == _cullPrimMask && _cullPrimitiveCount == n)
+            return;
+
+        _cullPrimitiveCount = 0;
+        if (n <= 0)
+        {
+            _cullPrimMask = -1;
+            return;
+        }
+
+        int stride = (int)Season.Rendering.InstanceCull.PrimitiveInfoStride;
+        var bytes = new byte[n * stride];
+        for (int i = 0; i < n; i++)
+            Season.Rendering.InstanceCull.WritePrimitiveInfo(bytes, i * stride, (uint)_cullPrimIndexCounts[i], 0u, 0);
+
+        if (Season.Basic.Graphics.Instance.TryUpdateStorageBuffer(_cullPrimInfo, bytes))
+        {
+            _cullPrimMask = mask;
+            _cullPrimitiveCount = n;
+        }
+    }
+
+    /// <summary>
+    /// 组级合并盒：内核只收一个盒，所以把全部 surface 的顶点局部 AABB 并起来。
+    /// 几何在加载后不变，所以在拿到首个非退化盒之后就不再重算，不进每帧热路径。
+    /// </summary>
+    void UpdateCullLocalBounds(Season.Controls.InstancedMesh3D mesh)
+    {
+        if (_cullLocalExtents.LengthSquared() > 0f)
+            return;
+
+        var min = new Vector3(float.MaxValue);
+        var max = new Vector3(float.MinValue);
+        foreach (var surface in mesh.Surfaces)
+        {
+            var vertices = surface.Vertices;
+            if (vertices == null)
+                continue;
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                var p = vertices[i].Position;
+                min = Vector3.Min(min, p);
+                max = Vector3.Max(max, p);
+            }
+        }
+
+        if (min.X > max.X)
+        {
+            _cullLocalCenter = Vector3.Zero;
+            _cullLocalExtents = Vector3.Zero;
+            return;
+        }
+
+        _cullLocalCenter = (min + max) * 0.5f;
+        _cullLocalExtents = (max - min) * 0.5f;
+    }
+
+    /// <summary>
+    /// A7：在三次派发之后由 InstanceCullEffect 回调，核定本帧能否走间接绘制。
+    /// Web 没有显式屏障可发：compute pass 与 render pass 的命令次序加 queue 提交顺序就是同步点，
+    /// 与 Metal 同属“提交模型代管”的一侧，所以这里只做准入校验。
+    /// </summary>
+    public bool PrepareCullDraw()
+    {
+        _cullDrawReady = false;
+        if (_cullSorted is not WGPUStorageBuffer) return false;
+        if (_cullArgs is not WGPUStorageBuffer args) return false;
+        if (_cullCapacity <= 0 || _cullPrimitiveCount <= 0) return false;
+
+        if (!Season.Basic.Graphics.Instance.TryPrepareIndirectArgs(args)) return false;
+
+        _cullDrawReady = true;
+        return true;
+    }
+
+    void ReleaseCullResources()
+    {
+        if (_cullRegistered)
+        {
+            Season.Rendering.InstanceCull.Unregister(this);
+            _cullRegistered = false;
+        }
+        _cullSource?.Dispose(); _cullSource = null;
+        _cullSorted?.Dispose(); _cullSorted = null;
+        _cullArgs?.Dispose(); _cullArgs = null;
+        _cullVisible?.Dispose(); _cullVisible = null;
+        _cullPrimInfo?.Dispose(); _cullPrimInfo = null;
+        _cullCapacity = -1;
+        _cullPrimitiveCount = -1;
+        _cullPrimMask = -1;
+        _cullLocalCenter = Vector3.Zero;
+        _cullLocalExtents = Vector3.Zero;
+        _cullDrawReady = false;
+    }
+
+    /// <summary>卸载时把剔除目标从共享层撤掉，否则列表里会留下指向已死 JS 句柄的引用。</summary>
+    public void Dispose() => ReleaseCullResources();
 
     // Writes instance world matrices into a persistent byte buffer
     // (reallocated only when capacity changes), and returns the reused or newly created buffer.

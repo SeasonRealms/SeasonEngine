@@ -60,6 +60,19 @@ public enum AoMode
     Gtao,
 }
 
+/// <summary>
+/// P3 屏幕空间反射档位：互斥且初始化时固定，与 <see cref="AoMode"/> / <see cref="GiMode"/> 同一套约定。
+/// 只有一档算法，质量伸缩改的是射线长度、厚度容差与采样步数，不切换实现。
+/// </summary>
+public enum SsrMode
+{
+    /// <summary>关闭。不建 Hi-Z 金字塔，也不建反射目标，整条链零残留。</summary>
+    Off,
+
+    /// <summary>P3：Hi-Z 加速的屏幕空间步进（深度金字塔整块跳过 + 命中后细化 + 天空/离屏回退）。</summary>
+    HiZ,
+}
+
 /// <summary>Global illumination mode (2-4 contract clause 1: mutually exclusive and fixed at initialization). See the RenderQuality class header for fallback rules.
 /// No side branches such as screen-space GI are pre-added: quality scaling changes parameters (SDF resolution / probe count / ray count / amortization divisor, see clause 11)
 /// rather than switching algorithms, matching the AoMode policy.</summary>
@@ -442,6 +455,18 @@ public class RenderQuality
 
     public static FogQuality DefaultVolumetricFog = FogQuality.Off;
     public static float DefaultFogHistoryWeight = 0.85f;
+
+    /// <summary>Default value for ScreenSpaceReflections (overrideable in the app constructor and captured by Init()).</summary>
+    public static SsrMode DefaultScreenSpaceReflections = SsrMode.Off;
+
+    /// <summary>Default value for SsrMaxDistance: how far a reflection ray may travel, in world units.</summary>
+    public static float DefaultSsrMaxDistance = 60f;
+
+    /// <summary>Default value for SsrThickness: view-space depth a ray must fall behind a surface to count as a hit.</summary>
+    public static float DefaultSsrThickness = 0.6f;
+
+    /// <summary>Default value for SsrIntensity: linear multiplier on the composited reflection radiance.</summary>
+    public static float DefaultSsrIntensity = 1f;
 
     /// <summary>Default value for TextureMipmaps (overrideable in the app constructor and captured by Init()).</summary>
     public static bool DefaultTextureMipmaps = true;
@@ -891,6 +916,31 @@ public class RenderQuality
 
     /// <summary>局部散射源项的历史权重，0 关闭历史；不对累计透射率做时域混合。</summary>
     public float FogHistoryWeight { get; set; } = DefaultFogHistoryWeight;
+
+    /// <summary>
+    /// P3 屏幕空间反射档位。初始化时固定：Hi-Z 金字塔的级数与反射目标的形状都按它分配，
+    /// 运行期再改只会影响下一次 Initialize，不会重建已有资源。
+    /// 依赖 <see cref="EffectiveSceneNormals"/>：反射方向必须取自场景法线目标，
+    /// 从深度现场重建的法线在轮廓两侧会翻转，反射会顺着轮廓糊成一片。
+    /// </summary>
+    public SsrMode ScreenSpaceReflections { get; set; } = DefaultScreenSpaceReflections;
+
+    /// <summary>反射射线的世界空间最大长度。太长会把远处本不该出现在反射里的几何拉进来，太短则掠射角只剩天空。</summary>
+    public float SsrMaxDistance { get; set; } = DefaultSsrMaxDistance;
+
+    /// <summary>射线落到表面之后多少个视空间单位仍算命中。薄表面比它窄时会被穿透，表现为反射"漏"到背后的物体上。</summary>
+    public float SsrThickness { get; set; } = DefaultSsrThickness;
+
+    /// <summary>合成时的线性强度倍率；0 相当于只保留 Hi-Z 的构建成本而不显示反射。</summary>
+    public float SsrIntensity { get; set; } = DefaultSsrIntensity;
+
+    /// <summary>
+    /// P3：屏幕空间反射对显式 SceneDepth 与法线目标的需求。与雾、贴花同一形态 —— 三者共享同一张显式深度，
+    /// 任一需求成立后端就必须把 SceneDepth 建出来；法线目标另由 <see cref="EffectiveSceneNormals"/> 决定，
+    /// 这里只声明依赖，不负责开关它。
+    /// </summary>
+    public bool RequiresReflectionSceneDepth(bool hdrSceneColor, bool computeSupported, bool immediate2D)
+        => ScreenSpaceReflections != SsrMode.Off && hdrSceneColor && computeSupported && !immediate2D;
 
     public int FogShadowSamples => VolumetricFog == FogQuality.Low ? 1 : 4;
 

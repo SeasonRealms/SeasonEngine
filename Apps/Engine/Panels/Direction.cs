@@ -195,8 +195,13 @@ internal class Direction : Panel
     // A short press steps 0.1m exactly like a button tap, while holding a key moves continuously
     // at RunSpeed scaled by frame time. Every direction reuses MovePlayer, so collision,
     // floor settle, camera follow and Run/Idle switching stay identical to touch input.
+    // Ctrl combos are application shortcuts, not movement: Ctrl+S takes a screenshot (App.Update),
+    // and without this guard the same keypress would also turn the character and step it backwards
+    // inside the very frame that gets captured.
     void UpdateKeyboardInput(float time)
     {
+        if (KeyboardService.Ctrl) return;
+
         float step = RunSpeed * time;
 
         if (KeyboardService.IsPressed(Key.W)) MovePlayer(0f, 0.1f, YawFront);

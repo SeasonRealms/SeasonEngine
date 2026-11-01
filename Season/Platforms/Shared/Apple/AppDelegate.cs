@@ -1057,7 +1057,9 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         if (!immediate2D && Season.Rendering.FrameSchedule.SceneDepth == null
             && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresAtmosphereSceneDepth(
                 MtlDevice.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)
-                || RenderQuality.Current.RequiresDecalSceneDepth(MtlDevice.HdrSceneColor, immediate2D)))
+                || RenderQuality.Current.RequiresDecalSceneDepth(MtlDevice.HdrSceneColor, immediate2D)
+                || RenderQuality.Current.RequiresReflectionSceneDepth(MtlDevice.HdrSceneColor,
+                    Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)))
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {

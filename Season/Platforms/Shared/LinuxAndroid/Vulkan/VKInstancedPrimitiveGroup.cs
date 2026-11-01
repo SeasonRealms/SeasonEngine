@@ -36,7 +36,7 @@ internal struct InstanceTransformData
 /// Derived classes: VKInstancedModel (glTF template cloning) /
 /// VKInstancedMesh3D (code-generated geometry).
 /// </summary>
-internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup
+internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Season.Rendering.IInstanceCullTarget
 {
     protected readonly List<PrimitiveData> _primitives = new();
     protected readonly List<PrimitiveData> _opaquePrimitives = new();
@@ -83,6 +83,23 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup
         Name = name;
     }
 
+    // ============================================================
+    // A7 逐实例 GPU 剔除
+    // ============================================================
+    // 由派生类在自己上传完实例后再调 UpdateCullUpload；没调的那些组保持全 null，
+    // 共享层直接早退，阴影自然退回 CPU 整批剔除。
+    Season.Rendering.StorageBuffer? _cullSource;
+    Season.Rendering.StorageBuffer? _cullSorted;
+    Season.Rendering.StorageBuffer? _cullArgs;
+    Season.Rendering.StorageBuffer? _cullVisible;
+    Season.Rendering.StorageBuffer? _cullPrimInfo;
+    int _cullCapacity = -1;
+    int _cullPrimitiveCount = -1;
+    bool _cullRegistered;
+    bool _cullDrawReady;
+    Vector3 _cullLocalCenter;
+    Vector3 _cullLocalExtents;
+
     protected void RebuildPrimitiveBuckets()
     {
         _opaquePrimitives.Clear();
@@ -95,6 +112,33 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup
             else
                 _opaquePrimitives.Add(primitive);
         }
+
+        UpdateCullLocalBounds();
+    }
+
+    /// <summary>
+    /// 把全部 primitive 的局部包围盒并成组级合并盒。剔除内核只收一个盒，传单个 surface 的盒
+    /// 会让其余 surface 的实例在盒外被成批误剔。
+    /// </summary>
+    void UpdateCullLocalBounds()
+    {
+        if (_primitives.Count == 0)
+        {
+            _cullLocalCenter = Vector3.Zero;
+            _cullLocalExtents = Vector3.Zero;
+            return;
+        }
+
+        var min = new Vector3(float.MaxValue);
+        var max = new Vector3(float.MinValue);
+        foreach (var primitive in _primitives)
+        {
+            min = Vector3.Min(min, primitive.LocalBoundsCenter - primitive.LocalBoundsExtents);
+            max = Vector3.Max(max, primitive.LocalBoundsCenter + primitive.LocalBoundsExtents);
+        }
+
+        _cullLocalCenter = (min + max) * 0.5f;
+        _cullLocalExtents = (max - min) * 0.5f;
     }
 
     protected void EnsureInstanceBufferCapacity(int count)
@@ -208,7 +252,31 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup
                 ref primitive.DdgiAtlasViewVersions[fi],
                 ref primitive.DdgiDepthViewVersions[fi],
                 ref primitive.CloudNoiseViewVersions[fi],
-                ref primitive.AerialLutViewVersions[fi]);
+                ref primitive.AerialLutViewVersions[fi],
+                ref primitive.SkyViewViewVersions[fi]);
+        }
+
+        // A7：本帧剔除链路已就绪时，实例流改读本槽位的重排分段，索引数与实例数由间接参数给出。
+        if (_cullDrawReady && _cullCapacity >= _instanceCount
+            && _cullSorted is VKStorageBuffer sorted && sorted.Buffer.Buffer.Handle != 0
+            && _cullArgs is VKStorageBuffer args && args.Buffer.Buffer.Handle != 0)
+        {
+            int slot = Season.Rendering.CascadedShadow.ActiveSlot;
+            if (slot >= 0 && slot < Season.Rendering.InstanceCull.MaxSlots)
+            {
+                // 偏移放在绑定上而不是参数里：firstInstance 会改变 gl_InstanceIndex 的起点。
+                ulong instanceOffset = (ulong)(slot * _cullCapacity) * Season.Rendering.InstanceCull.WorldStride;
+                for (int i = 0; i < _opaquePrimitives.Count; i++)
+                {
+                    var primitive = _opaquePrimitives[i];
+                    Pipeline.DrawShadowPrimitiveIndirect(cmd, primitive,
+                        primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
+                        primitive.DescriptorSets[fi],
+                        sorted.Buffer.Buffer, instanceOffset,
+                        args.Buffer.Buffer, Season.Rendering.InstanceCull.ArgsOffset(slot, i));
+                }
+                return;
+            }
         }
 
         for (int i = 0; i < _opaquePrimitives.Count; i++)
@@ -270,6 +338,169 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup
         }
     }
 
+    // ============================================================
+    // A7 逐实例 GPU 剔除：资源面与交接
+    // ============================================================
+
+    int Season.Rendering.IInstanceCullTarget.CullInstanceCount => _instanceCount;
+
+    int Season.Rendering.IInstanceCullTarget.CullCapacity => _cullCapacity;
+
+    int Season.Rendering.IInstanceCullTarget.CullPrimitiveCount => _opaquePrimitives.Count;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSourceWorlds => _cullSource;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSortedWorlds => _cullSorted;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullPrimitiveInfo => _cullPrimInfo;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullArgs => _cullArgs;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullVisible => _cullVisible;
+
+    Vector3 Season.Rendering.IInstanceCullTarget.CullLocalCenter => _cullLocalCenter;
+
+    Vector3 Season.Rendering.IInstanceCullTarget.CullLocalExtents => _cullLocalExtents;
+
+    /// <summary>派生类在实例上传完成后调用：准备剔除资源并上传源矩阵。</summary>
+    protected void UpdateCullUpload()
+    {
+        _cullDrawReady = false;
+        EnsureCullResources(_instanceCount);
+        UploadCullSource();
+    }
+
+    /// <summary>容量按 64 对齐，实例数小幅抖动因此不会每帧重建五个缓冲。</summary>
+    void EnsureCullResources(int count)
+    {
+        if (!Season.Rendering.InstanceCull.Enabled)
+        {
+            ReleaseCullResources();
+            return;
+        }
+        // 实例数掉到 0 不等于要释放：隐藏再显示会因此每帧重建五个缓冲。
+        if (count <= 0)
+            return;
+
+        int capacity = (count + 63) / 64 * 64;
+        if (_cullCapacity != capacity || _cullSorted == null)
+        {
+            ReleaseCullResources();
+            try
+            {
+                var g = Season.Basic.Graphics.Instance;
+                _cullSource = g.CreateStorageBuffer((uint)capacity * Season.Rendering.InstanceCull.WorldStride);
+                // 重排流会被直接绑成顶点流，所以必须声明为 ComputeAndVertexInput：
+                // VertexBufferBit 烘在创建期的 VkBufferUsageFlags 里，事后加不回来。
+                _cullSorted = g.CreateStorageBuffer(Season.Rendering.InstanceCull.SortedBytes(capacity),
+                    Season.Rendering.StorageBufferUsage.ComputeAndVertexInput);
+                _cullVisible = g.CreateStorageBuffer((uint)(Season.Rendering.InstanceCull.MaxSlots * capacity) * 4u);
+                _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsBytes,
+                    Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs);
+                _cullPrimInfo = g.CreateStorageBuffer(
+                    (uint)Season.Rendering.InstanceCull.MaxPrimitives * Season.Rendering.InstanceCull.PrimitiveInfoStride);
+            }
+            catch (Exception ex)
+            {
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] 缓冲创建失败：{ex.Message}");
+            }
+
+            if (_cullSource == null || _cullSorted == null || _cullVisible == null
+                || _cullArgs == null || _cullPrimInfo == null)
+            {
+                ReleaseCullResources();
+                return;
+            }
+
+            _cullCapacity = capacity;
+            _cullPrimitiveCount = -1;
+        }
+
+        EnsureCullPrimitiveInfo();
+
+        if (!_cullRegistered)
+        {
+            Season.Rendering.InstanceCull.Register(this);
+            _cullRegistered = true;
+        }
+    }
+
+    void EnsureCullPrimitiveInfo()
+    {
+        if (_cullPrimInfo == null)
+            return;
+        int n = _opaquePrimitives.Count;
+        if (n <= 0 || n > Season.Rendering.InstanceCull.MaxPrimitives)
+            return;
+        if (_cullPrimitiveCount == n)
+            return;
+
+        var bytes = new byte[n * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride];
+        for (int i = 0; i < n; i++)
+        {
+            var primitive = _opaquePrimitives[i];
+            Season.Rendering.InstanceCull.WritePrimitiveInfo(bytes,
+                i * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride,
+                (uint)primitive.Indices.Length, 0u, 0);
+        }
+
+        if (Season.Basic.Graphics.Instance.TryUpdateStorageBuffer(_cullPrimInfo, bytes))
+            _cullPrimitiveCount = n;
+    }
+
+    void UploadCullSource()
+    {
+        if (_cullSource == null || _instanceCount <= 0)
+            return;
+        Season.Basic.Graphics.Instance.TryUpdateStorageBuffer(_cullSource,
+            MemoryMarshal.AsBytes(_instanceData.AsSpan(0, _instanceCount)));
+    }
+
+    /// <summary>
+    /// A7：把 gather 写出的重排流与参数缓冲交接到绘制可读状态。必须在 Pass 之外执行，
+    /// 所以由 InstanceCullEffect 在三次派发之后回调。
+    /// </summary>
+    public bool PrepareCullDraw()
+    {
+        _cullDrawReady = false;
+        if (_cullSorted is not VKStorageBuffer sorted || sorted.Buffer.Buffer.Handle == 0)
+            return false;
+        if (_cullArgs is not VKStorageBuffer args || args.Buffer.Buffer.Handle == 0)
+            return false;
+        if (_cullCapacity <= 0)
+            return false;
+
+        var cmd = Device.GraphicsCommandBuffer;
+        if (cmd.Handle == 0 || Device.InRenderPass)
+            return false;
+
+        // 顶点属性读取发生在 VertexInput 阶段，与 TryPrepareIndirectArgs 的 DrawIndirect 阶段不能互代。
+        sorted.BarrierToVertexInput(cmd);
+
+        if (!Season.Basic.Graphics.Instance.TryPrepareIndirectArgs(args))
+            return false;
+
+        _cullDrawReady = true;
+        return true;
+    }
+
+    void ReleaseCullResources()
+    {
+        if (_cullRegistered)
+        {
+            Season.Rendering.InstanceCull.Unregister(this);
+            _cullRegistered = false;
+        }
+        _cullSource?.Dispose(); _cullSource = null;
+        _cullSorted?.Dispose(); _cullSorted = null;
+        _cullArgs?.Dispose(); _cullArgs = null;
+        _cullVisible?.Dispose(); _cullVisible = null;
+        _cullPrimInfo?.Dispose(); _cullPrimInfo = null;
+        _cullCapacity = -1;
+        _cullPrimitiveCount = -1;
+        _cullDrawReady = false;
+    }
+
     protected void BuildTransparentInstanceOrder(PrimitiveData primitive)
     {
         _transparentInstanceOrder.Clear();
@@ -302,6 +533,8 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup
     /// </summary>
     public override void Dispose()
     {
+        ReleaseCullResources();
+
         _primitives.Clear();
         _opaquePrimitives.Clear();
         _transparentPrimitives.Clear();

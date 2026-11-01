@@ -26,6 +26,10 @@ public enum RenderPassId
     /// <summary>D1 屏幕空间贴花：不透明绘制结束后、雾/雨幕合成与透明绘制之前，只写 SceneColor。
     /// 这个 Pass 没有颜色清屏、也没有深度附件（SceneDepth 此时是采样源），后端 BeginPass 必须按此特判。</summary>
     SceneDecal = 10,
+
+    /// <summary>P2 水面：贴花之后、透明几何之前。同样没有深度附件（遮挡靠着色器里的软件深度测试），
+    /// 但多一张开画前的场景色快照作为折射源 —— 本 Pass 的颜色附件不能同时被采样。</summary>
+    SceneWater = 11,
 }
 
 /// <summary>RenderTarget pixel format (cross-platform abstraction mapped to native formats per backend).</summary>
@@ -308,6 +312,19 @@ public static class FrameSchedule
     /// 此时即使场景里注册了贴花也不会打散场景 Pass —— 有贴花却没有渲染器是「不显示」，不是「贴错位置」。
     /// </summary>
     public static DecalEffect? DecalRenderer { get; private set; }
+
+    /// <summary>
+    /// P2 水面材质的后端入口。契约与 <see cref="DecalRenderer"/> 一致：null 表示本后端没有实现，
+    /// 此时即使场景里注册了水面也不会打散场景 Pass —— 有水面却没有渲染器是「不显示」，不是「画错位置」。
+    /// </summary>
+    public static WaterEffect? WaterRenderer { get; private set; }
+
+    /// <summary>
+    /// 水面折射用的场景色快照。生命周期跟随 <see cref="RegisterWaters"/> / <see cref="UnregisterWaters"/>，
+    /// 尺寸在 <see cref="ResizeCompute"/> 里随 SceneColor 同步重建。与 SceneColor 严格是两张资源：
+    /// 水面 Pass 里 SceneColor 是颜色附件，同一资源不能同时被采样。
+    /// </summary>
+    public static RenderTarget? WaterRefractionTarget => _waterRefractionTarget;
 
     /// <summary>A0.1 粒子间接绘制入口。Prepare 在场景 Pass 之外完成参数交接并解析资源，返回 false 表示本帧放弃提交；
     /// Submit 在场景透明阶段末尾（未分段时紧随完整 Scene 绘制）内提交一次，不新增 Pass 也不新增附件。
@@ -610,6 +627,64 @@ public static class FrameSchedule
         effect.Dispose();
     }
 
+    static RenderTarget? _waterRefractionTarget;
+
+    /// <summary>
+    /// P2: 建立水面渲染入口与折射快照。前提与贴花一致：场景颜色是单采样 HDR、显式 SceneDepth 存在，
+    /// 另外还要求能建出与 SceneColor 同形的快照目标。任一前提缺失就返回 false 并留下零残留。
+    /// </summary>
+    public static bool RegisterWaters(IGraphics g)
+    {
+        if (WaterRenderer != null) return true;
+        if (Immediate2DMode.Enabled) return false;
+        if (SceneColor is not { Desc.ColorFormat: RtFormat.Rgba16Float } color
+            || color.Desc.SampleCount > 1 || SceneDepth == null) return false;
+        var pipeline = g.CreateWaterPipeline();
+        if (pipeline == null) return false;
+        var effect = new WaterEffect(g, pipeline);
+        bool ready;
+        try { ready = EnsureWaterRefractionTarget(g, color); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] 快照目标创建失败：{ex.Message}");
+            ready = false;
+        }
+        if (!ready) { effect.Dispose(); ReleaseWaterRefractionTarget(); return false; }
+        WaterRenderer = effect;
+        return true;
+    }
+
+    public static void UnregisterWaters()
+    {
+        var effect = WaterRenderer;
+        if (effect == null) return;
+        WaterRenderer = null;
+        effect.Dispose();
+        ReleaseWaterRefractionTarget();
+    }
+
+    /// <summary>尺寸与 SceneColor 不一致时整体重建；同形则直接复用，避免每帧比较分配。</summary>
+    static bool EnsureWaterRefractionTarget(IGraphics g, RenderTarget color)
+    {
+        var current = _waterRefractionTarget;
+        if (current != null && current.Desc.Width == color.Desc.Width && current.Desc.Height == color.Desc.Height
+            && current.Desc.ColorFormat == color.Desc.ColorFormat) return true;
+        ReleaseWaterRefractionTarget();
+        var target = g.CreateRenderTarget(new RenderTargetDesc {
+            ColorFormat = RtFormat.Rgba16Float, DepthFormat = RtFormat.None, SampleCount = 1, NoImplicitDepth = true,
+            Width = color.Desc.Width, Height = color.Desc.Height,
+            MatchBackbufferSize = color.Desc.MatchBackbufferSize, ClearColor = Vector4.Zero });
+        if (target == null) return false;
+        _waterRefractionTarget = target;
+        return true;
+    }
+
+    static void ReleaseWaterRefractionTarget()
+    {
+        _waterRefractionTarget?.Dispose();
+        _waterRefractionTarget = null;
+    }
+
     /// <summary>
     /// Notify all registered compute effects to rebuild size-dependent storage textures after a window resize.
     /// Called by BaseApp.Resize after backend HandleResize (GPU idle) so the old native resources can be safely destroyed and rebuilt in place
@@ -626,6 +701,18 @@ public static class FrameSchedule
         ResizeList(_computeFrameStart);
         ResizeList(_computeAfterOpaque);
         ResizeList(_computeAfterScene);
+
+        // P2: 水面快照必须跟着 SceneColor 重建，且要在任何一帧开始前完成 ——
+        // 拓扑变更期不允许在渲染中途创建资源。
+        if (WaterRenderer != null && SceneColor is { } waterColor)
+        {
+            try { EnsureWaterRefractionTarget(g, waterColor); }
+            catch (Exception ex)
+            {
+                DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] 快照重建失败：{ex.Message}");
+                UnregisterWaters();
+            }
+        }
 
         void ResizeList(List<ComputeEffect> effects)
         {
@@ -824,7 +911,15 @@ public static class FrameSchedule
         // 贴花没有雾那种「本帧输出未就绪」的退路，所以只要视图开着不透明、场景里有活动贴花，就无条件打散。
         bool decalSplit = DecalRenderer != null && opaque && (features & ViewFeature.Decals) != 0
             && SceneColor != null && SceneDepth != null && app.Decals.ActiveCount > 0;
-        bool split = fogSplit || weatherSplit || decalSplit;
+        // P2: 水面同样必须分段 —— 不分段时完整 Scene Pass 已经把透明图元一起画进去了，
+        // 水面会盖在本来应该在它之上的透明物体上。折射快照必须与场景色同形，否则宁可不画。
+        bool waterSplit = WaterRenderer != null && opaque && (features & ViewFeature.Water) != 0
+            && SceneColor is { } waterColorTarget && SceneDepth != null && app.Waters.ActiveCount > 0
+            && WaterRefractionTarget is { } waterSnapshot
+            && !ReferenceEquals(waterSnapshot, waterColorTarget)
+            && waterSnapshot.Desc.Width == waterColorTarget.Desc.Width
+            && waterSnapshot.Desc.Height == waterColorTarget.Desc.Height;
+        bool split = fogSplit || weatherSplit || decalSplit || waterSplit;
         targets.SceneSegmented = split;
 
         try
@@ -926,6 +1021,25 @@ public static class FrameSchedule
                         composited = true;
                     }
                 }
+                // P2 水面：贴花与雾/雨幕之后、透明几何之前。
+                // 快照必须在 BeginPass 之前拷好 —— 水面 Pass 里 SceneColor 是颜色附件，同一资源不能同时被采样。
+                // 拷贝失败时整帧跳水面：拿未初始化的快照当折射源会直接花屏，而不是少一个特效。
+                if (waterSplit && EffectiveSceneColor is { } waterColor && WaterRefractionTarget is { } snapshot
+                    && g.CopyRenderTarget(waterColor, snapshot)
+                    && WaterRenderer!.Prepare(g, app.Waters, waterColor, snapshot, SceneDepth, app.Time))
+                {
+                    g.BeginPass(new PassDesc
+                    {
+                        Id = RenderPassId.SceneWater,
+                        ColorTarget = waterColor,
+                        ClearColorEnable = false,
+                        ClearDepthEnable = false,
+                        StoreDepth = false,
+                    });
+                    try { WaterRenderer!.Draw(g); }
+                    finally { g.EndPass(); }
+                }
+
                 // Transparent geometry is the second half of the scene; a view that switched it off still gets the
                 // fog/weather composites above, because those blend over the whole image rather than over geometry.
                 if (transparent)

@@ -95,7 +95,14 @@ public enum ViewFeature
     /// <summary>D1 屏幕空间贴花。关闭时本视图不写贴花，也不会为了贴花把场景打散成不透明/透明两段。</summary>
     Decals = 1 << 10,
 
-    All = Opaque | Transparent | Shadows | Fog | Weather | AmbientOcclusion | Bloom | AntiAliasing | Particles | Post | Decals,
+    /// <summary>P2 水面材质。关闭时本视图不画任何水面，也不会为了水面把场景打散成不透明/透明两段。</summary>
+    Water = 1 << 11,
+
+    /// <summary>P3 屏幕空间反射（Hi-Z 金字塔 + 反射合成）。关闭时本视图既不建金字塔也不合成反射，
+    /// 水面退回只采天空 LUT。</summary>
+    Reflections = 1 << 12,
+
+    All = Opaque | Transparent | Shadows | Fog | Weather | AmbientOcclusion | Bloom | AntiAliasing | Particles | Post | Decals | Water | Reflections,
 }
 
 /// <summary>How a view consumes the frame-wide cascaded shadow atlas.</summary>

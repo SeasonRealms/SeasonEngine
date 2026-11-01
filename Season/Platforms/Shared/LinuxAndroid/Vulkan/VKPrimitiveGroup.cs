@@ -102,6 +102,21 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
     /// (GLSL `sampler3D aerialLut`, linear-clamp immutable).</summary>
     internal const uint AerialLutBinding = 20;
 
+    // 2-7 P0: the procedural-sky Sky-View LUT for the current frame
+    // (compute 2D texture rgba16float, binding 25).
+    // Same pattern as above: resolved in SetLighting each frame, Bound falls back to Device.White.
+    // White is not a dangerous value here: the consumer branch is gated on skyParams0.w > 0, which
+    // SkyLighting.Apply writes only when FrameSchedule.SkyViewTexture is non-null.
+    internal static Texture? SkyViewActive;
+
+    /// <summary>2-7 P0: Sky-View LUT to bind to binding 25 for the current frame
+    /// (prefer Active, otherwise fall back to White). Never null.</summary>
+    internal static Texture SkyViewBound => SkyViewActive ?? Device.White;
+
+    /// <summary>2-7 P0: descriptor binding index for the Sky-View LUT
+    /// (GLSL `sampler2D skyView`, linear-clamp immutable).</summary>
+    internal const uint SkyViewBinding = Pipeline.SkyViewBinding;
+
     /// <summary>Refresh binding 17 of <paramref name="set"/> to the current view of
     /// <see cref="DdgiAtlasBound"/>.
     /// Only updates when ViewVersion changes
@@ -201,6 +216,32 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
             SType = StructureType.WriteDescriptorSet,
             DstSet = set,
             DstBinding = AerialLutBinding,
+            DstArrayElement = 0,
+            DescriptorCount = 1,
+            DescriptorType = DescriptorType.CombinedImageSampler,
+            PImageInfo = &info
+        };
+        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 1, &write, 0, null);
+        cachedVersion = lut.ViewVersion;
+    }
+
+    /// <summary>2-7 P0: refresh binding 25 of <paramref name="set"/> to the current view of
+    /// <see cref="SkyViewBound"/>.
+    /// Follows the same pattern as <see cref="RefreshAerialLutBinding"/>.
+    /// The Sky-View LUT is rebaked whenever the sun moves or the sky parameters change,
+    /// so its ViewVersion can change frame to frame; the version compare keeps the steady case a no-op.</summary>
+    internal static void RefreshSkyViewBinding(DescriptorSet set, ref ulong cachedVersion)
+    {
+        var lut = SkyViewBound;
+        if (lut.ViewVersion == cachedVersion)
+            return;
+        var info = new DescriptorImageInfo
+        { ImageView = lut.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
+        var write = new WriteDescriptorSet
+        {
+            SType = StructureType.WriteDescriptorSet,
+            DstSet = set,
+            DstBinding = SkyViewBinding,
             DstArrayElement = 0,
             DescriptorCount = 1,
             DescriptorType = DescriptorType.CombinedImageSampler,
@@ -486,6 +527,15 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
             ? VKTexture3D.Find(aerialName)
             : null;
 
+        // 2-7 P0: resolve the current-frame Sky-View LUT through the same 2D compute dictionary.
+        // It is resolved every frame for the same reason as cloud noise: after a quality downgrade
+        // or Dispose, FrameSchedule.SkyViewTexture becomes null and Active must be cleared in sync,
+        // otherwise an already-freed texture handle would keep being bound.
+        // When null, binding 25 falls back to Device.White, and the consumer branch is gated by skyParams0.w.
+        SkyViewActive = Season.Rendering.FrameSchedule.SkyViewTexture is string skyViewName
+            ? Graphics.FindDdgiAtlas(skyViewName)
+            : null;
+
         // The snapshot is read by fog / weather / particles, so it must come from the view that is actually
         // being rendered, not from the legacy camera mirror.
         var snapshotView = RenderView.Current;
@@ -623,6 +673,9 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         // 2-5 Step E: binding 20 AP-volume version cache aligned with DescriptorSets
         // (same semantics).
         p.AerialLutViewVersions = new ulong[n];
+        // 2-7 P0: binding 25 Sky-View LUT version cache aligned with DescriptorSets
+        // (same semantics).
+        p.SkyViewViewVersions = new ulong[n];
         var bones = BoneMatrixBuffers;
         var instanceBones = InstanceBoneBuffers;
         var morphDeltas = MorphDeltasBuffers;
@@ -715,7 +768,7 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         { ImageView = p.EmissiveTexture.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
 
         var set = p.DescriptorSets[fi];
-        var writes = stackalloc WriteDescriptorSet[25];
+        var writes = stackalloc WriteDescriptorSet[26];
         writes[0] = MakeBufferWrite(set, 0, DescriptorType.UniformBuffer, &matrixInfo);
         writes[1] = MakeBufferWrite(set, 1, DescriptorType.UniformBuffer, &lightInfo);
         writes[2] = MakeBufferWrite(set, 2, DescriptorType.UniformBuffer, &materialInfo);
@@ -827,6 +880,17 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         if (p.AerialLutViewVersions != null)
             p.AerialLutViewVersions[fi] = aerialLut.ViewVersion;
 
+        // 2-7 P0: binding 25 Sky-View LUT.
+        // Same pattern as binding 17 (Bound falls back to White, is never null,
+        // and leaving it empty would mean stack garbage -> WSL abort).
+        // Actual sampling is gated by skyParams0.w, which is written only when the LUT exists.
+        var skyView = SkyViewBound;
+        var skyViewInfo = new DescriptorImageInfo
+        { ImageView = skyView.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
+        writes[25] = MakeImageWrite(set, SkyViewBinding, &skyViewInfo);
+        if (p.SkyViewViewVersions != null)
+            p.SkyViewViewVersions[fi] = skyView.ViewVersion;
+
         // 雾采样三段（22/23/24）：
         // 22 是帧常量存储缓冲，先写零填充占位（帧内容由雾合成那边的帧缓冲提供，
         // 透明阶段只负责把真正句柄补写进本槽描述符）；
@@ -842,7 +906,7 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         writes[23] = MakeImageWrite(set, Pipeline.SceneFogIntegratedBinding, &fogVolumeInfo);
         writes[24] = MakeImageWrite(set, Pipeline.SceneFogLocalBinding, &fogVolumeInfo);
 
-        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 25, writes, 0, null);
+        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 26, writes, 0, null);
     }
 
     /// <summary>2-3 Step C: derived classes may override this to return the prev bone SSBO
@@ -2141,7 +2205,8 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
                 ref p.DdgiAtlasViewVersions[fi],
                 ref p.DdgiDepthViewVersions[fi],
                 ref p.CloudNoiseViewVersions[fi],
-                ref p.AerialLutViewVersions[fi]);
+                ref p.AerialLutViewVersions[fi],
+                ref p.SkyViewViewVersions[fi]);
         }
 
         OnBeforeDraw();

@@ -97,7 +97,7 @@ internal unsafe sealed class SwapChain : IDisposable
         BackBufferFormat = chosenFormat;
         ColorSpace = chosenSpace;
 
-        // 3) Choose the present mode, preferring Mailbox and falling back to FIFO.
+        // 3) Choose the present mode, see ChoosePresentMode: Mailbox first, FIFO otherwise.
         PresentMode = ChoosePresentMode();
 
         // 4) Choose the extent.

@@ -98,6 +98,11 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
     // Semantics match _cachedDdgiAtlasViewVersions.
     ulong[] _cachedAerialLutViewVersions = Array.Empty<ulong>();
 
+    // 2-7 P0: per-frame-slot cache, aligned with _descriptorSets,
+    // recording which Sky-View LUT view is currently written to binding 25.
+    // Semantics match _cachedDdgiAtlasViewVersions.
+    ulong[] _cachedSkyViewViewVersions = Array.Empty<ulong>();
+
     // ============================================================
     // Instance UBO creation / release
     // ============================================================
@@ -260,6 +265,11 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         if (_cachedAerialLutViewVersions.Length != n)
             _cachedAerialLutViewVersions = new ulong[n];
 
+        // 2-7 P0: per-slot version cache for binding 25 Sky-View LUT
+        // (same semantics).
+        if (_cachedSkyViewViewVersions.Length != n)
+            _cachedSkyViewViewVersions = new ulong[n];
+
         for (int fi = 0; fi < n; fi++)
             WriteDescriptorSet(fi);
 
@@ -305,7 +315,7 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         { ImageView = (EmissiveMap ?? fallback).View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
 
         var set = _descriptorSets[fi];
-        var writes = stackalloc WriteDescriptorSet[25];
+        var writes = stackalloc WriteDescriptorSet[26];
         writes[0] = MakeBufferWrite(set, 0, DescriptorType.UniformBuffer, &matrixInfo);
         writes[1] = MakeBufferWrite(set, 1, DescriptorType.UniformBuffer, &lightInfo);
         writes[2] = MakeBufferWrite(set, 2, DescriptorType.UniformBuffer, &materialInfo);
@@ -403,6 +413,17 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         if (fi < _cachedAerialLutViewVersions.Length)
             _cachedAerialLutViewVersions[fi] = aerialLut.ViewVersion;
 
+        // 2-7 P0: binding 25 Sky-View LUT.
+        // The Sprite path shares SetLayout / FS with the 3D path, so a valid descriptor must still be written
+        // (SkyViewBound falls back to White and is never null);
+        // actual sampling is gated by skyParams0.w in a uniform branch.
+        var skyView = VKPrimitiveGroup.SkyViewBound;
+        var skyViewInfo = new DescriptorImageInfo
+        { ImageView = skyView.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
+        writes[25] = MakeImageWrite(set, VKPrimitiveGroup.SkyViewBinding, &skyViewInfo);
+        if (fi < _cachedSkyViewViewVersions.Length)
+            _cachedSkyViewViewVersions[fi] = skyView.ViewVersion;
+
         // 1-5 clause 15: binding 21 is the shadow view again, reached through the immutable
         // point sampler for the blocker search. The Sprite path shares the layout / FS
         // with the 3D path, so it must supply the same pair (12 uses the comparison sampler).
@@ -421,7 +442,7 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         writes[23] = MakeImageWrite(set, Pipeline.SceneFogIntegratedBinding, &fogVolumeInfo);
         writes[24] = MakeImageWrite(set, Pipeline.SceneFogLocalBinding, &fogVolumeInfo);
 
-        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 25, writes, 0, null);
+        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 26, writes, 0, null);
     }
 
     /// <summary>
@@ -445,6 +466,8 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         VKPrimitiveGroup.RefreshCloudNoiseBinding(_descriptorSets[fi], ref _cachedCloudNoiseViewVersions[fi]);
         // 2-5 Step E: binding 20, the AP volume.
         VKPrimitiveGroup.RefreshAerialLutBinding(_descriptorSets[fi], ref _cachedAerialLutViewVersions[fi]);
+        // 2-7 P0: binding 25, the Sky-View LUT.
+        VKPrimitiveGroup.RefreshSkyViewBinding(_descriptorSets[fi], ref _cachedSkyViewViewVersions[fi]);
     }
 
     static WriteDescriptorSet MakeBufferWrite(DescriptorSet set, uint binding, DescriptorType descriptorType, DescriptorBufferInfo* info)

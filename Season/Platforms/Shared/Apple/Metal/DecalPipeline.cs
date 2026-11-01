@@ -274,6 +274,8 @@ internal sealed class MTLDecalPipeline : DecalPipeline
         encoder.SetFragmentTexture(depthTexture, 1);
 
         int mode = -1;
+        // MSL 侧是 uint4，字节原样拷贝，必须写整数位；写 float 会让第二个贴花起的偏移越界。
+        var parameters = stackalloc uint[4];
         for (int i = 0; i < inputs.Count; i++)
         {
             // 贴图没就绪的贴花整个跳过：采样一个占位纹理会把「还没加载完」画成一块错误颜色。
@@ -290,9 +292,9 @@ internal sealed class MTLDecalPipeline : DecalPipeline
             var texture = _drawTextures[i];
             if (texture != null) encoder.SetFragmentTexture(texture.Image, 1);
             // 贴花槽位只到 64，uint4 足够；顶点与像素读的是同一份，所以两个阶段都要推。
-            var parameters = new Vector4(draw.Index, 0, 0, 0);
-            encoder.SetVertexBytes((IntPtr)(&parameters), (nuint)sizeof(Vector4), 1);
-            encoder.SetFragmentBytes((IntPtr)(&parameters), (nuint)sizeof(Vector4), 1);
+            parameters[0] = (uint)draw.Index;
+            encoder.SetVertexBytes((IntPtr)parameters, 16, 1);
+            encoder.SetFragmentBytes((IntPtr)parameters, 16, 1);
             encoder.DrawPrimitives(MTLPrimitiveType.Triangle, 0, 36);
         }
         return true;

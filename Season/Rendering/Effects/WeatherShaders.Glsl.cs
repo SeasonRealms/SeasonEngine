@@ -112,6 +112,11 @@ vec3 WeatherCloudComposite(vec3 sky,vec3 origin,vec3 dir,vec3 sunDirection) {
             // 大气透视：6km 尺度上云板收向同一像素的天空底色，地平线附近的云层才会自然消失，
             // 而不是在覆盖率淡出处留下一条切边。
             radiance=mix(sky,radiance,exp(-hits[k]/6000.0));
+            // 2-7 雷电：云内发光。weatherFlash 存的是主导雷击的世界坐标 + 回击包络亮度，
+            // 用 1/(1+d^2/L^2) 把点回击摊成一小片被照亮的云团；L=250m 与云板水平尺度同量级，
+            // 再远就退化成整片均匀提亮，不再是“云里闪了一下”。
+            vec3 flashDelta=p-WeatherFlash().xyz;
+            radiance+=WeatherFlash().w/(1.0+dot(flashDelta,flashDelta)/62500.0)*vec3(0.55,0.62,0.85)*12.0;
             acc+=trans*alpha*radiance; trans*=1.0-alpha;
         }
     }

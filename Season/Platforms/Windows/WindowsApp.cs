@@ -946,7 +946,9 @@ public static class WindowsApp
         if (!immediate2D && Season.Rendering.FrameSchedule.SceneDepth == null
             && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresAtmosphereSceneDepth(
                 DirectX.Device.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)
-                || RenderQuality.Current.RequiresDecalSceneDepth(DirectX.Device.HdrSceneColor, immediate2D)))
+                || RenderQuality.Current.RequiresDecalSceneDepth(DirectX.Device.HdrSceneColor, immediate2D)
+                || RenderQuality.Current.RequiresReflectionSceneDepth(DirectX.Device.HdrSceneColor,
+                    Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)))
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
             {

@@ -1073,7 +1073,8 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
                 ref primitive.DdgiAtlasViewVersions[fi],
                 ref primitive.DdgiDepthViewVersions[fi],
                 ref primitive.CloudNoiseViewVersions[fi],
-                ref primitive.AerialLutViewVersions[fi]);
+                ref primitive.AerialLutViewVersions[fi],
+                ref primitive.SkyViewViewVersions[fi]);
         }
 
         for (int i = 0; i < _opaquePrimitives.Count; i++)

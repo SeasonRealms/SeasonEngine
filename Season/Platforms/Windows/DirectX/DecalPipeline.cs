@@ -189,7 +189,11 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
             DepthStencilState = new() { DepthFunc = ComparisonFunc.Always, FrontFace = stencil, BackFace = stencil },
             SampleMask = uint.MaxValue, PrimitiveTopologyType = PrimitiveTopologyType.Triangle,
             NumRenderTargets = roughness ? 2u : 1u, SampleDesc = new(1, 0) };
-        desc.BlendState.RenderTarget[0] = new() { SrcBlend = source,
+        // BlendEnable 必须显式打开：默认 0 时混合因子全被忽略，PS 输出直接覆写 SceneColor ——
+        // Modulate 在盒内 coverage=0 处写出 1.0（白块，连盒后面的人物也被盖掉），Additive 写出 0（黑块）。
+        // 两个附件的混合方式不同，所以还要 IndependentBlendEnable，否则 RT1 会套用 RT0 的设置把法线整块覆写。
+        desc.BlendState.IndependentBlendEnable = roughness ? 1u : 0u;
+        desc.BlendState.RenderTarget[0] = new() { BlendEnable = 1, SrcBlend = source,
             DestBlend = source == Blend.One ? Blend.One : Blend.Zero, BlendOp = BlendOp.Add,
             SrcBlendAlpha = Blend.Zero, DestBlendAlpha = Blend.One, BlendOpAlpha = BlendOp.Add,
             LogicOp = LogicOp.Noop, RenderTargetWriteMask = (byte)ColorWriteEnable.All };
@@ -198,7 +202,7 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
         {
             // 只写 .z（Blue）：法线的八面体编码在 .xy，金属度在 .w，两者必须保留。
             // 混合用 coverage 做 lerp，coverage 为 0 时结果恰好等于原值，所以“不碰粗糙度”的贴花不会改变目标。
-            desc.BlendState.RenderTarget[1] = new() { SrcBlend = Blend.SrcAlpha,
+            desc.BlendState.RenderTarget[1] = new() { BlendEnable = 1, SrcBlend = Blend.SrcAlpha,
                 DestBlend = Blend.InvSrcAlpha, BlendOp = BlendOp.Add,
                 SrcBlendAlpha = Blend.One, DestBlendAlpha = Blend.Zero, BlendOpAlpha = BlendOp.Add,
                 LogicOp = LogicOp.Noop, RenderTargetWriteMask = (byte)ColorWriteEnable.Blue };
@@ -336,6 +340,9 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
         // 同一模式的连续贴花共用一次 PSO 切换；排序已由共享层按 SortOrder 稳定排好。
         int mode = -1;
         int shape = roughness ? 1 : 0;
+        // 着色器侧是 uint4 decalParams，根常量按位原样拷贝：必须写整数位。写成 float 时 1.0f 会被读成
+        // 0x3F800000，DecalOffset 越界到根 SRV 之外（根描述符没有边界检查），第二个贴花起 GPU 就挂死。
+        var parameters = stackalloc uint[4];
         for (int i = 0; i < inputs.Count; i++)
         {
             // 贴图没就绪的贴花整个跳过：采样一个占位纹理会把“还没加载完”画成一块错误颜色。
@@ -349,8 +356,8 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
             }
             // 逐贴花纹理：直接借字典里已经建好的 SRV 句柄，不再重新分配描述符。
             if (textures[i] != null) command->SetGraphicsRootDescriptorTable(TextureRoot, textures[i]!.GpuDescriptorHandle);
-            var parameters = new Vector4(draw.Index, 0, 0, 0);
-            command->SetGraphicsRoot32BitConstants(ParamsRoot, 4, &parameters, 0);
+            parameters[0] = (uint)draw.Index;
+            command->SetGraphicsRoot32BitConstants(ParamsRoot, 4, parameters, 0);
             command->DrawInstanced(36, 1, 0, 0);
         }
         return true;

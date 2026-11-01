@@ -9,6 +9,9 @@ namespace Engine.Panels;
 /// A stone rim of four solid boxes stands on the grass, the rim top sits at 0.5m, and the water surface is a flat plane
 /// at 0.4m inside it. The pond bottom is the grass itself, so the water has a real 0.4m depth below the surface,
 /// enough for later refraction and depth-based absorption to read a meaningful thickness from SceneDepth.
+/// The surface itself is drawn by the dedicated P2 water pass (RenderPassId.SceneWater) from
+/// <see cref="Season.Rendering.WaterPlane"/> data, not by the main shader: the main shader cannot sample the very color
+/// and depth targets that are its own attachments in the transparent stage.
 /// Three stone steps on the north face, toward the player spawn, lead up to the rim. The rim is two player widths wide
 /// so the player can walk all the way around and look down at the water from close range.
 ///
@@ -25,8 +28,9 @@ internal class Pond : Panel
 
     Vector3[] partMins, partMaxs;
 
-    // Water surface: a flat plane spanning the pond interior. It is kept separate from pondParts because it is neither walkable nor a GI proxy.
-    internal Mesh3D water;
+    // Water surface: a flat rectangle spanning the pond interior. It is kept separate from pondParts because it is neither walkable nor a GI proxy.
+    // 这里存的是数据而不是网格：P2 的水面 Pass 按矩形现算 6 个顶点，法线、折射与吸收都在着色器里。
+    internal Season.Rendering.WaterPlane Water { get; }
 
     // Pond-local layout. Orientation convention matches Room: north = +Z, south = -Z, east = +X, west = -X.
     const float InnerHalfX = 5f;        // Water extends 10m along X.
@@ -45,7 +49,10 @@ internal class Pond : Panel
     static readonly Vector4 StoneColor = new Vector4(0.55f, 0.53f, 0.50f, 1f);
 
     // Water tint with partial coverage so the grass bottom stays visible through the surface.
-    static readonly Vector4 WaterColor = new Vector4(0.10f, 0.32f, 0.38f, 0.7f);
+    static readonly Vector4 WaterColor = new Vector4(0.10f, 0.32f, 0.38f, 1f);
+
+    // 平视时的不透明度：0.35 让池底的草与焦散仍然透出来，掠射角由 Fresnel 推到接近 1。
+    const float WaterOpacity = 0.35f;
 
     internal Pond()
     {
@@ -64,17 +71,16 @@ internal class Pond : Panel
             AddControl(pondParts[i]);
         }
 
-        // CastShadows=false keeps the water out of shadow casting and GI proxies: a solid proxy over the water would fill
-        // the pond in the SDF, and a transparent sheet should not darken the grass bottom it is meant to reveal.
-        water = new Mesh3D()
+        // 水面已退场旧的透明 Mesh3D：它只能作为主着色器的一个材质，而主着色器采不到本帧的 SceneColor/SceneDepth
+        // （透明段里这两张都是附件）。P2 的独立 Pass 才能同时读（快照 + 深度）与写（场景色），
+        // 遮挡改由着色器里的软件深度测试负责。注册由 App 完成，位置每帧跟着面板。
+        Water = new Season.Rendering.WaterPlane
         {
-            Name = "PondWater",
-            CastShadows = false,
-            CullingEnabled = false,
-            // Leave Width/Height/Depth unset so OnBoundsEstablished keeps native size with a scale of 1.
+            // 比内沿多出 1cm：压住与内壁之间的缝。
+            Size = new Vector2(2f * InnerHalfX + 0.02f, 2f * InnerHalfZ + 0.02f),
+            Tint = new Vector4(WaterColor.X, WaterColor.Y, WaterColor.Z, 1f),
+            Opacity = WaterOpacity,
         };
-        water.Surfaces.Add(BuildWaterSurface());
-        AddControl(water);
     }
 
     /// <summary>
@@ -200,34 +206,6 @@ internal class Pond : Panel
         });
     }
 
-    /// <summary>
-    /// Water plane centered at the local origin, covering the pond interior plus 1cm under the rim on every side
-    /// so no seam opens against the inner rim faces. Winding follows Ground.BuildRoad with u=+X and v=+Z, so the front face points up.
-    /// The plane is flat for now; normals come from the mesh until a dedicated water pass provides surface detail.
-    /// </summary>
-    static Surface BuildWaterSurface()
-    {
-        const float hx = InnerHalfX + 0.01f, hz = InnerHalfZ + 0.01f;
-        var up = new Vector3(0, 1, 0);
-
-        return new Surface
-        {
-            Vertices = new[]
-            {
-                MakeVertex(new Vector3(-hx, 0f, -hz), new Vector2(0, 1), up),
-                MakeVertex(new Vector3(hx, 0f, -hz), new Vector2(1, 1), up),
-                MakeVertex(new Vector3(-hx, 0f, hz), new Vector2(0, 0), up),
-                MakeVertex(new Vector3(hx, 0f, hz), new Vector2(1, 0), up),
-            },
-            Indices = new ushort[] { 2, 3, 1, 2, 1, 0 },
-            BaseColor = WaterColor,
-            MetallicFactor = 0f,                          // Water is a dielectric.
-            RoughnessFactor = 0.05f,                      // Near-mirror so sun and sky highlights read clearly on the flat plane.
-            Unlit = false,
-            Mode = SurfaceBlendMode.Blend,
-        };
-    }
-
     static Vertex MakeVertex(Vector3 pos, Vector2 uv, Vector3 normal)
     {
         return new Vertex
@@ -270,13 +248,8 @@ internal class Pond : Panel
             }
         }
 
-        water.PosX = origin.X;
-        water.PosY = WaterLevel;
-        water.PosZ = origin.Z;
-        if (water.Update(time))
-        {
-            result = true;
-        }
+        // 水面矩形是一份世界坐标数据（没有网格也没有子控件），直接跟着面板走。
+        Water.Position = new Vector3(origin.X, WaterLevel, origin.Z);
 
         return result;
     }

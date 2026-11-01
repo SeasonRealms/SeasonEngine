@@ -154,7 +154,7 @@ internal static class Device
     static MTLRenderPassDescriptor? _backbufferRpd;
 
     /// <summary>Pass debug labels used for encoder.Label and Xcode GPU capture markers in step 0. The index matches RenderPassId.</summary>
-    static readonly string[] _passLabels = { "Shadow", "Scene", "Post", "OutlineMask", "FinalBlit", "Overlay", "SceneOpaque", "FogComposite", "SceneTransparent", "WeatherComposite", "SceneDecal" };
+    static readonly string[] _passLabels = { "Shadow", "Scene", "Post", "OutlineMask", "FinalBlit", "Overlay", "SceneOpaque", "FogComposite", "SceneTransparent", "WeatherComposite", "SceneDecal", "SceneWater" };
 
     /// <summary>Phase 4 current pass id, written by BeginPass and reset by EndPass.
     /// Pipeline.SetPipeline uses it to route OutlineMask passes to the mask PSO,
@@ -452,7 +452,8 @@ internal static class Device
         double vpWidth, vpHeight;
         bool depthOnly = false;
         // D1：贴花只叠加不清屏，无论 PassDesc 怎么写都不允许 Clear —— 清掉的正是刚画完的不透明结果。
-        bool decalPass = desc.Id == Season.Rendering.RenderPassId.SceneDecal;
+        // P2 水面同理：它是叠在已合成的场景色上，清屏会把整幅背景抹成单色。
+        bool decalPass = desc.Id is Season.Rendering.RenderPassId.SceneDecal or Season.Rendering.RenderPassId.SceneWater;
         var c = desc.ClearColor;
 
         if ((desc.ColorTarget ?? desc.DepthTarget) is MTLRenderTarget rt)
@@ -474,9 +475,10 @@ internal static class Device
             if (!depthOnly)
                 rpd.ColorAttachments[0].Texture = rt.ColorTexture;
             // 雾合成使用独立的无深度全屏管线；透明阶段再挂载原场景深度。
-            // D1 贴花的深度是采样源而不是附件：同一资源不能既采样又当深度附件。
+            // D1 贴花与 P2 水面的深度是采样源而不是附件：同一资源不能既采样又当深度附件。
             rpd.DepthAttachment.Texture = desc.Id is Season.Rendering.RenderPassId.FogComposite
                 or Season.Rendering.RenderPassId.WeatherComposite or Season.Rendering.RenderPassId.SceneDecal
+                or Season.Rendering.RenderPassId.SceneWater
                 ? null : explicitDepth?.DepthTexture ?? rt.DepthTexture;
             // 颜色缺席时 rt 本身就是那张深度图（Shadow），它确实是本 Pass 的深度附件；
             // 否则只有显式深度 RT 算数，用的是 RT 自带的隐式深度时没有 RT 可记。
@@ -646,6 +648,10 @@ internal static class Device
         {
             enc.SetFragmentTexture((MTLPrimitiveGroup.CloudNoiseActive ?? White).Image, 9);
             enc.SetFragmentTexture((MTLPrimitiveGroup.AerialLutActive ?? MTLTexture3D.DummyBlack).Image, 10);
+            // 2-7 P0：程序化天空的 Sky-View LUT 基线绑定在 texture(13)，与 envCube texture(6) 并列。
+            // MSL 恒声明该纹理，所以每个带片元的 Pass 都必须有合法绑定（文本/精灵路径也共用同一个 PS）。
+            // 白衣是安全的回落：写入 skyParams0.w 的前提正是该 LUT 存在，StaticCube 档走 else 分支去采 envCube。
+            enc.SetFragmentTexture((MTLPrimitiveGroup.SkyViewActive ?? White).Image, 13);
             enc.SetFragmentSamplerState(Pipeline.WrapSampler, 2);
 
             // 工作包 D：雾采样三件套的基线绑定。
@@ -686,6 +692,38 @@ internal static class Device
             ActiveVelocityTexture = null;
             ActiveNormalTexture = null;
         }
+    }
+
+    /// <summary>
+    /// P2: 把一张离屏颜色目标原样拷进另一张同形目标，供水面折射在「SceneColor 仍是颜色附件」
+    /// 的那一帧里拿到可采样的背景。
+    ///
+    /// Metal 靠 blit 编码器做纹理到纹理的整幅拷贝：没有滤波损失，也不需要额外管线。
+    /// 必须在一个渲染 Pass 之外调用 —— 同一个 command buffer 不能同时开着渲染与 blit 编码器，
+    /// 而调度器正是在水面 Pass 的 BeginPass 之前叫它。
+    /// </summary>
+    internal static bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination)
+    {
+        if (GraphicsEncoder != null) return false;
+        var frame = FrameContexts[FrameIndex];
+        var command = frame.CommandBuffer;
+        if (command == null || command.Handle == IntPtr.Zero) return false;
+        if (source is not MTLRenderTarget src || destination is not MTLRenderTarget dst) return false;
+        if (ReferenceEquals(src, dst) || src.IsDepthOnly || dst.IsDepthOnly) return false;
+        if (src.Desc.ColorFormat != dst.Desc.ColorFormat) return false;
+        if (src.Width <= 0 || src.Width != dst.Width || src.Height != dst.Height) return false;
+        var srcTexture = src.ColorTexture;
+        var dstTexture = dst.ColorTexture;
+        if (srcTexture == null || dstTexture == null || srcTexture.Handle == IntPtr.Zero || dstTexture.Handle == IntPtr.Zero)
+            return false;
+
+        using var blit = command.CreateBlitCommandEncoder(new MTLBlitPassDescriptor());
+        if (blit == null) return false;
+        blit.CopyFromTexture(srcTexture, 0, 0, new MTLOrigin(0, 0, 0),
+            new MTLSize(src.Width, src.Height, 1),
+            dstTexture, 0, 0, new MTLOrigin(0, 0, 0));
+        blit.EndEncoding();
+        return true;
     }
 
     /// <summary>Ends the frame at frame scope by Present plus Commit and then advancing FrameIndex. Pass closure is already handled by EndPass.</summary>

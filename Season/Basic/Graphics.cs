@@ -127,6 +127,16 @@ public interface IGraphics
     /// <summary>D1: 缺少屏幕空间贴花能力时返回 null，<see cref="Season.Rendering.FrameSchedule.RegisterDecals"/> 据此保持零残留。</summary>
     Season.Rendering.DecalPipeline? CreateDecalPipeline() => null;
 
+    /// <summary>P2: 缺少水面材质能力时返回 null，<see cref="Season.Rendering.FrameSchedule.RegisterWaters"/> 据此保持零残留。</summary>
+    Season.Rendering.WaterPipeline? CreateWaterPipeline() => null;
+
+    /// <summary>
+    /// P2: 把 <paramref name="source"/> 的内容原样拷进 <paramref name="destination"/>（同尺寸、同格式）。
+    /// 水面折射要在「SceneColor 仍是颜色附件」的那一帧里采样场景色，而同一资源不能同时是附件与采样源，
+    /// 所以必须在开画前拿到一份独立副本。返回 false 表示本后端不支持或形状不符，调用方据此整帧跳水面。
+    /// </summary>
+    bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination) => false;
+
     void BeginPass(in Season.Rendering.PassDesc desc)
         => throw new NotImplementedException("BeginPass: this platform has not integrated pass scheduling yet");
 

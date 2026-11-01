@@ -13,7 +13,7 @@ namespace Season.Platforms.Windows.DirectX;
 /// Derived classes (DXInstancedMesh3D / DXInstancedModel) only need to provide
 /// the PrimitiveData collection and pass the instance-transform list to Update.
 /// </summary>
-internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
+internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Season.Rendering.IInstanceCullTarget
 {
     // _currentAlpha / _transformInitialized / Name / SyncAlpha / CreateMaterialBuffer / WriteMaterialBuffer
     // All inherited from DXPrimitiveGroup and not repeated here.
@@ -69,6 +69,27 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
     protected GpuDescriptorHandle _prevInstanceWorldSrvHandle;
     protected int _prevInstanceWorldDescriptorId = -1;
     protected int _prevInstanceWorldCapacity;
+
+    // ============================================================
+    // A7 逐实例 GPU 剔除
+    // ============================================================
+    // 五个缓冲一起分配、一起释放，容量按 64 对齐只增不减。全为 null 即本组不参与 A7，
+    // 阴影自然退回 CPU 整批剔除，不会拿空缓冲去画。
+    Season.Rendering.StorageBuffer? _cullSource;
+    Season.Rendering.StorageBuffer? _cullSorted;
+    Season.Rendering.StorageBuffer? _cullArgs;
+    Season.Rendering.StorageBuffer? _cullVisible;
+    Season.Rendering.StorageBuffer? _cullPrimInfo;
+    int _cullCapacity = -1;
+    int _cullPrimitiveCount = -1;
+    bool _cullRegistered;
+
+    /// <summary>组局部合并包围盒。剔除内核用它把实例矩阵换算成世界包围球，多 surface 的组必须传并集。</summary>
+    Vector3 _cullLocalCenter;
+    Vector3 _cullLocalExtents;
+
+    /// <summary>本帧是否已把重排流与间接参数交接到可绘制状态。Update 开头清零，PrepareCullDraw 置位。</summary>
+    bool _cullDrawReady;
 
     protected DXInstancedPrimitiveGroup(string name)
     {
@@ -127,6 +148,33 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
             else
                 _opaquePrimitives.Add(primitive);
         }
+
+        UpdateCullLocalBounds();
+    }
+
+    /// <summary>
+    /// 把全部 primitive 的局部包围盒并成组级合并盒。剔除内核只收一个盒，所以并集是必填项：
+    /// 传某个 surface 的盒会让其余 surface 的实例在盒外被成批误剔。
+    /// </summary>
+    void UpdateCullLocalBounds()
+    {
+        if (_primitives.Count == 0)
+        {
+            _cullLocalCenter = Vector3.Zero;
+            _cullLocalExtents = Vector3.Zero;
+            return;
+        }
+
+        var min = new Vector3(float.MaxValue);
+        var max = new Vector3(float.MinValue);
+        foreach (var primitive in _primitives)
+        {
+            min = Vector3.Min(min, primitive.LocalBoundsCenter - primitive.LocalBoundsExtents);
+            max = Vector3.Max(max, primitive.LocalBoundsCenter + primitive.LocalBoundsExtents);
+        }
+
+        _cullLocalCenter = (min + max) * 0.5f;
+        _cullLocalExtents = (max - min) * 0.5f;
     }
 
     // ============================================================
@@ -218,6 +266,8 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
         bool wasInitialized = _transformInitialized;
         _wireframeActive = false;
         _instanceCount = 0;
+        // 交接状态每帧重算：上一帧的 true 不能继续授权本帧的间接绘制。
+        _cullDrawReady = false;
 
         // Unified highlighting: clear this frame's per-instance draw lists
         // (rebuilt every frame; _boundsActive / _wireframeActive are set by the
@@ -355,6 +405,11 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
             anyInstanceOutline ? _outline2DInstanceWidth : owner.Highlight.OutlineWidth);
 
         Device.SetVertexBuffer(_instanceBuffer, _instanceBufferView, _instanceData);
+
+        // A7：剔除内核的输入是与 IA 实例流逐位相同的 80 字节矩阵流，所以直接复用这份 CPU 数组，
+        // 不多存一份副本，也不额外计算包围球——球由 GPU 从矩阵与组级盒算出。
+        EnsureCullResources(_instanceCount);
+        UploadCullSource();
 
         int fi = (int)Device.FrameIndex;
         var matrices = new MatrixBuffer
@@ -606,6 +661,37 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
         bool materialBound = false;
 
         int fi = (int)Device.FrameIndex;
+
+        // A7：本帧剔除链路已就绪时，实例流改读本槽位的重排分段，实例数由间接参数给出。
+        // 参数表按 (slot, primitive) 定长寻址，所以一条 ExecuteIndirect 仍只对应一个 primitive：
+        // 间接只改变参数的来源，不合并绘制。
+        if (_cullDrawReady && _cullCapacity >= _instanceCount
+            && _cullSorted is DXStorageBuffer sorted && sorted.Resource != null
+            && _cullArgs is DXStorageBuffer args && args.Resource != null)
+        {
+            int slot = Season.Rendering.CascadedShadow.ActiveSlot;
+            if (slot >= 0 && slot < Season.Rendering.InstanceCull.MaxSlots)
+            {
+                // 槽位分段：容量按实例计，每实例 80 字节，四端同一个定义。
+                var slotView = new VertexBufferView
+                {
+                    BufferLocation = sorted.Resource->GetGPUVirtualAddress()
+                        + (ulong)(slot * _cullCapacity) * Season.Rendering.InstanceCull.WorldStride,
+                    SizeInBytes = (uint)_cullCapacity * Season.Rendering.InstanceCull.WorldStride,
+                    StrideInBytes = Season.Rendering.InstanceCull.WorldStride,
+                };
+
+                for (int i = 0; i < _opaquePrimitives.Count; i++)
+                {
+                    Pipeline.DrawShadowPrimitiveIndirect(_opaquePrimitives[i], _matrixBuffers[fi], &slotView,
+                        args.Resource, Season.Rendering.InstanceCull.ArgsOffset(slot, i),
+                        bindMaterial: !shareMaterial || !materialBound);
+                    materialBound = true;
+                }
+                return;
+            }
+        }
+
         for (int i = 0; i < _opaquePrimitives.Count; i++)
         {
             fixed (VertexBufferView* instanceVB = &_instanceBufferView)
@@ -697,6 +783,170 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
             Unsafe.CopyBlock(_mappedPrevInstanceWorldBuffer, pSrc, (uint)(count * sizeof(Matrix4x4)));
     }
 
+    // ============================================================
+    // A7 逐实例 GPU 剔除：资源面与交接
+    // ============================================================
+
+    int Season.Rendering.IInstanceCullTarget.CullInstanceCount => _instanceCount;
+
+    int Season.Rendering.IInstanceCullTarget.CullCapacity => _cullCapacity;
+
+    int Season.Rendering.IInstanceCullTarget.CullPrimitiveCount => _opaquePrimitives.Count;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSourceWorlds => _cullSource;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSortedWorlds => _cullSorted;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullPrimitiveInfo => _cullPrimInfo;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullArgs => _cullArgs;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullVisible => _cullVisible;
+
+    Vector3 Season.Rendering.IInstanceCullTarget.CullLocalCenter => _cullLocalCenter;
+
+    Vector3 Season.Rendering.IInstanceCullTarget.CullLocalExtents => _cullLocalExtents;
+
+    /// <summary>
+    /// 按实例数准备剔除资源。容量按 64 对齐，于是实例数小幅抖动不会每帧重建五个缓冲；
+    /// 但接口上报的容量必须是真实容量，否则序号表会按本帧实例数寻址而与内核写入错位。
+    /// </summary>
+    void EnsureCullResources(int count)
+    {
+        if (!Season.Rendering.InstanceCull.Enabled)
+        {
+            ReleaseCullResources();
+            return;
+        }
+        // 实例数掉到 0 不等于要释放：隐藏再显示会因此每帧重建五个缓冲。
+        if (count <= 0)
+            return;
+
+        int capacity = (count + 63) / 64 * 64;
+        if (_cullCapacity != capacity || _cullSorted == null)
+        {
+            ReleaseCullResources();
+            try
+            {
+                var g = Season.Basic.Graphics.Instance;
+                _cullSource = g.CreateStorageBuffer((uint)capacity * Season.Rendering.InstanceCull.WorldStride);
+                _cullSorted = g.CreateStorageBuffer(Season.Rendering.InstanceCull.SortedBytes(capacity),
+                    Season.Rendering.StorageBufferUsage.ComputeAndVertexInput);
+                _cullVisible = g.CreateStorageBuffer((uint)(Season.Rendering.InstanceCull.MaxSlots * capacity) * 4u);
+                // 参数缓冲是唯一必须声明间接用途的一个：三端都把这份用途烘进原生对象，事后加不回来。
+                _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsBytes,
+                    Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs);
+                _cullPrimInfo = g.CreateStorageBuffer(
+                    (uint)Season.Rendering.InstanceCull.MaxPrimitives * Season.Rendering.InstanceCull.PrimitiveInfoStride);
+            }
+            catch (Exception ex)
+            {
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] 缓冲创建失败：{ex.Message}");
+            }
+
+            if (_cullSource == null || _cullSorted == null || _cullVisible == null
+                || _cullArgs == null || _cullPrimInfo == null)
+            {
+                ReleaseCullResources();
+                return;
+            }
+
+            _cullCapacity = capacity;
+            _cullPrimitiveCount = -1;
+        }
+
+        EnsureCullPrimitiveInfo();
+
+        if (!_cullRegistered)
+        {
+            Season.Rendering.InstanceCull.Register(this);
+            _cullRegistered = true;
+        }
+    }
+
+    /// <summary>
+    /// primitive 集合不变就不重写。索引区间与绘制端必须同源：reset 内核把这里的
+    /// indexCount 写进间接参数，而绘制端不再自己提供索引数。
+    /// </summary>
+    void EnsureCullPrimitiveInfo()
+    {
+        if (_cullPrimInfo == null)
+            return;
+        int n = _opaquePrimitives.Count;
+        if (n <= 0 || n > Season.Rendering.InstanceCull.MaxPrimitives)
+            return;
+        if (_cullPrimitiveCount == n)
+            return;
+
+        var bytes = new byte[n * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride];
+        for (int i = 0; i < n; i++)
+        {
+            var primitive = _opaquePrimitives[i];
+            Season.Rendering.InstanceCull.WritePrimitiveInfo(bytes,
+                i * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride,
+                (uint)primitive.Indices.Length, 0u, 0);
+        }
+
+        if (Season.Basic.Graphics.Instance.TryUpdateStorageBuffer(_cullPrimInfo, bytes))
+            _cullPrimitiveCount = n;
+    }
+
+    /// <summary>只在实例数变化后的那一帧上传，且只传有效段，不留余量。</summary>
+    void UploadCullSource()
+    {
+        if (_cullSource == null || _instanceCount <= 0)
+            return;
+        Season.Basic.Graphics.Instance.TryUpdateStorageBuffer(_cullSource,
+            MemoryMarshal.AsBytes(_instanceData.AsSpan(0, _instanceCount)));
+    }
+
+    /// <summary>
+    /// A7：把 gather 写出的重排流与参数缓冲交接到绘制可读状态。必须在 Pass 之外执行，
+    /// 所以由 InstanceCullEffect 在三次派发之后回调，而不是等到 DrawShadow。
+    /// 任一环节不成就返回 false，本帧整组退回 CPU 剔除。
+    /// </summary>
+    public bool PrepareCullDraw()
+    {
+        _cullDrawReady = false;
+        if (_cullSorted is not DXStorageBuffer sorted || sorted.Resource == null)
+            return false;
+        if (_cullArgs is not DXStorageBuffer args || args.Resource == null)
+            return false;
+        if (_cullCapacity <= 0)
+            return false;
+
+        var cmd = Device.GraphicsCommandList;
+        if (cmd == null)
+            return false;
+
+        // 顶点阶段要读它；下一次 gather 会经 DispatchCompute 的门控转换送回 UnorderedAccess。
+        sorted.TransitionTo(cmd, ResourceStates.VertexAndConstantBuffer);
+
+        // 参数缓冲走统一入口：它同时核对 usage 与"当前不在 Pass 内"。
+        if (!Season.Basic.Graphics.Instance.TryPrepareIndirectArgs(args))
+            return false;
+
+        _cullDrawReady = true;
+        return true;
+    }
+
+    void ReleaseCullResources()
+    {
+        if (_cullRegistered)
+        {
+            Season.Rendering.InstanceCull.Unregister(this);
+            _cullRegistered = false;
+        }
+        _cullSource?.Dispose(); _cullSource = null;
+        _cullSorted?.Dispose(); _cullSorted = null;
+        _cullArgs?.Dispose(); _cullArgs = null;
+        _cullVisible?.Dispose(); _cullVisible = null;
+        _cullPrimInfo?.Dispose(); _cullPrimInfo = null;
+        _cullCapacity = -1;
+        _cullPrimitiveCount = -1;
+        _cullDrawReady = false;
+    }
+
     /// <summary>2-3 Step C (tier C-b): derived classes may override this to
     /// return the previous per-instance morph-weights SB SRV handle.</summary>
     protected override GpuDescriptorHandle GetPrevMorphSrvHandle() => default;
@@ -707,6 +957,8 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup
 
     public override void Dispose()
     {
+        ReleaseCullResources();
+
         foreach (var primitive in _primitives)
             primitive.Dispose();
         _primitives.Clear();

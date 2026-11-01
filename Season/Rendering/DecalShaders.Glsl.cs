@@ -40,9 +40,7 @@ vec2 DecalSize() { return DecalF(9).xy; }
     /// 投影盒的 36 个顶点。面索引的位拆分与 HLSL 版逐字一致：六个面统一成「从盒外看逆时针」，
     /// 后端再配 <c>CullMode.Front</c>（只留背面），每个像素恰好命中一次。
     /// </summary>
-    public const string VertexGlsl = """
-#version 450
-""" + CoreGlsl + """
+    public const string VertexGlsl = "#version 450\n" + CoreGlsl + """
 
 void main() {
     uint id=uint(gl_VertexIndex);
@@ -67,9 +65,7 @@ void main() {
     /// 所以屏幕坐标到 NDC 的换算保持 <c>vec2(2,-2)</c> 不变。
     /// </para>
     /// </summary>
-    const string PixelCoreGlsl = """
-#version 450
-""" + CoreGlsl + """
+    const string PixelCoreGlsl = "#version 450\n" + CoreGlsl + """
 
 void DecalEval(out vec4 color,out float coverage,out float roughness,out float roughWeight) {
     uint index=decalParams.x;

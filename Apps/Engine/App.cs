@@ -137,6 +137,10 @@ internal class App : BaseApp
 
     internal Pond pond;
 
+    // 池底的焦散贴花。Additive 贴花本身与光照无关，所以由 Update 每帧把阳光倍率写进 Intensity，
+    // 否则夜里场景变暗后它会因为对比度反而显得更亮。
+    Season.Rendering.DecalVolume pondCaustics;
+
     internal Campfire campfire;
 
     internal Robots robots;
@@ -190,6 +194,11 @@ internal class App : BaseApp
     INativeImageDecoder? _pendingVideoFrame;
     string? _mp4Path;
 
+    // Ctrl+S screenshot in-flight guard: CaptureApp completes through a single
+    // render-thread slot, so overlapping captures would orphan the earlier completion;
+    // a new capture only starts once the previous one has finished.
+    System.Threading.Tasks.Task screenShotTask = System.Threading.Tasks.Task.CompletedTask;
+
     // 1-3: FovY preset cycle (30/45/60 degrees), demonstrating runtime-adjustable camera projection settings.
     //internal readonly float[] fovPresets = { MathF.PI / 6f, MathF.PI / 4f, MathF.PI / 3f };
     //internal int fovPresetIndex = 1;
@@ -211,6 +220,13 @@ internal class App : BaseApp
         // Overriding Default* here is snapshotted into Settings.RenderQuality when BaseApp.Init reads Settings,
         // after which rendering always consumes Settings.RenderQuality.
         RenderQuality.DefaultGlobalIllumination = Season.Rendering.GiMode.Ddgi;
+        // Probe traces must be occluded by the same SDF the scene is rasterized from, otherwise a point
+        // light shines straight through the stone rim of the pond and the log teepee of the campfire,
+        // landing as a warm square on the grass on the wrong side of the obstruction.
+        // Cost note: this adds one 24-step SDF march per light per ray, paid only for lights inside their
+        // own Range (the range window zeroes the contribution first, and the shader skips the march when
+        // the irradiance term is already zero). Flip it back to false to A/B a suspected GPU hang.
+        RenderQuality.DefaultGiPunctualShadow = true;
         // Measurement note: GiBounceGain=3 was tested and then rolled back.
         // A feedback gain of alb*3 > 1 makes probe irradiance diverge frame by frame,
         // saturating the fp16 atlas into solid white. The bounce chain itself works correctly;
@@ -251,6 +267,12 @@ internal class App : BaseApp
         // SceneDepth 会不会被补出来 —— 两件事都无法在运行期补救，所以在这里开。
         // 没有这个开关时贴花只是数据，不会出现在画面上。
         RenderQuality.DefaultDecals = true;
+
+        // P3: Hi-Z screen-space reflection, consumed only by the water pass. The scene depth it needs is
+        // declared through RequiresReflectionSceneDepth, so a backend without compute support keeps the
+        // depth-less frame it had before. A backend that can create the pyramid but not this frame simply
+        // reports HiZEffect.Ready=false, and the water shader falls back to the sky LUT.
+        RenderQuality.DefaultScreenSpaceReflections = SsrMode.HiZ;
 
         ResetCamera();
     }
@@ -332,6 +354,15 @@ internal class App : BaseApp
 
     void RegisterEffects()
     {
+        // A7：逐实例 GPU 剔除。Phase=FrameStart 且 Scope=App，因为派发必须在任何 Pass 之外（Vulkan 在 Pass 内
+        // 禁止 dispatch，Metal 的 compute 与 render encoder 互斥），而级联图集整帧只有一张，不该随视图重复剔除。
+        // 注册失败（后端无 kernel 源、或缺少间接绘制能力）时 InstanceCull.Enabled 保持 false，
+        // 各端 instanced group 于是不分配剔除资源，阴影自然退回 CPU 整批剔除，不会拿空缓冲去画。
+        if (Season.Rendering.FrameSchedule.RegisterCompute(
+                Season.Basic.Graphics.Instance, new Season.Rendering.InstanceCullEffect()))
+        {
+        }
+
         // 1-6 compute-baseline validation: register the built-in PlasmaEffect.
         // It dispatches every frame in the FrameStart phase and writes a 256x256 storage texture.
         // When registration succeeds, Sprite2D can display it directly by TextureName without extra changes.
@@ -391,6 +422,15 @@ internal class App : BaseApp
                 Season.Basic.Graphics.Instance, new Season.Rendering.Effects.GtaoEffect()))
         {
 
+        }
+
+        // P3: Hi-Z depth pyramid. AfterOpaque, four dispatches that halve SceneDepth four times into an r16f chain,
+        // consumed by the water pass's screen-space reflection march. SSR Off means no consumer at all,
+        // so the effect is not registered and the four dispatches never happen.
+        if (Season.Rendering.RenderQuality.Current.ScreenSpaceReflections != Season.Rendering.SsrMode.Off)
+        {
+            Season.Rendering.FrameSchedule.RegisterCompute(
+                Season.Basic.Graphics.Instance, new Season.Rendering.Effects.HiZEffect());
         }
 
         // 2-3 Step A first acceptance: register VelocityViewEffect.
@@ -625,6 +665,15 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         pond.PosY = 0;
         pond.PosZ = -12;
         AddPanel(pond);
+
+        // P2: 水面几何由着色器按 SV_VertexID 现算，所以这里注册的是数据而不是控件 ——
+        // 矩形与位置由 Pond 自己维护（位置每帧跟着面板）。
+        // 后端建不出水面管线时它只是一份没人读的数据，不会退化成错的画面。
+        Waters.Add(pond.Water);
+
+        // P3: 海面同样是一份矩形数据。Sea 的 255×255 起伏网格已经退到水面以下 12m 当水体底面，
+        // 水面本身由 SceneWater Pass 画：Fresnel、折射、Hi-Z 屏幕空间反射与深度吸收全在着色器里。
+        Waters.Add(sea.Water);
 
         CreatePondDecals();
 
@@ -897,6 +946,17 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     {
         base.Update(time, alpha: alpha, posX: posX, posY: posY, width: width, height: height);
 
+        // Ctrl+S screenshot hotkey, polled from the frame keyboard snapshot base.Update just
+        // pumped. This is NOT a system-wide hotkey: the platform keyboard service only sees
+        // keys routed to this window and clears them on deactivation, so the shortcut works
+        // only while the window is active and never blocks other apps' Ctrl+S.
+        // Checked before every early return below, so a screenshot also works while the
+        // settings or AI panel owns the frame.
+        if (IsActive && KeyboardService.IsPressed(Key.S) && KeyboardService.Ctrl)
+        {
+            SaveScreenShot();
+        }
+
         if (Mode is Mode.Show)
         {
             setting?.Alpha = 0f;
@@ -947,12 +1007,14 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         celestial?.UpdateWeatherBackground();
         bool regionalWeather = WorldSettings.Current.WeatherMode != WeatherMode.Showcase;
         if (weather != null) weatherVisuals.Update(weather.Field, time, regionalWeather, Camera.Far);
+        DayNightCycle.Evaluate(celestial?.DayPhase ?? 0, out _, out float daylight, out _, out _, out _, out _);
         if (precipitation != null)
         {
             precipitation.Enabled = regionalWeather;
-            DayNightCycle.Evaluate(celestial?.DayPhase ?? 0, out _, out float daylight, out _, out _, out _, out _);
             precipitation.Advance(time, daylight);
         }
+        // 贴花的 Intensity 每帧都要重算：DecalEffect 每帧按当前值重新打包，所以写在这里就够，不需要通知。
+        if (pondCaustics != null) pondCaustics.Intensity = CausticsIntensity * SunlightFactor(celestial?.DayPhase ?? 0);
 
         if (settingPanel != null)
         {
@@ -1180,6 +1242,37 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         return false;
     }
 
+    /// <summary>
+    /// Ctrl+S screenshot: capture the current app frame and save it as a quality-90 JPEG at
+    /// ScreenShot/yyyyMMddHHmmss.jpg. CaptureApp's completion source is single-slot and the
+    /// readback needs a render-thread frame, so only one capture may be in flight; repeat
+    /// presses are ignored until it finishes.
+    /// </summary>
+    void SaveScreenShot()
+    {
+        if (!screenShotTask.IsCompleted) return;
+        screenShotTask = SaveScreenShotAsync();
+    }
+
+    async System.Threading.Tasks.Task SaveScreenShotAsync()
+    {
+        try
+        {
+            using var file = await DeviceServices.Record.CaptureApp();
+
+            if (file != null)
+            {
+                var bytes = await DeviceServices.Image.SaveImageAsync(file, Season.Basic.ImageFormat.Jpeg, 90);
+
+                StorageService.SaveFile(StorageService.DirectoryBase, $"ScreenShot/{DateTime.Now.ToDateTimeTicks()}.jpg", bytes);
+            }
+        }
+        catch (Exception ex)
+        {
+            AddLog(LogType.Error, $"{DateTime.UtcNow} [ScreenShot] capture failed err={ex}");
+        }
+    }
+
     public override void Dispose()
     {
         if (IsDisposed) return;
@@ -1234,12 +1327,14 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     void CreatePondDecals()
     {
         // 池外西南侧的湿草：Modulate 且写粗糙度（水洼），这是 s9 的验证点。
+        // 投影盒必须以受贴表面为中心、上下各留余量：盒面恰好落在表面上时，深度重建的误差加上 TAA 抖动
+        // 会让 |local.y|≤1 的判定逐行翻转，表现为闪烁的条纹。草地在 y=0。
         var wetGrass = new Season.Rendering.DecalVolume
         {
             Mode = Season.Rendering.DecalMode.Modulate,
             Texture = "Assets/DecalWetGrass.png",
-            Position = new(1f, 0.02f, -16f),
-            Size = new(8f, 0.06f, 8f),
+            Position = new(1f, 0f, -16f),
+            Size = new(8f, 0.4f, 8f),
             Tint = new(0.94f, 0.97f, 1.00f),
             Opacity = 0.9f,
             AngleFade = 0f,
@@ -1252,13 +1347,14 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         Decals.Add(wetGrass);
         RegisterDecalTexture(wetGrass.Texture);
 
-        // 北侧池沿顶面的苔藓：只调制颜色，盒子很薄，好看出掠射淡出。
+        // 北侧池沿顶面的苔藓：只调制颜色。池沿顶面在 Pond.RimTop=0.5，盒子以它为中心；
+        // 池沿内外侧壁有一截落进盒里，正好用来看掠射淡出。
         var moss = new Season.Rendering.DecalVolume
         {
             Mode = Season.Rendering.DecalMode.Modulate,
             Texture = "Assets/DecalMoss.png",
-            Position = new(14f, 0.53f, -7f),
-            Size = new(9f, 0.06f, 1.6f),
+            Position = new(14f, 0.5f, -7f),
+            Size = new(9f, 0.2f, 1.6f),
             Tint = new(0.88f, 1.00f, 0.86f),
             Opacity = 0.85f,
             AngleFade = 0.25f,
@@ -1268,23 +1364,41 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         Decals.Add(moss);
         RegisterDecalTexture(moss.Texture);
 
-        // 池底的焦散：Additive，透明度 0.35 的池水会盖在它上面，同时验证“贴花在透明之前”。
+        //池底的焦散：Additive，透明度 0.35 的池水会盖在它上面，同时验证“贴花在透明之前”。
         // 贴图本身已经是「黑底上的光网」，像素就是光，所以 Tint 只带到接近白，强度靠 Intensity 收。
-        var caustics = new Season.Rendering.DecalVolume
+        // 池底就是 y=0 的草地，水面在 0.4：盒子以池底为中心，顶端 0.15 仍在水面以下。
+        // Intensity 这里只是设计值，实际亮度每帧由 Update 按阳光高度重算（见 CausticsIntensity / SunlightFactor）。
+        pondCaustics = new Season.Rendering.DecalVolume
         {
             Mode = Season.Rendering.DecalMode.Additive,
             Texture = "Assets/DecalCaustics.png",
-            Position = new(14f, 0.03f, -12f),
-            Size = new(9f, 0.06f, 7.2f),
+            Position = new(14f, 0f, -12f),
+            Size = new(9f, 0.3f, 7.2f),
             Tint = new(0.80f, 0.95f, 1.00f),
             Opacity = 0.5f,
             AngleFade = 0.1f,
             EdgeFade = 0.25f,
-            Intensity = 0.5f,
+            Intensity = CausticsIntensity,
             SortOrder = 2,
         };
-        Decals.Add(caustics);
-        RegisterDecalTexture(caustics.Texture);
+        Decals.Add(pondCaustics);
+        RegisterDecalTexture(pondCaustics.Texture);
+    }
+
+    /// <summary>正午直射时的焦散强度设计值。</summary>
+    const float CausticsIntensity = 0.5f;
+
+    /// <summary>
+    /// 直射阳光倍率：色散焦散是阳光经水面折射汇聚出来的亮网，不是自发光，亮度必须跟着太阳走。
+    /// 太阳越高越强、接近地平线时几乎全部被水面按菲涅尔反射掉，所以用高次幂而不是线性，
+    /// 并带一个起始阈值，避免日没前后在地平线附近拖出一条微亮的贴花。
+    /// 月光焦散太弱，不参与。
+    /// </summary>
+    static float SunlightFactor(float phase)
+    {
+        DayNightCycle.Evaluate(phase, out _, out float sunElev01, out _, out _, out _, out _);
+        float rise = Math.Clamp((sunElev01 - 0.04f) / 0.30f, 0f, 1f);
+        return rise * rise * MathF.Pow(sunElev01, 1.5f);
     }
 
     /// <summary>

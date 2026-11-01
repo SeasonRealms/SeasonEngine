@@ -49,6 +49,22 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
     }
 
+    /// <summary>P2 水面：与贴花同样只依赖图形阶段（深度采样 + 颜色快照），不需要 compute。</summary>
+    public Season.Rendering.WaterPipeline? CreateWaterPipeline()
+    {
+        try { return new DXWaterPipeline(name => TryGetTexture(name, out var tex) ? tex : null); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] 创建失败：{ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>P2: 场景色快照，供水面在「颜色已是附件」的帧里采样水底。
+    /// 状态收尾由 Device 负责（源回到 RenderTarget、目标转到 PixelShaderResource）。</summary>
+    public bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination)
+        => DirectX.Device.CopyRenderTarget(source, destination);
+
     // ── Text GPU Instancing: lightweight ITextureHolder (no GPU resources) ──
     internal sealed class TextGlyphHolder : ITextureHolder
     {

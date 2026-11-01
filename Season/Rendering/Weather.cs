@@ -4,8 +4,12 @@
 
 namespace Season.Rendering;
 
-/// <summary>天气名称只用于配置；具体强度和视觉配方由应用定义。</summary>
-public enum WeatherKind { Clear, Cloudy, Overcast, LightRain, Rain, HeavyRain, LightSnow, HeavySnow }
+/// <summary>
+/// 天气名称只用于配置；具体强度和视觉配方由应用定义。
+/// Thunderstorm 追加在枚举末尾：已保存配置按数值序列化，追加不改变既有值的语义。
+/// 它是「只打雷不下雨」的上位天气，雷雨叠加留给后续 WeatherSample 组合，不在枚举里再拆一支。
+/// </summary>
+public enum WeatherKind { Clear, Cloudy, Overcast, LightRain, Rain, HeavyRain, LightSnow, HeavySnow, Thunderstorm }
 
 /// <summary>
 /// 可持久化的世界区域。长度使用米、旋转使用弧度；标量属性避免 JSON 默认忽略 Vector 字段。
@@ -57,15 +61,20 @@ public sealed record WeatherRegionSettings
     static bool Positive(float value) => float.IsFinite(value) && value > 0 && float.IsFinite(1 / value);
 }
 
-/// <summary>归一化的雨、雪、天气云强度。与显示名称分离，允许过渡途中雨雪共存。</summary>
-public readonly record struct WeatherSample(float Rain, float Snow, float Cloud)
+/// <summary>
+/// 归一化的雨、雪、天气云强度与雷电活动度。与显示名称分离，允许过渡途中雨雪共存。
+/// <see cref="Lightning"/> 是「电气活跃度」而不是某一帧的闪光亮度：它决定落雷间隔，
+/// 具体亮度由 WeatherVisualState 的泊松调度与回击包络逐帧算出，因此过渡途中会自然衰减。
+/// </summary>
+public readonly record struct WeatherSample(float Rain, float Snow, float Cloud, float Lightning = 0)
 {
     internal Vector3 Vector => new(Rain, Snow, Cloud);
-    internal static WeatherSample From(Vector3 value) => new(value.X, value.Y, value.Z);
+    internal static WeatherSample From(Vector3 value, float lightning) => new(value.X, value.Y, value.Z, lightning);
     internal void Validate()
     {
-        if (!float.IsFinite(Rain) || !float.IsFinite(Snow) || !float.IsFinite(Cloud)
-            || Rain < 0 || Snow < 0 || Cloud < 0 || Rain + Snow > 1.00001f || Cloud > 1)
+        if (!float.IsFinite(Rain) || !float.IsFinite(Snow) || !float.IsFinite(Cloud) || !float.IsFinite(Lightning)
+            || Rain < 0 || Snow < 0 || Cloud < 0 || Lightning < 0
+            || Rain + Snow > 1.00001f || Cloud > 1 || Lightning > 1)
             throw new ArgumentOutOfRangeException(nameof(WeatherSample));
     }
 }
@@ -100,7 +109,10 @@ public sealed class WeatherTransition
         if (!float.IsFinite(seconds) || seconds < 0) throw new ArgumentOutOfRangeException(nameof(seconds));
         _elapsed = MathF.Min(_duration, _elapsed + seconds);
         float t = Progress;
-        Current = WeatherSample.From(Vector3.Lerp(_from.Vector, _target.Vector, t * t * (3 - 2 * t)));
+        float s = t * t * (3 - 2 * t);
+        // 雷电与雨雪共用同一条平滑曲线，否则切换雷暴时云会先变厚、电活动却瞬跳。
+        Current = WeatherSample.From(Vector3.Lerp(_from.Vector, _target.Vector, s),
+            _from.Lightning + (_target.Lightning - _from.Lightning) * s);
     }
 }
 
@@ -160,7 +172,7 @@ public sealed class WeatherField
         if (!float.IsFinite(worldPosition.X) || !float.IsFinite(worldPosition.Y) || !float.IsFinite(worldPosition.Z))
             return default;
         Vector3 value = default;
-        float remaining = 1, cloudRemaining = 1;
+        float lightning = 0, remaining = 1, cloudRemaining = 1;
         foreach (var region in Regions)
         {
             var s = region.Settings;
@@ -171,9 +183,11 @@ public sealed class WeatherField
             remaining *= 1 - weight;
             float cloud = FootprintWeight(worldPosition, s, true);
             value.Z += cloudRemaining * cloud * region.State.Cloud;
+            // 闪电只发生在云里，所以它和云共用同一条覆盖权重，而不是降水的柱体权重。
+            lightning += cloudRemaining * cloud * region.State.Lightning;
             cloudRemaining *= 1 - cloud;
         }
-        return WeatherSample.From(value);
+        return WeatherSample.From(value, lightning);
     }
 
     static float FootprintWeight(Vector3 p, WeatherRegionSettings s, bool cloud)

@@ -132,6 +132,9 @@ internal sealed class WeatherController
         WeatherKind.HeavyRain => new(1, 0, 1),
         WeatherKind.LightSnow => new(0, 0.2f, 0.55f),
         WeatherKind.HeavySnow => new(0, 1, 0.9f),
+        // 雷电：乌云到顶、不落雨雪。云厚直接取 1，因为云片数与消光都由它驱动，
+        // 闪光只能靠一层足够厚且足够低的云才读得出来。
+        WeatherKind.Thunderstorm => new(0, 0, 1, 1),
         _ => default,
     };
 
@@ -139,7 +142,8 @@ internal sealed class WeatherController
     {
         WeatherKind.Cloudy => "多云", WeatherKind.Overcast => "阴",
         WeatherKind.LightRain => "小雨", WeatherKind.Rain => "中雨", WeatherKind.HeavyRain => "大雨",
-        WeatherKind.LightSnow => "小雪", WeatherKind.HeavySnow => "大雪", _ => "晴",
+        WeatherKind.LightSnow => "小雪", WeatherKind.HeavySnow => "大雪",
+        WeatherKind.Thunderstorm => "雷电", _ => "晴",
     };
 }
 

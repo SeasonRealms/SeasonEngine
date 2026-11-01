@@ -1193,6 +1193,8 @@ internal unsafe static class Device
         "FogComposite\0"u8.ToArray(),
         "SceneTransparent\0"u8.ToArray(),
         "WeatherComposite\0"u8.ToArray(),
+        "SceneDecal\0"u8.ToArray(),
+        "SceneWater\0"u8.ToArray(),
     ];
 
     internal static void PushDebugGroup(byte[] utf8LabelZ)
@@ -1323,6 +1325,7 @@ internal unsafe static class Device
         // 4) Reset cmd pool + begin cmd buffer
         frame.Reset();
         GraphicsCommandBuffer = frame.CommandList;
+        IsRecording = true;
 
         // 4.5) Drain deferred texture layout transitions.
         // This must happen outside passes before any CmdBeginRenderPass.
@@ -1640,6 +1643,14 @@ internal unsafe static class Device
             attachmentCount = decalNormal != null ? 2u : 1u;
             ActiveNormalTarget = decalNormal;
         }
+        else if (desc.Id == Season.Rendering.RenderPassId.SceneWater && desc.ColorTarget is VKRenderTarget waterColor)
+        {
+            // P2: 水面 Pass 与贴花同形 —— 没有深度附件（深度是采样源），也不清颜色。
+            // 取到颜色附件的只有一个折射快照，那是采样源，在 Pass 外已经拷好。
+            (renderPass, framebuffer) = EnsureWaterPass(waterColor);
+            extent = new Extent2D(waterColor.Width, waterColor.Height);
+            attachmentCount = 1u;
+        }
         else if (desc.ColorTarget is VKRenderTarget colorRT && desc.DepthTarget is VKRenderTarget depthRT)
         {
             (renderPass, framebuffer) = EnsureSceneTargetPass(colorRT, depthRT,
@@ -1685,9 +1696,9 @@ internal unsafe static class Device
         // A0.2: the four-target shape inserts the normal attachment at index 2, also cleared to zero.
         var clearValues = stackalloc ClearValue[4];
         uint clearCount;
-        if (desc.Id == Season.Rendering.RenderPassId.SceneDecal)
+        if (desc.Id is Season.Rendering.RenderPassId.SceneDecal or Season.Rendering.RenderPassId.SceneWater)
         {
-            // 两个附件都是 Load，ClearValue 一个都不需要。
+            // 两个 Pass 的附件全是 Load，ClearValue 一个都不需要。
             clearCount = 0u;
         }
         else if (depthOnly)
@@ -1792,6 +1803,158 @@ internal unsafe static class Device
         }
     }
 
+    /// <summary>
+    /// P2 水面 Pass。render pass 只有一种形态（单颜色附件），烘焙一次永久复用；
+    /// framebuffer 绑定当帧 SceneColor，view 版本变化时重建。
+    /// 与贴花分开缓存，避免两者交替挂/不挂法线附件时互相把对方的 framebuffer 拆掉重建。
+    /// 仅渲染线程访问。
+    /// </summary>
+    static RenderPass _waterRenderPass;
+
+    static Framebuffer _waterFramebuffer;
+
+    static VKRenderTarget? _waterColorRT;
+
+    static ulong _waterColorVersion;
+
+    /// <summary>
+    /// 取水面 Pass 的 render pass。后端在烘 PSO 时据此锚定，<see cref="BeginPass"/> 用同一个对象建 framebuffer；
+    /// 返回后不再销毁（与贴花、OutlineMask 的锚点契约相同）。
+    /// </summary>
+    internal static RenderPass GetWaterRenderPass()
+    {
+        if (_waterRenderPass.Handle == 0)
+            _waterRenderPass = VKRenderTarget.CreateWaterRenderPassForFormat(Format.R16G16B16A16Sfloat);
+        return _waterRenderPass;
+    }
+
+    /// <summary>
+    /// 备好水面 Pass 的 render pass 与 framebuffer。颜色附件是当帧 SceneColor：
+    /// 没有深度附件（深度与折射快照都是采样源），也不清颜色。
+    /// </summary>
+    static (RenderPass, Framebuffer) EnsureWaterPass(VKRenderTarget color)
+    {
+        if (color.ColorView.Handle == 0 || color.Width == 0 || color.Height == 0)
+            throw new InvalidOperationException("水面 Pass 的附件无效。");
+
+        var renderPass = GetWaterRenderPass();
+        if (_waterFramebuffer.Handle == 0 || !ReferenceEquals(_waterColorRT, color)
+            || _waterColorVersion != color.ColorViewVersion)
+        {
+            if (_waterFramebuffer.Handle != 0)
+                Vk.DestroyFramebuffer(LogicalDevice, _waterFramebuffer, null);
+
+            var attachments = stackalloc Silk.NET.Vulkan.ImageView[1] { color.ColorView };
+            var fbInfo = new FramebufferCreateInfo
+            {
+                SType = StructureType.FramebufferCreateInfo,
+                RenderPass = renderPass,
+                AttachmentCount = 1,
+                PAttachments = attachments,
+                Width = color.Width,
+                Height = color.Height,
+                Layers = 1
+            };
+            if (Vk.CreateFramebuffer(LogicalDevice, in fbInfo, null, out var fb) != Result.Success)
+                throw new Exception("vkCreateFramebuffer (water) failed");
+            _waterFramebuffer = fb;
+            _waterColorRT = color;
+            _waterColorVersion = color.ColorViewVersion;
+        }
+        return (renderPass, _waterFramebuffer);
+    }
+
+    /// <summary>
+    /// P2: 把一张离屏颜色目标原样拷进另一张同形目标，供水面折射在「SceneColor 仍是颜色附件」
+    /// 的那一帧里拿到可采样的背景。
+    ///
+    /// Vulkan 没有 CopyResource 这种一句到位的写法，但同格式同尺寸的 <c>vkCmdCopyImage</c>
+    /// 同样不经过滤波，也不需要额外管线；两侧都在 1 层 1 mip，所以 region 是整幅。
+    ///
+    /// 目标每次都声明 <c>Undefined</c> 作为旧布局：它只作为拷贝目标与采样源，永远不做附件，
+    /// 内容每一帧都被整幅覆盖，所以「旧内容可丢弃」正是事实。这同时省掉一张重命名后失效的
+    /// layout 记录表 —— 源阶段仍全面覆盖上一帧的采样读与上一段 Pass 的颜色写（WAR/WAW），
+    /// 所以这并不是一次“不走同步”的偷懒转换。
+    /// </summary>
+    internal static bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination)
+    {
+        if (InRenderPass || GraphicsCommandBuffer.Handle == 0) return false;
+        if (source is not VKRenderTarget src || destination is not VKRenderTarget dst) return false;
+        if (ReferenceEquals(src, dst) || !src.HasColor || !dst.HasColor) return false;
+        if (src.ColorFormat != dst.ColorFormat) return false;
+        if (src.Width == 0 || src.Width != dst.Width || src.Height != dst.Height) return false;
+        if (src.ColorImage.Handle == 0 || dst.ColorImage.Handle == 0) return false;
+
+        var command = GraphicsCommandBuffer;
+        var range = new ImageSubresourceRange
+        {
+            AspectMask = ImageAspectFlags.ColorBit,
+            BaseMipLevel = 0, LevelCount = 1, BaseArrayLayer = 0, LayerCount = 1
+        };
+
+        // 源是上一段 Pass 发布的 ShaderReadOnlyOptimal，拷完必须原路送回 —— 水面 render pass
+        // 以这个布局作为 initialLayout，少这一次回来就会在验证层报 layout 不匹配。
+        var barriers = stackalloc ImageMemoryBarrier[2];
+        barriers[0] = new ImageMemoryBarrier
+        {
+            SType = StructureType.ImageMemoryBarrier,
+            OldLayout = ImageLayout.ShaderReadOnlyOptimal,
+            NewLayout = ImageLayout.TransferSrcOptimal,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Image = src.ColorImage,
+            SubresourceRange = range,
+            SrcAccessMask = AccessFlags.ColorAttachmentWriteBit | AccessFlags.ShaderReadBit,
+            DstAccessMask = AccessFlags.TransferReadBit
+        };
+        barriers[1] = new ImageMemoryBarrier
+        {
+            SType = StructureType.ImageMemoryBarrier,
+            OldLayout = ImageLayout.Undefined,
+            NewLayout = ImageLayout.TransferDstOptimal,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Image = dst.ColorImage,
+            SubresourceRange = range,
+            SrcAccessMask = AccessFlags.ColorAttachmentWriteBit | AccessFlags.ShaderReadBit | AccessFlags.TransferWriteBit,
+            DstAccessMask = AccessFlags.TransferWriteBit
+        };
+        Vk.CmdPipelineBarrier(command,
+            PipelineStageFlags.ColorAttachmentOutputBit | PipelineStageFlags.FragmentShaderBit | PipelineStageFlags.TransferBit,
+            PipelineStageFlags.TransferBit, 0, 0, null, 0, null, 2, barriers);
+
+        var region = new ImageCopy
+        {
+            SrcSubresource = new ImageSubresourceLayers
+            {
+                AspectMask = ImageAspectFlags.ColorBit, MipLevel = 0, BaseArrayLayer = 0, LayerCount = 1
+            },
+            DstSubresource = new ImageSubresourceLayers
+            {
+                AspectMask = ImageAspectFlags.ColorBit, MipLevel = 0, BaseArrayLayer = 0, LayerCount = 1
+            },
+            SrcOffset = default,
+            DstOffset = default,
+            Extent = new Extent3D(src.Width, src.Height, 1)
+        };
+        Vk.CmdCopyImage(command, src.ColorImage, ImageLayout.TransferSrcOptimal,
+            dst.ColorImage, ImageLayout.TransferDstOptimal, 1, in region);
+
+        // 源回到水面的颜色附件前置状态；目标转到采样布局，紧接着作为折射源被读。
+        barriers[0].OldLayout = ImageLayout.TransferSrcOptimal;
+        barriers[0].NewLayout = ImageLayout.ShaderReadOnlyOptimal;
+        barriers[0].SrcAccessMask = AccessFlags.TransferReadBit;
+        barriers[0].DstAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ColorAttachmentWriteBit;
+        barriers[1].OldLayout = ImageLayout.TransferDstOptimal;
+        barriers[1].NewLayout = ImageLayout.ShaderReadOnlyOptimal;
+        barriers[1].SrcAccessMask = AccessFlags.TransferWriteBit;
+        barriers[1].DstAccessMask = AccessFlags.ShaderReadBit;
+        Vk.CmdPipelineBarrier(command, PipelineStageFlags.TransferBit,
+            PipelineStageFlags.FragmentShaderBit | PipelineStageFlags.ColorAttachmentOutputBit,
+            0, 0, null, 0, null, 2, barriers);
+        return true;
+    }
+
     /// <summary>RT 销毁时按 fence 退休；只有 Resize 的 GPU 空闲点允许立即清理。</summary>
     internal static void ReleaseSceneTargetPasses(VKRenderTarget target, bool immediate = false)
     {
@@ -1811,6 +1974,23 @@ internal unsafe static class Device
                 void ReleaseDecal() => vk.DestroyFramebuffer(device, decalFramebuffer, null);
                 if (immediate) ReleaseDecal();
                 else EnqueueDeferredRelease(ReleaseDecal);
+            }
+        }
+
+        // 水面 Pass 的 framebuffer 同样引用 RT 的 view，理由同上。
+        if (ReferenceEquals(_waterColorRT, target))
+        {
+            var waterFramebuffer = _waterFramebuffer;
+            _waterFramebuffer = default;
+            _waterColorRT = null;
+            _waterColorVersion = 0;
+            if (waterFramebuffer.Handle != 0)
+            {
+                var vk = Vk;
+                var device = LogicalDevice;
+                void ReleaseWater() => vk.DestroyFramebuffer(device, waterFramebuffer, null);
+                if (immediate) ReleaseWater();
+                else EnqueueDeferredRelease(ReleaseWater);
             }
         }
         foreach (var entry in _sceneTargetPasses.ToArray())
@@ -1985,18 +2165,28 @@ internal unsafe static class Device
         }
     }
 
+    /// <summary>
+    /// True only between vkBeginCommandBuffer and vkEndCommandBuffer of the frame command buffer.
+    /// Outside that window GraphicsCommandBuffer.Handle is still non-zero, so a handle check alone lets a caller
+    /// record into an already-ended command buffer, which is undefined behaviour and leaves the padding of the
+    /// driver's command stream in an unspecified state.
+    /// </summary>
+    internal static bool IsRecording;
+
     static void AfterRenderCore()
     {
         var frame = FrameContexts[FrameIndex];
+        bool capturing = BaseApp.CaptureAppTcs != null;
 
         // Insert CaptureApp GPU readback after the last pass EndPass and before frame.End.
-        if (BaseApp.CaptureAppTcs != null)
+        if (capturing)
         {
             CaptureBackBuffer();
         }
 
         Trace("frame.End");
         frame.End();
+        IsRecording = false;
 
         // Submit and signal both the binary RenderFinished semaphore for present and the completion value
         // for the next CPU wait on the same frame slot: through the timeline semaphore on 1.2 devices,

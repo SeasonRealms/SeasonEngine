@@ -112,7 +112,7 @@ public struct CloudLayerArray
 
 /// <summary>
 /// 1-2 lighting system: C#-side mirror of the main-pipeline lighting UBO, with contract layout defined by the 1-2, 1-5, and 1-7 sections in the RenderQuality header.
-/// 布局仅使用 vec4/mat4；原 1376 字节前缀不变，区域天气追加 1056 字节，共 2432 字节。
+/// 布局仅使用 vec4/mat4；原 1376 字节前缀不变，区域天气追加 1056 字节，末尾再追加雷电 16 字节，共 2448 字节。
 /// The SceneLights UBO declared in shaders on all four backends must match it byte for byte.
 /// Byte offsets are:
 /// CameraPos=0, Ambient=16, Params0=32, Lights[i]=48+64i,
@@ -311,6 +311,15 @@ public struct SceneLightParams
     public Vector4 WeatherParams1;
     /// <summary>偏移 1408：8 个区域，每区域 8 行；详见 WeatherVisualState。</summary>
     public WeatherVisualArray WeatherRegions;
+
+    /// <summary>
+    /// 偏移 2432，2-7 雷电：xyz = 当前主导雷击在云内的世界坐标，w = 回击包络亮度，0~1。
+    /// **w &gt; 0 是消费侧唯一的总开关**；没有雷暴、区域质量档位为 Off、或处于 Showcase 模式时整个字段为零。
+    /// 只存一次而不是每区域一次，是因为同一帧可见的雷击几乎总发生在同一片云下，
+    /// 而按区域存会把 8 行预算再扩一倍却换不到可分辨的第二处闪光。
+    /// 记位置而不是方向：云内发光按到雷击点的距离衰减，不看视线方向。
+    /// </summary>
+    public Vector4 WeatherFlash;
 
     /// <summary>Convenience accessor for lightCount, wrapping the float-as-integer semantic of Params0.X and clamping writes into [0, MaxLights].</summary>
     public int LightCount

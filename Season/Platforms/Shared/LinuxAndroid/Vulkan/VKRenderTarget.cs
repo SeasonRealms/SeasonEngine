@@ -659,6 +659,15 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
     }
 
     /// <summary>
+    /// P2 水面 Pass 的 render pass。附件形态与「不写法线」的贴花完全一致：单颜色附件、Load、没有深度附件、
+    /// initial/finalLayout 都是 <c>ShaderReadOnlyOptimal</c>。水面同样靠着色器里的软件深度测试遮挡，
+    /// 并且要采样 SceneDepth 与折射快照，所以两者对附件的要求本就相同，直接复用贴花的烘焙路径，
+    /// 不另写一份只差名字的 80 行。
+    /// </summary>
+    internal static RenderPass CreateWaterRenderPassForFormat(Format colorFormat)
+        => CreateDecalRenderPassForFormat(colorFormat, false);
+
+    /// <summary>
     /// Depth-only RP (shadow map): a single D32 attachment with Clear/Store
     /// (StoreDepth=true, so depth is itself the output),
     /// and finalLayout=ShaderReadOnlyOptimal for direct sampling by later passes.
@@ -750,10 +759,19 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
 
         if (HasColor)
         {
-            // color: used both as attachment and sampled texture
+            // color: used both as attachment and sampled texture.
+            // TransferSrc/TransferDst are load-bearing rather than decorative: Device.CopyRenderTarget
+            // (the water refraction snapshot) copies this image into another one of the same shape with
+            // vkCmdCopyImage, and moving an image into TRANSFER_SRC_OPTIMAL / TRANSFER_DST_OPTIMAL is only
+            // legal when it was created with the matching transfer usage bit. Without them the validation
+            // layer reports VUID-VkImageMemoryBarrier-oldLayout-01212/01213 and
+            // VUID-vkCmdCopyImage-aspect-06662/06663 on every frame, and the copy itself is undefined
+            // behaviour. D3D12 has no equivalent switch because every resource there is implicitly
+            // copyable, which is why only this backend has to spell it out.
             (ColorImage, _colorMemory, ColorView) = CreateImage(
                 width, height, _colorFormat,
-                ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.SampledBit,
+                ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.SampledBit |
+                ImageUsageFlags.TransferSrcBit | ImageUsageFlags.TransferDstBit,
                 ImageAspectFlags.ColorBit);
             ColorViewVersion = Device.NextViewVersion();
 

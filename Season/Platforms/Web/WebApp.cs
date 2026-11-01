@@ -287,7 +287,9 @@ public static class WebApp
             if (!immediate2D && Season.Rendering.FrameSchedule.SceneDepth == null
                 && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresAtmosphereSceneDepth(
                     Graphics.HdrSceneColor, _graphics.ComputeSupported, immediate2D)
-                    || RenderQuality.Current.RequiresDecalSceneDepth(Graphics.HdrSceneColor, immediate2D)))
+                    || RenderQuality.Current.RequiresDecalSceneDepth(Graphics.HdrSceneColor, immediate2D)
+                    || RenderQuality.Current.RequiresReflectionSceneDepth(Graphics.HdrSceneColor,
+                        _graphics.ComputeSupported, immediate2D)))
             {
                 Season.Rendering.FrameSchedule.SceneDepth = _graphics.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
                 {

@@ -77,6 +77,24 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
     }
 
+    /// <summary>P2 水面：构造失败时返回 null，调度器据此保持零残留（有水面但不画，而不是画错）。</summary>
+    public Season.Rendering.WaterPipeline? CreateWaterPipeline()
+    {
+        try { return new VKWaterPipeline(DictionaryVKTexture); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] 创建失败：{ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// P2 水面折射用的场景色快照。转调后端：同格式同尺寸的 vkCmdCopyImage，附带的两次 barrier
+    /// 把源送回采样布局、把目标转入采样布局 —— 水面 Pass 里 SceneColor 是颜色附件，不能同时被采样。
+    /// </summary>
+    public bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination)
+        => Vulkan.Device.CopyRenderTarget(source, destination);
+
     readonly GlyphAtlasManager<VkTexture> _glyphAtlas = new(
         2048, 2048,
         createAtlasTexture: (w, h) => VkTexture.CreateEmpty((uint)w, (uint)h, "TextAtlas"),
@@ -2474,7 +2492,11 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         {
             DictionaryInstancedModel.TryGetValue((model.ModelName, model.ID), out vkModel!);
         }
-        vkModel?.Draw();
+        if (vkModel == null)
+        {
+
+        }
+        else vkModel.Draw();
     }
 
     public void DisposeInstancedModel(InstancedModel model)
@@ -3359,6 +3381,11 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public bool TryUpdateStorageBuffer(Season.Rendering.StorageBuffer buffer, ReadOnlySpan<byte> data)
     {
         if (!ComputeSupported || data.Length == 0 || data.Length > buffer.SizeInBytes || (data.Length & 3) != 0) return false;
+        // The frame command buffer is only in the recording state between vkBeginCommandBuffer and vkEndCommandBuffer.
+        // Effect Update paths run between frames, where the handle is still non-zero, so recording here would append
+        // barriers and a copy to an already-ended buffer - undefined behaviour that the validation layer reports as
+        // "was recorded, but vkBeginCommandBuffer() was not called prior to this command".
+        if (!Vulkan.Device.IsRecording) return false;
         var cmd = Vulkan.Device.GraphicsCommandBuffer;
         if (cmd.Handle == 0) return false;
 

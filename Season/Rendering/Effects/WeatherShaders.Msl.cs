@@ -112,6 +112,11 @@ float3 WeatherCloudComposite(float3 sky,float3 origin,float3 dir,float3 sunDirec
             // 大气透视：6km 尺度上云板收向同一像素的天空底色，地平线附近的云层才会自然消失，
             // 而不是在覆盖率淡出处留下一条切边。
             radiance=mix(sky,radiance,exp(-hits[k]/6000.0));
+            // 2-7 雷电：云内发光。flash 存的是主导雷击的世界坐标 + 回击包络亮度，
+            // 用 1/(1+d^2/L^2) 把点回击摊成一小片被照亮的云团；L=250m 与云板水平尺度同量级，
+            // 再远就退化成整片均匀提亮，不再是“云里闪了一下”。
+            float3 flashDelta=p-WeatherFlash().xyz;
+            radiance+=WeatherFlash().w/(1.0+dot(flashDelta,flashDelta)/62500.0)*float3(0.55,0.62,0.85)*12.0;
             acc+=trans*alpha*radiance; trans*=1.0-alpha;
         }
     }
@@ -230,8 +235,12 @@ template<typename RegionBuffer> struct WeatherCloudContext {
     float4 h0,h1;
     RegionBuffer regions;
     texture2d<float> cloudNoise;
+    // 2-7 雷电：主导雷击（xyz = 云内世界坐标，w = 回击包络亮度 0~1）。
+    // 做成结构体成员而不是全局量，因为同一份数学要同时服务 constant（主光照）与 device（雾帧）两种地址空间。
+    float4 flash;
     float4 WeatherH(int i) { return i==0?h0:h1; }
     float4 WeatherR(int i,int row) { return regions[i*8+row]; }
+    float4 WeatherFlash() { return flash; }
     float4 WeatherNoise(float2 uv) {
         constexpr sampler wrap(coord::normalized,address::repeat,filter::linear);
         return cloudNoise.sample(wrap,uv,level(0));

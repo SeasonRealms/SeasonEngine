@@ -262,7 +262,6 @@ public abstract class Mesh3DBase : Control, ITransparentSortable
         {
             if (!Ready || !HasContent || !Enable || Alpha == 0f)
             {
-                
             }
             else if (IsFrustumCulled())
             {

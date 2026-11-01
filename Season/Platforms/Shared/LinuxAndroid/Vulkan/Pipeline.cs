@@ -146,6 +146,13 @@ public static VkPipeline TransparentBackFacePipelineState;
 
     internal const uint SceneFogLocalBinding = 24;
 
+    /// <summary>
+    /// 2-7 P0：程序化天空的 Sky-View LUT（binding 25，GLSL `sampler2D skyView`），PBR 的环境镜面源。
+    /// 与 binding 16 的 envCube 并行而不是替换它：两者互斥，由 skyParams0.w 在 uniform 分支里二选一，
+    /// 所以两张图都必须有合法描述符（未就绪时绑 Device.White）。
+    /// </summary>
+    internal const uint SkyViewBinding = 25;
+
     // 雾三件套已搬到独立的 set 1：set 0 里的 22/23/24 仍在布局中（无害的多余绑定），
     // 但 shader 改从 set 1 取。原因是同一帧里阴影 pass 会绑定 set 0，而透明阶段要给每一项
     // 改写雾绑定；两者撞在同一个 set 上，未声明 UPDATE_AFTER_BIND 的绑定被改写就会让整条
@@ -1047,7 +1054,8 @@ public static VkPipeline TransparentBackFacePipelineState;
             ref primitiveData.DdgiAtlasViewVersions[fi],
             ref primitiveData.DdgiDepthViewVersions[fi],
             ref primitiveData.CloudNoiseViewVersions[fi],
-            ref primitiveData.AerialLutViewVersions[fi]);
+            ref primitiveData.AerialLutViewVersions[fi],
+            ref primitiveData.SkyViewViewVersions[fi]);
     }
 
     /// <summary>
@@ -1060,7 +1068,7 @@ public static VkPipeline TransparentBackFacePipelineState;
     /// </summary>
     internal static void RefreshSceneBindings(DescriptorSet descriptorSet,
         ref ulong envCubeVersion, ref ulong ddgiAtlasVersion, ref ulong ddgiDepthVersion,
-        ref ulong cloudNoiseVersion, ref ulong aerialLutVersion)
+        ref ulong cloudNoiseVersion, ref ulong aerialLutVersion, ref ulong skyViewVersion)
     {
         // These rewrites bypass WriteDescriptorSet, so they need their own check: the scene sets are also reached
         // from the shadow pass pre-refresh in VKPrimitiveGroup.DrawShadow, and from the background loading thread
@@ -1072,6 +1080,7 @@ public static VkPipeline TransparentBackFacePipelineState;
         VKPrimitiveGroup.RefreshDdgiDepthBinding(descriptorSet, ref ddgiDepthVersion);
         VKPrimitiveGroup.RefreshCloudNoiseBinding(descriptorSet, ref cloudNoiseVersion);
         VKPrimitiveGroup.RefreshAerialLutBinding(descriptorSet, ref aerialLutVersion);
+        VKPrimitiveGroup.RefreshSkyViewBinding(descriptorSet, ref skyViewVersion);
     }
 
     /// <summary>
@@ -1115,7 +1124,8 @@ public static VkPipeline TransparentBackFacePipelineState;
                 ref primitive.DdgiAtlasViewVersions[fi],
                 ref primitive.DdgiDepthViewVersions[fi],
                 ref primitive.CloudNoiseViewVersions[fi],
-                ref primitive.AerialLutViewVersions[fi]);
+                ref primitive.AerialLutViewVersions[fi],
+                ref primitive.SkyViewViewVersions[fi]);
         }
 
         // 精灵走自己的描述符集与版本缓存，同样必须在 begin 之前对齐。
@@ -1302,6 +1312,44 @@ public static VkPipeline TransparentBackFacePipelineState;
         vk.CmdDrawIndexed(cmd, indexCount, instanceCount, 0, 0, firstInstance);
     }
 
+    /// <summary>
+    /// A7 的阴影视图：与 <see cref="DrawShadowPrimitive"/> 只差最后一步——索引数与实例数不再来自 CPU 参数，
+    /// 而是从 indirectBuffer 读一条 VkDrawIndexedIndirectCommand。
+    /// PSO、管线布局、描述符集、顶点与索引绑定全部照旧，因为间接只改变参数的来源。
+    /// <para>
+    /// 实例流带非常数偏移：剔除后的可见实例物化在槽位分段里。Vulkan 的 firstInstance 会改变
+    /// gl_InstanceIndex 的起点，所以偏移必须放在绑定上而不是参数里。
+    /// </para>
+    /// </summary>
+    public static void DrawShadowPrimitiveIndirect(
+        CommandBuffer cmd,
+        PrimitiveData primitiveData,
+        VkBuffer primitiveVertexBuffer,
+        VkBuffer primitiveIndexBuffer,
+        DescriptorSet descriptorSet,
+        VkBuffer instanceBuffer,
+        ulong instanceOffset,
+        VkBuffer indirectBuffer,
+        ulong indirectOffset)
+    {
+        var vk = Device.Vk;
+
+        ulong vbOffset = 0;
+        vk.CmdBindVertexBuffers(cmd, 0, 1, &primitiveVertexBuffer, &vbOffset);
+
+        var instBuf = instanceBuffer.Handle != 0 ? instanceBuffer : IdentityInstanceBuffer.Buffer;
+        vk.CmdBindVertexBuffers(cmd, 1, 1, &instBuf, &instanceOffset);
+
+        vk.CmdBindIndexBuffer(cmd, primitiveIndexBuffer, 0, primitiveData.Use32BitIndices ? IndexType.Uint32 : IndexType.Uint16);
+
+        var set = descriptorSet;
+        vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 0, 1, &set, 0, null);
+        BindViewSet(cmd, MainViewSet);
+
+        vk.CmdDrawIndexedIndirect(cmd, indirectBuffer, indirectOffset, 1,
+            Season.Rendering.IndirectDrawIndexedArgs.SizeInBytes);
+    }
+
     static Sampler CreateImmutableSampler()
     {
         // 2-6 clause 6: this is the only sampler that gets anisotropy. It is bound immutably into the descriptor set
@@ -1442,7 +1490,7 @@ public static VkPipeline TransparentBackFacePipelineState;
         var pointSampler = StaticPointSampler;
         var shadowSampler = ShadowComparisonSampler;
         var wrapSampler = WrapSampler;
-        var bindings = stackalloc DescriptorSetLayoutBinding[25];
+        var bindings = stackalloc DescriptorSetLayoutBinding[26];
 
         bindings[0] = new DescriptorSetLayoutBinding
         {
@@ -1653,10 +1701,24 @@ public static VkPipeline TransparentBackFacePipelineState;
             PImmutableSamplers = &sampler
         };
 
+        // 2-7 P0：程序化天空的 Sky-View LUT 挂在 binding 25，沿用 binding 4..8 的线性 Clamp 不可变采样器。
+        // LUT 无 mip，shader 侧只做 textureLod(...,0.0)，采样器只提供归一化双线性；
+        // u 接缝两侧的导数无意义，所以不能用隐式 LOD。
+        // 未就绪时 VKPrimitiveGroup.SkyViewBound 回落到 Device.White，描述符永远合法；
+        // 消费侧由 skyParams0.w 在 uniform 分支里互斥 gate 住，StaticCube 档根本不会采到白衣。
+        bindings[25] = new DescriptorSetLayoutBinding
+        {
+            Binding = SkyViewBinding,
+            DescriptorType = DescriptorType.CombinedImageSampler,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.FragmentBit,
+            PImmutableSamplers = &sampler
+        };
+
         var info = new DescriptorSetLayoutCreateInfo
         {
             SType = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 25,
+            BindingCount = 26,
             PBindings = bindings
         };
 
@@ -1800,7 +1862,8 @@ public static VkPipeline TransparentBackFacePipelineState;
         // A0.2: NORMAL_OUTPUT adds slot2 = SceneNormal (oct normal xy, roughness, metallic) on top of velocity,
         // mirroring the DX normalOutput gate.
         bool normalOutput = velocityOutput && RenderQuality.Current.EffectiveSceneNormals;
-        string shadowDefs = (RenderQuality.Current.ShadowsEnabled ? "#define SHADOW_ENABLED 1\n" : "#define SHADOW_ENABLED 0\n")
+        bool shaderShadow = RenderQuality.Current.ShadowsEnabled;
+        string shadowDefs = (shaderShadow ? "#define SHADOW_ENABLED 1\n" : "#define SHADOW_ENABLED 0\n")
             + (shadowPass ? "#define SHADOW_PASS 1\n" : "#define SHADOW_PASS 0\n")
             + (velocityOutput ? "#define VELOCITY_OUTPUT 1\n" : "#define VELOCITY_OUTPUT 0\n")
             + (normalOutput ? "#define NORMAL_OUTPUT 1\n" : "#define NORMAL_OUTPUT 0\n");
@@ -2496,10 +2559,13 @@ layout(std140, binding = 1) uniform SceneLights {
     // x = farthest distance in km, >0 enables AP and is the only gate.
     // y = Intensity, where 0 means identity composition.
     vec4 apParams0;            // offset 1360
-    // 区域天气：头两行后每区域八行；前缀 1376B 保持，总长 2432B。
+    // 区域天气：头两行后每区域八行；前缀 1376B 保持，总长 2448B。
     vec4 weatherParams0;       // offset 1376
     vec4 weatherParams1;       // offset 1392
     vec4 weatherRegions[64];   // offset 1408, ends at 2432 bytes
+    // 2-7 雷电 (offset 2432)：xyz = 当前主导雷击在云内的世界坐标 / w = 回击包络亮度 0~1。
+    // w 是唯一总开关；非雷暴天气、区域质量 Off、Showcase 模式下整个字段为零。
+    vec4 weatherFlash;         // offset 2432, ends at 2448 bytes
 };
 
 layout(std140, binding = 2) uniform MaterialParams {
@@ -2575,9 +2641,25 @@ layout(binding = 18) uniform sampler2D ddgiDepth;
 // noise tiles at a fixed period, while wind offsets can push uv outside [0,1].
 // Clamp would stretch the outermost column into a motionless stripe across the sky, just like DX s2 wrapSampler avoids.
 layout(binding = 19) uniform sampler2D cloudNoise;
+// 2-7 P0：程序化天空的 Sky-View LUT（binding 25）。无 mip，只做 textureLod(...,0.0)。
+// 未就绪时绑 1x1 白衣，消费侧由 skyParams0.w 在 uniform 分支里互斥 gate 住，永远不会采到它。
+layout(binding = 25) uniform sampler2D skyView;
 vec4 WeatherH(int i) { return i==0?weatherParams0:weatherParams1; }
 vec4 WeatherR(int i,int row) { return weatherRegions[i*8+row]; }
+vec4 WeatherFlash() { return weatherFlash; }
 vec4 WeatherNoise(vec2 uv) { return textureLod(cloudNoise,uv,0.0); }
+
+// 2-7 P0：程序化天空的 Sky-View LUT（binding 25），环境**镜面**源。
+// 参数化与 renderMode == 3 的天空球、以及 skyView 计算内核的反解逐字节对齐：
+// u 接缝在 +Z，v 用 sqrt 折叠把分辨率往地平线集中。
+vec3 SampleSkyViewRadiance(vec3 d) {
+    // 1/(2*PI) 写成字面量：PI 在共享常量块里声明，位置在本函数之后，GLSL 要求先声明后使用。
+    // GLSL 没有 atan2：双参数反正切写作 atan(y,x)，与 HLSL/WGSL/MSL 的 atan2(y,x) 同义。
+    vec2 uv;
+    uv.x = atan(d.x, -d.z) * 0.15915494309 + 0.5;
+    uv.y = 0.5 - 0.5 * sign(d.y) * sqrt(abs(d.y));
+    return textureLod(skyView, uv, 0.0).rgb;
+}
 " + Season.Rendering.Effects.WeatherShaders.CommonGlsl
   + Season.Rendering.Effects.WeatherShaders.CloudGlsl
   + Season.Rendering.Effects.WeatherShaders.RainGlsl + @"
@@ -3668,10 +3750,28 @@ void main() {
     // the specular term samples the radiance cube at LOD0 along the reflected direction.
     // There is no mip chain and no GGX prefiltering,
     // so the term is masked by (1 - roughness)^2, while rough-surface environment energy is carried by the SH9 diffuse term above.
+    // 2-7 P0：程序化天空下 EnvironmentMap 停在 Diffuse 档（没有 radiance cube），环境镜面改由 Sky-View LUT 提供。
+    // 两者互斥，且 skyParams0.w 是 UBO 常量，所以这里是一个 uniform 分支，只采一次；
+    // 同时它也蕴含了 envParams.w，不必再查环境图是否就绪。
+    // LUT 是没有任何预滤波的全分辨率天空，只适合接近镜面的表面，因此再叠一次 (1-roughness)^2，
+    // 总权重退化为 (1-r)^4；粗糙面的环境能量仍由 SH9 漫反射承担。
     vec3 R = reflect(-V, N);
-    vec3 envSpecular = textureLod(envCube, R, 0.0).rgb * envParams.x;
     float specMask = (1.0 - roughness) * (1.0 - roughness);
-    ambient += envSpecular * F0 * specMask * ao * step(0.5, envParams.w);
+    vec3 reflectionRadiance; float specGate;
+    if (skyParams0.w > 0.0) {
+        reflectionRadiance = SampleSkyViewRadiance(R);
+        specMask *= specMask;
+        specGate = 1.0;
+    } else {
+        reflectionRadiance = textureLod(envCube, R, 0.0).rgb;
+        specGate = step(0.5, envParams.w);
+    }
+    ambient += reflectionRadiance * envParams.x * F0 * specMask * ao * specGate;
+
+    // 2-7：雷击对地面的均匀照亮。走环境项而不是瞬时点光：云底到地面的距离让 1/d² 退化成
+    // 一成不变的亮度，还会在 8 盏光的预算里挤掉场景灯。
+    if (weatherFlash.w > 0.0)
+        ambient += albedo * ao * (1.0 - metallic) * weatherFlash.w * vec3(0.55, 0.62, 0.85) * 0.8;
 
     vec3 color = ambient + Lo + emissive;
 

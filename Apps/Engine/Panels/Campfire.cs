@@ -105,8 +105,21 @@ internal class Campfire : Panel
             Name = LogsPath,
             PosX = CenterX,
             PosZ = CenterZ,
-            // CastShadows keeps the default: the teepee is the only part of the fire that throws a
-            // real silhouette, and it is also the only part registered as a collider obstacle.
+            // CastShadows is off for two separate reasons, and both are about the GI proxy it would emit.
+            //
+            // 1. The proxy is the whole world AABB of the teepee, and the point light sits at LightHeight
+            //    0.70 m inside that box (the settled pile is ~0.716 m tall). Every probe ray that hits the
+            //    teepee therefore lands a few centimetres from the light, where 1/d^2 is enormous, and a
+            //    2 m probe grid cannot resolve that spike except as one grid-aligned bright square.
+            // 2. Now that GiPunctualShadow is on (see App), a solid proxy that encloses the light would
+            //    occlude the campfire from every probe in the volume: the SDF is negative everywhere inside
+            //    the box, so every shadow ray toward the flame reports blocked and the fire stops lighting
+            //    the ground at all.
+            //
+            // The cost is that the teepee no longer casts a CSM shadow. At 0.78 m wide next to a fire the
+            // player stands around, that silhouette was never readable; the grass under the pile is already
+            // fully lit by the unshadowed point light.
+            CastShadows = false,
         };
 
         bed = new Season.Controls.Model()

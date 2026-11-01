@@ -821,6 +821,52 @@ internal static class Pipeline
             primitiveIndexBuffer, 0, instanceCount);
     }
 
+    /// <summary>
+    /// A7：阴影间接绘制出口，与 <see cref="DrawShadowPrimitive"/> 逐项同构，差别只在“画多少”由 GPU 侧参数缓冲给出。
+    /// 索引数、实例数与 baseVertex 全都读同一条 20 字节记录（布局与 D3D12_DRAW_INDEXED_ARGUMENTS 一致），
+    /// 所以这里不再收 indexCount 与 instanceCount——传进来只会和参数缓冲里的值打架。
+    /// 重载是 drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset:，
+    /// 索引缓冲在前、参数缓冲在后。
+    /// </summary>
+    /// <param name="instanceBufferOffset">
+    /// 剔除后重排流的槽位段起点。这里放偏移而不是放参数缓冲里的 firstInstance，
+    /// 是因为 Metal 与 Vulkan 都把 baseInstance 算进 gl_InstanceIndex，那会让实例流下标整体平移错位。
+    /// </param>
+    /// <param name="indirectOffset">本 primitive 在参数表中的字节偏移。</param>
+    public static void DrawShadowPrimitiveIndirect(
+        IMTLRenderCommandEncoder enc,
+        PrimitiveData primitiveData,
+        IMTLBuffer primitiveVertexBuffer,
+        IMTLBuffer primitiveIndexBuffer,
+        IMTLBuffer matrixBuffer,
+        IMTLBuffer materialBuffer,
+        IMTLBuffer boneBuffer,
+        IMTLBuffer morphBuffer,
+        IMTLBuffer instanceBoneBuffer,
+        MTLIndexType indexType,
+        IMTLBuffer instanceBuffer,
+        nuint instanceBufferOffset,
+        IMTLBuffer indirectBuffer,
+        nuint indirectOffset,
+        bool bindMaterial = true)
+    {
+        enc.SetVertexBuffer(primitiveVertexBuffer, 0, 0); // VB slot 0
+        enc.SetVertexBuffer(matrixBuffer, 0, 1);          // b1 Matrices
+        BindView(enc, MainViewBuffer);                    // b11 ViewConstants（shadow 不读 view/proj，保留占位）
+        enc.SetVertexBuffer(boneBuffer, 0, 3);            // b3 BoneMatrices
+        if (bindMaterial)
+        {
+            enc.SetVertexBuffer(materialBuffer, 0, 4);    // b2 MaterialParams（VS 读变形标志）
+            enc.SetVertexBuffer(morphBuffer, 0, 5);       // b4 MorphDeltas
+        }
+        enc.SetVertexBuffer(instanceBoneBuffer, 0, 6);    // b5 InstanceBoneMatrices
+
+        enc.SetVertexBuffer(instanceBuffer, instanceBufferOffset, 2);
+
+        enc.DrawIndexedPrimitives(MTLPrimitiveType.Triangle, indexType,
+            primitiveIndexBuffer, 0, indirectBuffer, indirectOffset);
+    }
+
     static IMTLSamplerState CreateStaticSampler()
     {
         // 2-6 clause 6: anisotropy goes on the material sampler only. Metal caps the count at 16 and rejects 0, which
@@ -1165,10 +1211,13 @@ struct SceneLights {
     // x=maxDistanceKm, where values greater than 0 enable AP and act as the only gate.
     // y=Intensity, where 0 means identity composition.
     float4 apParams0;                      // offset 1360
-    // 区域天气：头两行后每区域八行；前缀 1376B 保持，总长 2432B。
+    // 区域天气：头两行后每区域八行；前缀 1376B 保持，总长 2448B。
     float4 weatherParams0;                 // offset 1376
     float4 weatherParams1;                 // offset 1392
     float4 weatherRegions[64];             // offset 1408，尾部 2432B
+    // 2-7 雷电 (offset 2432)：xyz = 当前主导雷击在云内的世界坐标 / w = 回击包络亮度 0~1。
+    // w 是唯一总开关；非雷暴天气、区域质量 Off、Showcase 模式下整个字段为零。
+    float4 weatherFlash;                   // offset 2432，尾部 2448B
 };
 
 struct MaterialParams {
@@ -1707,7 +1756,7 @@ inline float ComputeCloudShadow(constant SceneLights& lights, texture2d<float> c
         }
         result = 1.0 - lights.cloudParams1.x * saturate(1.0 - exp(-tau));
     }
-    WeatherCloudContext<constant float4*> weather{lights.weatherParams0,lights.weatherParams1,lights.weatherRegions,cloudNoise};
+    WeatherCloudContext<constant float4*> weather{lights.weatherParams0,lights.weatherParams1,lights.weatherRegions,cloudNoise,lights.weatherFlash};
     return result*weather.WeatherCloudShadow(worldPos,toLight);
 }
 
@@ -2213,6 +2262,19 @@ struct FragmentOut {
 #define SEASON_RETURN_COLOR(col_) return ApplySceneFog(ApplySceneWeather((col_), in.vWorldPos, lights, fogParams), in.vWorldPos, sceneFog, fogParams);
 #endif
 
+// 2-7 P0：采样 Sky-View LUT 取反射方向的辐射度。
+// 参数化与 renderMode == 3 的天空球、以及 skyView 计算内核的反解逐字节对齐：
+// u 接缝在 +Z，v 用 sqrt 折叠把分辨率往地平线集中。LUT 无 mip，只能采 level 0——
+// 接缝两侧的隐式导数会选出错误的 level。
+inline float3 SampleSkyViewRadiance(texture2d<float> skyView, sampler s, float3 dir)
+{
+    // 1/(2*PI) 写成字面量，避开与共享常量块中宏名的重复定义。
+    float2 uv;
+    uv.x = atan2(dir.x, -dir.z) * 0.15915494309 + 0.5;
+    uv.y = 0.5 - 0.5 * sign(dir.y) * sqrt(abs(dir.y));
+    return skyView.sample(s, uv, level(0.0)).rgb;
+}
+
 fragment SEASON_FS_OUT fragment_main(
     VertexOut in [[stage_in]],
 #if OUTLINE_MASK
@@ -2293,6 +2355,11 @@ fragment SEASON_FS_OUT fragment_main(
     // 片元阶段的 texture3d 默认是 access::sample，正好能直接交给 FogSampler 的形参。
     , texture3d<float> fogIntegratedVolume [[texture(11)]]
     , texture3d<float> fogLocalVolume      [[texture(12)]]
+    // 2-7 P0：程序化天空的 Sky-View LUT（texture(13)），PBR 的环境镜面源。
+    // 与 texture(6) 的 envCube 并行而不是替换：两者互斥，由 skyParams0.w 在 uniform 分支里二选一，
+    // 因此两张图都必须有合法绑定（未就绪时 Device.BeginPass 绑 1x1 白）。
+    // 白衣不会被采到：写入 skyParams0.w 的前提正是 FrameSchedule.SkyViewTexture 非空。
+    , texture2d<float> skyView             [[texture(13)]]
 #if SHADOW_ENABLED
     , depth2d<float> shadowAtlas          [[texture(5)]]
     , sampler shadowSampler               [[sampler(1)]]
@@ -2427,7 +2494,7 @@ fragment SEASON_FS_OUT fragment_main(
         // The body only uses explicit level zero sampling, so this non-uniform branch involves no implicit derivatives.
         if (lights.cloudParams0.w > 0.0 && skyDir.y > 0.0)
             skyRadiance = CloudComposite(lights, cloudNoise, wrapSampler, skyRadiance, skyDir, lights.cameraPos.xz * 0.001);
-        WeatherCloudContext<constant float4*> weather{lights.weatherParams0,lights.weatherParams1,lights.weatherRegions,cloudNoise};
+        WeatherCloudContext<constant float4*> weather{lights.weatherParams0,lights.weatherParams1,lights.weatherRegions,cloudNoise,lights.weatherFlash};
         skyRadiance=weather.WeatherCloudComposite(skyRadiance,lights.cameraPos.xyz,skyDir,lights.skyParams0.xyz);
 #if HDR_CHAIN
         // The LUT already stores linear HDR radiance,
@@ -2624,10 +2691,31 @@ fragment SEASON_FS_OUT fragment_main(
     // the specular term uses mirrored reflection from radiance cube LOD0.
     // There is no mip chain and no GGX prefiltering,
     // so it is masked by one-minus-roughness squared and rough-surface environment energy is carried by the SH9 diffuse term above.
+    // 2-7 P0：程序化天空下 EnvironmentMap 停在 Diffuse 档（没有 radiance cube），环境镜面改由 Sky-View LUT 提供。
+    // 两者互斥，且 skyParams0.w 是 UBO 常量，所以这里是一个 uniform 分支，只采一次；
+    // 同时它也蕴含了 envParams.w，不必再查环境图是否就绪。
+    // LUT 是没有任何预滤波的全分辨率天空，只适合接近镜面的表面，因此再叠一次 (1-roughness)^2，
+    // 总权重退化为 (1-r)^4；粗糙面的环境能量仍由 SH9 漫反射承担。
     float3 R = reflect(-V, N);
-    float3 envSpecular = envCube.sample(texSampler, R, level(0.0)).rgb * lights.envParams.x;
     float specMask = (1.0 - roughness) * (1.0 - roughness);
-    ambient += envSpecular * F0 * specMask * ao * step(0.5, lights.envParams.w);
+    float3 reflectionRadiance; float specGate;
+    if (lights.skyParams0.w > 0.0)
+    {
+        reflectionRadiance = SampleSkyViewRadiance(skyView, texSampler, R);
+        specMask *= specMask;
+        specGate = 1.0;
+    }
+    else
+    {
+        reflectionRadiance = envCube.sample(texSampler, R, level(0.0)).rgb;
+        specGate = step(0.5, lights.envParams.w);
+    }
+    ambient += reflectionRadiance * lights.envParams.x * F0 * specMask * ao * specGate;
+
+    // 2-7：雷击对地面的均匀照亮。走环境项而不是瞬时点光：云底到地面的距离让 1/d² 退化成
+    // 一成不变的亮度，还会在 8 盏光的预算里挤掉场景灯。
+    if (lights.weatherFlash.w > 0.0)
+        ambient += albedo * ao * (1.0 - metallic) * lights.weatherFlash.w * float3(0.55, 0.62, 0.85) * 0.8;
 
     float3 color = ambient + Lo + emissive;
 

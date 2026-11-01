@@ -103,6 +103,9 @@ public sealed class DecalEffect : IDisposable
         {
             var decal = decals[i];
             if (!decal.Enabled) continue;
+            // 强度为 0 的加法贴花对场景没有任何贡献（输出 0，dst+0 = dst），直接剔除。
+            // 除了省一次 draw，这也排除了「混合没开时输出 0 直接把目标涂黑」这类后端配置错的可见后果。
+            if (decal.Mode == DecalMode.Additive && decal.Intensity <= 0f) continue;
             decal.GetBounds(out var center, out var extents);
             if (!frustum.Intersects(in center, in extents)) continue;
             // 稳定插入排序：上限 64，插入排序比分配 key 数组更省也更不容易写错。

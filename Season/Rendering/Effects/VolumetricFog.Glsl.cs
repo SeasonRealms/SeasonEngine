@@ -140,6 +140,9 @@ vec4 CloudSample(vec2 uv) {
 }
 vec4 WeatherH(int i) { vec4 h=F(118+i); if(i==0 && F(16).w<0.5) h.y=0; return h; }
 vec4 WeatherR(int i,int row) { return F(120+i*8+row); }
+// 2-7 雷电：雾帧里 SceneLightParams 从索引 32 起，WeatherFlash 是其中第 152 行，所以绝对位置是 184。
+// 图形管线读的是 UBO 同名成员，两边是同一份数据。
+vec4 WeatherFlash() { return F(184); }
 vec4 WeatherNoise(vec2 uv) { return CloudSample(uv); }
 """ + WeatherShaders.CommonGlsl + WeatherShaders.CloudGlsl + """
 float CloudShadow(vec3 p,vec3 l) {

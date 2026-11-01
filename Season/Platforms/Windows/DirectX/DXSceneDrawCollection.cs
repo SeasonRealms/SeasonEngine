@@ -9,7 +9,10 @@ namespace Season.Platforms.Windows.DirectX;
 /// <summary>只保存不可变的本帧地址/视图，不保存控件、图元或重放 Draw 的委托。</summary>
 internal unsafe struct DXSceneDrawCommand : ISceneDrawCommand
 {
-    [System.Runtime.CompilerServices.InlineArray(23)]
+    // 29 而不是 23：2-7 P0 的 Sky-View LUT 挂在根参数 28（见 Pipeline.SkyViewRoot）。
+    // 23~27 在根签名里不是描述符表（t16 是根 SRV，b6/b7 是根常量，b8 是 CBV），
+    // 所以重放循环只走到 22，索引 28 单独绑定。
+    [System.Runtime.CompilerServices.InlineArray(29)]
     internal struct Views { GpuDescriptorHandle _first; }
     internal Views Textures;
     internal PipelineMode Mode;
@@ -35,6 +38,8 @@ internal unsafe struct DXSceneDrawCommand : ISceneDrawCommand
         cmd->SetGraphicsRootConstantBufferView(11, Text);
         for (uint root = 3; root < 23; root++)
             if (Textures[(int)root].Ptr != 0) cmd->SetGraphicsRootDescriptorTable(root, Textures[(int)root]);
+        if (Textures[(int)Pipeline.SkyViewRoot].Ptr != 0)
+            cmd->SetGraphicsRootDescriptorTable(Pipeline.SkyViewRoot, Textures[(int)Pipeline.SkyViewRoot]);
         if (Indexed)
         {
             var indices = Indices;
@@ -92,6 +97,7 @@ internal unsafe sealed class DXSceneDrawCollection
         draw.Textures[19] = _sceneTemplate.Textures[19];
         draw.Textures[21] = _sceneTemplate.Textures[21];
         draw.Textures[22] = _sceneTemplate.Textures[22];
+        draw.Textures[(int)Pipeline.SkyViewRoot] = _sceneTemplate.Textures[(int)Pipeline.SkyViewRoot];
     }
 
     internal void Seal()

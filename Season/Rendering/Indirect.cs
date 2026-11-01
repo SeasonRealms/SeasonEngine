@@ -21,6 +21,16 @@ public enum StorageBufferUsage
     /// Carries a real cost on D3D12, where a resource that can become INDIRECT_ARGUMENT is excluded from some driver fast paths, so it is not the default.
     /// </summary>
     ComputeAndIndirectArgs,
+
+    /// <summary>
+    /// Compute read/write plus use as a vertex input stream. A7 introduced this: the gather kernel materialises
+    /// the surviving instances into a per-slot block, and the very same buffer is then bound as the IA instance
+    /// stream. Vulkan and WebGPU both bake this into the native object (VkBufferUsageFlags.VertexBuffer,
+    /// GPUBufferUsage.VERTEX) and refuse to widen it afterwards, so it has to be asked for at creation.
+    /// D3D12 and Metal need nothing extra: a D3D12 resource moves into VERTEX_AND_CONSTANT_BUFFER by barrier and
+    /// an MTLBuffer has no usage bits at all, but both still honour the declaration for validation symmetry.
+    /// </summary>
+    ComputeAndVertexInput,
 }
 
 /// <summary>

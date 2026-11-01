@@ -265,6 +265,13 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.setAerialLut")]
     internal static partial void SetAerialLut(string? name);
 
+    /// <summary>2-7 P0: registers the procedural-sky Sky-View LUT name active for this frame
+    /// (same pattern as SetAerialLut).
+    /// Main-pass binding 23 resolves from it. Passing null/empty falls back to a 1×1 White texture,
+    /// which is never sampled because the WGSL gate skyParams0.w is only written when the LUT exists.</summary>
+    [JSImport("globalThis.seasonWebGPU.setSkyView")]
+    internal static partial void SetSkyView(string? name);
+
     [JSImport("globalThis.seasonWebGPU.updateStaticMeshVertices")]
     internal static partial void UpdateStaticMeshVertices(
         string cacheKey,
@@ -379,14 +386,38 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.disposeDecalPipeline")]
     internal static partial void DisposeDecalPipeline(string name);
 
+    // P2 池塘水。WGSL 一次性下发（顶点与片元同一份源码），JS 侧只建一条 PSO 与两级绑定组：
+    // group 0 是帧级资源（帧缓冲、场景深度、折射快照、天空 LUT、采样器），group 1 是逐水面的法线贴图。
+    // 与贴花一样，本 Pass 不挂深度附件 —— 本帧的深度只是采样源。
+    // drawsJson 是 [[slot, "textureName"], ...]；纹理名为 null 表示走程序化双正弦波。
+    // hzChain 是 P3 Hi-Z 四级的名字（逗号分隔），空串表示本帧不画屏幕空间反射。
+    [JSImport("globalThis.seasonWebGPU.createWaterPipeline")]
+    internal static partial bool CreateWaterPipeline(string name, string wgsl);
+
+    [JSImport("globalThis.seasonWebGPU.prepareWater")]
+    internal static partial bool PrepareWater(string name, string color, string depth, string refraction,
+        string frame, string drawsJson, string? skyView, string hzChain, string destination);
+
+    [JSImport("globalThis.seasonWebGPU.drawWater")]
+    internal static partial bool DrawWater(string name);
+
+    [JSImport("globalThis.seasonWebGPU.disposeWaterPipeline")]
+    internal static partial void DisposeWaterPipeline(string name);
+
+    /// <summary>P2: 整幅纹理拷贝，用来在水面 Pass 开画前拷一份场景色当折射源。
+    /// <c>copyTextureToTexture</c> 必须在帧外、渲染 Pass 之外录制，否则整帧放弃。</summary>
+    [JSImport("globalThis.seasonWebGPU.copyRenderTarget")]
+    internal static partial bool CopyRenderTarget(string source, string destination);
+
     /// <summary>Registers a storage texture (write-only storage + sampleable) into the JS _textures dictionary.
     /// formatKind is aligned with ComputeStorageFormat (0=rgba8unorm, 1=rgba16float, used by the 2-1 bloom chain).</summary>
     [JSImport("globalThis.seasonWebGPU.createComputeTexture")]
     internal static partial void CreateComputeTexture(string name, int width, int height, int formatKind);
 
-    /// <summary>A0.1: indirect adds GPUBufferUsage.INDIRECT, which must be requested at creation time and cannot be widened later.</summary>
+    /// <summary>A0.1: indirect adds GPUBufferUsage.INDIRECT, which must be requested at creation time and cannot be widened later.
+    /// A7: vertex adds GPUBufferUsage.VERTEX for the same reason — the gathered instance stream is bound as a vertex buffer.</summary>
     [JSImport("globalThis.seasonWebGPU.createStorageBuffer")]
-    internal static partial bool CreateStorageBuffer(string id, int sizeInBytes, bool indirect);
+    internal static partial bool CreateStorageBuffer(string id, int sizeInBytes, bool indirect, bool vertex);
 
     [JSImport("globalThis.seasonWebGPU.disposeStorageBuffer")]
     internal static partial void DisposeStorageBuffer(string id);

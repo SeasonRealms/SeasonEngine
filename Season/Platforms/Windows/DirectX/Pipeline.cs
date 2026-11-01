@@ -36,11 +36,19 @@ internal static unsafe class Pipeline
 {
     internal static ID3D12RootSignature* RootSignature;
     internal const uint FogFrameRoot = 23, FogIntegratedRoot = 24, FogLocalRoot = 25, FogParamsRoot = 26;
-
     /// <summary>Per-view constants (b8, <see cref="ViewConstants"/>): View / Projection / history ViewProjection of
     /// the view being drawn. Split out of the per-object b0 so one set of object buffers can be drawn into several
     /// views; b0 now carries only World / PrevWorld.</summary>
     internal const uint ViewConstantsRoot = 27;
+
+    /// <summary>
+    /// 2-7 P0: descriptor table of the procedural-sky Sky-View LUT (t19), sampled by the PBR pixel shader
+    /// as the environment **specular** source. It gets its own root index instead of a slot inside the
+    /// 3..22 table run because every index in that range is already taken: 8 is the b3 bone CBV, 11 the
+    /// b4 text CBV, and 13 the b5 shadow root constants, so the layout up to 27 is fully occupied.
+    /// 28 keeps the existing table run byte-identical and costs one more root-table DWORD.
+    /// </summary>
+    internal const uint SkyViewRoot = 28;
     static bool _fogSamplingEnabled;
 
     // Per-view constants: one CB per view slot per frame slot, rewritten by WriteViewConstants (N-buffered like every
@@ -116,6 +124,11 @@ internal static unsafe class Pipeline
 
     /// <summary>1-5 shadow PSO (depth-only, CullNone, bias baked in; created when ShadowsEnabled is on).</summary>
     internal static ID3D12PipelineState* ShadowPipelineState;
+    /// <summary>
+    /// A7：阴影间接绘制的命令签名（一条 DrawIndexed 记录）。惰性创建且与进程同寿：
+    /// 它不引用任何根签名，也不随渲染目标或采样数变化，所以只需一份。
+    /// </summary>
+    internal static ID3D12CommandSignature* ShadowIndirectCommandSignature;
 
     /// <summary>Identity instance buffer used as the slot 1 placeholder for regular draws (64B, permanently reused;
     /// also referenced by the sprite quad path to avoid debug layer #202 spam for missing VB bindings).</summary>
@@ -190,6 +203,12 @@ internal static unsafe class Pipeline
     // Unlike the cloud-noise case, this fallback is an identity element rather than a dangerous value, so
     // the apParams0.x gate only exists to save one sample.
     internal static DXTexture3D AerialLutActive;
+
+    // 2-7 P0: the procedural-sky Sky-View LUT (compute 2D rgba16float). Resolved once per frame in SetLighting,
+    // consumed by DrawPrimitive as the environment specular source. Falls back to Device.White when null.
+    // White is not a dangerous value here: the consumer branch is gated on skyParams0.w > 0, which is written only
+    // when FrameSchedule.SkyViewTexture is non-null, so the white fallback is never sampled in the StaticCube tier.
+    internal static DXTexture SkyViewActive;
 
     public static void Init()
     {
@@ -484,14 +503,15 @@ internal static unsafe class Pipeline
         using ComPtr<ID3D10Blob> signature = null;
         using ComPtr<ID3D10Blob> error = null;
 
-        // Root parameters: 23 total (five CBVs b0-b4 + 16 SRV tables t0-t7 + t8/t9/t10
+        // Root parameters: 29 total (five CBVs b0-b4 + 16 SRV tables t0-t7 + t8/t9/t10
         // + 1-7 envCube t11 + 2-4 ddgiAtlas t12 + 2-4 ddgiDepth t13 + 2-5 cloudNoise t14
         // + 2-5 apLut t15 + 1-5 shadow root constants b5 + Outline2D mask color root constants b6)
         // 新增独立雾绑定占 8 DWORD，总计 58，不改写已经提交的光照 CBV。
         // 每视图常量 b8 再占 2 DWORD，总计 60（上限 64）。
+        // 2-7 P0 再追加一个 t19 描述符表，总计 61（上限 64），剩余 3 DWORD。
         _fogSamplingEnabled = RenderQuality.Current.RequiresAtmosphereSceneDepth(
             Device.HdrSceneColor, true, Immediate2DMode.Enabled);
-        var rootParameters = new RootParameter[28];
+        var rootParameters = new RootParameter[29];
 
         // Constant buffer (b0)
         rootParameters[0] = new RootParameter
@@ -527,7 +547,7 @@ internal static unsafe class Pipeline
         // prev bone / prev instance world / prev morph weights / env cube / DdgiAtlas / DdgiDepth /
         // CloudNoise / AerialLut (from t0 to t15)
         // 放在栈上，保证后续序列化时各 table 指针仍然有效。
-        Span<DescriptorRange> descriptorRanges = stackalloc DescriptorRange[18];
+        Span<DescriptorRange> descriptorRanges = stackalloc DescriptorRange[19];
         for (int i = 0; i < 5; i++)
         {
             descriptorRanges[i] = new DescriptorRange
@@ -628,6 +648,8 @@ internal static unsafe class Pipeline
 
         descriptorRanges[16] = new() { RangeType = DescriptorRangeType.Srv, NumDescriptors = 1, BaseShaderRegister = 17 };
         descriptorRanges[17] = new() { RangeType = DescriptorRangeType.Srv, NumDescriptors = 1, BaseShaderRegister = 18 };
+        // 2-7 P0: t19 = 程序化天空的 Sky-View LUT，PBR 的环境镜面源
+        descriptorRanges[18] = new() { RangeType = DescriptorRangeType.Srv, NumDescriptors = 1, BaseShaderRegister = 19 };
 
         // Pin the descriptorRanges array with a fixed block
         fixed (DescriptorRange* pDescriptorRanges = descriptorRanges)
@@ -798,6 +820,20 @@ internal static unsafe class Pipeline
                 {
                     NumDescriptorRanges = 1,
                     PDescriptorRanges = pDescriptorRanges + 15
+                },
+                ShaderVisibility = ShaderVisibility.Pixel
+            };
+
+            // 2-7 P0: Sky-View LUT (t19)，程序化天空下的 PBR 环境镜面源。
+            // 与 t11 envCube 并列而不是替换它：两者互斥，由 skyParams0.w 在 uniform 分支里二选一，
+            // 所以两张图表都必须有合法描述符（未就绪时绑 1x1 白）。
+            rootParameters[SkyViewRoot] = new RootParameter
+            {
+                ParameterType = RootParameterType.TypeDescriptorTable,
+                DescriptorTable = new RootDescriptorTable
+                {
+                    NumDescriptorRanges = 1,
+                    PDescriptorRanges = pDescriptorRanges + 18
                 },
                 ShaderVisibility = ShaderVisibility.Pixel
             };
@@ -1111,6 +1147,9 @@ cbuffer SceneLights : register(b1)
     float4 weatherParams0;
     float4 weatherParams1;
     float4 weatherRegions[64];
+    // 2-7 雷电 (offset 2432): xyz = 当前主导雷击在云内的世界坐标 / w = 回击包络亮度 0~1。
+    // w 是唯一总开关；非雷暴天气、区域质量 Off、Showcase 模式下整个字段为零。
+    float4 weatherFlash;
 };
 
 #if SHADOW_PASS
@@ -1519,6 +1558,12 @@ Texture2D ddgiDepth : register(t13);
 // as real noise because it would saturate density.
 Texture2D cloudNoise : register(t14);
 
+// 2-7 P0: procedural-sky Sky-View LUT (t19), the environment **specular** source when the sky is procedural.
+// Declared unconditionally because the root signature always contains the slot; DrawPrimitive binds a 1x1 white
+// dummy when not ready. The only consumer branch is gated on skyParams0.w > 0, which SkyLighting.Apply writes
+// only when FrameSchedule.SkyViewTexture is non-null, so the white fallback is never sampled with StaticCube.
+    Texture2D skyView : register(t19);
+
 // 2-5 Step C: linear-**wrap** sampler dedicated to cloud noise (s2). This is the only sampling path in
 // the whole pipeline that needs Wrap. The noise tiles on a fixed period (integer lattice hashes are modulo-
 // wrapped by the octave lattice count), while wind offset can push uv outside [0,1].
@@ -1526,7 +1571,22 @@ Texture2D cloudNoise : register(t14);
 SamplerState wrapSampler : register(s2);
 float4 WeatherH(int i) { return i==0?weatherParams0:weatherParams1; }
 float4 WeatherR(int i,int row) { return weatherRegions[i*8+row]; }
+float4 WeatherFlash() { return weatherFlash; }
 float4 WeatherNoise(float2 uv) { return cloudNoise.SampleLevel(wrapSampler,uv,0.0); }
+
+// 2-7 P0: sample the Sky-View LUT for a reflection direction. The parameterization is the same one the
+// renderMode == 3 sky sphere uses, and it stays byte-for-byte aligned with the skyView kernel's inverse:
+// the u seam sits at +Z and v uses a sqrt fold so resolution concentrates toward the horizon.
+// The LUT has no mips and implicit derivatives across the seam would pick a wrong LOD, so LOD 0 only.
+float3 SampleSkyViewRadiance(float3 dir)
+{
+    // 1/(2*PI) is written out instead of using PI: this block is emitted before the shared
+    // constant block that declares PI, and fxc requires a declaration before use.
+    float2 uv;
+    uv.x = atan2(dir.x, -dir.z) * 0.15915494309 + 0.5;
+    uv.y = 0.5 - 0.5 * sign(dir.y) * sqrt(abs(dir.y));
+    return skyView.SampleLevel(linearSampler, uv, 0.0).rgb;
+}
 " + Season.Rendering.Effects.WeatherShaders.CommonHlsl
   + Season.Rendering.Effects.WeatherShaders.CloudHlsl
   + Season.Rendering.Effects.WeatherShaders.RainHlsl + @"
@@ -2722,10 +2782,32 @@ float4 PSMain(PSInput input) : SV_TARGET
     // There is no mip chain and no GGX prefiltering, so it is masked by (1-roughness)^2; the environment
     // energy for rough surfaces is carried by the SH9 diffuse term above.
     float3 R = reflect(-V, N);
-    float3 envSpecular = envCube.SampleLevel(linearSampler, R, 0).rgb * envParams.x;
     float specMask = (1.0 - roughness) * (1.0 - roughness);
-    ambient += envSpecular * F0 * specMask * ao * step(0.5, envParams.w);
-    
+    // 2-7 P0: 程序化天空下 EnvironmentMap 停在 Diffuse 档（没有 radiance cube），环境镜面改由 Sky-View LUT 提供。
+    // 两者互斥，且 skyParams0.w 是 cbuffer 常量，所以这里是一个 uniform 分支，只采一次；
+    // 同时它也蕴含了 envParams.w，不必再查环境图是否就绪。
+    // LUT 是没有任何预滤波的全分辨率天空，只适合接近镜面的表面，因此再叠一次 (1-roughness)^2，
+    // 总权重退化为 (1-r)^4；粗糙面的环境能量仍由 SH9 漫反射承担。
+    float3 reflectionRadiance;
+    float specGate;
+    [branch] if (skyParams0.w > 0.0)
+    {
+        reflectionRadiance = SampleSkyViewRadiance(R);
+        specMask *= specMask;
+        specGate = 1.0;
+    }
+    else
+    {
+        reflectionRadiance = envCube.SampleLevel(linearSampler, R, 0).rgb;
+        specGate = step(0.5, envParams.w);
+    }
+    ambient += reflectionRadiance * envParams.x * F0 * specMask * ao * specGate;
+
+    // 2-7: 雷击对地面的均匀照亮。走环境项而不是瞬时点光：云底到地面的距离让 1/d² 退化成
+    // 一成不变的亮度，还会在 8 盏光的预算里挤掉场景灯。
+    [branch] if (weatherFlash.w > 0.0)
+        ambient += albedo * ao * (1.0 - metallic) * weatherFlash.w * float3(0.55, 0.62, 0.85) * 0.8;
+
     // Emissive contribution
     float3 emissiveContribution = emissive;
     
@@ -3227,6 +3309,7 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         draw.Textures[22] = arena.CaptureView(aerial.NativeResource, new ShaderResourceViewDesc {
             Format = aerial.NativeFormat, ViewDimension = SrvDimension.Texture3D, Shader4ComponentMapping = 0x1688,
             Texture3D = new() { MipLevels = 1 } });
+        draw.Textures[(int)SkyViewRoot] = DXSceneDrawCollection.Texture(SkyViewActive);
     }
 
     static void BindSceneTextures()
@@ -3283,6 +3366,13 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         var apLut = AerialLutActive ?? DXTexture3D.DummyBlack;
         apLut.EnsureReadyForRendering(cmdList);
         cmdList->SetGraphicsRootDescriptorTable(22, apLut.GpuDescriptorHandle);
+
+        // 2-7 P0: Sky-View LUT (t19)。着色器在 skyParams0.w > 0 的 uniform 分支里静态引用它，
+        // 而那个门控只在 FrameSchedule.SkyViewTexture 非空时成立，所以未就绪时绑的 1x1 白永远不会被采样。
+        // Active 每帧由 SetLighting 解析，不缓存挂掉的资源句柄。
+        var skyView = SkyViewActive ?? Device.White;
+        skyView.EnsureReadyForRendering(cmdList);
+        cmdList->SetGraphicsRootDescriptorTable(SkyViewRoot, skyView.GpuDescriptorHandle);
     }
 
     // ============================================================
@@ -3436,5 +3526,89 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         }
 
         cmdList->DrawIndexedInstanced((uint)primitiveData.Indices.Length, instanceCount, 0, 0, startInstanceLocation);
+    }
+
+    /// <summary>
+    /// A7 的阴影视图：与 <see cref="DrawShadowPrimitive"/> 只差最后一步——五个绘制参数不再来自 CPU 寄存器，
+    /// 而是从 argsResource 的指定偏移读一条记录。PSO、根签名、顶点布局、深度状态全部照旧，
+    /// 因为间接绘制只改变参数的来源，不改变任何管线形状。
+    /// <para>
+    /// 实例数由 gather 内核写出，CPU 这一侧从不回读。调用方必须已经通过 PrepareCullDraw 把参数缓冲
+    /// 交接到 INDIRECT_ARGUMENT，否则调试层会报状态不匹配。
+    /// </para>
+    /// </summary>
+    public static void DrawShadowPrimitiveIndirect(
+        PrimitiveData primitiveData,
+        ID3D12Resource* matrixBuffer,
+        VertexBufferView* instanceBufferView,
+        ID3D12Resource* argsResource,
+        uint argsOffset,
+        bool bindMaterial = true)
+    {
+        var cmdList = Device.GraphicsCommandList;
+        if (cmdList == null || argsResource == null)
+            return;
+        var signature = EnsureShadowIndirectSignature();
+        if (signature == null)
+            return;
+
+        var vertexViews = stackalloc VertexBufferView[2];
+        vertexViews[0] = primitiveData.VertexBufferView;
+        vertexViews[1] = instanceBufferView != null ? *instanceBufferView : IdentityInstanceBufferView;
+        cmdList->IASetVertexBuffers(0, 2, vertexViews);
+
+        fixed (IndexBufferView* ibv = &primitiveData.IndexBufferView)
+            cmdList->IASetIndexBuffer(ibv);
+
+        cmdList->SetGraphicsRootConstantBufferView(0, matrixBuffer->GetGPUVirtualAddress());
+
+        if (bindMaterial)
+        {
+            int fi = (int)Device.FrameIndex;
+            cmdList->SetGraphicsRootConstantBufferView(2, primitiveData.MaterialBuffers[fi]->GetGPUVirtualAddress());
+
+            // t5 morph：顶点阶段的形变分支需要它，与主通道共用同一个默认缓冲。
+            cmdList->SetGraphicsRootDescriptorTable(9,
+                primitiveData.MorphDeltasSrvHandle.Ptr != 0
+                    ? primitiveData.MorphDeltasSrvHandle
+                    : DefaultMorphDeltasSrvHandle);
+        }
+
+        cmdList->ExecuteIndirect(signature, 1, argsResource, argsOffset, null, 0);
+    }
+
+    /// <summary>
+    /// 阴影间接视图的命令签名：一条 DrawIndexed 记录，不引用任何根签名（间接只描述绘制参数，
+    /// 不改变已绑定的根参数）。ByteStride 直接用共享层常量，布局漂移会在这里立即暴露。
+    /// </summary>
+    static ID3D12CommandSignature* EnsureShadowIndirectSignature()
+    {
+        if (ShadowIndirectCommandSignature != null)
+            return ShadowIndirectCommandSignature;
+        if (Device.D3dDevice == null)
+            return null;
+
+        var argument = new IndirectArgumentDesc { Type = IndirectArgumentType.DrawIndexed };
+        var desc = new CommandSignatureDesc
+        {
+            ByteStride = Season.Rendering.IndirectDrawIndexedArgs.SizeInBytes,
+            NumArgumentDescs = 1,
+            PArgumentDescs = &argument,
+            NodeMask = 0,
+        };
+        ID3D12CommandSignature* signature = null;
+        var iid = ID3D12CommandSignature.Guid;
+        try
+        {
+            Device.CheckResult(Device.D3dDevice->CreateCommandSignature(&desc, null, &iid, (void**)&signature));
+        }
+        catch (Exception ex)
+        {
+            // 失败即保持 null：调用方据此退回直接绘制，而不是拿一个空签名去发间接提交。
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] 命令签名创建失败：{ex.Message}");
+            return null;
+        }
+        ShadowIndirectCommandSignature = signature;
+        return signature;
     }
 }

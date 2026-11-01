@@ -125,6 +125,11 @@ internal unsafe class PrimitiveData : IDisposable
     /// with the same semantics as <see cref="DdgiAtlasViewVersions"/>.</summary>
     public ulong[] AerialLutViewVersions = null!;
 
+    /// <summary>2-7 P0：
+    /// 与 <see cref="DescriptorSets"/> 等长，逐帧槽记录 binding 25 当前写入的是哪一张 Sky-View LUT 的 view，
+    /// 语义与 <see cref="DdgiAtlasViewVersions"/> 完全一致。</summary>
+    public ulong[] SkyViewViewVersions = null!;
+
     public Texture BaseColorTexture = null!;
 
     public Texture NormalTexture = null!;

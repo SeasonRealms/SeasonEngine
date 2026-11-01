@@ -11,15 +11,22 @@ namespace Engine.Panels;
 /// The earlier monolithic procedural beach slopes, four 128x33 grids merged into the sea, were retired in 2026-08
 /// because the large mesh was too complex and hard to compose, and small instanced tiles work better.
 /// Heights and normals are baked once on the CPU from deterministic noise, using a fixed seed that stays stable across launches.
-/// The material is solid-color PBR with no textures at all. Sea height can be adjusted at runtime through <see cref="SeaLevel"/>,
+/// Sea height can be adjusted at runtime through <see cref="SeaLevel"/>,
 /// with a default of y=-3, three units below grass at y=0. With Mountains using Sink=10, their lower edges remain submerged,
 /// making the ring read as island chains in the sea.
+///
+/// P3: the visible surface is no longer this mesh. It is a <see cref="Season.Rendering.WaterPlane"/> drawn by the
+/// SceneWater pass, which is the only stage that can both sample this frame's scene color (through the refraction
+/// snapshot) and depth, and write the scene color. This mesh is kept as the <b>sea floor</b>: Update keeps it
+/// <see cref="SeaDepth"/> below the water plane, so the shader's depth-absorption term has real geometry to read a
+/// thickness from, and a backend that cannot create a water pipeline still shows a dark seabed instead of a hole.
+/// Fresnel, refraction, sky reflection, and the Hi-Z screen-space reflection all live in the water shader.
 ///
 /// Geometry budget: Surface.Indices uses ushort, so the hard vertex limit is 65535, matching the rule in Ground.BuildRoad.
 /// The sea uses 255x255 = 65025 vertices, right up against that limit, with grid spacing 1400/254 about 5.512m,
 /// and 254x254x6 = 387096 ushort indices. The mesh is static geometry uploaded once during loading,
 /// because the engine currently has no cross-backend dynamic vertex path and UpdateMesh3D only synchronizes transforms and materials.
-/// Waves are therefore static undulation from baked noise rather than per-frame animation.
+/// That is fine now that it is only the floor: the waves that move are evaluated per frame in the water shader (P4).
 ///
 /// Area contract: land is the 150x150 grass tile, 22500m², while the sea was expanded three times in 2026-08 to 1960000m²,
 /// ending up as a 1400m square centered at the world origin and extending to +/-700m.
@@ -29,43 +36,66 @@ namespace Engine.Panels;
 /// The only real constraint is the far plane, which App.ResetCamera sets to 1300 to cover the farthest sea-corner rays.
 /// The plane fills the whole area rather than cutting a hole for land; land naturally occludes the sea by depth testing because y=0 is above sea level.
 ///
-/// Near shore, wave damping reduces FBM amplitude to zero within ShoreDampRange=60m using smoothstep over the distance from shore,
-/// defined as the L-infinity distance to the land rectangle. Shore water therefore stays calm and wave crests never rise above
-/// the beach top or grass seam, even if sea level is raised. Offshore, the sea keeps a swell envelope of about +/-4.5m.
+/// Near shore, the floor relief fades to zero within ShoreDampRange=60m of the land square (L-infinity distance), so the
+/// 12m water column stays even and the absorption term reads as a flat tint instead of noise shadows.
 /// The useful SeaLevel range is roughly [-7,-1]. Beach tiles are static instances and do not track SeaLevel,
 /// with their top pinned near y=-0.4 and bottoms around y=-11 to -17, so raising the sea too much will flood over the beach top onto the grass seam.
+///
+/// P4: the swell is no longer baked into geometry. The visible surface is a Gerstner water plane whose displacement,
+/// analytic normals, and phase speed all come from <see cref="Water"/>; the 1420m rectangle is cut into 8x8 tiles of
+/// 20x20 quads so the vertex grid can carry the 155m..42m wave components from <see cref="WaterMath.BuildWaves"/>.
+/// Surface amplitude stays at 2.4m peak-to-trough on purpose: the beach slopes about 1:4, so every extra meter of
+/// crest sweeps the waterline roughly four meters further up the sand.
 /// </summary>
 internal class Sea : Panel
 {
     const int GridSize = 255;                       // Vertex count per side: 255x255 = 65025, below the ushort index hard limit.
     const float Size = 1400f;                       // Sea side length in meters after the three-stage expansion to 1400x1400.
     const float DefaultSeaLevel = -3f;              // Default sea height in world Y, three units below the ground.
+    const float SeaDepth = 12f;                     // Distance from the water surface down to the baked floor mesh, in meters.
     const uint Seed = 0x0CEA2026u;                  // Fixed seed so sea shape stays reproducible across launches.
 
     // Shoreline parameters
     const float LandHalf = 75f;                     // Half-width of the land square in meters: the 150x150 grass tile becomes +/-75.
     const float ShoreDampRange = 60f;               // Near-shore damping zone where FBM amplitude fades out with smoothstep.
 
+    // P4 sea state. The swell lives in the water shader now, so the sea is described by wind instead of geometry.
+    // 11 m/s puts the PM peak wavelength at 2*pi*U^2/g = 78m, doubled to about 155m by WaterMath.BuildWaves,
+    // with the remaining three components stepping down by 1.55x to 100m, 64m, and 42m.
+    const float WaveWindSpeed = 11f;                // m/s; 0 would switch the Gerstner displacement off entirely.
+    const float WaveWindDirection = 0.55f;          // Radians in world XZ: 0=+X, pi/2=+Z, so the swell crosses the shore at an angle.
+    const float WaveSwellHeight = 2.4f;             // Peak-to-trough in meters, i.e. 1.2m crests over a 12m water column.
+    const float WaveChoppiness = 1.2f;              // Slightly sharper crests than a plain sine; still far below self-intersection.
+    const float WaveTileSize = 180f;                // 1420/180 rounds up to 8 tiles per axis, so 64 tiles in total.
+    const int WaveTileSubdiv = 20;                  // 20x20 quads per tile: 8.9m spacing, 153600 vertices for the whole sea.
+
     // FBM octave table with wavelengths 160/80/40/20m and amplitudes 2.4/1.2/0.6/0.3m.
-    // This yields open-ocean swell within about +/-4.5m offshore, while near shore the amplitude is damped by ShoreDampRange.
-    // Given grid spacing of about 5.512m, the shortest resolvable wavelength by Nyquist is about 11m,
-    // so the finest 20m octave still has about 3.6 samples per wavelength.
+    // Since P3 this is the relief of the sea floor, not of the visible surface: offshore it spans about +/-4.5m,
+    // which varies the water thickness the absorption term reads, and near shore it fades out by ShoreDampRange.
+    // Grid spacing is about 5.512m, and the shortest 20m octave still has about 3.6 samples per wavelength.
     static readonly float[] Wavelengths = { 160f, 80f, 40f, 20f };
     static readonly float[] Amplitudes = { 2.4f, 1.2f, 0.6f, 0.3f };
 
     internal Mesh3D sea;
 
     /// <summary>
-    /// Sea height in world Y, defaulting to -3. This writes directly to Mesh3D.PosY.
-    /// Under the unified placement convention, the anchor is the geometric center of the bounds,
-    /// and vertices are centered by the midpoint of the bounds in Y, so PosY equals the average sea height.
+    /// The visible sea surface: a 1400x1400m rectangle at <see cref="SeaLevel"/>. Registered by App through
+    /// <see cref="Season.Basic.BaseApp.Waters"/>; the SceneWater pass expands it into 6 vertices and evaluates
+    /// Fresnel, refraction, Hi-Z screen-space reflection, and depth absorption in the shader.
+    /// </summary>
+    internal Season.Rendering.WaterPlane Water { get; }
+
+    /// <summary>
+    /// Sea height in world Y, defaulting to -3. This is the water plane's height; the baked floor mesh follows
+    /// <see cref="SeaDepth"/> below it, so moving the level moves the whole water body.
     /// The change takes effect on the next Update. The practical range is about [-7,-1],
     /// since higher values flood over the beach top and onto the grass seam while beach tiles remain static.
     /// </summary>
     internal float SeaLevel
     {
-        get => sea.PosY;
-        set => sea.PosY = value;
+        get => Water.Position.Y;
+        // Position 是 struct：只能整体回写，改不动 Water.Position.Y 本身。
+        set => Water.Position = new Vector3(Water.Position.X, value, Water.Position.Z);
     }
 
     internal Sea()
@@ -80,20 +110,53 @@ internal class Sea : Panel
             // CullingEnabled=false keeps the sea on the always-visible baseline, exempt from frustum culling.
             CullingEnabled = false,
             PosX = 0f,
-            PosY = DefaultSeaLevel,
+            PosY = DefaultSeaLevel - SeaDepth,
             PosZ = 0f,
             // Leave Width/Height/Depth unset so OnBoundsEstablished keeps the native size with a scale of 1.
         };
 
         sea.Surfaces.Add(BuildSurface());
         AddControl(sea);
+
+        // P3: the surface itself carries no mesh. The shader derives normals, refraction, and absorption from the
+        // world position, so the data here is just the rectangle plus its material constants.
+        Water = new Season.Rendering.WaterPlane
+        {
+            Position = new Vector3(0f, DefaultSeaLevel, 0f),
+            // The mountains and beach hide the rim, and a little overshoot keeps the horizon seam from showing.
+            Size = new Vector2(Size + 20f, Size + 20f),
+            Tint = new Vector4(0.020f, 0.075f, 0.100f, 1f),
+            // Deep water is nearly opaque even at normal incidence; Fresnel pushes it the rest of the way.
+            Opacity = 0.72f,
+            // 1.6/m turns the 12m floor into a faint silhouette and leaves open water a flat blue-green.
+            Absorption = 1.6f,
+            // Large swells need a longer wavelength than the pond, or the near field reads as static noise.
+            NormalTiling = 0.075f,
+            NormalStrength = 1.6f,
+            ScrollSpeed = 0.05f,
+            RippleStrength = 1.4f,
+            // Open ocean has no nearby shoreline to sample, so refraction is mostly a depth-cue here.
+            RefractionStrength = 0.012f,
+            Roughness = 0.08f,
+            // P4: Gerstner swell plus the tile grid that gives it vertices. The four wave components are built
+            // on the CPU from the wind settings; the shader only evaluates them, so phase speed stays physical
+            // (deep-water dispersion, sqrt(g*k)) and WaveSpeed is a pure time multiplier.
+            WindSpeed = WaveWindSpeed,
+            WindDirection = WaveWindDirection,
+            SwellHeight = WaveSwellHeight,
+            Choppiness = WaveChoppiness,
+            WaveSpeed = 1f,
+            TileSize = WaveTileSize,
+            TileSubdiv = WaveTileSubdiv,
+        };
     }
 
     /// <summary>
-    /// Builds the sea Surface in local space with x/z in [-Size/2, Size/2], where the local origin is the plane center.
+    /// Builds the sea floor Surface in local space with x/z in [-Size/2, Size/2], where the local origin is the plane center.
     /// Height comes from FBM noise with shoreline damping. The midpoint of the bounds in Y is then subtracted so the anchor,
-    /// which is the geometric center of the box, lands on the average sea level. That makes PosY equal the sea height.
-    /// Normals are computed from central differences on the height grid, and all PBR specular highlights come from those normal variations.
+    /// which is the geometric center of the box, lands on the average floor height. That makes PosY the floor height.
+    /// Normals are computed from central differences on the height grid; the floor is matte silt, so they only matter
+    /// for the little CSM and GI shading that survives the water tint above it.
     /// </summary>
     static Surface BuildSurface()
     {
@@ -170,11 +233,12 @@ internal class Sea : Panel
         {
             Vertices = verts,
             Indices = indices,
-            // Solid-color PBR with no textures: a deep ocean teal base.
-            // Low roughness lets sun and moon produce bright glints across the noisy normals.
-            BaseColor = new Vector4(0.06f, 0.28f, 0.38f, 1f),
-            MetallicFactor = 0f,                          // Water is a dielectric; specular strength comes from low-roughness F0.
-            RoughnessFactor = 0.15f,
+            // P3: this mesh is the sea floor now, not the visible surface. It sits 12m down and is painted as dark silt
+            // with very high roughness, so the only thing that reaches the camera through the water is the
+            // depth-absorption tint. A glossy teal here would read as a second, wrongly lit water surface.
+            BaseColor = new Vector4(0.022f, 0.055f, 0.062f, 1f),
+            MetallicFactor = 0f,                          // Silt is a dielectric; the floor must not add specular.
+            RoughnessFactor = 0.96f,
             Unlit = false,                                // Uses PBR lighting and receives CSM shadows and GI.
             Mode = SurfaceBlendMode.Opaque,
         };
@@ -237,8 +301,15 @@ internal class Sea : Panel
     {
         var result = base.Update(time, alpha: alpha, posX: posX, posY: posY, posZ: posZ, width: width, height: height, depth: depth);
 
-        // Sea geometry is static. Update only synchronizes the world transform and material,
-        // and SeaLevel changes take effect here through PosY.
+        // The water rectangle is world-space data with no mesh and no child control, so it follows the panel directly.
+        // The baked floor mesh sits SeaDepth below it; that gap is what the shader reads as water thickness.
+        float level = Water.Position.Y;
+        Water.Position = new Vector3(PosX, level, PosZ);
+        sea.PosX = PosX;
+        sea.PosY = level - SeaDepth;
+        sea.PosZ = PosZ;
+
+        // The floor mesh is static geometry: Update only synchronizes its transform and material.
         if (sea.Update(time))
         {
             result = true;

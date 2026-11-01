@@ -74,6 +74,21 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         }
     }
 
+    /// <summary>P2 水面：同样只靠图形阶段，构造失败时返回 null，调度器据此保持零残留。</summary>
+    public Season.Rendering.WaterPipeline? CreateWaterPipeline()
+    {
+        try { return new MTLWaterPipeline(DictionaryMtlTexture); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] 创建失败：{ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>P2 水面折射用的场景色快照。转调后端 blit：水面 Pass 里 SceneColor 是颜色附件，不能同时被采样。</summary>
+    public bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination)
+        => Metal.Device.CopyRenderTarget(source, destination);
+
     readonly GlyphAtlasManager<MTLTexture> _glyphAtlas = new(
         2048, 2048,
         createAtlasTexture: (w, h) => MTLTexture.CreateEmpty((uint)w, (uint)h, "TextAtlas"),

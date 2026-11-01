@@ -102,7 +102,12 @@ fn WeatherCloudComposite(sky: vec3f,origin: vec3f,dir: vec3f,sunDirection: vec3f
             let radiance0=light.xyz*mix(light.w,1.0,1.0-d)*(1.0+silver);
             // 大气透视：6km 尺度上云板收向同一像素的天空底色，地平线附近的云层才会自然消失，
             // 而不是在覆盖率淡出处留下一条切边。
-            let radiance=mix(sky,radiance0,exp(-hits[k]/6000.0));
+            var radiance=mix(sky,radiance0,exp(-hits[k]/6000.0));
+            // 2-7 雷电：云内发光。WeatherFlash 存的是主导雷击的世界坐标 + 回击包络亮度，
+            // 用 1/(1+d^2/L^2) 把点回击摊成一小片被照亮的云团；L=250m 与云板水平尺度同量级，
+            // 再远就退化成整片均匀提亮，不再是“云里闪了一下”。
+            let flashDelta=p-WeatherFlash().xyz;
+            radiance+=WeatherFlash().w/(1.0+dot(flashDelta,flashDelta)/62500.0)*vec3f(0.55,0.62,0.85)*12.0;
             acc+=trans*faded*radiance; trans*=1.0-faded;
         }
     }
@@ -217,6 +222,8 @@ struct WeatherFrame { values: array<vec4f> }
 fn WF(i: i32) -> vec4f { return weatherFrame.values[i]; }
 fn WeatherH(i: i32) -> vec4f { return WF(94+i); }
 fn WeatherR(i: i32,row: i32) -> vec4f { return WF(96+i*8+row); }
+// 2-7 雷电：weatherFrame 的第 161 行（索引 160）= 主导雷击（xyz 世界坐标 + w 包络亮度）。
+fn WeatherFlash() -> vec4f { return WF(160); }
 """ + CommonWgsl + RainWgsl + """
 @fragment fn PSMain(@builtin(position) position: vec4f) -> @location(0) vec4f {
     let pixel=vec2i(position.xy); let uv=position.xy/vec2f(textureDimensions(sceneColor));

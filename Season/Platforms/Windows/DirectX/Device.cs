@@ -233,6 +233,9 @@ internal unsafe static class Device
 
         var dxgiFactoryFlags = TryEnableDebugLayer(debug) ? 0x01 : 0u;
 
+        // Must precede CreateDevice: DRED settings are captured by the device at creation time.
+        TryEnableDred();
+
         IDXGIFactory4* dxgiFactory;
         var iid = IDXGIFactory4.Guid;
         var result = Dxgi.CreateDXGIFactory2(dxgiFactoryFlags, &iid, (void**)&dxgiFactory);
@@ -481,6 +484,222 @@ internal unsafe static class Device
         return false;
     }
 
+    /// <summary>
+    /// Device-removed extended data (DRED). <b>Must</b> run before CreateDevice: the settings object is
+    /// sampled when the device is created, so turning it on afterwards has no effect on that device.
+    ///
+    /// Two captures are enabled, and they answer different questions:
+    /// <list type="bullet">
+    /// <item>Auto breadcrumbs record the last command each queue actually completed, so the next command in
+    /// the history is the one the GPU was executing at removal. Breadcrumb context additionally captures the
+    /// BeginEvent marker string, and this backend already brackets every render pass (<see cref="PushDebugGroup"/>)
+    /// and every compute kernel, so the report names "SceneTransparent" or a kernel instead of just "Dispatch".</item>
+    /// <item>Page-fault tracking records the GPU virtual address that faulted together with the allocations
+    /// alive or recently freed at that moment. Without it, NVIDIA reports a page fault as
+    /// DXGI_ERROR_DEVICE_HUNG and the two become indistinguishable; see <see cref="DumpDredReport"/>.</item>
+    /// </list>
+    ///
+    /// Everything here is optional: on a machine without DRED support GetDebugInterface returns
+    /// E_NOINTERFACE and startup proceeds unchanged.
+    /// </summary>
+    static void TryEnableDred()
+    {
+#if DEBUG
+        // Settings1 is the first version with breadcrumb context (the marker strings). Windows 10 1809
+        // only exposes Settings, so fall back to it and lose only the pass names.
+        var iid = ID3D12DeviceRemovedExtendedDataSettings1.Guid;
+        using ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> settings = null;
+        var hr = D3D12.GetDebugInterface(&iid, (void**)&settings);
+        if (HResult.IndicatesSuccess(hr) && settings.Handle != null)
+        {
+            settings.SetAutoBreadcrumbsEnablement(DredEnablement.DredEnablementForcedOn);
+            settings.SetPageFaultEnablement(DredEnablement.DredEnablementForcedOn);
+            settings.SetBreadcrumbContextEnablement(DredEnablement.DredEnablementForcedOn);
+            return;
+        }
+
+        iid = ID3D12DeviceRemovedExtendedDataSettings.Guid;
+        using ComPtr<ID3D12DeviceRemovedExtendedDataSettings> legacy = null;
+        hr = D3D12.GetDebugInterface(&iid, (void**)&legacy);
+        if (HResult.IndicatesSuccess(hr) && legacy.Handle != null)
+        {
+            legacy.SetAutoBreadcrumbsEnablement(DredEnablement.DredEnablementForcedOn);
+            legacy.SetPageFaultEnablement(DredEnablement.DredEnablementForcedOn);
+        }
+#endif
+    }
+
+    /// <summary>Guards against a second report: every CheckResult after the first one sees the same dead device.</summary>
+    static bool _dredReported;
+
+    /// <summary>
+    /// Writes what DRED captured about the device that was just removed. Safe to call on a removed device:
+    /// every read here goes to CPU-side state the runtime froze at removal, not to the GPU.
+    ///
+    /// Called from <see cref="CheckResult"/> before the exception leaves, because that is the only place
+    /// that still knows the reason code and still has a stack that names the pass that was running.
+    /// </summary>
+    static void DumpDredReport(int removedReason)
+    {
+        if (_dredReported) return;
+        _dredReported = true;
+
+        DredLog($"[DRED] DeviceRemovedReason=0x{(uint)removedReason:X8} ({DescribeRemovedReason(removedReason)})");
+
+        var iid = ID3D12DeviceRemovedExtendedData1.Guid;
+        ID3D12DeviceRemovedExtendedData1* dred = null;
+        if (!HResult.IndicatesSuccess(D3dDevice->QueryInterface(&iid, (void**)&dred)) || dred == null)
+        {
+            DredLog("[DRED] ID3D12DeviceRemovedExtendedData1 unavailable, no breadcrumbs captured");
+            return;
+        }
+
+        try
+        {
+            DredPageFaultOutput fault;
+            if (HResult.IndicatesSuccess(dred->GetPageFaultAllocationOutput(&fault)))
+            {
+                if (fault.PageFaultVA != 0)
+                    DredLog($"[DRED] PageFaultVA=0x{fault.PageFaultVA:X16}: this is a GPU page fault, not a hang");
+                DumpAllocationChain("alive", fault.PHeadExistingAllocationNode);
+                DumpAllocationChain("recently-freed", fault.PHeadRecentFreedAllocationNode);
+            }
+
+            // Prefer the v1.1 output because it carries the breadcrumb contexts (the marker names).
+            DredAutoBreadcrumbsOutput1 crumbs;
+            if (HResult.IndicatesSuccess(dred->GetAutoBreadcrumbsOutput1(&crumbs)))
+                DumpBreadcrumbs(crumbs.PHeadAutoBreadcrumbNode);
+            else
+            {
+                DredAutoBreadcrumbsOutput legacy;
+                if (HResult.IndicatesSuccess(dred->GetAutoBreadcrumbsOutput(&legacy)))
+                    DumpBreadcrumbs(legacy.PHeadAutoBreadcrumbNode);
+            }
+        }
+        finally
+        {
+            dred->Release();
+        }
+    }
+
+    /// <summary>
+    /// Prints the tail of one command list's breadcrumb history. The completed count is where the GPU
+    /// stopped, so the entry <b>at</b> that index is the command that never finished, and the entries just
+    /// before it are what the driver was doing successfully up to that point.
+    /// </summary>
+    static void DumpBreadcrumbs(AutoBreadcrumbNode1* head)
+    {
+        int guard = 0;
+        for (var node = head; node != null && guard++ < 16; node = node->PNext)
+        {
+            uint count = node->BreadcrumbCount;
+            uint completed = node->PLastBreadcrumbValue != null ? *node->PLastBreadcrumbValue : 0u;
+            DredLog($"[DRED] breadcrumbs: count={count} completed={completed} list=\"{WideToText(node->PCommandListDebugNameW)}\" queue=\"{WideToText(node->PCommandQueueDebugNameW)}\"");
+            DumpOps(node->PCommandHistory, count, completed, node->PBreadcrumbContexts, node->BreadcrumbContextsCount);
+        }
+    }
+
+    /// <summary>Same report for a device that only exposes DRED v1.0: identical history, no marker names.</summary>
+    static void DumpBreadcrumbs(AutoBreadcrumbNode* head)
+    {
+        int guard = 0;
+        for (var node = head; node != null && guard++ < 16; node = node->PNext)
+        {
+            uint count = node->BreadcrumbCount;
+            uint completed = node->PLastBreadcrumbValue != null ? *node->PLastBreadcrumbValue : 0u;
+            DredLog($"[DRED] breadcrumbs: count={count} completed={completed} list=\"{WideToText(node->PCommandListDebugNameW)}\" queue=\"{WideToText(node->PCommandQueueDebugNameW)}\"");
+            DumpOps(node->PCommandHistory, count, completed, null, 0);
+        }
+    }
+
+    static void DumpOps(AutoBreadcrumbOp* history, uint count, uint completed,
+        DredBreadcrumbContext* contexts, uint contextCount)
+    {
+        if (history == null) return;
+
+        // The last few completed commands plus the pending one are enough to identify a hang, and printing
+        // the whole history of a scene frame would bury the interesting tail in hundreds of lines.
+        uint from = completed > 4 ? completed - 4 : 0;
+        for (uint i = from; i < count && i <= completed; i++)
+            DredLog($"[DRED]   #{i} done    {DescribeOp(history[i])}{ContextOf(contexts, contextCount, i)}");
+
+        if (completed < count)
+            DredLog($"[DRED]   #{completed} PENDING {DescribeOp(history[completed])}{ContextOf(contexts, contextCount, completed)}");
+    }
+
+    /// <summary>
+    /// The marker that was open at <paramref name="index"/>: the nearest recorded context at or before it.
+    /// This is what turns a bare op index into the pass name the app pushed with PushDebugGroup.
+    /// </summary>
+    static string ContextOf(DredBreadcrumbContext* contexts, uint contextCount, uint index)
+    {
+        if (contexts == null) return "";
+
+        string? name = null;
+        uint best = 0;
+        for (uint i = 0; i < contextCount; i++)
+        {
+            var context = contexts + i;
+            if (context->BreadcrumbIndex <= index && (name == null || context->BreadcrumbIndex >= best))
+            {
+                best = context->BreadcrumbIndex;
+                name = WideToText(context->PContextString);
+            }
+        }
+
+        return string.IsNullOrEmpty(name) ? "" : $"  [{name}]";
+    }
+
+    static void DumpAllocationChain(string tag, DredAllocationNode* head)
+    {
+        int guard = 0;
+        for (var node = head; node != null && guard++ < 16; node = node->PNext)
+            DredLog($"[DRED] allocation({tag}): {node->AllocationType} \"{AnsiToText(node->ObjectNameA)}\"");
+    }
+
+    static string DescribeOp(AutoBreadcrumbOp op)
+    {
+        const string prefix = "AutoBreadcrumbOp";
+        var name = op.ToString();
+        return name.StartsWith(prefix, StringComparison.Ordinal) ? name[prefix.Length..] : name;
+    }
+
+    /// <summary>Reason codes that actually show up for this renderer; anything else prints as hex only.</summary>
+    static string DescribeRemovedReason(int reason) => (uint)reason switch
+    {
+        0x00000000 => "S_OK (device alive)",
+        0x887A0001 => "DXGI_ERROR_INVALID_CALL",
+        0x887A0002 => "DXGI_ERROR_NOT_FOUND",
+        0x887A0004 => "DXGI_ERROR_UNSUPPORTED",
+        0x887A0005 => "DXGI_ERROR_DEVICE_REMOVED",
+        0x887A0006 => "DXGI_ERROR_DEVICE_HUNG",
+        0x887A0007 => "DXGI_ERROR_DEVICE_RESET",
+        0x887A0020 => "DXGI_ERROR_DRIVER_INTERNAL_ERROR",
+        0x887A002B => "DXGI_ERROR_ACCESS_LOST",
+        _ => "unknown",
+    };
+
+    static string WideToText(char* text) => text == null ? "" : Marshal.PtrToStringUni((nint)text) ?? "";
+
+    static string AnsiToText(byte* text) => text == null ? "" : Marshal.PtrToStringAnsi((nint)text) ?? "";
+
+    /// <summary>
+    /// Logging for the DRED report. Debug.WriteLine reaches the IDE output window even before the app's log
+    /// surface is usable; AddLog is what puts the same text in the in-app error panel for a bug report.
+    /// </summary>
+    static void DredLog(string message)
+    {
+        System.Diagnostics.Debug.WriteLine(message);
+        try
+        {
+            DeviceServices.BaseApp?.AddLog(LogType.Error, message);
+        }
+        catch
+        {
+            // Logging must never mask the device-removal exception that is about to be thrown.
+        }
+    }
+
     internal static void CreateSwapChain(int width, int height)
     {
         if (SwapChain != null)
@@ -727,6 +946,37 @@ internal unsafe static class Device
     }
 
     /// <summary>
+    /// Stops the frame before it hands a removed device its first D3D12 call. That call faults in the
+    /// driver and the fault arrives as a bare SEHException raised from a Silk.NET vtable stub - no
+    /// HRESULT, no code path, nothing naming the cause. Resetting the frame's allocator is normally the
+    /// first call of a frame, so the report used to blame FrameContext.Reset for a device that was
+    /// already gone. Checking here names it instead, and skips the swap-chain wait, which never signals
+    /// once the device is removed either.
+    /// </summary>
+    static void ThrowIfDeviceRemoved()
+    {
+        if (D3dDevice == null) return;
+
+        int reason;
+        try
+        {
+            reason = D3dDevice->GetDeviceRemovedReason();
+        }
+        catch (SEHException exception)
+        {
+            DumpDredReport(0);
+            throw new InvalidOperationException(
+                "D3D12 设备已被移除：GetDeviceRemovedReason 本身触发 SEH，本帧不再提交任何命令。", exception);
+        }
+
+        if (reason == 0) return;
+
+        DumpDredReport(reason);
+        throw new InvalidOperationException(
+            $"D3D12 设备已被移除（0x{reason:X8}：{Marshal.GetExceptionForHR(reason)?.Message}），本帧不再提交任何命令。");
+    }
+
+    /// <summary>
     /// Shutdown only: reset all command allocators so they release the internal
     /// GPU-resource references held by recorded command lists, allowing later
     /// ID3D12Resource::Release() calls in PumpDeferredReleases(force: true) to
@@ -748,10 +998,10 @@ internal unsafe static class Device
             for (int i = 0; i < frameCount; i++)
             {
                 var context = FrameContexts[i];
-                // AfterRender leaves the command list closed on the normal path, but it checks for device
-                // removal at the top, so a frame that threw before its Close() is still recording here and
-                // D3D12 then rejects the allocator Reset.
-                if (context.IsRecording && !context.CloseForShutdown()) continue;
+                // AfterRender leaves the command list closed on the normal path, but it runs its removal
+                // check and its capture while the list is still open, so a frame that threw mid-way is
+                // still recording here and D3D12 then rejects the allocator Reset.
+                if (!context.CloseIfRecording()) continue;
                 context.Reset();
             }
         }
@@ -1714,7 +1964,8 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         "FogComposite\0"u8.ToArray(),
         "SceneTransparent\0"u8.ToArray(),
         "WeatherComposite\0"u8.ToArray(),
-        "Pass\0"u8.ToArray(),
+        "SceneDecal\0"u8.ToArray(),
+        "SceneWater\0"u8.ToArray(),
     ];
 
     internal static void PushDebugGroup(byte[] asciiLabelZ)
@@ -1738,6 +1989,9 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     /// </summary>
     internal static void BeforeRender()
     {
+        // Nothing below is survivable on a removed device; see ThrowIfDeviceRemoved.
+        ThrowIfDeviceRemoved();
+
         // === Wait for the DXGI compositor to release the backbuffer ===
         // This avoids whole-frame flicker when the CPU runs ahead of the
         // compositor (pink clears interleaving with the scene).
@@ -2104,6 +2358,29 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     }
 
     /// <summary>
+    /// P2: 把一张离屏颜色目标原样拷进另一张同形目标，供水面折射在「SceneColor 仍是颜色附件」
+    /// 的那一帧里拿到可采样的背景。
+    ///
+    /// 用 CopyResource 而不是 blit：两侧同格式同尺寸时逐 texel 复制没有滤波损失，也不需要 PSO。
+    /// 状态收尾按各自后续用途走 —— 源回到 RenderTarget（下一句就是水面的颜色附件），
+    /// 目标转到 PixelShaderResource（紧接着作为折射源被采样）。
+    /// </summary>
+    internal static bool CopyRenderTarget(RenderTarget source, RenderTarget destination)
+    {
+        if (GraphicsCommandList == null) return false;
+        if (source is not DXRenderTarget src || destination is not DXRenderTarget dst) return false;
+        if (ReferenceEquals(src, dst) || src.Color == null || dst.Color == null) return false;
+        if (src.ColorNativeFormat != dst.ColorNativeFormat) return false;
+        if (src.Width == 0 || src.Width != dst.Width || src.Height != dst.Height) return false;
+        src.TransitionTo(GraphicsCommandList, ResourceStates.CopySource);
+        dst.TransitionTo(GraphicsCommandList, ResourceStates.CopyDest);
+        GraphicsCommandList->CopyResource(dst.Color, src.Color);
+        src.TransitionTo(GraphicsCommandList, ResourceStates.RenderTarget);
+        dst.TransitionTo(GraphicsCommandList, ResourceStates.PixelShaderResource);
+        return true;
+    }
+
+    /// <summary>
     /// Called inside the FinalBlit pass: transitions the source offscreen RT to
     /// PixelShaderResource and samples it to the screen with a fullscreen
     /// triangle. The backbuffer is already bound as the current RT by
@@ -2276,10 +2553,26 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
 
     internal static void CheckResult()
     {
-        var result0 = D3dDevice->GetDeviceRemovedReason();
+        if (D3dDevice == null) return;
+
+        int result0;
+        try
+        {
+            result0 = D3dDevice->GetDeviceRemovedReason();
+        }
+        catch (SEHException)
+        {
+            // Once the device is gone this raw vtable call can fault instead of returning a reason, which
+            // is exactly the bare SEHException that reaches the app with no code attached. Report whatever
+            // DRED captured, then let the original exception keep its identity.
+            DumpDredReport(0);
+            throw;
+        }
+
         var ex0 = Marshal.GetExceptionForHR(result0);
         if (ex0 is not null)
         {
+            DumpDredReport(result0);
             throw ex0;
         }
     }

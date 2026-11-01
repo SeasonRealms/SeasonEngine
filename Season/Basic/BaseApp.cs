@@ -180,6 +180,10 @@ public abstract class BaseApp : Panel
     /// 与后端实现同时到位，否则贴花只是数据，不会出现在画面上。</summary>
     public Season.Rendering.SceneDecals Decals { get; } = new();
 
+    /// <summary>P2 场景水面注册表。与贴花一样，实际绘制还需要后端实现了
+    /// <see cref="IGraphics.CreateWaterPipeline"/>，否则水面只是数据。</summary>
+    public Season.Rendering.SceneWaters Waters { get; } = new();
+
     /// <summary>The effective scene lighting consumed by each platform frame loop (single convergence point;
     /// hdrExposure is still injected by each backend via SetLighting).</summary>
     public SceneLightParams EffectiveSceneLights => SceneLights;
@@ -319,10 +323,12 @@ public abstract class BaseApp : Panel
 
             SaveSettings();
         }
+
     }
 
     public void AddLog(LogType logType, string log)
     {
+        if (logType == LogType.Error || logType == LogType.Load) Console.Error.WriteLine("[LOGERR] " + log);
         if (Debug && LogTypes.HasFlag(logType))
         {
             lock (Logs)
@@ -342,6 +348,10 @@ public abstract class BaseApp : Panel
             // SceneColor/SceneDepth，所以这里是唯一一个五端都经过、且目标已就位的时机；
             // 后端没有实现的平台由 CreateDecalPipeline 返回 null，RegisterDecals 自己不注册、不留残留。
             Season.Rendering.FrameSchedule.RegisterDecals(Graphics.Instance);
+
+            // P2: 水面的 PSO 与折射快照同样必须在第一帧之前准备好。前提与贴花一致（单采样 HDR 场景色 + 显式深度），
+            // 另外还需要一张与 SceneColor 同形的快照目标；任一缺失时 RegisterWaters 自己退回、不留残留。
+            Season.Rendering.FrameSchedule.RegisterWaters(Graphics.Instance);
 
             // On Web, consume the channel from the main-thread render loop; on native platforms, start a background consumer.
             if (DeviceServices.Core.Platform is not Platform.Web)

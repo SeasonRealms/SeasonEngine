@@ -48,12 +48,14 @@ internal unsafe class FrameContext
     public void MarkClosed() => IsRecording = false;
 
     /// <summary>
-    /// Shutdown only: closes a list that is still recording so its allocator becomes resettable.
-    /// Returns false when the close itself failed, in which case the caller must skip the Reset -
-    /// issuing it against an open list raises its own debug-layer error and hides the original fault.
+    /// Closes a list that is still recording so its allocator becomes resettable. Returns true when the
+    /// list is closed on return; false when the close itself failed, in which case the caller must skip
+    /// the Reset - issuing it against an open list raises its own debug-layer error and hides the
+    /// original fault.
     /// </summary>
-    public bool CloseForShutdown()
+    public bool CloseIfRecording()
     {
+        if (!IsRecording) return true;
         if (CommandList == null) return false;
         MarkClosed();
         return CommandList->Close() >= 0;
@@ -111,6 +113,13 @@ internal unsafe class FrameContext
             throw new InvalidOperationException(
                 "FrameContext.CommandList is null. " +
                 "Initialize() must be called (via Device.CreateGraphicsCommandLists()) before Reset().");
+
+        // A frame that threw before it reached its own Close() leaves this list recording: AfterRender
+        // runs its removal check and its capture while the list is still open. D3D12 then rejects the
+        // allocator Reset below, and that second error is louder than whatever went wrong first.
+        if (!CloseIfRecording())
+            throw new InvalidOperationException(
+                "FrameContext.Reset 无法继续：上一帧的命令列表仍在录制且关闭失败，不能重置其分配器。");
 
         // Snapshot the pointer value before Reset
         var cmdListBefore = (IntPtr)CommandList;

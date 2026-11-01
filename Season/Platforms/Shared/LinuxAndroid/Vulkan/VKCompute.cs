@@ -281,10 +281,44 @@ internal sealed unsafe class VKStorageBuffer : Season.Rendering.StorageBuffer
         var usageFlags = BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferDstBit;
         if (usage == Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs)
             usageFlags |= BufferUsageFlags.IndirectBufferBit;
+        // A7：gather 物化出的实例流要直接当顶点流绑定，而 VertexBufferBit 与 IndirectBufferBit 一样
+        // 只能在创建时声明。
+        if (usage == Season.Rendering.StorageBufferUsage.ComputeAndVertexInput)
+            usageFlags |= BufferUsageFlags.VertexBufferBit;
         Buffer = Device.ResourceManager.CreateBuffer(
             alignedSize,
             usageFlags,
             MemoryPropertyFlags.DeviceLocalBit);
+    }
+
+    /// <summary>
+    /// A7：把 compute 写入的缓冲交给顶点输入阶段。
+    ///
+    /// 不复用 TryPrepareIndirectArgs 的 barrier：那一道的 dstStage 是 DrawIndirect，
+    /// 而顶点属性读取发生在 VertexInput 阶段、访问位是 VertexAttributeRead，两者不能互代。
+    /// 必须由调用方在 Pass 之外录制，理由与其它 barrier 相同：Vulkan 的 render pass 实例内插不了 barrier。
+    /// </summary>
+    internal void BarrierToVertexInput(CommandBuffer cmd)
+    {
+        if (Buffer.Buffer.Handle == 0 || cmd.Handle == 0)
+            return;
+
+        var vk = Device.Vk;
+        var barrier = new BufferMemoryBarrier
+        {
+            SType = StructureType.BufferMemoryBarrier,
+            SrcAccessMask = AccessFlags.ShaderWriteBit,
+            DstAccessMask = AccessFlags.VertexAttributeReadBit,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Buffer = Buffer.Buffer,
+            Offset = 0,
+            Size = Vk.WholeSize,
+        };
+        vk.CmdPipelineBarrier(cmd,
+            PipelineStageFlags.ComputeShaderBit,
+            PipelineStageFlags.VertexInputBit,
+            0, 0, null, 1, &barrier, 0, null);
     }
 
     /// <summary>Get the staging buffer for the current frame slot (created on demand).

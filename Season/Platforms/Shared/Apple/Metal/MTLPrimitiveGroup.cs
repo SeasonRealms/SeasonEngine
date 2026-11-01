@@ -70,6 +70,12 @@ internal abstract class MTLPrimitiveGroup : IDisposable
     // where 1x1x1 acts as an additive identity and apParams0.x gating only avoids the sampling work.
     internal static MTLTexture3D? AerialLutActive;
 
+    // 2-7 P0:
+    // 当前帧的程序化天空 Sky-View LUT，compute 算出的 rgba16float 2D 纹理。
+    // 与上三者同一套模式：SetLighting 每帧解一次，Device.BeginPass 绑到 texture(13)；
+    // 为 null 时回落到 Device.White，但消费侧由 skyParams0.w 在 uniform 分支里互斥 gate 住，白衣永远不会被采到。
+    internal static MTLTexture? SkyViewActive;
+
     // === Shared instance state ===
     internal string Name = string.Empty;
 
@@ -314,6 +320,13 @@ internal abstract class MTLPrimitiveGroup : IDisposable
             ? Season.Platforms.Shared.Apple.Graphics.FindDdgiAtlas(cloudNoiseName)
             : null;
         AerialLutActive = MTLTexture3D.Find(Season.Rendering.FrameSchedule.AerialLutTexture);
+
+        // 2-7 P0：每帧解一次当前帧的 Sky-View LUT，理由与云噪声相同：
+        // 释放或质量降档后 FrameSchedule.SkyViewTexture 会回到 null，
+        // Active 必须同步清空，否则已经释放的纹理句柄会继续被绑。
+        SkyViewActive = Season.Rendering.FrameSchedule.SkyViewTexture is string skyViewName
+            ? Season.Platforms.Shared.Apple.Graphics.FindDdgiAtlas(skyViewName)
+            : null;
 
         // The snapshot is read by fog / weather / particles, so it must come from the view that is actually
         // being rendered, not from the legacy camera mirror.

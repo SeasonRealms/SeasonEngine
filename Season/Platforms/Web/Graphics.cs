@@ -466,6 +466,36 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         return null;
     }
 
+    /// <summary>
+    /// P2 池塘水。与贴花一样只依赖图形阶段的深度采样与一张颜色快照（本 Pass 不挂深度附件），
+    /// 所以不需要 compute/间接绘制能力；创建失败即返回 null，水面效果整体不注册。
+    /// </summary>
+    public Season.Rendering.WaterPipeline? CreateWaterPipeline()
+    {
+        var pipeline = new WGPUWaterPipeline();
+        try
+        {
+            if (pipeline.Initialize()) return pipeline;
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] WebGPU 管线创建失败：{ex.Message}");
+        }
+        pipeline.Dispose();
+        return null;
+    }
+
+    /// <summary>
+    /// P2: 场景色快照，供水面在「颜色已是附件」的帧里采水底。
+    /// 名字未注册、形状不一致或不在帧外调用都返回 false —— 调用方据此整帧跳过水面，
+    /// 而不是拿一张没初始化过的快照当折射源。
+    /// </summary>
+    public bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination)
+    {
+        if (source is not WGPURenderTarget src || destination is not WGPURenderTarget dst) return false;
+        return WebGPUInterop.CopyRenderTarget(src.Name, dst.Name);
+    }
+
     // 1-2 Contract 8: mirrored scene lighting (SceneLightParams, 976B after the 2-3 expansion). After
     // UpdateCamera3D injects exposure and jitter each frame, the whole block is uploaded into the shared
     // UBO at JS binding(10). It is no longer inlined into each per-object draw uniform
@@ -1050,7 +1080,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     {
         var buffer = new WGPUStorageBuffer(sizeInBytes, usage);
         WebGPUInterop.CreateStorageBuffer(buffer.Id, (int)sizeInBytes,
-            usage == Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs);
+            usage == Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs,
+            usage == Season.Rendering.StorageBufferUsage.ComputeAndVertexInput);
         return buffer;
     }
 
@@ -3560,11 +3591,14 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public void DisposeInstancedMesh3D(InstancedMesh3D mesh)
     {
         var key = (mesh.Name, mesh.ID);
+        WGPUInstancedMesh3D? dropped = null;
         lock (DictionaryInstancedMesh3D)
         {
-            if (DictionaryInstancedMesh3D.ContainsKey(key))
+            if (DictionaryInstancedMesh3D.TryGetValue(key, out dropped))
                 DictionaryInstancedMesh3D.Remove(key);
         }
+        // A7：把剔除目标从共享层撤掉；不撤的话列表里会留下指向已死 JS 句柄的引用。
+        dropped?.Dispose();
 
         // Remove synthesized procedural-texture metadata slot by slot (registered under mesh-private names).
         ReleaseProcSurfaceTextures(mesh.Name, mesh.ID, mesh.Surfaces.Count);
@@ -3937,6 +3971,49 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
         FlushDrawMesh3DBatch();
         FlushDrawSkinnedMeshBatch();
+
+        // A7：整组走间接路径时，索引数/实例数/baseVertex 全由 GPU 侧参数缓冲给出，
+        // 实例流换成 gather 产出的重排块——按槽位分段，所以偏移放在 setVertexBuffer 上。
+        // 参数表的迭代顺序与下面那段 CPU 循环必须完全一致，否则索引区间会与 primitive 错位。
+        int cullSlot = Season.Rendering.CascadedShadow.ActiveSlot;
+        if (cullSlot >= 0 && cullSlot < Season.Rendering.InstanceCull.MaxSlots
+            && wgpuMesh.TryGetCullDrawHandles(out var cullSortedId, out var cullArgsId, out int cullCapacity))
+        {
+            var indirectMatrix = _scratchWorldMatrix;
+            CopyMatrixTransposed(Matrix4x4.Identity, indirectMatrix, 0);
+
+            long vertexOffset = (long)cullSlot * cullCapacity * Season.Rendering.InstanceCull.WorldStride;
+            int slotBytes = cullCapacity * (int)Season.Rendering.InstanceCull.WorldStride;
+            int primitiveIndex = 0;
+            bool indirectOk = true;
+
+            foreach (var surface in mesh.Surfaces)
+            {
+                if (surface.Vertices == null || surface.Indices == null || surface.Vertices.Length == 0)
+                    continue;
+                if (surface.Mode == SurfaceBlendMode.Blend)
+                    continue;
+                if (!wgpuMesh.SurfaceCaches.TryGetValue(surface, out var cache) || !cache.Uploaded)
+                    continue;
+                if (primitiveIndex >= Season.Rendering.InstanceCull.MaxPrimitives)
+                {
+                    // 参数表装不下就整组退回，不画半路：已经发出的间接绘制无法撤回。
+                    indirectOk = false;
+                    break;
+                }
+
+                wgpuMesh.ResolvedTextures.TryGetValue(surface, out var resolvedTextures);
+                var uniformData = new float[WebGPUUniformLayout.TotalFloats];
+                BuildSurfaceUniform(uniformData, indirectMatrix, surface, wgpuMesh.MeshAlpha, isInstanced: true, resolvedTextures: resolvedTextures);
+                _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3DIndirect",
+                    cache.CacheKey, uniformData, cullSortedId, vertexOffset, (long)slotBytes, cullArgsId,
+                    (long)Season.Rendering.InstanceCull.ArgsOffset(cullSlot, primitiveIndex));
+                primitiveIndex++;
+            }
+
+            if (indirectOk)
+                return;
+        }
 
         var matrixData = _scratchWorldMatrix;
         CopyMatrixTransposed(Matrix4x4.Identity, matrixData, 0);
@@ -4401,6 +4478,11 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         // WGSL cloudParams0.w (layer count) / apParams0.x (max distance in km).
         WebGPUInterop.SetCloudNoise(Season.Rendering.FrameSchedule.CloudNoiseTexture);
         WebGPUInterop.SetAerialLut(Season.Rendering.FrameSchedule.AerialLutTexture);
+
+        // 2-7 P0: push this frame's procedural-sky Sky-View LUT name with the same pattern.
+        // Pass null when not ready so binding 23 falls back to a 1×1 White texture that is never sampled;
+        // the WGSL gate skyParams0.w is written by SkyLighting.Apply only when the LUT exists.
+        WebGPUInterop.SetSkyView(Season.Rendering.FrameSchedule.SkyViewTexture);
 
         FrameSchedule.CaptureLighting(sceneLights, view.View, view.RenderProjection,
             view.RenderViewProjection);

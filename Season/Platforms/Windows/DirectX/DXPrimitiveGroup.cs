@@ -280,6 +280,15 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
             ? DXTexture3D.Find(aerialName)
             : null;
 
+        // 2-7 P0: resolve this frame's Sky-View LUT, the PBR environment specular source under procedural sky.
+        // Resolved every frame for the same reason as cloud noise: after a downgrade or Dispose the schedule
+        // name goes null and a stale handle must not survive into the next frame's bindings.
+        if (Season.Rendering.FrameSchedule.SkyViewTexture is string skyViewName
+            && Season.Basic.Graphics.Instance is Season.Platforms.Windows.Graphics skyViewGraphics)
+            skyViewGraphics.TryGetTexture(skyViewName, out Pipeline.SkyViewActive);
+        else
+            Pipeline.SkyViewActive = null;
+
         // The snapshot is read by fog / weather / particles, so it must come from the view that is actually
         // being rendered, not from the legacy camera mirror.
         var snapshotView = RenderView.Current;
