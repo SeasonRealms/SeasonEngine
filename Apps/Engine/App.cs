@@ -1223,12 +1223,13 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     }
 
     /// <summary>
-    /// D1 贴花演示（s2 验证）：三块贴花全部不写纹理，靠像素着色器里的程序化图案工作，
-    /// 因此这里的验收不依赖任何资源，只看三件事：
-    /// 1) 图案跟着草地/台阶起伏 —— 深度重建正确；
-    /// 2) 从侧面看图案不往池沿侧壁上拉丝 —— 掠射淡出生效；
-    /// 3) 池底那块 Additive 被水面盖住却不被水染 —— 贴花排在透明之前。
-    /// 后续 s3 接纹理时把 Texture 填上名字即可，其余参数不用改。
+    /// D1 贴花演示：三块贴花各带一张 SeasonImage 生成的 RGBA 贴图（见 .dbg/_decal_assets）。
+    /// 贴图是「乘数」而不是反照率：Modulate 走 dst*src 混合，把一张照片直接当 albedo 会把地面
+    /// 压暗好几倍，所以两张地表图的亮度在生成器里已被压进 [0.5,1.0] / [0.62,1.0]，颜色仍留在图里，
+    /// Tint 只做轻微偏向。alpha 由生成器画出有机轮廓，取代了原先着色器里的 4x4 调试棋盘格。
+    ///
+    /// 贴花只按名字查后端纹理字典，不会自己加载文件：名字未注册的那一帧整块贴花会被后端跳过，
+    /// 所以要先把同一张图交给 <see cref="RegisterDecalTexture"/> 走既有的命名纹理路径。
     /// </summary>
     void CreatePondDecals()
     {
@@ -1236,46 +1237,75 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         var wetGrass = new Season.Rendering.DecalVolume
         {
             Mode = Season.Rendering.DecalMode.Modulate,
+            Texture = "Assets/DecalWetGrass.png",
             Position = new(1f, 0.02f, -16f),
             Size = new(8f, 0.06f, 8f),
-            Tint = new(0.55f, 0.60f, 0.62f),
+            Tint = new(0.94f, 0.97f, 1.00f),
             Opacity = 0.9f,
             AngleFade = 0f,
-            EdgeFade = 0.35f,
+            // 轮廓已经由贴图 alpha 画好，盒边羽化再压下去就只剩一个小圆点了。
+            EdgeFade = 0.15f,
             AffectRoughness = true,
             Roughness = 0.04f,
             SortOrder = 0,
         };
         Decals.Add(wetGrass);
+        RegisterDecalTexture(wetGrass.Texture);
 
         // 北侧池沿顶面的苔藓：只调制颜色，盒子很薄，好看出掠射淡出。
         var moss = new Season.Rendering.DecalVolume
         {
             Mode = Season.Rendering.DecalMode.Modulate,
+            Texture = "Assets/DecalMoss.png",
             Position = new(14f, 0.53f, -7f),
             Size = new(9f, 0.06f, 1.6f),
-            Tint = new(0.36f, 0.52f, 0.30f),
+            Tint = new(0.88f, 1.00f, 0.86f),
             Opacity = 0.85f,
             AngleFade = 0.25f,
             EdgeFade = 0.2f,
             SortOrder = 1,
         };
         Decals.Add(moss);
+        RegisterDecalTexture(moss.Texture);
 
         // 池底的焦散：Additive，透明度 0.35 的池水会盖在它上面，同时验证“贴花在透明之前”。
+        // 贴图本身已经是「黑底上的光网」，像素就是光，所以 Tint 只带到接近白，强度靠 Intensity 收。
         var caustics = new Season.Rendering.DecalVolume
         {
             Mode = Season.Rendering.DecalMode.Additive,
+            Texture = "Assets/DecalCaustics.png",
             Position = new(14f, 0.03f, -12f),
             Size = new(9f, 0.06f, 7.2f),
-            Tint = new(0.30f, 0.55f, 0.62f),
-            Opacity = 0.55f,
+            Tint = new(0.80f, 0.95f, 1.00f),
+            Opacity = 0.5f,
             AngleFade = 0.1f,
-            EdgeFade = 0.45f,
-            Intensity = 1.2f,
+            EdgeFade = 0.25f,
+            Intensity = 0.5f,
             SortOrder = 2,
         };
         Decals.Add(caustics);
+        RegisterDecalTexture(caustics.Texture);
+    }
+
+    /// <summary>
+    /// 把贴图名字注册进后端纹理字典。贴花自己不会加载文件，名字没注册就会被整块跳过，
+    /// 所以这里复用既有的命名纹理路径：一张永远不画的 Sprite2D 用同一个名字加载。
+    /// 加载是异步的，贴图到位之前那几帧贴花不出现，这是设计而不是丢失。
+    /// </summary>
+    void RegisterDecalTexture(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return;
+
+        AddControl(new Season.Controls.Sprite2D
+        {
+            Name = name,
+            // LoadSprite2D 内部把 Width/Height 转成 int，null 会被吞成一次“加载失败”，这里给实数。
+            Width = 1,
+            Height = 1,
+            // 纯载体：Alpha 为 0 时 Draw 直接返回，不会出现在屏幕上。
+            Alpha = 0f,
+            Enable = false,
+        });
     }
 
 }

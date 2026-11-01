@@ -2,7 +2,7 @@
 
 This file records the known provenance and license information for **model** and **font** assets under `Apps/Engine/Resources/Raw/Assets`.
 
-Image assets are intentionally excluded from this list.
+Third-party image assets are intentionally excluded from this list. Generated images are recorded under _Generated Images_, because for those the prompt and seed are the only provenance there is.
 
 ## Models
 
@@ -45,6 +45,16 @@ Image assets are intentionally excluded from this list.
 
 | `WaterBottle.glb` | Khronos `glTF-Sample-Assets/Models/WaterBottle` | `CC0-1.0`
 | https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/WaterBottle
+
+## Generated Images
+
+These three are decal textures for the D1 pond decals in `Apps/Engine/App.cs`. Each is a single 512x512 RGBA PNG: the RGB is the photo FLUX.2 [klein] 4B returned, the alpha is a matte authored in code because a diffusion model cannot draw one. The two Modulate textures are additionally re-exposed into a multiplier range, since a Modulate decal multiplies the already-lit ground and photographic albedo would darken it several times over.
+
+| Asset file | Upstream source | License | Notes |
+|---|---|---|---|
+| `DecalWetGrass.png` | SeasonEngine asset pipeline: SeasonImage (FLUX.2 [klein] 4B) text-to-image, then a 2x box filter and a code-authored blob matte | Generated in-repo, no third-party license | 512x512 RGBA, 890 KB. Prompt: "top-down close-up texture of damp dark green grass and muddy soil with small shallow puddles reflecting a grey overcast sky, wet blades pressed flat, macro photograph, flat even lighting, seamless texture tile, nothing else in frame". Alpha: lobed radial falloff. RGB: luminance compressed into [0.50, 1.00], hue preserved. Seed 20261101, 1024x1024 / 16 steps / CFG 1.0. Generator: `.dbg/_decal_assets`. |
+| `DecalMoss.png` | SeasonEngine asset pipeline: SeasonImage (FLUX.2 [klein] 4B) text-to-image, then a 2x box filter and a code-authored band matte | Generated in-repo, no third-party license | 512x512 RGBA, 950 KB. Prompt: "top-down close-up texture of dense green moss and lichen creeping over wet stone, soft velvety surface, small dark crevices between tufts, macro photograph, flat even lighting, seamless texture tile, nothing else in frame". Alpha: ragged soft-edged band. RGB: luminance compressed into [0.62, 1.00], hue preserved. Seed 20261102, 1024x1024 / 16 steps / CFG 1.0. Generator: `.dbg/_decal_assets`. |
+| `DecalCaustics.png` | SeasonEngine asset pipeline: SeasonImage (FLUX.2 [klein] 4B) text-to-image, then a 2x box filter and a luminance-derived matte | Generated in-repo, no third-party license | 512x512 RGBA, 435 KB. Prompt: "top-down photograph of sunlight caustics on the bottom of a shallow clear pond, bright pale cyan wavy light network, thin crossing filaments of light on a pure black background, high contrast, flat orthographic texture, no water surface, no reflections". Alpha: smoothstep over luminance, so black stays invisible. RGB kept as generated: an Additive decal adds its pixels as light. Seed 20261103, 1024x1024 / 16 steps / CFG 1.0. Generator: `.dbg/_decal_assets`. |
 
 ## Fonts
 
