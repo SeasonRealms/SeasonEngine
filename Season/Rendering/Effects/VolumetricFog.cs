@@ -35,14 +35,24 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
     FogCompositePipeline? _composite;
     RenderTarget? _compositeTarget;
     ComputeKernel? _noise, _inject, _filter, _integrate;
-    SceneFog? _scene;
-    SceneLightParams _previousLights;
-    Matrix4x4 _previousVp, _previousProjection;
-    Vector3 _previousPosition, _previousForward;
-    uint _revision;
-    int _ping, _width, _height;
-    bool _historyValid, _noiseReady, _allocated;
+    int _width, _height;
+    bool _noiseReady, _allocated;
     FogQuality _quality;
+
+    /// <summary>Per-view temporal and scene-tracking state, replacing the former flat instance fields.</summary>
+    sealed class FogViewState
+    {
+        public int Ping;
+        public bool HistoryValid;
+        public SceneFog? Scene;
+        public uint Revision;
+        public Matrix4x4 PreviousVp, PreviousProjection;
+        public Vector3 PreviousPosition, PreviousForward;
+        public SceneLightParams PreviousLights;
+        public float HistoryWeight;
+        public bool Ready;
+        public string? FilteredTexture;
+    }
 
     public override string Name => "volumetricFog";
     public override ComputePhase Phase => ComputePhase.AfterOpaque;
@@ -52,9 +62,19 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
     public override ComputeScope Scope => ComputeScope.View;
     public override ViewFeature RequiredFeature => ViewFeature.Fog;
     public (int Width, int Height, int Slices) Grid { get; private set; }
-    public string? FilteredTexture { get; private set; }
+
+    /// <summary>Convenience accessor: the primary view's filtered texture name (history-write slot).
+    /// Use <see cref="GetViewFilteredTexture"/> for per-view access.</summary>
+    public string? FilteredTexture => FrameSchedule.PrimaryTargets.FogLocalName;
+
+    /// <summary>Convenience accessor: the primary view's fogFrame buffer.
+    /// Backends should read <see cref="ViewTargets.FogFrameBuffer"/> for per-view binding.</summary>
     public StorageBuffer? SamplingBuffer => _frameBuffer;
+
+    /// <summary>Primary-view Ready; check <see cref="ViewTargets.FogOutputReady"/> for per-view.</summary>
     public bool Ready { get; private set; }
+
+    /// <summary>Primary-view history blend weight; per-view weight is in <see cref="FogViewState"/>.</summary>
     public float HistoryWeight { get; private set; }
 
     public override bool Initialize(IGraphics g)
@@ -86,6 +106,14 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
             _filterResources[1] = InjectionTexture;
             _integrateResources[2] = IntegratedTexture;
             if (!Allocate(g)) { Dispose(); return false; }
+            // Register primary-view fog resources on its targets (so Record() reads uniformly from ActiveTargets).
+            var primary = FrameSchedule.PrimaryTargets;
+            primary.FogFrameBuffer = _frameBuffer;
+            primary.FogIntegratedName = IntegratedTexture;
+            primary.FogInjectionName = InjectionTexture;
+            primary.FogHistory0Name = HistoryTextures[0];
+            primary.FogHistory1Name = HistoryTextures[1];
+            primary.FogLocalName = HistoryTextures[0]; // initial write slot
             FrameSchedule.PrepareFogComposite = PrepareComposite;
             FrameSchedule.RenderFogComposite = DrawComposite;
             return true;
@@ -130,127 +158,274 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
         return _allocated;
     }
 
+    /// <summary>
+    /// Lazily allocates per-view fog resources (frame buffer + scoped 3D volumes) for secondary views.
+    /// The primary view (Index==0) already has resources from Initialize(); this is a no-op for it.
+    /// </summary>
+    bool EnsureViewFogResources(ViewTargets targets, IGraphics g)
+    {
+        if (targets.HasFogVolumes) return true;
+        if (targets.Index == 0) return _allocated; // primary uses Initialize-time allocation
+        if (!_allocated) return false; // volumes depend on primary allocation succeeding first
+
+        targets.FogFrameBuffer = g.CreateStorageBuffer(FrameVectorCount * 16);
+        targets.FogInjectionName = targets.Scope(InjectionTexture);
+        targets.FogHistory0Name = targets.Scope(HistoryTextures[0]);
+        targets.FogHistory1Name = targets.Scope(HistoryTextures[1]);
+        targets.FogIntegratedName = targets.Scope(IntegratedTexture);
+
+        bool valid = true;
+        uint w = (uint)Grid.Width, h = (uint)Grid.Height, slices = (uint)Grid.Slices;
+        valid &= g.TryCreateComputeTexture3D(targets.FogInjectionName, w, h, slices, ComputeStorageFormat.Rgba16Float);
+        valid &= g.TryCreateComputeTexture3D(targets.FogHistory0Name, w, h, slices, ComputeStorageFormat.Rgba16Float);
+        valid &= g.TryCreateComputeTexture3D(targets.FogHistory1Name, w, h, slices, ComputeStorageFormat.Rgba16Float);
+        valid &= g.TryCreateComputeTexture3D(targets.FogIntegratedName, w, h, slices + 1, ComputeStorageFormat.Rgba16Float);
+
+        if (valid)
+        {
+            targets.FogLocalName = targets.FogHistory0Name; // initial write slot
+            targets.FogPing = 0;
+            targets.FogHistoryValid = false;
+        }
+        else
+        {
+            // Rollback on partial failure
+            targets.FogFrameBuffer?.Dispose();
+            targets.FogFrameBuffer = null;
+            targets.FogInjectionName = targets.FogHistory0Name = targets.FogHistory1Name = targets.FogIntegratedName = null;
+        }
+
+        // Allocate per-view composite target matching this view's scene dimensions
+        if (valid && targets.FogCompositeTarget == null && targets.SceneColor != null)
+        {
+            targets.FogCompositeTarget = g.CreateRenderTarget(new RenderTargetDesc
+            {
+                ColorFormat = RtFormat.Rgba16Float, DepthFormat = RtFormat.None, SampleCount = 1,
+                NoImplicitDepth = true, Width = targets.SceneColor.Desc.Width, Height = targets.SceneColor.Desc.Height,
+                MatchBackbufferSize = false, ClearColor = Vector4.Zero
+            });
+        }
+        return valid;
+    }
+
+    /// <summary>Releases per-view fog resources allocated by <see cref="EnsureViewFogResources"/>.</summary>
+    void ReleaseViewFogResources(ViewTargets targets, IGraphics? g)
+    {
+        if (targets.Index == 0) return; // primary is cleaned by Dispose()
+        if (g != null)
+        {
+            if (targets.FogInjectionName != null) g.ReleaseComputeTexture3D(targets.FogInjectionName);
+            if (targets.FogHistory0Name != null) g.ReleaseComputeTexture3D(targets.FogHistory0Name);
+            if (targets.FogHistory1Name != null) g.ReleaseComputeTexture3D(targets.FogHistory1Name);
+            if (targets.FogIntegratedName != null) g.ReleaseComputeTexture3D(targets.FogIntegratedName);
+        }
+        targets.FogFrameBuffer?.Dispose();
+        targets.FogFrameBuffer = null;
+        targets.FogInjectionName = targets.FogHistory0Name = targets.FogHistory1Name = null;
+        targets.FogIntegratedName = targets.FogLocalName = null;
+        targets.FogPing = 0;
+        targets.FogHistoryValid = false;
+        targets.FogCompositeTarget?.Dispose();
+        targets.FogCompositeTarget = null;
+    }
+
     public override void OnResize(IGraphics g)
     {
         if (!ReferenceEquals(_graphics, g)) return;
-        try { Allocate(g); }
+        try
+        {
+            Allocate(g);
+            // Primary view targets get re-synced after allocate
+            var primary = FrameSchedule.PrimaryTargets;
+            primary.FogFrameBuffer = _frameBuffer;
+            primary.FogIntegratedName = IntegratedTexture;
+            primary.FogInjectionName = InjectionTexture;
+            primary.FogHistory0Name = HistoryTextures[0];
+            primary.FogHistory1Name = HistoryTextures[1];
+            primary.FogLocalName = HistoryTextures[0];
+            // Invalidate per-view state for secondary views (grid dimensions may change)
+            ClearViewStates();
+            foreach (var slot in FrameSchedule.Views)
+                if (slot.Targets != primary && slot.Targets.HasFogVolumes)
+                    ReleaseViewFogResources(slot.Targets, g);
+        }
         catch (Exception ex)
         {
             _allocated = false;
-            ResetOutput();
             DeviceServices.BaseApp.AddLog(LogType.Error, $"[VolumetricFog] Resize 失败：{ex.Message}");
         }
     }
 
+    /// <summary>Per-view resize: releases and lets the next Record() re-allocate the secondary view's fog resources.</summary>
+    public override void OnViewResize(IGraphics g, ViewTargets targets)
+    {
+        if (!ReferenceEquals(_graphics, g) || targets.Index == 0) return;
+        if (targets.HasFogVolumes) ReleaseViewFogResources(targets, g);
+    }
+
+    void ResetOutput(ViewTargets targets)
+    {
+        Ready = false;
+        targets.FogOutputReady = false;
+        var state = ViewState<FogViewState>(targets);
+        state.HistoryValid = false;
+        state.HistoryWeight = 0;
+        state.Ready = false;
+        state.FilteredTexture = null;
+        targets.FogLocalName = targets.FogHistory0Name;
+    }
+
+    /// <summary>Legacy no-arg reset for Initialize-failure paths (targets may not have fog fields yet).</summary>
     void ResetOutput()
     {
         Ready = false;
-        FilteredTexture = null;
-        if (ReferenceEquals(_active, this)) FrameSchedule.FogOutputReady = false;
-        _historyValid = false;
         HistoryWeight = 0;
+        if (ReferenceEquals(_active, this)) FrameSchedule.FogOutputReady = false;
     }
 
     public override void Record(IGraphics g)
     {
         Ready = false;
-        FilteredTexture = null;
         if (!ReferenceEquals(_active, this)) return;
-        FrameSchedule.FogOutputReady = false;
+        var targets = FrameSchedule.ActiveTargets;
+        targets.FogOutputReady = false;
+        var state = ViewState<FogViewState>(targets);
+        state.Ready = false;
+        state.FilteredTexture = null;
         var app = DeviceServices.BaseApp;
         var fog = app.Fog;
-        if (!_allocated || !ReferenceEquals(g, _graphics) || !FrameSchedule.SceneSegmented
+        if (!_allocated || !ReferenceEquals(g, _graphics) || !targets.SceneSegmented
             || !fog.Enabled || RenderQuality.Current.VolumetricFog != _quality
-            || FrameSchedule.SceneDepth == null || FrameSchedule.SceneColor == null
-            || !FrameSchedule.LightingSnapshotValid
-            || FrameSchedule.SceneColor.Desc.Width != _width || FrameSchedule.SceneColor.Desc.Height != _height
-            || FrameSchedule.SceneDepth.Desc.Width != _width || FrameSchedule.SceneDepth.Desc.Height != _height)
-        { ResetOutput(); return; }
+            || targets.SceneDepth == null || targets.SceneColor == null
+            || !FrameSchedule.LightingSnapshotValid)
+        { ResetOutput(targets); return; }
+        // Primary view: match allocated dimensions; secondary: rely on primary grid (shared resolution).
+        if (targets.Index == 0 && (targets.SceneColor.Desc.Width != _width || targets.SceneColor.Desc.Height != _height
+            || targets.SceneDepth.Desc.Width != _width || targets.SceneDepth.Desc.Height != _height))
+        { ResetOutput(targets); return; }
+        // Lazily allocate per-view fog resources for secondary views.
+        if (!EnsureViewFogResources(targets, g))
+        { ResetOutput(targets); return; }
         var vp = FrameSchedule.UnjitteredRenderViewProjection;
         var view = FrameSchedule.RenderView;
         if (!Matrix4x4.Invert(vp, out var inverse) || !Matrix4x4.Invert(view, out var inverseView)
             || !Matrix4x4.Invert(view * FrameSchedule.RenderProjection, out var inverseJittered))
-        { ResetOutput(); return; }
+        { ResetOutput(targets); return; }
         var position = inverseView.Translation;
         var forward = Vector3.Normalize(new Vector3(inverseView.M31, inverseView.M32, inverseView.M33));
         var projection = inverseView * vp;
         ref readonly var lights = ref FrameSchedule.LightingSnapshot;
-        bool reset = !_historyValid || !ReferenceEquals(_scene, fog) || _revision != fog.HistoryRevision
-            || Vector3.Distance(position, _previousPosition) > 2f || Vector3.Dot(forward, _previousForward) < 0.8f
-            || !ProjectionMatches(projection, _previousProjection) || LightsChanged(lights, _previousLights);
+        bool reset = !state.HistoryValid || !ReferenceEquals(state.Scene, fog) || state.Revision != fog.HistoryRevision
+            || Vector3.Distance(position, state.PreviousPosition) > 2f || Vector3.Dot(forward, state.PreviousForward) < 0.8f
+            || !ProjectionMatches(projection, state.PreviousProjection) || LightsChanged(lights, state.PreviousLights);
         float requested = RenderQuality.Current.FogHistoryWeight;
-        HistoryWeight = reset ? 0 : Math.Clamp(float.IsFinite(requested) ? requested : 0, 0, 0.98f)
+        float historyWeight = reset ? 0 : Math.Clamp(float.IsFinite(requested) ? requested : 0, 0, 0.98f)
             / (1f + fog.WindVelocity.Length() * 0.1f);
-        PackFrame(_frame, fog, lights, Grid, inverse, inverseJittered, _previousVp, position, forward,
-            _previousPosition, _previousForward, HistoryWeight, !reset, RenderQuality.Current.FogShadowSamples);
+        state.HistoryWeight = historyWeight;
+        // For primary view, keep legacy property in sync:
+        if (targets.Index == 0) HistoryWeight = historyWeight;
+        PackFrame(_frame, fog, lights, Grid, inverse, inverseJittered, state.PreviousVp, position, forward,
+            state.PreviousPosition, state.PreviousForward, historyWeight, !reset, RenderQuality.Current.FogShadowSamples);
         // 无图集时用场景深度满足绑定形状，同时清掉所有几何阴影开关。
         if (FrameSchedule.ShadowMap == null)
         {
             _frame[LightingOffset + 56].X = 0;
             _frame[LightingOffset + 57].X = 0;
         }
-        _injectResources[2] = FrameSchedule.ShadowMap ?? FrameSchedule.SceneDepth;
+        // Resolve per-view frame buffer and scoped volume names.
+        var frameBuf = targets.FogFrameBuffer!;
+        string injection = targets.FogInjectionName!;
+        string historyRead = (state.Ping == 0 ? targets.FogHistory0Name : targets.FogHistory1Name)!;
+        string historyWrite = (state.Ping == 0 ? targets.FogHistory1Name : targets.FogHistory0Name)!;
+        string integrated = targets.FogIntegratedName!;
+
+        // Update CS resource arrays to per-view names.
+        _injectResources[0] = frameBuf;
+        _injectResources[2] = FrameSchedule.ShadowMap ?? targets.SceneDepth;
         _injectResources[3] = FrameSchedule.CloudNoiseTexture is string cloud
-            ? new ComputeResourceRef { TextureName = cloud } : new ComputeResourceRef { Target = FrameSchedule.SceneColor };
-        if (!g.TryUpdateStorageBuffer(_frameBuffer!, MemoryMarshal.AsBytes(_frame.AsSpan())))
-        { ResetOutput(); return; }
-        int write = _ping ^ 1;
-        _filterResources[2] = HistoryTextures[_ping];
-        _filterResources[3] = HistoryTextures[write];
-        _integrateResources[1] = HistoryTextures[write];
+            ? new ComputeResourceRef { TextureName = cloud } : new ComputeResourceRef { Target = targets.SceneColor };
+        _injectResources[4] = injection;
+        _filterResources[0] = frameBuf;
+        _filterResources[1] = injection;
+        _filterResources[2] = historyRead;
+        _filterResources[3] = historyWrite;
+        _integrateResources[0] = frameBuf;
+        _integrateResources[1] = historyWrite;
+        _integrateResources[2] = integrated;
+
+        if (!g.TryUpdateStorageBuffer(frameBuf, MemoryMarshal.AsBytes(_frame.AsSpan())))
+        { ResetOutput(targets); return; }
         if (!_noiseReady)
         {
             _noiseReady = Dispatch(g, _noise!, _noiseResources, 16, 16, 16);
-            if (!_noiseReady) { ResetOutput(); return; }
+            if (!_noiseReady) { ResetOutput(targets); return; }
         }
         if (!Dispatch(g, _inject!, _injectResources, (Grid.Width + 3) / 4, (Grid.Height + 3) / 4, (Grid.Slices + 3) / 4)
             || !Dispatch(g, _filter!, _filterResources, (Grid.Width + 3) / 4, (Grid.Height + 3) / 4, (Grid.Slices + 3) / 4)
             || !Dispatch(g, _integrate!, _integrateResources, (Grid.Width + 7) / 8, (Grid.Height + 7) / 8, 1))
-        { ResetOutput(); return; }
-        _ping = write;
-        _historyValid = true;
-        _scene = fog; _revision = fog.HistoryRevision;
-        _previousPosition = position; _previousForward = forward;
-        _previousVp = vp; _previousProjection = projection; _previousLights = lights;
-        FilteredTexture = HistoryTextures[write];
-        Ready = FrameSchedule.FogOutputReady = true;
+        { ResetOutput(targets); return; }
+        // Swap ping for next frame's history read/write.
+        state.Ping ^= 1;
+        state.HistoryValid = true;
+        state.Scene = fog; state.Revision = fog.HistoryRevision;
+        state.PreviousPosition = position; state.PreviousForward = forward;
+        state.PreviousVp = vp; state.PreviousProjection = projection; state.PreviousLights = lights;
+        state.FilteredTexture = historyWrite;
+        state.Ready = true;
+        targets.FogLocalName = historyWrite;
+        targets.FogOutputReady = true;
+        // Keep primary-view properties in sync for legacy consumers.
+        if (targets.Index == 0) { Ready = true; }
     }
 
     bool PrepareComposite(IGraphics g)
     {
-        if (!Ready || !ReferenceEquals(g, _graphics) || _composite == null || _compositeTarget == null
-            || !ReferenceEquals(FrameSchedule.FogCompositeTarget, _compositeTarget)
-            || FrameSchedule.SceneColor == null || FrameSchedule.SceneDepth == null || FilteredTexture == null)
-        { ResetOutput(); return false; }
+        var targets = FrameSchedule.ActiveTargets;
+        var state = ViewState<FogViewState>(targets);
+        if (!state.Ready || !ReferenceEquals(g, _graphics) || _composite == null)
+        { ResetOutput(targets); return false; }
+        // Resolve per-view composite target: primary uses _compositeTarget, secondary uses targets.FogCompositeTarget.
+        var compositeTarget = targets.Index == 0 ? _compositeTarget : targets.FogCompositeTarget;
+        if (compositeTarget == null)
+        { ResetOutput(targets); return false; }
+        // For primary, also verify our target hasn't been replaced:
+        if (targets.Index == 0 && !ReferenceEquals(targets.FogCompositeTarget, _compositeTarget))
+        { ResetOutput(targets); return false; }
+        if (targets.SceneColor == null || targets.SceneDepth == null || state.FilteredTexture == null)
+        { ResetOutput(targets); return false; }
         // 此时 GTAO 已完成，不受 AfterOpaque 注册先后次序影响。
         string? ao = FrameSchedule.PostAoTexture;
-        var inputs = new FogCompositeInputs(FrameSchedule.EffectiveSceneColor!, FrameSchedule.SceneDepth, _frameBuffer!,
-            IntegratedTexture, FilteredTexture, new ComputeResourceRef { TextureName = ao }, RenderQuality.Current.AoIntensity, ao != null);
+        var frameBuf = targets.FogFrameBuffer!;
+        var inputs = new FogCompositeInputs(FrameSchedule.EffectiveSceneColor!, targets.SceneDepth, frameBuf,
+            targets.FogIntegratedName!, state.FilteredTexture, new ComputeResourceRef { TextureName = ao },
+            RenderQuality.Current.AoIntensity, ao != null);
         try
         {
-            if (_composite.Prepare(inputs, _compositeTarget)) return true;
+            if (_composite.Prepare(inputs, compositeTarget)) return true;
         }
         catch (Exception ex)
         {
             DeviceServices.BaseApp.AddLog(LogType.Error, $"[VolumetricFog] 合成准备失败：{ex.Message}");
         }
-        ResetOutput();
+        ResetOutput(targets);
         return false;
     }
 
     FogCompositeResult DrawComposite(IGraphics g, RenderTarget source)
     {
-        if (!Ready || !ReferenceEquals(g, _graphics) || !ReferenceEquals(source, FrameSchedule.EffectiveSceneColor))
-        { ResetOutput(); return default; }
+        var targets = FrameSchedule.ActiveTargets;
+        var state = ViewState<FogViewState>(targets);
+        if (!state.Ready || !ReferenceEquals(g, _graphics) || !ReferenceEquals(source, FrameSchedule.EffectiveSceneColor))
+        { ResetOutput(targets); return default; }
         try
         {
             var result = _composite!.Draw();
-            if (!result.Success) ResetOutput();
+            if (!result.Success) ResetOutput(targets);
             return result;
         }
         catch (Exception ex)
         {
-            ResetOutput();
+            ResetOutput(targets);
             DeviceServices.BaseApp.AddLog(LogType.Error, $"[VolumetricFog] 合成绘制失败：{ex.Message}");
             return default;
         }
@@ -348,8 +523,19 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
         _noise = _inject = _filter = _integrate = null;
         _frameBuffer?.Dispose(); _frameBuffer = null;
         foreach (string name in OwnedTextures) graphics.ReleaseComputeTexture3D(name);
+        // Release all per-view fog resources (secondary views only).
+        foreach (var slot in FrameSchedule.Views)
+            ReleaseViewFogResources(slot.Targets, graphics);
+        if (FrameSchedule.PrimaryTargets.FogFrameBuffer == _frameBuffer)
+        {
+            FrameSchedule.PrimaryTargets.FogFrameBuffer = null;
+            FrameSchedule.PrimaryTargets.FogIntegratedName = FrameSchedule.PrimaryTargets.FogInjectionName = null;
+            FrameSchedule.PrimaryTargets.FogHistory0Name = FrameSchedule.PrimaryTargets.FogHistory1Name = null;
+            FrameSchedule.PrimaryTargets.FogLocalName = null;
+        }
+        ClearViewStates();
         if (ReferenceEquals(_active, this)) _active = null;
-        _graphics = null; _scene = null; _allocated = _noiseReady = false;
+        _graphics = null; _allocated = _noiseReady = false;
         Array.Clear(_injectResources); Array.Clear(_filterResources); Array.Clear(_integrateResources);
     }
 

@@ -56,6 +56,33 @@ public sealed class ViewTargets
     /// <summary>Independent HDR target for the fog composite pass; null = single Scene route.</summary>
     public RenderTarget? FogCompositeTarget;
 
+    // -- Per-view fog volume resources (allocated lazily when ViewFeature.Fog is active for this view). --
+
+    /// <summary>Per-view fog frame constant buffer (448×float4). Allocated on first fog Record for this view;
+    /// null = this view does not have volumetric fog.</summary>
+    public StorageBuffer? FogFrameBuffer;
+
+    /// <summary>Scoped name of this view's integrated 3D volume; null = not yet allocated.</summary>
+    public string? FogIntegratedName;
+
+    /// <summary>Scoped name of this view's local (filtered) 3D volume (current history-write slot); null = not yet allocated.</summary>
+    public string? FogLocalName;
+
+    /// <summary>Scoped name of this view's injection 3D volume.</summary>
+    public string? FogInjectionName;
+
+    /// <summary>Scoped name pair for this view's temporal history ping-pong volumes.</summary>
+    public string? FogHistory0Name, FogHistory1Name;
+
+    /// <summary>Per-view ping index (0 or 1); swaps after each successful fog Record.</summary>
+    public int FogPing;
+
+    /// <summary>Per-view temporal history validity; false after reset (camera jump, quality change).</summary>
+    public bool FogHistoryValid;
+
+    /// <summary>True when this view has fully allocated fog resources (frame buffer + both volumes).</summary>
+    public bool HasFogVolumes => FogFrameBuffer != null && FogIntegratedName != null && FogLocalName != null;
+
     /// <summary>Independent HDR target for the weather composite pass; null = single Scene route.</summary>
     public RenderTarget? WeatherCompositeTarget;
 

@@ -56,8 +56,8 @@ internal class RearViews : Panel
     /// <summary>Transparent geometry and opaque geometry, nothing else: the cheapest useful rear view.</summary>
     const ViewFeature MirrorFeatures = ViewFeature.Opaque | ViewFeature.Transparent;
 
-    /// <summary>Opaque only: a plan view has no use for sorted transparency, and it halves the mirror's cost.</summary>
-    const ViewFeature MinimapFeatures = ViewFeature.Opaque;
+    /// <summary>Opaque + Fog: per-view volumetric fog test for the minimap (orthographic top-down).</summary>
+    const ViewFeature MinimapFeatures = ViewFeature.Opaque | ViewFeature.Fog;
 
     public const string MirrorTextureName = "view://rear-mirror";
     public const string MinimapTextureName = "view://minimap";

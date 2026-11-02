@@ -936,15 +936,20 @@ public static class FrameSchedule
         bool opaque = (features & ViewFeature.Opaque) != 0;
         bool transparent = (features & ViewFeature.Transparent) != 0;
         bool particleSubmit = (features & ViewFeature.Particles) != 0;
+        // Per-view fog split: for the primary view, FogCompositeTarget is pre-allocated at Initialize;
+        // for secondary views, Record() lazily allocates it, so we permit the route when the target is null
+        // and the view has a valid SceneColor (the allocation will happen inside the CS phase).
+        bool fogTargetReady = FogCompositeTarget is { Desc.ColorFormat: RtFormat.Rgba16Float }
+            && FogCompositeTarget.Desc.SampleCount <= 1
+            && FogCompositeTarget.Desc.Width == SceneColor?.Desc.Width
+            && FogCompositeTarget.Desc.Height == SceneColor?.Desc.Height
+            && !ReferenceEquals(FogCompositeTarget, SceneColor);
+        bool fogLazyAllowed = ActiveTargets.Index != 0 && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float, Desc.SampleCount: <= 1 };
         bool fogSplit = segmented != null && (features & ViewFeature.Fog) != 0 && app.Fog.Enabled && g.ComputeSupported
             && RenderQuality.Current.VolumetricFog != FogQuality.Off
             && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float }
             && SceneColor.Desc.SampleCount <= 1 && SceneDepth != null
-            && FogCompositeTarget is { Desc.ColorFormat: RtFormat.Rgba16Float }
-            && FogCompositeTarget.Desc.SampleCount <= 1
-            && FogCompositeTarget.Desc.Width == SceneColor.Desc.Width
-            && FogCompositeTarget.Desc.Height == SceneColor.Desc.Height
-            && !ReferenceEquals(FogCompositeTarget, SceneColor) && RenderFogComposite != null;
+            && (fogTargetReady || fogLazyAllowed) && RenderFogComposite != null;
         bool weatherSplit = segmented != null && (features & ViewFeature.Weather) != 0
             && LightingSnapshotValid && _frameLights.WeatherParams1.W > 0
             && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float, Desc.SampleCount: <= 1 }
