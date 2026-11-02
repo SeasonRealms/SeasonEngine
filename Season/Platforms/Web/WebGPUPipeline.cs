@@ -131,7 +131,7 @@ struct VertexOutput {
     @location(6) prevClip: vec4f, // 2-3: previous-frame non-jittered clip-space position (used by FS to compute velocity; w<=0 = no history)
 };
 
-// Per-object state only (60 floats = 240B). View / Projection / PrevViewProjection come from the per-view UBO at
+// Per-object state only (64 floats = 256B). View / Projection / PrevViewProjection come from the per-view UBO at
 // binding 22 (ViewUniforms), so one object buffer serves every view of the frame.
 struct Uniforms {
     world: mat4x4f,              // float 0
@@ -148,6 +148,9 @@ struct Uniforms {
     flags: vec4<i32>,            // float 48  y=renderMode, z=alphaMode, w=textureFlags
     morphWeights: vec4f,         // float 52  Morph weights for the non-instanced path (aligned with native MaterialParams.MorphWeights)
     hdrParams: vec4f,            // float 56  retired 1-2 slot (exposure reads uLights.params0.y); Phase 4 outline color carrier
+    // Vertex swell (currently only the sea writes it): x = half peak-to-trough amplitude in meters (0 = off),
+    // y = current phase, z = previous-frame phase, w = fade radius in meters. See SwellEvaluate below.
+    vertexWave: vec4f,           // float 60
 };
 
 // ── P2: per-view uniform (binding 22), one 256B slot per view / shadow quadrant.
@@ -158,6 +161,9 @@ struct ViewUniforms {
     view: mat4x4f,               // float 0
     projection: mat4x4f,         // float 16 (jitter already baked in)
     prevViewProjection: mat4x4f, // float 32 (all zero = no history)
+    // float 48: xyz = world position, w = view index. The CPU already uploads the full 256B ViewConstants block,
+    // so this needs no extra upload; it was simply not declared on the Web side until the vertex swell needed it.
+    cameraPos: vec4f,
 };
 
 // ── 1-2 lighting system (Contract 8): dedicated shared lighting UBO uploaded once per frame (updateSceneLights),
@@ -396,6 +402,47 @@ fn computePrevLocalPosition(input: VertexInput, instanceIndex: u32, vertexIndex:
     return localPosition;
 }
 
+// -- Vertex swell: the stylized moving sea, evaluated entirely in the vertex stage --
+//
+// Three radial sines centered on the island rather than Gerstner: no crest sharpening and no high-frequency
+// ripple layer, so the silhouette stays round and reads as the same flat-shaded cartoon water the static path
+// already has, only in motion. Three slightly offset centers keep the wavefronts from reading as perfect
+// concentric circles, which is what a single radial wave would look like.
+//
+// The components advance at 1x / 2x / 3x of the shared phase. The integer ratios are what make wrapping the phase
+// at 2*PI seamless: sin(k*r + n*PHI) is exactly periodic in PHI with period 2*PI/n, so a wrap is invisible. They
+// also put the shorter components slightly faster, which is where deep-water dispersion goes anyway (c = sqrt(g/k)).
+//
+// The shore mask is read from the UV channel. Sea.BuildSurfaces bakes the same smoothstep distance to the island
+// square that damps the mesh's own relief, so the swell flattens over the beach exactly where the baked relief
+// does and the waterline stays put.
+//
+// Written as three named components rather than a loop over constant arrays: dynamic indexing into a const array
+// is the one construct where the four backends' compilers disagree about what is legal, and three explicit terms
+// are what all four of them fold identically anyway.
+fn SwellEvaluate(p: vec2f, phase: f32, amp: f32, grad: ptr<function, vec2f>) -> f32 {
+    let d0 = p;                            // 90m component, weight 0.55
+    let d1 = p - vec2f(37.0, -24.0);       // 55m component, weight 0.30
+    let d2 = p - vec2f(-61.0, 43.0);       // 34m component, weight 0.15
+    let r0 = max(length(d0), 1.0);
+    let r1 = max(length(d1), 1.0);
+    let r2 = max(length(d2), 1.0);
+    // The plus sign is the travel direction. A crest sits where k*r + ph = 2*PI*n + PI/2, so r shrinks as the phase
+    // grows: the swell runs inward, toward the island, which is the only direction this ocean needs. A minus would
+    // radiate the rings outward instead, like a stone dropped in a pond.
+    let p0 = 0.06981317 * r0 + phase;
+    let p1 = 0.11423740 * r1 + phase * 2.0;
+    let p2 = 0.18478989 * r2 + phase * 3.0;
+    let c0 = cos(p0);
+    let c1 = cos(p1);
+    let c2 = cos(p2);
+    // d(a*sin(k*r + ph))/dp = a*k*cos(k*r + ph) * d/r
+    *grad = amp * (0.55 * 0.06981317 * c0 / r0 * d0
+                 + 0.30 * 0.11423740 * c1 / r1 * d1
+                 + 0.15 * 0.18478989 * c2 / r2 * d2);
+    return amp * (0.55 * sin(p0) + 0.30 * sin(p1) + 0.15 * sin(p2));
+}
+
 @vertex
 fn vs_main(input: VertexInput, @builtin(instance_index) instanceIndex: u32, @builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
     var output: VertexOutput;
@@ -461,7 +508,35 @@ fn vs_main(input: VertexInput, @builtin(instance_index) instanceIndex: u32, @bui
     } else {
         worldMatrix = u.world;
     }
-    let worldPos = worldMatrix * localPosition;
+    // Vertex swell (see SwellEvaluate). u.vertexWave.x is zero for every mesh except the sea, so the whole block is
+    // skipped by a single compare. Only the water near the camera is displaced: past u.vertexWave.w the mesh keeps its
+    // baked relief, which is all the eye resolves at that range, and the six trig calls never run on the far half of a
+    // 65025-vertex sheet.
+    //
+    // The distance is the full 3D distance to the camera, not the horizontal one. That single choice covers all three
+    // cases the sea has to survive: standing on the island (dy is a few meters, so it is the same as horizontal),
+    // sailing (camera at the water surface, same again), and flying over it (dy is the altitude, so the water directly
+    // below is already past the radius and the whole sheet stops displacing without needing a second altitude rule).
+    //
+    // The gate reads the per-view camera position, so it stays correct for every view of the frame. There is no
+    // SHADOW_PASS switch to guard here: the shadow pass is a separate vertex-only pipeline entry, the sea never casts
+    // (Mesh3D.CastShadows=false), and the wave slot is only written by the scene path, so this never sees a
+    // camera-less slot.
+    var worldPos = worldMatrix * localPosition;
+    var swellGrad = vec2f(0.0, 0.0);
+    var prevSwellHeight = 0.0;
+    if (u.vertexWave.x > 0.0) {
+        // w <= 0 disables the fade: a 1e6 end keeps smoothstep well-formed and puts every vertex inside the range.
+        let fadeEnd = select(max(u.vertexWave.w, 1.0), 1000000.0, u.vertexWave.w <= 0.0);
+        let rangeFade = 1.0 - smoothstep(fadeEnd * 0.62, fadeEnd, length(worldPos.xyz - uView.cameraPos.xyz));
+        let swellAmp = u.vertexWave.x * rangeFade * input.uv.x;
+        if (swellAmp > 0.0) {
+            let swellHeight = SwellEvaluate(worldPos.xz, u.vertexWave.y, swellAmp, &swellGrad);
+            worldPos = vec4f(worldPos.xyz + vec3f(0.0, swellHeight, 0.0), worldPos.w);
+            var gradUnused = vec2f(0.0, 0.0);
+            prevSwellHeight = SwellEvaluate(worldPos.xz, u.vertexWave.z, swellAmp, &gradUnused);
+        }
+    }
     output.position = uView.projection * uView.view * worldPos;
     output.viewDepth = (uView.view * worldPos).z;  // 1-5: view-space z, equivalent to Metal viewPos.z
 
@@ -486,12 +561,22 @@ fn vs_main(input: VertexInput, @builtin(instance_index) instanceIndex: u32, @bui
                 prevWorldMatrix = u.prevWorld;
             }
             let prevLocalPosition = computePrevLocalPosition(input, instanceIndex, vertexIndex);
-            output.prevClip = uView.prevViewProjection * (prevWorldMatrix * prevLocalPosition);
+            // The swell is time-varying geometry, so the previous-frame position needs the previous-frame phase.
+            // Reusing the current height would cancel the wave's own motion out of the velocity buffer and leave the
+            // one surface that should be streaking perfectly clean.
+            var prevWorldPosition = prevWorldMatrix * prevLocalPosition;
+            prevWorldPosition.y += prevSwellHeight;
+            output.prevClip = uView.prevViewProjection * prevWorldPosition;
         }
     }
 
     output.uv = input.uv;
-    output.normal = normalize((worldMatrix * vec4f(localNormal, 0.0)).xyz);
+    // The swell is a height field added on top of the baked relief, over which the normal is always close to +Y, so
+    // n' = normalize(n - (dh/dx, 0, dh/dz)) is the small-slope form of the perturbed normal. Without it the sun glints
+    // would stay frozen in place while the geometry moved underneath them, which is exactly the part of the static sea
+    // worth keeping.
+    let worldNormal = normalize((worldMatrix * vec4f(localNormal, 0.0)).xyz) - vec3f(swellGrad.x, 0.0, swellGrad.y);
+    output.normal = normalize(worldNormal);
     output.worldPos = worldPos.xyz;
     output.tangent = vec4f(normalize((worldMatrix * vec4f(localTangent.xyz, 0.0)).xyz), input.tangent.w);
 

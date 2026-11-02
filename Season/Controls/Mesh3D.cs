@@ -236,6 +236,86 @@ public class Mesh3D : Mesh3DBase
     /// </summary>
     public bool ExcludeFromAo { get; set; }
 
+    /// <summary>
+    /// 主涌浪分量的波数（2π/90m）。着色器里三道分量的波长是 90m/55m/34m，这里只复现第一道：
+    /// 相位是三道共用的一个标量，另外两道的角频率取它的 2 倍与 3 倍，
+    /// 所以 CPU 侧只需要知道主分量的波数就能把 <see cref="WaveSpeed"/> 换算成相位推进量。
+    /// 两侧各写一份常量是刻意的，这个值不是给外部调的，多一条序列化字段没有好处；
+    /// 改波长时要同时改这里和四个后端的 <c>SwellEvaluate</c>。
+    /// </summary>
+    const float SwellWaveNumber0 = 0.06981317f;     // 2 * PI / 90
+
+    const float TwoPi = 6.2831853f;
+
+    /// <summary>
+    /// 顶点涌浪的峰谷高度（米），0 表示完全关闭。默认关闭，因此所有既有网格的行为一字不变。
+    ///
+    /// 这是叠在网格自身烘焙起伏之上的一层行波，不是替代：起伏仍然决定海面的整体形状与近岸衰减，
+    /// 涌浪只让它在原地上下动起来。位移发生在顶点着色器里，法线也随解析梯度重建，
+    /// 所以太阳高光、CSM 阴影接收与 GI 都跟着一起动，不需要额外的通道。
+    /// </summary>
+    public float WaveAmplitude { get; set; }
+
+    /// <summary>
+    /// 主分量相速度（米/秒）。相位由它积分出来，所以改这个值只影响之后的推进速度，
+    /// 不会像"历经时间乘速率"那样让整个波形瞬移。
+    ///
+    /// 浪向是固定的：相位在着色器里是加号，波峰半径 r 满足 k*r + 相位 = 常数，
+    /// 相位涨一点波峰半径就小一点，所以浪永远朝岛心收拢，这个速度也就是径向靠岸速度。
+    /// </summary>
+    public float WaveSpeed { get; set; } = 9f;
+
+    /// <summary>
+    /// 涌浪半径（米）：离相机超过这个距离的顶点回到烘焙起伏。0 表示不做距离衰减。
+    ///
+    /// 这是这个特性里最大的一笔性能账：1400m 的网格有 65025 个顶点，而 1m 的浪高在 150m 外不到一个像素，
+    /// 真正需要位移的只有相机附近那一圈。远处的海面本来就看不出一米级别的起伏，但它的太阳反光带是看得见的，
+    /// 所以那里不能剔除、也不能变黑，只能退回静态姿态——正好就是烘焙好的那份几何与法线。
+    ///
+    /// 门控量的是到相机的三维距离，不是水平距离，这一个判据同时覆盖三种处境：站在岛上时高度差只有几米，
+    /// 与水平距离等价；坐船时相机贴着水面，同样等价；飞到高空时高度差就是离地高度，正下方的水面早已超出半径，
+    /// 整片海自动停止位移。所以这里不需要额外的"相机太高就归零"规则，也不该由面板去猜多高才算看不出。
+    /// </summary>
+    public float WaveFadeRadius { get; set; } = 260f;
+
+    float _wavePhase;
+    float _wavePhasePrev;
+    float _waveLastTime;
+    bool _waveClockSeeded;
+
+    /// <summary>
+    /// 交给后端的一个 float4：(半峰谷振幅, 当前相位, 上一帧相位, 衰减半径)。
+    /// 缓冲区里的相位不取模也能算对，取模只是为了长时间运行时不丢 float 的有效位。
+    /// </summary>
+    internal Vector4 WaveParams => new(WaveAmplitude * 0.5f, _wavePhase, _wavePhasePrev, WaveFadeRadius);
+
+    /// <summary>
+    /// 相位积分。用增量而不是 elapsedTime × speed：后者在改速度的那一刻会把整个波形瞬移一段，
+    /// 而增量只改变之后走多快。取模 2π 不产生接缝，因为三道分量的角频率是 1:2:3 的整数比。
+    /// </summary>
+    void AdvanceWavePhase(float time)
+    {
+        if (!_waveClockSeeded)
+        {
+            _waveClockSeeded = true;
+            _waveLastTime = time;
+            return;
+        }
+
+        float dt = time - _waveLastTime;
+        _waveLastTime = time;
+
+        // 场景时间被重定基准（切场景）或这一帧卡了很久时，dt 会是负数或一大段空白；
+        // 按 0 处理让波形停在原地，而不是突然跳半圈。
+        if (dt <= 0f || dt > 0.25f)
+            return;
+
+        _wavePhasePrev = _wavePhase;
+        _wavePhase = WrapPhase(_wavePhase + dt * WaveSpeed * SwellWaveNumber0);
+    }
+
+    static float WrapPhase(float phase) => phase - TwoPi * MathF.Floor(phase / TwoPi);
+
     /// <summary>Transparent-sort reference point: the unified positioning model uses the anchor's world position.</summary>
     public override Vector3 TransparentSortPosition => new Vector3(PosX, PosY, PosZ);
 
@@ -279,6 +359,11 @@ public class Mesh3D : Mesh3DBase
         {
             Alpha = alpha.Value;
         }
+
+        // Phase advances even while the control is disabled: it is two float adds, and a hidden sea that keeps
+        // its clock running is what lets it reappear mid-wave instead of snapping back to phase 0.
+        if (WaveAmplitude > 0f)
+            AdvanceWavePhase(time);
 
         if (Ready && HasContent && Enable)
         {

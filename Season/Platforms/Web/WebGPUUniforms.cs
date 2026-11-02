@@ -6,7 +6,7 @@ namespace Season.Platforms.Web;
 
 /// <summary>
 /// Per-draw uniform buffer layout, precisely aligned with the WGSL <c>Uniforms</c> struct (std140 layout).
-/// Only per-object state lives here: 60 floats = 240 bytes.
+/// Only per-object state lives here: 64 floats = 256 bytes.
 ///
 /// View / Projection / PrevViewProjection used to be copied into every draw (432B). They now live in one shared
 /// per-view uniform buffer (<see cref="WebGPUViewUniformLayout"/>, binding 22) addressed by slot, so a single object
@@ -54,8 +54,16 @@ public static class WebGPUUniformLayout
     /// in Phase 4 it is repurposed as the per-draw outline color carrier for the OutlineMask pass, see <see cref="WebGPUUniformWriter.SetOutlineMaskColor"/>)</summary>
     public const int HdrParams = 56;
 
-    /// <summary>Total float count in the uniform buffer.</summary>
-    public const int TotalFloats = 60;
+    // Vertex swell (currently only the sea writes it).
+    /// <summary>vec4f vertexWave (x = half peak-to-trough amplitude in meters, 0 = off; y = current phase;
+    /// z = previous-frame phase for the velocity path; w = fade-out radius in meters). The amplitude is what the
+    /// vertex shader branches on, so a zero here costs one compare per vertex.</summary>
+    public const int VertexWave = 60;
+
+    /// <summary>Total float count in the uniform buffer (= 256B, which is also the WebGPU
+    /// <c>minUniformBufferOffsetAlignment</c> unit, so the widened stride is absorbed by the per-view slot size and no
+    /// further growth is free).</summary>
+    public const int TotalFloats = 64;
     /// <summary>Total byte size of the uniform buffer.</summary>
     public const int TotalBytes = TotalFloats * 4;
 }
@@ -80,8 +88,12 @@ public static class WebGPUViewUniformLayout
     public const int Projection = 64;
     /// <summary>mat4x4f prevViewProjection at byte offset 128 (all zero = no history sentinel).</summary>
     public const int PrevViewProjection = 128;
-    /// <summary>Bytes read by the WGSL <c>ViewUniforms</c> struct (three mat4x4f).</summary>
-    public const int StructBytes = 192;
+    /// <summary>Vector4 cameraPos at byte offset 192 (matches <see cref="Season.Rendering.ViewConstants.CameraPos"/>).
+    /// Read by the vertex-stage swell range gate.</summary>
+    public const int CameraPos = 192;
+    /// <summary>Bytes read by the WGSL <c>ViewUniforms</c> struct: three mat4x4f plus the camera position,
+    /// which is the whole slot. Nothing past this is declared, so the block has to stay 256B for the read to be legal.</summary>
+    public const int StructBytes = 256;
     /// <summary>Bytes per slot: one whole ViewConstants block.</summary>
     public const int SlotBytes = Season.Rendering.ViewConstants.SizeInBytes;
     /// <summary>Number of render-view slots.</summary>
@@ -249,6 +261,15 @@ public ref struct WebGPUUniformWriter
     public void SetMorphWeights(Vector4 v)
     {
         int o = WebGPUUniformLayout.MorphWeights;
+        _data[o] = v.X; _data[o + 1] = v.Y; _data[o + 2] = v.Z; _data[o + 3] = v.W;
+    }
+
+    /// <summary>Vertex swell (sea only). x = half peak-to-trough amplitude in meters (0 = off), y = current phase,
+    /// z = previous-frame phase, w = fade radius in meters. Draw sites that leave this unset keep the all-zero slot,
+    /// and the vertex shader then skips the swell on a single compare.</summary>
+    public void SetVertexWave(Vector4 v)
+    {
+        int o = WebGPUUniformLayout.VertexWave;
         _data[o] = v.X; _data[o + 1] = v.Y; _data[o + 2] = v.Z; _data[o + 3] = v.W;
     }
 

@@ -19,6 +19,9 @@ internal unsafe class VKMesh3D : VKPrimitiveGroup
     // One PrimitiveData per Surface; order matches Mesh3D.Surfaces
     internal List<PrimitiveData> Primitives = new();
 
+    /// <summary>Last value pushed to the material buffers, so a mesh that does not swell writes nothing.</summary>
+    System.Numerics.Vector4 _vertexWave;
+
     public VKMesh3D(string name)
     {
         Name = name;
@@ -180,6 +183,9 @@ internal unsafe class VKMesh3D : VKPrimitiveGroup
         // written only when changed)
         SyncColorTint(mesh.ColorTint);
 
+        // Vertex swell (sea only; every other mesh hands over a zero vector and returns immediately).
+        SyncVertexWave(mesh.WaveParams);
+
         // Unified highlighting: synchronize the wireframe flag
         // (can be toggled at runtime) + lazily build per-primitive shell geometry.
         // It is built on the first enabled frame and then kept resident;
@@ -231,6 +237,31 @@ internal unsafe class VKMesh3D : VKPrimitiveGroup
         // Unified highlighting: synchronize Outline2D state
         // (active state is collected by Graphics' OutlineMask pass; mirrors DXMesh3D on DX)
         SetOutline2DState(mesh.Highlight.Outline, mesh.Highlight.OutlineColor, mesh.Highlight.OutlineWidth);
+    }
+
+    /// <summary>
+    /// Publishes the swell parameters into every frame slot, not just the current one: the first frame after the
+    /// swell is turned off still has the old phase sitting in the other slots, and a reused slot would otherwise
+    /// bring a stale wave back for one frame. The phase changes every frame, so unlike SyncAlpha there is no
+    /// "only when changed" saving to be had here; what the early out buys is that every mesh that never swells
+    /// pays one vector compare and nothing else.
+    /// </summary>
+    void SyncVertexWave(System.Numerics.Vector4 wave)
+    {
+        if (_vertexWave == wave)
+            return;
+        _vertexWave = wave;
+
+        int n = (int)Device.frameCount;
+        foreach (var primitive in Primitives)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var materialParams = Unsafe.Read<MaterialParams>(primitive.MappedMaterialBuffers[i]);
+                materialParams.VertexWave = wave;
+                Unsafe.Write(primitive.MappedMaterialBuffers[i], materialParams);
+            }
+        }
     }
 
     /// <summary>Called by the base Draw: copy the Primitives into result

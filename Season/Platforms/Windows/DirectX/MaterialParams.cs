@@ -16,7 +16,7 @@ internal enum TextureSlot
     Emissive = 4
 }
 
-[StructLayout(LayoutKind.Explicit, Size = 128)]
+[StructLayout(LayoutKind.Explicit, Size = 144)]
 internal struct MaterialParams
 {
     [FieldOffset(0)] public Vector4 BaseColor;
@@ -50,6 +50,10 @@ internal struct MaterialParams
     [FieldOffset(116)] public uint HasPrevInstanceWorld;  // 0/1, whether the previous instanceWorld SB is valid
     [FieldOffset(120)] public uint HasPrevMorph;          // 0/1, whether the previous morphWeights SB is valid
     [FieldOffset(124)] public uint _Padding2;             // 16-byte alignment padding
+    // Vertex swell (currently only the sea uses it): x = half peak-to-trough amplitude in meters (0 = off),
+    // y = current phase, z = previous-frame phase for the velocity path, w = fade-out radius in meters.
+    // The amplitude is what the vertex shader branches on, so a zero here costs one compare per vertex.
+    [FieldOffset(128)] public Vector4 VertexWave;
 }
 
 internal unsafe class PrimitiveData

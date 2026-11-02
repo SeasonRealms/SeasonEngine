@@ -1210,6 +1210,11 @@ internal class WGPUMesh3D
     /// BuildSurfaceUniform uses it to set the NoDepthWrite bit in flags.w, which routes JS to the Nd pipeline variant).</summary>
     public bool ExcludeFromAo { get; set; }
 
+    /// <summary>Vertex swell (mirrors Mesh3D.WaveParams and is synchronized every frame by UpdateMesh3D; zero for every
+    /// mesh except the sea). The Web backend rebuilds uniforms per draw, so this needs no dirty gate - it is simply
+    /// written into the per-draw slot on the scene path and stays zero everywhere else.</summary>
+    public Vector4 VertexWave { get; set; }
+
     // Unified highlight: host bounds-box state
     // (box geometry is built lazily on the first enabled frame, synchronized by UpdateMesh3D, and drawn at the end of DrawMesh3D).
     internal bool BoundsActive { get; set; }

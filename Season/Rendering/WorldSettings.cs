@@ -23,6 +23,36 @@ public enum FogPreset
 }
 
 /// <summary>
+/// 海面呈现方式。这是世界参数而不是渲染质量档位：三种方式都走既有的、四端都已实现的渲染通道，
+/// 差别只在用哪一份几何与材质、以及顶点阶段要不要多算几道正弦，所以它可以随时切换，
+/// 也不存在"某端不支持"的情形。
+///
+/// <see cref="Static"/> 是 P3 之前的海面做法取回来：1400m 烘焙起伏网格本身就是可见表面，
+/// 靠低粗糙度与噪声法线让太阳和月亮在水面上拉出高光带。它没有折射，也没有屏幕空间反射，
+/// 但每帧的开销只有一次矩阵写入。
+/// <see cref="Swell"/> 在同一个网格上叠一层顶点涌浪：波形是三道绕岛的径向正弦，没有 Gerstner 的尖峰
+/// 也没有高频细纹，所以轮廓保持圆润的卡通感；太阳反光、CSM 阴影接收与 GI 全部沿用，
+/// 因为走的还是同一个 PBR 着色器。位移只在相机附近的一个圆内发生，圆外回到静态的烘焙起伏。
+/// <see cref="Dynamic"/> 是 P3/P4 的水面：同一张网格退到水下当海底提供水深，
+/// 可见表面由 SceneWater Pass 的 Gerstner 水面绘制，菲涅尔、折射、Hi-Z 屏幕空间反射与深度吸收都在着色器里。
+/// 池塘不受这个开关影响，始终走动态水面。
+/// </summary>
+public enum SeaMode
+{
+    /// <summary>烘焙起伏网格直接作为可见海面，默认。</summary>
+    Static,
+
+    /// <summary>SceneWater Pass 的 Gerstner 水面。</summary>
+    Dynamic,
+
+    /// <summary>
+    /// 烘焙网格 + 顶点涌浪。追加在枚举末尾而不是插在中间：Settings.json 把枚举存成数字，
+    /// 中间插入会把已保存的 Dynamic 读成新值。面板上的排列顺序不受这里影响。
+    /// </summary>
+    Swell,
+}
+
+/// <summary>
 /// World-simulation settings: the parameters that say how the world itself behaves over time, as opposed to how it
 /// is rendered. Persisted in Settings.json next to <see cref="RenderQuality"/> and editable while the frame loop runs.
 ///
@@ -122,6 +152,44 @@ public class WorldSettings
     /// preset runs at its authored density regardless of the sky.
     /// </summary>
     public bool FogWeatherLink { get; set; } = DefaultFogWeatherLink;
+
+    /// <summary>Default value for SeaMode (overrideable in the app constructor and captured by Init()).</summary>
+    public static SeaMode DefaultSeaMode = SeaMode.Static;
+
+    /// <summary>
+    /// 海面用哪一种呈现方式，默认 <see cref="SeaMode.Static"/>。
+    ///
+    /// 切换是一次结构性替换而不是渐变：静态与涌浪共用同一张网格（涌浪只是多算一段顶点位移），
+    /// 动态方式则把网格压到水下当天底并换成 SceneWater 的可见表面，三条路径的可见表面没有共同的中间态可插值。
+    /// 每帧只读一次这个属性，所以改动在下一帧生效，不需要重建任何管线 —— 三种方式用的都是已经常驻的通道
+    /// （Mesh3D 的 PBR 与 SceneWater Pass）。
+    /// </summary>
+    public SeaMode SeaMode { get; set; } = DefaultSeaMode;
+
+    /// <summary>Default value for SeaWaveHeight (overrideable in the app constructor and captured by Init()).</summary>
+    public static float DefaultSeaWaveHeight = 1f;
+
+    /// <summary>
+    /// 涌浪的峰谷高度（米），只在 <see cref="SeaMode.Swell"/> 下有意义。
+    ///
+    /// 这个量是峰到谷的距离，与 <see cref="WaterPlane.SwellHeight"/> 同口径，着色器里取一半当振幅。
+    /// 海面网格的烘焙起伏本身已有约 ±4.5m 的开阔海涌浪，这一层是叠在它之上的行波，
+    /// 所以 1m 已经足够让水面"活"起来；再大就会开始与近岸 1:4 的沙滩坡度打架——
+    /// 每多一米波峰，水线就要往岸上多扫约四米。
+    /// </summary>
+    public float SeaWaveHeight { get; set; } = DefaultSeaWaveHeight;
+
+    /// <summary>Default value for SeaWaveSpeed (overrideable in the app constructor and captured by Init()).</summary>
+    public static float DefaultSeaWaveSpeed = 9f;
+
+    /// <summary>
+    /// 涌浪主分量的相速度（米/秒），只在 <see cref="SeaMode.Swell"/> 下有意义。
+    ///
+    /// 这是"浪峰每秒走过多少米"，不是相位角速度：相位由它积分出来，所以改这个值只影响之后的推进速度，
+    /// 不会像"历经时间乘速率"那样让整个波形瞬移。另外两道分量的角频率是它的 2 倍与 3 倍，
+    /// 整数倍是为了让相位取模 2π 时完全无缝；它们的波长更短，相速度因此略快，正好符合深水色散的方向。
+    /// </summary>
+    public float SeaWaveSpeed { get; set; } = DefaultSeaWaveSpeed;
 
     /// <summary>空间天气配置。旧设置缺失此项时为空，由应用补齐场景默认区域。</summary>
     public WeatherRegionSettings[] WeatherRegions { get; set; } = [];

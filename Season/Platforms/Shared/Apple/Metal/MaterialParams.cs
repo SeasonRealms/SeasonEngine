@@ -21,7 +21,7 @@ internal enum TextureSlot
 /// It is fully consistent with the DX and Vulkan MaterialParams definitions and shares the same cross-platform semantics.
 /// Within this 80-byte region, the MSL constant-buffer layout for scalars and vectors matches std140 and cbuffer semantics.
 /// </summary>
-[StructLayout(LayoutKind.Explicit, Size = 144)]
+[StructLayout(LayoutKind.Explicit, Size = 160)]
 internal struct MaterialParams
 {
     [FieldOffset(0)] public Vector4 BaseColor;
@@ -57,6 +57,12 @@ internal struct MaterialParams
     /// and never read back from the N-buffer ring, satisfying contract clause 6.
     /// </summary>
     [FieldOffset(128)] public Vector4 PrevMorphWeights;
+    /// <summary>
+    /// Vertex swell (currently only the sea uses it): x = half peak-to-trough amplitude in meters (0 = off),
+    /// y = current phase, z = previous-frame phase for the velocity path, w = fade-out radius in meters.
+    /// The amplitude is what the vertex shader branches on, so a zero here costs one compare per vertex.
+    /// </summary>
+    [FieldOffset(144)] public Vector4 VertexWave;
 }
 
 /// <summary>

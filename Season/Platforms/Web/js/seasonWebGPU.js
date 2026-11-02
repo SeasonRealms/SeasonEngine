@@ -746,10 +746,10 @@ window.seasonWebGPU = (() => {
 
     // Sprite2D scratch:
     // vertices + uniform are rewritten every frame
-    // (60 floats aligned to WGSL Uniforms; view/projection now come from the per-view UBO, so only the identity
+    // (64 floats = the full WGSL Uniforms struct; view/projection now come from the per-view UBO, so only the identity
     // world matrix has to be pre-seeded here)
     const _SPRITE2D_VERTEX_SCRATCH = new Float32Array(120);
-    const _SPRITE2D_UNIFORM_SCRATCH = new Float32Array(60);
+    const _SPRITE2D_UNIFORM_SCRATCH = new Float32Array(64);
     const _SPRITE2D_UNIFORM_I32 = new Int32Array(_SPRITE2D_UNIFORM_SCRATCH.buffer, 48 * 4, 4);
     _SPRITE2D_UNIFORM_SCRATCH[0]=1; _SPRITE2D_UNIFORM_SCRATCH[5]=1; _SPRITE2D_UNIFORM_SCRATCH[10]=1; _SPRITE2D_UNIFORM_SCRATCH[15]=1;
     _SPRITE2D_UNIFORM_SCRATCH[43]=1; _SPRITE2D_UNIFORM_SCRATCH[45]=1; _SPRITE2D_UNIFORM_SCRATCH[47]=0.5;
@@ -758,8 +758,10 @@ window.seasonWebGPU = (() => {
     // Dedicated scratch for text GPU instancing:
     // separate from Sprite2D scratch so the instancing bit in flags.w
     // cannot leak into later sprite draws.
-    // 60 floats aligned to WGSL Uniforms (identity world only; view state comes from the screen-space slot).
-    const _TEXT_UNIFORM_SCRATCH = new Float32Array(60);
+    // 64 floats = the full WGSL Uniforms struct (identity world only; view state comes from the screen-space slot).
+    // The tail floats past 60 must be uploaded, not left out: the uniform buffers are pooled, so a short write would
+    // let a sea pass's vertexWave sit in the untouched bytes and displace a glyph.
+    const _TEXT_UNIFORM_SCRATCH = new Float32Array(64);
     const _TEXT_UNIFORM_I32 = new Int32Array(_TEXT_UNIFORM_SCRATCH.buffer, 48 * 4, 4);
     _TEXT_UNIFORM_SCRATCH[0]=1; _TEXT_UNIFORM_SCRATCH[5]=1; _TEXT_UNIFORM_SCRATCH[10]=1; _TEXT_UNIFORM_SCRATCH[15]=1;
     _TEXT_UNIFORM_SCRATCH[43]=1; _TEXT_UNIFORM_SCRATCH[45]=1; _TEXT_UNIFORM_SCRATCH[47]=0.5;
@@ -1640,7 +1642,7 @@ window.seasonWebGPU = (() => {
                 // P2: per-view uniform (View / Projection / PrevViewProjection), one 256B slot per view.
                 // Referenced statically by vs_main, so _shadowBindGroupLayout must declare it as well
                 // (same reason as bindings 13/14).
-                { binding: 22, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 192 } },
+                { binding: 22, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 256 } },
                 // 2-7 P0: Sky-View LUT, the PBR ambient specular source.
                 // 2D float, referenced statically only by fs_main. Reuses the sampler at binding 1.
                 // Parallel to, not a replacement for, uEnvCube at binding 15: the two are mutually exclusive,
@@ -1776,7 +1778,7 @@ window.seasonWebGPU = (() => {
                 { binding: 14, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
                 // P2: same reason as 13/14 - vs_main references the per-view UBO through a global const path, so
                 // the vertex-only shadow layout has to declare it too.
-                { binding: 22, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 192 } },
+                { binding: 22, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 256 } },
             ]
         });
         _shadowPipeline = _device.createRenderPipeline({
@@ -3596,7 +3598,7 @@ window.seasonWebGPU = (() => {
         // because identity matrices would snap vertices back to rest pose.
         const prevBoneBuffer = skinKey ? (_prevSkinnedBoneBuffers[skinKey] || boneBuffer) : _defaultBoneBuffer;
 
-        const STRIDE = 60;  // Aligned with C# WebGPUUniformLayout.TotalFloats (per-object state only;
+        const STRIDE = 64;  // Aligned with C# WebGPUUniformLayout.TotalFloats (per-object state only;
                             // the view matrices live in the per-view UBO at binding 22)
         const BYTES_PER_UNIFORM = STRIDE * 4;
 
@@ -5516,6 +5518,7 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         // 2-7 P0 procedural-sky Sky-View LUT
         setSkyView,
         drawInstancedMesh3D,
+        drawInstancedMesh3DIndirect,
         endFrame,
         resizeCanvas,
         getCanvasSize,

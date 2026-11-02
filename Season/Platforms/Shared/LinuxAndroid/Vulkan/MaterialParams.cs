@@ -22,7 +22,7 @@ internal enum TextureSlot
 /// The scalar region from 0 to 103 matches the DX cbuffer layout,
 /// but morphWeights must live at offset 112, after 8 bytes of padding, instead of DX offset 96.
 /// </summary>
-[StructLayout(LayoutKind.Explicit, Size = 128)]
+[StructLayout(LayoutKind.Explicit, Size = 144)]
 internal struct MaterialParams
 {
     [FieldOffset(0)] public Vector4 BaseColor;
@@ -48,6 +48,12 @@ internal struct MaterialParams
     [FieldOffset(104)] public uint HasPrevInstanceWorld;  // 0 or 1, whether the prev instanceWorld storage buffer is valid.
     [FieldOffset(108)] public uint HasPrevMorph;          // 0 or 1, whether the prev morphWeights storage buffer is valid.
     [FieldOffset(112)] public Vector4 MorphWeights; // Used by regular models. Instanced models use per-instance morph weights.
+    /// <summary>
+    /// Vertex swell (currently only the sea uses it): x = half peak-to-trough amplitude in meters (0 = off),
+    /// y = current phase, z = previous-frame phase for the velocity path, w = fade-out radius in meters.
+    /// The amplitude is what the vertex shader branches on, so a zero here costs one compare per vertex.
+    /// </summary>
+    [FieldOffset(128)] public Vector4 VertexWave;
 }
 
 /// <summary>

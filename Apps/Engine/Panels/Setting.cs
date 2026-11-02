@@ -51,9 +51,9 @@ internal class SettingPanel : BoardPanel
     Input inputPage;
     int page, pageCount = 1;
 
-    Texts textsMode, textsMovement, textsFov, textsDayNightSpeed, textsStartHour, textsStep, textsAntiAliasing, textsGi, textsShadows, textsAo, textsFog, textsFogPreset, textsFogDensity, textsFogQuality, textsFogHistory, textsFogInfo, textsShadowOffset, textsShadowSoftness, textsShadowContact, textsNormalVariance, textsSceneNormals, textsLog;
+    Texts textsMode, textsMovement, textsFov, textsDayNightSpeed, textsStartHour, textsStep, textsAntiAliasing, textsGi, textsShadows, textsAo, textsSea, textsWaveHeight, textsWaveSpeed, textsFog, textsFogPreset, textsFogDensity, textsFogQuality, textsFogHistory, textsFogInfo, textsShadowOffset, textsShadowSoftness, textsShadowContact, textsNormalVariance, textsSceneNormals, textsLog;
 
-    Input inputMode, inputMovement, inputFov, inputDayNightSpeed, inputStartHour, inputStep, inputAntiAliasing, inputGi, inputShadows, inputAo, inputFog, inputFogPreset, inputFogDensity, inputFogQuality, inputFogHistory, inputFogInfo, inputShadowOffset, inputShadowSoftness, inputShadowContact, inputNormalVariance, inputSceneNormals, inputLog;
+    Input inputMode, inputMovement, inputFov, inputDayNightSpeed, inputStartHour, inputStep, inputAntiAliasing, inputGi, inputShadows, inputAo, inputSea, inputWaveHeight, inputWaveSpeed, inputFog, inputFogPreset, inputFogDensity, inputFogQuality, inputFogHistory, inputFogInfo, inputShadowOffset, inputShadowSoftness, inputShadowContact, inputNormalVariance, inputSceneNormals, inputLog;
 
     BaseControl current = null;
 
@@ -195,6 +195,36 @@ internal class SettingPanel : BoardPanel
             Scale = Vector2.One * 1f
         };
         AddControl(textsAo);
+
+        // Sea presentation. Sits with the AO row rather than with the fog block because it is a "what does the world
+        // look like" switch, not a quality tier: both values are fully built paths and neither can be declined by a
+        // backend, which is why this row never shows the pending * marker the rows above use.
+        textsSea = new Texts()
+        {
+            Content = "Sea",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsSea);
+
+        // Swell rows. Only the middle presentation reads them, but they stay visible on every mode: hiding rows would
+        // make the panel jump as soon as someone switched away, and reading "1.0 m" while the sea is static is the
+        // cheaper confusion.
+        textsWaveHeight = new Texts()
+        {
+            Content = "Wave height",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsWaveHeight);
+
+        textsWaveSpeed = new Texts()
+        {
+            Content = "Wave speed",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsWaveSpeed);
 
         // 1-5 clause 13: the normal-offset is the one member of the shadow bias trio that is read from the UBO every frame
         // rather than baked into the shadow PSO, so it is the only one that can honestly be offered as a runtime knob here.
@@ -841,6 +871,164 @@ internal class SettingPanel : BoardPanel
         };
         AddPanel(inputAo);
 
+        inputSea = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                // Panel order is not enum order. Swell sits between the other two here, but it was appended to the enum
+                // rather than inserted next to Static, because Settings.json stores the value as a number and inserting
+                // in the middle would have read every saved Dynamic back as Swell. So the options are matched by name.
+                var sources = new List<Season.Entities.EData>
+                {
+                    new Season.Entities.EData() { Key = nameof(Season.Rendering.SeaMode.Static), Title = "Static (baked mesh, sun glints)" },
+                    new Season.Entities.EData() { Key = nameof(Season.Rendering.SeaMode.Swell), Title = "Swell (baked mesh + moving waves)" },
+                    new Season.Entities.EData() { Key = nameof(Season.Rendering.SeaMode.Dynamic), Title = "Dynamic (Gerstner water)" }
+                };
+
+                current = inputSea;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null)
+                        {
+                            // A world switch, live on the next frame: Sea reads it in Update and flips which of its two
+                            // meshes is enabled, whether the water rectangle joins the SceneWater pass, and whether the
+                            // visible mesh carries a swell amplitude. Nothing is built or destroyed either way, so going
+                            // back and forth costs three Enable writes.
+                            if (Enum.TryParse<Season.Rendering.SeaMode>(picked.Key, out var mode))
+                                Season.Rendering.WorldSettings.Current.SeaMode = mode;
+
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputSea);
+
+        // Five preset stops rather than a free slider: the sea is stylized, and a handful of values that were actually
+        // looked at beat a continuous control whose extremes nobody would have checked. 1 m is the default and already
+        // near the useful ceiling - the baked relief underneath is about +/-4.5m offshore, the beach slopes around 1:4,
+        // and every extra meter of crest walks the waterline roughly four meters further up the sand.
+        inputWaveHeight = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                var sources = new List<Season.Entities.EData>();
+
+                foreach (var height in new[] { "0.3", "0.6", "1", "1.6", "2.5" })
+                {
+                    sources.Add(new Season.Entities.EData()
+                    {
+                        Key = height,
+                        Title = height + " m" + (height == "1" ? " (default)" : "")
+                    });
+                }
+
+                current = inputWaveHeight;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null)
+                        {
+                            // Peak-to-trough, the same measure as WaterPlane.SwellHeight. Live: Sea writes it onto the
+                            // visible mesh every frame and the vertex shader reads it as half that value.
+                            Season.Rendering.WorldSettings.Current.SeaWaveHeight =
+                                float.Parse(picked.Key, System.Globalization.CultureInfo.InvariantCulture);
+
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputWaveHeight);
+
+        // Metres per second of the 90m component, not an abstract multiplier: 9 m/s is a ten-second period, which is
+        // what makes the near water read as ocean swell rather than as a ripple tank.
+        inputWaveSpeed = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                var sources = new List<Season.Entities.EData>();
+
+                foreach (var speed in new[] { "3", "6", "9", "14", "20" })
+                {
+                    sources.Add(new Season.Entities.EData()
+                    {
+                        Key = speed,
+                        Title = speed + " m/s" + (speed == "9" ? " (default)" : "")
+                    });
+                }
+
+                current = inputWaveSpeed;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null)
+                        {
+                            // Phase speed of the 90m component. The phase is integrated from this value rather than
+                            // computed as elapsed time times speed, so changing it only alters how fast the water
+                            // advances from here on and never teleports the wave pattern.
+                            Season.Rendering.WorldSettings.Current.SeaWaveSpeed =
+                                float.Parse(picked.Key, System.Globalization.CultureInfo.InvariantCulture);
+
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputWaveSpeed);
+
         inputFog = new Input()
         {
             WidthMin = WidthMin,
@@ -1415,7 +1603,7 @@ internal class SettingPanel : BoardPanel
 
         // 同时限制列宽和行高，避免新增天气行后越出面板。短窗口压缩行距，放不下时分页。
         // 非当前页的输入停用且透明，防止看不见的旧位置仍参与命中。
-        const int rowCount = 25;
+        const int rowCount = 28;
         var rowTop = (int)(title.PosY + padding + paddingH);
         var rowWidth = inputLeft + width0 + 100;
         var panelWidth = (int)(width ?? App.Instance.ExtendResolution.X - 200);
@@ -1519,6 +1707,21 @@ internal class SettingPanel : BoardPanel
         Place(textsFogInfo, inputFogInfo, App.Instance.fogEffect is { } fogEffect
             ? $"{fogEffect.Grid.Width}x{fogEffect.Grid.Height}x{fogEffect.Grid.Slices}"
             : "-");
+
+        // Fixed labels rather than the enum's own spelling: the row is "Sea" and these are the things a person is
+        // choosing between, so the box should not read as an internal identifier.
+        Place(textsSea, inputSea, Season.Rendering.WorldSettings.Current.SeaMode switch
+        {
+            Season.Rendering.SeaMode.Dynamic => "Dynamic",
+            Season.Rendering.SeaMode.Swell => "Swell",
+            _ => "Static"
+        });
+        // Shown on every mode, not just Swell: a row that appeared and disappeared as the picker above changed would
+        // make the whole panel jump under the finger.
+        Place(textsWaveHeight, inputWaveHeight, Season.Rendering.WorldSettings.Current.SeaWaveHeight.ToString("0.##",
+            System.Globalization.CultureInfo.InvariantCulture) + " m");
+        Place(textsWaveSpeed, inputWaveSpeed, Season.Rendering.WorldSettings.Current.SeaWaveSpeed.ToString("0.##",
+            System.Globalization.CultureInfo.InvariantCulture) + " m/s");
 
         Place(textsShadowOffset, inputShadowOffset, RenderQuality.Current.ShadowNormalOffset.ToString("0.##",
             System.Globalization.CultureInfo.InvariantCulture) + " texel");

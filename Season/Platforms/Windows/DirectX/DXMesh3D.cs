@@ -17,6 +17,9 @@ internal unsafe class DXMesh3D : DXPrimitiveGroup
     // One PrimitiveData per Surface, aligned with Mesh3D.Surfaces order
     internal List<PrimitiveData> Primitives = new List<PrimitiveData>();
 
+    /// <summary>Last value pushed to the material buffers, so a mesh that does not swell writes nothing.</summary>
+    System.Numerics.Vector4 _vertexWave;
+
     public DXMesh3D(string name)
     {
         Name = name;
@@ -181,6 +184,9 @@ internal unsafe class DXMesh3D : DXPrimitiveGroup
         // cycle; written only when it changes)
         SyncColorTint(mesh.ColorTint);
 
+        // Vertex swell (sea only; every other mesh hands over a zero vector and returns immediately).
+        SyncVertexWave(mesh.WaveParams);
+
         // Unified highlighting: sync the wireframe bit
         // (runtime on/off is supported) and lazily build per-primitive shell
         // geometry on the first enabled frame, then keep it resident. When fully
@@ -230,6 +236,31 @@ internal unsafe class DXMesh3D : DXPrimitiveGroup
 
         SetOutline2DState(mesh.Highlight.Outline,
             mesh.Highlight.OutlineColor, mesh.Highlight.OutlineWidth);
+    }
+
+    /// <summary>
+    /// Publishes the swell parameters into every frame slot, not just the current one: the first frame after the
+    /// swell is turned off still has the old phase sitting in the other slots, and a reused slot would otherwise
+    /// bring a stale wave back for one frame. The phase changes every frame, so unlike SyncAlpha there is no
+    /// "only when changed" saving to be had here; what the early out buys is that every mesh that never swells
+    /// pays one vector compare and nothing else.
+    /// </summary>
+    void SyncVertexWave(System.Numerics.Vector4 wave)
+    {
+        if (_vertexWave == wave)
+            return;
+        _vertexWave = wave;
+
+        int n = (int)Device.frameCount;
+        foreach (var primitive in Primitives)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var materialParams = Unsafe.Read<MaterialParams>(primitive.MappedMaterialBuffers[i]);
+                materialParams.VertexWave = wave;
+                Unsafe.Write(primitive.MappedMaterialBuffers[i], materialParams);
+            }
+        }
     }
 
     /// <summary>Called by the base Draw path: copies Primitives into

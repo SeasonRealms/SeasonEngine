@@ -5516,6 +5516,7 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         // 2-7 P0 procedural-sky Sky-View LUT
         setSkyView,
         drawInstancedMesh3D,
+        drawInstancedMesh3DIndirect,
         endFrame,
         resizeCanvas,
         getCanvasSize,

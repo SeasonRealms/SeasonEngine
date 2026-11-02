@@ -18,6 +18,9 @@ internal sealed class MTLMesh3D : MTLPrimitiveGroup
     // One PrimitiveData per Surface, kept in the same order as Mesh3D.Surfaces.
     internal List<PrimitiveData> Primitives = new();
 
+    /// <summary>Last value pushed to the material buffers, so a mesh that does not swell writes nothing.</summary>
+    System.Numerics.Vector4 _vertexWave;
+
     public MTLMesh3D(string name)
     {
         Name = name;
@@ -178,6 +181,9 @@ internal sealed class MTLMesh3D : MTLPrimitiveGroup
         // and writes happen only when values change.
         SyncColorTint(mesh.ColorTint);
 
+        // Vertex swell (sea only; every other mesh hands over a zero vector and returns immediately).
+        SyncVertexWave(mesh.WaveParams);
+
         // Unified highlighting:
         // sync the wireframe flag, which can be toggled at runtime,
         // and lazily build per-primitive shell geometry.
@@ -230,6 +236,31 @@ internal sealed class MTLMesh3D : MTLPrimitiveGroup
         // synchronize Outline2D state.
         // Activation is collected by the OutlineMask pass in Graphics, mirroring DXMesh3D and VKMesh3D.
         SetOutline2DState(mesh.Highlight.Outline, mesh.Highlight.OutlineColor, mesh.Highlight.OutlineWidth);
+    }
+
+    /// <summary>
+    /// Publishes the swell parameters into every frame slot, not just the current one: the first frame after the
+    /// swell is turned off still has the old phase sitting in the other slots, and a reused slot would otherwise
+    /// bring a stale wave back for one frame. The phase changes every frame, so unlike SyncAlpha there is no
+    /// "only when changed" saving to be had here; what the early out buys is that every mesh that never swells
+    /// pays one vector compare and nothing else.
+    /// </summary>
+    void SyncVertexWave(System.Numerics.Vector4 wave)
+    {
+        if (_vertexWave == wave)
+            return;
+        _vertexWave = wave;
+
+        int n = Device.frameCount;
+        foreach (var primitive in Primitives)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var materialParams = ReadStruct<MaterialParams>(primitive.MaterialBuffers[i]);
+                materialParams.VertexWave = wave;
+                WriteStruct(primitive.MaterialBuffers[i], materialParams);
+            }
+        }
     }
 
     /// <summary>Called by the base-class Draw to append primitives into result in Surface order.</summary>

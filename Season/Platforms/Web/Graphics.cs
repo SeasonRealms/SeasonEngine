@@ -155,7 +155,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         return ToByteArray(floats);
     }
 
-    /// <summary>Aligned with <see cref="WebGPUPipeline.UniformBytes"/> (240 bytes = per-object state only) and defined uniformly by the shared layer.</summary>
+    /// <summary>Aligned with <see cref="WebGPUPipeline.UniformBytes"/> (256 bytes = per-object state only) and defined uniformly by the shared layer.</summary>
     const int BYTES_PER_UNIFORM = WebGPUPipeline.UniformBytes;
     // The Web backend previously uploaded only one primitive per frame, so complex skinned glTF assets
     // could remain in a "partially uploaded" state for a long time, which looked inconsistent with
@@ -2748,6 +2748,9 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         // 2-2 Contract Clause 7: mirror the GTAO exemption bit. It can change at runtime, and per-draw
         // uniform rebuilds naturally keep it in sync.
         wgpuMesh.ExcludeFromAo = mesh.ExcludeFromAo;
+        // Vertex swell (sea only; every other mesh hands over a zero vector). Rebuilt into the per-draw slot below,
+        // so no dirty gate is needed on this backend.
+        wgpuMesh.VertexWave = mesh.WaveParams;
 
         // Unified highlight: sync the Bounds box. Box geometry is created lazily on the first enabled frame.
         // Face/edge dual colors are independent of the model alpha chain and are written every frame.
@@ -3045,6 +3048,10 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
         var uniformData = _scratchUniform;
         BuildSurfaceUniform(uniformData, matrixData, surface, wgpuMesh.MeshAlpha, colorTint: wgpuMesh.ColorTint, excludeFromAo: wgpuMesh.ExcludeFromAo, resolvedTextures: resolvedTextures);
+        // Vertex swell (sea only). Written here rather than inside BuildSurfaceUniform because the shadow path and the
+        // instanced path share that helper and must never displace anything: the sea never casts, and its swell is a
+        // function of the per-view camera position, which the shadow slots do not carry.
+        new WebGPUUniformWriter(uniformData).SetVertexWave(wgpuMesh.VertexWave);
         // 2-3 Contract Clause 6: this must run after BuildSurfaceUniform, because it clears the prev slots internally.
         // Only the main pass calls this method. The shadow path does not inject prev data, so the prev slots
         // stay all-zero and the VS sentinel skips motion-vector logic directly.
