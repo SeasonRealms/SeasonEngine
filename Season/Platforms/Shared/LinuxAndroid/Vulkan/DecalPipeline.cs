@@ -23,7 +23,7 @@ namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 /// </list>
 ///
 /// <para>粗糙度写入（s9）用第二个颜色附件，写掩码只开 B 通道，混合为 <c>SRC_ALPHA / ONE_MINUS_SRC_ALPHA</c>，
-/// 因此附件里的八面体法线（.xy）与金属度（.w）保持原值。该形态的 render pass 与不写粗糙度的形态
+/// 因此附件里的八面体法线（.xy）与反射权重（.w）保持原值。该形态的 render pass 与不写粗糙度的形态
 /// 附件数量不同、互不兼容，所以各烘一套 PSO。</para>
 /// </summary>
 internal sealed unsafe class VKDecalPipeline : Season.Rendering.DecalPipeline

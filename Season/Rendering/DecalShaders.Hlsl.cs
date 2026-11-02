@@ -116,7 +116,7 @@ float4 PSMain(float4 position:SV_Position):SV_Target {
 }
 
 // s9：法线目标只开 B 通道写掩码，所以这里只需要把目标粗糙度送到 .z，
-// 八面体法线（.xy）与金属度（.w）由附件里的原值保留。混合用 roughWeight 在 B 通道上插值。
+// 八面体法线（.xy）与反射权重（.w）由附件里的原值保留。混合用 roughWeight 在 B 通道上插值。
 struct PSRoughnessOut { float4 color:SV_Target0; float4 normal:SV_Target1; };
 
 PSRoughnessOut PSMainRoughness(float4 position:SV_Position) {

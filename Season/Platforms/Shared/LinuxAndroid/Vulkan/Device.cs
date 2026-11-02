@@ -1195,6 +1195,7 @@ internal unsafe static class Device
         "WeatherComposite\0"u8.ToArray(),
         "SceneDecal\0"u8.ToArray(),
         "SceneWater\0"u8.ToArray(),
+        "SsrComposite\0"u8.ToArray(),
     ];
 
     internal static void PushDebugGroup(byte[] utf8LabelZ)
@@ -1651,6 +1652,14 @@ internal unsafe static class Device
             extent = new Extent2D(waterColor.Width, waterColor.Height);
             attachmentCount = 1u;
         }
+        else if (desc.Id == Season.Rendering.RenderPassId.SsrComposite && desc.ColorTarget is VKRenderTarget ssrColor)
+        {
+            // P0: SSR 合成与水面同形 —— 单颜色附件、Load、无深度。增量纹理是采样源，
+            // 颜色附件就是 SceneColor 本身，所以这里绝不能清屏。
+            (renderPass, framebuffer) = EnsureSsrCompositePass(ssrColor);
+            extent = new Extent2D(ssrColor.Width, ssrColor.Height);
+            attachmentCount = 1u;
+        }
         else if (desc.ColorTarget is VKRenderTarget colorRT && desc.DepthTarget is VKRenderTarget depthRT)
         {
             (renderPass, framebuffer) = EnsureSceneTargetPass(colorRT, depthRT,
@@ -1696,9 +1705,10 @@ internal unsafe static class Device
         // A0.2: the four-target shape inserts the normal attachment at index 2, also cleared to zero.
         var clearValues = stackalloc ClearValue[4];
         uint clearCount;
-        if (desc.Id is Season.Rendering.RenderPassId.SceneDecal or Season.Rendering.RenderPassId.SceneWater)
+        if (desc.Id is Season.Rendering.RenderPassId.SceneDecal or Season.Rendering.RenderPassId.SceneWater
+            or Season.Rendering.RenderPassId.SsrComposite)
         {
-            // 两个 Pass 的附件全是 Load，ClearValue 一个都不需要。
+            // 这几个 Pass 的附件全是 Load，ClearValue 一个都不需要。
             clearCount = 0u;
         }
         else if (depthOnly)
@@ -1862,6 +1872,62 @@ internal unsafe static class Device
             _waterColorVersion = color.ColorViewVersion;
         }
         return (renderPass, _waterFramebuffer);
+    }
+
+    /// <summary>
+    /// P0 SSR 合成 Pass 的 render pass（单颜色附件、Load、无深度）。烘焙 PSO 时据此锚定，
+    /// <see cref="BeginPass"/> 用同一个对象建 framebuffer，与水面、贴花、OutlineMask 的锚点契约相同。
+    /// </summary>
+    static RenderPass _ssrCompositeRenderPass;
+
+    static Framebuffer _ssrCompositeFramebuffer;
+
+    static VKRenderTarget? _ssrCompositeColorRT;
+
+    static ulong _ssrCompositeColorVersion;
+
+    internal static RenderPass GetSsrCompositeRenderPass()
+    {
+        if (_ssrCompositeRenderPass.Handle == 0)
+            _ssrCompositeRenderPass = VKRenderTarget.CreateSsrCompositeRenderPassForFormat(Format.R16G16B16A16Sfloat);
+        return _ssrCompositeRenderPass;
+    }
+
+    /// <summary>
+    /// 备好 SSR 合成的 render pass 与 framebuffer。颜色附件是当帧 SceneColor：
+    /// 没有深度附件，也不清颜色 —— 反射增量是加法叠上去的，清一下就什么都不剩了。
+    /// 与水面分开缓存，避免两个同样挂 SceneColor 的 Pass 每帧互相拆对方的 framebuffer。
+    /// </summary>
+    static (RenderPass, Framebuffer) EnsureSsrCompositePass(VKRenderTarget color)
+    {
+        if (color.ColorView.Handle == 0 || color.Width == 0 || color.Height == 0)
+            throw new InvalidOperationException("SSR 合成 Pass 的附件无效。");
+
+        var renderPass = GetSsrCompositeRenderPass();
+        if (_ssrCompositeFramebuffer.Handle == 0 || !ReferenceEquals(_ssrCompositeColorRT, color)
+            || _ssrCompositeColorVersion != color.ColorViewVersion)
+        {
+            if (_ssrCompositeFramebuffer.Handle != 0)
+                Vk.DestroyFramebuffer(LogicalDevice, _ssrCompositeFramebuffer, null);
+
+            var attachments = stackalloc Silk.NET.Vulkan.ImageView[1] { color.ColorView };
+            var fbInfo = new FramebufferCreateInfo
+            {
+                SType = StructureType.FramebufferCreateInfo,
+                RenderPass = renderPass,
+                AttachmentCount = 1,
+                PAttachments = attachments,
+                Width = color.Width,
+                Height = color.Height,
+                Layers = 1
+            };
+            if (Vk.CreateFramebuffer(LogicalDevice, in fbInfo, null, out var fb) != Result.Success)
+                throw new Exception("vkCreateFramebuffer (ssr composite) failed");
+            _ssrCompositeFramebuffer = fb;
+            _ssrCompositeColorRT = color;
+            _ssrCompositeColorVersion = color.ColorViewVersion;
+        }
+        return (renderPass, _ssrCompositeFramebuffer);
     }
 
     /// <summary>

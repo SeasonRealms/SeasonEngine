@@ -12,9 +12,13 @@ namespace Season.Rendering.Effects;
 /// 而主着色器正在写这张图，同一资源不能既当附件又当采样源。放到场景之后单独算，
 /// 输入是一张完整的、可采样的不透明色，也就不需要为反射再拷一份全屏快照。
 ///
-/// 输出是**辐射值**而不是最终颜色：rgb 是命中点的线性 HDR 场景色，a 是命中置信度（0 = 没命中）。
-/// 加权交给 <see cref="SsrCompositePipeline"/> —— 场景色的合成与水面的直接采样用的是同一套权重
-/// （F0 × (1-roughness)^4 × Fresnel），两边分开算会立刻在衔接处露出色差。
+/// 输出是**增量**而不是辐射值：核里已经把「把天空那一项换成命中点」的差分算完，
+/// Δ = conf · (1-r)² · w · (ssr − reflSky)，其中 w 是主着色器写进 SceneNormal.w 的反射权重
+/// （F0 的 Rec.709 亮度 × ao）。所以 <see cref="SsrCompositePipeline"/> 只剩一条全屏加法绘制：
+/// 不重算权重、不清屏、不另开目标。差分里 giDiffuse 自动抵消（替换量减替换量），
+/// 这也正是核必须知道 reflSky 的原因 —— 命中点亮度本身不能直接加，那是一份重复的天空能量。
+///
+/// 没命中的像素写 0，什么都没变，画面自然退回主着色器已经算好的天空 + 地面反射。
 ///
 /// 步进分两段：粗段按屏幕像素步长自动挑一级金字塔（步长大就查更粗的级，一个 texel 覆盖一整片），
 /// 射线深度还没越过该块的最近深度就整块跳过；越过之后在该块内用全分辨率深度细化，找第一个交点。
@@ -25,7 +29,7 @@ namespace Season.Rendering.Effects;
 /// </summary>
 public sealed class SsrEffect : ComputeEffect
 {
-    /// <summary>反射辐射输出：rgb = 线性 HDR 反射色，a = 命中置信度。</summary>
+    /// <summary>反射增量输出：rgb = 已含权重的 HDR 差分（可为负），a 恒为 0（加法合成不叠加透明度）。</summary>
     public const string TextureName = "compute://ssr/reflection";
 
     /// <summary>帧缓冲只含 float4；矩阵按 System.Numerics 原始行序存放。</summary>
@@ -40,10 +44,11 @@ public sealed class SsrEffect : ComputeEffect
     static SsrEffect? _active;
 
     readonly Vector4[] _frame = new Vector4[FrameVectorCount];
-    readonly ComputeResourceRef[] _resources = new ComputeResourceRef[9];
+    readonly ComputeResourceRef[] _resources = new ComputeResourceRef[10];
     IGraphics? _graphics;
     StorageBuffer? _frameBuffer;
     ComputeKernel? _kernel;
+    SsrCompositePipeline? _composite;
     uint _width, _height;
     bool _ready;
     bool _unregistering;
@@ -96,18 +101,24 @@ public sealed class SsrEffect : ComputeEffect
                 new ComputeBindingDesc { Type = ComputeBindingType.SampledTexture },
                 new ComputeBindingDesc { Type = ComputeBindingType.SampledTexture },
                 new ComputeBindingDesc { Type = ComputeBindingType.SampledTexture },
+                new ComputeBindingDesc { Type = ComputeBindingType.SampledTexture },
                 new ComputeBindingDesc { Type = ComputeBindingType.StorageTextureWrite, StorageFormat = ComputeStorageFormat.Rgba16Float },
             },
         });
         if (_kernel == null) return false;
         _frameBuffer = g.CreateStorageBuffer(FrameVectorCount * 16);
-        if (_frameBuffer == null)
+        // 后端没有加法全屏合成能力时根本不该注册：反射算得出来却画不上去，
+        // 只会白白打散场景 Pass（split 判据看的是委托非 null），还多一次全屏 dispatch。
+        _composite = g.CreateSsrCompositePipeline();
+        if (_frameBuffer == null || _composite == null)
         {
             Dispose();
             return false;
         }
         _graphics = g;
         _active = this;
+        FrameSchedule.PrepareSsrComposite = PrepareComposite;
+        FrameSchedule.RenderSsrComposite = DrawComposite;
         Allocate(g, color.Desc.Width, color.Desc.Height);
         return true;
     }
@@ -119,7 +130,7 @@ public sealed class SsrEffect : ComputeEffect
         _params = new Vector4(width, height, 0f, 0f);
         g.CreateComputeTexture(TextureName, width, height, ComputeStorageFormat.Rgba16Float);
         // 槽位表与绑定声明一一对应（Params 之后从 0 数）：0 帧缓冲、1 场景色、2 深度、
-        // 3 法线、4..7 金字塔、8 输出。只建一次：纹理名是常量，尺寸变化时
+        // 3 法线、4..7 金字塔、8 天空 LUT、9 输出。只建一次：纹理名是常量，尺寸变化时
         // CreateComputeTexture 会就地重建，引用同一名字的绑定不需要跟着换。
         _resources[0] = _frameBuffer!;
         _resources[1] = FrameSchedule.SceneColor!;
@@ -127,7 +138,7 @@ public sealed class SsrEffect : ComputeEffect
         _resources[3] = FrameSchedule.SceneNormal!;
         for (int level = 0; level < HiZEffect.LevelCount; level++)
             _resources[4 + level] = HiZEffect.LevelName(level);
-        _resources[8] = TextureName;
+        _resources[9] = TextureName;
     }
 
     public override void OnResize(IGraphics g)
@@ -141,8 +152,14 @@ public sealed class SsrEffect : ComputeEffect
     public override void Record(IGraphics g)
     {
         _ready = false;
-        if (!ReferenceEquals(g, _graphics) || _kernel == null || _frameBuffer == null) return;
+        // 每帧先撤销出版：合成 Pass 只有在核真的写成功之后才该发出。
+        FrameSchedule.SsrOutputReady = false;
+        if (!ReferenceEquals(g, _graphics) || _kernel == null || _frameBuffer == null || _composite == null) return;
         if (!HiZEffect.Ready || RenderQuality.Current.ScreenSpaceReflections != SsrMode.HiZ) return;
+        // 没有 Sky-View LUT 就没有 reflSky 可减：核要算的是「换成命中点」的差分，
+        // 少了基项只能算成「净加一份反射」，那正是上一轮 A 要修的重影。这种情况下主着色器写的
+        // 反射权重也是 0 整屏，所以直接不跑，画面保持主着色器已经算好的天空 + 地面反射。
+        if (FrameSchedule.SkyViewTexture is not string skyView || !FrameSchedule.LightingSnapshotValid) return;
         var color = FrameSchedule.SceneColor;
         var depth = FrameSchedule.SceneDepth;
         var normal = FrameSchedule.SceneNormal;
@@ -165,6 +182,12 @@ public sealed class SsrEffect : ComputeEffect
             MathF.Max(0.01f, RenderQuality.Current.SsrThickness), RenderQuality.Current.SsrIntensity,
             FrameSchedule.SkyViewTexture != null ? 1f : 0f);
         _frame[12] = new Vector4((float)(FrameSchedule.FrameIndex & 0xFFFFUL), CoarseSteps, RefineSteps, 0f);
+        // 13 = reflectionParams0（地面辐亮度 xyz + 地面高度 w），14 = 天空强度与出版位。
+        // 帧缓冲本来就留了三行空位，reflSky 需要的全部外部输入正好塞得下，不必扩容。
+        _frame[13] = FrameSchedule.LightingSnapshot.ReflectionParams0;
+        _frame[14] = new Vector4(FrameSchedule.LightingSnapshot.EnvParams.X, 1f, 0f, 0f);
+        // 天空 LUT 只在注册期之后才存在（SkyAtmosphere 注册晚于本效果），所以这里每帧解析名字。
+        _resources[8] = skyView;
         if (!g.TryUpdateStorageBuffer(_frameBuffer, MemoryMarshal.AsBytes(_frame.AsSpan()))) return;
         if (!g.TryDispatchCompute(new ComputeDispatchArgs
         {
@@ -176,7 +199,15 @@ public sealed class SsrEffect : ComputeEffect
             GroupsZ = 1,
         })) return;
         _ready = true;
+        FrameSchedule.SsrOutputReady = true;
     }
+
+    /// <summary>调度层在 <see cref="RenderPassId.SsrComposite"/> 打开之前调用；false 表示这一帧不合成。</summary>
+    bool PrepareComposite(IGraphics g) => _composite != null && FrameSchedule.SceneColor is { } color
+        && _composite.Prepare(new SsrCompositeInputs(color, TextureName));
+
+    /// <summary>只在该 Pass 内调用一次；合成失败时场景保持原样（反射只是少一份增量）。</summary>
+    bool DrawComposite(IGraphics g) => _composite?.Draw() ?? false;
 
     Vector4 _params;
 
@@ -190,6 +221,12 @@ public sealed class SsrEffect : ComputeEffect
         _graphics = null;
         _ready = false;
         if (graphics != null) FrameSchedule.UnregisterCompute(this);
+        // 委托必须摘干净：split 判据只看委托是否非 null，留着就会让场景 Pass 白打散。
+        if (FrameSchedule.PrepareSsrComposite == PrepareComposite) FrameSchedule.PrepareSsrComposite = null;
+        if (FrameSchedule.RenderSsrComposite == DrawComposite) FrameSchedule.RenderSsrComposite = null;
+        FrameSchedule.SsrOutputReady = false;
+        _composite?.Dispose();
+        _composite = null;
         _kernel?.Dispose();
         _kernel = null;
         _frameBuffer?.Dispose();
@@ -224,6 +261,7 @@ Texture2D<float> uHz0 : register(t4);
 Texture2D<float> uHz1 : register(t5);
 Texture2D<float> uHz2 : register(t6);
 Texture2D<float> uHz3 : register(t7);
+Texture2D<float4> uSkyView : register(t8);
 RWTexture2D<float4> uOutput : register(u0);
 
 // 帧缓冲走 ByteAddressBuffer：Load4 的偏移是字节，i * 16 就是 float4 的下标 i。
@@ -250,6 +288,26 @@ float Linearize(float d)
 {
     float near = FrameF(10u).x, far = FrameF(10u).y;
     return near * far / (far - d * (far - near));
+}
+
+// 与主 PS 的 SampleSkyViewRadiance 逐字同形：地平线落在 uv.y = 0.5，天顶 0，天底 1。
+// 这张 LUT 是唯一的天空辐亮度来源，核里必须用同一套 UV 映射，否则差分会对不上。
+float3 SkyRadiance(float3 dir)
+{
+    float2 uv;
+    uv.x = atan2(dir.x, -dir.z) * 0.15915494309 + 0.5;
+    uv.y = 0.5 - 0.5 * sign(dir.y) * sqrt(abs(dir.y));
+    return uSkyView.SampleLevel(uLinearClamp, uv, 0.0).rgb;
+}
+
+// 这一像素上主 PS 原本加进去的天空反射项（A+B 之后的值）。差分是「换成命中点」，
+// 所以必须知道被换掉的是什么 —— 直接加命中点亮度会把天空那份能量算两遍。
+float3 ReflectedSky(float3 P, float3 R)
+{
+    float3 lut = SkyRadiance(R) * FrameF(14u).x;
+    float aboveGround = step(FrameF(13u).w, P.y);
+    float horizonW = max(smoothstep(-0.09, 0.09, R.y), 1.0 - aboveGround);
+    return lerp(FrameF(13u).xyz, lut, horizonW);
 }
 
 // 单一出口 + 显式 .x：fxc 4.x 对「模板化 SampleLevel 返回值隐式转 float + 多 return」的
@@ -279,11 +337,14 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         {
             float4 packed = uNormal.SampleLevel(uLinearClamp, uv, 0.0);
             float roughness = saturate(packed.z);
+            // w 是主 PS 算好的反射权重（F0 的 Rec.709 亮度 × ao）。envCube 路径写 0，
+            // 那种像素点的基项不是天空、差分无从定义，这里也就不该出任何东西。
+            float weight = saturate(packed.w);
             float3 N = OctDecode(packed.xy);
 
             // 粗糙面上屏幕空间反射本来就会糊成一片，还容易被单像素的误命中放大成噪点；
             // 粗糙面的环境能量由 SH9 漫反射项承担，这里直接不出反射。
-            if (roughness < 0.6)
+            if (roughness < 0.6 && weight > 0.0)
             {
                 // 世界坐标重建：UV 的 Y 向下，所以 NDC 的 Y 要翻回来。
                 float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
@@ -291,6 +352,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                 float3 P = world.xyz / world.w;
                 float3 V = normalize(FrameF(8u).xyz - P);
                 float3 R = reflect(-V, N);
+                // 与主 PS 的 B 项同一个粗糙度权重：命中点替换掉的正是这一份镜面能量。
+                float mirrorW = (1.0 - roughness) * (1.0 - roughness);
 
                 // 沿法线偏移：不偏就直接命中自己所在的平面，整屏会反射成同一个颜色。
                 float bias = max(0.02, length(FrameF(8u).xyz - P) * 0.002);
@@ -363,7 +426,10 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                                 float edge = min(min(hitUv.x, 1.0 - hitUv.x), min(hitUv.y, 1.0 - hitUv.y));
                                 float fade = saturate(edge / 0.06);
                                 fade *= saturate(1.0 - (float)i / (float)" + CoarseSteps + @");
-                                result = float4(uScene.SampleLevel(uLinearClamp, hitUv, 0.0).rgb, fade);
+                                // 差分写在这里而不是合成端：命中点的辐射减去这一像素原本的天空项，
+                                // 再乘 (1-r)²、反射权重与置信度 —— 合成端因此只剩一条加法绘制。
+                                float3 hitRadiance = uScene.SampleLevel(uLinearClamp, hitUv, 0.0).rgb;
+                                result = float4((hitRadiance - ReflectedSky(P, R)) * (mirrorW * weight * fade), 0.0);
                                 break;
                             }
                         }
@@ -397,7 +463,8 @@ layout(binding = 5) uniform sampler2D uHz0;
 layout(binding = 6) uniform sampler2D uHz1;
 layout(binding = 7) uniform sampler2D uHz2;
 layout(binding = 8) uniform sampler2D uHz3;
-layout(binding = 9, rgba16f) uniform writeonly image2D uOutput;
+layout(binding = 9) uniform sampler2D uSkyView;
+layout(binding = 10, rgba16f) uniform writeonly image2D uOutput;
 
 vec4 Transform(vec4 p, int offset)
 {
@@ -415,6 +482,24 @@ float Linearize(float d)
 {
     float near = uFrame.data[10].x, far = uFrame.data[10].y;
     return near * far / (far - d * (far - near));
+}
+
+// 与主 PS 的 SampleSkyViewRadiance 逐字同形：地平线落在 uv.y = 0.5，天顶 0，天底 1。
+vec3 SkyRadiance(vec3 dir)
+{
+    vec2 uv;
+    uv.x = atan(dir.x, -dir.z) * 0.15915494309 + 0.5;
+    uv.y = 0.5 - 0.5 * sign(dir.y) * sqrt(abs(dir.y));
+    return textureLod(uSkyView, uv, 0.0).rgb;
+}
+
+// 这一像素上主 PS 原本加进去的天空反射项（A+B 之后的值），差分要把它减掉。
+vec3 ReflectedSky(vec3 P, vec3 R)
+{
+    vec3 lut = SkyRadiance(R) * uFrame.data[14].x;
+    float aboveGround = step(uFrame.data[13].w, P.y);
+    float horizonW = max(smoothstep(-0.09, 0.09, R.y), 1.0 - aboveGround);
+    return mix(uFrame.data[13].xyz, lut, horizonW);
 }
 
 float HiZ(vec2 uv, int level)
@@ -439,15 +524,17 @@ void main()
         {
             vec4 packed = textureLod(uNormal, uv, 0.0);
             float roughness = clamp(packed.z, 0.0, 1.0);
+            float weight = clamp(packed.w, 0.0, 1.0);
             vec3 N = OctDecode(packed.xy);
 
-            if (roughness < 0.6)
+            if (roughness < 0.6 && weight > 0.0)
             {
                 vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
                 vec4 world = Transform(vec4(ndc, depth, 1.0), 4);
                 vec3 P = world.xyz / world.w;
                 vec3 V = normalize(uFrame.data[8].xyz - P);
                 vec3 R = reflect(-V, N);
+                float mirrorW = (1.0 - roughness) * (1.0 - roughness);
 
                 float bias = max(0.02, length(uFrame.data[8].xyz - P) * 0.002);
                 vec3 origin = P + N * bias + R * bias;
@@ -510,7 +597,8 @@ void main()
                                 float edge = min(min(hitUv.x, 1.0 - hitUv.x), min(hitUv.y, 1.0 - hitUv.y));
                                 float fade = clamp(edge / 0.06, 0.0, 1.0);
                                 fade *= clamp(1.0 - float(i) / float(" + CoarseSteps + @"), 0.0, 1.0);
-                                result = vec4(textureLod(uScene, hitUv, 0.0).rgb, fade);
+                                vec3 hitRadiance = textureLod(uScene, hitUv, 0.0).rgb;
+                                result = vec4((hitRadiance - ReflectedSky(P, R)) * (mirrorW * weight * fade), 0.0);
                                 break;
                             }
                         }
@@ -555,6 +643,24 @@ float Linearize(const device float4* frame, float d)
     return near * far / (far - d * (far - near));
 }
 
+// 与主 PS 的 SampleSkyViewRadiance 逐字同形：地平线落在 uv.y = 0.5，天顶 0，天底 1。
+float3 SkyRadiance(texture2d<float, access::sample> sky, sampler sm, float3 dir)
+{
+    float2 uv;
+    uv.x = atan2(dir.x, -dir.z) * 0.15915494309 + 0.5;
+    uv.y = 0.5 - 0.5 * sign(dir.y) * sqrt(abs(dir.y));
+    return sky.sample(sm, uv, level(0.0)).rgb;
+}
+
+// 这一像素上主 PS 原本加进去的天空反射项（A+B 之后的值），差分要把它减掉。
+float3 ReflectedSky(texture2d<float, access::sample> sky, sampler sm, const device float4* frame, float3 P, float3 R)
+{
+    float3 lut = SkyRadiance(sky, sm, R) * frame[14].x;
+    float aboveGround = step(frame[13].w, P.y);
+    float horizonW = max(smoothstep(-0.09, 0.09, R.y), 1.0 - aboveGround);
+    return mix(frame[13].xyz, lut, horizonW);
+}
+
 float HiZ(texture2d<float, access::sample> hz0, texture2d<float, access::sample> hz1,
     texture2d<float, access::sample> hz2, texture2d<float, access::sample> hz3,
     sampler sm, float2 uv, int level)
@@ -575,7 +681,8 @@ kernel void CSMain(
     texture2d<float, access::sample> uHz1 [[texture(4)]],
     texture2d<float, access::sample> uHz2 [[texture(5)]],
     texture2d<float, access::sample> uHz3 [[texture(6)]],
-    texture2d<float, access::write> uOutput [[texture(7)]],
+    texture2d<float, access::sample> uSkyView [[texture(7)]],
+    texture2d<float, access::write> uOutput [[texture(8)]],
     sampler uLinearClamp [[sampler(0)]],
     uint2 id [[thread_position_in_grid]])
 {
@@ -590,15 +697,17 @@ kernel void CSMain(
         {
             float4 packed = uNormal.sample(uLinearClamp, uv, level(0.0));
             float roughness = saturate(packed.z);
+            float weight = saturate(packed.w);
             float3 N = OctDecode(packed.xy);
 
-            if (roughness < 0.6)
+            if (roughness < 0.6 && weight > 0.0)
             {
                 float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
                 float4 world = Transform(frame, float4(ndc, depth, 1.0), 4);
                 float3 P = world.xyz / world.w;
                 float3 V = normalize(frame[8].xyz - P);
                 float3 R = reflect(-V, N);
+                float mirrorW = (1.0 - roughness) * (1.0 - roughness);
 
                 float bias = max(0.02, length(frame[8].xyz - P) * 0.002);
                 float3 origin = P + N * bias + R * bias;
@@ -661,7 +770,9 @@ kernel void CSMain(
                                 float edge = min(min(hitUv.x, 1.0 - hitUv.x), min(hitUv.y, 1.0 - hitUv.y));
                                 float fade = saturate(edge / 0.06);
                                 fade *= saturate(1.0 - float(i) / float(" + CoarseSteps + @"));
-                                result = float4(uScene.sample(uLinearClamp, hitUv, level(0.0)).rgb, fade);
+                                float3 hitRadiance = uScene.sample(uLinearClamp, hitUv, level(0.0)).rgb;
+                                result = float4((hitRadiance - ReflectedSky(uSkyView, uLinearClamp, frame, P, R))
+                                    * (mirrorW * weight * fade), 0.0);
                                 break;
                             }
                         }
@@ -694,7 +805,8 @@ struct SsrParams
 @group(0) @binding(6) var uHz1 : texture_2d<f32>;
 @group(0) @binding(7) var uHz2 : texture_2d<f32>;
 @group(0) @binding(8) var uHz3 : texture_2d<f32>;
-@group(0) @binding(9) var uOutput : texture_storage_2d<rgba16float, write>;
+@group(0) @binding(9) var uSkyView : texture_2d<f32>;
+@group(0) @binding(10) var uOutput : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(15) var uLinearClamp : sampler;
 
 fn Transform(p : vec4<f32>, offset : i32) -> vec4<f32>
@@ -716,6 +828,24 @@ fn Linearize(d : f32) -> f32
     let near = uFrame[10].x;
     let far = uFrame[10].y;
     return near * far / (far - d * (far - near));
+}
+
+// 与主 PS 的 SampleSkyViewRadiance 逐字同形：地平线落在 uv.y = 0.5，天顶 0，天底 1。
+fn SkyRadiance(dir : vec3<f32>) -> vec3<f32>
+{
+    var uv : vec2<f32>;
+    uv.x = atan2(dir.x, -dir.z) * 0.15915494309 + 0.5;
+    uv.y = 0.5 - 0.5 * sign(dir.y) * sqrt(abs(dir.y));
+    return textureSampleLevel(uSkyView, uLinearClamp, uv, 0.0).rgb;
+}
+
+// 这一像素上主 PS 原本加进去的天空反射项（A+B 之后的值），差分要把它减掉。
+fn ReflectedSky(P : vec3<f32>, R : vec3<f32>) -> vec3<f32>
+{
+    let lut = SkyRadiance(R) * uFrame[14].x;
+    let aboveGround = step(uFrame[13].w, P.y);
+    let horizonW = max(smoothstep(-0.09, 0.09, R.y), 1.0 - aboveGround);
+    return mix(uFrame[13].xyz, lut, horizonW);
 }
 
 fn HiZ(uv : vec2<f32>, level : i32) -> f32
@@ -741,15 +871,17 @@ fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
         {
             let packed = textureSampleLevel(uNormal, uLinearClamp, uv, 0.0);
             let roughness = saturate(packed.z);
+            let weight = saturate(packed.w);
             let N = OctDecode(packed.xy);
 
-            if (roughness < 0.6)
+            if (roughness < 0.6 && weight > 0.0)
             {
                 let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
                 let world = Transform(vec4<f32>(ndc, depth, 1.0), 4);
                 let P = world.xyz / world.w;
                 let V = normalize(uFrame[8].xyz - P);
                 let R = reflect(-V, N);
+                let mirrorW = (1.0 - roughness) * (1.0 - roughness);
 
                 let bias = max(0.02, length(uFrame[8].xyz - P) * 0.002);
                 let origin = P + N * bias + R * bias;
@@ -813,7 +945,8 @@ fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
                                 let edge = min(min(hitUv.x, 1.0 - hitUv.x), min(hitUv.y, 1.0 - hitUv.y));
                                 var fade = saturate(edge / 0.06);
                                 fade = fade * saturate(1.0 - f32(i) / f32(" + CoarseSteps + @"));
-                                result = vec4<f32>(textureSampleLevel(uScene, uLinearClamp, hitUv, 0.0).rgb, fade);
+                                let hitRadiance = textureSampleLevel(uScene, uLinearClamp, hitUv, 0.0).rgb;
+                                result = vec4<f32>((hitRadiance - ReflectedSky(P, R)) * (mirrorW * weight * fade), 0.0);
                                 break;
                             }
                         }

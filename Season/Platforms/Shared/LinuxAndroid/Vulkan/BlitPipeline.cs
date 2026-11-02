@@ -1338,3 +1338,187 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
         });
     }
 }
+
+/// <summary>
+/// P0 SSR 加法合成：把反射增量按 One/One 叠进 SceneColor，整个 Pass 只有一条全屏绘制。
+/// 与雾合成的差别都在「没有自己的目标」上：不清屏、不发布颜色源、不挂深度，
+/// 增量纹理以 <c>ShaderReadOnlyOptimal</c> 绑进来（核在 dispatch 尾部已经发布好这个布局）。
+/// </summary>
+internal sealed unsafe class VKSsrCompositePipeline : Season.Rendering.SsrCompositePipeline
+{
+    const string Fragment = """
+#version 450
+layout(binding = 0) uniform sampler2D reflectionDelta;
+layout(location = 0) out vec4 outColor;
+void main() {
+    // texelFetch 而不是采样：增量逐像素确定，线性过滤会在轮廓处把正负差分抵消掉。
+    outColor = vec4(texelFetch(reflectionDelta, ivec2(gl_FragCoord.xy), 0).rgb, 0.0);
+}
+""";
+
+    readonly Dictionary<string, Texture> _textures;
+    readonly List<DescriptorSet>[] _sets = new List<DescriptorSet>[(int)Device.frameCount];
+    readonly int[] _cursors = new int[(int)Device.frameCount];
+    readonly ulong[] _stamps = new ulong[(int)Device.frameCount];
+    DescriptorSetLayout _setLayout;
+    PipelineLayout _layout;
+    VkPipeline _pipeline;
+    RenderPass _renderPass;
+    DescriptorSet _preparedSet;
+    VKRenderTarget? _destination;
+    Texture? _reflection;
+    ulong _reflectionVersion;
+    CommandBuffer _command;
+    ulong _stamp;
+    uint _frameIndex;
+    bool _disposed;
+
+    internal VKSsrCompositePipeline(Dictionary<string, Texture> textures)
+    {
+        _textures = textures;
+        for (int i = 0; i < _sets.Length; i++) _sets[i] = new();
+        try { Initialize(); }
+        catch { Dispose(); throw; }
+    }
+
+    void Initialize()
+    {
+        var vk = Device.Vk; var device = Device.LogicalDevice;
+        var point = Pipeline.StaticPointSampler;
+        if (point.Handle == 0) throw new InvalidOperationException("SSR 合成采样器尚未初始化。");
+        var bindings = stackalloc DescriptorSetLayoutBinding[1];
+        bindings[0] = new() { Binding = 0, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit,
+            DescriptorType = DescriptorType.CombinedImageSampler, PImmutableSamplers = &point };
+        var setInfo = new DescriptorSetLayoutCreateInfo { SType = StructureType.DescriptorSetLayoutCreateInfo,
+            BindingCount = 1, PBindings = bindings };
+        if (vk.CreateDescriptorSetLayout(device, in setInfo, null, out _setLayout) != Result.Success)
+            throw new InvalidOperationException("创建 SSR 合成描述符布局失败。");
+        var setLayout = _setLayout;
+        var layoutInfo = new PipelineLayoutCreateInfo { SType = StructureType.PipelineLayoutCreateInfo,
+            SetLayoutCount = 1, PSetLayouts = &setLayout };
+        if (vk.CreatePipelineLayout(device, in layoutInfo, null, out _layout) != Result.Success)
+            throw new InvalidOperationException("创建 SSR 合成管线布局失败。");
+        // 锚点取自 BeginPass 实际会用的那个 render pass：单颜色附件、Load、无深度。
+        _renderPass = Device.GetSsrCompositeRenderPass();
+        ShaderModule vertex = default, fragment = default;
+        try
+        {
+            vertex = ShaderCompiler.CreateShaderModule(vk, device, Season.Rendering.Effects.VolumetricFogEffect.CompositeVertexGlsl,
+                ShaderStageFlags.VertexBit, "main", "ssr_composite.vert", false);
+            fragment = ShaderCompiler.CreateShaderModule(vk, device, Fragment,
+                ShaderStageFlags.FragmentBit, "main", "ssr_composite.frag", false);
+            ReadOnlySpan<byte> entry = "main\0"u8;
+            fixed (byte* name = entry)
+            {
+                var stages = stackalloc PipelineShaderStageCreateInfo[2];
+                stages[0] = new() { SType = StructureType.PipelineShaderStageCreateInfo, Stage = ShaderStageFlags.VertexBit, Module = vertex, PName = name };
+                stages[1] = new() { SType = StructureType.PipelineShaderStageCreateInfo, Stage = ShaderStageFlags.FragmentBit, Module = fragment, PName = name };
+                var input = new PipelineVertexInputStateCreateInfo { SType = StructureType.PipelineVertexInputStateCreateInfo };
+                var assembly = new PipelineInputAssemblyStateCreateInfo { SType = StructureType.PipelineInputAssemblyStateCreateInfo, Topology = PrimitiveTopology.TriangleList };
+                var viewport = new PipelineViewportStateCreateInfo { SType = StructureType.PipelineViewportStateCreateInfo, ViewportCount = 1, ScissorCount = 1 };
+                var raster = new PipelineRasterizationStateCreateInfo { SType = StructureType.PipelineRasterizationStateCreateInfo,
+                    PolygonMode = PolygonMode.Fill, CullMode = CullModeFlags.None, FrontFace = FrontFace.Clockwise, LineWidth = 1 };
+                var samples = new PipelineMultisampleStateCreateInfo { SType = StructureType.PipelineMultisampleStateCreateInfo, RasterizationSamples = SampleCountFlags.Count1Bit };
+                // One/One 而不是雾的 One/Zero：画的是增量，负值要能减回场景色。
+                var blendAttachment = new PipelineColorBlendAttachmentState {
+                    BlendEnable = true, SrcColorBlendFactor = BlendFactor.One, DstColorBlendFactor = BlendFactor.One,
+                    ColorBlendOp = BlendOp.Add, SrcAlphaBlendFactor = BlendFactor.One, DstAlphaBlendFactor = BlendFactor.One,
+                    AlphaBlendOp = BlendOp.Add,
+                    ColorWriteMask = ColorComponentFlags.RBit | ColorComponentFlags.GBit | ColorComponentFlags.BBit | ColorComponentFlags.ABit };
+                var blend = new PipelineColorBlendStateCreateInfo { SType = StructureType.PipelineColorBlendStateCreateInfo, AttachmentCount = 1, PAttachments = &blendAttachment };
+                var states = stackalloc DynamicState[2] { DynamicState.Viewport, DynamicState.Scissor };
+                var dynamic = new PipelineDynamicStateCreateInfo { SType = StructureType.PipelineDynamicStateCreateInfo, DynamicStateCount = 2, PDynamicStates = states };
+                var info = new GraphicsPipelineCreateInfo { SType = StructureType.GraphicsPipelineCreateInfo,
+                    StageCount = 2, PStages = stages, PVertexInputState = &input, PInputAssemblyState = &assembly,
+                    PViewportState = &viewport, PRasterizationState = &raster, PMultisampleState = &samples,
+                    PColorBlendState = &blend, PDynamicState = &dynamic, Layout = _layout, RenderPass = _renderPass };
+                if (vk.CreateGraphicsPipelines(device, default, 1, in info, null, out _pipeline) != Result.Success)
+                    throw new InvalidOperationException("创建 SSR 合成图形管线失败。");
+            }
+        }
+        finally
+        {
+            if (vertex.Handle != 0) vk.DestroyShaderModule(device, vertex, null);
+            if (fragment.Handle != 0) vk.DestroyShaderModule(device, fragment, null);
+        }
+    }
+
+    // 只接受生产者已经完成写入并转入采样布局的资源，不在 Pass 内补发 barrier。
+    bool Resolve(in Season.Rendering.SsrCompositeInputs inputs, VKRenderTarget destination, out Texture reflection)
+    {
+        reflection = null!;
+        if (destination.Desc.ColorFormat != Season.Rendering.RtFormat.Rgba16Float
+            || destination.Desc.SampleCount != 1 || !destination.HasColor
+            || destination.ColorView.Handle == 0 || destination.Width == 0 || destination.Height == 0) return false;
+        Texture? candidate = null;
+        if (inputs.ReflectionTexture != null)
+            lock (_textures) _textures.TryGetValue(inputs.ReflectionTexture, out candidate);
+        if (candidate == null || !candidate.Ready || candidate.View.Handle == 0
+            || candidate.CurrentLayout != ImageLayout.ShaderReadOnlyOptimal
+            || candidate.Format != Format.R16G16B16A16Sfloat
+            || candidate.Width != destination.Width || candidate.Height != destination.Height) return false;
+        reflection = candidate;
+        return true;
+    }
+
+    public override bool Prepare(in Season.Rendering.SsrCompositeInputs inputs)
+    {
+        _destination = null; _reflection = null; _preparedSet = default;
+        if (_disposed || Device.InRenderPass || Device.GraphicsCommandBuffer.Handle == 0
+            || inputs.Color is not VKRenderTarget destination || !Resolve(inputs, destination, out var reflection)) return false;
+        int index = (int)Device.FrameIndex;
+        ulong stamp = Device.GetCurrentRetireFenceValue();
+        if (_stamps[index] != stamp)
+        {
+            // 同一槽三帧前用过的 set 可能仍在 GPU 上；改写前必须先等该槽退休，见 Device.WaitForFrameSlot。
+            Device.WaitForFrameSlot(index);
+            _stamps[index] = stamp; _cursors[index] = 0;
+        }
+        var ring = _sets[index];
+        if (_cursors[index] == ring.Count) ring.Add(Device.DescriptorAllocator.AllocateSet(_setLayout));
+        var set = ring[_cursors[index]++];
+        var image = new DescriptorImageInfo { ImageView = reflection.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
+        var write = new WriteDescriptorSet { SType = StructureType.WriteDescriptorSet, DstSet = set, DstBinding = 0,
+            DescriptorCount = 1, DescriptorType = DescriptorType.CombinedImageSampler, PImageInfo = &image };
+        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 1, &write, 0, null);
+        _destination = destination; _reflection = reflection; _reflectionVersion = reflection.ViewVersion;
+        _preparedSet = set; _command = Device.GraphicsCommandBuffer; _stamp = stamp; _frameIndex = Device.FrameIndex;
+        return true;
+    }
+
+    public override bool Draw()
+    {
+        var destination = _destination; var reflection = _reflection; var set = _preparedSet;
+        _destination = null; _reflection = null; _preparedSet = default;
+        // 身份与状态都要核对：Prepare 与 Draw 之间可能插入别的 Pass，此时加法叠错目标就毁掉了整帧。
+        if (_disposed || destination == null || reflection == null
+            || !Device.InRenderPass || Device.ActivePassId != Season.Rendering.RenderPassId.SsrComposite
+            || !ReferenceEquals(Device.ActiveColorTarget, destination)
+            || Device.GraphicsCommandBuffer.Handle != _command.Handle || Device.FrameIndex != _frameIndex
+            || Device.GetCurrentRetireFenceValue() != _stamp
+            || !reflection.Ready || reflection.View.Handle == 0
+            || reflection.ViewVersion != _reflectionVersion
+            || reflection.CurrentLayout != ImageLayout.ShaderReadOnlyOptimal) return false;
+        var vk = Device.Vk;
+        vk.CmdBindPipeline(_command, PipelineBindPoint.Graphics, _pipeline);
+        vk.CmdBindDescriptorSets(_command, PipelineBindPoint.Graphics, _layout, 0, 1, &set, 0, null);
+        vk.CmdDraw(_command, 3, 1, 0, 0);
+        return true;
+    }
+
+    public override void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true; _destination = null; _reflection = null; _preparedSet = default;
+        var vk = Device.Vk; var device = Device.LogicalDevice; var allocator = Device.DescriptorAllocator;
+        var pipeline = _pipeline; var layout = _layout; var setLayout = _setLayout;
+        _pipeline = default; _layout = default; _setLayout = default; _renderPass = default;
+        Device.EnqueueDeferredRelease(() =>
+        {
+            foreach (var ring in _sets) foreach (var set in ring) allocator.FreeSet(set);
+            if (pipeline.Handle != 0) vk.DestroyPipeline(device, pipeline, null);
+            if (layout.Handle != 0) vk.DestroyPipelineLayout(device, layout, null);
+            if (setLayout.Handle != 0) vk.DestroyDescriptorSetLayout(device, setLayout, null);
+        });
+    }
+}

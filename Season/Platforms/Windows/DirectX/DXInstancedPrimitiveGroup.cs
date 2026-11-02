@@ -81,7 +81,13 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     Season.Rendering.StorageBuffer? _cullVisible;
     Season.Rendering.StorageBuffer? _cullPrimInfo;
     int _cullCapacity = -1;
+    /// <summary>已上传到 GPU 的参数表条数。与 <see cref="_cullPrimInfoPending"/> 不等时说明本帧要重传。</summary>
     int _cullPrimitiveCount = -1;
+    /// <summary>CPU 侧已构造好的参数表字节。放在这里而不是 UPDATE 里直接传，是因为构造不等同于上传：
+    /// 构造随时可做，上传要等命令列表打开（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。</summary>
+    byte[]? _cullPrimInfoBytes;
+    /// <summary>CPU 侧参数表的条数，-1 表示还没构造过。</summary>
+    int _cullPrimInfoPending = -1;
     bool _cullRegistered;
 
     /// <summary>组局部合并包围盒。剔除内核用它把实例矩阵换算成世界包围球，多 surface 的组必须传并集。</summary>
@@ -408,8 +414,8 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
 
         // A7：剔除内核的输入是与 IA 实例流逐位相同的 80 字节矩阵流，所以直接复用这份 CPU 数组，
         // 不多存一份副本，也不额外计算包围球——球由 GPU 从矩阵与组级盒算出。
+        // 这里只备资源、不上传：上传要等 Record 相位，见 PrepareCullInputs 的说明。
         EnsureCullResources(_instanceCount);
-        UploadCullSource();
 
         int fi = (int)Device.FrameIndex;
         var matrices = new MatrixBuffer
@@ -865,7 +871,9 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     }
 
     /// <summary>
-    /// primitive 集合不变就不重写。索引区间与绘制端必须同源：reset 内核把这里的
+    /// 只构造参数表字节，不碰 GPU —— 构造与上传的安全时机不同：构造随时可做，
+    /// 上传必须等命令列表打开（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。
+    /// primitive 集合不变就不重建。索引区间与绘制端必须同源：reset 内核把这里的
     /// indexCount 写进间接参数，而绘制端不再自己提供索引数。
     /// </summary>
     void EnsureCullPrimitiveInfo()
@@ -874,8 +882,15 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             return;
         int n = _opaquePrimitives.Count;
         if (n <= 0 || n > Season.Rendering.InstanceCull.MaxPrimitives)
+        {
+            // 明确记下"没有可传的参数表"：否则 PrepareCullInputs 会拿上一次的字节反复上传，
+            // 条数看起来对得上，内容却是过期的那一份。
+            _cullPrimInfoBytes = null;
+            _cullPrimInfoPending = 0;
+            _cullPrimitiveCount = 0;
             return;
-        if (_cullPrimitiveCount == n)
+        }
+        if (_cullPrimInfoPending == n)
             return;
 
         var bytes = new byte[n * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride];
@@ -887,16 +902,35 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
                 (uint)primitive.Indices.Length, 0u, 0);
         }
 
-        if (Season.Basic.Graphics.Instance.TryUpdateStorageBuffer(_cullPrimInfo, bytes))
-            _cullPrimitiveCount = n;
+        _cullPrimInfoBytes = bytes;
+        _cullPrimInfoPending = n;
     }
 
-    /// <summary>只在实例数变化后的那一帧上传，且只传有效段，不留余量。</summary>
-    void UploadCullSource()
+    /// <summary>
+    /// A7：把剔除的 CPU 侧输入传到 GPU。由 InstanceCullEffect 在每次派发之前回调，
+    /// 那个相位在 BeforeRender 之后、所有 Pass 之外，是四端唯一共同满足上传前置条件的位置。
+    /// 控制件的 Update 不行：那时命令列表还没打开。
+    /// </summary>
+    bool Season.Rendering.IInstanceCullTarget.PrepareCullInputs()
     {
-        if (_cullSource == null || _instanceCount <= 0)
-            return;
-        Season.Basic.Graphics.Instance.TryUpdateStorageBuffer(_cullSource,
+        if (!Season.Rendering.InstanceCull.Enabled || _instanceCount <= 0)
+            return false;
+
+        var g = Season.Basic.Graphics.Instance;
+
+        // 参数表跟着几何走而不跟帧走，所以只在条数变了时重传。
+        if (_cullPrimInfoPending != _cullPrimitiveCount)
+        {
+            if (_cullPrimInfoPending <= 0 || _cullPrimInfoBytes == null || _cullPrimInfo == null)
+                return false;
+            int bytes = _cullPrimInfoPending * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride;
+            if (!g.TryUpdateStorageBuffer(_cullPrimInfo, new ReadOnlySpan<byte>(_cullPrimInfoBytes, 0, bytes)))
+                return false;
+            _cullPrimitiveCount = _cullPrimInfoPending;
+        }
+
+        // 矩阵流每帧都变，只传有效段，不留余量。
+        return _cullSource != null && g.TryUpdateStorageBuffer(_cullSource,
             MemoryMarshal.AsBytes(_instanceData.AsSpan(0, _instanceCount)));
     }
 
@@ -944,6 +978,8 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         _cullPrimInfo?.Dispose(); _cullPrimInfo = null;
         _cullCapacity = -1;
         _cullPrimitiveCount = -1;
+        _cullPrimInfoBytes = null;
+        _cullPrimInfoPending = -1;
         _cullDrawReady = false;
     }
 

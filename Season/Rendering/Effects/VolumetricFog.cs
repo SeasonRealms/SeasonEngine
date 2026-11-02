@@ -11,7 +11,8 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
     // 0..3 inverseVP，4..7 previousVP，8 camera/D，9 forward/g，10 grid/history，
     // 11 density/height/falloff/noise，12 albedo/scale，13 wind/count，14 environment/PCF，
     // 15 previousCamera/valid，16 previousForward/cloudReady，18..21 inverseJitteredVP，22..25 currentVP，
-    // 32..183 最终 SceneLightParams（含区域天气），192..447 为 32 个局部体。
+    // 32..185 最终 SceneLightParams（含区域天气与 2-8 虚拟地面），192..447 为 32 个局部体。
+    // 186..191 是留给 SceneLightParams 继续追加的余量：追加字段只会往这里长，碰不到 192。
     public const int FrameVectorCount = 448;
     public const int LightingOffset = 32;
     public const int VolumeOffset = 192;

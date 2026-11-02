@@ -116,6 +116,23 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
         _pendingDelta = MathF.Min(0.1f, _pendingDelta + seconds);
     }
 
+    /// <summary>
+    /// 把累积相位归零。唯一的调用方是逐像素 A/B 的取证钩子。
+    ///
+    /// 相位回答的是"这个系统已经记录了多久"，而记录是从粒子系统被创建那一刻开始的 ——
+    /// 创建时机取决于异步加载，两次运行可以差出几十帧。这个偏移不会随帧数收敛：等到第几帧，
+    /// 两边的雨雪都错开同样的距离，画面里那一大片落区于是永远对不上。
+    /// 归零会让粒子瞬移一次，但取证要的是可复现，不是连续。正常运行路径不调用它。
+    /// </summary>
+    public void ResetPhase()
+    {
+        _phase = 0f;
+        _pendingDelta = 0f;
+        // 外部喂时间时 _lastSeconds 不参与运算，但内部计时那条路径会用它算 delta；
+        // 不同步更新的话，归零后的第一帧会算进"从上次记录到现在的全部墙钟时间"。
+        _lastSeconds = _clock.Elapsed.TotalSeconds;
+    }
+
     const uint CompactGroupSize = 64;
 
     readonly Vector4[] _frame = new Vector4[ParticleDraw.FrameVectorCount];
@@ -132,6 +149,10 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
     double _lastSeconds;
     float _phase;
     bool _ready;
+    // 上一帧提交是否失败。Draw 返回 false 有多种合法成因（Pass 身份不符、PSO 仍在异步烘焙），
+    // 单帧失败不值得记，但连续失败意味着这套系统整场一帧都没画出来——而每帧都报会把日志刷满。
+    // 所以只在翻转时各记一次。
+    bool _submitFailed;
     // 是否已进入 FrameSchedule 的提交表。Initialize 可能在加表之前就失败回退，
     // 那时 Dispose 不能去移除一个从未加入的条目。
     bool _routed;
@@ -242,7 +263,7 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
         {
             _pipeline = g.CreateParticleDrawPipeline();
             if (_pipeline == null) { Dispose(); return false; }
-            _reset = g.CreateComputeKernel(CreateResetKernel());
+            _reset = g.CreateComputeKernel(CreateArgsKernel("particleReset"));
             _compact = g.CreateComputeKernel(CreateCompactKernel());
             if (_reset == null || _compact == null) { Dispose(); return false; }
             _frameBuffer = g.CreateStorageBuffer(ParticleDraw.FrameBytes);
@@ -328,6 +349,8 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
             float.IsFinite(SizeEnd) ? SizeEnd : 0f);
         _frame[11] = new Vector4(MathF.Max(SpawnRadius, 0f), MathF.Max(Spread, -100f),
             MathF.Max(Turbulence, 0f), CurveMode ? 1f : 0f);
+        // rows 12..15 保持零：那四行是 ribbon 带（闪电通道）的视口与雾参数，粒子路径从不填，
+        // 于是帧缓冲的 ribbon 标志为 0，顶点阶段不进新分支，粒子路径的每个字节与扩容前一致。
         if (!g.TryUpdateStorageBuffer(_frameBuffer, MemoryMarshal.AsBytes(_frame.AsSpan()))) return;
 
         Span<float> reset = stackalloc float[4];
@@ -359,7 +382,11 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
         p[9] = Color.Y;
         p[10] = Color.Z;
         p[11] = Color.W;
-        p[12] = Math.Clamp(Density, 0, 1);
+        // 密度同时决定 compact 的派发宽度：门控在 shader 侧按下标有序，所以第 ceil(密度×预算)
+        // 个之前的下标必然放行、之后必然被拒，派发后者只是让 GPU 空跑。
+        // p[12] 必须与下面算派发宽度用的是同一个值，否则 CPU 派发的宽度与 shader 判定的前缀对不上。
+        float density = Math.Clamp(Density, 0f, 1f);
+        p[12] = density;
         p[13] = MathF.Max(Sway, 0);
         // 寿命以秒送进 shader，让 kernel 把 [0,1) 的年龄换算回真实时间做闭式积分；
         // 0 表示相位冻结，shader 会把时间项整条取零，于是位置与速度都退回不扩展前的结果。
@@ -378,10 +405,15 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
             Kernel = _compact,
             Params = MemoryMarshal.AsBytes(p),
             Resources = _compactResources,
-            GroupsX = (ParticleBudget + CompactGroupSize - 1) / CompactGroupSize,
+            // 只派发会放行的那一段下标前缀：候选线程数随密度线性收窄，晴天过渡到小雨时
+            // 派发宽度也是连续变化的，不会出现"密度 0.02 仍按满预算跑"的空转。
+            // 向上取整到整组，组内多出来的下标由 shader 的下标门控自己拒掉。
+            GroupsX = (uint)MathF.Ceiling(density * ParticleBudget / CompactGroupSize),
             GroupsY = 1,
             GroupsZ = 1,
         });
+        // 密度为 0 时 GroupsX 也是 0，后端跳过整条派发，args 停在 reset 写的 0：
+        // 本帧明确不画，而不是画一片上一帧已经淘汰的旧实例。
         _ready = true;
     }
 
@@ -396,10 +428,19 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
             _instances!, _args!, _frameBuffer!));
     }
 
-    void IParticleSubmitter.Submit(IGraphics g)
+    bool IParticleSubmitter.Submit(IGraphics g)
     {
-        if (!ReferenceEquals(g, _graphics)) return;
-        _pipeline?.Draw();
+        if (!ReferenceEquals(g, _graphics)) return false;
+        bool drawn = _pipeline?.Draw() == true;
+        if (drawn == _submitFailed)
+        {
+            _submitFailed = !drawn;
+            // 恢复记 Backend、进入失败记 Error：前者是本该如此，后者需要有人去看。
+            DeviceServices.BaseApp.AddLog(drawn ? LogType.Backend : LogType.Error, drawn
+                ? $"[Particles] 间接绘制恢复提交（预算 {ParticleBudget}）。"
+                : $"[Particles] 间接绘制连续未提交（预算 {ParticleBudget}）：本帧管线状态与 Prepare 不一致，这套粒子在整帧缺失。");
+        }
+        return drawn;
     }
 
     public override void OnUnregistered() => Dispose();
@@ -432,15 +473,26 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
 
     // ── Kernel declarations ──
     // Binding order is the cross-backend slot contract; see the ComputeBindingType summary.
-    // reset:   [0] Params 16B -> b0 / [1] StorageBufferReadWrite args -> u0
-    // compact: [0] Params 96B -> b0 / [1] StorageBufferRead frame -> t0
+    // args:    [0] Params 16B -> b0 / [1] StorageBufferReadWrite args -> u0
+    // compact: [0] Params 96B -> b0 / [1] StorageBufferRead regions -> t0
     //          [2] StorageBufferReadWrite instances -> u0 / [3] StorageBufferReadWrite args -> u1
-    //          [4] StorageBufferRead regions -> t1
+    //          [4] StorageBufferRead frame -> t1
     // 96B 低于 Vulkan push constant / WebGPU uniform 的跨端 128B 上限。
 
-    static ComputeKernelDesc CreateResetKernel() => new()
+    /// <summary>
+    /// 单线程改写五个间接参数的 kernel。参数是四个 float：indexCount / instanceCount /
+    /// startIndex / baseVertex；第五个字段 startInstance 恒写 0。
+    ///
+    /// 粒子每帧用它把实例计数归零（随后由压缩阶段用原子加抬高），闪电通道每帧用它写入固定的
+    /// 段数。闪电没有走 CPU 上传：间接参数缓冲的 compute-write → indirect-read 这条同步链
+    /// 已经被粒子路径在四端验证过，而 CPU 上传在 Vulkan 上要一道 copy→drawIndirect 的屏障，
+    /// 那条链路从未被验证，写成 CPU 上传会在 VK 上留下一个只在真机才现形的可见性缺口。
+    ///
+    /// Name 只用于编译错误归因与调试标记，两端各传各的，日志里因此能区分是哪套系统在写参数。
+    /// </summary>
+    internal static ComputeKernelDesc CreateArgsKernel(string name) => new()
     {
-        Name = "particleReset",
+        Name = name,
         Source = new ShaderSourceSet
         {
             Hlsl = ResetHlsl, Glsl = ResetGlsl, Msl = ResetMsl, Wgsl = ResetWgsl, EntryPoint = "CSMain",

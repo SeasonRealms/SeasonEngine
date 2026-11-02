@@ -80,7 +80,8 @@ const HDR_CHAIN : bool = false;
 // Mutually exclusive with SHADOW_PASS, since shadow uses a vertex-only pipeline with no fragment stage.
 const VELOCITY_OUTPUT : bool = false;
 
-// ── A0.2: SceneNormal output (MRT slot 2, rgba16float: xy = octahedral world normal, z = Toksvig roughness, w = metallic),
+// ── A0.2: SceneNormal output (MRT slot 2, rgba16float: xy = octahedral world normal, z = Toksvig roughness,
+// w = the P0 reflection weight SSR replaces the sky term with),
 // mirroring NORMAL_OUTPUT on DX/VK/Metal. Only ever true together with VELOCITY_OUTPUT (RenderQuality.EffectiveSceneNormals),
 // so the Scene pass keeps three shapes. Same two-entry reasoning as above: fs_main_mrtn = color + velocity + normal.
 const NORMAL_OUTPUT : bool = false;
@@ -237,6 +238,10 @@ struct SceneLights {
     // 2-7 雷电 (offset 2432)：xyz = 当前主导雷击在云内的世界坐标 / w = 回击包络亮度 0~1。
     // w 是唯一总开关；非雷暴天气、区域质量 Off、Showcase 模式下整个字段为零。
     weatherFlash: vec4f,            // offset 2432，尾部 2448B
+    // 2-8 环境镜面的虚拟地面 (offset 2448)：xyz = 地面辐亮度（线性 HDR，含 albedo/直射/天空 SH9/1π），
+    // w = 地面所在的世界 Y。只由 SkyLighting.Apply 注入，只在程序化天空分支里被读取。
+    // 追加后 SCENE_LIGHT_BYTES 同步为 2464，见 js/seasonWebGPU.js。
+    reflectionParams0: vec4f,       // offset 2448，尾部 2464B
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -413,9 +418,10 @@ fn computePrevLocalPosition(input: VertexInput, instanceIndex: u32, vertexIndex:
 // at 2*PI seamless: sin(k*r + n*PHI) is exactly periodic in PHI with period 2*PI/n, so a wrap is invisible. They
 // also put the shorter components slightly faster, which is where deep-water dispersion goes anyway (c = sqrt(g/k)).
 //
-// The shore mask is read from the UV channel. Sea.BuildSurfaces bakes the same smoothstep distance to the island
-// square that damps the mesh's own relief, so the swell flattens over the beach exactly where the baked relief
-// does and the waterline stays put.
+// The mask is read from the UV channel. Sea.BuildSurfaces bakes a smoothstep distance to the island square into it -
+// the swell's own band, 6m to 24m offshore, deliberately narrower than the 60m band that damps the baked relief.
+// It reaches zero before the waterline, so a crest can never climb the beach, while the first visible crest sits
+// close enough to the shore (and to the east-coast rocks) to actually be seen.
 //
 // Written as three named components rather than a loop over constant arrays: dynamic indexing into a const array
 // is the one construct where the four backends' compilers disagree about what is legal, and three explicit terms
@@ -1409,6 +1415,21 @@ fn shade(input: ShadeInput) -> vec4f {
     if (u.flags.y == 0) {
         if (alpha < 0.001) { discard; }
         if (HDR_CHAIN) {
+            // S1: analytic in-scatter for unlit geometry in secondary views. uView.cameraPos.w is the view slot
+            // (0 = primary). The primary view still draws its brightness entirely from ApplySceneFog, so this
+            // branch is pixel-identical to the pre-change behavior on the primary view.
+            // On secondary views fogParams=(0,0,0,0) (no fog composited), so ApplySceneFog is a no-op
+            // and scattering-fed geometry such as the beacon beam would otherwise
+            // collapse to a bare 6% albedo film and decouple from the main render.
+            // Gate divergence note: DX/VK/Metal gate on emissiveFactor.w because those backends upload the full
+            // Vector4 emissiveFactor. WebGPU's Uniforms block packs emissive as vec4f(color, ao) to fit the
+            // 64-float budget, and WebGPUPrimitive.EmissiveFactor is Vector3, so there is no spare .w slot
+            // here. The unlit path never reads u.emissive, so a non-zero emissive color is used as the
+            // opt-in signal instead - Tower's beacon beam is the only consumer today (Sprite2D and glTF-unlit
+            // draws all upload emissive = Zero by default, which keeps them out of this branch unchanged).
+            if (uView.cameraPos.w > 0.5 && u.emissive.x > 0.0) {
+                albedo = albedo + u.emissive.xyz * alpha;
+            }
             // 1-4 Step A: output directly in pre-encoding space and move gamma into the FinalBlit tonemap variant.
             // This is a pure relocation of work and remains pixel-equivalent.
             return vec4f(albedo, alpha);
@@ -1472,9 +1493,8 @@ fn shade(input: ShadeInput) -> vec4f {
     }
 
     // A0.2: the final shading normal and the Toksvig-adjusted roughness, i.e. what SSR / decals must see.
-    if (NORMAL_OUTPUT) {
-        gSceneNormal = vec4f(OctEncodeNormal(N), roughness, metallic);
-    }
+    // P0 起第 4 通道不再是 metallic：它是 SSR 差分要用的**反射权重**，必须等 F0 与 ao 都算出来才能写，
+    // 所以写入点挪到下面的反射项之后（见 ambient += reflectionRadiance 那一行）。
 
     let V = normalize(uLights.cameraPos.xyz - input.worldPos);
     var F0 = vec3f(0.04);
@@ -1556,29 +1576,59 @@ fn shade(input: ShadeInput) -> vec4f {
     // 1-7 Contract Clause 6: use mirrored reflection from the radiance cube at LOD0 for the specular term.
     // There is no mip chain and no GGX prefiltering, so it is masked by (1-roughness)^2.
     // The ambient energy of rough surfaces is carried by the SH9 diffuse term above.
-    // 2-7 P0：程序化天空下 EnvironmentMap 停在 Diffuse 档（没有 radiance cube），环境镜面改由 Sky-View LUT 提供。
-    // 两者互斥，且 skyParams0.w 是 UBO 常量，所以这里是一个 uniform 分支，只采一次；
-    // 同时它也蕴含了 envParams.w，不必再查环境图是否就绪。
-    // LUT 是没有任何预滤波的全分辨率天空，只适合接近镜面的表面，因此再叠一次 (1-roughness)^2，
-    // 总权重退化为 (1-r)^4；粗糙面的环境能量仍由 SH9 漫反射承担。
+    // 2-8 的两处修正都只发生在程序化天空分支里，else 分支（envCube）保持 1-7 的原式不变，
+    // 这样只开贴图立方图的预设仍是零回归：
+    //   A. R.y < 0 时 Sky-View LUT 那一侧几乎是黑的（朝下的射线只穿过视点到地面那几百米空气，
+    //      而地面自身被照亮后的辐亮度根本没有被加进去），于是改用 CPU 预算好的地面辐亮度，
+    //      地平线两侧用 smoothstep 过渡。镜面球下半部分本来就该映出草地，而不是黑。
+    //   B. 粗糙端不再靠再叠一次 (1-roughness)^2 把镜面压成零：金属的漫反射项被 (1-metallic) 乘掉，
+    //      压成零就等于金属在粗糙之后完全失去环境能量。改为按 (1-roughness)^2 在镜面采样与
+    //      giDiffuse（半球平均，已是 E/pi 且含 DDGI 的地面反弹）之间插值。粗糙时 R 本来就贴近 N，
+    //      用 N 上的辐照度近似反射叶内的平均入射辐射，不必再采一次探针。
     let R = reflect(-V, N);
-    var specMask = (1.0 - roughness) * (1.0 - roughness);
+    let mirrorW = (1.0 - roughness) * (1.0 - roughness);
     var reflectionRadiance: vec3f;
     var specGate: f32;
     if (uLights.skyParams0.w > 0.0) {
-        reflectionRadiance = SampleSkyViewRadiance(R);
-        specMask *= specMask;
+        var skyRadiance = SampleSkyViewRadiance(R);
+        // 观察点必须在地面之上，地面项才有意义；否则（贴地或穿地的相机）一律退回天空。
+        let aboveGround = step(uLights.reflectionParams0.w, input.worldPos.y);
+        let horizonW = max(smoothstep(-0.09, 0.09, R.y), 1.0 - aboveGround);
+        skyRadiance = mix(uLights.reflectionParams0.xyz, skyRadiance, horizonW);
+        reflectionRadiance = mix(giDiffuse, skyRadiance * uLights.envParams.x, mirrorW);
         specGate = 1.0;
     } else {
-        reflectionRadiance = textureSampleLevel(uEnvCube, uSampler, R, 0.0).rgb;
+        // 1-7 原式：LOD0 镜面 × envParams.x × (1-r)^4。
+        reflectionRadiance = textureSampleLevel(uEnvCube, uSampler, R, 0.0).rgb * uLights.envParams.x * mirrorW * mirrorW;
         specGate = step(0.5, uLights.envParams.w);
     }
-    ambient += reflectionRadiance * uLights.envParams.x * F0 * specMask * ao * specGate;
+    ambient += reflectionRadiance * F0 * ao * specGate;
 
-    // 2-7：雷击对地面的均匀照亮。走环境项而不是瞬时点光：云底到地面的距离让 1/d² 退化成
-    // 一成不变的亮度，还会在 8 盏光的预算里挤掉场景灯。
+    if (NORMAL_OUTPUT) {
+        // P0 SSR 的 F0 通道。合成端要做的是「把天空那一项换成屏幕空间命中」，
+        // 恒等式是 Δ = conf·(1-r)²·(F0·ao)·(ssr − reflSky)：giDiffuse 在差里抵消，
+        // 所以这里只需要一个标量权重，用 Rec.709 亮度把 F0 压成一维。
+        // 丢掉的只是色偏（金球 vs 银球），因为 Δ 是替换量、不是颜色本身；换来的是不必为 SSR 再开一个 MRT 目标。
+        // envCube 分支写 0：那条路径的基项是贴图立方图，SSR 核拿不到它，替换只会算错。
+        gSceneNormal = vec4f(OctEncodeNormal(N), roughness,
+            select(0.0, dot(F0, vec3f(0.2126, 0.7152, 0.0722)) * ao, uLights.skyParams0.w > 0.0));
+    }
+
+    // 2-7：雷击的照明。v1 把它并进环境项，于是任何朝向都均匀变亮——山脊背面也亮，
+    // 与「闪电在那边」对不上。v2 给出方向，做法与 DX12 逐字一致：
+    //   光源取击穿点在地面投影处、高度夹进 [地面, 击穿点]；衰减用 1/(1+d²/R²)，R=400 m；
+    //   朗伯项保留 25% 的底，因为通道有多段分支，总有某一段能照到背光面；
+    //   系数 1.6 使 400 m 处恰好回到 v1 的 0.8，远景亮度不变。
     if (uLights.weatherFlash.w > 0.0) {
-        ambient += albedo * ao * (1.0 - metallic) * uLights.weatherFlash.w * vec3f(0.55, 0.62, 0.85) * 0.8;
+        let flashGround = min(uLights.reflectionParams0.w, uLights.weatherFlash.y);
+        let flashTo = vec3f(uLights.weatherFlash.x,
+            clamp(input.worldPos.y, flashGround, uLights.weatherFlash.y), uLights.weatherFlash.z) - input.worldPos;
+        let flashDist2 = dot(flashTo, flashTo);
+        let flashL = flashTo * inverseSqrt(max(flashDist2, 1e-4));
+        let flashFace = clamp(dot(N, flashL) * 0.75 + 0.25, 0.0, 1.0);
+        let flashFall = 1.0 / (1.0 + flashDist2 * (1.0 / 160000.0));
+        ambient += albedo * ao * (1.0 - metallic) * uLights.weatherFlash.w * flashFace * flashFall
+            * vec3f(0.55, 0.62, 0.85) * 1.6;
     }
 
     var color = ambient + Lo + emissive;

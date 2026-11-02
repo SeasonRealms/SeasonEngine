@@ -63,6 +63,19 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         }
     }
 
+    /// <summary>P0 SSR 加法合成：一条全屏绘制把反射增量叠进 SceneColor，没有独立目标。</summary>
+    public Season.Rendering.SsrCompositePipeline? CreateSsrCompositePipeline()
+    {
+        // 没有 compute 就没有增量纹理，合成无处可读。
+        if (!ComputeSupported) return null;
+        try { return new MTLSsrCompositePipeline(DictionaryMtlTexture); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[SsrComposite] 创建失败：{ex.Message}");
+            return null;
+        }
+    }
+
     /// <summary>D1 屏幕空间贴花：只依赖图形阶段的深度采样，不需要 compute，所以没有 ComputeSupported 门控。</summary>
     public Season.Rendering.DecalPipeline? CreateDecalPipeline()
     {
@@ -2960,6 +2973,10 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
 
     public bool IndirectDrawSupported => ComputeSupported;
 
+    /// <summary>A0.2：间接计算派发（dispatchThreadgroupsWithIndirectBuffer）。与间接绘制是两道独立能力位，
+    /// 但这里同源：两者都只需要 compute encoder 与一个已声明的参数缓冲。</summary>
+    public bool DispatchIndirectSupported => ComputeSupported;
+
     public bool TryPrepareIndirectArgs(Season.Rendering.StorageBuffer buffer)
         => Metal.Device.GraphicsEncoder == null
             && buffer is MTLStorageBuffer mtlBuffer && mtlBuffer.Buffer != null
@@ -3065,6 +3082,18 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
 
         var kernel = (MTLComputeKernel)args.Kernel;
         var bindings = kernel.Desc.Bindings;
+
+        // A0.2 的准入与另外三端一致：放在开编码器之前，失败时不留一个空 encoder 出去了。
+        MTLStorageBuffer indirect = null;
+        if (args.IsIndirect)
+        {
+            indirect = args.Arguments as MTLStorageBuffer;
+            if (indirect == null || indirect.Buffer == null
+                || indirect.Usage != Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs
+                || (args.ArgumentsOffset & 3u) != 0
+                || indirect.SizeInBytes < args.ArgumentsOffset + Season.Rendering.IndirectDispatchArgs.SizeInBytes)
+                return false;
+        }
 
         var enc = cmd.ComputeCommandEncoder;
         if (enc == null)
@@ -3194,9 +3223,19 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         // The existing seven effects keep the default unchanged,
         // so behavior stays literally equivalent to the previous line with zero regression.
         // This backend is the only one among the four that consumes this field at runtime.
-        enc.DispatchThreadgroups(
-            new MTLSize((nint)args.GroupsX, (nint)args.GroupsY, (nint)args.GroupsZ),
-            kernel.ThreadsPerGroup);
+        if (indirect != null)
+        {
+            // Metal 是四端里唯一连 barrier 都不需要的一端：同一 command buffer 内的编码顺序
+            // 加上驱动的自动 hazard tracking 就是全部同步，所以这里只是换一个重载。
+            // 工作组长仍然是 kernel.ThreadsPerGroup —— 间接块只给组数，不给组长。
+            enc.DispatchThreadgroups(indirect.Buffer, (nuint)args.ArgumentsOffset, kernel.ThreadsPerGroup);
+        }
+        else
+        {
+            enc.DispatchThreadgroups(
+                new MTLSize((nint)args.GroupsX, (nint)args.GroupsY, (nint)args.GroupsZ),
+                kernel.ThreadsPerGroup);
+        }
         enc.EndEncoding();
 
         // No post synchronization is needed under rule 2.

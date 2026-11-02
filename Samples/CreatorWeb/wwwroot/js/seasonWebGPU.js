@@ -746,10 +746,10 @@ window.seasonWebGPU = (() => {
 
     // Sprite2D scratch:
     // vertices + uniform are rewritten every frame
-    // (60 floats aligned to WGSL Uniforms; view/projection now come from the per-view UBO, so only the identity
+    // (64 floats = the full WGSL Uniforms struct; view/projection now come from the per-view UBO, so only the identity
     // world matrix has to be pre-seeded here)
     const _SPRITE2D_VERTEX_SCRATCH = new Float32Array(120);
-    const _SPRITE2D_UNIFORM_SCRATCH = new Float32Array(60);
+    const _SPRITE2D_UNIFORM_SCRATCH = new Float32Array(64);
     const _SPRITE2D_UNIFORM_I32 = new Int32Array(_SPRITE2D_UNIFORM_SCRATCH.buffer, 48 * 4, 4);
     _SPRITE2D_UNIFORM_SCRATCH[0]=1; _SPRITE2D_UNIFORM_SCRATCH[5]=1; _SPRITE2D_UNIFORM_SCRATCH[10]=1; _SPRITE2D_UNIFORM_SCRATCH[15]=1;
     _SPRITE2D_UNIFORM_SCRATCH[43]=1; _SPRITE2D_UNIFORM_SCRATCH[45]=1; _SPRITE2D_UNIFORM_SCRATCH[47]=0.5;
@@ -758,8 +758,10 @@ window.seasonWebGPU = (() => {
     // Dedicated scratch for text GPU instancing:
     // separate from Sprite2D scratch so the instancing bit in flags.w
     // cannot leak into later sprite draws.
-    // 60 floats aligned to WGSL Uniforms (identity world only; view state comes from the screen-space slot).
-    const _TEXT_UNIFORM_SCRATCH = new Float32Array(60);
+    // 64 floats = the full WGSL Uniforms struct (identity world only; view state comes from the screen-space slot).
+    // The tail floats past 60 must be uploaded, not left out: the uniform buffers are pooled, so a short write would
+    // let a sea pass's vertexWave sit in the untouched bytes and displace a glyph.
+    const _TEXT_UNIFORM_SCRATCH = new Float32Array(64);
     const _TEXT_UNIFORM_I32 = new Int32Array(_TEXT_UNIFORM_SCRATCH.buffer, 48 * 4, 4);
     _TEXT_UNIFORM_SCRATCH[0]=1; _TEXT_UNIFORM_SCRATCH[5]=1; _TEXT_UNIFORM_SCRATCH[10]=1; _TEXT_UNIFORM_SCRATCH[15]=1;
     _TEXT_UNIFORM_SCRATCH[43]=1; _TEXT_UNIFORM_SCRATCH[45]=1; _TEXT_UNIFORM_SCRATCH[47]=0.5;
@@ -1640,7 +1642,7 @@ window.seasonWebGPU = (() => {
                 // P2: per-view uniform (View / Projection / PrevViewProjection), one 256B slot per view.
                 // Referenced statically by vs_main, so _shadowBindGroupLayout must declare it as well
                 // (same reason as bindings 13/14).
-                { binding: 22, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 192 } },
+                { binding: 22, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 256 } },
                 // 2-7 P0: Sky-View LUT, the PBR ambient specular source.
                 // 2D float, referenced statically only by fs_main. Reuses the sampler at binding 1.
                 // Parallel to, not a replacement for, uEnvCube at binding 15: the two are mutually exclusive,
@@ -1776,7 +1778,7 @@ window.seasonWebGPU = (() => {
                 { binding: 14, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
                 // P2: same reason as 13/14 - vs_main references the per-view UBO through a global const path, so
                 // the vertex-only shadow layout has to declare it too.
-                { binding: 22, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 192 } },
+                { binding: 22, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 256 } },
             ]
         });
         _shadowPipeline = _device.createRenderPipeline({
@@ -2632,7 +2634,7 @@ window.seasonWebGPU = (() => {
     // Offscreen targets are introduced in Step 2.
     // passId order matches the C# RenderPassId enum,
     // and the debug group is attached at the encoder level to wrap the whole pass (Step 0).
-    const _passLabels = ['Shadow', 'Scene', 'Post', 'OutlineMask', 'FinalBlit', 'Overlay', 'SceneOpaque', 'FogComposite', 'SceneTransparent', 'WeatherComposite', 'SceneDecal', 'SceneWater'];
+    const _passLabels = ['Shadow', 'Scene', 'Post', 'OutlineMask', 'FinalBlit', 'Overlay', 'SceneOpaque', 'FogComposite', 'SceneTransparent', 'WeatherComposite', 'SceneDecal', 'SceneWater', 'SsrComposite'];
 
     function beginPass(passId, targetName, clearColorEnable, clearR, clearG, clearB, clearA, clearDepthEnable, storeDepth, depthTargetName, velocityTargetName, normalTargetName) {
         if (!_frameStarted || !_commandEncoder) return;
@@ -2651,10 +2653,16 @@ window.seasonWebGPU = (() => {
         // P2 水面（RenderPassId.SceneWater=11）与贴花同形：只叠加、不清屏，深度与法线都不挂
         // （本帧的深度是采样源，同一资源不能既采样又当附件）。
         const waterPass = passId === 11;
-        const blendPass = decalPass || waterPass;
+        // P0 SSR 合成（RenderPassId.SsrComposite=12）与水面同形：颜色附件就是 SceneColor，
+        // 反射增量按加法叠上去，所以既不能清屏也不能挂深度（深度此刻仍是透明阶段的附件）。
+        const ssrPass = passId === 12;
+        const blendPass = decalPass || waterPass || ssrPass;
         if (waterPass && (!fogTarget || fogTarget.depthOnly || fogTarget.colorFormat !== 'rgba16float'
             || depthTargetName || velocityTargetName || normalTargetName))
             throw new Error('水面必须使用 HDR 颜色目标，且不能挂载深度、速度或法线');
+        if (ssrPass && (!fogTarget || fogTarget.depthOnly || fogTarget.colorFormat !== 'rgba16float'
+            || depthTargetName || velocityTargetName || normalTargetName))
+            throw new Error('SSR 合成必须使用 HDR 颜色目标，且不能挂载深度、速度或法线');
         _clearActivePass();
 
         _commandEncoder.pushDebugGroup(_passLabels[passId] || `Pass${passId}`);
@@ -3006,7 +3014,7 @@ window.seasonWebGPU = (() => {
     // semantically identical to SetLighting on the other three backends.
     // Length must exactly match C# SceneLightParams.Bytes,
     // or updateSceneLights silently drops the upload.
-    const SCENE_LIGHT_BYTES = 2448;
+    const SCENE_LIGHT_BYTES = 2464;
     let _sceneLightBuffer = null;
 
     function _ensureSceneLightBuffer() {
@@ -3596,7 +3604,7 @@ window.seasonWebGPU = (() => {
         // because identity matrices would snap vertices back to rest pose.
         const prevBoneBuffer = skinKey ? (_prevSkinnedBoneBuffers[skinKey] || boneBuffer) : _defaultBoneBuffer;
 
-        const STRIDE = 60;  // Aligned with C# WebGPUUniformLayout.TotalFloats (per-object state only;
+        const STRIDE = 64;  // Aligned with C# WebGPUUniformLayout.TotalFloats (per-object state only;
                             // the view matrices live in the per-view UBO at binding 22)
         const BYTES_PER_UNIFORM = STRIDE * 4;
 
@@ -4001,10 +4009,10 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
     // 独立雾合成：生产 WGSL 由 C# 提供；异步编译完成前 Prepare 明确回退。
     const _fogComposites = Object.create(null);
     const _fogFrameBytes = 448 * 16;
-    // 前导 8 行（逆抖动 VP + 相机位置）+ SceneLightParams 全部 153 行（2448B）。
+    // 前导 8 行（逆抖动 VP + 相机位置）+ SceneLightParams 全部 154 行（2464B）。
     // 与 C# WeatherCurtainEffect.FrameVectorCount 和 SceneLightParams 大小严格同步；
     // 小于它时 Prepare 会直接回退，天气合成静默失效。
-    const _weatherFrameBytes = 161 * 16;
+    const _weatherFrameBytes = 162 * 16;
     const _fogAoFormats = new Set(['r8unorm', 'r16float', 'rg16float', 'rgba16float',
         'rgba8unorm', 'bgra8unorm']);
 
@@ -4191,12 +4199,117 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         state.slots.length = 0;
     }
 
+    // P0 SSR 加法合成：WGSL 由 C# 下发，JS 只烘一条 PSO 与逐帧绑定组。
+    // 增量在核里已经是最终值（含 (1-r)²、反射权重与置信度），这里只做 One/One 叠加，
+    // 不重算任何权重 —— 两处各算一遍 Fresnel 与粗糙度，口径迟早会分叉。
+    const _ssrComposites = Object.create(null);
+
+    function createSsrCompositePipeline(name, vertex, fragment) {
+        if (!_device || _instancedDiag.deviceLost || !name) return false;
+        if (_ssrComposites[name]) return !_ssrComposites[name].failed;
+        const device = _device;
+        const state = { device, pipeline: null, prepared: null, group: null, deltaView: null, failed: false };
+        let scopeOpen = false;
+        try {
+            device.pushErrorScope('validation'); scopeOpen = true;
+            // 只有一张被读的增量纹理：片元用 textureLoad 按整数像素取值，不需要采样器。
+            state.layout = device.createBindGroupLayout({ label: `${name}_layout`, entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+            ] });
+            const pending = device.createRenderPipelineAsync({ label: name,
+                layout: device.createPipelineLayout({ bindGroupLayouts: [state.layout] }),
+                vertex: { module: device.createShaderModule({ label: `${name}_vs`, code: vertex }), entryPoint: 'VSMain' },
+                fragment: { module: device.createShaderModule({ label: `${name}_ps`, code: fragment }),
+                    entryPoint: 'PSMain', targets: [{ format: 'rgba16float', blend: {
+                        color: { operation: 'add', srcFactor: 'one', dstFactor: 'one' },
+                        alpha: { operation: 'add', srcFactor: 'one', dstFactor: 'one' } } }] },
+                primitive: { topology: 'triangle-list', cullMode: 'none' }, multisample: { count: 1 },
+            });
+            const validation = device.popErrorScope(); scopeOpen = false;
+            _ssrComposites[name] = state;
+            Promise.all([pending, validation]).then(([pipeline, error]) => {
+                if (error) throw new Error(error.message);
+                if (_ssrComposites[name] === state && _device === device && !_instancedDiag.deviceLost)
+                    state.pipeline = pipeline;
+            }).catch(error => {
+                state.failed = true; state.prepared = null;
+                console.error(`SSR 合成 '${name}' 编译失败：${error}`);
+            });
+            return true;
+        } catch (error) {
+            if (scopeOpen) device.popErrorScope().catch(() => {});
+            console.error(`SSR 合成 '${name}' 创建失败：${error}`);
+            return false;
+        }
+    }
+
+    function _resolveSsrComposite(input) {
+        const target = _renderTargets[input.color];
+        const delta = _textures[input.reflection], deltaView = _textureViews[input.reflection];
+        if (!target || target.depthOnly || target.colorFormat !== 'rgba16float' || !target.colorView) return null;
+        if (target.matchBackbuffer && (!_canvas || target.width !== _canvas.width || target.height !== _canvas.height)) return null;
+        if (!delta || !deltaView || delta.dimension !== '2d' || delta.sampleCount !== 1
+            || delta.format !== 'rgba16float'
+            || (delta.usage & GPUTextureUsage.TEXTURE_BINDING) !== GPUTextureUsage.TEXTURE_BINDING) return null;
+        // 增量按像素写，尺寸必须与场景色一致；不符只能说明本帧的核没按当前分辨率跑。
+        if (delta.width !== target.width || delta.height !== target.height) return null;
+        return [target, delta, deltaView, target.colorView];
+    }
+
+    function prepareSsrComposite(name, color, reflection) {
+        const state = _ssrComposites[name];
+        if (!state) return false;
+        state.prepared = null;
+        if (!_frameStarted || !_commandEncoder || _passEncoder || _instancedDiag.deviceLost
+            || state.device !== _device || !state.pipeline || state.failed) return false;
+        try {
+            const input = { color, reflection };
+            const refs = _resolveSsrComposite(input);
+            if (!refs) return false;
+            // 绑定组只在增量视图身份变化时重建（compute 纹理 Resize 会换一张 GPUTexture）。
+            if (state.deltaView !== refs[2]) {
+                state.deltaView = refs[2];
+                state.group = _device.createBindGroup({ layout: state.layout,
+                    entries: [{ binding: 0, resource: refs[2] }] });
+            }
+            state.prepared = { input, refs, group: state.group, owner: state,
+                command: _commandEncoder, frameId: _computeFrameId };
+            return true;
+        } catch (error) {
+            console.error(`SSR 合成 '${name}' 准备失败：${error}`);
+            return false;
+        }
+    }
+
+    function drawSsrComposite(name) {
+        const state = _ssrComposites[name], prepared = state?.prepared;
+        if (!prepared) return false;
+        state.prepared = null;
+        if (!_frameStarted || !_passEncoder || _instancedDiag.deviceLost || state.device !== _device
+            || prepared.command !== _commandEncoder || prepared.frameId !== _computeFrameId
+            || _activePassId !== 12 || _passDepthOnly || _passVelocity || _passNormal
+            || _activeColorTarget !== prepared.refs[0] || _activeColorView !== prepared.refs[3]
+            || !_sameFogResources(prepared.refs, _resolveSsrComposite(prepared.input))) return false;
+        _passEncoder.setPipeline(state.pipeline);
+        _passEncoder.setBindGroup(0, prepared.group);
+        _passEncoder.draw(3);
+        return true;
+    }
+
+    function disposeSsrCompositePipeline(name) {
+        const state = _ssrComposites[name];
+        if (!state) return;
+        delete _ssrComposites[name];
+        state.prepared = null; state.group = null; state.deltaView = null;
+    }
+
     // A0.1 粒子间接绘制：WGSL 全部由 C# 下发，JS 只负责 PSO、绑定与那一条 drawIndexedIndirect。
     // PSO 按本帧真实附件形状异步烘焙；未就绪时 Prepare 明确回退，和雾合成同一回退语义。
     const _particleDraws = Object.create(null);
     // 必须与 ParticleDraw.FrameBytes 一致：绑定组声明的 size 若小于着色器读到的下标，
     // WebGPU 校验器会直接判非法，而报错点只出现在首次 draw 那一帧。
-    const _particleFrameBytes = 192;
+    // 16 行 = 256B：第 12、13 行是 ribbon 带（闪电通道）的视口/最小屏宽/雾参数。
+    const _particleFrameBytes = 256;
     const _particleInstanceStride = 32;
     const _particleArgsBytes = 20;
     let _particleQuadIndex = null;
@@ -4446,7 +4559,7 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
                 for (let roughness = 0; roughness < 2; roughness++) {
                     const targets = [{ format: 'rgba16float', blend: colorBlend(mode === 1) }];
                     if (roughness) targets.push({ format: 'rgba16float',
-                        // 用 coverage 在原值上 lerp；只写 .z，八面体法线在 .xy、金属度在 .w 必须保留。
+                        // 用 coverage 在原值上 lerp；只写 .z，八面体法线在 .xy、反射权重在 .w 必须保留。
                         blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
                             alpha: { srcFactor: 'one', dstFactor: 'zero', operation: 'add' } },
                         writeMask: GPUColorWrite.BLUE });
@@ -5547,6 +5660,8 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         createDecalPipeline, prepareDecal, drawDecal, disposeDecalPipeline,
         // P2 池塘水
         createWaterPipeline, prepareWater, drawWater, disposeWaterPipeline, copyRenderTarget,
+        // P0 SSR 加法合成
+        createSsrCompositePipeline, prepareSsrComposite, drawSsrComposite, disposeSsrCompositePipeline,
         createComputeTexture,
         createStorageBuffer,
         disposeStorageBuffer,

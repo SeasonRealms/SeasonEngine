@@ -23,6 +23,56 @@ internal unsafe static class Device
 
     internal static DescriptorAllocator DescriptorAllocator { get; } = new(2048);
 
+    /// <summary>
+    /// A0.2：间接计算派发的命令签名。设备级单例 —— 签名只描述"一条 12 字节的 Dispatch 记录"，
+    /// 与调用方、与缓冲都无关，每帧新建它只会在驱动里多分配一次对象。
+    ///
+    /// 记住创建它的设备指针而不是一个 bool：D3D12 设备一旦重建，旧签名就属于已销毁的设备，
+    /// 必须重新创建。Device 是静态类、没有"设备销毁"的钩子可挂，指针比较是唯一不依赖调用顺序的判据。
+    /// </summary>
+    static ID3D12CommandSignature* _dispatchCommandSignature;
+
+    static nint _dispatchCommandSignatureOwner;
+
+    internal static ID3D12CommandSignature* EnsureDispatchCommandSignature()
+    {
+        nint device = (nint)D3dDevice;
+        if (_dispatchCommandSignature != null && _dispatchCommandSignatureOwner == device)
+            return _dispatchCommandSignature;
+        if (device == 0)
+            return null;
+
+        ReleaseDispatchCommandSignature();
+
+        // 命令签名只描述记录格式，不改任何根参数，所以 root signature 必须传 null。
+        // ByteStride 取自共享层的 IndirectDispatchArgs：布局若漂移，会在这里而不是在画面里暴露。
+        var argument = new IndirectArgumentDesc { Type = IndirectArgumentType.Dispatch };
+        var desc = new CommandSignatureDesc
+        {
+            ByteStride = Season.Rendering.IndirectDispatchArgs.SizeInBytes,
+            NumArgumentDescs = 1,
+            PArgumentDescs = &argument,
+            NodeMask = 0,
+        };
+        ID3D12CommandSignature* signature = null;
+        var iid = ID3D12CommandSignature.Guid;
+        CheckResult(D3dDevice->CreateCommandSignature(&desc, null, &iid, (void**)&signature));
+        _dispatchCommandSignature = signature;
+        _dispatchCommandSignatureOwner = device;
+        return signature;
+    }
+
+    static void ReleaseDispatchCommandSignature()
+    {
+        if (_dispatchCommandSignature == null)
+            return;
+        // 签名在本次调用之前已经录制过的命令里不再被引用：ExecuteIndirect 在录制时就把签名内容解引用进
+        // 命令列表，之后 GPU 只读参数缓冲本身。所以这里可以直接释放，不必走延迟队列。
+        _dispatchCommandSignature->Release();
+        _dispatchCommandSignature = null;
+        _dispatchCommandSignatureOwner = 0;
+    }
+
     internal static Vector4 BackgroundColor;
 
     internal static Format DepthBufferFormat;
@@ -1966,6 +2016,7 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         "WeatherComposite\0"u8.ToArray(),
         "SceneDecal\0"u8.ToArray(),
         "SceneWater\0"u8.ToArray(),
+        "SsrComposite\0"u8.ToArray(),
     ];
 
     internal static void PushDebugGroup(byte[] asciiLabelZ)

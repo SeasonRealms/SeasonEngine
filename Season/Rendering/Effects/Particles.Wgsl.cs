@@ -33,7 +33,7 @@ namespace Season.Rendering.Effects;
 /// </summary>
 public sealed partial class ParticleSystemEffect
 {
-    /// <summary>WebGPU compute: rewrites the five indirect arguments every frame, zeroing the count the compaction pass will raise.</summary>
+    /// <summary>WebGPU compute: rewrites the five indirect arguments every frame. indexCount / instanceCount / startIndex / baseVertex come from Params; startInstance stays 0.</summary>
     const string ResetWgsl = """
 struct Params { resetParams: vec4f }
 struct Args { values: array<u32,5> }
@@ -45,10 +45,11 @@ struct Args { values: array<u32,5> }
         // u32 indices 0..4 are the HLSL byte offsets 0/4/8/12/16 divided by the 4-byte stride.
         // startInstance stays 0 by contract -- WebGPU rejects a non-zero firstInstance without the
         // optional indirect-first-instance feature -- so instance_index equals the compacted slot.
+        // 粒子把后三项传 0，于是输出与参数化之前逐位相同；闪电通道传固定的段数。
         args.values[0]=u32(params.resetParams.x);
-        args.values[1]=0u;
-        args.values[2]=0u;
-        args.values[3]=0u;
+        args.values[1]=u32(params.resetParams.y);
+        args.values[2]=u32(params.resetParams.z);
+        args.values[3]=u32(params.resetParams.w);
         args.values[4]=0u;
     }
 }
@@ -77,12 +78,17 @@ fn ParticleHash(seed: u32) -> f32 {
     let p0=params.p[0]; let p1=params.p[1]; let p2=params.p[2]; let p3=params.p[3]; let p4=params.p[4];
     let p5=params.p[5];
     if(id.x<u32(p0.w)) {
+        // 密度门控按下标有序，不按哈希：放行的是 [0, 密度×预算) 这一段前缀，
+        // 于是 CPU 只派发这一段的下标数即可，晴天与小雪不必按满预算空跑。
+        // 哈希仍然要算，因为下标会被种子平移——平移决定了这一批下标的空间分布。
+        let ordinal=f32(id.x);
+        let cutoff=p3.x*p0.w;
         let index=id.x+u32(p3.w);
         let h0=ParticleHash(index*3u+1u);
         let h1=ParticleHash(index*5u+7u);
         let h2=ParticleHash(index*11u+23u);
         let h3=ParticleHash(index*17u+41u);
-        if(h3<p3.x) {
+        if(ordinal<cutoff) {
             // 相位以寿命为时标，所以原来的 fall 同时就是 [0,1) 的归一化年龄；换算回秒即可闭式积分。
             // 寿命为 0 时 t 与 invLife 一并取零，位置和速度都精确退回未扩展前的结果。
             // WGSL 没有三元运算符，而 select() 会把两个分支都算出来，所以这里用语句形式写，
@@ -161,7 +167,9 @@ fn ParticleHash(seed: u32) -> f32 {
                 let f=clamp((1.0-length(center-frameData.values[6].xyz)/viewDistance)*4.0,0.0,1.0);
                 weight*=f*f*(3.0-2.0*f);
             }
-            if((u32(p5.w)&8u)!=0u) { weight*=clamp((p3.x-h3)*50.0,0.0,1.0); }
+            // 软边的宽度按放行前缀的 2% 算（至少一个下标）：密度渐变时新放行的粒子
+            // 从零覆盖度开始，不会整批突然出现。旧版按 h3 的 0.02 取边，宽度同阶。
+            if((u32(p5.w)&8u)!=0u) { weight*=clamp((cutoff-ordinal)/max(cutoff*0.02,1.0),0.0,1.0); }
 
             // frameData[0..3] are the HLSL Load4(0/16/32/48): the four rows of the view-projection.
             let viewProjection=mat4x4f(frameData.values[0],frameData.values[1],frameData.values[2],frameData.values[3]);
@@ -230,6 +238,7 @@ struct Frame { values: array<vec4f> }
     // frameData[4] and [5] are the HLSL Load4(64) and Load4(80): camera right and up.
     let right=frameData.values[4].xyz;
     let up=frameData.values[5].xyz;
+    let eye=frameData.values[6].xyz;
     // frameData[7] is the HLSL Load4(112): fadeIn / fadeOut (fractions of the lifetime) / stretch in seconds.
     let drawParams=frameData.values[7].xyz;
     // frameData[8..11] 是外观曲线与出生形状：曲线模式关闭时标志位为 0，下面这个分支不成立，
@@ -238,6 +247,7 @@ struct Frame { values: array<vec4f> }
     let tintMid=frameData.values[9];
     let tintEnd=frameData.values[10];
     let curve=frameData.values[11];
+    let viewProjection=mat4x4f(frameData.values[0],frameData.values[1],frameData.values[2],frameData.values[3]);
     var seed=0.0;
     var shape=corner;
     if(curve.w>0.5) {
@@ -265,14 +275,50 @@ struct Frame { values: array<vec4f> }
     color.a*=fadeIn*fadeOut;
     // 沿速度方向把四边形切变成平行四边形，总长度为 |velocity| * stretch；
     // 上下两角各偏移半个长度，所以 stretch 为 0 时精确退化回原来的正方形公告板。
-    let world=center+(right*shape.x+up*shape.y)*size+velocity*(drawParams.z*shape.y*0.5);
-    let viewProjection=mat4x4f(frameData.values[0],frameData.values[1],frameData.values[2],frameData.values[3]);
+    var world=center+(right*shape.x+up*shape.y)*size+velocity*(drawParams.z*shape.y*0.5);
+    var uv=corner;
+
+    // ── ribbon 带：闪电通道这类"分段折线"不走公告板 ──
+    // frameData[12] = (视口宽, 视口高, 最小半宽像素, ribbon 标志)，
+    // frameData[13] = (强度, 雾消光系数, 保留, 保留)。标志为 0 时整段不执行。
+    let ribbon=frameData.values[12];
+    if(ribbon.w>0.5) {
+        // 这一档的实例记录换了语义：Position 是段中点，Velocity 是半段向量，
+        // 于是"中点 ± 半段"就是两个端点，不需要为每段多存一个实例。
+        let segLen=length(velocity);
+        var tangent=vec3f(0.0,1.0,0.0);
+        if(segLen>1e-5) { tangent=velocity/segLen; }
+        // 面向相机的带：横向取切线与视线的叉积。正对镜头时叉积退化（带子本来就只是一个点），
+        // 退回相机右轴即可，方向此时无关紧要。
+        let lateral=cross(tangent,eye-center);
+        let sideLen=length(lateral);
+        var side=right;
+        if(sideLen>1e-5) { side=lateral/sideLen; }
+
+        // 最小屏宽：把世界单位的 side 投影到像素空间，得到「一米横向等于几个像素」，
+        // 再反算保底像素宽所需的世界半宽。折线细到亚像素时光栅化会时有时无——那是片元
+        // 根本没产生的丢失，任何时间域补偿都救不回来。TAA 的反应矩形
+        //（ViewTargets.ReactiveRect）只保证已经画出来的像素不被历史拖住，补不上一个不存在的片元。
+        let clipSide=viewProjection*vec4f(side,0.0);
+        let clipW=max(abs(clipSide.w),1e-3);
+        let pxPerWorld=max(length(abs(clipSide.xy)/clipW*ribbon.xy*0.5),1e-4);
+        let halfWidth=max(size,ribbon.z/pxPerWorld);
+
+        // 沿切线各多伸半个带宽：相邻段在折点处因此重叠，而不是留下一道缝。
+        world=center+tangent*(corner.y*(segLen+halfWidth))+side*(corner.x*halfWidth);
+        // 横向衰减复用片元里那条 1-dot(uv,uv)：纵向不参与，带子才是一条亮度均匀的线。
+        uv=vec2f(corner.x,0.0);
+
+        // 强度与雾衰减都只压覆盖度：片元把 rgb 乘进 alpha，压在 rgb 上会变成平方。
+        let trim=frameData.values[13];
+        color.a*=trim.x*exp(-trim.y*length(center-eye));
+    }
 
     // No Y flip: WebGPU clip space matches D3D, so this is the HLSL line verbatim.
     var result: ParticleVertex;
     result.position=viewProjection*vec4f(world,1.0);
     // offset 保持未旋转的角点：衰减只取它的平方和，旋转不改变结果，默认路径因此一字未改。
-    result.offset=corner;
+    result.offset=uv;
     result.color=color;
     // (稳定随机数, 归一化年龄, 噪声强度, 加法混合标志)
     result.misc=vec4f(seed,age,select(0.0,tintMid.w,curve.w>0.5),tintStart.w);

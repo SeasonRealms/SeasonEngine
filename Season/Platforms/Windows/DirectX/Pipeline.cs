@@ -1001,7 +1001,7 @@ internal static unsafe class Pipeline
         var velocityOutput = !overlay && RenderQuality.Current.MotionVectors && !shadowPass;
 
         // A0.2 contract clause 3: NORMAL_OUTPUT only ever rides on top of VELOCITY_OUTPUT (SV_Target2 = octahedral normal,
-        // roughness, metallic), so the shapes stay at three per process. OutlineMask binds a single RTV and is excluded.
+        // roughness, P0 reflection weight), so the shapes stay at three per process. OutlineMask binds a single RTV and is excluded.
         var normalOutput = velocityOutput && !outlineMask && RenderQuality.Current.EffectiveSceneNormals;
 
         // HDR chain switch (1-4 Step A): injected at compile time, with zero runtime branch cost.
@@ -1150,6 +1150,9 @@ cbuffer SceneLights : register(b1)
     // 2-7 雷电 (offset 2432): xyz = 当前主导雷击在云内的世界坐标 / w = 回击包络亮度 0~1。
     // w 是唯一总开关；非雷暴天气、区域质量 Off、Showcase 模式下整个字段为零。
     float4 weatherFlash;
+    // 2-8 环境镜面的虚拟地面 (offset 2448)：xyz = 地面辐亮度（线性 HDR，含 albedo/直射/天空 SH9/1π），
+    // w = 地面所在的世界 Y。只由 SkyLighting.Apply 注入，只在程序化天空分支里被读取。
+    float4 reflectionParams0;
 };
 
 #if SHADOW_PASS
@@ -1259,9 +1262,10 @@ StructuredBuffer<float4> g_PrevMorphWeights : register(t10);
 // at 2*PI seamless: sin(k*r + n*PHI) is exactly periodic in PHI with period 2*PI/n, so a wrap is invisible. They
 // also put the shorter components slightly faster, which is where deep-water dispersion goes anyway (c = sqrt(g/k)).
 //
-// The shore mask is read from TEXCOORD0.x. Sea.BuildSurfaces bakes the same smoothstep distance to the island
-// square that damps the mesh's own relief, so the swell flattens over the beach exactly where the baked relief
-// does and the waterline stays put.
+// The mask is read from TEXCOORD0.x. Sea.BuildSurfaces bakes a smoothstep distance to the island square into it -
+// the swell's own band, 6m to 24m offshore, deliberately narrower than the 60m band that damps the baked relief.
+// It reaches zero before the waterline, so a crest can never climb the beach, while the first visible crest sits
+// close enough to the shore (and to the east-coast rocks) to actually be seen.
 // Returns the height and writes the horizontal gradient (dh/dx, dh/dz), which is what the normal needs.
 // Both are in world XZ, the same space as the height the caller adds to world Y.
 //
@@ -1273,7 +1277,7 @@ float SwellEvaluate(float2 p, float phase, float amp, out float2 grad)
     float2 d0 = p;                            // 90m component, weight 0.55
     float2 d1 = p - float2(37.0, -24.0);      // 55m component, weight 0.30
     float2 d2 = p - float2(-61.0, 43.0);      // 34m component, weight 0.15
-    // The island center is a singular point for a radial wave. The swell is already zero there because the shore mask
+    // The island center is a singular point for a radial wave. The swell is already zero there because the swell mask
     // covers the whole land square, but the divide still has to be guarded.
     float r0 = max(length(d0), 1.0);
     float r1 = max(length(d1), 1.0);
@@ -2653,6 +2657,14 @@ float4 PSMain(PSInput input) : SV_TARGET
     [branch] if (renderMode == 0)
     {
 #if HDR_CHAIN
+        // S1: unlit 几何在二级视图的解析式自散射。viewCameraPos.w 是视图槽位（0 = 主视图），
+        // 主视图仍然完全交给 ApplySceneFog 里的体积雾 in-scatter 供光，观感与改动前逐像素一致。
+        // 二级视图的 BindSceneFog 走「雾透明旁路」（S5 门控 = ViewHasFog = false），fogParams 全零，
+        // 光束这类「靠散射活着」的几何会只剩 6% 裸 albedo 薄膜，与主画面完全脱节。
+        // emissiveFactor 是这条支路的 HDR 增益（.rgb = 增益色，.w = 门控），unlit 路径原先不读它，
+        // 所以只有真正需要该通道的图元（灯塔光束）会显式设置；其余图元保持零，不会有任何变化。
+        [branch] if (viewCameraPos.w > 0.5 && emissiveFactor.w > 0.0)
+            albedo = albedo + emissiveFactor.rgb * alpha;
         // Sprite2D: unlit, output linear color directly and let the FinalBlit exposure + ACES + gamma chain close it out
         return ApplySceneFog(float4(albedo, alpha), input.worldPos);
 #else
@@ -2770,7 +2782,8 @@ float4 PSMain(PSInput input) : SV_TARGET
 #if NORMAL_OUTPUT
     // A0.2 contract clause 2: world-space shading normal (after the normal map) and the roughness the lobe is actually
     // evaluated with (after Toksvig), so SSR and decals see the same surface the lighting below does.
-    outNormal = float4(OctEncodeNormal(N), roughness, metallic);
+    // P0 起第 4 通道不再是 metallic：它是 SSR 差分要用的**反射权重**，必须等 F0 与 ao 都算出来才能写，
+    // 所以写入点挪到下面的反射项之后（见 ambient += reflectionRadiance 那一行）。
 #endif
 
     // Compute the view direction
@@ -2874,32 +2887,68 @@ float4 PSMain(PSInput input) : SV_TARGET
     // 1-7 contract clause 6: the specular term uses the mirror-reflection sample from radiance cube LOD0.
     // There is no mip chain and no GGX prefiltering, so it is masked by (1-roughness)^2; the environment
     // energy for rough surfaces is carried by the SH9 diffuse term above.
+    // 2-8 的两处修正都只发生在程序化天空分支里，else 分支（envCube）保持 1-7 的原式不变，
+    // 这样只开贴图立方图的预设仍是零回归：
+    //   A. R.y < 0 时 Sky-View LUT 那一侧几乎是黑的（朝下的射线只穿过视点到地面那几百米空气，
+    //      而地面自身被照亮后的辐亮度根本没有被加进去），于是改用 CPU 预算好的地面辐亮度，
+    //      地平线两侧用 smoothstep 过渡。镜面球下半部分本来就该映出草地，而不是黑。
+    //   B. 粗糙端不再靠再叠一次 (1-roughness)^2 把镜面压成零：金属的漫反射项被 (1-metallic) 乘掉，
+    //      压成零就等于金属在粗糙之后完全失去环境能量。改为按 (1-roughness)^2 在镜面采样与
+    //      giDiffuse（半球平均，已是 E/pi 且含 DDGI 的地面反弹）之间插值。粗糙时 R 本来就贴近 N，
+    //      用 N 上的辐照度近似反射叶内的平均入射辐射，不必再采一次探针。
     float3 R = reflect(-V, N);
-    float specMask = (1.0 - roughness) * (1.0 - roughness);
-    // 2-7 P0: 程序化天空下 EnvironmentMap 停在 Diffuse 档（没有 radiance cube），环境镜面改由 Sky-View LUT 提供。
-    // 两者互斥，且 skyParams0.w 是 cbuffer 常量，所以这里是一个 uniform 分支，只采一次；
-    // 同时它也蕴含了 envParams.w，不必再查环境图是否就绪。
-    // LUT 是没有任何预滤波的全分辨率天空，只适合接近镜面的表面，因此再叠一次 (1-roughness)^2，
-    // 总权重退化为 (1-r)^4；粗糙面的环境能量仍由 SH9 漫反射承担。
+    float mirrorW = (1.0 - roughness) * (1.0 - roughness);
     float3 reflectionRadiance;
     float specGate;
     [branch] if (skyParams0.w > 0.0)
     {
-        reflectionRadiance = SampleSkyViewRadiance(R);
-        specMask *= specMask;
+        float3 skyRadiance = SampleSkyViewRadiance(R);
+        // 观察点必须在地面之上，地面项才有意义；否则（贴地或穿地的相机）一律退回天空。
+        float aboveGround = step(reflectionParams0.w, input.worldPos.y);
+        float horizonW = max(smoothstep(-0.09, 0.09, R.y), 1.0 - aboveGround);
+        skyRadiance = lerp(reflectionParams0.xyz, skyRadiance, horizonW);
+        reflectionRadiance = lerp(giDiffuse, skyRadiance * envParams.x, mirrorW);
         specGate = 1.0;
     }
     else
     {
-        reflectionRadiance = envCube.SampleLevel(linearSampler, R, 0).rgb;
+        // 1-7 原式：LOD0 镜面 × envParams.x × (1-r)^4。
+        reflectionRadiance = envCube.SampleLevel(linearSampler, R, 0).rgb * envParams.x * mirrorW * mirrorW;
         specGate = step(0.5, envParams.w);
     }
-    ambient += reflectionRadiance * envParams.x * F0 * specMask * ao * specGate;
+    ambient += reflectionRadiance * F0 * ao * specGate;
 
-    // 2-7: 雷击对地面的均匀照亮。走环境项而不是瞬时点光：云底到地面的距离让 1/d² 退化成
-    // 一成不变的亮度，还会在 8 盏光的预算里挤掉场景灯。
+#if NORMAL_OUTPUT
+    // P0 SSR 的 F0 通道。合成端要做的是「把天空那一项换成屏幕空间命中」，
+    // 恒等式是 Δ = conf·(1-r)²·(F0·ao)·(ssr − reflSky)：giDiffuse 在差里抵消，
+    // 所以这里只需要一个标量权重，用 Rec.709 亮度把 F0 压成一维。
+    // 丢掉的只是色偏（金球 vs 银球），因为 Δ 是替换量、不是颜色本身；换来的是不必为 SSR 再开一个 MRT 目标。
+    // envCube 分支写 0：那条路径的基项是贴图立方图，SSR 核拿不到它，替换只会算错。
+    outNormal = float4(OctEncodeNormal(N), roughness,
+        skyParams0.w > 0.0 ? dot(F0, float3(0.2126, 0.7152, 0.0722)) * ao : 0.0);
+#endif
+
+    // 2-7: 雷击的照明。v1 把它并进环境项，于是任何朝向都均匀变亮——山脊背面也亮，
+    // 与「闪电在那边」对不上。v2 给出方向：
+    //   光源取击穿点在地面投影处、高度夹进 [地面, 击穿点]：通道是竖直的，对站在地面的
+    //     观察者真正起作用的是它最低的那几段，用云点会让入射角几乎为零；
+    //   衰减用 1/(1+d²/R²) 而不是 1/d²：R=400 m 时 400 m 处仍有半亮，符合一次地闪照亮
+    //     方圆数公里的量级，也不会像 1/d² 那样在近处炸成白屏；系数 1.6 使 400 m 处
+    //     恰好回到 v1 的 0.8，远景亮度不变；
+    //   朗伯项保留 25% 的底：通道有多段分支，任何朝向都有某一段能照到，纯 dot 会把
+    //     背光面直接压黑，反而比 v1 更像错误。
     [branch] if (weatherFlash.w > 0.0)
-        ambient += albedo * ao * (1.0 - metallic) * weatherFlash.w * float3(0.55, 0.62, 0.85) * 0.8;
+    {
+        float flashGround = min(reflectionParams0.w, weatherFlash.y);
+        float3 flashTo = float3(weatherFlash.x,
+            clamp(input.worldPos.y, flashGround, weatherFlash.y), weatherFlash.z) - input.worldPos;
+        float flashDist2 = dot(flashTo, flashTo);
+        float3 flashL = flashTo * rsqrt(max(flashDist2, 1e-4));
+        float flashFace = saturate(dot(N, flashL) * 0.75 + 0.25);
+        float flashFall = 1.0 / (1.0 + flashDist2 * (1.0 / 160000.0));
+        ambient += albedo * ao * (1.0 - metallic) * weatherFlash.w * flashFace * flashFall
+            * float3(0.55, 0.62, 0.85) * 1.6;
+    }
 
     // Emissive contribution
     float3 emissiveContribution = emissive;
@@ -3260,17 +3309,22 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
 
     static void BindSceneFog()
     {
-        if (!DXSceneDrawCollection.SuppressFog && DXFogCompositePipeline.BindTransparent()) return;
+        // S5: 门控从原来的 "Pass id 是否等于 SceneTransparent" 改成 "本视图是否有雾"（ViewHasFog）。
+        // deferredScene（非分段二级视图）也在 SceneTransparent pass 里重放，但它没有合成雾，
+        // 所以 ViewHasFog=false → 走下面的零门控旁路，保持 fogParams 全零。
+        // 光束在这条旁路里不会因丢失 in-scatter 而变成暗刀：S1 分支（emissiveFactor 增益）
+        // 已在 shader 端为二级视图提供了不依赖雾的解析式亮度。
+        if (DXSceneDrawCollection.ViewHasFog && DXFogCompositePipeline.BindTransparent()) return;
         var command = Device.GraphicsCommandList;
-        // 未成功合成时仍绑定合法哨兵；门控为零，绝不访问哨兵中的雾参数。
+        // 雾透明旁路：本视图没有体积雾合成，绑定合法哨兵并把 fogParams 保持全零。
         // 复用既有骨骼缓冲和 AP 哨兵，不为雾关闭路径额外创建纹理。
+        // 光束亮度由 S1（emissiveFactor × alpha）在 shader 中独立供给，不依赖 fogParams。
         var dummy = DXTexture3D.DummyBlack;
         dummy.EnsureReadyForRendering(command);
         command->SetGraphicsRootShaderResourceView(FogFrameRoot, DefaultInstanceBoneBuffer->GetGPUVirtualAddress());
         command->SetGraphicsRootDescriptorTable(FogIntegratedRoot, dummy.GpuDescriptorHandle);
         command->SetGraphicsRootDescriptorTable(FogLocalRoot, dummy.GpuDescriptorHandle);
-        var parameters = new Vector4(0, Device.ActivePassId == RenderPassId.SceneTransparent
-            && FrameSchedule.WeatherComposited ? 1 : 0, 0, 0);
+        var parameters = new Vector4(0, 0, 0, 0);
         command->SetGraphicsRoot32BitConstants(FogParamsRoot, 4, &parameters, 0);
     }
 

@@ -47,6 +47,28 @@ public sealed class WeatherVisualState
     /// </summary>
     public Vector4 Flash { get; private set; }
 
+    /// <summary>
+    /// 落雷计数：每发生一次新的雷击就自增。包络亮度分不清「新落雷」和「上一道雷的余辉」，
+    /// 所以应用层（雷声、震动）用这个单调计数做边沿检测，而不是看 <see cref="Flash"/> 的亮度。
+    /// 天气切出雷暴不回退，重新进入时从原值继续。
+    /// </summary>
+    public int StrikeSerial { get; private set; }
+
+    /// <summary>最近一次落雷的世界坐标，与 <see cref="StrikeSerial"/> 同步更新；用于按距离计算雷声延迟与音量。</summary>
+    public Vector3 StrikePoint { get; private set; }
+
+    /// <summary>
+    /// 最近一次地闪的可见通道几何，与 <see cref="StrikeSerial"/> 同步重建。
+    ///
+    /// 挂在视觉状态上而不是挂在渲染效果上，是因为消费方有两个且都必须看到同一道雷：
+    /// 闪电效果拿它生成 ribbon 实例，雷声拿它算最近点距离。云内闪不重建几何，
+    /// 于是 <see cref="LightningChannel.Visible"/> 为假，只有 v1 的云内发光。
+    /// </summary>
+    public LightningChannel Channel { get; } = new();
+
+    /// <summary>通道在地面处的米制半宽。整条通道向上收窄到它的 45%。</summary>
+    public float ChannelHalfWidth = 1.1f;
+
     public void Update(WeatherField field, float seconds, bool enabled, float farDistance)
     {
         ArgumentNullException.ThrowIfNull(field);
@@ -116,6 +138,14 @@ public sealed class WeatherVisualState
         _flashAge[slot] = 0;
         _flashPoint[slot] = FlashPoint(region, _flashStrike[slot]);
         _flashDelay[slot] = StrikeInterval(region.Settings.Seed, _flashStrike[slot], region.State.Lightning);
+        // 通道几何在这里一次性生成。code 与 FlashPoint / FlashEnvelope 里的表达式必须逐字一致：
+        // 三者派生自同一枚种子，改动任何一处都会让"落点、包络、形状"来自三道不同的雷。
+        // 从云内击穿点到地面，地面高度取天空参数里那块虚拟地面，通道因此贴在地面而不是穿进去。
+        Channel.Build((region.Settings.Seed * 0x9E3779B9u) ^ (_flashStrike[slot] * 0x85EBCA6Bu),
+            _flashPoint[slot], region.Settings.CloudBase, SkyLighting.ReflectionGroundHeight, ChannelHalfWidth);
+        // 先落点、再发信号：消费方（雷声）读到的坐标一定属于刚刚计数的那道雷。
+        StrikePoint = _flashPoint[slot];
+        StrikeSerial++;
     }
 
     /// <summary>两次落雷之间的静默秒数。活度 1 时落在 2.6~9.0 秒，活度越低间隔按反比拉长。</summary>
@@ -166,14 +196,9 @@ public sealed class WeatherVisualState
             s.CenterZ + n * lx + c * lz);
     }
 
-    /// <summary>整数雪崩哈希取 [0,1)。只用于调度与位置，不参与渲染积分，不需要任何分布性质。</summary>
-    static float Hash01(uint value)
-    {
-        value ^= value >> 16; value *= 0x7FEB352Du;
-        value ^= value >> 15; value *= 0x846CA68Bu;
-        value ^= value >> 16;
-        return (value & 0x00FFFFFFu) * (1f / 16777215f);
-    }
+    /// <summary>整数雪崩哈希取 [0,1)。只用于调度与位置，不参与渲染积分，不需要任何分布性质。
+    /// 与通道几何共用同一条公式，见 <see cref="LightningChannel.Hash01"/>。</summary>
+    static float Hash01(uint value) => LightningChannel.Hash01(value);
 
     public void Apply(ref SceneLightParams lights, RegionalWeatherQuality quality, bool cloudReady)
     {

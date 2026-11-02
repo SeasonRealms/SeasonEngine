@@ -71,8 +71,16 @@ public static class ParticleDraw
     /// row 10 = 终点颜色 rgb / 终点半尺寸，row 11 = 圆盘半径 / 径向速度 / 摆动幅度 / 曲线模式标志。
     /// 关闭曲线模式时这四行仍会被写入，但两端都不读，于是旧路径的每个字节都与扩容前一致。
     /// 之所以放在帧缓冲而不是 Params：顶点与片元阶段都读不到 compute Params，而这几项恰好都要跨阶段用。
+    ///
+    /// 第 12..15 行给 ribbon 带（闪电通道）用，粒子系统一律写零：
+    /// row 12 = 视口宽 / 视口高 / 最小半宽（像素）/ ribbon 标志，
+    /// row 13 = 强度 / 雾消光系数（每米）/ 保留 / 保留，row 14、15 保留。
+    /// ribbon 标志为 0 时顶点阶段不进新分支，于是粒子路径的每个字节仍与扩容前一致。
+    /// 最小半宽按像素给而不是按世界单位：远处的一道闪电必须保底有若干像素宽，
+    /// 否则光栅化在亚像素宽度上会时有时无——有些帧产生片元、有些帧整段消失。
+    /// 那是「像素根本不发生」的丢失，TAA 的反应矩形补不上：它只保护已经画出来的像素。
     /// </summary>
-    public const uint FrameVectorCount = 12;
+    public const uint FrameVectorCount = 16;
 
     /// <summary>Byte size of the frame buffer described by <see cref="FrameVectorCount"/>.</summary>
     public const uint FrameBytes = FrameVectorCount * 16;
@@ -138,6 +146,11 @@ public interface IParticleSubmitter
     /// <summary>Hands over this frame's parameters against the pass colour target. False means skip this system for this frame; Submit must then not be called.</summary>
     bool Prepare(IGraphics g, RenderTarget color);
 
-    /// <summary>Submits the indirect draw inside the pass. Called only after Prepare returned true, exactly once per Prepare.</summary>
-    void Submit(IGraphics g);
+    /// <summary>
+    /// Submits the indirect draw inside the pass. Called only after Prepare returned true, exactly once per Prepare.
+    /// 返回 false 表示这一帧没有真的画出来。合法成因不止一种（Prepare 与 Draw 之间 Pass 身份变了、
+    /// PSO 还在异步烘焙、资源在手交之后失效），调用方无法据此做任何补救，所以这里返回而不是抛：
+    /// 谁有历史状态谁决定要不要记日志，避免每帧刷同一行。
+    /// </summary>
+    bool Submit(IGraphics g);
 }

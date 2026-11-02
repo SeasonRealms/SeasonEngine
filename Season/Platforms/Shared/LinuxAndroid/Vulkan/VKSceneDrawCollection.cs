@@ -213,7 +213,10 @@ internal sealed unsafe class VKSceneDrawCollection
             fog = true;
         }
 
-        Pipeline.SceneFogParams = new Vector4(fog ? 1 : 0, FrameSchedule.WeatherComposited ? 1 : 0, 0, 0);
+        // S5: 雾透明旁路 —— 本视图没有雾时 fogParams 全零，weather 也跟随关闭，
+        // 不再检查 FrameSchedule.WeatherComposited 独立位（避免二级视图误采主视图的天气残留）。
+        // 光束亮度由 S1（emissiveFactor × alpha）在 shader 端独立供给，不依赖 fogParams。
+        Pipeline.SceneFogParams = new Vector4(fog ? 1 : 0, fog && FrameSchedule.WeatherComposited ? 1 : 0, 0, 0);
         var app = DeviceServices.BaseApp;
         if (app != null && _reportedFog != fog)
         {

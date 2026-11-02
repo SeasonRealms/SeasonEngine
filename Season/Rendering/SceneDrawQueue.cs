@@ -263,3 +263,22 @@ public abstract class FogCompositePipeline : IDisposable
     public abstract FogCompositeResult Draw();
     public abstract void Dispose();
 }
+
+/// <summary>P0 SSR 合成绑定：反射增量纹理名 + 它是被加进哪张场景色。</summary>
+public readonly record struct SsrCompositeInputs(RenderTarget Color, string ReflectionTexture);
+
+/// <summary>
+/// P0：把反射增量按加法并进场景色的后端入口。与雾合成不同，它不新开目标也不发布颜色源，
+/// 增量由 <see cref="Effects.SsrEffect"/> 的核直接算成最终值（含 (1-r)²、反射权重与置信度），
+/// 所以这里只剩一条全屏加法绘制 —— 权重不在这里重算，否则两处的 Fresnel 与粗糙度口径迟早会分叉。
+/// </summary>
+public abstract class SsrCompositePipeline : IDisposable
+{
+    /// <summary>在 Pass 外解析本帧资源；false 表示这一帧不合成，场景保持原样。</summary>
+    public abstract bool Prepare(in SsrCompositeInputs inputs);
+
+    /// <summary>只在 <see cref="RenderPassId.SsrComposite"/> 内调用一次。</summary>
+    public abstract bool Draw();
+
+    public abstract void Dispose();
+}

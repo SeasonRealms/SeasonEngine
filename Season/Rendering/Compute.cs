@@ -239,6 +239,28 @@ public ref struct ComputeDispatchArgs
     public ReadOnlySpan<ComputeResourceRef> Resources;
 
     public uint GroupsX, GroupsY, GroupsZ;
+
+    /// <summary>
+    /// A0.2: when non-null, the three group counts above are ignored and the backend reads them from
+    /// this buffer at <see cref="ArgumentsOffset"/> as an <see cref="IndirectDispatchArgs"/> block.
+    /// <para>
+    /// The block has to be written by an earlier dispatch in the same frame, which means the caller is
+    /// asserting that a GPU-side value now exists where the CPU would otherwise have had to guess. That
+    /// is the whole point: the alternative is a readback, and a readback stalls the frame.
+    /// </para>
+    /// <para>
+    /// Failure is not fatal and not silent: the backend returns false from the dispatch, and the caller
+    /// keeps its last-good state for the frame. A caller that cannot tolerate a skipped frame should
+    /// fall back to the fixed-count path on false rather than assume the dispatch happened.
+    /// </para>
+    /// </summary>
+    public StorageBuffer? Arguments;
+
+    /// <summary>Byte offset of the argument block inside <see cref="Arguments"/>. Must be a multiple of 4.</summary>
+    public uint ArgumentsOffset;
+
+    /// <summary>True when this dispatch takes its group counts from <see cref="Arguments"/>.</summary>
+    public readonly bool IsIndirect => Arguments != null;
 }
 
 /// <summary>

@@ -971,3 +971,165 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
         _depthState?.Dispose(); _depthState = null;
     }
 }
+
+/// <summary>
+/// P0 SSR 加法合成：把 <see cref="SsrEffect"/> 算出的反射增量叠进 SceneColor。
+/// 增量在核里已经是最终值（含 (1-r)²、反射权重与置信度），这里不做任何权重重算 ——
+/// 两处各算一遍 Fresnel 与粗糙度，口径迟早会分叉。
+/// 因此只剩一条全屏三角形 + One/One 混合：不新开目标、不清屏、无深度附件。
+/// </summary>
+internal sealed class MTLSsrCompositePipeline : SsrCompositePipeline
+{
+    const string Msl = """
+#include <metal_stdlib>
+using namespace metal;
+
+// 顶点着色器把全屏三角形铺满目标，position.xy 就是像素中心；
+// read 按整数像素取增量，不需要采样器，也不会因为半像素偏移取到邻位。
+fragment float4 PSMain(float4 position [[position]], texture2d<float> reflectionDelta [[texture(0)]]) {
+    return float4(reflectionDelta.read(uint2(position.xy)).rgb, 0.0);
+}
+""";
+
+    readonly Dictionary<string, Texture> _textures;
+    IMTLRenderPipelineState? _pipeline;
+    IMTLDepthStencilState? _depthState;
+    IMTLCommandBuffer? _command;
+    MTLRenderTarget? _destination;
+    SsrCompositeInputs _inputs;
+    Resources _prepared;
+    int _frame;
+    bool _disposed;
+
+    readonly record struct Resources(IMTLTexture Delta, IMTLTexture Destination)
+    {
+        // 同时比较托管身份与有效原生句柄，Resize 后不能误认复用的原生地址。
+        internal bool Same(in Resources other) => ReferenceEquals(Delta, other.Delta)
+            && ReferenceEquals(Destination, other.Destination);
+    }
+
+    internal MTLSsrCompositePipeline(Dictionary<string, Texture> textures)
+    {
+        _textures = textures;
+        try
+        {
+            var vsLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, VolumetricFogEffect.CompositeVertexMsl);
+            var fsLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, Msl);
+            using var vs = vsLibrary.CreateFunction("VSMain")
+                ?? throw new InvalidOperationException("未找到 SSR 合成顶点入口。");
+            using var fs = fsLibrary.CreateFunction("PSMain")
+                ?? throw new InvalidOperationException("未找到 SSR 合成片元入口。");
+            using var desc = new MTLRenderPipelineDescriptor
+            {
+                Label = "Season-SsrComposite", VertexFunction = vs, FragmentFunction = fs,
+                DepthAttachmentPixelFormat = MTLPixelFormat.Invalid,
+                StencilAttachmentPixelFormat = MTLPixelFormat.Invalid, RasterSampleCount = 1,
+            };
+            var color = desc.ColorAttachments[0];
+            color.PixelFormat = MTLPixelFormat.RGBA16Float;
+            // 加法：场景色是 rgba16float，负增量（反射比被反射的天空暗）也能正确压暗。
+            // alpha 恒写 0，所以 alpha 槽的 One/One 只是让目标 alpha 保持不变。
+            color.BlendingEnabled = true;
+            color.RgbBlendOperation = MTLBlendOperation.Add;
+            color.AlphaBlendOperation = MTLBlendOperation.Add;
+            color.SourceRgbBlendFactor = MTLBlendFactor.One;
+            color.DestinationRgbBlendFactor = MTLBlendFactor.One;
+            color.SourceAlphaBlendFactor = MTLBlendFactor.One;
+            color.DestinationAlphaBlendFactor = MTLBlendFactor.One;
+            _pipeline = Device.MtlDevice.CreateRenderPipelineState(desc, out Foundation.NSError? error)
+                ?? throw new InvalidOperationException($"SSR 合成 PSO 创建失败：{error?.LocalizedDescription}");
+            using var depth = new MTLDepthStencilDescriptor
+            {
+                DepthCompareFunction = MTLCompareFunction.Always, DepthWriteEnabled = false,
+            };
+            _depthState = Device.MtlDevice.CreateDepthStencilState(depth)
+                ?? throw new InvalidOperationException("SSR 合成深度状态创建失败。");
+        }
+        catch { Dispose(); throw; }
+    }
+
+    static bool Readable(IMTLTexture? texture, MTLTextureType type) => texture != null
+        && texture.Handle != IntPtr.Zero && texture.TextureType == type && texture.SampleCount == 1
+        && texture.Width > 0 && texture.Height > 0 && (texture.Usage & MTLTextureUsage.ShaderRead) != 0;
+
+    // 只接受生产者已经写好的增量纹理，不在 Pass 内补屏障 —— Metal 的 hazard tracking 负责这条依赖。
+    bool Resolve(in SsrCompositeInputs inputs, MTLRenderTarget destination, out Resources resources)
+    {
+        resources = default;
+        if (string.IsNullOrEmpty(inputs.ReflectionTexture)
+            || destination.Desc.ColorFormat != RtFormat.Rgba16Float || destination.Desc.SampleCount > 1)
+            return false;
+
+        var dst = destination.ColorTexture;
+        if (!Readable(dst, MTLTextureType.k2D) || dst!.PixelFormat != MTLPixelFormat.RGBA16Float
+            || (dst.Usage & MTLTextureUsage.RenderTarget) == 0
+            || (nuint)destination.Width != dst.Width || (nuint)destination.Height != dst.Height)
+            return false;
+
+        Texture? texture = null;
+        lock (_textures) _textures.TryGetValue(inputs.ReflectionTexture, out texture);
+        if (texture == null || !Volatile.Read(ref texture.Ready)) return false;
+        var delta = texture.Image;
+        // 尺寸必须与场景色一致：增量是按像素写的，尺寸不符只能说明这一帧的核没按当前分辨率跑。
+        if (!Readable(delta, MTLTextureType.k2D) || delta!.PixelFormat != MTLPixelFormat.RGBA16Float
+            || delta.Handle == dst.Handle || delta.Width != dst.Width || delta.Height != dst.Height)
+            return false;
+
+        resources = new(delta, dst);
+        return true;
+    }
+
+    void ClearPrepared()
+    {
+        _destination = null;
+        _command = null;
+        _inputs = default;
+        _prepared = default;
+    }
+
+    public override bool Prepare(in SsrCompositeInputs inputs)
+    {
+        ClearPrepared();
+        var command = Device.GraphicsCommandBuffer;
+        if (_disposed || Device.GraphicsEncoder != null || command == null || command.Handle == IntPtr.Zero
+            || inputs.Color is not MTLRenderTarget target || !Resolve(inputs, target, out var resources)) return false;
+        _inputs = inputs;
+        _destination = target;
+        _prepared = resources;
+        _command = command;
+        _frame = Device.FrameIndex;
+        return true;
+    }
+
+    public override bool Draw()
+    {
+        var destination = _destination;
+        var inputs = _inputs;
+        var prepared = _prepared;
+        var command = _command;
+        ClearPrepared();
+        var encoder = Device.GraphicsEncoder;
+        if (_disposed || destination == null || encoder == null || encoder.Handle == IntPtr.Zero
+            || command == null || command.Handle == IntPtr.Zero || !ReferenceEquals(command, Device.GraphicsCommandBuffer)
+            || _frame != Device.FrameIndex || Device.ActivePassId != RenderPassId.SsrComposite
+            || !ReferenceEquals(destination, Device.ActiveColorTarget)
+            || !Resolve(inputs, destination, out var resources) || !prepared.Same(resources)
+            || Device.ActiveColorTexture?.Handle != resources.Destination.Handle) return false;
+
+        encoder.SetRenderPipelineState(_pipeline!);
+        encoder.SetDepthStencilState(_depthState!);
+        encoder.SetCullMode(MTLCullMode.None);
+        encoder.SetFragmentTexture(resources.Delta, 0);
+        encoder.DrawPrimitives(MTLPrimitiveType.Triangle, 0, 3);
+        return true;
+    }
+
+    public override void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        ClearPrepared();
+        _pipeline?.Dispose(); _pipeline = null;
+        _depthState?.Dispose(); _depthState = null;
+    }
+}

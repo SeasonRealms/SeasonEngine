@@ -6,7 +6,7 @@ namespace Season.Rendering;
 
 public sealed partial class InstanceCullEffect
 {
-    // A7 的 Vulkan 侧两份内核。Params 走 push constant，其余资源按"声明索引即 binding 编号"落位，
+    // A7 的 Vulkan 侧四份内核。Params 走 push constant，其余资源按"声明索引即 binding 编号"落位，
     // 于是 binding 0 留给 Params 占位而不会被任何 buffer 占用，与 ComputeBindingType 的契约一致。
 
     const string ResetGlsl = """
@@ -129,6 +129,35 @@ void main()
 }
 """;
 
+    const string FinalizeGlsl = """
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform FinalizeParams
+{
+    uint slotCount;
+    uint slotStride;
+    uint groupSize;
+    uint pad;
+} finalizeParams;
+
+layout(std430, binding = 1) readonly buffer DrawArgs { uint drawArgs[]; };
+layout(std430, binding = 2) buffer DispatchArgs { uint dispatchArgs[]; };
+
+void main()
+{
+    uint maxCount = 0u;
+    for (uint slot = 0u; slot < finalizeParams.slotCount; ++slot)
+        maxCount = max(maxCount, drawArgs[(slot * finalizeParams.slotStride + 4u) / 4u]);
+
+    uint groups = (maxCount + finalizeParams.groupSize - 1u) / finalizeParams.groupSize;
+    dispatchArgs[0] = groups;
+    dispatchArgs[1] = finalizeParams.slotCount;
+    dispatchArgs[2] = 1u;
+}
+""";
+
     const string GatherGlsl = """
 #version 450
 
@@ -153,9 +182,10 @@ layout(std430, binding = 4) buffer DrawArgs { uint drawArgs[]; };
 
 void main()
 {
-    uint idx = gl_GlobalInvocationID.x;
-    uint slot = idx / gatherParams.capacity;
-    uint k = idx % gatherParams.capacity;
+    // 二维映射：X = 槽位内序号，Y = 槽位。固定派发与间接派发共用它，
+    // 于是 A/B 的唯一变量是 X 维的组数。
+    uint slot = gl_GlobalInvocationID.y;
+    uint k = gl_GlobalInvocationID.x;
     if (slot >= gatherParams.slotCount)
         return;
 

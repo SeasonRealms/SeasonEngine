@@ -579,6 +579,19 @@ public static class CascadedShadow
     /// </summary>
     public static bool AccumulatingCasters => _fingerprintWalk;
 
+    /// <summary>
+    /// 本帧阴影图是否复用上一帧的结果，由 <see cref="EvaluateReuse"/> 的调用方在 FrameStart 相位之前写入。
+    ///
+    /// 存在的理由是顺序：A7 的实例剔除在 FrameStart 相位里跑，早于阴影 Pass，所以它只能在 Record 时
+    /// 读这个标志。复用命中时整个阴影 Pass 被跳过，剔除与收集的产物没有任何消费者，那一帧的三次派发
+    /// 纯属浪费。把判定提前到 RecordPhase 之前是可行的，因为 EvaluateReuse 只做一次树遍历而不提交任何
+    /// 绘制命令——见 <see cref="AccumulatingCasters"/>。
+    ///
+    /// 没有调用 EvaluateReuse 的帧（复用档关闭、无阴影、无光源）由调用方明确写回 false，
+    /// 不依赖这个属性自己重置，否则一次命中之后标志会永久留着。
+    /// </summary>
+    public static bool ReuseActive { get; internal set; }
+
     /// <summary>1-5 clause 12: folds one float into the running caster digest, by its bit pattern rather than its value.
     /// Bits rather than value because +0 and -0 must be distinguished here: they are interchangeable inside a matrix, but a
     /// coordinate that flipped sign is a coordinate that was written by different code, and treating that as "no change" is
@@ -662,6 +675,7 @@ public static class CascadedShadow
         {
             // Nothing was fingerprinted, so the stored digest no longer describes a known frame.
             _prevFingerprintValid = false;
+            ReuseActive = false;
             return false;
         }
 
@@ -679,6 +693,7 @@ public static class CascadedShadow
         if (reuse)
             _reuseSkipped++;
 
+        ReuseActive = reuse;
         return reuse;
     }
 

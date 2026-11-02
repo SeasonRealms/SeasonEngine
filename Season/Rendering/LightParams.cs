@@ -112,7 +112,7 @@ public struct CloudLayerArray
 
 /// <summary>
 /// 1-2 lighting system: C#-side mirror of the main-pipeline lighting UBO, with contract layout defined by the 1-2, 1-5, and 1-7 sections in the RenderQuality header.
-/// 布局仅使用 vec4/mat4；原 1376 字节前缀不变，区域天气追加 1056 字节，末尾再追加雷电 16 字节，共 2448 字节。
+/// 布局仅使用 vec4/mat4；原 1376 字节前缀不变，区域天气追加 1056 字节，末尾追加雷电 16 字节，2-8 再追加虚拟地面 16 字节，共 2464 字节。
 /// The SceneLights UBO declared in shaders on all four backends must match it byte for byte.
 /// Byte offsets are:
 /// CameraPos=0, Ambient=16, Params0=32, Lights[i]=48+64i,
@@ -320,6 +320,18 @@ public struct SceneLightParams
     /// 记位置而不是方向：云内发光按到雷击点的距离衰减，不看视线方向。
     /// </summary>
     public Vector4 WeatherFlash;
+
+    /// <summary>
+    /// 偏移 2448，2-8 环境镜面的虚拟地面：xyz = 地面辐亮度（线性 HDR，已含 albedo、
+    /// 太阳与月亮的直射透射和余弦、天空 SH9，以及 1/π），w = 地面所在的世界 Y（米）。
+    /// 只由 <see cref="SkyLighting.Apply"/> 注入，与 hdrExposure 同一约定，App 侧写入无效。
+    /// 消费侧只在程序化天空分支（skyParams0.w &gt; 0）里使用：反射方向掉到地平线以下时，
+    /// Sky-View LUT 那一侧几乎没有能量（朝下的射线只穿过视点到地面那几百米空气），
+    /// 直接采样会得到纯黑的下半球，而这个字段给出那块地面本该有的亮度。
+    /// xyz 全零表示地面是黑的，也就是退回 2-7 之前的行为。
+    /// 追加在尾部而不是插在中间：前面所有字段的偏移被雾、雨幕与四端着色器硬编码，挪动它们等于整体重排。
+    /// </summary>
+    public Vector4 ReflectionParams0;
 
     /// <summary>Convenience accessor for lightCount, wrapping the float-as-integer semantic of Params0.X and clamping writes into [0, MaxLights].</summary>
     public int LightCount

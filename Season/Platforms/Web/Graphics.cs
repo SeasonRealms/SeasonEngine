@@ -447,6 +447,27 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         return null;
     }
 
+    /// <summary>P0 SSR 加法合成：一条全屏绘制把反射增量叠进 SceneColor，没有独立目标。
+    /// 没有 compute 就没有增量纹理，合成无处可读，所以返回 null 让调度层保持零残留。</summary>
+    public Season.Rendering.SsrCompositePipeline? CreateSsrCompositePipeline()
+    {
+        if (!ComputeSupported) return null;
+        var pipeline = new WGPUSsrCompositePipeline();
+        try
+        {
+            if (pipeline.Initialize()) return pipeline;
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[SsrComposite] 创建失败：{ex.Message}");
+        }
+        // 失败路径也要能安全收尾：JS 导出缺失时 Dispose 会再次抛绑定异常，
+        // 放任它冒泡就把「不合成」升级成「BaseApp.Create 失败」。
+        try { pipeline.Dispose(); }
+        catch (Exception ex) { DeviceServices.BaseApp.AddLog(LogType.Error, $"[SsrComposite] 失败句柄释放异常：{ex.Message}"); }
+        return null;
+    }
+
     /// <summary>
     /// D1 屏幕空间贴花。只依赖图形阶段的深度采样（本 Pass 不挂深度附件），所以不像雾/粒子那样要求
     /// compute/间接绘制能力；创建失败即返回 null，贴花效果整体不注册。
@@ -1098,6 +1119,11 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
     public bool IndirectDrawSupported => _initialized;
 
+    /// <summary>A0.2：间接计算派发（dispatchWorkgroupsIndirect）。与间接绘制是两道独立能力位，
+    /// 但这里同源：两者都只需要一个 ComputeAndIndirectArgs 缓冲，而 Web 没有显式状态机，
+    /// 编码顺序本身就是同步点。</summary>
+    public bool DispatchIndirectSupported => _initialized;
+
     public bool TryPrepareIndirectArgs(Season.Rendering.StorageBuffer buffer)
         => _initialized
             && buffer is WGPUStorageBuffer wgpuBuffer
@@ -1166,12 +1192,29 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     {
         if (!_initialized) return false;
         var kernel = (WGPUComputeKernel)args.Kernel;
+
+        // A0.2 的准入与另外三端一致：放在跨越 interop 边界之前，失败时 JS 侧什么都不知道。
+        // 这一端没有状态机也没有 barrier —— 同一 encoder 内的编码顺序就是全部同步。
+        string? indirectId = null;
+        uint indirectOffset = 0;
+        if (args.IsIndirect)
+        {
+            if (args.Arguments is not WGPUStorageBuffer indirect
+                || indirect.Usage != Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs
+                || (args.ArgumentsOffset & 3u) != 0
+                || indirect.SizeInBytes < args.ArgumentsOffset + Season.Rendering.IndirectDispatchArgs.SizeInBytes)
+                return false;
+            indirectId = indirect.Id;
+            indirectOffset = args.ArgumentsOffset;
+        }
+
         args.Params.CopyTo(_computeParamsScratch);
         return WebGPUInterop.DispatchCompute(
             kernel.JsName,
             _computeParamsScratch.AsSpan(0, args.Params.Length),
             kernel.ResolveResourcesJson(args.Resources),
-            (int)args.GroupsX, (int)args.GroupsY, (int)args.GroupsZ);
+            (int)args.GroupsX, (int)args.GroupsY, (int)args.GroupsZ,
+            indirectId, (int)indirectOffset);
     }
 
     // ── 1-7 Cubemap (see the summaries at the top of IGraphics / RenderQuality for the contract) ──

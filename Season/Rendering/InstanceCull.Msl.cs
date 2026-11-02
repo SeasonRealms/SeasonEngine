@@ -6,8 +6,9 @@ namespace Season.Rendering;
 
 public sealed partial class InstanceCullEffect
 {
-    // A7 的 Metal 侧两份内核。MSL 没有编译期的组大小声明，64 由 DispatchThreadgroups 的第二个参数给出，
+    // A7 的 Metal 侧四份内核。MSL 没有编译期的组大小声明，64 由 DispatchThreadgroups 的第二个参数给出，
     // 所以这里的 C# 常量是唯一的来源；buffer 槽位按"Params 为 0，其余 buffer 从 1 起"排布。
+    // finalize 是唯一组大小为 1 的内核，C# 侧与之对应的 WorkgroupX/Y/Z 也是 1。
 
     const string ResetMsl = """
 #include <metal_stdlib>
@@ -127,6 +128,36 @@ kernel void CSMain(uint3 id [[thread_position_in_grid]],
 }
 """;
 
+    const string FinalizeMsl = """
+#include <metal_stdlib>
+using namespace metal;
+
+struct FinalizeParams
+{
+    uint slotCount;
+    uint slotStride;
+    uint groupSize;
+    uint pad;
+};
+
+// 单线程：槽位上限 4，串行读四个 uint 远低于开工作组再做归约同步的成本，
+// 也免去四端各写一遍 threadsync 方言。
+kernel void CSMain(uint3 id [[thread_position_in_grid]],
+                   constant FinalizeParams& finalizeParams [[buffer(0)]],
+                   const device uint* drawArgs [[buffer(1)]],
+                   device uint* dispatchArgs [[buffer(2)]])
+{
+    uint maxCount = 0u;
+    for (uint slot = 0u; slot < finalizeParams.slotCount; ++slot)
+        maxCount = max(maxCount, drawArgs[(slot * finalizeParams.slotStride + 4u) >> 2u]);
+
+    uint groups = (maxCount + finalizeParams.groupSize - 1u) / finalizeParams.groupSize;
+    dispatchArgs[0] = groups;
+    dispatchArgs[1] = finalizeParams.slotCount;
+    dispatchArgs[2] = 1u;
+}
+""";
+
     const string GatherMsl = """
 #include <metal_stdlib>
 using namespace metal;
@@ -150,9 +181,9 @@ kernel void CSMain(uint3 id [[thread_position_in_grid]],
                    device float* sortedWorlds [[buffer(3)]],
                    device uint* drawArgs [[buffer(4)]])
 {
-    uint idx = id.x;
-    uint slot = idx / gatherParams.capacity;
-    uint k = idx % gatherParams.capacity;
+    // 二维映射：X = 槽位内序号，Y = 槽位。两条派发路径共用它，A/B 的唯一变量是 X 维组数。
+    uint slot = id.y;
+    uint k = id.x;
     if (slot >= gatherParams.slotCount)
         return;
 

@@ -98,7 +98,13 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     Season.Rendering.StorageBuffer? _cullVisible;
     Season.Rendering.StorageBuffer? _cullPrimInfo;
     int _cullCapacity = -1;
+    /// <summary>已上传到 GPU 的参数表条数。与 <see cref="_cullPrimInfoPending"/> 不等时说明本帧要重传。</summary>
     int _cullPrimitiveCount = -1;
+    /// <summary>CPU 侧已构造好的参数表字节：构造随时可做，上传要等 blit encoder 能开出来
+    ///（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。</summary>
+    byte[]? _cullPrimInfoBytes;
+    /// <summary>CPU 侧参数表的条数，-1 表示还没构造过。</summary>
+    int _cullPrimInfoPending = -1;
     bool _cullRegistered;
     Vector3 _cullLocalCenter;
     Vector3 _cullLocalExtents;
@@ -419,8 +425,8 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     Vector3 Season.Rendering.IInstanceCullTarget.CullLocalExtents => _cullLocalExtents;
 
     /// <summary>
-    /// 派生类在实例流上传之后调用。剔除的输入与 IA 实例流逐位相同（都是 InstanceTransformData，
-    /// 步长 80 与 <see cref="Season.Rendering.InstanceCull.WorldStride"/> 一致），所以直接复用同一份数组。
+    /// 派生类在实例流上传之后调用，只备资源。矩阵流上传延后到 Record 相位：控制件的 Update 阶段
+    /// render encoder 可能还开着，那时 CreateBlitCommandEncoder 直接失败，上传被丢弃且只留一行日志。
     /// </summary>
     protected void UpdateCullUpload()
     {
@@ -429,11 +435,6 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
             return;
 
         EnsureCullResources(_instanceCount);
-        if (_cullSource == null)
-            return;
-
-        Season.Basic.Graphics.Instance.TryUpdateStorageBuffer(_cullSource,
-            MemoryMarshal.AsBytes(_instanceData.AsSpan(0, _instanceCount)));
     }
 
     /// <summary>
@@ -493,7 +494,9 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     }
 
     /// <summary>
-    /// primitive 集合不变就不重写。索引区间与绘制端必须同源：reset 内核把这里的
+    /// 只构造参数表字节，不碰 GPU —— 构造与上传的安全时机不同：构造随时可做，
+    /// 上传要等 blit encoder 能开出来（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。
+    /// primitive 集合不变就不重建。索引区间与绘制端必须同源：reset 内核把这里的
     /// indexCount 写进间接参数，而绘制端不再自己提供索引数。
     /// </summary>
     void EnsureCullPrimitiveInfo()
@@ -502,8 +505,15 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
             return;
         int n = _opaquePrimitives.Count;
         if (n <= 0 || n > Season.Rendering.InstanceCull.MaxPrimitives)
+        {
+            // 明确记下"没有可传的参数表"：否则 PrepareCullInputs 会拿上一次的字节反复上传，
+            // 条数看起来对得上，内容却是过期的那一份。
+            _cullPrimInfoBytes = null;
+            _cullPrimInfoPending = 0;
+            _cullPrimitiveCount = 0;
             return;
-        if (_cullPrimitiveCount == n)
+        }
+        if (_cullPrimInfoPending == n)
             return;
 
         var bytes = new byte[n * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride];
@@ -515,8 +525,38 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
                 (uint)primitive.Indices.Length, 0u, 0);
         }
 
-        if (Season.Basic.Graphics.Instance.TryUpdateStorageBuffer(_cullPrimInfo, bytes))
-            _cullPrimitiveCount = n;
+        _cullPrimInfoBytes = bytes;
+        _cullPrimInfoPending = n;
+    }
+
+    /// <summary>
+    /// A7：把剔除的 CPU 侧输入传到 GPU。由 InstanceCullEffect 在每次派发之前回调，
+    /// 那个相位在所有 Pass 之外 —— Metal 的 compute 与 render encoder 互斥，
+    /// render encoder 开着时开 blit encoder 必失败，所以这是本端唯一可靠的上传时机。
+    /// 输入与 IA 实例流逐位相同（都是 InstanceTransformData，步长 80 与 WorldStride 一致），
+    /// 所以直接复用同一份数组，不多存副本。
+    /// </summary>
+    bool Season.Rendering.IInstanceCullTarget.PrepareCullInputs()
+    {
+        if (!Season.Rendering.InstanceCull.Enabled || _instanceCount <= 0)
+            return false;
+
+        var g = Season.Basic.Graphics.Instance;
+
+        // 参数表跟着几何走而不跟帧走，所以只在条数变了时重传。
+        if (_cullPrimInfoPending != _cullPrimitiveCount)
+        {
+            if (_cullPrimInfoPending <= 0 || _cullPrimInfoBytes == null || _cullPrimInfo == null)
+                return false;
+            int bytes = _cullPrimInfoPending * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride;
+            if (!g.TryUpdateStorageBuffer(_cullPrimInfo, new ReadOnlySpan<byte>(_cullPrimInfoBytes, 0, bytes)))
+                return false;
+            _cullPrimitiveCount = _cullPrimInfoPending;
+        }
+
+        // 矩阵流每帧都变，只传有效段，不留余量。
+        return _cullSource != null && g.TryUpdateStorageBuffer(_cullSource,
+            MemoryMarshal.AsBytes(_instanceData.AsSpan(0, _instanceCount)));
     }
 
     /// <summary>
@@ -556,6 +596,8 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
         _cullPrimInfo?.Dispose(); _cullPrimInfo = null;
         _cullCapacity = -1;
         _cullPrimitiveCount = -1;
+        _cullPrimInfoBytes = null;
+        _cullPrimInfoPending = -1;
         _cullDrawReady = false;
     }
 

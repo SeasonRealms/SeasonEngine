@@ -38,6 +38,18 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
     }
 
+    /// <summary>P0 SSR 加法合成：一条全屏绘制把反射增量叠进 SceneColor，没有独立目标。</summary>
+    public Season.Rendering.SsrCompositePipeline? CreateSsrCompositePipeline()
+    {
+        if (!ComputeSupported) return null;
+        try { return new DXSsrCompositePipeline(DictionaryDXTexture); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[SsrComposite] 创建失败：{ex.Message}");
+            return null;
+        }
+    }
+
     /// <summary>D1 屏幕空间贴花：只依赖图形阶段的深度采样，不需要 compute，所以没有 ComputeSupported 门控。</summary>
     public Season.Rendering.DecalPipeline? CreateDecalPipeline()
     {
@@ -561,6 +573,11 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
     public bool IndirectDrawSupported => ComputeSupported;
 
+    /// <summary>A0.2：间接计算派发。D3D12 的间接绘制与间接派发用的是两条不同的命令签名
+    /// （argument type 不同、字节步长也不同，绘制是 20 字节五段，派发是 12 字节三 uint），
+    /// 所以能力位各管各的；这里与 <see cref="IndirectDrawSupported"/> 同源是因为两者都只依赖 compute。</summary>
+    public bool DispatchIndirectSupported => ComputeSupported;
+
     public bool TryPrepareIndirectArgs(Season.Rendering.StorageBuffer buffer)
     {
         var cmd = DirectX.Device.GraphicsCommandList;
@@ -729,6 +746,19 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         var kernel = (DXComputeKernel)args.Kernel;
         var bindings = kernel.Desc.Bindings;
 
+        // A0.2 的准入放在最前面而不是派发点：校验放在绑定循环之后的话，失败时前面已经做了一堆
+        // 状态转换，虽然幂等无害，但会让"这一帧什么都没发生"这件事变得更难在抓帧里读懂。
+        DXStorageBuffer indirect = null;
+        if (args.IsIndirect)
+        {
+            indirect = args.Arguments as DXStorageBuffer;
+            if (indirect == null || indirect.Resource == null
+                || indirect.Usage != Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs
+                || indirect.SizeInBytes < args.ArgumentsOffset + Season.Rendering.IndirectDispatchArgs.SizeInBytes
+                || DirectX.Device.EnsureDispatchCommandSignature() == null)
+                return false;
+        }
+
         DirectX.Device.PushDebugGroup(kernel.LabelZ);
 
         cmd->SetComputeRootSignature(kernel.RootSignature);
@@ -856,7 +886,19 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             kernel.ResolvedScratch[i] = tex;
         }
 
-        cmd->Dispatch(args.GroupsX, args.GroupsY, args.GroupsZ);
+        if (indirect != null)
+        {
+            // 组数由 GPU 写在参数块里。缓冲刚被上游内核写过、停在 UnorderedAccess，而 ExecuteIndirect
+            // 要求 INDIRECT_ARGUMENT；UNORDERED_ACCESS 转出的状态屏障本身就把之前的 UAV 写排到前面，
+            // 所以这里不需要再补一条 UAV barrier。
+            indirect.TransitionTo(cmd, ResourceStates.IndirectArgument);
+            cmd->ExecuteIndirect(DirectX.Device.EnsureDispatchCommandSignature(),
+                1, indirect.Resource, args.ArgumentsOffset, null, 0);
+        }
+        else
+        {
+            cmd->Dispatch(args.GroupsX, args.GroupsY, args.GroupsZ);
+        }
 
         // Post-dispatch synchronization: storage/sampled textures return to PixelShaderResource
         // (draw sampling can consume them directly, and the transition barrier itself provides

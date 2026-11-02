@@ -13,7 +13,7 @@ namespace Season.Rendering.Effects;
 ///
 /// Behavior: each AfterScene phase downsamples the full-resolution SceneNormal into a fixed 480x270 storage texture with
 /// nearest sampling. <see cref="Mode"/> 0 shows the decoded world normal as n * 0.5 + 0.5; 1 shows roughness in red and
-/// metallic in green. Sprite2D consumes it directly by name.
+/// the P0 reflection weight (Rec.709 luminance of F0 times ao) in green. Sprite2D consumes it directly by name.
 ///
 /// Acceptance criteria (thumbnail appearance):
 /// - Flat ground -> one uniform color (+Y up reads as (0.5, 1, 0.5), light green).

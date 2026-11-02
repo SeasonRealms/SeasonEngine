@@ -124,6 +124,11 @@ public interface IGraphics
     Season.Rendering.FogCompositePipeline? CreateFogCompositePipeline() => null;
     Season.Rendering.Effects.WeatherCompositePipeline? CreateWeatherCompositePipeline() => null;
 
+    /// <summary>P0: 缺少「把反射增量加法并进场景色」的能力时返回 null，<see cref="Season.Rendering.Effects.SsrEffect"/>
+    /// 据此拒绝注册（零残留），画面退回天空反射。返回 null 而不是抛异常，是因为这条通路缺的只是额外信息，
+    /// 少了它画面依然正确 —— 只是镜面里看不到相邻物体。</summary>
+    Season.Rendering.SsrCompositePipeline? CreateSsrCompositePipeline() => null;
+
     /// <summary>D1: 缺少屏幕空间贴花能力时返回 null，<see cref="Season.Rendering.FrameSchedule.RegisterDecals"/> 据此保持零残留。</summary>
     Season.Rendering.DecalPipeline? CreateDecalPipeline() => null;
 
@@ -257,6 +262,21 @@ public interface IGraphics
 
     /// <summary>后端是否已接通间接索引绘制；为 false 时消费者应改走固定实例数的退化路径或整体不注册。</summary>
     bool IndirectDrawSupported => false;
+
+    /// <summary>
+    /// A0.2: 后端是否已接通间接计算派发（<see cref="Season.Rendering.ComputeDispatchArgs.Arguments"/> 非空的那条路径）。
+    /// 为 false 时消费者应改走固定组数派发，而不是跳过本次工作。
+    ///
+    /// 它和 <see cref="IndirectDrawSupported"/> 是两件事：D3D12 的间接绘制只需要一条命令签名，
+    /// 间接派发需要另一条（argument type 不同，字节步长也不同），所以两道能力位各管各的。
+    /// 现有四端全部接通，但能力位保留 —— 消费者据它决定是否值得为"组数由 GPU 决定"付出
+    /// 一次额外的内核，拿不到就直接按上界派发。
+    ///
+    /// 和绘制不同，这里没有配对的 Prepare 入口，也不需要：DispatchCompute 本身受 ComputePhase 约束、
+    /// 天然在 Pass 之外录制，参数交接与派发是同一次调用。绘制那边之所以要拆成 Prepare + Draw，
+    /// 是因为 Draw 落在 Pass 内，而 PassDesc 禁止在 Pass 体内切资源状态。
+    /// </summary>
+    bool DispatchIndirectSupported => false;
 
     /// <summary>把间接参数缓冲从 compute 写入状态交接到间接读取状态，返回是否已录制。必须在 Pass 之外调用；
     /// 传入非 ComputeAndIndirectArgs 缓冲、或后端未接通时返回 false，调用方据此放弃本帧的间接提交。</summary>

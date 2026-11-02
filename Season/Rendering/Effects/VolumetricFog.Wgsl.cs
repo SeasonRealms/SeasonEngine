@@ -138,6 +138,8 @@ fn CloudSample(uv: vec2f) -> vec4f {
 }
 fn WeatherH(i: i32) -> vec4f { var h=F(u32(118+i)); if(i==0 && F(16u).w<0.5) { h.y=0.0; } return h; }
 fn WeatherR(i: i32,row: i32) -> vec4f { return F(u32(120+i*8+row)); }
+// 2-7 雷电：雾帧里 SceneLightParams 从索引 32 起，WeatherFlash 是其中第 152 行，所以绝对位置是 184。
+fn WeatherFlash() -> vec4f { return F(184u); }
 fn WeatherNoise(uv: vec2f) -> vec4f { return CloudSample(uv); }
 """ + WeatherShaders.CommonWgsl + WeatherShaders.CloudWgsl + """
 fn CloudShadow(p: vec3f,l: vec3f) -> f32 {

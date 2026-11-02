@@ -1128,11 +1128,12 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
     }
 
     // 仅消费成功合成的同帧快照；绑定不转换深度状态，也不改写共享光照参数。
+    // S5: 不再检查 ActivePassId==SceneTransparent —— 门控已上提到 BindSceneFog 用 ViewHasFog 表达，
+    // 这里只保留"合成所有者有效 + 帧/资源匹配"的硬安全校验。
     internal static bool BindTransparent()
     {
         var owner = _transparentOwner;
         if (owner == null || owner._disposed || owner._transparentSlot is not { } slot
-            || Device.ActivePassId != RenderPassId.SceneTransparent
             || Device.GraphicsCommandList != owner._command || Device.FrameIndex != owner._frameIndex
             || Device.GetCurrentRetireFenceValue() != owner._stamp
             || !ReferenceEquals(Device.ActiveTarget, owner._transparentDestination)
@@ -1171,6 +1172,148 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
         Device.EnqueueDeferredRelease(Device.GetCurrentRetireFenceValue(), () =>
         {
             foreach (var ring in _slots) foreach (var slot in ring) slot.Dispose();
+            if (pipeline != 0) ((ID3D12PipelineState*)pipeline)->Release();
+            if (signature != 0) ((ID3D12RootSignature*)signature)->Release();
+        });
+    }
+}
+
+/// <summary>
+/// P0 SSR 加法合成：一条全屏绘制，把反射增量按 One/One 叠进 SceneColor。
+/// 与雾合成不同，它没有自己的目标：颜色附件就是场景色，所以既不清屏也不发布颜色源，
+/// 增量纹理也只读一次 —— 权重在 SSR 核里已经乘完，这里再乘一遍就会和主着色器分叉。
+/// </summary>
+internal sealed unsafe class DXSsrCompositePipeline : SsrCompositePipeline
+{
+    const string Hlsl = """
+Texture2D<float4> reflectionDelta : register(t0);
+float4 PSMain(float4 pos : SV_Position) : SV_Target
+{
+    // Load 而不是采样：增量是逐像素的确定值，线性过滤会在轮廓处把正负差分互相抵消。
+    return float4(reflectionDelta.Load(int3(pos.xy, 0)).rgb, 0.0);
+}
+""";
+
+    readonly Dictionary<string, DXTexture> _textures;
+    ID3D12RootSignature* _signature;
+    ID3D12PipelineState* _pipeline;
+    ID3D12GraphicsCommandList* _command;
+    DXRenderTarget? _destination;
+    DXTexture? _reflection;
+    bool _disposed;
+
+    internal DXSsrCompositePipeline(Dictionary<string, DXTexture> textures)
+    {
+        _textures = textures;
+        try { Initialize(); }
+        catch { Dispose(); throw; }
+    }
+
+    void Initialize()
+    {
+        var ranges = stackalloc DescriptorRange[1];
+        ranges[0] = new() { RangeType = DescriptorRangeType.Srv, NumDescriptors = 1, BaseShaderRegister = 0 };
+        var parameters = stackalloc RootParameter[1];
+        parameters[0] = new() { ParameterType = RootParameterType.TypeDescriptorTable,
+            DescriptorTable = new() { NumDescriptorRanges = 1, PDescriptorRanges = ranges },
+            ShaderVisibility = ShaderVisibility.Pixel };
+        var root = new RootSignatureDesc { NumParameters = 1, PParameters = parameters };
+        using ComPtr<ID3D10Blob> blob = null;
+        using ComPtr<ID3D10Blob> error = null;
+        Device.CheckResult(Device.D3D12.SerializeRootSignature(&root, D3DRootSignatureVersion.Version1,
+            blob.GetAddressOf(), error.GetAddressOf()));
+        ID3D12RootSignature* signature = null;
+        var iid = ID3D12RootSignature.Guid;
+        Device.CheckResult(Device.D3dDevice->CreateRootSignature(0, blob.Get().GetBufferPointer(),
+            blob.Get().GetBufferSize(), &iid, (void**)&signature));
+        _signature = signature;
+        ID3D10Blob* vertex = null; ID3D10Blob* fragment = null;
+        try
+        {
+            vertex = ShaderCompiler.CompileShaderFromSource(VolumetricFogEffect.CompositeVertexHlsl, "VSMain", "vs_5_0");
+            fragment = ShaderCompiler.CompileShaderFromSource(Hlsl, "PSMain", "ps_5_0");
+            var stencil = new DepthStencilopDesc { StencilFailOp = StencilOp.Keep, StencilDepthFailOp = StencilOp.Keep,
+                StencilPassOp = StencilOp.Keep, StencilFunc = ComparisonFunc.Always };
+            var desc = new GraphicsPipelineStateDesc {
+                PRootSignature = _signature,
+                VS = new(vertex->GetBufferPointer(), vertex->GetBufferSize()),
+                PS = new(fragment->GetBufferPointer(), fragment->GetBufferSize()),
+                RasterizerState = new() { FillMode = FillMode.Solid, CullMode = CullMode.None, DepthClipEnable = 1 },
+                DepthStencilState = new() { DepthFunc = ComparisonFunc.Always, FrontFace = stencil, BackFace = stencil },
+                SampleMask = uint.MaxValue, PrimitiveTopologyType = PrimitiveTopologyType.Triangle,
+                NumRenderTargets = 1, SampleDesc = new(1, 0) };
+            // One/One 而不是雾的 One/Zero：这里画的是一份**增量**，负值要能减回场景色。
+            desc.BlendState.RenderTarget[0] = new() { BlendEnable = 1, SrcBlend = Blend.One, DestBlend = Blend.One,
+                BlendOp = BlendOp.Add, SrcBlendAlpha = Blend.One, DestBlendAlpha = Blend.One, BlendOpAlpha = BlendOp.Add,
+                LogicOp = LogicOp.Noop, RenderTargetWriteMask = (byte)ColorWriteEnable.All };
+            desc.RTVFormats[0] = Format.FormatR16G16B16A16Float;
+            ID3D12PipelineState* pipeline = null;
+            iid = ID3D12PipelineState.Guid;
+            Device.CheckResult(Device.D3dDevice->CreateGraphicsPipelineState(&desc, &iid, (void**)&pipeline));
+            _pipeline = pipeline;
+        }
+        finally
+        {
+            if (vertex != null) vertex->Release();
+            if (fragment != null) fragment->Release();
+        }
+    }
+
+    public override bool Prepare(in SsrCompositeInputs inputs)
+    {
+        _destination = null; _reflection = null; _command = null;
+        // 只能在 Pass 之外调用：转换屏障要落在 BeginPass 之前，和雾合成的时序一致。
+        if (_disposed || Device.ActiveTarget != null || Device.GraphicsCommandList == null
+            || inputs.Color is not DXRenderTarget destination) return false;
+        if (destination.Color == null || destination.Desc.ColorFormat != RtFormat.Rgba16Float
+            || destination.Desc.SampleCount != 1 || destination.Desc.DepthFormat != RtFormat.None
+            || destination.HasDepth || destination.RtvIndex == DXRenderTarget.NoRtv
+            || destination.Width == 0 || destination.Height == 0
+            || destination.ColorNativeFormat != Format.FormatR16G16B16A16Float) return false;
+        DXTexture? reflection = null;
+        if (inputs.ReflectionTexture != null)
+            lock (_textures) _textures.TryGetValue(inputs.ReflectionTexture, out reflection);
+        if (reflection == null || !System.Threading.Volatile.Read(ref reflection.Ready)
+            || reflection.NativeResource == null || reflection.Width != destination.Width
+            || reflection.Height != destination.Height
+            || reflection.NativeFormat != Format.FormatR16G16B16A16Float) return false;
+        var command = Device.GraphicsCommandList;
+        reflection.EnsureReadyForRendering(command);
+        reflection.TransitionTo(command, ResourceStates.PixelShaderResource);
+        _destination = destination; _reflection = reflection; _command = command;
+        return true;
+    }
+
+    public override bool Draw()
+    {
+        var destination = _destination; var reflection = _reflection; var command = _command;
+        _destination = null; _reflection = null; _command = null;
+        // 身份与状态都要核对：Prepare 与 Draw 之间可能插入了别的 Pass，此时加法叠错目标就毁掉了整帧。
+        if (_disposed || destination == null || reflection == null || command == null
+            || Device.ActivePassId != RenderPassId.SsrComposite
+            || !ReferenceEquals(Device.ActiveTarget, destination) || Device.GraphicsCommandList != command
+            || reflection.NativeResource == null || !System.Threading.Volatile.Read(ref reflection.Ready)
+            || (reflection.CurrentState & ResourceStates.PixelShaderResource) == 0
+            || destination.CurrentState != ResourceStates.RenderTarget) return false;
+        var heap = Device.SrvHeapManager.Heap;
+        command->SetDescriptorHeaps(1, &heap);
+        command->SetGraphicsRootSignature(_signature);
+        command->SetPipelineState(_pipeline);
+        command->IASetPrimitiveTopology(D3DPrimitiveTopology.D3DPrimitiveTopologyTrianglelist);
+        command->SetGraphicsRootDescriptorTable(0, reflection.GpuDescriptorHandle);
+        command->DrawInstanced(3, 1, 0, 0);
+        return true;
+    }
+
+    public override void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true; _destination = null; _reflection = null; _command = null;
+        nint pipeline = (nint)_pipeline, signature = (nint)_signature;
+        _pipeline = null; _signature = null;
+        if (pipeline == 0 && signature == 0) return;
+        Device.EnqueueDeferredRelease(Device.GetCurrentRetireFenceValue(), () =>
+        {
             if (pipeline != 0) ((ID3D12PipelineState*)pipeline)->Release();
             if (signature != 0) ((ID3D12RootSignature*)signature)->Release();
         });

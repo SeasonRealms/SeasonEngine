@@ -28,8 +28,9 @@ namespace Engine.Panels;
 /// relief, plus a travelling wave evaluated in the vertex stage of the ordinary PBR shader. It keeps the flat-shaded
 /// cartoon read of the static path - three radial sines instead of Gerstner, so no crest sharpening and no ripple
 /// layer - and it costs nothing on the CPU: the only per-frame work is a phase accumulation of two float adds. The
-/// displacement is gated to the water near the camera (see Mesh3D.WaveFadeRadius), so a far horizon and a high
-/// altitude both fall back to the baked relief on a single compare per vertex.
+/// displacement is gated to the water near the camera (see Mesh3D.WaveFadeRadius, 750m), so a far horizon and a high
+/// altitude both fall back to the baked relief on a single compare per vertex; 750m is what makes the sea read as
+/// moving water from the 20m tower deck rather than only from the shore.
 ///
 /// <see cref="Season.Rendering.SeaMode.Dynamic"/> is P3/P4: the visible surface is a
 /// <see cref="Season.Rendering.WaterPlane"/> drawn by the SceneWater pass - the only stage that can both sample this
@@ -57,6 +58,9 @@ namespace Engine.Panels;
 /// Near shore, the FBM relief fades to zero within ShoreDampRange=60m of the land square (L-infinity distance): on the
 /// dynamic path that keeps the 12m water column even so the absorption term reads a flat tint instead of noise shadows,
 /// and on the static path it is what keeps the waterline calm against the beach.
+/// The vertex wave uses a much narrower band of its own (SwellMaskStart=6m, ramping to full amplitude by 24m): the
+/// relief never has to be visible from the shore, the wave does. Sharing the 60m band held the first crest 135m out
+/// and left the water around the east-coast rocks perfectly still.
 /// The useful SeaLevel range is roughly [-7,-1]. Beach tiles are static instances and do not track SeaLevel,
 /// with their top pinned near y=-0.4 and bottoms around y=-11 to -17, so raising the sea too much will flood over the beach top onto the grass seam.
 ///
@@ -77,6 +81,17 @@ internal class Sea : Panel
     // Shoreline parameters
     const float LandHalf = 75f;                     // Half-width of the land square in meters: the 150x150 grass tile becomes +/-75.
     const float ShoreDampRange = 60f;               // Near-shore damping zone where FBM amplitude fades out with smoothstep.
+
+    // Swell shoaling band, kept separate from ShoreDampRange on purpose.
+    // The baked relief has to stay flat 60m out so the static path's waterline holds still against the beach, but the
+    // travelling wave is the one thing that has to be visible from the shore. Sharing that 60m band pushed the swell's
+    // first crest out to 135m from the island centre - a thin strip near the horizon - and left the water around the
+    // east-coast rocks (x about 75..90) perfectly still, which reads as "the wave is on the other side of the island".
+    // Beach tiles pin their top edge at -0.4 and reach about -13 at the bottom, so the shoreline sits within a few
+    // metres of the land square at SeaLevel -3. Starting at 6m keeps every crest off that band, and the short ramp means
+    // the swell grows to full height over roughly three grid cells (3 x 5.512m) instead of fading in forever.
+    const float SwellMaskStart = 6f;                // Distance from the land square where the swell is still fully damped.
+    const float SwellMaskRange = 18f;               // Ramp length; full amplitude at SwellMaskStart + SwellMaskRange (24m).
 
     // Material constants for the two variants. They are fixed at Load time rather than switched at runtime because
     // Mesh3D uploads its material once during Load and UpdateMesh3D never re-reads Surface afterwards; that is why the
@@ -315,11 +330,12 @@ internal class Sea : Panel
                 verts[row + i] = new Vertex
                 {
                     Position = new Vector3(-half + i * step, heights[row + i] - midY, z),
-                    // UV0.x carries the shore mask, not a texture coordinate: the sea has no textures on any path, so
-                    // the channel is free, and the swell shader reads it to flatten the wave over the same beach band
-                    // that damps the baked relief. Sharing ShoreMask with Fbm is what guarantees the two agree - if
-                    // they drifted apart the waterline would walk up and down the sand as the wave moved.
-                    TexCoord = new Vector2(ShoreMask(-half + i * step, z), 0f),
+                    // UV0.x carries the swell mask, not a texture coordinate: the sea has no textures on any path, so
+                    // the channel is free, and the swell shader reads it to attenuate the wave before it reaches the
+                    // beach. Deliberately not ShoreMask - that one is 60m wide because it also flattens the baked
+                    // relief, which would hold the first crest 135m out and leave the east-coast rocks in still water.
+                    // Both masks reach zero before the waterline, which is what keeps the shoreline from walking.
+                    TexCoord = new Vector2(SwellMask(-half + i * step, z), 0f),
                     Normal = normal,
                     Tangent = new Vector4(1, 0, 0, 1),
                     Joints = Vector4.Zero,
@@ -394,18 +410,28 @@ internal class Sea : Panel
     }
 
     /// <summary>
-    /// Shore mask in [0,1]: 0 over the land square and rising to 1 at <see cref="ShoreDampRange"/> offshore, measured as
-    /// the L-infinity distance to the land rectangle so the band follows the square coastline rather than the circle.
-    /// Two consumers, and they must stay identical: <see cref="Fbm"/> multiplies the baked relief by it, and
-    /// <see cref="BuildSurfaces"/> writes it into vertex UV0.x, which is where the swell shader attenuates its own
-    /// displacement. Same value in both places means the wave flattens exactly where the relief does, so the waterline
-    /// against the beach stays where the static path put it.
+    /// Relief mask in [0,1] for the baked shoreline: 0 over the land square and rising to 1 at
+    /// <see cref="ShoreDampRange"/> offshore, measured as the L-infinity distance to the land rectangle so the band
+    /// follows the square coastline rather than the circle. Only <see cref="Fbm"/> consumes it. The vertex wave uses
+    /// the narrower <see cref="SwellMask"/> instead; the two are independent on purpose, see the constants above.
     /// </summary>
     static float ShoreMask(float x, float z)
     {
         // Land and boundary points clamp to zero so the shoreline stays flat under the grass edge.
         float d = MathF.Max(MathF.Max(MathF.Abs(x), MathF.Abs(z)) - LandHalf, 0f);
         return Smoothstep01(d / ShoreDampRange);
+    }
+
+    /// <summary>
+    /// Swell mask in [0,1], written into vertex UV0.x and read by the vertex wave in all four backends.
+    /// Same L-infinity shape as <see cref="ShoreMask"/> but with a much shorter start and ramp, so crests exist from
+    /// roughly 24m offshore instead of 135m. It still reaches zero 6m from the land square, which is past the
+    /// waterline, so a crest can never climb the beach and the shoreline stays where the static path put it.
+    /// </summary>
+    static float SwellMask(float x, float z)
+    {
+        float d = MathF.Max(MathF.Max(MathF.Abs(x), MathF.Abs(z)) - LandHalf, 0f);
+        return Smoothstep01((d - SwellMaskStart) / SwellMaskRange);
     }
 
     /// <summary>Deterministic value noise with smoothstep bilinear interpolation, where (x,z) are continuous coordinates in lattice space.</summary>

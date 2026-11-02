@@ -67,6 +67,18 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
     }
 
+    /// <summary>P0 SSR 加法合成：一条全屏绘制把反射增量叠进 SceneColor，没有独立目标。</summary>
+    public Season.Rendering.SsrCompositePipeline? CreateSsrCompositePipeline()
+    {
+        if (!ComputeSupported) return null;
+        try { return new VKSsrCompositePipeline(DictionaryVKTexture); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[SsrComposite] 创建失败：{ex.Message}");
+            return null;
+        }
+    }
+
     public Season.Rendering.DecalPipeline? CreateDecalPipeline()
     {
         try { return new VKDecalPipeline(DictionaryVKTexture); }
@@ -3325,6 +3337,10 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
     public bool IndirectDrawSupported => ComputeSupported;
 
+    /// <summary>A0.2：间接计算派发（vkCmdDispatchIndirect）。与间接绘制是两道独立能力位，
+    /// 但这里同源：两者都只需要 compute 队列与一个 ComputeAndIndirectArgs 缓冲。</summary>
+    public bool DispatchIndirectSupported => ComputeSupported;
+
     public unsafe bool TryPrepareIndirectArgs(Season.Rendering.StorageBuffer buffer)
     {
         var cmd = Vulkan.Device.GraphicsCommandBuffer;
@@ -3489,6 +3505,18 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         var vk = Vulkan.Device.Vk;
         var kernel = (VKComputeKernel)args.Kernel;
         var bindings = kernel.Desc.Bindings;
+
+        // A0.2 的准入与 D3D12 端同样放在绑定循环之前：失败时不该已经录进去一堆布局转换。
+        VKStorageBuffer indirect = null;
+        if (args.IsIndirect)
+        {
+            indirect = args.Arguments as VKStorageBuffer;
+            if (indirect == null || indirect.Buffer.Buffer.Handle == 0
+                || indirect.Usage != Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs
+                || (args.ArgumentsOffset & 3u) != 0
+                || indirect.SizeInBytes < args.ArgumentsOffset + Season.Rendering.IndirectDispatchArgs.SizeInBytes)
+                return false;
+        }
 
         Vulkan.Device.PushDebugGroup(kernel.LabelZ);
 
@@ -3714,7 +3742,34 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
 
         vk.CmdBindDescriptorSets(cmd, VkPipelineBindPoint.Compute, kernel.PipelineLayout, 0, 1, &set, 0, null);
-        vk.CmdDispatch(cmd, args.GroupsX, args.GroupsY, args.GroupsZ);
+
+        if (indirect != null)
+        {
+            // 参数块刚被上游内核写过，停在 ShaderWrite。派发这里同样要一道独立的 barrier：
+            // vkCmdDispatchIndirect 在 DRAW_INDIRECT 阶段读参数（规范把它与 vkCmdDrawIndirect* 归在同一个阶段），
+            // 而上一段派发的收尾 barrier 的 dstStage 只开到 ComputeShader|VertexShader，覆盖不到它。
+            // 与绘制那条路径的唯一区别是不必拆成两步：派发本身就在 Pass 之外，录制与交接是同一次调用。
+            var indirectBarrier = new VkBufferMemoryBarrier
+            {
+                SType = VkStructureType.BufferMemoryBarrier,
+                SrcAccessMask = VkAccessFlags.ShaderWriteBit,
+                DstAccessMask = VkAccessFlags.IndirectCommandReadBit,
+                SrcQueueFamilyIndex = SVk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = SVk.QueueFamilyIgnored,
+                Buffer = indirect.Buffer.Buffer,
+                Offset = 0,
+                Size = SVk.WholeSize,
+            };
+            vk.CmdPipelineBarrier(cmd,
+                VkPipelineStageFlags.ComputeShaderBit,
+                VkPipelineStageFlags.DrawIndirectBit,
+                0, 0, null, 1, &indirectBarrier, 0, null);
+            vk.CmdDispatchIndirect(cmd, indirect.Buffer.Buffer, args.ArgumentsOffset);
+        }
+        else
+        {
+            vk.CmdDispatch(cmd, args.GroupsX, args.GroupsY, args.GroupsZ);
+        }
 
         // Post-dispatch cleanup:
         // storage textures transition to ShaderReadOnlyOptimal

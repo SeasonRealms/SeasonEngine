@@ -154,7 +154,7 @@ internal static class Device
     static MTLRenderPassDescriptor? _backbufferRpd;
 
     /// <summary>Pass debug labels used for encoder.Label and Xcode GPU capture markers in step 0. The index matches RenderPassId.</summary>
-    static readonly string[] _passLabels = { "Shadow", "Scene", "Post", "OutlineMask", "FinalBlit", "Overlay", "SceneOpaque", "FogComposite", "SceneTransparent", "WeatherComposite", "SceneDecal", "SceneWater" };
+    static readonly string[] _passLabels = { "Shadow", "Scene", "Post", "OutlineMask", "FinalBlit", "Overlay", "SceneOpaque", "FogComposite", "SceneTransparent", "WeatherComposite", "SceneDecal", "SceneWater", "SsrComposite" };
 
     /// <summary>Phase 4 current pass id, written by BeginPass and reset by EndPass.
     /// Pipeline.SetPipeline uses it to route OutlineMask passes to the mask PSO,
@@ -405,6 +405,12 @@ internal static class Device
         if (desc.Id is (Season.Rendering.RenderPassId.FogComposite or Season.Rendering.RenderPassId.WeatherComposite)
             && (desc.ColorTarget is not MTLRenderTarget || desc.DepthTarget != null || desc.VelocityTarget != null))
             throw new ArgumentException("雾合成必须使用独立颜色目标，不能挂载深度或速度。", nameof(desc));
+        // P0 SSR 合成与雾合成的区别只有一处：颜色目标就是 SceneColor 本身（增量叠加，不另开目标），
+        // 但它同样不能挂深度、速度或法线 —— 这些资源这会儿都还是采样源。
+        if (desc.Id == Season.Rendering.RenderPassId.SsrComposite
+            && (desc.ColorTarget is not MTLRenderTarget || desc.DepthTarget != null
+                || desc.VelocityTarget != null || desc.NormalTarget != null))
+            throw new ArgumentException("SSR 合成必须只挂场景色，不能挂载深度、速度或法线。", nameof(desc));
         ActiveColorTarget = null;
         ActiveColorTexture = null;
         // 这三个字段记录的是“真的成了附件”，而不是 PassDesc 请求了什么；下面逐条绑定时才落值。
@@ -453,7 +459,9 @@ internal static class Device
         bool depthOnly = false;
         // D1：贴花只叠加不清屏，无论 PassDesc 怎么写都不允许 Clear —— 清掉的正是刚画完的不透明结果。
         // P2 水面同理：它是叠在已合成的场景色上，清屏会把整幅背景抹成单色。
-        bool decalPass = desc.Id is Season.Rendering.RenderPassId.SceneDecal or Season.Rendering.RenderPassId.SceneWater;
+        // P0 SSR 合成同理：反射增量按加法叠进 SceneColor，清一下就把整帧场景抹掉了。
+        bool decalPass = desc.Id is Season.Rendering.RenderPassId.SceneDecal or Season.Rendering.RenderPassId.SceneWater
+            or Season.Rendering.RenderPassId.SsrComposite;
         var c = desc.ClearColor;
 
         if ((desc.ColorTarget ?? desc.DepthTarget) is MTLRenderTarget rt)
@@ -476,9 +484,10 @@ internal static class Device
                 rpd.ColorAttachments[0].Texture = rt.ColorTexture;
             // 雾合成使用独立的无深度全屏管线；透明阶段再挂载原场景深度。
             // D1 贴花与 P2 水面的深度是采样源而不是附件：同一资源不能既采样又当深度附件。
+            // P0 SSR 合成没有深度需求，且 SceneColor 自带的隐式深度此刻仍要留给透明阶段，不能在这里挂上。
             rpd.DepthAttachment.Texture = desc.Id is Season.Rendering.RenderPassId.FogComposite
                 or Season.Rendering.RenderPassId.WeatherComposite or Season.Rendering.RenderPassId.SceneDecal
-                or Season.Rendering.RenderPassId.SceneWater
+                or Season.Rendering.RenderPassId.SceneWater or Season.Rendering.RenderPassId.SsrComposite
                 ? null : explicitDepth?.DepthTexture ?? rt.DepthTexture;
             // 颜色缺席时 rt 本身就是那张深度图（Shadow），它确实是本 Pass 的深度附件；
             // 否则只有显式深度 RT 算数，用的是 RT 自带的隐式深度时没有 RT 可记。
@@ -561,7 +570,8 @@ internal static class Device
         enc.SetScissorRect(new MTLScissorRect { X = 0, Y = 0, Width = (nuint)vpWidth, Height = (nuint)vpHeight });
 
         // 合成管线在 Draw 完整绑定自身资源，不访问主材质的环境和光照后备资源。
-        if (desc.Id is Season.Rendering.RenderPassId.FogComposite or Season.Rendering.RenderPassId.WeatherComposite) return;
+        if (desc.Id is Season.Rendering.RenderPassId.FogComposite or Season.Rendering.RenderPassId.WeatherComposite
+            or Season.Rendering.RenderPassId.SsrComposite) return;
 
         // Immediate-2D compatibility mode (Season.Rendering.Immediate2DMode):
         // Pipeline.Init and every 3D resource bound below were skipped for the session,

@@ -165,7 +165,7 @@ fn PSMain(varyings : DecalVaryings) -> DecalPixelOut {
 }
 
 // s9：法线目标只开 B 通道写掩码，所以这里只需要把目标粗糙度送到 .z，
-// 八面体法线（.xy）与金属度（.w）由附件里的原值保留。混合用 roughWeight 在 B 通道上插值。
+// 八面体法线（.xy）与反射权重（.w）由附件里的原值保留。混合用 roughWeight 在 B 通道上插值。
 @fragment
 fn PSMainRoughness(varyings : DecalVaryings) -> DecalRoughnessOut {
     var o : DecalRoughnessOut;

@@ -6,14 +6,14 @@ namespace Season.Rendering.Effects;
 
 public sealed partial class ParticleSystemEffect
 {
-    /// <summary>D3D12 cs_5_0: rewrites the five indirect arguments every frame, zeroing the count the compaction pass will raise.</summary>
+    /// <summary>D3D12 cs_5_0: rewrites the five indirect arguments every frame. indexCount / instanceCount / startIndex / baseVertex come from Params; startInstance stays 0.</summary>
     const string ResetHlsl = @"
 cbuffer ParticleResetParams : register(b0)
 {
     float uIndexCount;
-    float uPad0;
-    float uPad1;
-    float uPad2;
+    float uInstanceCount;
+    float uStartIndex;
+    float uBaseVertex;
 };
 
 RWByteAddressBuffer uArgs : register(u0);
@@ -25,10 +25,11 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     {
         // IndirectDrawIndexedArgs: indexCount / instanceCount / startIndex / baseVertex / startInstance.
         // startInstance stays 0 by contract so SV_InstanceID equals the compacted slot on every backend.
+        // 粒子把后三项传 0，于是输出与参数化之前逐位相同；闪电通道传固定的段数。
         uArgs.Store(0u, (uint)uIndexCount);
-        uArgs.Store(4u, 0u);
-        uArgs.Store(8u, 0u);
-        uArgs.Store(12u, 0u);
+        uArgs.Store(4u, (uint)uInstanceCount);
+        uArgs.Store(8u, (uint)uStartIndex);
+        uArgs.Store(12u, (uint)uBaseVertex);
         uArgs.Store(16u, 0u);
     }
 }
@@ -82,12 +83,17 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     uint index = id.x;
     if (index < (uint)uCapacity)
     {
+        // 密度门控按下标有序，不按哈希：放行的是 [0, 密度×预算) 这一段前缀，
+        // 于是 CPU 只派发这一段的下标数即可，晴天与小雪不必按满预算空跑。
+        // 哈希仍然要算，因为下标会被种子平移——平移决定了这一批下标的空间分布。
+        float ordinal = (float)index;
+        float cutoff = uDensity * uCapacity;
         index += (uint)uSeed;
         float h0 = Hash(index * 3u + 1u);
         float h1 = Hash(index * 5u + 7u);
         float h2 = Hash(index * 11u + 23u);
         float h3 = Hash(index * 17u + 41u);
-        if (h3 < uDensity)
+        if (ordinal < cutoff)
         {
             // 相位以寿命为时标，所以原来的 fall 同时就是 [0,1) 的归一化年龄；换算回秒即可闭式积分。
             // 寿命为 0 时 t 与 invLife 一并取零，位置和速度都精确退回未扩展前的结果。
@@ -168,7 +174,12 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                 float f = saturate((1.0 - length(center - asfloat(uFrame.Load4(96u)).xyz) / viewDistance) * 4.0);
                 weight *= f * f * (3.0 - 2.0 * f);
             }
-            if (((uint)uFlags & 8u) != 0u) weight *= saturate((uDensity - h3) * 50.0);
+            if (((uint)uFlags & 8u) != 0u)
+            {
+                // 软边的宽度按放行前缀的 2% 算（至少一个下标）：密度渐变时新放行的粒子
+                // 从零覆盖度开始，不会整批突然出现。旧版按 h3 的 0.02 取边，宽度同阶。
+                weight *= saturate((cutoff - ordinal) / max(cutoff * 0.02, 1.0));
+            }
 
             float4x4 viewProjection = float4x4(
                 asfloat(uFrame.Load4(0u)), asfloat(uFrame.Load4(16u)),
@@ -234,6 +245,7 @@ VSOutput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
     float2 corner = float2((vertexId & 1u) != 0u ? 1.0 : -1.0, (vertexId & 2u) != 0u ? -1.0 : 1.0);
     float3 right = asfloat(uFrame.Load4(64u)).xyz;
     float3 up = asfloat(uFrame.Load4(80u)).xyz;
+    float3 eye = asfloat(uFrame.Load4(96u)).xyz;
     // Frame row 7 = fadeIn / fadeOut (both fractions of the lifetime) / stretch in seconds.
     float3 drawParams = asfloat(uFrame.Load4(112u)).xyz;
     // rows 8..11 是外观曲线与出生形状：曲线模式关闭时标志位为 0，下面这个分支不成立，
@@ -242,6 +254,9 @@ VSOutput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
     float4 tintMid = asfloat(uFrame.Load4(144u));
     float4 tintEnd = asfloat(uFrame.Load4(160u));
     float4 curve = asfloat(uFrame.Load4(176u));
+    float4x4 viewProjection = float4x4(
+        asfloat(uFrame.Load4(0u)), asfloat(uFrame.Load4(16u)),
+        asfloat(uFrame.Load4(32u)), asfloat(uFrame.Load4(48u)));
     float seed = 0.0;
     float2 shape = corner;
     if (curve.w > 0.5)
@@ -268,14 +283,47 @@ VSOutput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
     // 上下两角各偏移半个长度，所以 stretch 为 0 时精确退化回原来的正方形公告板。
     float3 world = center + (right * shape.x + up * shape.y) * size
         + velocity * (drawParams.z * shape.y * 0.5);
-    float4x4 viewProjection = float4x4(
-        asfloat(uFrame.Load4(0u)), asfloat(uFrame.Load4(16u)),
-        asfloat(uFrame.Load4(32u)), asfloat(uFrame.Load4(48u)));
+    float2 uv = corner;
+
+    // ── ribbon 带：闪电通道这类「分段折线」不走公告板 ──
+    // row 12 = (视口宽, 视口高, 最小半宽像素, ribbon 标志)，row 13 = (强度, 雾消光系数, 保留, 保留)。
+    // 标志为 0 时整段不执行，粒子路径的每个字节因此与扩容前一致。
+    float4 ribbon = asfloat(uFrame.Load4(192u));
+    if (ribbon.w > 0.5)
+    {
+        // 这一档的实例记录换了语义：Position 是段中点，Velocity 是半段向量，
+        // 于是「中点 ± 半段」就是两个端点，不需要为每段多存一个实例。
+        float segLen = length(velocity);
+        float3 tangent = segLen > 1e-5 ? velocity / segLen : float3(0.0, 1.0, 0.0);
+        // 面向相机的带：横向取切线与视线的叉积。正对镜头时叉积退化（带子本来就只是一个点），
+        // 退回相机右轴即可，方向此时无关紧要。
+        float3 side = cross(tangent, eye - center);
+        float sideLen = length(side);
+        side = sideLen > 1e-5 ? side / sideLen : right;
+
+        // 最小屏宽：把世界单位的 side 投影到像素空间，得到「一米横向等于几个像素」，
+        // 再反算保底像素宽所需的世界半宽。折线细到亚像素时光栅化会时有时无——那是片元
+        // 根本没产生的丢失，任何时间域补偿都救不回来。TAA 的反应矩形
+        //（ViewTargets.ReactiveRect）只保证已经画出来的像素不被历史拖住，补不上一个不存在的片元。
+        float4 clipSide = mul(float4(side, 0.0), viewProjection);
+        float clipW = max(abs(clipSide.w), 1e-3);
+        float pxPerWorld = max(length(abs(clipSide.xy) / clipW * ribbon.xy * 0.5), 1e-4);
+        float halfWidth = max(size, ribbon.z / pxPerWorld);
+
+        // 沿切线各多伸半个带宽：相邻段在折点处因此重叠，而不是留下一道缝。
+        world = center + tangent * (corner.y * (segLen + halfWidth)) + side * (corner.x * halfWidth);
+        // 横向衰减复用片元里那条 1-dot(uv,uv)：纵向不参与，带子才是一条亮度均匀的线。
+        uv = float2(corner.x, 0.0);
+
+        // 强度与雾衰减都只压覆盖度：片元把 rgb 乘进 alpha，压在 rgb 上会变成平方。
+        float4 trim = asfloat(uFrame.Load4(208u));
+        color.a *= trim.x * exp(-trim.y * length(center - eye));
+    }
 
     VSOutput output;
     output.Position = mul(float4(world, 1.0), viewProjection);
     // Offset 保持未旋转的角点：衰减只取它的平方和，旋转不改变结果，默认路径因此一字未改。
-    output.Offset = corner;
+    output.Offset = uv;
     output.Color = color;
     output.Misc = float4(seed, age, curve.w > 0.5 ? tintMid.w : 0.0, tintStart.w);
     return output;

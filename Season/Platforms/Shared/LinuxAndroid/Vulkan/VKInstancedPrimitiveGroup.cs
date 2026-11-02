@@ -94,7 +94,13 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
     Season.Rendering.StorageBuffer? _cullVisible;
     Season.Rendering.StorageBuffer? _cullPrimInfo;
     int _cullCapacity = -1;
+    /// <summary>已上传到 GPU 的参数表条数。与 <see cref="_cullPrimInfoPending"/> 不等时说明本帧要重传。</summary>
     int _cullPrimitiveCount = -1;
+    /// <summary>CPU 侧已构造好的参数表字节：构造随时可做，上传必须等命令列表进入录制态
+    ///（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。</summary>
+    byte[]? _cullPrimInfoBytes;
+    /// <summary>CPU 侧参数表的条数，-1 表示还没构造过。</summary>
+    int _cullPrimInfoPending = -1;
     bool _cullRegistered;
     bool _cullDrawReady;
     Vector3 _cullLocalCenter;
@@ -362,12 +368,12 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
 
     Vector3 Season.Rendering.IInstanceCullTarget.CullLocalExtents => _cullLocalExtents;
 
-    /// <summary>派生类在实例上传完成后调用：准备剔除资源并上传源矩阵。</summary>
+    /// <summary>派生类在实例上传完成后调用：准备剔除资源。矩阵流上传延后到 Record 相位，
+    /// 见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>。</summary>
     protected void UpdateCullUpload()
     {
         _cullDrawReady = false;
         EnsureCullResources(_instanceCount);
-        UploadCullSource();
     }
 
     /// <summary>容量按 64 对齐，实例数小幅抖动因此不会每帧重建五个缓冲。</summary>
@@ -425,14 +431,26 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
         }
     }
 
+    /// <summary>
+    /// 只构造参数表字节，不碰 GPU —— 构造与上传的安全时机不同：构造随时可做，
+    /// 上传必须等命令缓冲进入录制态（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。
+    /// primitive 集合不变就不重建。
+    /// </summary>
     void EnsureCullPrimitiveInfo()
     {
         if (_cullPrimInfo == null)
             return;
         int n = _opaquePrimitives.Count;
         if (n <= 0 || n > Season.Rendering.InstanceCull.MaxPrimitives)
+        {
+            // 明确记下"没有可传的参数表"：否则 PrepareCullInputs 会拿上一次的字节反复上传，
+            // 条数看起来对得上，内容却是过期的那一份。
+            _cullPrimInfoBytes = null;
+            _cullPrimInfoPending = 0;
+            _cullPrimitiveCount = 0;
             return;
-        if (_cullPrimitiveCount == n)
+        }
+        if (_cullPrimInfoPending == n)
             return;
 
         var bytes = new byte[n * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride];
@@ -444,15 +462,35 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
                 (uint)primitive.Indices.Length, 0u, 0);
         }
 
-        if (Season.Basic.Graphics.Instance.TryUpdateStorageBuffer(_cullPrimInfo, bytes))
-            _cullPrimitiveCount = n;
+        _cullPrimInfoBytes = bytes;
+        _cullPrimInfoPending = n;
     }
 
-    void UploadCullSource()
+    /// <summary>
+    /// A7：把剔除的 CPU 侧输入传到 GPU。由 InstanceCullEffect 在每次派发之前回调，
+    /// 那个相位在 BeforeRender 之后、所有 Pass 之外，也是 Vulkan 命令缓冲唯一处于录制态的时候 ——
+    /// 控制件的 Update 阶段 IsRecording 为假，上传会被静默丢弃，缓冲保持全零。
+    /// </summary>
+    bool Season.Rendering.IInstanceCullTarget.PrepareCullInputs()
     {
-        if (_cullSource == null || _instanceCount <= 0)
-            return;
-        Season.Basic.Graphics.Instance.TryUpdateStorageBuffer(_cullSource,
+        if (!Season.Rendering.InstanceCull.Enabled || _instanceCount <= 0)
+            return false;
+
+        var g = Season.Basic.Graphics.Instance;
+
+        // 参数表跟着几何走而不跟帧走，所以只在条数变了时重传。
+        if (_cullPrimInfoPending != _cullPrimitiveCount)
+        {
+            if (_cullPrimInfoPending <= 0 || _cullPrimInfoBytes == null || _cullPrimInfo == null)
+                return false;
+            int bytes = _cullPrimInfoPending * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride;
+            if (!g.TryUpdateStorageBuffer(_cullPrimInfo, new ReadOnlySpan<byte>(_cullPrimInfoBytes, 0, bytes)))
+                return false;
+            _cullPrimitiveCount = _cullPrimInfoPending;
+        }
+
+        // 矩阵流每帧都变，只传有效段，不留余量。
+        return _cullSource != null && g.TryUpdateStorageBuffer(_cullSource,
             MemoryMarshal.AsBytes(_instanceData.AsSpan(0, _instanceCount)));
     }
 
@@ -498,6 +536,8 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
         _cullPrimInfo?.Dispose(); _cullPrimInfo = null;
         _cullCapacity = -1;
         _cullPrimitiveCount = -1;
+        _cullPrimInfoBytes = null;
+        _cullPrimInfoPending = -1;
         _cullDrawReady = false;
     }
 

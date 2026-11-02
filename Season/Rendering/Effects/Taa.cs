@@ -28,7 +28,8 @@ namespace Season.Rendering.Effects;
 ///
 /// Binding layout (declaration order defines the cross-backend slot convention;
 /// see ComputeBindingType summary):
-/// [0] Params 32B (width, height, 1/width, 1/height, feedback, clipGamma, historyValid, staticFeedback) -> HLSL b0
+/// [0] Params 48B (width, height, 1/width, 1/height, feedback, clipGamma, historyValid, staticFeedback,
+///     reactiveMinX, reactiveMinY, reactiveMaxX, reactiveMaxY) -> HLSL b0
 /// [1] SampledTexture (SceneColor target, rgba16float) -> HLSL t0
 /// [2] SampledTexture (SceneVelocity target, rg16float) -> HLSL t1
 /// [3] SampledTexture (history storage texture) -> HLSL t2
@@ -121,7 +122,7 @@ public sealed class TaaEffect : ComputeEffect
             },
             Bindings = new[]
             {
-                new ComputeBindingDesc { Type = ComputeBindingType.Params, SizeInBytes = 32 },
+                new ComputeBindingDesc { Type = ComputeBindingType.Params, SizeInBytes = 48 },
                 new ComputeBindingDesc { Type = ComputeBindingType.SampledTexture },
                 new ComputeBindingDesc { Type = ComputeBindingType.SampledTexture },
                 new ComputeBindingDesc { Type = ComputeBindingType.SampledTexture },
@@ -225,7 +226,7 @@ public sealed class TaaEffect : ComputeEffect
         state.Writer ^= 1;
         state.Resources[state.Writer][0] = source;
 
-        Span<float> p = stackalloc float[8];
+        Span<float> p = stackalloc float[12];
         p[0] = state.Width;
         p[1] = state.Height;
         p[2] = 1f / state.Width;
@@ -237,6 +238,14 @@ public sealed class TaaEffect : ComputeEffect
         // by reprojection length, so a still camera gets the longer accumulation window that
         // jitter convergence needs while moving pixels keep the original, ghost-free weight.
         p[7] = state.HistoryValid ? RenderQuality.Current.TaaStaticFeedback : 0f;
+        // 反应矩形：由本帧的亮事件生产者（闪电通道）写进视图状态，没有生产者时它保持空矩形
+        // (1,1,0,0)，着色器的区间判定恒假。四项原样送进着色器，CPU 不做任何裁剪——
+        // 生产者已经把矩形夹进 [0,1] 并按线宽膨胀过。
+        var reactive = targets.ReactiveRect;
+        p[8] = reactive.X;
+        p[9] = reactive.Y;
+        p[10] = reactive.Z;
+        p[11] = reactive.W;
 
         g.DispatchCompute(new ComputeDispatchArgs
         {
@@ -361,6 +370,10 @@ cbuffer TaaParams : register(b0)
     float uClipGamma;
     float uHistoryValid;
     float uStaticFeedback;
+    float uReactiveMinX;
+    float uReactiveMinY;
+    float uReactiveMaxX;
+    float uReactiveMaxY;
 };
 
 Texture2D<float4> uScene : register(t0);
@@ -516,6 +529,15 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         bool inside = all(prevUv > 0.0) && all(prevUv < 1.0);
         float w = (uHistoryValid > 0.5 && inside) ? fb : 0.0;
 
+        // 反应矩形（见 ViewTargets.ReactiveRect）：只存在一两帧的亮事件不接受历史。
+        // 静态反馈 0.97 对刚出现的像素意味着 3% 的权重，等历史积到看得见的亮度事件已经结束；
+        // 熄灭之后又要三十多帧才褪干净。矩形由生产者在 Pass 之前按屏幕包围盒写入，空矩形恒不命中。
+        // 这里不跳过历史采样：矩形边界在 warp 内几乎总是混合的，分支省不下那五次取指，
+        // 反而让编译器无法把采样延迟藏进后面的裁剪算术里。
+        bool reactive = uv.x > uReactiveMinX && uv.y > uReactiveMinY
+            && uv.x < uReactiveMaxX && uv.y < uReactiveMaxY;
+        if (reactive) w = 0.0;
+
         uOutput[id.xy] = float4(max(TaaUntonemap(lerp(cur, clamped, w)), 0.0), curRaw.a);
     }
 }
@@ -535,6 +557,10 @@ layout(push_constant) uniform TaaParams
     float uClipGamma;
     float uHistoryValid;
     float uStaticFeedback;
+    float uReactiveMinX;
+    float uReactiveMinY;
+    float uReactiveMaxX;
+    float uReactiveMaxY;
 };
 
 layout(binding = 1) uniform sampler2D uScene;
@@ -669,6 +695,11 @@ void main()
         bool inside = all(greaterThan(prevUv, vec2(0.0))) && all(lessThan(prevUv, vec2(1.0)));
         float w = (uHistoryValid > 0.5 && inside) ? fb : 0.0;
 
+        // 反应矩形：与 HLSL 端逐字同义，理由与「不跳过采样」的取舍见那边的注释。
+        bool reactive = uv.x > uReactiveMinX && uv.y > uReactiveMinY
+            && uv.x < uReactiveMaxX && uv.y < uReactiveMaxY;
+        if (reactive) w = 0.0;
+
         imageStore(uOutput, ivec2(id), vec4(max(TaaUntonemap(mix(cur, clamped, w)), vec3(0.0)), curRaw.a));
     }
 }
@@ -689,6 +720,10 @@ struct TaaParams
     float uClipGamma;
     float uHistoryValid;
     float uStaticFeedback;
+    float uReactiveMinX;
+    float uReactiveMinY;
+    float uReactiveMaxX;
+    float uReactiveMaxY;
 };
 
 static inline float TaaLuma(float3 c)
@@ -831,6 +866,11 @@ kernel void CSMain(
         bool inside = all(prevUv > float2(0.0)) && all(prevUv < float2(1.0));
         float w = (params.uHistoryValid > 0.5 && inside) ? fb : 0.0;
 
+        // 反应矩形：与 HLSL 端逐字同义，理由与「不跳过采样」的取舍见那边的注释。
+        bool reactive = uv.x > params.uReactiveMinX && uv.y > params.uReactiveMinY
+            && uv.x < params.uReactiveMaxX && uv.y < params.uReactiveMaxY;
+        if (reactive) w = 0.0;
+
         uOutput.write(float4(max(TaaUntonemap(mix(cur, clamped, w)), float3(0.0)), curRaw.a), id);
     }
 }
@@ -848,6 +888,10 @@ struct TaaParams
     uClipGamma : f32,
     uHistoryValid : f32,
     uStaticFeedback : f32,
+    uReactiveMinX : f32,
+    uReactiveMinY : f32,
+    uReactiveMaxX : f32,
+    uReactiveMaxY : f32,
 };
 
 @group(0) @binding(0) var<uniform> params : TaaParams;
@@ -994,6 +1038,14 @@ fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
         if (params.uHistoryValid > 0.5 && inside)
         {
             w = fb;
+        }
+
+        // 反应矩形：与 HLSL 端逐字同义，理由与「不跳过采样」的取舍见那边的注释。
+        let reactive = uv.x > params.uReactiveMinX && uv.y > params.uReactiveMinY
+            && uv.x < params.uReactiveMaxX && uv.y < params.uReactiveMaxY;
+        if (reactive)
+        {
+            w = 0.0;
         }
 
         textureStore(uOutput, coord, vec4<f32>(max(TaaUntonemap(mix(cur, clamped, w)), vec3<f32>(0.0)), curRaw.a));

@@ -6,7 +6,7 @@ namespace Season.Rendering;
 
 public sealed partial class InstanceCullEffect
 {
-    // A7 的 WebGPU 侧两份内核。WGSL 的 uniform 结构按 16 字节对齐，CullParams 正好 64 字节，
+    // A7 的 WebGPU 侧四份内核。WGSL 的 uniform 结构按 16 字节对齐，CullParams 正好 64 字节，
     // 与 HLSL/GLSL/MSL 三端逐位一致；dispatch 的 workgroup 数由 C# 给出，与 @workgroup_size 必须相符。
 
     const string ResetWgsl = """
@@ -114,6 +114,37 @@ fn CSMain(@builtin(global_invocation_id) id: vec3<u32>)
 }
 """;
 
+    const string FinalizeWgsl = """
+struct FinalizeParams
+{
+    slotCount: u32,
+    slotStride: u32,
+    groupSize: u32,
+    pad: u32,
+};
+
+@group(0) @binding(0) var<uniform> finalizeParams: FinalizeParams;
+@group(0) @binding(1) var<storage, read> drawArgs: array<u32>;
+@group(0) @binding(2) var<storage, read_write> dispatchArgs: array<u32>;
+
+// 单线程：槽位上限 4，串行读四个 uint 远低于开工作组再做归约同步的成本，
+// 也免去四端各写一遍 workgroup 同步方言（WGSL 没有跨 workgroup 的 device-scope fence）。
+@compute @workgroup_size(1, 1, 1)
+fn CSMain()
+{
+    var maxCount: u32 = 0u;
+    for (var slot: u32 = 0u; slot < finalizeParams.slotCount; slot = slot + 1u)
+    {
+        maxCount = max(maxCount, drawArgs[(slot * finalizeParams.slotStride + 4u) / 4u]);
+    }
+
+    let groups: u32 = (maxCount + finalizeParams.groupSize - 1u) / finalizeParams.groupSize;
+    dispatchArgs[0] = groups;
+    dispatchArgs[1] = finalizeParams.slotCount;
+    dispatchArgs[2] = 1u;
+}
+""";
+
     const string GatherWgsl = """
 struct GatherParams
 {
@@ -132,9 +163,10 @@ struct GatherParams
 @compute @workgroup_size(64, 1, 1)
 fn CSMain(@builtin(global_invocation_id) id: vec3<u32>)
 {
-    let idx: u32 = id.x;
-    let slot: u32 = idx / gatherParams.capacity;
-    let k: u32 = idx % gatherParams.capacity;
+    // 二维映射：X = 槽位内序号，Y = 槽位。固定派发与间接派发共用它，
+    // 于是 A/B 的唯一变量是 X 维的组数。
+    let slot: u32 = id.y;
+    let k: u32 = id.x;
     if (slot >= gatherParams.slotCount) { return; }
 
     let argsBase: u32 = slot * 16u * 5u;

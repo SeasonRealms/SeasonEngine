@@ -28,6 +28,23 @@ internal sealed class WeatherController
     /// </summary>
     internal WeatherRegionSettings? Cover { get; set; }
 
+    /// <summary>
+    /// 当前快照里是否有任何区域带电。雷声合成在第一次为真时启动：不进雷暴就完全不加载模型，
+    /// 进过之后缓存常驻，再进只看本地 WAV。
+    /// </summary>
+    internal bool LightningActive
+    {
+        get
+        {
+            foreach (var region in Field.Regions)
+            {
+                if (region.State.Lightning > 0) return true;
+            }
+
+            return false;
+        }
+    }
+
     // Rocks 位于 X=+75；区域以世界坐标固定，转动或移动相机不改变天气所在位置。
     static readonly WeatherRegionSettings Island = new()
     {
@@ -135,6 +152,9 @@ internal sealed class WeatherController
         // 雷电：乌云到顶、不落雨雪。云厚直接取 1，因为云片数与消光都由它驱动，
         // 闪光只能靠一层足够厚且足够低的云才读得出来。
         WeatherKind.Thunderstorm => new(0, 0, 1, 1),
+        // 雷雨：同样的满厚度雷云，同时落大雨。雨量取 1 与大雨一致，闪电、雷声和雨幕
+        // 都读同一个区域的同一条过渡曲线，切换时雨不会比电先到。
+        WeatherKind.ThunderRain => new(1, 0, 1, 1),
         _ => default,
     };
 
@@ -143,7 +163,7 @@ internal sealed class WeatherController
         WeatherKind.Cloudy => "多云", WeatherKind.Overcast => "阴",
         WeatherKind.LightRain => "小雨", WeatherKind.Rain => "中雨", WeatherKind.HeavyRain => "大雨",
         WeatherKind.LightSnow => "小雪", WeatherKind.HeavySnow => "大雪",
-        WeatherKind.Thunderstorm => "雷电", _ => "晴",
+        WeatherKind.Thunderstorm => "雷电", WeatherKind.ThunderRain => "雷雨", _ => "晴",
     };
 }
 

@@ -6,9 +6,16 @@ namespace Season.Rendering;
 
 public sealed partial class InstanceCullEffect
 {
-    // A7 的 D3D12 侧两份内核。两者的 [numthreads] 必须等于 C# 里的 InstanceCull.ResetThreads(64)
-    // 与 InstanceCull.CullGroupSize(64)，而 MAX_PRIMITIVES 必须等于 InstanceCull.MaxPrimitives(16)：
-    // 这三组数字是"定长寻址"的全部依据，任何一处漂移都表现为参数表错位而不是编译错误。
+    // A7 的 D3D12 侧四份内核。reset 与 cull 的 [numthreads] 必须等于 C# 里的
+    // InstanceCull.ResetThreads(64) 与 InstanceCull.CullGroupSize(64)，MAX_PRIMITIVES 必须等于
+    // InstanceCull.MaxPrimitives(16)：这两组数字是"定长寻址"的全部依据，任何一处漂移都表现为
+    // 参数表错位而不是编译错误。gather 的 [numthreads] 同样是 64，但组数由 X/Y 两维给出，
+    // finalize 固定单线程 —— 它只读 4 个 uint 归约成派发尺寸，没有可并行的部分。
+    //
+    // 参数一律走 cbuffer + 结构体实例，不用 SM5.1 的 ConstantBuffer<T> 模板：DX12 端用 fxc 编 cs_5_0，
+    // 模板形式在那里报 "unrecognized identifier 'ConstantBuffer'"，四份内核会一起注册失败，
+    // 表现为 A7 整体静默退回 CPU 剔除（InstanceCull.Enabled 一直是 false，画面完全正常所以很难察觉）。
+    // 两种写法落在 b0 上的字节布局相同，代码里的字段访问也不必改。
 
     const string ResetHlsl = """
 // A7 reset：把每 (槽位, primitive) 条间接参数写成定值，实例数归零。
@@ -26,7 +33,10 @@ struct ResetParams
     uint pad;
 };
 
-ConstantBuffer<ResetParams> resetParams : register(b0);
+cbuffer ResetParamsCB : register(b0)
+{
+    ResetParams resetParams;
+};
 ByteAddressBuffer primInfo : register(t0);
 RWByteAddressBuffer drawArgs : register(u0);
 
@@ -77,7 +87,10 @@ struct CullParams
     uint pad2;
 };
 
-ConstantBuffer<CullParams> cullParams : register(b0);
+cbuffer CullParamsCB : register(b0)
+{
+    CullParams cullParams;
+};
 ByteAddressBuffer slotMatrices : register(t0);
 ByteAddressBuffer instanceWorlds : register(t1);
 RWByteAddressBuffer drawArgs : register(u0);
@@ -142,6 +155,45 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 }
 """;
 
+    const string FinalizeHlsl = """
+// A7 finalize：把 cull 留在每条参数里的可见数折成一个派发尺寸，写进 IndirectDispatchArgs。
+//
+// 为什么需要它：序号表是压缩过的，CPU 无从得知可见多少个，于是 gather 只能按容量上界派发。
+// 这一步把"上界"换成"实际最大可见数"，让 gather 少跑那批注定早退的线程。
+//
+// 单线程是刻意的。槽位上限是 4，串行读四个 uint 远低于开一个工作组再做归约同步的成本，
+// 也免去了四端各写一遍 threadsync 方言 —— 那种重复正是漂移的来源。
+
+struct FinalizeParams
+{
+    uint slotCount;     // 扫几个槽位，同时就是 dispatch 的 Y 维组数
+    uint slotStride;    // 一个槽位占多少字节的参数表（MaxPrimitives * ARGS_STRIDE）
+    uint groupSize;     // gather 的工作组长，X 维组数 = ceil(maxCount / groupSize)
+    uint pad;
+};
+
+cbuffer FinalizeParamsCB : register(b0)
+{
+    FinalizeParams finalizeParams;
+};
+ByteAddressBuffer drawArgs : register(t0);
+RWByteAddressBuffer dispatchArgs : register(u0);
+
+[numthreads(1, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    FinalizeParams p = finalizeParams;
+    uint maxCount = 0;
+    for (uint slot = 0; slot < p.slotCount; slot++)
+        maxCount = max(maxCount, drawArgs.Load(slot * p.slotStride + 4));
+
+    // maxCount 为 0 时 groups 也是 0：四端都允许"0 组"的派发（它什么都不做），
+    // 所以整组被剔光的帧不需要在 CPU 侧再开一条分支。
+    uint groups = (maxCount + p.groupSize - 1) / p.groupSize;
+    dispatchArgs.Store3(0, uint3(groups, p.slotCount, 1));
+}
+""";
+
     const string GatherHlsl = """
 // A7 gather：第二阶段。剔除只产出"原始序号表 + 每槽位计数"，本内核按序号把实例数据物化到
 // 槽位分段里，绘制端就把这份流当实例缓冲用，实例数由间接参数给出。
@@ -162,7 +214,10 @@ struct GatherParams
     uint pad;
 };
 
-ConstantBuffer<GatherParams> gatherParams : register(b0);
+cbuffer GatherParamsCB : register(b0)
+{
+    GatherParams gatherParams;
+};
 ByteAddressBuffer visibleIds : register(t0);
 ByteAddressBuffer sourceWorlds : register(t1);
 RWByteAddressBuffer sortedWorlds : register(u0);
@@ -172,9 +227,10 @@ RWByteAddressBuffer drawArgs : register(u1);
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
     GatherParams p = gatherParams;
-    uint idx = id.x;
-    uint slot = idx / p.capacity;
-    uint k = idx % p.capacity;
+    // 二维映射：X = 槽位内序号，Y = 槽位。固定派发与间接派发共用它 ——
+    // 唯一会变的是 X 维的组数，所以 A/B 两次运行必须逐像素一致。
+    uint slot = id.y;
+    uint k = id.x;
     if (slot >= p.slotCount)
         return;
 

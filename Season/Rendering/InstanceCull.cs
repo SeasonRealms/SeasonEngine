@@ -61,6 +61,21 @@ public interface IInstanceCullTarget
     Vector3 CullLocalExtents { get; }
 
     /// <summary>
+    /// 每次派发之前回调，让实现方把剔除的 CPU 侧输入（每实例矩阵流与 primitive 参数表）传到 GPU。
+    ///
+    /// 这个回调存在的唯一理由是"相位"：GPU 上传要求命令列表已打开且不在 Pass 内，
+    /// 而控制件的 Update 两个条件都不满足。Windows 主循环先跑 App.Update 再调 Device.BeforeRender，
+    /// 于是 Update 阶段命令列表还停在上一帧关闭后的状态 —— DX12 在那里录 barrier 直接抛 SEH，
+    /// Vulkan 则被 IsRecording 判定静默丢弃（缓冲保持全零，整组实例被误剔，画面只是"少了一批东西"）。
+    /// 两端连失败方式都不一样，正说明上传时机不该由控制件自己决定，而该由"命令列表此刻能不能录"决定。
+    /// 本回调由 <see cref="InstanceCullEffect"/> 在 Record 里调用，刚好落在 BeforeRender 之后、
+    /// 阴影 Pass 之前，是四端唯一共同满足条件的相位。
+    ///
+    /// 返回 false 表示本帧输入不可用，调用方必须跳过该目标；绘制端会自行退回 CPU 整批剔除。
+    /// </summary>
+    bool PrepareCullInputs();
+
+    /// <summary>
     /// 三次派发之后回调，让实现方把重排流与间接参数从 compute 写入状态交接到绘制可读状态，
     /// 返回本帧是否可以直接走间接路径。
     ///
@@ -108,8 +123,15 @@ public static class InstanceCull
     /// <summary>重排实例流的总字节数：槽位 × 容量 × 80。容量只增不减，与实例缓冲同样的策略。</summary>
     public static uint SortedBytes(int capacity) => (uint)(MaxSlots * capacity) * WorldStride;
 
-    /// <summary>gather 内核每槽位要扫的线程数上限，等于容量本身；一次派发覆盖全部槽位。</summary>
-    public static uint GatherGroups(int capacity) => (uint)((long)MaxSlots * capacity + CullGroupSize - 1) / CullGroupSize;
+    /// <summary>
+    /// gather 内核沿 X 的组数上限，X 维是一个槽位内的候选序号。按容量算而不是按实例数算：
+    /// 序号表是压缩过的，CPU 无从得知可见多少个，只有 GPU 知道。
+    /// 走间接派发时这一维改由 finalize 内核写成"最大槽位可见数对应的组数"，容量在这里只是上界。
+    /// </summary>
+    public static uint GatherGroupsX(int capacity) => (uint)((long)capacity + CullGroupSize - 1) / CullGroupSize;
+
+    /// <summary>gather 内核沿 Y 的组数，一个槽位一行。两条派发路径都用这个值：A/B 对比只允许 X 维变化。</summary>
+    public const uint GatherGroupsY = MaxSlots;
 
     /// <summary>reset 内核的线程数：一次覆盖全部槽位与 primitive。</summary>
     public const uint ResetThreads = (uint)(MaxSlots * MaxPrimitives);
@@ -125,6 +147,19 @@ public static class InstanceCull
 
     /// <summary>本帧登记的剔除目标。由各端 group 在创建时加入、销毁时按引用移除。</summary>
     public static readonly List<IInstanceCullTarget> Targets = new();
+
+    /// <summary>
+    /// 进程内走间接派发的 gather 次数。诊断用，两个数字合起来是"这一轮 A/B 到底走了哪条路"的唯一证据：
+    /// 只比较两张截图是不够的——两条路都正确时它们必然相同，但"gather 压根没被派发"同样会让它们相同，
+    /// 而那种情况下这组对比什么也没证明。
+    ///
+    /// 累加发生在 <see cref="InstanceCullEffect"/> 的 DispatchTarget 里，每目标每帧最多加一，
+    /// 所以它与帧数的比值就是实际参与剔除的目标数。
+    /// </summary>
+    public static long IndirectGatherDispatches;
+
+    /// <summary>进程内走固定组数派发的 gather 次数，与 <see cref="IndirectGatherDispatches"/> 互斥且穷尽。</summary>
+    public static long FixedGatherDispatches;
 
     /// <summary>间接参数表中 (slot, primitive) 条目的字节偏移。</summary>
     public static uint ArgsOffset(int slot, int primitive)
@@ -167,9 +202,13 @@ public static class InstanceCull
 /// （Vulkan 在 Pass 内禁止 dispatch，Metal 的 compute 与 render encoder 互斥），而阴影图集整帧只有一张，
 /// 不该随视图重复剔除。
 ///
-/// 每组每帧固定三次派发：reset 填参数表、cull 分槽位压缩、fanout 把槽位 0 的实例数摊到其余 primitive。
-/// 三次都必须在 Pass 之外，这一点与粒子系统的 A0.1 链路完全相同，区别只在于这里产出的是
-/// "每槽位一份间接参数 + 一份原始序号表"，而不是一条唯一的 apply 命令。
+/// 每组每帧固定四次派发：reset 填参数表、cull 分槽位压缩、finalize 把可见数归约成 gather 的派发尺寸、
+/// gather 按序号物化重排流并把实例数扇到其余 primitive。四次都必须在 Pass 之外，这一点与粒子系统的
+/// A0.1 链路完全相同，区别只在于这里产出的是"每槽位一份间接参数 + 一份原始序号表"，而不是一条唯一的
+/// apply 命令。
+///
+/// finalize 只在 gather 走间接派发时才录制（<see cref="IndirectGather"/>）。固定派发不需要它：
+/// CPU 手里的容量就是个足够用的上界，多派出去的空线程各自读一个 uint 就早退。
 /// </summary>
 public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
 {
@@ -177,17 +216,47 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
 
     public override ComputePhase Phase => ComputePhase.FrameStart;
 
+    /// <summary>
+    /// A7 gather 的派发方式开关，也是 A0.2 的第一处真实消费者。
+    ///
+    /// 打开时 gather 的组数由 GPU 决定：finalize 内核把"每槽位可见数的最大值"折成组数写进一个
+    /// 12 字节的 <see cref="IndirectDispatchArgs"/> 块，gather 用 ExecuteIndirect / CmdDispatchIndirect
+    /// 一类原语消费它。关闭时 CPU 按容量上界固定派发。
+    ///
+    /// 两条路径的**线程映射完全相同**（X = 槽位内序号，Y = 槽位），唯一变量是 X 维的组数，
+    /// 所以两次运行的画面必须逐像素一致 —— 这就是 A/B 验证的判据。任何差异都是派发契约的 bug，
+    /// 不是"性能优化的副作用"。
+    ///
+    /// 默认关闭，用环境变量开启，因为它存在的理由是验证而不是提速。实测收益取决于容量与可见数的
+    /// 差距：容量按 64 对齐，而可见数常常只是容量的一个零头，省下的就是那批"读一个 uint 就退出"的
+    /// 空转线程 —— 它们各自很便宜，但数量按槽位数倍乘。
+    /// </summary>
+    public static bool IndirectGather { get; set; } =
+        Environment.GetEnvironmentVariable("SEASON_CULL_INDIRECT") == "1";
+
     readonly Vector4[] _slotMatrices = new Vector4[InstanceCull.MaxSlots * 4];
     readonly uint[] _resetParams = new uint[4];
     readonly uint[] _gatherParams = new uint[4];
+    readonly uint[] _finalizeParams = new uint[4];
     readonly float[] _cullParams = new float[16];
     readonly ComputeResourceRef[] _resetRefs = new ComputeResourceRef[2];
     readonly ComputeResourceRef[] _cullRefs = new ComputeResourceRef[4];
+    readonly ComputeResourceRef[] _finalizeRefs = new ComputeResourceRef[2];
     readonly ComputeResourceRef[] _gatherRefs = new ComputeResourceRef[4];
 
     IGraphics? _graphics;
-    ComputeKernel? _reset, _cull, _gather;
+    ComputeKernel? _reset, _cull, _finalize, _gather;
     StorageBuffer? _slotBuffer;
+
+    /// <summary>
+    /// 12 字节的派发参数块，由 finalize 内核写、gather 读。
+    ///
+    /// 全部剔除目标共用一份，因为同一帧里每一组的四次派发都是背靠背录制的：GPU 读完这个块跑完
+    /// gather 之后，下一组的 finalize 才会覆盖它。共享省掉的是"每组建一个 12 字节缓冲"，
+    /// 代价是将来若改成并行录制多组就必须拆开 —— 到那时这个字段要变成 per-target。
+    /// </summary>
+    StorageBuffer? _dispatchArgs;
+
     bool _routed;
 
     public override bool Initialize(IGraphics g)
@@ -199,10 +268,28 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         {
             _reset = g.CreateComputeKernel(CreateResetKernel());
             _cull = g.CreateComputeKernel(CreateCullKernel());
+            _finalize = g.CreateComputeKernel(CreateFinalizeKernel());
             _gather = g.CreateComputeKernel(CreateGatherKernel());
-            if (_reset == null || _cull == null || _gather == null) { Dispose(); return false; }
+            if (_reset == null || _cull == null || _finalize == null || _gather == null) { Dispose(); return false; }
             _slotBuffer = g.CreateStorageBuffer(InstanceCull.SlotMatrixBytes);
             if (_slotBuffer == null || _slotBuffer.SizeInBytes < InstanceCull.SlotMatrixBytes) { Dispose(); return false; }
+
+            // 派发参数块只要后端支持就建，不跟着开关走：开关是"这一帧想走哪条路"，缓冲是"能不能走"。
+            // 让两者解耦，A/B 就能在同一进程内逐帧切换而不必重启 —— 逐像素比对需要的正是这一点。
+            // 拿不到就退回固定派发，而不是让整个 A7 失效：剔除本身与"gather 怎么被派发"是两件事。
+            if (g.DispatchIndirectSupported)
+            {
+                _dispatchArgs = g.CreateStorageBuffer(Season.Rendering.IndirectDispatchArgs.SizeInBytes,
+                    Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs);
+                if (_dispatchArgs == null
+                    || _dispatchArgs.SizeInBytes < Season.Rendering.IndirectDispatchArgs.SizeInBytes)
+                {
+                    _dispatchArgs = null;
+                    DeviceServices.BaseApp.AddLog(LogType.Backend,
+                        "[InstanceCull] 间接派发参数块创建失败，gather 退回固定组数派发。");
+                }
+            }
+
             InstanceCull.Enabled = true;
             _routed = true;
             return true;
@@ -217,8 +304,13 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
 
     public override void Record(IGraphics g)
     {
-        if (!ReferenceEquals(g, _graphics) || _reset == null || _cull == null || _gather == null || _slotBuffer == null) return;
+        if (!ReferenceEquals(g, _graphics) || _reset == null || _cull == null || _finalize == null
+            || _gather == null || _slotBuffer == null) return;
         if (!CascadedShadow.SunActive && !CascadedShadow.SpotActive) return;
+        // 阴影图复用命中时整个阴影 Pass 会被跳过，剔除与收集的产物没有任何消费者：
+        // 这一帧的四次派发（reset/cull/finalize/gather）连同每槽位的绘制参数都是纯浪费，直接早退。
+        // 早退安全的前提是本帧没有人读这些缓冲——绘制端只由阴影 Pass 驱动，而它这一帧不存在。
+        if (CascadedShadow.ReuseActive) return;
         if (InstanceCull.Targets.Count == 0) return;
 
         // 槽位掩码在这里确定，而不是让内核拿一个"无效矩阵"去猜：未激活槽位直接不参与，
@@ -259,9 +351,16 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
     void DispatchTarget(IGraphics g, IInstanceCullTarget target, int slotMask)
     {
         int count = target.CullInstanceCount;
+        if (count <= 0) return;
+
+        // 上传排在 CullPrimitiveCount 的读取之前，而不是排在容量校验之后：
+        // Web 端那个属性发布的是"参数表已上传"的条数，若先读它再上传，首次运行时它还是 -1，
+        // 校验当场早退，上传于是永远没有机会发生 —— 一个自己锁死自己的顺序。
+        if (!target.PrepareCullInputs()) return;
+
         int capacity = target.CullCapacity;
         int primitives = target.CullPrimitiveCount;
-        if (count <= 0 || capacity < count || primitives <= 0 || primitives > InstanceCull.MaxPrimitives) return;
+        if (capacity < count || primitives <= 0 || primitives > InstanceCull.MaxPrimitives) return;
 
         var source = target.CullSourceWorlds;
         var sorted = target.CullSortedWorlds;
@@ -331,8 +430,38 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             GroupsZ = 1,
         });
 
-        // 3) gather：按序号表把可见实例物化到槽位分段里，顺便把实例数扇到其余 primitive。
-        // 这一次派发扫的是容量而不是实例数，因为序号表是压缩过的，CPU 无从得知可见多少个。
+        // 3) finalize（仅间接路径）：把每槽位的可见数归约成"X 维要派发几组"。
+        //    尺寸只能由 GPU 给出 —— 序号表是压缩过的，CPU 手里只有容量这个上界。
+        //    它是四端里唯一一个 [numthreads(1,1,1)] 的内核：槽位数上限是 4，串行读四个 uint
+        //    比开一个工作组做归约再同步便宜得多，也不必为此在四端各写一遍 threadsync 的方言。
+        bool indirect = IndirectGather && _dispatchArgs != null;
+        if (indirect)
+        {
+            // 扫的槽位数就是 gather 的 Y 维组数，直接取 MaxSlots 而不是 GatherGroupsY：
+            // 两者眼下相等，但语义不同 —— 后者是"派发多少行"，前者是"参数表里有几行"。
+            _finalizeParams[0] = (uint)InstanceCull.MaxSlots;
+            // 槽位跨度 = 一个槽位占多少字节的参数表。写成参数而不是让内核自带常量：
+            // 那条 MAX_PRIMITIVES × 20 的乘法是 reset 与 gather 共同依赖的契约，
+            // 多写一份就多一个漂移点。
+            _finalizeParams[1] = (uint)InstanceCull.MaxPrimitives * InstanceCull.ArgsStride;
+            _finalizeParams[2] = InstanceCull.CullGroupSize;
+            _finalizeParams[3] = 0;
+            _finalizeRefs[0] = args;
+            _finalizeRefs[1] = _dispatchArgs!;
+            g.DispatchCompute(new ComputeDispatchArgs
+            {
+                Kernel = _finalize!,
+                Params = MemoryMarshal.AsBytes(_finalizeParams.AsSpan()),
+                Resources = _finalizeRefs,
+                GroupsX = 1,
+                GroupsY = 1,
+                GroupsZ = 1,
+            });
+        }
+
+        // 4) gather：按序号表把可见实例物化到槽位分段里，顺便把实例数扇到其余 primitive。
+        // X 维是槽位内序号，Y 维是槽位。这个二维映射两条派发路径完全共用 —— 否则 A/B 对比的
+        // 就不是"派发方式"，而是两套寻址，任何差异都无从归因。
         _gatherParams[0] = (uint)capacity;
         _gatherParams[1] = (uint)primitives;
         _gatherParams[2] = (uint)InstanceCull.MaxSlots;
@@ -341,14 +470,21 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         _gatherRefs[1] = source;
         _gatherRefs[2] = sorted;
         _gatherRefs[3] = args;
+        // 计数器放在派发点而不是分支判定处：将来若 finalize 被合并进别的内核，分支还在、gather 却可能
+        // 不再被派发，那时候数字要与真实派发一一对应才有诊断价值。
+        if (indirect) InstanceCull.IndirectGatherDispatches++;
+        else InstanceCull.FixedGatherDispatches++;
         g.DispatchCompute(new ComputeDispatchArgs
         {
             Kernel = _gather!,
             Params = MemoryMarshal.AsBytes(_gatherParams.AsSpan()),
             Resources = _gatherRefs,
-            GroupsX = InstanceCull.GatherGroups(capacity),
-            GroupsY = 1,
+            // 间接路径下这一维被参数块取代，写 0 而不是写一个永远用不上的容量：
+            // 抓帧时"0 组"是"去看参数块"的最短提示。
+            GroupsX = indirect ? 0u : InstanceCull.GatherGroupsX(capacity),
+            GroupsY = InstanceCull.GatherGroupsY,
             GroupsZ = 1,
+            Arguments = indirect ? _dispatchArgs : null,
         });
 
         // 交接放到这里而不是绘制时：draw 在阴影 Pass 内部，Pass 内不允许切资源状态。
@@ -367,17 +503,20 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         }
         _reset?.Dispose(); _reset = null;
         _cull?.Dispose(); _cull = null;
+        _finalize?.Dispose(); _finalize = null;
         _gather?.Dispose(); _gather = null;
         _slotBuffer?.Dispose(); _slotBuffer = null;
+        _dispatchArgs?.Dispose(); _dispatchArgs = null;
         _graphics = null;
     }
 
     // ── Kernel declarations ──
-    // reset:  [0] Params 16B / [1] StorageBufferRead primInfo -> t0 / [2] StorageBufferReadWrite args -> u0
-    // cull:   [0] Params 64B / [1] StorageBufferRead slotMatrices -> t0 / [2] StorageBufferRead source -> t1
-    //         [3] StorageBufferReadWrite args -> u0 / [4] StorageBufferReadWrite visible -> u1
-    // gather: [0] Params 16B / [1] StorageBufferRead visible -> t0 / [2] StorageBufferRead source -> t1
-    //         [3] StorageBufferReadWrite sorted -> u0 / [4] StorageBufferReadWrite args -> u1
+    // reset:    [0] Params 16B / [1] StorageBufferRead primInfo -> t0 / [2] StorageBufferReadWrite args -> u0
+    // cull:     [0] Params 64B / [1] StorageBufferRead slotMatrices -> t0 / [2] StorageBufferRead source -> t1
+    //           [3] StorageBufferReadWrite args -> u0 / [4] StorageBufferReadWrite visible -> u1
+    // finalize: [0] Params 16B / [1] StorageBufferRead args -> t0 / [2] StorageBufferReadWrite dispatch -> u0
+    // gather:   [0] Params 16B / [1] StorageBufferRead visible -> t0 / [2] StorageBufferRead source -> t1
+    //           [3] StorageBufferReadWrite sorted -> u0 / [4] StorageBufferReadWrite args -> u1
     // 64B 远低于 Vulkan push constant 与 WebGPU uniform 的 128B 跨端上限。
 
     static ComputeKernelDesc CreateResetKernel() => new()
@@ -414,6 +553,27 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferReadWrite },
         },
         WorkgroupX = InstanceCull.CullGroupSize,
+        WorkgroupY = 1,
+        WorkgroupZ = 1,
+    };
+
+    static ComputeKernelDesc CreateFinalizeKernel() => new()
+    {
+        Name = "instanceCullFinalize",
+        Source = new ShaderSourceSet
+        {
+            Hlsl = FinalizeHlsl, Glsl = FinalizeGlsl, Msl = FinalizeMsl, Wgsl = FinalizeWgsl, EntryPoint = "CSMain",
+        },
+        Bindings = new[]
+        {
+            new ComputeBindingDesc { Type = ComputeBindingType.Params, SizeInBytes = 16 },
+            new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferRead },
+            new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferReadWrite },
+        },
+        // 一个线程。归约的上限是 MaxSlots(4) 个 uint，开一整个工作组只为了同步四个读远比它本身贵，
+        // 更不用说四端各写一遍 threadsync 的方言（GroupMemoryBarrierWithGroupSync / barrier /
+        // threadgroup_barrier / workgroupBarrier）就意味着四份可能漂移的实现。
+        WorkgroupX = 1,
         WorkgroupY = 1,
         WorkgroupZ = 1,
     };

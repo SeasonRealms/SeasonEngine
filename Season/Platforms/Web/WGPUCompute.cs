@@ -132,6 +132,54 @@ internal sealed class WGPUFogCompositePipeline(bool weather = false) : Season.Re
 }
 
 /// <summary>
+/// P0 SSR 加法合成句柄；原生 PSO、绑定组与 Pass 身份校对由 JS 管理。
+/// 片元只把增量读出来再叠加，权重在 <see cref="Season.Rendering.Effects.SsrEffect"/> 的核里已经算成最终值。
+/// </summary>
+internal sealed class WGPUSsrCompositePipeline : Season.Rendering.SsrCompositePipeline
+{
+    static int _nextId;
+
+    // 顶点复用雾合成那条全屏三角形；片元用 textureLoad 取整数像素，不需要采样器。
+    const string Fragment = """
+@group(0) @binding(0) var reflectionDelta:texture_2d<f32>;
+
+@fragment fn PSMain(@builtin(position) pos:vec4f)->@location(0) vec4f {
+    let delta = textureLoad(reflectionDelta, vec2<i32>(floor(pos.xy)), 0);
+    return vec4f(delta.rgb, 0.0);
+}
+""";
+
+    readonly string _name = $"ssr_composite_{_nextId++}";
+    bool _disposed, _prepared;
+
+    internal bool Initialize() => WebGPUInterop.CreateSsrCompositePipeline(_name,
+        Season.Rendering.Effects.VolumetricFogEffect.CompositeVertexWgsl, Fragment);
+
+    public override bool Prepare(in Season.Rendering.SsrCompositeInputs inputs)
+    {
+        _prepared = false;
+        if (_disposed || inputs.Color is not WGPURenderTarget color || string.IsNullOrEmpty(inputs.ReflectionTexture))
+            return false;
+        _prepared = WebGPUInterop.PrepareSsrComposite(_name, color.Name, inputs.ReflectionTexture);
+        return _prepared;
+    }
+
+    public override bool Draw()
+    {
+        if (_disposed || !_prepared) return false;
+        _prepared = false;
+        return WebGPUInterop.DrawSsrComposite(_name);
+    }
+
+    public override void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true; _prepared = false;
+        WebGPUInterop.DisposeSsrCompositePipeline(_name);
+    }
+}
+
+/// <summary>
 /// A0.1 粒子间接绘制句柄。原生 PSO、绑定组与 Pass 身份校对全在 JS 侧，这边只做类型下转与一次性消费。
 /// Depth 为空是合法输入：场景 Pass 此时跑在默认深度缓冲上，JS 侧改为只要求深度附件存在。
 /// </summary>

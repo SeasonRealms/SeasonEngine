@@ -56,7 +56,8 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     // === A7 逐实例 GPU 剔除 ===
     // Web 这一端没有"group"对象，剔除目标只能挂在网格实例宿主上；C# 侧只持有 StorageBuffer 的 JS 句柄，
     // 真正的 GPUBuffer 在 JS 的 _storageBuffers[Id] 里。与另外三端的一处结构差异是本类的实例流
-    // 每帧由 C# 逐字节下发，所以 _cullSource 的上传点与 InstanceBytes 共用同一个时点，不需要额外挂勾。
+    // 每帧由 C# 逐字节下发，但上传时机仍与另外三端一致：都延后到 Record 相位，
+    // 由 InstanceCullEffect 在 Pass 之外回调 PrepareCullInputs（WebGPU 的 writeBuffer 同样不允许在 Pass 内调用）。
 
     Season.Rendering.StorageBuffer? _cullSource;
     Season.Rendering.StorageBuffer? _cullSorted;
@@ -64,7 +65,13 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     Season.Rendering.StorageBuffer? _cullVisible;
     Season.Rendering.StorageBuffer? _cullPrimInfo;
     int _cullCapacity = -1;
+    /// <summary>已上传到 GPU 的参数表条数。与 <see cref="_cullPrimPendingCount"/> 不等时说明本帧要重传。</summary>
     int _cullPrimitiveCount = -1;
+    /// <summary>CPU 侧已构造好的参数表字节：构造随时可做，上传要等 Pass 之外的相位
+    ///（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。</summary>
+    byte[]? _cullPrimPendingBytes;
+    /// <summary>CPU 侧参数表的条数，-1 表示还没构造过。</summary>
+    int _cullPrimPendingCount = -1;
     bool _cullRegistered;
     Vector3 _cullLocalCenter;
     Vector3 _cullLocalExtents;
@@ -76,6 +83,9 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     /// 而 indexCount 一旦错位画出来就是错的。
     /// </summary>
     int _cullPrimMask = -1;
+    /// <summary>待上传的掩码。两者分开是因为 <see cref="_cullPrimMask"/> 是与绘制端对齐的已上传状态，
+    /// 而这张表可能已经因为几何变化被重建：先写好待传值，上传成功才让绘制端看见。</summary>
+    int _cullPrimPendingMask = -1;
     readonly int[] _cullPrimIndexCounts = new int[Season.Rendering.InstanceCull.MaxPrimitives];
 
     public WGPUInstancedMesh3D(string name)
@@ -318,7 +328,8 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
         return true;
     }
 
-    /// <summary>每帧 Update 末尾调用一次，与 InstanceBytes 的上传同居一个时点。</summary>
+    /// <summary>每帧 Update 末尾调用一次：只备资源。矩阵流上传延后到 Record 相位，
+    /// 见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>。</summary>
     void UpdateCullUpload(Season.Controls.InstancedMesh3D mesh)
     {
         _cullDrawReady = false;
@@ -326,12 +337,6 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
             return;
 
         EnsureCullResources(EnabledInstanceCount, mesh);
-        if (_cullSource == null)
-            return;
-
-        int bytes = EnabledInstanceCount * (int)Season.Rendering.InstanceCull.WorldStride;
-        Season.Basic.Graphics.Instance.TryUpdateStorageBuffer(_cullSource,
-            new ReadOnlySpan<byte>(InstanceBytes, 0, bytes));
     }
 
     /// <summary>
@@ -393,6 +398,8 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     }
 
     /// <summary>
+    /// 只构造参数表字节，不碰 GPU —— 构造与上传的安全时机不同：构造随时可做，
+    /// 上传要等 Pass 之外（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。
     /// 参数表的索引区间必须与 <c>DrawInstancedMesh3DShadow</c> 的迭代顺序逐位对齐，
     /// 所以谓词取完全相同的一份：非透明 + 有几何 + 已上传。
     /// </summary>
@@ -405,8 +412,7 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
         if (surfaces > 31)
         {
             // 一位一个 surface 才装得下；装不下就明确放弃本网格的 GPU 剔除，而不是取前 16 个就当完事。
-            _cullPrimitiveCount = 0;
-            _cullPrimMask = -1;
+            AbandonCullPrimitiveInfo();
             return;
         }
 
@@ -423,8 +429,7 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
                 continue;
             if (n >= Season.Rendering.InstanceCull.MaxPrimitives)
             {
-                _cullPrimitiveCount = 0;
-                _cullPrimMask = -1;
+                AbandonCullPrimitiveInfo();
                 return;
             }
 
@@ -433,13 +438,12 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
             n++;
         }
 
-        if (mask == _cullPrimMask && _cullPrimitiveCount == n)
+        if (mask == _cullPrimPendingMask && _cullPrimPendingCount == n)
             return;
 
-        _cullPrimitiveCount = 0;
         if (n <= 0)
         {
-            _cullPrimMask = -1;
+            AbandonCullPrimitiveInfo();
             return;
         }
 
@@ -448,11 +452,58 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
         for (int i = 0; i < n; i++)
             Season.Rendering.InstanceCull.WritePrimitiveInfo(bytes, i * stride, (uint)_cullPrimIndexCounts[i], 0u, 0);
 
-        if (Season.Basic.Graphics.Instance.TryUpdateStorageBuffer(_cullPrimInfo, bytes))
+        _cullPrimPendingBytes = bytes;
+        _cullPrimPendingCount = n;
+        _cullPrimPendingMask = mask;
+    }
+
+    /// <summary>
+    /// 参数表用不了：待传值与已上传值一起清掉。只清待传值是不够的 ——
+    /// 已上传值仍在发布给绘制端，它会让绘制端按一张过期的表去取索引区间。
+    /// </summary>
+    void AbandonCullPrimitiveInfo()
+    {
+        _cullPrimPendingBytes = null;
+        _cullPrimPendingCount = 0;
+        _cullPrimPendingMask = -1;
+        _cullPrimitiveCount = 0;
+        _cullPrimMask = -1;
+    }
+
+    /// <summary>
+    /// A7：把剔除的 CPU 侧输入传到 GPU。由 InstanceCullEffect 在每次派发之前回调，
+    /// 那个相位在所有 Pass 之外 —— WebGPU 的 writeBuffer 不允许在 Pass 内调用。
+    /// 矩阵流与 IA 实例流逐位相同（都是 20 floats = 80B，与 WorldStride 一致），所以复用 InstanceBytes。
+    /// </summary>
+    bool Season.Rendering.IInstanceCullTarget.PrepareCullInputs()
+    {
+        int count = EnabledInstanceCount;
+        if (!Season.Rendering.InstanceCull.Enabled || count <= 0)
+            return false;
+
+        var g = Season.Basic.Graphics.Instance;
+
+        // 参数表跟着几何走而不跟帧走；掩码要和条数一起比，否则"少一个 surface、多一个 surface"
+        // 会因条数不变而被当成没事发生，indexCount 从此整体错位。
+        if (_cullPrimPendingCount != _cullPrimitiveCount || _cullPrimPendingMask != _cullPrimMask)
         {
-            _cullPrimMask = mask;
-            _cullPrimitiveCount = n;
+            if (_cullPrimPendingCount <= 0 || _cullPrimPendingBytes == null || _cullPrimInfo == null)
+                return false;
+            int primBytes = _cullPrimPendingCount * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride;
+            if (!g.TryUpdateStorageBuffer(_cullPrimInfo,
+                    new ReadOnlySpan<byte>(_cullPrimPendingBytes, 0, primBytes)))
+                return false;
+            _cullPrimitiveCount = _cullPrimPendingCount;
+            _cullPrimMask = _cullPrimPendingMask;
         }
+
+        // 矩阵流每帧都变，只传有效段，不留余量。
+        if (_cullSource == null)
+            return false;
+        int sourceBytes = count * (int)Season.Rendering.InstanceCull.WorldStride;
+        if (sourceBytes > InstanceBytes.Length)
+            return false;
+        return g.TryUpdateStorageBuffer(_cullSource, new ReadOnlySpan<byte>(InstanceBytes, 0, sourceBytes));
     }
 
     /// <summary>
@@ -523,6 +574,9 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
         _cullCapacity = -1;
         _cullPrimitiveCount = -1;
         _cullPrimMask = -1;
+        _cullPrimPendingBytes = null;
+        _cullPrimPendingCount = -1;
+        _cullPrimPendingMask = -1;
         _cullLocalCenter = Vector3.Zero;
         _cullLocalExtents = Vector3.Zero;
         _cullDrawReady = false;

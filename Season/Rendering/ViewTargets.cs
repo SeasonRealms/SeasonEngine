@@ -84,6 +84,9 @@ public sealed class ViewTargets
     /// <summary>Set once this frame's weather curtain produced its output.</summary>
     public bool WeatherOutputReady;
 
+    /// <summary>P0：本帧屏幕空间反射的增量纹理已出版，紧随其后的合成 Pass 才会发出。</summary>
+    public bool SsrOutputReady;
+
     /// <summary>Only after this frame's rain composite succeeded do transparent materials sample weather transmission.</summary>
     public bool WeatherComposited;
 
@@ -97,6 +100,18 @@ public sealed class ViewTargets
     /// what the single-view path always did).
     /// </summary>
     public bool TaaActive;
+
+    /// <summary>
+    /// 本帧 TAA 反应矩形，归一化 uv 空间的 (minX, minY, maxX, maxY)。矩形内的像素不复用历史。
+    ///
+    /// 存在的理由：只存在一两帧的亮事件（闪电通道）在静态反馈 0.97 下第一帧只拿到 3% 权重，
+    /// 等历史积到看得见的亮度事件已经结束；熄灭之后又要三十多帧才褪干净。
+    ///
+    /// 默认值是**空矩形** (1,1,0,0)，它同时也是并集运算的单位元：合并时 x/y 取 min、z/w 取 max，
+    /// 而空矩形在这两个方向上恰好各自等于中性值，所以多个生产者可以无条件合并。
+    /// 没有生产者时任何 uv 都落不进矩形内，着色器那条分支因此恒假，普通帧零成本。
+    /// </summary>
+    public Vector4 ReactiveRect = new(1f, 1f, 0f, 0f);
 
     /// <summary>Downstream consumers read this; TAA itself only reads <see cref="SceneColor"/>.</summary>
     public RenderTarget? EffectiveSceneColor => CompleteSceneColor ?? SceneColor;
@@ -126,8 +141,10 @@ public sealed class ViewTargets
         SceneColorOverride = null;
         FogOutputReady = false;
         WeatherOutputReady = false;
+        SsrOutputReady = false;
         WeatherComposited = false;
         SceneSegmented = false;
+        ReactiveRect = new Vector4(1f, 1f, 0f, 0f);
     }
 
     /// <summary>Drop the published composite when it points at a target that is being retired or rebuilt.</summary>

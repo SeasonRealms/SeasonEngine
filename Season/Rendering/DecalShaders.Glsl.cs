@@ -122,7 +122,7 @@ void main() {
 
     /// <summary>
     /// s9：同时写粗糙度的像素入口。法线附件只开 B 通道写掩码，所以这里只需要把目标粗糙度送到 .z，
-    /// 八面体法线（.xy）与金属度（.w）由附件里的原值保留，混合因子用 <c>roughWeight</c> 在 B 通道上插值。
+    /// 八面体法线（.xy）与反射权重（.w）由附件里的原值保留，混合因子用 <c>roughWeight</c> 在 B 通道上插值。
     /// </summary>
     public const string PixelRoughnessGlsl = PixelCoreGlsl + """
 

@@ -922,10 +922,12 @@ internal class SettingPanel : BoardPanel
         };
         AddPanel(inputSea);
 
-        // Five preset stops rather than a free slider: the sea is stylized, and a handful of values that were actually
-        // looked at beat a continuous control whose extremes nobody would have checked. 1 m is the default and already
-        // near the useful ceiling - the baked relief underneath is about +/-4.5m offshore, the beach slopes around 1:4,
-        // and every extra meter of crest walks the waterline roughly four meters further up the sand.
+        // Ten preset stops rather than a free slider: the sea is stylized, and a handful of values that were actually
+        // looked at beat a continuous control whose extremes nobody would have checked. The list widened at both ends
+        // once the 20m tower deck gave a high vantage point: from up there the small stops read as flat water, and the
+        // old 2.5m ceiling read as only a moderate sea. 1 m stays the default and still matches the baked relief
+        // underneath (about +/-4.5m offshore), so the swell reads as motion added to the existing shape rather than as
+        // a different one.
         inputWaveHeight = new Input()
         {
             WidthMin = WidthMin,
@@ -934,7 +936,7 @@ internal class SettingPanel : BoardPanel
             {
                 var sources = new List<Season.Entities.EData>();
 
-                foreach (var height in new[] { "0.3", "0.6", "1", "1.6", "2.5" })
+                foreach (var height in new[] { "0.3", "0.5", "0.8", "1", "1.5", "2", "2.5", "3", "4", "5" })
                 {
                     sources.Add(new Season.Entities.EData()
                     {
@@ -977,7 +979,9 @@ internal class SettingPanel : BoardPanel
         AddPanel(inputWaveHeight);
 
         // Metres per second of the 90m component, not an abstract multiplier: 9 m/s is a ten-second period, which is
-        // what makes the near water read as ocean swell rather than as a ripple tank.
+        // what makes the near water read as ocean swell rather than as a ripple tank. The ends of the list are chosen
+        // to bracket that: 1.5 m/s is a sixty-second period, slow enough to read as a heave from the tower deck, and
+        // 30 m/s is a three-second period, fast enough that the same crests read as chop instead.
         inputWaveSpeed = new Input()
         {
             WidthMin = WidthMin,
@@ -986,7 +990,7 @@ internal class SettingPanel : BoardPanel
             {
                 var sources = new List<Season.Entities.EData>();
 
-                foreach (var speed in new[] { "3", "6", "9", "14", "20" })
+                foreach (var speed in new[] { "1.5", "3", "4.5", "6", "9", "12", "15", "20", "25", "30" })
                 {
                     sources.Add(new Season.Entities.EData()
                     {

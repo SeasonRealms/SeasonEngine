@@ -30,6 +30,11 @@ public enum RenderPassId
     /// <summary>P2 水面：贴花之后、透明几何之前。同样没有深度附件（遮挡靠着色器里的软件深度测试），
     /// 但多一张开画前的场景色快照作为折射源 —— 本 Pass 的颜色附件不能同时被采样。</summary>
     SceneWater = 11,
+
+    /// <summary>P0 屏幕空间反射合成：不透明段与贴花之后、雾/雨幕合成之前。
+    /// 与雾合成不同，它不另开目标：增量直接按加法并进 SceneColor，因此没有清屏、没有深度附件，
+    /// 也不需要 PublishSceneComposite —— 后面的雾/雨幕读到的是已经含反射的那张场景色。</summary>
+    SsrComposite = 12,
 }
 
 /// <summary>RenderTarget pixel format (cross-platform abstraction mapped to native formats per backend).</summary>
@@ -186,6 +191,16 @@ public static class FrameSchedule
     /// (<see cref="RenderView.UpdateInterval"/>) has to agree on what "this frame" means; backends only read it.</summary>
     public static ulong FrameIndex { get; private set; }
 
+    /// <summary>
+    /// 把帧序号归零。唯一的调用方是逐像素 A/B 的取证钩子。
+    ///
+    /// 需要它的原因是这个序号从进程启动就在递增，而两次运行的加载耗时不同：
+    /// 即使仿真时间已经对齐，截图帧的序号仍会差出几十。凡是拿序号当噪声种子的地方
+    /// （SSR 的蓝噪声偏移就是典型）都会因此画出一模一样的场景配不同的噪声图案，
+    /// 逐像素比对就被这种"无意义的差异"淹没。正常运行路径不调用它。
+    /// </summary>
+    public static void ResetFrameIndex() => FrameIndex = 0;
+
     /// <summary>Feature flags of the view being executed right now. Read by <see cref="RecordPhase"/> so a compute
     /// effect that a view switched off is never even recorded.</summary>
     public static ViewFeature ActiveFeatures { get; private set; } = ViewFeature.All;
@@ -299,6 +314,22 @@ public static class FrameSchedule
     /// <summary>所有 AfterOpaque 效果结束后、开启合成 Pass 前准备只读资源；false 跳过合成。</summary>
     public static Func<IGraphics, bool>? PrepareFogComposite;
 
+    /// <summary>
+    /// P0 屏幕空间反射的合成入口，由 <see cref="Effects.SsrEffect"/> 在注册成功后挂上、退休时摘掉。
+    /// 两个委托同时非 null 才打散场景 Pass —— 与雾合成不同，SSR 只能改写不透明段，
+    /// 透明图元必须画在反射之后（它们的颜色不该被当成反射源，也不该被加法叠一次）。
+    /// null 表示本后端没有加法合成能力，此时 SSR 根本不注册，画面退回天空反射。
+    /// </summary>
+    public static Func<IGraphics, bool>? PrepareSsrComposite;
+    public static Func<IGraphics, bool>? RenderSsrComposite;
+
+    /// <summary>仅在本帧反射增量已出版时置为 true，每帧开始自动清除。</summary>
+    public static bool SsrOutputReady
+    {
+        get => ActiveTargets.SsrOutputReady;
+        set => ActiveTargets.SsrOutputReady = value;
+    }
+
     /// <summary>仅在本帧注入、滤波和积分都完成后置为 true，每帧开始自动清除。</summary>
     public static bool FogOutputReady
     {
@@ -349,11 +380,16 @@ public static class FrameSchedule
         return _preparedParticles.Count > 0;
     }
 
-    /// <summary>提交本帧交接成功的粒子系统，并立刻清表，使每次 Prepare 最多兑付一次提交。</summary>
-    public static void SubmitParticles(IGraphics g)
+    /// <summary>提交本帧交接成功的粒子系统，并立刻清表，使每次 Prepare 最多兑付一次提交。
+    /// 返回真的画出来的系统数。失败不是异常：Prepare 与 Draw 之间夹着 BeginPass，
+    /// 后端可能在 Pass 内重新核对身份；失败本身由各系统按状态翻转自己记日志，这里只汇总。</summary>
+    public static int SubmitParticles(IGraphics g)
     {
-        for (int i = 0; i < _preparedParticles.Count; i++) _preparedParticles[i].Submit(g);
+        int drawn = 0;
+        for (int i = 0; i < _preparedParticles.Count; i++)
+            if (_preparedParticles[i].Submit(g)) drawn++;
         _preparedParticles.Clear();
+        return drawn;
     }
 
     public static bool SceneCollectionActive { get; private set; }
@@ -467,7 +503,9 @@ public static class FrameSchedule
     /// <summary>Scene-normal target for the Scene pass (A0.2 contract clause 2: full-size MatchBackbufferSize Rgba16Float with a zero
     /// optimized clear, created by the backend during initialization when RenderQuality.EffectiveSceneNormals holds, as Scene pass MRT slot 2).
     /// Non-null implies <see cref="SceneVelocity"/> is non-null and the main shader baked NORMAL_OUTPUT; null = no residue in the pipeline.
-    /// Layout: xy = octahedral-encoded world normal in [-1,1], z = Toksvig-corrected roughness, w = metallic. Texels with no opaque surface
+    /// Layout: xy = octahedral-encoded world normal in [-1,1], z = Toksvig-corrected roughness,
+    /// w = the scalar reflection weight the SSR delta is built from (Rec.709 luminance of F0 times ao, and 0 on
+    /// the envCube path where SSR has no base term to replace). Texels with no opaque surface
     /// (sky, background, transparent-only pixels) keep the zero clear, but zero xy is also a legal encoding (+Z), so consumers must tell
     /// "no surface" apart through SceneDepth at the far plane, never through the normal itself.</summary>
     public static RenderTarget? SceneNormal
@@ -785,6 +823,13 @@ public static class FrameSchedule
             return;
         }
 
+        // Shadow reuse has to be decided before the FrameStart phase, not at the pass: A7's instance cull runs
+        // inside that phase and must know whether its output will have a consumer. Entering the shadow pass at all
+        // destroys the atlas contents being reused (the pass clears on entry), so this decision also gates BeginPass.
+        // The test only walks the caster tree and submits nothing, so running it here costs nothing extra.
+        bool shadowReuse = ShadowMap != null && RenderShadow != null && CascadedShadow.EvaluateReuse(app);
+        CascadedShadow.ReuseActive = shadowReuse;
+
         // FrameStart phase, App scope: dispatch before all render passes (strictest-platform contract: VK forbids dispatch
         // inside a pass, and Metal compute/render encoders are mutually exclusive; synchronization is centralized inside
         // backend DispatchCompute). Effects that produce something a single view needs (per-view culling, per-view
@@ -793,10 +838,9 @@ public static class FrameSchedule
 
         // Shadow (before Scene, depth-only; activated after 1-5 registration). It stays outside the view loop because the
         // cascaded atlas is one texture for the whole frame.
-        // Clause 12: the reuse test runs first because it has to walk the caster tree to fingerprint it, and a positive
-        // result must bypass BeginPass rather than the pass body - the pass clears the atlas on entry, so entering it at
-        // all destroys the very contents being reused.
-        if (ShadowMap != null && RenderShadow != null && !CascadedShadow.EvaluateReuse(app))
+        // Clause 12: the reuse result decided above bypasses BeginPass rather than merely returning early from the pass
+        // body - the pass clears the atlas on entry, so entering it at all destroys the very contents being reused.
+        if (ShadowMap != null && RenderShadow != null && !shadowReuse)
         {
             g.BeginPass(new PassDesc
             {
@@ -919,14 +963,27 @@ public static class FrameSchedule
             && !ReferenceEquals(waterSnapshot, waterColorTarget)
             && waterSnapshot.Desc.Width == waterColorTarget.Desc.Width
             && waterSnapshot.Desc.Height == waterColorTarget.Desc.Height;
-        bool split = fogSplit || weatherSplit || decalSplit || waterSplit;
+        // P0 SSR：反射要读「已经画完的不透明场景色」，而那段渲染正把它当颜色附件，同一资源不能既当附件又当采样源；
+        // 合成又必须落在透明图元之前，所以只要这一帧可能出版反射就打散。判据只看能力（委托已挂），
+        // 不看本帧是否 Ready —— 打散是 Pass 结构，不能由一帧的输出倒推，否则同一后端会逐帧换路由。
+        bool ssrSplit = PrepareSsrComposite != null && RenderSsrComposite != null
+            && opaque && (features & ViewFeature.Reflections) != 0
+            && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float } && SceneDepth != null;
+        bool split = fogSplit || weatherSplit || decalSplit || waterSplit || ssrSplit;
+        // S4: 非分段视图同样要走「收集 → 不透明 → 透明」两段。不分段时完整 Scene Pass 会把透明图元
+        // 按场景顺序混进不透明里，于是 ViewFeature.Transparent 形同无效（只请求 Opaque 的小地图照样画出
+        // 光束），透明几何也没有「深度已写完」这个前提。后端把队列硬绑在 SceneOpaque / SceneTransparent
+        // 两个 Pass id 上，所以这里不能沿用 Scene Pass，只能把结构对齐分段路由。
+        bool deferredScene = !split && segmented != null && opaque;
+        // SceneSegmented 的语义保持原样（是否做了雾/天气那类全屏合成分段）：VolumetricFog 与 WeatherCurtain
+        // 都以它为发布输出的前提，而 deferredScene 只是把几何绘制拆成两段，并没有引入这两个合成阶段。
         targets.SceneSegmented = split;
 
         try
         {
             // 未分段时粒子随完整 Scene 绘制提交，交接必须赶在 BeginPass 之前；分段时推迟到透明阶段开启前。
             bool particles = false;
-            if (split)
+            if (split || deferredScene)
             {
                 SceneDrawOrder.BeginCollection();
                 SceneCollectionActive = true;
@@ -941,7 +998,7 @@ public static class FrameSchedule
 
             g.BeginPass(new PassDesc
             {
-                Id = split ? RenderPassId.SceneOpaque : RenderPassId.Scene,
+                Id = split || deferredScene ? RenderPassId.SceneOpaque : RenderPassId.Scene,
                 ColorTarget = SceneColor,
                 DepthTarget = SceneDepth,
                 VelocityTarget = SceneVelocity,
@@ -953,7 +1010,7 @@ public static class FrameSchedule
             });
             try
             {
-                if (opaque && split) segmented!.DrawCollectedOpaque();
+                if (split || deferredScene) segmented!.DrawCollectedOpaque();
                 else if (opaque)
                 {
                     app.DrawScene();
@@ -985,6 +1042,23 @@ public static class FrameSchedule
             // so both scopes run before the composites. App-scope effects only run on the view that closes the frame.
             RecordPhase(g, ComputePhase.AfterOpaque, ComputeScope.View);
             RecordPhase(g, ComputePhase.AfterOpaque, ComputeScope.App, lastView);
+
+            // P0 SSR：贴花已经把粗糙度改完，反射该看到的是最终表面；增量按加法并进 SceneColor，
+            // 因此这一步必须排在雾/雨幕之前 —— 那两个合成会把结果拷进自己的目标并发布颜色源，
+            // 晚于它们就再也写不回最终画面了。透明图元在下面，天然不会被当成反射源。
+            if (ssrSplit && SsrOutputReady && PrepareSsrComposite!(g))
+            {
+                g.BeginPass(new PassDesc
+                {
+                    Id = RenderPassId.SsrComposite,
+                    ColorTarget = SceneColor,
+                    ClearColorEnable = false,
+                    ClearDepthEnable = false,
+                    StoreDepth = false,
+                });
+                try { RenderSsrComposite!(g); }
+                finally { g.EndPass(); }
+            }
 
             if (split)
             {
@@ -1065,6 +1139,29 @@ public static class FrameSchedule
                     finally { g.EndPass(); }
                 }
             }
+            else if (deferredScene && transparent)
+            {
+                // S4: 非分段视图的透明阶段。这里没有雾/天气合成，所以 EffectiveSceneColor 仍是 SceneColor；
+                // sampleFog 传 false —— 视图没请求 Fog，后端据此把体积三件套保持成零门控而不是上一帧的残留。
+                particles = particleSubmit && PrepareParticles(g, EffectiveSceneColor);
+                g.BeginPass(new PassDesc
+                {
+                    Id = RenderPassId.SceneTransparent,
+                    ColorTarget = EffectiveSceneColor,
+                    DepthTarget = SceneDepth,
+                    VelocityTarget = SceneVelocity,
+                    NormalTarget = SceneNormal,
+                    ClearColorEnable = false,
+                    ClearDepthEnable = false,
+                    StoreDepth = true,
+                });
+                try
+                {
+                    segmented!.DrawCollectedTransparent(false);
+                    if (particles) SubmitParticles(g);
+                }
+                finally { g.EndPass(); }
+            }
         }
         finally
         {
@@ -1072,7 +1169,7 @@ public static class FrameSchedule
             // Pass 体内抛出会跳过 SubmitParticles，交接记录必须在这里丢掉：
             // 带着它进下一帧虽不会误绘（Prepare 开头就清表），但会让残留跨帧存在。
             _preparedParticles.Clear();
-            if (split)
+            if (split || deferredScene)
             {
                 try { segmented!.ReleaseSceneCollection(); }
                 finally { SceneDrawOrder.Reset(); }

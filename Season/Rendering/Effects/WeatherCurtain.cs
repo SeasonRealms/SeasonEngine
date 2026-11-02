@@ -20,11 +20,11 @@ public sealed class WeatherCurtainEffect : ComputeEffect, IDisposable
     public const int LightingOffset = 8;
     /// <summary>
     /// 帧缓冲向量数 = 前导 8 行（逆抖动 VP 与相机位置）+ <see cref="SceneLightParams"/> 的全部行。
-    /// 2432B/16 = 152 行，末尾追加雷电后 2448B/16 = 153 行，所以是 161。
+    /// 2432B/16 = 152 行，追加雷电后 153 行，2-8 追加虚拟地面后 154 行，所以是 162。
     /// 这个常量被四端合成管线的绑定字节数共用，也是 js/seasonWebGPU.js 里 _weatherFrameBytes 的唯一依据；
     /// 改 SceneLightParams 的尾部字段时必须同步，否则合成会因为绑定过小而静默丢帧。
     /// </summary>
-    public const int FrameVectorCount = 161;
+    public const int FrameVectorCount = 162;
     readonly Vector4[] _frame = new Vector4[FrameVectorCount];
     IGraphics? _graphics;
     StorageBuffer? _buffer;

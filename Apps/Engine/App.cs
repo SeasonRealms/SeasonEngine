@@ -37,6 +37,13 @@ internal class App : BaseApp
     // Update must run it before sky because skybox tinting and marker visibility read its per-frame cache.
     CelestialLighting celestial;
 
+    /// <summary>
+    /// Clock hour in [0,24), read straight off the celestial clock so scene props switch on the same sun that lights
+    /// them instead of keeping a second timer. The tower beacon opens at 18:00 and closes at 06:00 against this.
+    /// Falls back to sunrise, i.e. daylight, before the driver exists.
+    /// </summary>
+    internal float HourOfDay => Season.Rendering.DayNightCycle.HourFromPhase(celestial?.DayPhase ?? 0f);
+
     // Scene-medium driver: the three authored fog presets, the local volumes they use, and the colonnade the sun-shaft
     // preset needs as an occluder. Update runs right after celestial because the wind drift shares that clock's frame
     // delta and simulation scale rather than reading App.Time.
@@ -52,7 +59,11 @@ internal class App : BaseApp
 
     internal WeatherController weather;
     readonly WeatherVisualState weatherVisuals = new();
+    // 雷电天气的雷声：落雷边沿来自 weatherVisuals，播放的是 Resources/Raw/Musics 里的静态 WAV。
+    readonly ThunderAudio thunderAudio = new();
     WeatherCurtainEffect weatherCurtain;
+    // 闪电通道 V2：每次落雷把通道几何当 ribbon 带间接绘制一次；注册失败时保持 null，退回 v1 的云内发光。
+    LightningEffect lightning;
 
     // 最后一次同步给天气场的房间内腔；房间被缩放或移动后才会重建遮挡区域记录。
     Vector3 weatherCoverMin, weatherCoverMax;
@@ -136,6 +147,8 @@ internal class App : BaseApp
     internal Room room;
 
     internal Pond pond;
+
+    internal Tower tower;
 
     // 池底的焦散贴花。Additive 贴花本身与光照无关，所以由 Update 每帧把阳光倍率写进 Intensity，
     // 否则夜里场景变暗后它会因为对比度反而显得更亮。
@@ -433,6 +446,15 @@ internal class App : BaseApp
                 Season.Basic.Graphics.Instance, new Season.Rendering.Effects.HiZEffect());
         }
 
+        // P0: SSR。紧随 Hi-Z —— 它按名字引用那四级金字塔，注册顺序反了会拿到还没建出来的纹理。
+        // 反射增量的合成入口由它自己挂到 FrameSchedule.Prepare/RenderSsrComposite 上，
+        // 注册失败（后端没有加法合成能力、没有 SceneNormal、天空不是程序化）时两个委托保持 null，
+        // 场景 Pass 也就不打散，画面停在主着色器已经算好的天空 + 地面反射。
+        if (Season.Rendering.FrameSchedule.RegisterCompute(
+                Season.Basic.Graphics.Instance, new Season.Rendering.Effects.SsrEffect()))
+        {
+        }
+
         // 2-3 Step A first acceptance: register VelocityViewEffect.
         // In AfterScene it downsamples full-resolution SceneVelocity into a 480x270 direction-and-magnitude visualization texture.
         // MotionVectors Off or a missing SceneVelocity both degrade gracefully at registration time.
@@ -517,6 +539,13 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         weatherCurtain = new WeatherCurtainEffect();
         if (!FrameSchedule.RegisterCompute(Season.Basic.Graphics.Instance, weatherCurtain))
             weatherCurtain = null;
+
+        // 闪电通道 V2：几何与 args 都在 FrameStart 里写完，绘制则挂在粒子提交列表上，
+        // 与降水共用场景透明阶段的末尾——闪电必须画在雨幕之后、雾合成之前。
+        // 没有 compute 或间接绘制的后端在这里失败，通道不出现，云内发光仍由主着色器给出。
+        lightning = new LightningEffect();
+        if (!FrameSchedule.RegisterCompute(Season.Basic.Graphics.Instance, lightning))
+            lightning = null;
 
         // D1: 屏幕空间贴花。它不在 Compute 相位里，而是一个固定位置的独立 Pass（雾合成之前），
         // 所以注册顺序与上面的相位无关；后端没有实现时这里返回 false 并留下零残留。
@@ -675,6 +704,17 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // 水面本身由 SceneWater Pass 画：Fresnel、折射、Hi-Z 屏幕空间反射与深度吸收全在着色器里。
         Waters.Add(sea.Water);
 
+        // Square observation tower on the open lawn southeast of the spawn: a 3x3 deck at 20 player heights, with a
+        // single 3m flight filling one whole flank. The flight runs east-west, perpendicular to the shoreline, so it
+        // keeps a constant distance from the sea and the climber keeps the sea to the side. A slim mast on the deck
+        // carries a searchlight that sweeps the rock line offshore every night, so the tower is also the harbor
+        // light. See Tower.cs.
+        tower = new Tower();
+        tower.PosX = 48f;
+        tower.PosY = 0f;
+        tower.PosZ = -26f;
+        AddPanel(tower);
+
         CreatePondDecals();
 
         robots = new Robots();
@@ -800,6 +840,13 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // The pond rim and steps are walkable surfaces rather than obstacles: PlayerCollider lifts the player onto them,
         // refuses rises above one step, and keeps the footprint out of the water. See PlayerCollider.RetractLedge.
         collider.Pond = pond;
+        // The tower deck and flight are walkable surfaces as well, so the shaft blocks ground travel by
+        // height alone, and only the thin railings and stair parapets are obstacles. See Tower.cs.
+        collider.Tower = tower;
+        foreach (var blocker in tower.Blockers)
+        {
+            collider.Obstacles.Add(blocker);
+        }
         collider.Obstacles.Add(ball.model);
         collider.Obstacles.Add(ball.bee);
         collider.Obstacles.Add(streetLight.lightsPunctualLamp);
@@ -832,6 +879,10 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         fade = new OcclusionFade();
         foreach (var obstacle in collider.Obstacles)
             fade.Register(obstacle);
+        // Tower structure: not obstacles because it is walkable, but the shaft and the stair mass do stand
+        // between the camera and the player. The railings are already covered by the obstacle loop above.
+        foreach (var part in tower.Occluders)
+            fade.Register(part);
         foreach (var part in room.roomParts)
         {
             if (part.Name is "RoomRoof" or "RoomCeiling")
@@ -944,6 +995,11 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
 
     public override bool Update(float time, float? alpha = null, float? posX = null, float? posY = null, float? width = null, float? height = null, float? posZ = null, float? depth = null)
     {
+        // 逐像素 A/B 的取证钩子（见 AbCapture）：未启用时这两行分别是原样返回与一个静态布尔判断。
+        // delta 必须在 base.Update 之前替换，否则 Time 已经按墙上时钟推进过一帧了。
+        time = AbCapture.FrameDelta(time);
+        AbCapture.Tick();
+
         base.Update(time, alpha: alpha, posX: posX, posY: posY, width: width, height: height);
 
         // Ctrl+S screenshot hotkey, polled from the frame keyboard snapshot base.Update just
@@ -1006,7 +1062,12 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             RequestSaveSettings();
         celestial?.UpdateWeatherBackground();
         bool regionalWeather = WorldSettings.Current.WeatherMode != WeatherMode.Showcase;
-        if (weather != null) weatherVisuals.Update(weather.Field, time, regionalWeather, Camera.Far);
+        if (weather != null)
+        {
+            weatherVisuals.Update(weather.Field, time, regionalWeather, Camera.Far);
+            // 落雷边沿在本帧已经推进，雷声按声速延迟到闪电之后才响；展示模式没有区域闪电，不发声。
+            thunderAudio.Update(time, weatherVisuals, CameraPos, regionalWeather && weather.LightningActive);
+        }
         DayNightCycle.Evaluate(celestial?.DayPhase ?? 0, out _, out float daylight, out _, out _, out _, out _);
         if (precipitation != null)
         {
@@ -1225,6 +1286,8 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         room?.Update(time);
 
         pond?.Update(time);
+
+        tower?.Update(time);
 
         sphere?.Update(time);
 

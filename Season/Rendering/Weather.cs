@@ -6,10 +6,11 @@ namespace Season.Rendering;
 
 /// <summary>
 /// 天气名称只用于配置；具体强度和视觉配方由应用定义。
-/// Thunderstorm 追加在枚举末尾：已保存配置按数值序列化，追加不改变既有值的语义。
-/// 它是「只打雷不下雨」的上位天气，雷雨叠加留给后续 WeatherSample 组合，不在枚举里再拆一支。
+/// Thunderstorm 与 ThunderRain 追加在枚举末尾：已保存配置按数值序列化，追加不改变既有值的语义。
+/// Thunderstorm 是「只打雷不下雨」，ThunderRain 是雷雨：降水与电活动由 WeatherSample 同时给出，
+/// 两者在同一个区域里共存，不需要用户叠两个区域。
 /// </summary>
-public enum WeatherKind { Clear, Cloudy, Overcast, LightRain, Rain, HeavyRain, LightSnow, HeavySnow, Thunderstorm }
+public enum WeatherKind { Clear, Cloudy, Overcast, LightRain, Rain, HeavyRain, LightSnow, HeavySnow, Thunderstorm, ThunderRain }
 
 /// <summary>
 /// 可持久化的世界区域。长度使用米、旋转使用弧度；标量属性避免 JSON 默认忽略 Vector 字段。

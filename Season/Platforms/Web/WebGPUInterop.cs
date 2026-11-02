@@ -354,6 +354,20 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.disposeFogCompositePipeline")]
     internal static partial void DisposeFogCompositePipeline(string name);
 
+    // P0 SSR 加法合成：顶点复用雾合成那条全屏三角形，片元只做 textureLoad + One/One 叠加。
+    // 增量在核里已经是最终值，这里不重算权重 —— 两处各算一遍 Fresnel 与粗糙度，口径迟早会分叉。
+    [JSImport("globalThis.seasonWebGPU.createSsrCompositePipeline")]
+    internal static partial bool CreateSsrCompositePipeline(string name, string vertex, string fragment);
+
+    [JSImport("globalThis.seasonWebGPU.prepareSsrComposite")]
+    internal static partial bool PrepareSsrComposite(string name, string color, string reflection);
+
+    [JSImport("globalThis.seasonWebGPU.drawSsrComposite")]
+    internal static partial bool DrawSsrComposite(string name);
+
+    [JSImport("globalThis.seasonWebGPU.disposeSsrCompositePipeline")]
+    internal static partial void DisposeSsrCompositePipeline(string name);
+
     // A0.1 粒子间接绘制。三段 WGSL 在创建期一次下发，JS 侧按本帧附件形状烘焙 PSO；
     // depth 允许为空，代表场景 Pass 跑在默认深度缓冲上（见 ParticleDrawInputs）。
     [JSImport("globalThis.seasonWebGPU.createParticleDrawPipeline")]
@@ -442,11 +456,14 @@ internal static partial class WebGPUInterop
         [JSMarshalAs<JSType.MemoryView>] Span<byte> bytes);
 
     /// <summary>Must be called outside a render pass (FrameStart/AfterScene phases).
-    /// The JS side encodes writeBuffer plus a standalone compute pass into the current frame encoder.</summary>
+    /// The JS side encodes writeBuffer plus a standalone compute pass into the current frame encoder.
+    /// A0.2: indirectBufferId non-null means the group counts are read from that storage buffer at
+    /// indirectOffset instead of from the three ints, which the JS side then ignores.</summary>
     [JSImport("globalThis.seasonWebGPU.dispatchCompute")]
     internal static partial bool DispatchCompute(
         string name,
         [JSMarshalAs<JSType.MemoryView>] Span<byte> paramsBytes,
         string resourcesJson,
-        int groupsX, int groupsY, int groupsZ);
+        int groupsX, int groupsY, int groupsZ,
+        string? indirectBufferId, int indirectOffset);
 }

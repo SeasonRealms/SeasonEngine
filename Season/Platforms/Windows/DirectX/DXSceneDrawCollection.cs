@@ -60,7 +60,9 @@ internal unsafe sealed class DXSceneDrawCollection
     ulong _stamp;
     bool _live;
     internal static DXSceneDrawCollection? Active { get; private set; }
-    internal static bool SuppressFog { get; private set; }
+    /// <summary>S5: "本视图是否有雾" 正向门控，取代原 SuppressFog 反向语义。
+    /// 由 DrawTransparent(sampleFog) 在重放期设定；BindSceneFog 据此决定走真实合成绑定还是零门控旁路。</summary>
+    internal static bool ViewHasFog { get; private set; }
     internal DXSceneDrawCommand State;
     internal static DXDrawSnapshotArena Arena => Device.FrameContexts[Device.FrameIndex].DrawSnapshots;
     internal int OpaqueCount => _queue.OpaqueCount;
@@ -125,9 +127,9 @@ internal unsafe sealed class DXSceneDrawCollection
     {
         Validate();
         if (Device.ActivePassId != RenderPassId.SceneTransparent) throw new InvalidOperationException("透明队列的 Pass 无效。");
-        SuppressFog = !sampleFog;
+        ViewHasFog = sampleFog;
         try { _queue.DrawTransparent(); }
-        finally { SuppressFog = false; }
+        finally { ViewHasFog = false; }
     }
 
     internal void Release()

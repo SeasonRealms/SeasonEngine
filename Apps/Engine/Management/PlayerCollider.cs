@@ -23,7 +23,7 @@ namespace Engine.Management;
 /// or roofs do not block ground movement, and whether a long jump clears a low obstacle is
 /// determined naturally by the jump arc height.
 /// This class also provides step and floor height queries through FloorHeightUnder, using the
-/// layout of the registered Room and Pond. When the player's footprint touches a step or indoor floor,
+/// layout of the registered Room, Pond, and Tower. When the player's footprint touches a step or indoor floor,
 /// the player is lifted to that top surface and steps back down level by level when leaving.
 /// Walkable surfaces are climbed one riser at a time: a move whose target floor rises more than
 /// StepLimit above the feet is retracted, so raised slabs such as the pond rim are reached only
@@ -46,6 +46,9 @@ internal sealed class PlayerCollider
 
     /// <summary>Registered raised pond: its rim and steps add walkable heights, and its water area blocks entry. Null means no pond.</summary>
     internal Pond Pond;
+
+    /// <summary>Registered observation tower: its deck and flight add walkable heights, and the deck height keeps the shaft unwalkable from the grass. Null means no tower.</summary>
+    internal Tower Tower;
 
     /// <summary>Contact margin: stop 1 mm before intersection to avoid jitter from floating-point boundary ambiguity.</summary>
     const float ContactEpsilon = 1e-3f;
@@ -222,7 +225,13 @@ internal sealed class PlayerCollider
         float baseH = MathF.Max(FloorHeightUnder(start, half), start.Y - half.Y);
         float baseWater = Pond != null ? Pond.WaterOverlap(start, half) : 0f;
 
-        if (!LedgeBlocked(center, half, baseH, baseWater))
+        // Tower guard: once the feet are high enough for a drop to hurt, a move may not reduce the share of the
+        // footprint that stands on the tower's elevated surfaces. Railings are thin obstacles rather than floor boxes,
+        // and Sweep never pushes an already overlapping footprint back, so turning next to a railing can leave the
+        // footprint embedded; this is what keeps that from turning into a 20m fall. See Tower.SupportRatio.
+        float baseSupport = Tower != null && baseH > Tower.DangerHeight ? Tower.SupportRatio(start, half) : 1f;
+
+        if (!LedgeBlocked(center, half, baseH, baseWater, baseSupport))
             return allowed;   // Target is reachable, so no retraction is needed.
 
         // lo always stays reachable, hi always stays blocked.
@@ -238,7 +247,7 @@ internal sealed class PlayerCollider
             if (alongX) probe.X += dir * mid;
             else probe.Z += dir * mid;
 
-            if (LedgeBlocked(probe, half, baseH, baseWater))
+            if (LedgeBlocked(probe, half, baseH, baseWater, baseSupport))
                 hi = mid;
             else
                 lo = mid;
@@ -252,9 +261,12 @@ internal sealed class PlayerCollider
         return retained;
     }
 
-    bool LedgeBlocked(in Vector3 center, in Vector3 half, float baseH, float baseWater)
+    bool LedgeBlocked(in Vector3 center, in Vector3 half, float baseH, float baseWater, float baseSupport)
     {
         if (FloorHeightUnder(center, half) - baseH > StepLimit)
+            return true;
+
+        if (baseSupport < 1f && Tower.SupportRatio(center, half) < baseSupport)
             return true;
 
         return Pond != null && Pond.WaterOverlap(center, half) > baseWater + 1e-6f;
@@ -264,11 +276,11 @@ internal sealed class PlayerCollider
     /// Floor height under the footprint: sample the center plus the four corners and take the maximum.
     /// As soon as the footprint touches a step or indoor floor, the player is lifted to that top surface,
     /// preventing feet from sinking into a higher step ahead. Stepping off lowers symmetrically level by level.
-    /// Without a registered Room or Pond, the floor height is always zero.
+    /// Without a registered Room, Pond, or Tower, the floor height is always zero.
     /// </summary>
     internal float FloorHeightUnder(in Vector3 center, in Vector3 half)
     {
-        if (Room == null && Pond == null)
+        if (Room == null && Pond == null && Tower == null)
             return 0f;
 
         float h = FloorHeightAt(center.X, center.Z);
@@ -282,7 +294,9 @@ internal sealed class PlayerCollider
     float FloorHeightAt(float x, float z)
     {
         float h = Room != null ? Room.FloorHeightAtWorld(x, z) : 0f;
-        return Pond != null ? MathF.Max(h, Pond.FloorHeightAtWorld(x, z)) : h;
+        if (Pond != null)
+            h = MathF.Max(h, Pond.FloorHeightAtWorld(x, z));
+        return Tower != null ? MathF.Max(h, Tower.FloorHeightAtWorld(x, z)) : h;
     }
 
     /// <summary>

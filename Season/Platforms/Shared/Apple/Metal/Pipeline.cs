@@ -258,9 +258,16 @@ internal static class Pipeline
         *(ViewConstants*)_viewBuffers[index][Device.FrameIndex].Contents = constants.Transposed();
     }
 
-    /// <summary>把视图常量推上 VS buffer(11)。Metal 换 Pass 后绑定归零，所以每条绘制都要自带。</summary>
+    /// <summary>
+    /// 把视图常量同时推上 VS 与 FS 的 buffer(11)。Metal 换 Pass 后绑定归零，所以每条绘制都要自带。
+    /// FS 侧的引用只在 S1 分支（<c>viewc.cameraPos.w</c> 作视图槽门控）出现；shadow 通道的 PSO 无 FS 函数，
+    /// Metal 允许在该 encoder 上缓存未消费的 fragment 状态，因此这里不做分支处理。
+    /// </summary>
     internal static void BindView(IMTLRenderCommandEncoder enc, IMTLBuffer view)
-        => enc.SetVertexBuffer(view, 0, ViewConstantsSlot);
+    {
+        enc.SetVertexBuffer(view, 0, ViewConstantsSlot);
+        enc.SetFragmentBuffer(view, 0, ViewConstantsSlot);
+    }
 
     static unsafe IMTLBuffer CreateViewBuffer()
     {
@@ -638,9 +645,10 @@ internal static class Pipeline
         bool sampling = SceneFogParams.X > 0.5f && SceneFogFrame != null
             && SceneFogIntegrated != null && SceneFogLocal != null;
         // 栈上落一份再推送：SetFragmentBytes 会立刻把字节拷进命令流，栈页生命周期足够。
+        // S5: weather 跟随 sampling（"本视图是否有雾"），不再独立检查 ActivePassId==SceneTransparent
+        // —— deferredScene 视图同样在该 pass 里，但并没有合成雾或天气。
         Vector4* p = stackalloc Vector4[1];
-        *p = new Vector4(sampling ? 1 : 0, Device.ActivePassId == RenderPassId.SceneTransparent
-            && FrameSchedule.WeatherComposited ? 1 : 0, 0, 0);
+        *p = new Vector4(sampling ? 1 : 0, sampling && FrameSchedule.WeatherComposited ? 1 : 0, 0, 0);
         enc.SetFragmentBytes((IntPtr)p, 16, SceneFogParamsSlot);
         enc.SetFragmentBuffer(sampling ? SceneFogFrame! : DefaultFogFrameBuffer, 0, SceneFogFrameSlot);
         var dummy = MTLTexture3D.DummyBlack.Image;
@@ -1218,6 +1226,9 @@ struct SceneLights {
     // 2-7 雷电 (offset 2432)：xyz = 当前主导雷击在云内的世界坐标 / w = 回击包络亮度 0~1。
     // w 是唯一总开关；非雷暴天气、区域质量 Off、Showcase 模式下整个字段为零。
     float4 weatherFlash;                   // offset 2432，尾部 2448B
+    // 2-8 环境镜面的虚拟地面 (offset 2448)：xyz = 地面辐亮度（线性 HDR，含 albedo/直射/天空 SH9/1π），
+    // w = 地面所在的世界 Y。只由 SkyLighting.Apply 注入，只在程序化天空分支里被读取。
+    float4 reflectionParams0;              // offset 2448，尾部 2464B
 };
 
 struct MaterialParams {
@@ -1282,9 +1293,10 @@ struct VertexIn {
 // at 2*PI seamless: sin(k*r + n*PHI) is exactly periodic in PHI with period 2*PI/n, so a wrap is invisible. They
 // also put the shorter components slightly faster, which is where deep-water dispersion goes anyway (c = sqrt(g/k)).
 //
-// The shore mask is read from the UV channel. Sea.BuildSurfaces bakes the same smoothstep distance to the island
-// square that damps the mesh's own relief, so the swell flattens over the beach exactly where the baked relief
-// does and the waterline stays put.
+// The mask is read from the UV channel. Sea.BuildSurfaces bakes a smoothstep distance to the island square into it -
+// the swell's own band, 6m to 24m offshore, deliberately narrower than the 60m band that damps the baked relief.
+// It reaches zero before the waterline, so a crest can never climb the beach, while the first visible crest sits
+// close enough to the shore (and to the east-coast rocks) to actually be seen.
 //
 // Written as three named components rather than a loop over constant arrays: dynamic indexing into a const array
 // is the one construct where the four backends' compilers disagree about what is legal, and three explicit terms
@@ -2332,7 +2344,7 @@ struct FragmentOut {
     float4 color    [[color(0)]];
     float2 velocity [[color(1)]];
 #if NORMAL_OUTPUT
-    float4 normal   [[color(2)]];   // A0.2: octahedral world normal xy, roughness, metallic
+    float4 normal   [[color(2)]];   // A0.2: octahedral world normal xy, roughness, P0 reflection weight
 #endif
 };
 #define SEASON_FS_OUT FragmentOut
@@ -2376,6 +2388,10 @@ fragment SEASON_FS_OUT fragment_main(
     // 真正决定“是否采样”的是逐条命令推送的 fogParams.x。
     const device float4* fogFrameData      [[buffer(4)]],
     constant float4& fogParams             [[buffer(5)]],
+    // S1: per-view constants mirrored from VS buffer(11) onto FS buffer(11).
+    // Only cameraPos.w (view slot index, 0 = primary) is read, and only inside the renderMode==0 branch.
+    // BindView above binds both stages, so no other call-site change is needed here.
+    constant ViewConstants& viewc          [[buffer(11)]],
     texture2d<float> albedoMap            [[texture(0)]],
     texture2d<float> normalMap            [[texture(1)]],
     texture2d<float> metallicRoughnessMap [[texture(2)]],
@@ -2612,6 +2628,18 @@ fragment SEASON_FS_OUT fragment_main(
     // In HDR tiers it writes linear color directly and FinalBlit closes the chain.
     if (mat.renderMode == 0u) {
 #if HDR_CHAIN
+        // S1: analytic in-scatter for unlit geometry in secondary views. viewc.cameraPos.w is the view slot
+        // (0 = primary). The primary view still draws its brightness entirely from ApplySceneFog inside
+        // SEASON_RETURN_COLOR, so this branch is pixel-identical to the pre-change behavior on the primary view.
+        // On secondary views DrawTransparent(sampleFog=false) → sampling=false → fogParams=(0,0,0,0),
+        // so scattering-fed geometry such as the beacon beam would
+        // otherwise collapse to a bare 6% albedo film and decouple from the main render.
+        // emissiveFactor is repurposed as the HDR gain on this path (.rgb = gain color, .w = gate);
+        // the unlit path originally reads none of it, so only primitives that explicitly opt in (the beacon
+        // beam in Tower.cs) light up; every other primitive keeps emissiveFactor at zero and stays unchanged.
+        if (viewc.cameraPos.w > 0.5 && mat.emissiveFactor.w > 0.0) {
+            albedo = albedo + mat.emissiveFactor.rgb * alpha;
+        }
         // Sprite2D:
         // unlit path, direct linear output, then the FinalBlit exposure plus ACES plus gamma chain closes it at step B.
         SEASON_RETURN_COLOR(float4(albedo, alpha));
@@ -2680,7 +2708,8 @@ fragment SEASON_FS_OUT fragment_main(
     }
 
 #if NORMAL_OUTPUT
-    normal_ = float4(OctEncodeNormal(N), roughness, metallic);
+    // P0 起第 4 通道不再是 metallic：它是 SSR 差分要用的**反射权重**，必须等 F0 与 ao 都算出来才能写，
+    // 所以写入点挪到下面的反射项之后（见 ambient += reflectionRadiance 那一行）。
 #endif
 
     float3 V = normalize(lights.cameraPos.xyz - in.vWorldPos);
@@ -2776,31 +2805,63 @@ fragment SEASON_FS_OUT fragment_main(
     // the specular term uses mirrored reflection from radiance cube LOD0.
     // There is no mip chain and no GGX prefiltering,
     // so it is masked by one-minus-roughness squared and rough-surface environment energy is carried by the SH9 diffuse term above.
-    // 2-7 P0：程序化天空下 EnvironmentMap 停在 Diffuse 档（没有 radiance cube），环境镜面改由 Sky-View LUT 提供。
-    // 两者互斥，且 skyParams0.w 是 UBO 常量，所以这里是一个 uniform 分支，只采一次；
-    // 同时它也蕴含了 envParams.w，不必再查环境图是否就绪。
-    // LUT 是没有任何预滤波的全分辨率天空，只适合接近镜面的表面，因此再叠一次 (1-roughness)^2，
-    // 总权重退化为 (1-r)^4；粗糙面的环境能量仍由 SH9 漫反射承担。
+    // 2-8 的两处修正都只发生在程序化天空分支里，else 分支（envCube）保持 1-7 的原式不变，
+    // 这样只开贴图立方图的预设仍是零回归：
+    //   A. R.y < 0 时 Sky-View LUT 那一侧几乎是黑的（朝下的射线只穿过视点到地面那几百米空气，
+    //      而地面自身被照亮后的辐亮度根本没有被加进去），于是改用 CPU 预算好的地面辐亮度，
+    //      地平线两侧用 smoothstep 过渡。镜面球下半部分本来就该映出草地，而不是黑。
+    //   B. 粗糙端不再靠再叠一次 (1-roughness)^2 把镜面压成零：金属的漫反射项被 (1-metallic) 乘掉，
+    //      压成零就等于金属在粗糙之后完全失去环境能量。改为按 (1-roughness)^2 在镜面采样与
+    //      giDiffuse（半球平均，已是 E/pi 且含 DDGI 的地面反弹）之间插值。粗糙时 R 本来就贴近 N，
+    //      用 N 上的辐照度近似反射叶内的平均入射辐射，不必再采一次探针。
     float3 R = reflect(-V, N);
-    float specMask = (1.0 - roughness) * (1.0 - roughness);
+    float mirrorW = (1.0 - roughness) * (1.0 - roughness);
     float3 reflectionRadiance; float specGate;
     if (lights.skyParams0.w > 0.0)
     {
-        reflectionRadiance = SampleSkyViewRadiance(skyView, texSampler, R);
-        specMask *= specMask;
+        float3 skyRadiance = SampleSkyViewRadiance(skyView, texSampler, R);
+        // 观察点必须在地面之上，地面项才有意义；否则（贴地或穿地的相机）一律退回天空。
+        float aboveGround = step(lights.reflectionParams0.w, in.vWorldPos.y);
+        float horizonW = max(smoothstep(-0.09, 0.09, R.y), 1.0 - aboveGround);
+        skyRadiance = mix(lights.reflectionParams0.xyz, skyRadiance, horizonW);
+        reflectionRadiance = mix(giDiffuse, skyRadiance * lights.envParams.x, mirrorW);
         specGate = 1.0;
     }
     else
     {
-        reflectionRadiance = envCube.sample(texSampler, R, level(0.0)).rgb;
+        // 1-7 原式：LOD0 镜面 × envParams.x × (1-r)^4。
+        reflectionRadiance = envCube.sample(texSampler, R, level(0.0)).rgb * lights.envParams.x * mirrorW * mirrorW;
         specGate = step(0.5, lights.envParams.w);
     }
-    ambient += reflectionRadiance * lights.envParams.x * F0 * specMask * ao * specGate;
+    ambient += reflectionRadiance * F0 * ao * specGate;
 
-    // 2-7：雷击对地面的均匀照亮。走环境项而不是瞬时点光：云底到地面的距离让 1/d² 退化成
-    // 一成不变的亮度，还会在 8 盏光的预算里挤掉场景灯。
+#if NORMAL_OUTPUT
+    // P0 SSR 的 F0 通道。合成端要做的是「把天空那一项换成屏幕空间命中」，
+    // 恒等式是 Δ = conf·(1-r)²·(F0·ao)·(ssr − reflSky)：giDiffuse 在差里抵消，
+    // 所以这里只需要一个标量权重，用 Rec.709 亮度把 F0 压成一维。
+    // 丢掉的只是色偏（金球 vs 银球），因为 Δ 是替换量、不是颜色本身；换来的是不必为 SSR 再开一个 MRT 目标。
+    // envCube 分支写 0：那条路径的基项是贴图立方图，SSR 核拿不到它，替换只会算错。
+    normal_ = float4(OctEncodeNormal(N), roughness,
+        lights.skyParams0.w > 0.0 ? dot(F0, float3(0.2126, 0.7152, 0.0722)) * ao : 0.0);
+#endif
+
+    // 2-7：雷击的照明。v1 把它并进环境项，于是任何朝向都均匀变亮——山脊背面也亮，
+    // 与「闪电在那边」对不上。v2 给出方向，做法与 DX12 逐字一致：
+    //   光源取击穿点在地面投影处、高度夹进 [地面, 击穿点]；衰减用 1/(1+d²/R²)，R=400 m；
+    //   朗伯项保留 25% 的底，因为通道有多段分支，总有某一段能照到背光面；
+    //   系数 1.6 使 400 m 处恰好回到 v1 的 0.8，远景亮度不变。
     if (lights.weatherFlash.w > 0.0)
-        ambient += albedo * ao * (1.0 - metallic) * lights.weatherFlash.w * float3(0.55, 0.62, 0.85) * 0.8;
+    {
+        float flashGround = min(lights.reflectionParams0.w, lights.weatherFlash.y);
+        float3 flashTo = float3(lights.weatherFlash.x,
+            clamp(in.vWorldPos.y, flashGround, lights.weatherFlash.y), lights.weatherFlash.z) - in.vWorldPos;
+        float flashDist2 = dot(flashTo, flashTo);
+        float3 flashL = flashTo * rsqrt(max(flashDist2, 1e-4));
+        float flashFace = clamp(dot(N, flashL) * 0.75 + 0.25, 0.0, 1.0);
+        float flashFall = 1.0 / (1.0 + flashDist2 * (1.0 / 160000.0));
+        ambient += albedo * ao * (1.0 - metallic) * lights.weatherFlash.w * flashFace * flashFall
+            * float3(0.55, 0.62, 0.85) * 1.6;
+    }
 
     float3 color = ambient + Lo + emissive;
 

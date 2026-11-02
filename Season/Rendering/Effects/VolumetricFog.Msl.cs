@@ -173,7 +173,7 @@ kernel void CSMain(constant float4& params [[buffer(0)]],texture3d<float,access:
             }
         }
         float4 header=F(118); if(F(16).w<0.5) header.y=0;
-        WeatherCloudContext<const device float4*> weather{header,F(119),data+120,cloudNoise};
+        WeatherCloudContext<const device float4*> weather{header,F(119),data+120,cloudNoise,F(184)};
         return (1.0-F(116).x*saturate(1.0-exp(-tau)))*weather.WeatherCloudShadow(p,l);
     }
     float ShadowTile(float3 p,uint matrixIndex,int tile) const {

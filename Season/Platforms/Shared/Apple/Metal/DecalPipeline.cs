@@ -122,7 +122,7 @@ internal sealed class MTLDecalPipeline : DecalPipeline
         color.DestinationAlphaBlendFactor = MTLBlendFactor.One;
         if (roughness)
         {
-            // 只写 .z（Blue）：法线的八面体编码在 .xy，金属度在 .w，两者必须保留。
+            // 只写 .z（Blue）：法线的八面体编码在 .xy，反射权重在 .w，两者必须保留。
             // 混合用 coverage 做 lerp，coverage 为 0 时结果恰好等于原值，所以「不碰粗糙度」的贴花不会改变目标。
             var normal = desc.ColorAttachments[1];
             normal.PixelFormat = MTLPixelFormat.RGBA16Float;

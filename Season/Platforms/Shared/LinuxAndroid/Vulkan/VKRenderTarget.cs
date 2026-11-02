@@ -668,6 +668,15 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
         => CreateDecalRenderPassForFormat(colorFormat, false);
 
     /// <summary>
+    /// P0 SSR 加法合成的 render pass。附件形态与「不写法线」的贴花完全一致：单颜色附件、Load、
+    /// 没有深度附件、initial/finalLayout 都是 <c>ShaderReadOnlyOptimal</c>。
+    /// 理由也相同 —— 反射增量在 Pass 外由核写成采样布局，合成只把它按加法并进 SceneColor，
+    /// 而后续的雾/雨幕合成又要按采样布局读这张颜色，所以借同一条烘焙路径而不是另写一份。
+    /// </summary>
+    internal static RenderPass CreateSsrCompositeRenderPassForFormat(Format colorFormat)
+        => CreateDecalRenderPassForFormat(colorFormat, false);
+
+    /// <summary>
     /// Depth-only RP (shadow map): a single D32 attachment with Clear/Store
     /// (StoreDepth=true, so depth is itself the output),
     /// and finalLayout=ShaderReadOnlyOptimal for direct sampling by later passes.

@@ -141,6 +141,9 @@ float4 CloudSample(float2 uv) {
 }
 float4 WeatherH(int i) { float4 h=F(118+i); if(i==0 && F(16).w<0.5) h.y=0; return h; }
 float4 WeatherR(int i,int row) { return F(120+i*8+row); }
+// 2-7 雷电：雾帧里 SceneLightParams 从索引 32 起，WeatherFlash 是其中第 152 行，所以绝对位置是 184。
+// 图形管线读的是 cbuffer 同名成员，两边是同一份数据；缺了这一行 CloudHlsl 编不过，整条雾链在 Initialize 被拒。
+float4 WeatherFlash() { return F(184); }
 float4 WeatherNoise(float2 uv) { return CloudSample(uv); }
 """ + WeatherShaders.CommonHlsl + WeatherShaders.CloudHlsl + """
 float CloudShadow(float3 p,float3 l) {

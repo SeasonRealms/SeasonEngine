@@ -29,6 +29,16 @@ public unsafe class DXTexture : IDisposable
 
     public ID3D12Resource* _textureResource = null;
 
+    /// <summary>
+    /// 原生资源与格式的只读视图。与 <see cref="DXTexture3D"/>、<see cref="DXTextureCube"/> 上的同名成员同义：
+    /// SSR 合成要在 Pass 之外按「资源非空、格式为 R16G16B16A16Float」两道条件筛选它拿到的贴图，
+    /// 而那两个类型早就有这两个属性，这里补齐以免调用侧被迫区分具体类型。
+    /// </summary>
+    internal ID3D12Resource* NativeResource => _textureResource;
+
+    /// <summary>创建时记录的 DXGI 格式。</summary>
+    internal Format NativeFormat => _format;
+
     uint _srvDescriptorSize;
 
     public uint Width;
