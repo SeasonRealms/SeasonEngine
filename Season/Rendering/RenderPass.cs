@@ -250,6 +250,8 @@ public static class FrameSchedule
             var targets = Views[i].Targets;
             Views.RemoveAt(i);
             if (ReferenceEquals(view.Targets, targets)) view.Targets = null;
+            // The view's transients die with it: nothing else walks a slot that has left the list.
+            ReleaseViewTransients(targets);
             return true;
         }
         return false;
@@ -258,7 +260,11 @@ public static class FrameSchedule
     /// <summary>Drop every additional view (back to the single-view shape).</summary>
     public static void ClearViews()
     {
-        for (int i = 0; i < Views.Count; i++) Views[i].View.Targets = null;
+        for (int i = 0; i < Views.Count; i++)
+        {
+            Views[i].View.Targets = null;
+            ReleaseViewTransients(Views[i].Targets);
+        }
         Views.Clear();
     }
 
@@ -361,11 +367,13 @@ public static class FrameSchedule
 
     /// <summary>
     /// The scene-color snapshot used for water refraction. Its lifetime follows <see cref="RegisterWaters"/> /
-    /// <see cref="UnregisterWaters"/>, and it is rebuilt in sync with SceneColor inside <see cref="ResizeCompute"/>.
+    /// <see cref="UnregisterWaters"/>, it is rebuilt in sync with SceneColor inside <see cref="ResizeCompute"/>, and
+    /// it is per view (see <see cref="ViewTargets.WaterRefractionTarget"/>): the snapshot has to match the shape of
+    /// the scene color it refracts, and a minimap is not full-screen.
     /// It is strictly a separate resource from SceneColor: in the water pass SceneColor is the color attachment, and
     /// the same resource cannot be sampled at the same time.
     /// </summary>
-    public static RenderTarget? WaterRefractionTarget => _waterRefractionTarget;
+    public static RenderTarget? WaterRefractionTarget => ActiveTargets.WaterRefractionTarget;
 
     /// <summary>
     /// The backend entry for the P1 waterfall curtain. The contract matches <see cref="WaterRenderer"/>: null means this
@@ -373,6 +381,13 @@ public static class FrameSchedule
     /// the water surface it has no refraction snapshot, so there is no extra "snapshot not built" failure path.
     /// </summary>
     public static WaterfallEffect? WaterfallRenderer { get; private set; }
+
+    /// <summary>
+    /// The backend entry for the P1 river ribbon. Its contract is exactly <see cref="WaterfallRenderer"/>'s - it is the same
+    /// Pass, the same resources and the same frame buffer layout, only the shader differs - so a null here simply means the river
+    /// is data with nothing drawing it.
+    /// </summary>
+    public static WaterRibbonEffect? RiverRenderer { get; private set; }
 
     /// <summary>A0.1 particle indirect-draw entry. Prepare hands over the parameters and resolves resources outside the scene
     /// pass, and returning false means this frame gives up submission; Submit submits once at the end of the scene's transparent
@@ -686,12 +701,12 @@ public static class FrameSchedule
         if (effect == null) return;
         DecalRenderer = null;
         effect.Dispose();
+        // Secondary views own their own frame blocks, which nothing would reach once the renderer is gone.
+        for (int i = 0; i < Views.Count; i++) ReleaseViewTransients(Views[i].Targets);
     }
 
-    static RenderTarget? _waterRefractionTarget;
-
     /// <summary>
-    /// P2: establishes the water-surface render entry and the refraction snapshot. The preconditions match decals: the scene
+    /// P2: establishes the water-surface render entry and the main view's refraction snapshot. The preconditions match decals: the scene
     /// color is single-sampled HDR and an explicit SceneDepth exists; it additionally requires that a snapshot target with
     /// the same shape as SceneColor can be created. If any precondition is missing, returns false leaving zero leftovers.
     /// </summary>
@@ -705,13 +720,13 @@ public static class FrameSchedule
         if (pipeline == null) return false;
         var effect = new WaterEffect(g, pipeline);
         bool ready;
-        try { ready = EnsureWaterRefractionTarget(g, color); }
+        try { ready = EnsureWaterRefractionTarget(g, PrimaryTargets, color); }
         catch (Exception ex)
         {
             DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] Failed to create snapshot target: {ex.Message}");
             ready = false;
         }
-        if (!ready) { effect.Dispose(); ReleaseWaterRefractionTarget(); return false; }
+        if (!ready) { effect.Dispose(); ReleaseWaterRefractionTarget(PrimaryTargets); return false; }
         WaterRenderer = effect;
         return true;
     }
@@ -722,29 +737,72 @@ public static class FrameSchedule
         if (effect == null) return;
         WaterRenderer = null;
         effect.Dispose();
-        ReleaseWaterRefractionTarget();
+        ReleaseWaterRefractionTarget(PrimaryTargets);
+        // Secondary views own their own snapshots and frame blocks, which nothing would reach once the renderer is gone.
+        for (int i = 0; i < Views.Count; i++) ReleaseViewTransients(Views[i].Targets);
     }
 
-    /// <summary>Rebuilds entirely when the dimensions differ from SceneColor; reuses it directly when the shape matches, avoiding per-frame comparison allocations.</summary>
-    static bool EnsureWaterRefractionTarget(IGraphics g, RenderTarget color)
+    /// <summary>
+    /// Releases the per-view transients the shared pass chain allocated on a view's behalf: the water refraction
+    /// snapshot and the water / waterfall / river / decal frame blocks. Idempotent, so every owner can call it on the way out.
+    /// </summary>
+    internal static void ReleaseViewTransients(ViewTargets targets)
     {
-        var current = _waterRefractionTarget;
+        ReleaseWaterRefractionTarget(targets);
+        targets.WaterFrameBuffer?.Dispose();
+        targets.WaterFrameBuffer = null;
+        targets.WaterfallFrameBuffer?.Dispose();
+        targets.WaterfallFrameBuffer = null;
+        targets.RiverFrameBuffer?.Dispose();
+        targets.RiverFrameBuffer = null;
+        targets.DecalFrameBuffer?.Dispose();
+        targets.DecalFrameBuffer = null;
+    }
+
+    /// <summary>
+    /// Ensures <paramref name="targets"/> owns a refraction snapshot matching the shape of <paramref name="color"/>,
+    /// rebuilding it when the shape moved (resize) and allocating it on first use (a secondary view's first water frame).
+    /// Must be called outside a pass: creating a target mid-chain is only legal between passes.
+    /// </summary>
+    internal static bool EnsureWaterRefractionTarget(IGraphics g, ViewTargets targets, RenderTarget color)
+    {
+        ArgumentNullException.ThrowIfNull(targets);
+        ArgumentNullException.ThrowIfNull(color);
+        var current = targets.WaterRefractionTarget;
+        // Compared against the format this path creates (HDR) rather than the source's: a scene color in any other
+        // format would otherwise mismatch on every frame and rebuild the snapshot each time. A non-HDR source simply
+        // fails the pipeline's shape check and draws no water, which is the same outcome as no snapshot.
         if (current != null && current.Desc.Width == color.Desc.Width && current.Desc.Height == color.Desc.Height
-            && current.Desc.ColorFormat == color.Desc.ColorFormat) return true;
-        ReleaseWaterRefractionTarget();
+            && current.Desc.ColorFormat == RtFormat.Rgba16Float) return true;
+        ReleaseWaterRefractionTarget(targets);
         var target = g.CreateRenderTarget(new RenderTargetDesc {
             ColorFormat = RtFormat.Rgba16Float, DepthFormat = RtFormat.None, SampleCount = 1, NoImplicitDepth = true,
             Width = color.Desc.Width, Height = color.Desc.Height,
             MatchBackbufferSize = color.Desc.MatchBackbufferSize, ClearColor = Vector4.Zero });
         if (target == null) return false;
-        _waterRefractionTarget = target;
+        targets.WaterRefractionTarget = target;
         return true;
     }
 
-    static void ReleaseWaterRefractionTarget()
+    /// <summary>
+    /// <see cref="EnsureWaterRefractionTarget"/> for the render path: a failure is logged and the frame draws no water
+    /// rather than unwinding the whole view, which is the same outcome as "this view has no snapshot".
+    /// </summary>
+    static bool TryEnsureWaterRefractionTarget(IGraphics g, ViewTargets targets, RenderTarget color)
     {
-        _waterRefractionTarget?.Dispose();
-        _waterRefractionTarget = null;
+        try { return EnsureWaterRefractionTarget(g, targets, color); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] Failed to create snapshot for {targets}: {ex.Message}");
+            ReleaseWaterRefractionTarget(targets);
+            return false;
+        }
+    }
+
+    static void ReleaseWaterRefractionTarget(ViewTargets targets)
+    {
+        targets.WaterRefractionTarget?.Dispose();
+        targets.WaterRefractionTarget = null;
     }
 
     /// <summary>
@@ -774,6 +832,31 @@ public static class FrameSchedule
     }
 
     /// <summary>
+    /// P1: establishes the river-ribbon render entry. The preconditions are the curtain's, because the two share the Pass and the
+    /// resource shape; if any of them is missing this returns false and leaves zero leftovers.
+    /// </summary>
+    public static bool RegisterWaterRivers(IGraphics g)
+    {
+        if (RiverRenderer != null) return true;
+        if (Immediate2DMode.Enabled) return false;
+        if (SceneColor is not { Desc.ColorFormat: RtFormat.Rgba16Float } color
+            || color.Desc.SampleCount > 1 || SceneDepth == null) return false;
+        var pipeline = g.CreateWaterRibbonPipeline();
+        if (pipeline == null) return false;
+        RiverRenderer = new WaterRibbonEffect(g, pipeline);
+        return true;
+    }
+
+    /// <summary>Detaches the river entry and releases the backend pipeline; a no-op when it was never registered.</summary>
+    public static void UnregisterWaterRivers()
+    {
+        var effect = RiverRenderer;
+        if (effect == null) return;
+        RiverRenderer = null;
+        effect.Dispose();
+    }
+
+    /// <summary>
     /// Notify all registered compute effects to rebuild size-dependent storage textures after a window resize.
     /// Called by BaseApp.Resize after backend HandleResize (GPU idle) so the old native resources can be safely destroyed and rebuilt in place
     /// while keeping the C# object identity unchanged, which preserves Sprite2D references.
@@ -790,11 +873,12 @@ public static class FrameSchedule
         ResizeList(_computeAfterOpaque);
         ResizeList(_computeAfterScene);
 
-        // P2: the water snapshot must be rebuilt along with SceneColor, and before any frame starts -
-        // creating resources mid-render is not allowed during topology changes.
-        if (WaterRenderer != null && SceneColor is { } waterColor)
+        // P2: the main view's water snapshot must be rebuilt along with SceneColor, and before any frame starts -
+        // creating resources mid-render is not allowed during topology changes. Secondary views keep fixed-size
+        // targets, so their snapshots never leave the shape they were allocated with.
+        if (WaterRenderer != null && PrimaryTargets.SceneColor is { } waterColor)
         {
-            try { EnsureWaterRefractionTarget(g, waterColor); }
+            try { EnsureWaterRefractionTarget(g, PrimaryTargets, waterColor); }
             catch (Exception ex)
             {
                 DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] Failed to rebuild snapshot: {ex.Message}");
@@ -1009,23 +1093,33 @@ public static class FrameSchedule
         // D1: decals must use the segmented route. Without segmentation the full Scene pass already drew the transparent
         // primitives, and decals would land right on top of water and particles; decals have no "this frame's output not
         // ready" fallback like fog, so whenever the view has opacity on and the scene has active decals, split unconditionally.
-        bool decalSplit = DecalRenderer != null && opaque && (features & ViewFeature.Decals) != 0
+        bool decalSplit = segmented != null && DecalRenderer != null && opaque && (features & ViewFeature.Decals) != 0
             && SceneColor != null && SceneDepth != null && app.Decals.ActiveCount > 0;
         // P2: the water surface must likewise be segmented - without segmentation the full Scene pass already drew the
         // transparent primitives, and the water would cover transparent objects that should be above it. The refraction
-        // snapshot must have the same shape as the scene color, otherwise it is better not to draw at all.
-        bool waterSplit = WaterRenderer != null && opaque && (features & ViewFeature.Water) != 0
-            && SceneColor is { } waterColorTarget && SceneDepth != null && app.Waters.ActiveCount > 0
-            && WaterRefractionTarget is { } waterSnapshot
-            && !ReferenceEquals(waterSnapshot, waterColorTarget)
-            && waterSnapshot.Desc.Width == waterColorTarget.Desc.Width
-            && waterSnapshot.Desc.Height == waterColorTarget.Desc.Height;
+        // snapshot must have the same shape as the scene color, otherwise it is better not to draw at all. The snapshot
+        // lives on the view, so a secondary view has none until its first water frame and allocates it just before the
+        // pass (the same lazy rule the fog composite follows); the route is therefore also allowed while it is missing.
+        bool waterSnapshotReady = WaterRefractionTarget is { } waterSnapshot
+            && !ReferenceEquals(waterSnapshot, SceneColor)
+            && waterSnapshot.Desc.Width == SceneColor?.Desc.Width
+            && waterSnapshot.Desc.Height == SceneColor?.Desc.Height;
+        bool waterLazyAllowed = ActiveTargets.Index != 0
+            && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float, Desc.SampleCount: <= 1 };
+        bool waterSplit = segmented != null && WaterRenderer != null && opaque && (features & ViewFeature.Water) != 0
+            && SceneColor is not null && SceneDepth != null && app.Waters.ActiveCount > 0
+            && (waterSnapshotReady || waterLazyAllowed);
         // P1 curtain: like the water surface it must be segmented (otherwise the full Scene draw has already drawn the
         // transparent primitives and the curtain would cover them). It does not sample a scene-color snapshot, so there are
         // only two gates, shape and data: single-sampled HDR color + active curtains in the scene.
-        bool waterfallSplit = WaterfallRenderer != null && opaque && (features & ViewFeature.Waterfalls) != 0
+        bool waterfallSplit = segmented != null && WaterfallRenderer != null && opaque && (features & ViewFeature.Waterfalls) != 0
             && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float, Desc.SampleCount: 1 }
             && SceneDepth != null && app.Waterfalls.ActiveCount > 0;
+        // P1 river ribbon: identical gates to the curtain, because it is the same Pass with a flat band shader. Ordered after the
+        // curtain in the frame, so at the mouth the sea/pool water and the foam near the impact point are already in place.
+        bool riverSplit = segmented != null && RiverRenderer != null && opaque && (features & ViewFeature.Waterfalls) != 0
+            && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float, Desc.SampleCount: 1 }
+            && SceneDepth != null && app.Rivers.ActiveCount > 0;
         // P0 SSR: reflections need to read the "already-drawn opaque scene color", but that rendering passes it as the color
         // attachment, and the same resource cannot be both attachment and sampling source; the composite must also land
         // before the transparent primitives, so we split whenever this frame might publish reflections. The criterion only
@@ -1034,7 +1128,7 @@ public static class FrameSchedule
         bool ssrSplit = PrepareSsrComposite != null && RenderSsrComposite != null
             && opaque && (features & ViewFeature.Reflections) != 0
             && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float } && SceneDepth != null;
-        bool split = fogSplit || weatherSplit || decalSplit || waterSplit || waterfallSplit || ssrSplit;
+        bool split = fogSplit || weatherSplit || decalSplit || waterSplit || waterfallSplit || riverSplit || ssrSplit;
         // S4: a non-segmented view must also run the two stages "collect -> opaque -> transparent". Without segmentation the
         // full Scene pass mixes the transparent primitives into the opaque ones in scene order, so ViewFeature.Transparent is
         // effectively a no-op (a minimap that requests only Opaque still draws light beams) and transparent geometry loses the
@@ -1168,7 +1262,10 @@ public static class FrameSchedule
                 // The snapshot must be copied before BeginPass - in the water pass SceneColor is the color attachment, and the same
                 // resource cannot be sampled at the same time. When the copy fails, the whole frame skips water: using an uninitialized
                 // snapshot as the refraction source corrupts the image outright rather than just missing one effect.
-                if (waterSplit && EffectiveSceneColor is { } waterColor && WaterRefractionTarget is { } snapshot
+                // A secondary view allocates its snapshot here on its first water frame (the shape gate above lets it through).
+                if (waterSplit && EffectiveSceneColor is { } waterColor
+                    && TryEnsureWaterRefractionTarget(g, targets, waterColor)
+                    && WaterRefractionTarget is { } snapshot
                     && g.CopyRenderTarget(waterColor, snapshot)
                     && WaterRenderer!.Prepare(g, app.Waters, waterColor, snapshot, SceneDepth, app.Time))
                 {
@@ -1199,6 +1296,23 @@ public static class FrameSchedule
                         StoreDepth = false,
                     });
                     try { WaterfallRenderer!.Draw(g); }
+                    finally { g.EndPass(); }
+                }
+
+                // P1 river ribbon: after the curtain, before transparent geometry. Same pass id (the pipeline checks
+                // SceneWaterfall), same reason for the ordering: water writes no depth, so only pass order decides who covers whom.
+                if (riverSplit && EffectiveSceneColor is { } riverColor
+                    && RiverRenderer!.Prepare(g, app.Rivers, riverColor, SceneDepth, app.Time))
+                {
+                    g.BeginPass(new PassDesc
+                    {
+                        Id = RenderPassId.SceneWaterfall,
+                        ColorTarget = riverColor,
+                        ClearColorEnable = false,
+                        ClearDepthEnable = false,
+                        StoreDepth = false,
+                    });
+                    try { RiverRenderer!.Draw(g); }
                     finally { g.EndPass(); }
                 }
 

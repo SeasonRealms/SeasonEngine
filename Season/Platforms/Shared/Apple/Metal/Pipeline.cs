@@ -1015,8 +1015,10 @@ internal static class Pipeline
             att.AlphaBlendOperation = MTLBlendOperation.Add;
             att.SourceRgbBlendFactor = MTLBlendFactor.SourceAlpha;
             att.DestinationRgbBlendFactor = MTLBlendFactor.OneMinusSourceAlpha;
+            // Alpha accumulates coverage with "over" instead of replacing it, so a near-invisible picking proxy cannot
+            // zero the coverage of a secondary view that is composited through its alpha (see DX Pipeline).
             att.SourceAlphaBlendFactor = MTLBlendFactor.One;
-            att.DestinationAlphaBlendFactor = MTLBlendFactor.Zero;
+            att.DestinationAlphaBlendFactor = MTLBlendFactor.OneMinusSourceAlpha;
         }
 
         // Contract clause 7 of 2-3:

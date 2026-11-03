@@ -50,6 +50,12 @@ internal sealed class PlayerCollider
     /// <summary>Registered observation tower: its deck and flight add walkable heights, and the deck height keeps the shaft unwalkable from the grass. Null means no tower.</summary>
     internal Tower Tower;
 
+    /// <summary>
+    /// Registered river: its channel is a raised levee whose water surface blocks entry exactly like the pond's water.
+    /// Null means no river; the footprint test then behaves as if the island has no flowing water.
+    /// </summary>
+    internal River River;
+
     /// <summary>Contact margin: stop 1 mm before intersection to avoid jitter from floating-point boundary ambiguity.</summary>
     const float ContactEpsilon = 1e-3f;
 
@@ -223,7 +229,7 @@ internal sealed class PlayerCollider
         else start.Z -= allowed;
 
         float baseH = MathF.Max(FloorHeightUnder(start, half), start.Y - half.Y);
-        float baseWater = Pond != null ? Pond.WaterOverlap(start, half) : 0f;
+        float baseWater = WaterOverlap(start, half);
 
         // Tower guard: once the feet are high enough for a drop to hurt, a move may not reduce the share of the
         // footprint that stands on the tower's elevated surfaces. Railings are thin obstacles rather than floor boxes,
@@ -269,7 +275,20 @@ internal sealed class PlayerCollider
         if (baseSupport < 1f && Tower.SupportRatio(center, half) < baseSupport)
             return true;
 
-        return Pond != null && Pond.WaterOverlap(center, half) > baseWater + 1e-6f;
+        return WaterOverlap(center, half) > baseWater + 1e-6f;
+    }
+
+    /// <summary>
+    /// Water overlap under the footprint from every registered body of water: the pond's interior plus every river stretch
+    /// the footprint touches. Summing is safe because the caller only compares the target against the starting value, so what
+    /// matters is that the number grows as the player walks toward water and shrinks as they back out.
+    /// </summary>
+    float WaterOverlap(in Vector3 center, in Vector3 half)
+    {
+        float overlap = Pond != null ? Pond.WaterOverlap(center, half) : 0f;
+        if (River != null)
+            overlap += River.WaterOverlap(center, half);
+        return overlap;
     }
 
     /// <summary>

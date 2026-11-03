@@ -99,13 +99,23 @@ internal sealed unsafe class DXWaterfallPipeline : WaterfallPipeline
         }
     }
 
-    internal DXWaterfallPipeline(Func<string, DXTexture?> resolve)
+    /// <summary>
+    /// <paramref name="ribbon"/> switches the shader source only: a river ribbon is a flat horizontal band whose current runs
+    /// in meters per second, a waterfall curtain is a closed section ring that accelerates from lip to landing point. Everything
+    /// around the shader - root signature, descriptor ring, blending, software depth test, pass identity - is identical, so this is
+    /// a variant rather than a second class. The frame buffer layouts are slot-for-slot equal (see <see cref="WaterRibbonMath"/>).
+    /// </summary>
+    internal DXWaterfallPipeline(Func<string, DXTexture?> resolve, bool ribbon = false)
     {
         _resolve = resolve;
+        _ribbon = ribbon;
         for (int i = 0; i < _slots.Length; i++) _slots[i] = new();
         try { Initialize(); }
         catch { Dispose(); throw; }
     }
+
+    /// <summary>Whether this instance draws river ribbons instead of waterfall curtains.</summary>
+    readonly bool _ribbon;
 
     void Initialize()
     {
@@ -149,11 +159,15 @@ internal sealed unsafe class DXWaterfallPipeline : WaterfallPipeline
         _signature = signature;
 
         // The compiled artifact is kept alive by a reference held by the ShaderCompiler cache; the copy the caller receives must be released by the caller once used.
-        string common = WaterfallShaders.FrameHlsl;
-        ID3D10Blob* vertex = ShaderCompiler.CompileShaderFromSource(common + WaterfallShaders.VertexHlsl, "VSMain", "vs_5_0");
+        // The two variants keep the same entry point names on purpose: every Draw path below is shared, and the root signature
+        // and descriptor layout are the same, so only these two strings decide which body runs.
+        string common = _ribbon ? WaterRibbonShaders.FrameHlsl : WaterfallShaders.FrameHlsl;
+        string vertexSource = _ribbon ? WaterRibbonShaders.VertexHlsl : WaterfallShaders.VertexHlsl;
+        string pixelSource = _ribbon ? WaterRibbonShaders.PixelHlsl : WaterfallShaders.PixelHlsl;
+        ID3D10Blob* vertex = ShaderCompiler.CompileShaderFromSource(common + vertexSource, "VSMain", "vs_5_0");
         try
         {
-            ID3D10Blob* fragment = ShaderCompiler.CompileShaderFromSource(common + WaterfallShaders.PixelHlsl, "PSMain", "ps_5_0");
+            ID3D10Blob* fragment = ShaderCompiler.CompileShaderFromSource(common + pixelSource, "PSMain", "ps_5_0");
             try { _pipeline = CreatePipeline(vertex, fragment); }
             finally { fragment->Release(); }
         }

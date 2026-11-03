@@ -313,6 +313,9 @@ internal class Rocks : Panel, ILoadable
             }
         };
 
+        // The two rocks that used to sit at z = -43.5 and z = -49 are moved to the north end of the line. The river mouth
+        // exits the island at z = -46 between x = 74 and x = 80, so those two are the only ones standing in it; the rocks
+        // at z = -38 and z = -54 stay put and become the two headlands the mouth runs between.
         groups[11] = new List<Rock>
         {
             new Rock()
@@ -328,7 +331,7 @@ internal class Rocks : Panel, ILoadable
             {
                 PosX = 74,
                 PosY = 1,
-                PosZ = -43.5f,
+                PosZ = 67,
                 Width = 5,
                 Height = 5,
                 Depth = 5
@@ -350,7 +353,7 @@ internal class Rocks : Panel, ILoadable
             {
                 PosX = 74,
                 PosY = 1,
-                PosZ = -49,
+                PosZ = 70.5f,
                 Width = 5,
                 Height = 5,
                 Depth = 5

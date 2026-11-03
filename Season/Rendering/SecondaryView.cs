@@ -239,6 +239,12 @@ public sealed class SecondaryView : IDisposable
 
         for (int i = 0; i < _owned.Count; i++) _owned[i].Dispose();
         _owned.Clear();
+
+        // Per-view transients the shared pass chain allocated on this view's behalf (the water refraction snapshot and
+        // the water/waterfall frame blocks). They are not in _owned because the passes create them; RemoveView above
+        // already handed them back, and this call only keeps the guarantee explicit if that ever changes.
+        FrameSchedule.ReleaseViewTransients(Targets);
+
         Targets.SceneColor = null;
         Targets.SceneDepth = null;
         Targets.SceneVelocity = null;

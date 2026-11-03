@@ -25,6 +25,8 @@ public sealed class WaterfallEffect : IDisposable
     readonly Vector4[] _frame = new Vector4[WaterfallMath.VectorCount];
     readonly WaterfallDraw[] _draws = new WaterfallDraw[WaterfallMath.MaxSheets];
     readonly WaterfallSheet[] _sorted = new WaterfallSheet[WaterfallMath.MaxSheets];
+    /// <summary>Frame block for a view that has no <see cref="ViewTargets"/> registered (the single-view shape); a
+    /// registered view owns its own copy in <see cref="ViewTargets.WaterfallFrameBuffer"/>.</summary>
     StorageBuffer? _buffer;
     int _count;
     int _pipelineCount;
@@ -76,8 +78,13 @@ public sealed class WaterfallEffect : IDisposable
             sunDirection, sunColor, sunIntensity, ambient, ambientIntensity, time,
             _sorted.AsSpan(0, _count));
 
-        _buffer ??= g.CreateStorageBuffer(WaterfallMath.ByteCount);
-        if (_buffer == null || !g.TryUpdateStorageBuffer(_buffer, MemoryMarshal.AsBytes(_frame.AsSpan())))
+        // The frame block lives on the view, not on this effect: two views upload it in the same frame, and on backends
+        // whose staging keeps only a frame's last write a shared buffer would leave the main view drawing with the
+        // secondary view's matrices (see ViewTargets.WaterfallFrameBuffer).
+        var buffer = view.Targets != null
+            ? view.Targets.WaterfallFrameBuffer ??= g.CreateStorageBuffer(WaterfallMath.ByteCount)
+            : _buffer ??= g.CreateStorageBuffer(WaterfallMath.ByteCount);
+        if (buffer == null || !g.TryUpdateStorageBuffer(buffer, MemoryMarshal.AsBytes(_frame.AsSpan())))
             return false;
         for (int i = 0; i < _count; i++)
         {
@@ -89,7 +96,7 @@ public sealed class WaterfallEffect : IDisposable
             _draws[i] = new WaterfallDraw(i, sheet.MaskTexture, sheet.NormalTexture, sheet.FlowTexture,
                 columns, subdiv, WaterfallMath.VertexCount(sheet));
         }
-        var inputs = new WaterfallInputs(color, depth, _buffer, _draws, _count);
+        var inputs = new WaterfallInputs(color, depth, buffer, _draws, _count);
         if (!_pipeline.Prepare(inputs, color)) return false;
         _pipelineCount = _count;
         Ready = true;
@@ -100,7 +107,7 @@ public sealed class WaterfallEffect : IDisposable
     /// Fetch the sun's (the strongest directional light's) direction, color and intensity. By convention the direction is taken as the propagation direction "pointing toward the surface",
     /// consistent with the <c>dot(N, -sunDir)</c> usage in the main shader; when no directional light is found it returns zero intensity and the sheet is left with only ambient light.
     /// </summary>
-    static void SunLight(in SceneLightParams lights, bool valid, out Vector3 direction, out Vector3 color, out float intensity)
+    internal static void SunLight(in SceneLightParams lights, bool valid, out Vector3 direction, out Vector3 color, out float intensity)
     {
         direction = new Vector3(0f, -1f, 0f);
         color = Vector3.One;

@@ -3066,6 +3066,10 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
             StencilFunc = ComparisonFunc.Always
         };
 
+        // Alpha accumulates coverage with the "over" operator (One / InvSrcAlpha) rather than replacing it: a
+        // secondary view is composited onto the screen through its alpha, so a near-invisible proxy (the waterfall
+        // and mist volume carry one for picking, at alpha 0.001) would otherwise punch its silhouette through to
+        // whatever lies behind the sprite. Same factors as WebGPU's _createColorTarget, Vulkan and Metal.
         var transparentRenderTargetBlend = new RenderTargetBlendDesc()
         {
             BlendEnable = 1,
@@ -3074,7 +3078,7 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
             DestBlend = Blend.InvSrcAlpha,
             BlendOp = BlendOp.Add,
             SrcBlendAlpha = Blend.One,
-            DestBlendAlpha = Blend.Zero,
+            DestBlendAlpha = Blend.InvSrcAlpha,
             BlendOpAlpha = BlendOp.Add,
             LogicOp = LogicOp.Noop,
             RenderTargetWriteMask = (byte)ColorWriteEnable.All

@@ -54,16 +54,26 @@ internal sealed class MTLWaterfallPipeline : Season.Rendering.WaterfallPipeline
     int _frameIndex;
     bool _disposed;
 
-    internal MTLWaterfallPipeline(Dictionary<string, Texture> textures)
+    /// <summary>
+    /// <paramref name="ribbon"/> switches the shader source only: a river ribbon is a flat horizontal band whose current runs in
+    /// meters per second, a waterfall curtain is a closed section ring that accelerates from lip to landing point. The PSO shape and
+    /// the frame buffer layout are the same (see <see cref="WaterRibbonMath"/>), so this is a variant rather than a second class.
+    /// </summary>
+    internal MTLWaterfallPipeline(Dictionary<string, Texture> textures, bool ribbon = false)
     {
         _textures = textures;
+        _ribbon = ribbon;
         try { Initialize(); }
         catch { Dispose(); throw; }
     }
 
+    /// <summary>Whether this instance draws river ribbons instead of waterfall curtains.</summary>
+    readonly bool _ribbon;
+
     void Initialize()
     {
-        var library = MTLShaderCompiler.Compile(Device.MtlDevice, WaterfallShaders.Msl);
+        // The ribbon variant keeps the same entry point names and binding indices; only the body and the varyings' meaning differ.
+        var library = MTLShaderCompiler.Compile(Device.MtlDevice, _ribbon ? WaterRibbonShaders.Msl : WaterfallShaders.Msl);
         // MSL preserves the real entry point names (unlike GLSL, which is always main); a miss means the source and the names here have diverged.
         _vertexFunction = library.CreateFunction("VSMain")
             ?? throw new InvalidOperationException("Waterfall shader entry point VSMain not found.");
@@ -84,7 +94,7 @@ internal sealed class MTLWaterfallPipeline : Season.Rendering.WaterfallPipeline
     {
         using var desc = new MTLRenderPipelineDescriptor
         {
-            Label = "Season-Waterfall",
+            Label = _ribbon ? "Season-WaterRibbon" : "Season-Waterfall",
             VertexFunction = _vertexFunction,
             FragmentFunction = _fragmentFunction,
             // The waterfall Pass deliberately does not attach depth: depth is a sampling source this frame, and the same resource cannot be both sampled and used as an attachment.

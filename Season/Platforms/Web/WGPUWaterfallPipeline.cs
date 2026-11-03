@@ -31,7 +31,19 @@ internal sealed class WGPUWaterfallPipeline : Season.Rendering.WaterfallPipeline
     readonly StringBuilder _draws = new(256);
     bool _disposed, _prepared;
 
-    internal bool Initialize() => WebGPUInterop.CreateWaterfallPipeline(_name, Season.Rendering.WaterfallShaders.Wgsl);
+    /// <summary>
+    /// <paramref name="ribbon"/> switches the shader source only: a river ribbon is a flat horizontal band whose current runs in
+    /// meters per second, a waterfall curtain is a closed section ring that accelerates from lip to landing point. The JS side is
+    /// untouched - the bind group layouts, the 8-slot frame buffer size and the pass identity are identical, and the frame
+    /// buffers are slot-for-slot equal (see <see cref="Season.Rendering.WaterRibbonMath"/>).
+    /// </summary>
+    internal WGPUWaterfallPipeline(bool ribbon = false) => _ribbon = ribbon;
+
+    /// <summary>Whether this instance draws river ribbons instead of waterfall curtains.</summary>
+    readonly bool _ribbon;
+
+    internal bool Initialize() => WebGPUInterop.CreateWaterfallPipeline(_name,
+        _ribbon ? Season.Rendering.WaterRibbonShaders.Wgsl : Season.Rendering.WaterfallShaders.Wgsl);
 
     public override bool Prepare(in Season.Rendering.WaterfallInputs inputs, Season.Rendering.RenderTarget destination)
     {

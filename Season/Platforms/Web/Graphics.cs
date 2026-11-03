@@ -535,6 +535,26 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     }
 
     /// <summary>
+    /// P1 river ribbon. The JS side needs no change at all: the bind group layouts, the 8-slot/6400-byte frame buffer and the pass
+    /// identity are shared with the curtain (see <see cref="Season.Rendering.WaterRibbonMath"/>), so only the WGSL source differs.
+    /// </summary>
+    public Season.Rendering.WaterfallPipeline? CreateWaterRibbonPipeline()
+    {
+        var pipeline = new WGPUWaterfallPipeline(ribbon: true);
+        try
+        {
+            if (pipeline.Initialize()) return pipeline;
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[River] WebGPU pipeline creation failed: {ex.Message}");
+        }
+        try { pipeline.Dispose(); }
+        catch (Exception ex) { DeviceServices.BaseApp.AddLog(LogType.Error, $"[River] failed handle release exception: {ex.Message}"); }
+        return null;
+    }
+
+    /// <summary>
     /// P2: scene color snapshot, letting the water surface sample the water bottom on frames where "color is already an attachment".
     /// Returns false if the name is unregistered, the shape does not match, or it is called outside the frame -- the caller then skips the water surface for the whole frame,
     /// rather than using an uninitialized snapshot as the refraction source.

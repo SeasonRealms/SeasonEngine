@@ -110,6 +110,20 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         }
     }
 
+    /// <summary>
+    /// P1 river ribbon: the same Pass shape and the same 16-byte parameter block as the curtain, and a frame buffer that is
+    /// slot-for-slot identical (see <see cref="Season.Rendering.WaterRibbonMath"/>), so only the shader source is swapped.
+    /// </summary>
+    public Season.Rendering.WaterfallPipeline? CreateWaterRibbonPipeline()
+    {
+        try { return new MTLWaterfallPipeline(DictionaryMtlTexture, ribbon: true); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[River] creation failed: {ex.Message}");
+            return null;
+        }
+    }
+
     /// <summary>Scene-color snapshot used for P2 water surface refraction. Dispatched to the backend blit: in the water surface Pass, SceneColor is a color attachment and cannot be sampled at the same time.</summary>
     public bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination)
         => Metal.Device.CopyRenderTarget(source, destination);

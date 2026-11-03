@@ -83,6 +83,20 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
     }
 
+    /// <summary>
+    /// P1 river ribbon: the same Pass, root signature, descriptor ring and blending as the curtain, and a frame buffer that is
+    /// slot-for-slot identical (see <see cref="Season.Rendering.WaterRibbonMath"/>), so only the shader source is swapped.
+    /// </summary>
+    public Season.Rendering.WaterfallPipeline? CreateWaterRibbonPipeline()
+    {
+        try { return new DXWaterfallPipeline(name => TryGetTexture(name, out var tex) ? tex : null, ribbon: true); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[River] creation failed: {ex.Message}");
+            return null;
+        }
+    }
+
     /// <summary>P2: scene color snapshot, letting the water surface sample the riverbed in frames where "the color is already the attachment".
     /// Device handles the state finalization (source back to RenderTarget, target to PixelShaderResource).</summary>
     public bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination)

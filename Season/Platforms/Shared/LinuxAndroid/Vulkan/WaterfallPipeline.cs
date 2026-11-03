@@ -66,13 +66,23 @@ internal sealed unsafe class VKWaterfallPipeline : Season.Rendering.WaterfallPip
     uint _frameIndex;
     bool _disposed;
 
-    internal VKWaterfallPipeline(Dictionary<string, Texture> textures)
+    /// <summary>
+    /// <paramref name="ribbon"/> switches the shader source only: a river ribbon is a flat horizontal band whose current runs in
+    /// meters per second, a waterfall curtain is a closed section ring that accelerates from lip to landing point. The descriptor
+    /// layouts, push constant, blending and pass identity are the same, and the frame buffers are slot-for-slot equal (see
+    /// <see cref="WaterRibbonMath"/>), so this is a variant rather than a second class.
+    /// </summary>
+    internal VKWaterfallPipeline(Dictionary<string, Texture> textures, bool ribbon = false)
     {
         _textures = textures;
+        _ribbon = ribbon;
         for (int i = 0; i < _frameSets.Length; i++) { _frameSets[i] = new(); _textureSets[i] = new(); }
         try { Initialize(); }
         catch { Dispose(); throw; }
     }
+
+    /// <summary>Whether this instance draws river ribbons instead of waterfall curtains.</summary>
+    readonly bool _ribbon;
 
     void Initialize()
     {
@@ -123,10 +133,12 @@ internal sealed unsafe class VKWaterfallPipeline : Season.Rendering.WaterfallPip
         try
         {
             // glslang's simplified C interface only recognizes main, so vertex and fragment are two independent sources,
-            // each assembling the same frame buffer accessor.
-            vertex = ShaderCompiler.CreateShaderModule(vk, device, WaterfallShaders.VertexGlsl,
+            // each assembling the same frame buffer accessor. The ribbon variant keeps the same entry point and binding shape.
+            string vertexSource = _ribbon ? WaterRibbonShaders.VertexGlsl : WaterfallShaders.VertexGlsl;
+            string pixelSource = _ribbon ? WaterRibbonShaders.PixelGlsl : WaterfallShaders.PixelGlsl;
+            vertex = ShaderCompiler.CreateShaderModule(vk, device, vertexSource,
                 ShaderStageFlags.VertexBit, "main", "waterfall.vert", false);
-            pixel = ShaderCompiler.CreateShaderModule(vk, device, WaterfallShaders.PixelGlsl,
+            pixel = ShaderCompiler.CreateShaderModule(vk, device, pixelSource,
                 ShaderStageFlags.FragmentBit, "main", "waterfall.frag", false);
             _pipeline = CreatePipeline(vk, device, vertex, pixel);
         }

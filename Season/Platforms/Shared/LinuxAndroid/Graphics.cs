@@ -112,6 +112,20 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     }
 
     /// <summary>
+    /// P1 river ribbon: the same render pass, descriptor sets and push constant as the curtain, and a frame buffer that is
+    /// slot-for-slot identical (see <see cref="Season.Rendering.WaterRibbonMath"/>), so only the shader source is swapped.
+    /// </summary>
+    public Season.Rendering.WaterfallPipeline? CreateWaterRibbonPipeline()
+    {
+        try { return new VKWaterfallPipeline(DictionaryVKTexture, ribbon: true); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[River] creation failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Scene-color snapshot used for P2 water surface refraction. Delegates to the backend: a vkCmdCopyImage of the same format and size, with two accompanying barriers
     /// that return the source to a sample layout and transition the target into a sample layout — in the water Pass, SceneColor is a color attachment and cannot be sampled at the same time.
     /// </summary>

@@ -23,6 +23,7 @@
 		<ProjectReference Include="..\..\Season\Season.csproj" />
 		
 		<Compile Include="..\Engine\App.cs" Link="App.cs" />
+		<Compile Include="..\Engine\AbCapture.cs" Link="AbCapture.cs" />
 		<Compile Include="..\Engine\GlobalUsings.cs" Link="GlobalUsings.cs" />
 		<Compile Include="..\Engine\AI\*.cs" />
 		<Compile Include="..\Engine\Panels\*.cs" />

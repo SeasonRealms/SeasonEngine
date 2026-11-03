@@ -13,7 +13,7 @@ namespace Season.Controls;
 /// the box's center, yaw, and size each frame;</item>
 /// <item>but it <b>is</b> a plain <see cref="Mesh3D"/> box, so it inherits the property panel
 /// (PosX/PosY/PosZ, Width/Height/Depth, yaw), triangle-level picking, and the Bounds/Wireframe/Outline highlight
-/// styles, exactly like a house or a rock;</item>
+/// styles, exactly like a house or a rock; the default style is set to Wireframe below, see the comment there;</item>
 /// <item>the emitter reads <see cref="Center"/>, <see cref="SpawnAxis"/>, <see cref="HalfLength"/>,
 /// <see cref="HalfDepth"/> and <see cref="WorldHeight"/>; the box therefore <b>is</b> the parameterization —
 /// moving/scaling/rotating it in the panel edits the effect live, no code constants involved.</item>
@@ -50,6 +50,18 @@ public sealed class MistVolume : Mesh3D
         // Keep the proxy out of SceneDepth so the particles behind it are not culled by their own emitter box.
         ExcludeFromAo = true;
         CastShadows = false;
+
+        // Highlight style: Wireframe instead of the engine default Bounds, because Bounds is the *world AABB*
+        // (Mesh3DBase.GetWorldBoundsRaw, see DXMesh3D's WriteHighlightBox). Rotating this box by yaw therefore
+        // inflates the axis-aligned box instead of turning it -- a 8.8 x 2.4 m mist band at 45 degrees would show
+        // as an ~8 x 8 m box, which reads as "rotation scales it" and hides the fact that the band did turn.
+        // The Wireframe shell is baked from this proxy's own cube and drawn with the same world matrix, so the
+        // highlight is an <b>oriented</b> box: it turns with the panel's rotation and every knob stays legible.
+        Highlight.Style = HighlightStyle.Wireframe;
+
+        // 2 x EdgeWidth = strip width relative to the box's largest side. 0.004 gives ~7 cm strips on the default
+        // 8.8 m long band; the 0.002 default is nearly invisible on a proxy this large.
+        Highlight.EdgeWidth = 0.004f;
 
         BuildBox();
     }

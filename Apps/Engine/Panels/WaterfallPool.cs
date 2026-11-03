@@ -30,7 +30,14 @@ namespace Engine.Panels;
 /// 水汽是唯一的例外：它的出生矩形不再从落点推导，而是来自可拾取的隐形盒控件 <see cref="Season.Controls.MistVolume"/>，
 /// 与 <see cref="Season.Controls.Waterfall"/> 同一套路 —— 盒心/偏航/长宽深就是出生面与雾柱高度，
 /// 雾的参数于是变成一个能在属性面板里拖、转、缩的对象（改完下一帧即生效）。
-/// 首帧只按潭面摆一套默认值；之后盒子跟着潭心走，直到用户在面板里动过 Pos，才永久脱钩交给用户。
+/// 白沫也是同一个盒子驱动的：它就是画面里那条最白的带子（盒子 Width = 带长，Depth = 带厚），
+/// 所以盒子一动，雾与白沫一起动；水花仍绑在落点上。
+/// 首帧只按潭面摆一套默认值；之后盒子平面位置跟着潭心走，直到用户在面板里动过 Pos，才永久脱钩交给用户。
+///
+/// 粒子不吃场景光照（Particles 的 Shade 只算 Color.rgb * alpha，Color 就是 albedo）：
+/// 所以 Update 每帧按太阳高度把作者色缩放一份写回去（见 <see cref="ApplyParticlesLighting"/>），
+/// 水雾白天夜晚才有明暗差。瀑布水幕那边不需要这个补丁：WaterfallEffect 已经把
+/// FrameSchedule.LightingSnapshot 的太阳与环景光包进 frame buffer（rows 6..8），片元里乘 ambient/direct。
 ///
 /// 石块不自造盒子：几何与四张贴图来自 Rocks 面板后台抽出的 Assets/Rocks.glb 小变体，
 /// 本面板只往那几张 InstancedMesh3D 追加实例、每帧写矩阵（拖动瀑布时石圈跟着走），
@@ -59,7 +66,9 @@ internal class WaterfallPool : Panel
     static readonly Vector3 MistMid = new(0.95f, 0.97f, 1.00f);
     static readonly Vector3 MistEnd = new(1.00f, 1.00f, 1.00f);
 
-    static readonly Vector4 FoamColor = new(0.95f, 0.98f, 1.00f, 0.42f);
+    // 白沫 alpha 从 0.42 提到 0.52：这条带子是画面里最白的一笔，压得太透会露出后面的水与石头，
+    // 看起来“虚而不实”。
+    static readonly Vector4 FoamColor = new(0.95f, 0.98f, 1.00f, 0.52f);
     static readonly Vector3 FoamMid = new(0.92f, 0.96f, 0.99f);
     static readonly Vector3 FoamEnd = new(0.75f, 0.82f, 0.88f);
 
@@ -104,7 +113,9 @@ internal class WaterfallPool : Panel
     /// <summary>
     /// 水汽的可摆放体积：一个不可见的盒控件（与 Waterfall 同套路）。盒心与朝向、长宽高就是出生矩形，
     /// Height 决定粒子在寿命内爬多高 —— 于是「雾的参数」就是这一个可以在面板里拖、转、缩的盒子。
-    /// 它作为普通 Mesh3D 登进 picker.Targets，因此有三角级拾取与 Bounds/Wireframe/Outline 三种高亮。
+    /// 它作为普通 Mesh3D 登进 picker.Targets，因此有三角级拾取与 Bounds/Wireframe/Outline 三种高亮；
+    /// 控件自己的默认高亮改成了 Wireframe（见 MistVolume 构造函数）：Bounds 是世界轴对齐包围盒，
+    /// 转这个 8.8 × 2.4 m 的长盒子只会把 AABB 撑胖（ 45° 时约 8 × 8 m），“旋转”看上去像“放大”。
     /// </summary>
     internal readonly Season.Controls.MistVolume Mist = new("WaterfallMist");
 
@@ -263,31 +274,37 @@ internal class WaterfallPool : Panel
 
     /// <summary>
     /// 白沫：落点前沿一条浅带出生，水平向外 0.8、上浮 0.3，寿命 1.6 s。
-    /// 卡通云团：白色 alpha 0.42，尺寸 0.32→0.8，ToonEdge 0.2 把径向衰减压成清晰圆边，
+    /// 卡通云团：白色 alpha 0.52，尺寸 0.36→0.92，ToonEdge 0.30 把径向衰减压成清晰圆边，
     /// 一团团像挤出来的肥皂泡而不是灰烟。
+    ///
+    /// 密度：Density 是 GPU 侧的存活配额（容量 × Density），所以“更实”直接抬这里，不增加 draw call。
+    /// 768 × 0.80 ≈ 610 个粒子铺在盒子底面（默认 8.8 × 2.4 m ≈ 21 m²）上，间距约 0.19 m，
+    /// 而粒子自身 0.36 ~ 0.92 m，于是互相叠压成一条连续的白带；原来的 512 × 0.50 ≈ 256 个间距 0.29 m，
+    /// 叠压不足，看到的就是一颗颗分开的白点。
+    /// NoiseAmount 同时从 0.5 降到 0.35：噪声越大边缘越碎，白带会重新散回“点云”，与“更实”的诉求相反。
     /// </summary>
-    ParticleSystemEffect CreateFoam() => new(512)
+    ParticleSystemEffect CreateFoam() => new(768)
     {
         ExternalTime = true,
         CameraWindow = false,
         Seed = 0x5A110003,
-        Density = 0.50f,
+        Density = 0.80f,
         SpawnRect = true,
         Lifetime = 1.6f,
         Acceleration = new Vector3(0f, 0.08f, 0f),
         SpeedJitter = 0.3f,
-        ParticleSize = 0.32f,
-        SizeEnd = 0.8f,
+        ParticleSize = 0.36f,
+        SizeEnd = 0.92f,
         Color = FoamColor,
         ColorMid = FoamMid,
         ColorEnd = FoamEnd,
         FadeIn = 0.08f,
-        FadeOut = 0.40f,
+        FadeOut = 0.32f,
         Additive = false,
         CurveMode = true,
-        NoiseAmount = 0.5f,
+        NoiseAmount = 0.35f,
         Turbulence = 0.25f,
-        ToonEdge = 0.20f,
+        ToonEdge = 0.30f,
         ViewDistance = 55f,
     };
 

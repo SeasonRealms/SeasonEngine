@@ -2059,6 +2059,8 @@ vec4 ApplySceneFog(vec4 color, vec3 worldPos);
 
             // Blend:
             // Opaque disables blending, while Transparent and Fade enable alpha blending.
+            // Alpha accumulates coverage with "over" (One / OneMinusSrcAlpha) instead of replacing it, so a near-invisible
+            // picking proxy cannot zero the coverage of a secondary view that is composited through its alpha (see DX Pipeline).
             bool blendEnable = mode != PipelineMode.Opaque;
             var colorAttachment = new PipelineColorBlendAttachmentState
             {
@@ -2067,7 +2069,7 @@ vec4 ApplySceneFog(vec4 color, vec3 worldPos);
                 DstColorBlendFactor = BlendFactor.OneMinusSrcAlpha,
                 ColorBlendOp = BlendOp.Add,
                 SrcAlphaBlendFactor = BlendFactor.One,
-                DstAlphaBlendFactor = BlendFactor.Zero,
+                DstAlphaBlendFactor = BlendFactor.OneMinusSrcAlpha,
                 AlphaBlendOp = BlendOp.Add,
                 ColorWriteMask = ColorComponentFlags.RBit | ColorComponentFlags.GBit |
                                  ColorComponentFlags.BBit | ColorComponentFlags.ABit

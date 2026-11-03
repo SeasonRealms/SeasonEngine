@@ -83,6 +83,33 @@ public sealed class ViewTargets
     /// <summary>True when this view has fully allocated fog resources (frame buffer + both volumes).</summary>
     public bool HasFogVolumes => FogFrameBuffer != null && FogIntegratedName != null && FogLocalName != null;
 
+    /// <summary>
+    /// P2: scene-color snapshot the water surface samples as its refraction source. Per view, because the snapshot
+    /// must have exactly this view's SceneColor shape and the water pass cannot sample the attachment it writes.
+    /// The main view's snapshot is built at registration / resize; a secondary view allocates its own lazily on the
+    /// first frame that draws water. Null = this view has no snapshot yet.
+    /// </summary>
+    public RenderTarget? WaterRefractionTarget;
+
+    /// <summary>
+    /// Per-view water frame constant block. It lives on the view rather than on the effect because a view uploads it
+    /// between its own passes, and the staging of some backends only keeps a frame's last upload (Metal keeps one
+    /// staging buffer per frame, WebGPU's writeBuffer lands before the encoded commands run): two views sharing one
+    /// buffer would leave the main view drawing with the secondary view's matrices. Null = not yet allocated here.
+    /// </summary>
+    public StorageBuffer? WaterFrameBuffer;
+
+    /// <summary>Per-view waterfall frame constant block; same reasoning as <see cref="WaterFrameBuffer"/>.</summary>
+    public StorageBuffer? WaterfallFrameBuffer;
+
+    /// <summary>Per-view river-ribbon frame constant block; same reasoning as <see cref="WaterFrameBuffer"/>, and kept
+    /// separate from <see cref="WaterfallFrameBuffer"/> because the curtain and the ribbon are two uploads in one view.</summary>
+    public StorageBuffer? RiverFrameBuffer;
+
+    /// <summary>Per-view decal frame constant block; same reasoning as <see cref="WaterFrameBuffer"/>. Allocated on the
+    /// first decal frame of this view.</summary>
+    public StorageBuffer? DecalFrameBuffer;
+
     /// <summary>Independent HDR target for the weather composite pass; null = single Scene route.</summary>
     public RenderTarget? WeatherCompositeTarget;
 

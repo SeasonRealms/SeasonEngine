@@ -16,8 +16,10 @@ namespace Engine.Panels;
 /// readback, no platform code in this file.</para>
 ///
 /// <para>They also demonstrate the per-view policy that this feature added:</para>
-/// - <c>Features</c>: the mirror keeps opaque and transparent geometry but drops shadows, fog, weather, AO, bloom,
-///   anti-aliasing, particles and the Post slot; the minimap keeps opaque geometry only.
+/// - <c>Features</c>: both keep opaque and transparent geometry, the screen-space decals, the waterfall curtain and the water surface,
+///   which are per-view materials rather than screen-space effects; the mirror also drops shadows, fog, weather, AO, bloom,
+///   anti-aliasing, particles and the Post slot, and the minimap adds the fog composite (an orthographic
+///   top-down test of the per-view volumetric route).
 /// - <c>ShadowPolicy.Off</c>: both read the white fallback instead of the main view's cascaded atlas, whose texel
 ///   density is meaningless at this size.
 /// - <c>UpdateInterval</c>: the minimap re-renders every few frames and keeps its previous image in between.
@@ -53,11 +55,20 @@ internal class RearViews : Panel
     /// <summary>Height of the map camera above the ground; it has to stay inside the orthographic clip range.</summary>
     const float MinimapCameraHeight = 200f;
 
-    /// <summary>Transparent geometry and opaque geometry, nothing else: the cheapest useful rear view.</summary>
-    const ViewFeature MirrorFeatures = ViewFeature.Opaque | ViewFeature.Transparent;
+    /// <summary>
+    /// Opaque and transparent geometry, the screen-space decals, and the two materials that read as part of the world when
+    /// seen from behind: the waterfall curtain and the water surface. All of them are ordinary per-view passes - they cull,
+    /// pack and sort against this view's own camera - so they cost the mirror a second small pass chain and nothing else. The
+    /// water surface allocates its refraction snapshot at this view's size on the first frame it draws, and the decals and the
+    /// curtain upload into this view's own frame blocks. Everything that is screen-space or frame-global (shadows, fog, weather,
+    /// AO, bloom, anti-aliasing, particles, Post) stays off.
+    /// </summary>
+    const ViewFeature MirrorFeatures = ViewFeature.Opaque | ViewFeature.Transparent | ViewFeature.Decals
+        | ViewFeature.Waterfalls | ViewFeature.Water;
 
-    /// <summary>Opaque + Transparent + Fog: per-view volumetric fog test for the minimap (orthographic top-down).</summary>
-    const ViewFeature MinimapFeatures = ViewFeature.Opaque | ViewFeature.Transparent | ViewFeature.Fog;
+    /// <summary>Opaque + Transparent + Decals + Waterfalls + Water + Fog: per-view volumetric fog test for the minimap (orthographic top-down).</summary>
+    const ViewFeature MinimapFeatures = ViewFeature.Opaque | ViewFeature.Transparent | ViewFeature.Decals
+        | ViewFeature.Waterfalls | ViewFeature.Water | ViewFeature.Fog;
 
     public const string MirrorTextureName = "view://rear-mirror";
     public const string MinimapTextureName = "view://minimap";

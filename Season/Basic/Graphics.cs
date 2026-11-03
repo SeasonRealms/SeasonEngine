@@ -139,6 +139,13 @@ public interface IGraphics
     Season.Rendering.WaterfallPipeline? CreateWaterfallPipeline() => null;
 
     /// <summary>
+    /// P1 river ribbon: the same pass identity, resource shape and blending as the curtain (the two frame buffers are slot-for-slot
+    /// equal, see <see cref="Season.Rendering.WaterRibbonMath"/>), so a backend that can draw a curtain can draw a river by swapping
+    /// only the shader source. Null means the river is just data and nothing is drawn.
+    /// </summary>
+    Season.Rendering.WaterfallPipeline? CreateWaterRibbonPipeline() => null;
+
+    /// <summary>
     /// P2: copies the contents of <paramref name="source"/> verbatim into <paramref name="destination"/> (same size, same format).
     /// Water surface refraction needs to sample the scene color in the frame where "SceneColor is still a color attachment", and the same resource cannot be both an attachment and a sampling source,
     /// so an independent copy must be obtained before drawing begins. Returning false means this backend does not support it or the shapes do not match, and the caller skips the water surface for the whole frame accordingly.

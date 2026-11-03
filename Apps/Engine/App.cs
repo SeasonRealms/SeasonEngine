@@ -162,6 +162,11 @@ internal class App : BaseApp
     // 瀑布潭：水面 + 潭底贴花 + 石块潭沿 + 水花/雾/白沫三组粒子，锚点每帧跟随瀑布落点。见 WaterfallPool.cs。
     internal WaterfallPool waterfallPool;
 
+    // 河流：从瀑布潭一路弯绕到 Rocks 一侧的海。整条河道是一张固定表（见 River.Course），
+    // 按“直线段 / 弯道段”切成六个可选取的 Mesh3D；水面由 SceneWaterfall Pass 按 WaterRibbon 数据现算；
+    // 两岸的草土堤坝是 RiverBank.glb 的一个批次（River.Dikes），由河段每帧把自身矩阵折进去。
+    internal River river;
+
     internal Robots robots;
 
     internal Birds birds;
@@ -725,6 +730,19 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         waterfallPool = new WaterfallPool(waterfalls[^1]);
         AddPanel(waterfallPool);
 
+        // P1 河流。必须在 CreateWaterfall 之后：水面复用的是瀑布那三张同名贴图，
+        // 下面再登记一次只是为了“场景里没有瀑布时河也能画”（RegisterNamedTexture 按名字去重）。
+        //
+        // 每一段都是独立的 Mesh3D：岸坡在绘制时就是世界坐标，Load 完之后 Pos 取自己的锚点，
+        // 世界矩阵退化为单位阵，所以面板上的 PosX/PosY/PosZ + Width/Height/Depth + Rotation
+        // 改的就是这一段本身；水面挂在 RiverSegment.Water.Placement 上读同一个矩阵，不会落后一帧。
+        river = new River(Rivers);
+        AddPanel(river);
+        foreach (var texture in River.Textures)
+        {
+            RegisterNamedTexture(texture);
+        }
+
         // Square observation tower on the open lawn southeast of the spawn: a 3x3 deck at 20 player heights, with a
         // single 3m flight filling one whole flank. The flight runs east-west, perpendicular to the shoreline, so it
         // keeps a constant distance from the sea and the climber keeps the sea to the side. A slim mast on the deck
@@ -853,6 +871,16 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         {
             picker.Targets.Add(waterfallPool.Mist);
         }
+        // 河流的每一段各自是一个选取目标：直线段与弯道段都能单独拖动、改长宽高、转方向。
+        // 高亮必须走 Wireframe（长条网格的世界 AABB 一旋转就“变胖”，见 RiverSegment 的类注释）。
+        foreach (var segment in river.Segments)
+        {
+            picker.Targets.Add(segment);
+        }
+        // 两岸堤坝也可选，但粒度是单块：整条河一百多块共用一个 GLB 模板，按实例命中后选中的就是那一块，
+        // 面板上的 Pos/Width/Height/Depth/Rotation 直接写进这个实例（见 ObjectPanel 的实例分支）。
+        // 这些改动在 SyncDikes 里被当成相对自动布局的偏移保留，所以挪动整段河道时堤坝不会回到原样。
+        picker.InstancedTargets.Add(river.Dikes);
         if (robots != null)
         {
             picker.InstancedTargets.Add(robots.robotField);
@@ -876,6 +904,9 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // The tower deck and flight are walkable surfaces as well, so the shaft blocks ground travel by
         // height alone, and only the thin railings and stair parapets are obstacles. See Tower.cs.
         collider.Tower = tower;
+        // The river channel is a raised levee, so its water blocks entry exactly like the pond's water;
+        // the banks themselves are walkable ground with no floor height of their own.
+        collider.River = river;
         foreach (var blocker in tower.Blockers)
         {
             collider.Obstacles.Add(blocker);
@@ -1335,6 +1366,10 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // Panel.Update 不会自动递归（见上方注释），漏掉这一行水面/贴花/石块/粒子就会停在默认值（原点、默认 8m 矩形）。
         waterfallPool?.Update(time);
 
+        // 河流同理：每个河段各自是独立 Mesh3D，Panel 不会递归 tick，漏了这行高亮脉动与 Changed 就停在初值。
+        // 真正的水面由 SceneWaterfall Pass 按 River 构造时注册好的 WaterRibbon 数据现算，与这里无关。
+        river?.Update(time);
+
         meshes?.ForEach(me =>
         {
             me.Update(time);
@@ -1618,7 +1653,10 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     /// <summary>
     /// 把贴图名字注册进后端纹理字典。贴花与水幕都只按名字查字典、不会自己加载文件，
     /// 名字没注册就会被整块跳过，所以这里复用既有的命名纹理路径：一张永远不画的 Sprite2D 用同一个名字加载。
-    /// 加载是异步的，贴图到位之前那几帧效果不出现，这是设计而不是丢失。
+    ///
+    /// 注册时同步解码一次：AddControl 走的是后台队列（BaseApp.RequestLoad → 消费线程），只排队的话
+    /// 贴图要过几秒才进字典，而水幕/河流的第一帧就要按名字取样，期间整条水带按“缺表即跳过”的约定不画。
+    /// LoadSprite2D 内部是同步解码，队列里那条稍后会命中同一个缓存键，不会重复解码。
     ///
     /// 按名字去重：多条瀑布共用同一套三张贴图，不去重就是几个空 Sprite2D 各自加载同一份文件。
     /// internal：WaterfallPool 的潭底两张贴花走同一条命名纹理路径，不再另开加载链。
@@ -1628,7 +1666,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         if (string.IsNullOrWhiteSpace(name)) return;
         if (!namedTextures.Add(name)) return;
 
-        AddControl(new Season.Controls.Sprite2D
+        var sprite = new Season.Controls.Sprite2D
         {
             Name = name,
             // LoadSprite2D 内部把 Width/Height 转成 int，null 会被吞成一次“加载失败”，这里给实数。
@@ -1637,7 +1675,26 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             // 纯载体：Alpha 为 0 时 Draw 直接返回，不会出现在屏幕上。
             Alpha = 0f,
             Enable = false,
-        });
+        };
+        AddControl(sprite);
+
+        try
+        {
+            Season.Basic.Graphics.Instance.LoadSprite2D(sprite).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            AddLog(LogType.Error, $"[Texture] '{name}' LoadSprite2D threw: {ex}");
+        }
+
+        // 三张表缺任意一张，瀑布与河流就整段跳过，而后端失败是静默的（只是不画）。
+        // 缺图时把“文件在不在”一起写进日志，省得再猜是寻址错还是解码错。
+        if (sprite.OriginWidth <= 0 || sprite.OriginHeight <= 0)
+        {
+            string baseDir = Season.Storage.StorageService.DirectoryBase;
+            bool onDisk = Season.Storage.StorageService.FileExist(baseDir, name);
+            AddLog(LogType.Error, $"[Texture] '{name}' not decoded: origin={sprite.OriginWidth}x{sprite.OriginHeight} onDisk={onDisk} base='{baseDir}'");
+        }
     }
 
 }

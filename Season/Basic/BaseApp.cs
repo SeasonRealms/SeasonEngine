@@ -188,6 +188,11 @@ public abstract class BaseApp : Panel
     /// <see cref="IGraphics.CreateWaterfallPipeline"/>, otherwise the water curtain is just data.</summary>
     public Season.Rendering.SceneWaterfalls Waterfalls { get; } = new();
 
+    /// <summary>P1 river ribbon registry (the river's selectable water segments). Drawing additionally requires the backend to
+    /// implement <see cref="IGraphics.CreateWaterRibbonPipeline"/>; otherwise the river is just data. Kept apart from
+    /// <see cref="Waterfalls"/> because each registry is packed into its own frame buffer with its own draw table.</summary>
+    public Season.Rendering.SceneWaterRibbons Rivers { get; } = new();
+
     /// <summary>The effective scene lighting consumed by each platform frame loop (single convergence point;
     /// hdrExposure is still injected by each backend via SetLighting).</summary>
     public SceneLightParams EffectiveSceneLights => SceneLights;
@@ -360,6 +365,10 @@ public abstract class BaseApp : Panel
             // P1: the waterfall water curtain PSO must likewise be built before the first frame. The preconditions match decals (single-sample HDR scene color + explicit depth),
             // with no refraction snapshot; if the backend has no implementation, RegisterWaterfalls falls back itself and leaves no residue.
             Season.Rendering.FrameSchedule.RegisterWaterfalls(Graphics.Instance);
+
+            // P1: the river ribbon PSO, same preconditions as the curtain (the Pass and the resource shape are shared). Built
+            // before the first frame because the bank meshes register their ribbons in their own constructor.
+            Season.Rendering.FrameSchedule.RegisterWaterRivers(Graphics.Instance);
 
             // On Web, consume the channel from the main-thread render loop; on native platforms, start a background consumer.
             if (DeviceServices.Core.Platform is not Platform.Web)

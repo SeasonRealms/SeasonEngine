@@ -22,6 +22,8 @@ public sealed class WaterEffect : IDisposable
     readonly Vector4[] _frame = new Vector4[WaterMath.VectorCount];
     readonly WaterDraw[] _draws = new WaterDraw[WaterMath.MaxWaters];
     readonly WaterPlane[] _sorted = new WaterPlane[WaterMath.MaxWaters];
+    /// <summary>Frame block for a view that has no <see cref="ViewTargets"/> registered (the single-view shape); a
+    /// registered view owns its own copy in <see cref="ViewTargets.WaterFrameBuffer"/>.</summary>
     StorageBuffer? _buffer;
     int _count;
     int _pipelineCount;
@@ -76,8 +78,13 @@ public sealed class WaterEffect : IDisposable
         WaterMath.Pack(_frame, jitteredVp, inverseJitteredVp, view.Position, view.Width, view.Height,
             raining, time, FrameSchedule.SkyViewTexture != null, reflection, sunDirection, sunIntensity,
             _sorted.AsSpan(0, _count));
-        _buffer ??= g.CreateStorageBuffer(WaterMath.ByteCount);
-        if (_buffer == null || !g.TryUpdateStorageBuffer(_buffer, MemoryMarshal.AsBytes(_frame.AsSpan())))
+        // The frame block lives on the view, not on this effect: two views upload it in the same frame, and on backends
+        // whose staging keeps only a frame's last write a shared buffer would leave the main view drawing with the
+        // secondary view's matrices (see ViewTargets.WaterFrameBuffer).
+        var buffer = view.Targets != null
+            ? view.Targets.WaterFrameBuffer ??= g.CreateStorageBuffer(WaterMath.ByteCount)
+            : _buffer ??= g.CreateStorageBuffer(WaterMath.ByteCount);
+        if (buffer == null || !g.TryUpdateStorageBuffer(buffer, MemoryMarshal.AsBytes(_frame.AsSpan())))
             return false;
         for (int i = 0; i < _count; i++)
         {
@@ -87,7 +94,7 @@ public sealed class WaterEffect : IDisposable
             _draws[i] = new WaterDraw(i, _sorted[i].NormalTexture, tiling.X, tiling.Z, tiling.Subdiv);
         }
         var inputs = new WaterInputs(color, refractionSource, depth, FrameSchedule.SkyViewTexture,
-            _buffer, _draws, _count);
+            buffer, _draws, _count);
         if (!_pipeline.Prepare(inputs, color)) return false;
         _pipelineCount = _count;
         Ready = true;

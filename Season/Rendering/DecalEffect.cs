@@ -21,6 +21,8 @@ public sealed class DecalEffect : IDisposable
     readonly Vector4[] _frame = new Vector4[DecalMath.VectorCount];
     readonly DecalDraw[] _draws = new DecalDraw[DecalMath.MaxDecals];
     readonly DecalVolume[] _sorted = new DecalVolume[DecalMath.MaxDecals];
+    /// <summary>Frame block for a view that has no <see cref="ViewTargets"/> registered (the single-view shape); a
+    /// registered view owns its own copy in <see cref="ViewTargets.DecalFrameBuffer"/>.</summary>
     StorageBuffer? _buffer;
     int _count;
     int _pipelineCount;
@@ -65,12 +67,17 @@ public sealed class DecalEffect : IDisposable
         bool writeRoughness = normal != null && AnyRoughness();
         DecalMath.Pack(_frame, jitteredVp, inverseJitteredVp, view.Position, view.Width, view.Height,
             writeRoughness, _sorted.AsSpan(0, _count));
-        _buffer ??= g.CreateStorageBuffer(DecalMath.ByteCount);
-        if (_buffer == null || !g.TryUpdateStorageBuffer(_buffer, MemoryMarshal.AsBytes(_frame.AsSpan())))
+        // The frame block lives on the view, not on this effect: two views upload it in the same frame, and on backends
+        // whose staging keeps only a frame's last write a shared buffer would leave the main view drawing with the
+        // secondary view's matrices (see ViewTargets.DecalFrameBuffer).
+        var buffer = view.Targets != null
+            ? view.Targets.DecalFrameBuffer ??= g.CreateStorageBuffer(DecalMath.ByteCount)
+            : _buffer ??= g.CreateStorageBuffer(DecalMath.ByteCount);
+        if (buffer == null || !g.TryUpdateStorageBuffer(buffer, MemoryMarshal.AsBytes(_frame.AsSpan())))
             return false;
         for (int i = 0; i < _count; i++)
             _draws[i] = new DecalDraw(i, _sorted[i].Mode, _sorted[i].Texture);
-        var inputs = new DecalInputs(color, depth, normal, _buffer, _draws, _count, writeRoughness);
+        var inputs = new DecalInputs(color, depth, normal, buffer, _draws, _count, writeRoughness);
         if (!_pipeline.Prepare(inputs, color)) return false;
         _pipelineCount = _count;
         WriteRoughness = writeRoughness;
