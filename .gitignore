@@ -60,3 +60,5 @@ nunit-*.xml
 /.vs
 /Apps/Engine/Engine.csproj.user
 /Tests
+/Apps/Engine/.dbg/_river_bin
+/Season/.dbg/_river_bin
