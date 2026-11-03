@@ -128,7 +128,7 @@ struct FinalizeParams
 @group(0) @binding(1) var<storage, read> drawArgs: array<u32>;
 @group(0) @binding(2) var<storage, read_write> dispatchArgs: array<u32>;
 
-// Single-threaded: the slot count is at most 4, and reading four uints serially is far cheaper than
+// Single-threaded: the slot count is at most 5, and reading five uints serially is far cheaper than
 // launching a workgroup and then synchronizing a reduction. It also avoids writing a workgroup-sync
 // dialect for each of the four backends (WGSL has no cross-workgroup device-scope fence).
 @compute @workgroup_size(1, 1, 1)
@@ -153,7 +153,7 @@ struct GatherParams
     capacity: u32,
     primCount: u32,
     slotCount: u32,
-    pad: u32,
+    tagMask: u32,
 };
 
 @group(0) @binding(0) var<uniform> gatherParams: GatherParams;
@@ -190,6 +190,11 @@ fn CSMain(@builtin(global_invocation_id) id: vec3<u32>)
     for (var o: u32 = 0u; o < 20u; o = o + 1u)
     {
         sortedWorlds[dst + o] = sourceWorlds[src + o];
+    }
+    // Original-index tag for every slot in the mask: index + 1 in M14 (f32 index 3), decoded by the vertex stage. See the HLSL source for why.
+    if (((gatherParams.tagMask >> slot) & 1u) != 0u)
+    {
+        sortedWorlds[dst + 3u] = f32(vis + 1u);
     }
 }
 """;

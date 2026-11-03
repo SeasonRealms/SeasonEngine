@@ -140,7 +140,7 @@ struct FinalizeParams
     uint pad;
 };
 
-// Single-threaded: the slot count is at most 4, and reading four uints serially is far below the cost of opening a workgroup and doing a reduction with synchronization,
+// Single-threaded: the slot count is at most 5, and reading five uints serially is far below the cost of opening a workgroup and doing a reduction with synchronization,
 // and it also avoids writing a threadsync dialect per backend.
 kernel void CSMain(uint3 id [[thread_position_in_grid]],
                    constant FinalizeParams& finalizeParams [[buffer(0)]],
@@ -171,7 +171,7 @@ struct GatherParams
     uint capacity;
     uint primCount;
     uint slotCount;
-    uint pad;
+    uint tagMask;
 };
 
 kernel void CSMain(uint3 id [[thread_position_in_grid]],
@@ -204,6 +204,9 @@ kernel void CSMain(uint3 id [[thread_position_in_grid]],
     uint dst = (slot * gatherParams.capacity + k) * WORLD_STRIDE_F;
     for (uint o = 0u; o < WORLD_STRIDE_F; ++o)
         sortedWorlds[dst + o] = sourceWorlds[src + o];
+    // Original-index tag for every slot in the mask: index + 1 in M14 (float index 3), decoded by the vertex stage. See the HLSL source for why.
+    if (((gatherParams.tagMask >> slot) & 1u) != 0u)
+        sortedWorlds[dst + 3u] = float(vis + 1u);
 }
 """;
 }

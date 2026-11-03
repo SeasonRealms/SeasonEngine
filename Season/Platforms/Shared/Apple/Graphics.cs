@@ -2590,6 +2590,10 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             var mtlInstancedModel = new MTLInstancedModel(model.ModelName);
             mtlInstancedModel.Load(template, wrapperModel);
 
+            // A7: replay the clips on the instance's own runtime asset before it is published through model.Asset (picking reads
+            // its node tree), since sampling poses it; nothing else holds it yet. The shared template's player is never touched.
+            var cullBounds = mtlInstancedModel.Asset.ComputeClipUnionBounds(template.Asset.Model.LocalBounds);
+
             // v2 picking:
             // inject the instanced GltfAsset so the node tree, animation, and bone palette stay aligned with instanced rendering.
             model.Asset = mtlInstancedModel.Asset;
@@ -2601,6 +2605,7 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             // Follow the same unified positioning convention for the raw bounds as well,
             // providing the data source for instance anchors and per-axis scaling before animation enlargement.
             model.TemplateLocalBoundsRaw = template.Asset.Model.LocalBoundsRaw;
+            model.TemplateCullBounds = cullBounds;
 
             var animNames = mtlInstancedModel.GetAnimationNames();
             model.AnimationClipCount = animNames.Count;

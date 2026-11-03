@@ -16,10 +16,9 @@ namespace Engine.Panels;
 /// readback, no platform code in this file.</para>
 ///
 /// <para>They also demonstrate the per-view policy that this feature added:</para>
-/// - <c>Features</c>: both keep opaque and transparent geometry, the screen-space decals, the waterfall curtain and the water surface,
-///   which are per-view materials rather than screen-space effects; the mirror also drops shadows, fog, weather, AO, bloom,
-///   anti-aliasing, particles and the Post slot, and the minimap adds the fog composite (an orthographic
-///   top-down test of the per-view volumetric route).
+/// - <c>Features</c>: both keep opaque and transparent geometry, the screen-space decals, the waterfall curtain, the water surface
+///   and the volumetric fog, all of which are per-view passes rather than screen-space effects; both drop shadows, weather, AO,
+///   bloom, anti-aliasing and the Post slot.
 /// - <c>ShadowPolicy.Off</c>: both read the white fallback instead of the main view's cascaded atlas, whose texel
 ///   density is meaningless at this size.
 /// - <c>UpdateInterval</c>: the minimap re-renders every few frames and keeps its previous image in between.
@@ -56,19 +55,25 @@ internal class RearViews : Panel
     const float MinimapCameraHeight = 200f;
 
     /// <summary>
-    /// Opaque and transparent geometry, the screen-space decals, and the two materials that read as part of the world when
-    /// seen from behind: the waterfall curtain and the water surface. All of them are ordinary per-view passes - they cull,
-    /// pack and sort against this view's own camera - so they cost the mirror a second small pass chain and nothing else. The
-    /// water surface allocates its refraction snapshot at this view's size on the first frame it draws, and the decals and the
-    /// curtain upload into this view's own frame blocks. Everything that is screen-space or frame-global (shadows, fog, weather,
-    /// AO, bloom, anti-aliasing, particles, Post) stays off.
+    /// Opaque and transparent geometry, the screen-space decals, the particles (rain, snow, the campfire's fire and the lightning
+    /// ribbon) and the two materials that read as part of the world when seen from behind: the waterfall curtain and the water
+    /// surface. All of them are ordinary per-view passes - they cull, pack and sort against this view's own camera - so they cost
+    /// the mirror a second small pass chain and nothing else. The water surface allocates its refraction snapshot at this view's
+    /// size on the first frame it draws, the decals, the particles and the curtain upload into this view's own frame blocks, and
+    /// the fog owns its own froxel volumes under this view's scope.
+    ///
+    /// Fog is part of the list for the same reason as water: the island's mist is not a screen-space effect but an authored volume
+    /// placed in the world, so a mirror that switches it off renders the grove without its mist while the main view has it -
+    /// "the fog does not reflect in the mirror", which reads as a bug rather than as a quality trade-off. Everything that is
+    /// frame-global (shadows, weather fall, AO, bloom, anti-aliasing, Post) still stays off.
     /// </summary>
     const ViewFeature MirrorFeatures = ViewFeature.Opaque | ViewFeature.Transparent | ViewFeature.Decals
-        | ViewFeature.Waterfalls | ViewFeature.Water;
+        | ViewFeature.Waterfalls | ViewFeature.Water | ViewFeature.Particles | ViewFeature.Fog;
 
-    /// <summary>Opaque + Transparent + Decals + Waterfalls + Water + Fog: per-view volumetric fog test for the minimap (orthographic top-down).</summary>
+    /// <summary>Opaque + Transparent + Decals + Particles + Waterfalls + Water + Fog. The same policy as the mirror; the map differs
+    /// only in camera and refresh interval.</summary>
     const ViewFeature MinimapFeatures = ViewFeature.Opaque | ViewFeature.Transparent | ViewFeature.Decals
-        | ViewFeature.Waterfalls | ViewFeature.Water | ViewFeature.Fog;
+        | ViewFeature.Waterfalls | ViewFeature.Water | ViewFeature.Particles | ViewFeature.Fog;
 
     public const string MirrorTextureName = "view://rear-mirror";
     public const string MinimapTextureName = "view://minimap";

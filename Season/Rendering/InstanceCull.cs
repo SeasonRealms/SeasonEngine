@@ -14,8 +14,10 @@ namespace Season.Rendering;
 /// This is exactly the approach 1-5 deferred in <see cref="Season.Controls.InstancedMesh3DBase"/>: the comment there states
 /// "per-instance culling would require rebuilding and uploading the instance buffer for every cascade, violating clause 2 of 1-3", while the index table sidesteps the rebuild.
 ///
-/// All buffers are tiled across <see cref="InstanceCull.MaxSlots"/> slots, with the slot layout matching
-/// <see cref="CascadedShadow"/>: 0..2 are the sun cascades and 3 is the spot light. Inactive slots are skipped directly by slotMask,
+/// All buffers are tiled across <see cref="InstanceCull.MaxSlots"/> slots. The shadow slots keep the layout of
+/// <see cref="CascadedShadow"/>: 0..2 are the sun cascades and 3 is the spot light; <see cref="InstanceCull.MainViewSlot"/> follows them
+/// and holds the main camera's frustum for the groups that opted into indirect main-view drawing (<see cref="CullMainView"/>).
+/// Inactive slots are skipped directly by slotMask,
 /// rather than by filling in a "matrix that culls everything" -- that would require constructing a degenerate projection that silently breaks the moment the plane-extraction code changes.
 /// </summary>
 public interface IInstanceCullTarget
@@ -38,12 +40,24 @@ public interface IInstanceCullTarget
     StorageBuffer? CullSourceWorlds { get; }
 
     /// <summary>
-    /// The reordered world-matrix stream of 80 bytes per instance, tiled across <see cref="InstanceCull.MaxSlots"/> slots in capacity-sized segments.
+    /// Number of instance streams the gather kernel materializes from the one index table. A group whose primitives all read the same
+    /// instance stream (InstancedMesh3D) has one; a glTF InstancedModel has one per drawn primitive, because each primitive's stream is
+    /// "its node's world × the instance world" plus its own morph weights, so no single reordered stream could serve two of them.
+    /// The visibility decision is still made once per instance from <see cref="CullSourceWorlds"/>; every stream only replays it.
+    /// </summary>
+    int CullStreamCount { get; }
+
+    /// <summary>The 80-byte-per-instance stream gather reads for stream <paramref name="stream"/>, holding the instances in the same order as
+    /// <see cref="CullSourceWorlds"/>. A single-stream group returns <see cref="CullSourceWorlds"/> itself.</summary>
+    StorageBuffer? CullStreamSource(int stream);
+
+    /// <summary>
+    /// The reordered stream of 80 bytes per instance for stream <paramref name="stream"/>, tiled across <see cref="InstanceCull.MaxSlots"/> slots in capacity-sized segments.
     /// The gather kernel materializes visible instances here according to the index table; the draw side binds it as the instance stream and feeds the instance count via indirect args.
     /// The reason to materialize rather than have the vertex stage index the table itself: the D3D12 root signature has already used 61/64 DWORDs, and attaching two more SRV tables
     /// would exhaust the binding budget for every subsequent Phase, while IA's instance stepping cannot be indexed by original index.
     /// </summary>
-    StorageBuffer? CullSortedWorlds { get; }
+    StorageBuffer? CullStreamSorted(int stream);
 
     /// <summary>16 bytes per primitive: index count, start index, base vertex, reserved. Updated only when the primitive set changes.</summary>
     StorageBuffer? CullPrimitiveInfo { get; }
@@ -59,6 +73,14 @@ public interface IInstanceCullTarget
 
     /// <summary>Group-local bounding box half-extents.</summary>
     Vector3 CullLocalExtents { get; }
+
+    /// <summary>
+    /// Whether this group draws its opaque main-view body from the <see cref="InstanceCull.MainViewSlot"/> segment this frame.
+    /// Only then is the main-view slot added to this target's slot mask: a group that keeps the direct path pays nothing for the extra slot,
+    /// and a group whose shadows are reused this frame still gets its main-view segment built.
+    /// Latched by the implementer during Update from the owner's effective draw path, so it is stable for the whole frame.
+    /// </summary>
+    bool CullMainView { get; }
 
     /// <summary>
     /// Called before each dispatch so the implementer can upload the CPU-side cull inputs (per-instance matrix stream and primitive arg table) to the GPU.
@@ -92,8 +114,16 @@ public interface IInstanceCullTarget
 /// </summary>
 public static class InstanceCull
 {
-    /// <summary>Slot count, taken directly from the shadow system's atlas partition count: three cascades + one spot light.</summary>
-    public const int MaxSlots = CascadedShadow.SlotCount;
+    /// <summary>
+    /// Slot of the main camera's frustum, placed right after the shadow atlas partitions so the shadow slot numbers stay identical to
+    /// <see cref="CascadedShadow"/>'s and every shadow-side caller keeps indexing by <see cref="CascadedShadow.ActiveSlot"/> unchanged.
+    /// Its reordered stream carries the original-index tag like every other slot's (see the gather kernel and <see cref="InstanceCull.TagMask"/>).
+    /// </summary>
+    public const int MainViewSlot = CascadedShadow.SlotCount;
+
+    /// <summary>Slot count: the shadow system's atlas partitions (three cascades + one spot light) plus the main view.
+    /// It multiplies every per-slot buffer size below, so the backends that allocate through these helpers grow with it automatically.</summary>
+    public const int MaxSlots = CascadedShadow.SlotCount + 1;
 
     /// <summary>
     /// Per-group primitive limit. The indirect arg table is addressed at a fixed stride via <c>slot * MaxPrimitives + primitive</c>;
@@ -101,6 +131,15 @@ public static class InstanceCull
     /// one fewer drift point. 16 covers every surface combination of the current models; groups exceeding it simply do not participate in A7.
     /// </summary>
     public const int MaxPrimitives = 16;
+
+    /// <summary>
+    /// Slots whose reordered records get the original instance index written into M14 by gather: all of them.
+    /// The main view needs it for motion vectors (t9/t10) and per-instance palettes; the shadow slots need it as soon as a skinned group draws
+    /// from them, because its bone palette is laid out by original index and a compacted SV_InstanceID would read another instance's pose.
+    /// Tagging a slot that does not need it is free of visible effect: every vertex stage, the shadow variant included, decodes the tag and
+    /// restores M14 to 0 before using the matrix, so a tagged record yields bit for bit the world matrix of an untagged one.
+    /// </summary>
+    public const uint TagMask = (1u << MaxSlots) - 1u;
 
     /// <summary>Per-instance world-matrix stride, bit-consistent with DX's InstanceTransformData and each backend's IA instance stream.</summary>
     public const uint WorldStride = 80;
@@ -133,8 +172,13 @@ public static class InstanceCull
     /// <summary>Gather kernel's group count along Y, one row per slot. Both dispatch paths use this value: the A/B comparison is only allowed to vary the X dimension.</summary>
     public const uint GatherGroupsY = MaxSlots;
 
-    /// <summary>Thread count of the reset kernel: covers all slots and primitives in one go.</summary>
+    /// <summary>Thread count of the reset kernel: covers all slots and primitives in one go.
+    /// It is no longer a single workgroup (5 × 16 = 80 > 64), so it is dispatched as <see cref="ResetGroups"/> groups of <see cref="CullGroupSize"/>;
+    /// the kernel already discards the threads past the last slot.</summary>
     public const uint ResetThreads = (uint)(MaxSlots * MaxPrimitives);
+
+    /// <summary>Group count of the reset dispatch.</summary>
+    public const uint ResetGroups = (ResetThreads + CullGroupSize - 1) / CullGroupSize;
 
     /// <summary>Byte size of the slot matrix buffer.</summary>
     public const uint SlotMatrixBytes = (uint)MaxSlots * SlotMatrixStride;
@@ -149,17 +193,35 @@ public static class InstanceCull
     public static readonly List<IInstanceCullTarget> Targets = new();
 
     /// <summary>
+    /// Whether this frame's dispatches included <see cref="MainViewSlot"/> for the targets that asked for it. Written by
+    /// <see cref="InstanceCullEffect"/> before it dispatches anything, and read by the draw side next to its own "draw ready" flag:
+    /// that flag only says the chain ran, and a chain run for the shadow slots alone still resets the main-view args to zero instances,
+    /// so drawing from the segment without this check would make the whole group vanish for the frame (for instance when the main
+    /// view has not been prepared yet). A stale value from an earlier frame is harmless: the draw-ready flag is cleared every Update
+    /// and only set by a dispatch that rewrote this one first.
+    /// </summary>
+    public static bool MainViewCulled { get; internal set; }
+
+    /// <summary>
     /// Number of indirect-dispatch gathers within the process. For diagnostics; the two numbers together are the only evidence of "which path this A/B run actually took":
     /// comparing two screenshots is not enough -- when both paths are correct they must be identical, but "gather was never dispatched at all" would also make them identical,
     /// and in that case the comparison proves nothing.
     ///
-    /// The increment happens in <see cref="InstanceCullEffect"/>'s DispatchTarget, at most once per target per frame,
-    /// so its ratio to the frame count is the number of targets actually participating in culling.
+    /// The increment happens in <see cref="InstanceCullEffect"/>'s DispatchTarget, at most once per target per frame however many streams the target
+    /// gathers, so its ratio to the frame count is the number of targets actually participating in culling.
     /// </summary>
     public static long IndirectGatherDispatches;
 
     /// <summary>Number of fixed-group-count gathers within the process; mutually exclusive and exhaustive with <see cref="IndirectGatherDispatches"/>.</summary>
     public static long FixedGatherDispatches;
+
+    /// <summary>
+    /// Number of opaque main-view draws within the process that actually took their instances from the <see cref="MainViewSlot"/>
+    /// segment. Diagnostics only, for the same reason as the gather counters: <see cref="MainViewCulled"/> only proves the slot was culled,
+    /// and a draw side that silently fell back to the direct stream would make the main-view A/B identical while proving nothing.
+    /// Incremented by each backend once per primitive draw it issues from the segment.
+    /// </summary>
+    public static long MainViewDraws;
 
     /// <summary>Byte offset of the (slot, primitive) entry in the indirect arg table.</summary>
     public static uint ArgsOffset(int slot, int primitive)
@@ -306,27 +368,44 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
     {
         if (!ReferenceEquals(g, _graphics) || _reset == null || _cull == null || _finalize == null
             || _gather == null || _slotBuffer == null) return;
-        if (!CascadedShadow.SunActive && !CascadedShadow.SpotActive) return;
-        // On a shadow-map reuse hit the entire shadow Pass is skipped, and the culling and collection outputs have no consumers:
-        // this frame's four dispatches (reset/cull/finalize/gather) plus the per-slot draw args are pure waste, so exit early.
-        // The early exit is safe provided nobody reads these buffers this frame -- the draw side is driven only by the shadow Pass, which does not exist this frame.
-        if (CascadedShadow.ReuseActive) return;
         if (InstanceCull.Targets.Count == 0) return;
 
         // The slot mask is determined here rather than letting the kernel guess from an "invalid matrix": inactive slots simply do not participate,
         // their arg table keeps the InstanceCount=0 written by reset, and the draw side then naturally draws nothing.
-        int slotMask = 0;
-        int cascades = CascadedShadow.SunActive ? CascadedShadow.ActiveCascadeCount : 0;
-        for (int slot = 0; slot < cascades && slot < CascadedShadow.MaxCascades; slot++)
+        //
+        // On a shadow-map reuse hit the entire shadow Pass is skipped, so the shadow slots have no consumers this frame and stay out of the mask.
+        // That used to end Record outright; it no longer may, because the main-view slot is consumed by the scene Pass, which runs every frame
+        // whether or not the shadow atlas is reused or shadows are on at all.
+        int shadowMask = 0;
+        if (!CascadedShadow.ReuseActive)
         {
-            WriteSlotMatrix(slot, CascadedShadow.CascadeViewProj[slot]);
-            slotMask |= 1 << slot;
+            int cascades = CascadedShadow.SunActive ? CascadedShadow.ActiveCascadeCount : 0;
+            for (int slot = 0; slot < cascades && slot < CascadedShadow.MaxCascades; slot++)
+            {
+                WriteSlotMatrix(slot, CascadedShadow.CascadeViewProj[slot]);
+                shadowMask |= 1 << slot;
+            }
+            if (CascadedShadow.SpotActive)
+            {
+                WriteSlotMatrix(CascadedShadow.SpotSlot, CascadedShadow.SpotViewProj);
+                shadowMask |= 1 << CascadedShadow.SpotSlot;
+            }
         }
-        if (CascadedShadow.SpotActive)
-        {
-            WriteSlotMatrix(CascadedShadow.SpotSlot, CascadedShadow.SpotViewProj);
-            slotMask |= 1 << CascadedShadow.SpotSlot;
-        }
+
+        // The main view's unjittered ViewProjection without the backend NDC adjustment -- the same matrix control-level frustum culling uses,
+        // so an instance survives here exactly when its group would survive there. It is already current: every backend prepares the main view
+        // at the camera update point, before the shadow cascades are derived from it and long before this FrameStart phase.
+        // TAA jitter is sub-pixel and the cull sphere is conservative, so the unjittered planes never cut a visible instance.
+        bool mainView = false;
+        for (int i = 0; i < InstanceCull.Targets.Count && !mainView; i++)
+            mainView = InstanceCull.Targets[i].CullMainView;
+        var view = mainView ? DeviceServices.BaseApp?.MainView : null;
+        if (view == null || !view.Prepared) mainView = false;
+        else WriteSlotMatrix(InstanceCull.MainViewSlot, view.ViewProjection);
+        InstanceCull.MainViewCulled = mainView;
+        int mainBit = 1 << InstanceCull.MainViewSlot;
+
+        int slotMask = shadowMask | (mainView ? mainBit : 0);
         if (slotMask == 0) return;
 
         // Clear inactive slots: the matrix buffer is reused across frames; a leftover matrix from the previous frame, if read, would make some slot draw ghost instances.
@@ -335,8 +414,14 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
 
         if (!g.TryUpdateStorageBuffer(_slotBuffer, MemoryMarshal.AsBytes(_slotMatrices.AsSpan()))) return;
 
+        // Each target gets the shadow slots plus the main-view slot only if it asked for it: a direct-path group would otherwise
+        // pay a cull test and a gather row per instance for a segment nobody draws.
         for (int i = 0; i < InstanceCull.Targets.Count; i++)
-            DispatchTarget(g, InstanceCull.Targets[i], slotMask);
+        {
+            var target = InstanceCull.Targets[i];
+            int mask = shadowMask | (mainView && target.CullMainView ? mainBit : 0);
+            if (mask != 0) DispatchTarget(g, target, mask);
+        }
     }
 
     void WriteSlotMatrix(int slot, in Matrix4x4 vp)
@@ -363,19 +448,28 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         if (capacity < count || primitives <= 0 || primitives > InstanceCull.MaxPrimitives) return;
 
         var source = target.CullSourceWorlds;
-        var sorted = target.CullSortedWorlds;
         var info = target.CullPrimitiveInfo;
         var args = target.CullArgs;
         var visible = target.CullVisible;
-        if (source == null || sorted == null || info == null || args == null || visible == null) return;
+        int streams = target.CullStreamCount;
+        if (source == null || info == null || args == null || visible == null || streams <= 0) return;
 
         // The capacity checks live in the shared layer so the four backends do not each repeat them: args is fixed-size, and visible and the reordered stream must hold the full capacity.
         // source only needs to hold this frame's instances -- it is uploaded by instance count, with no spare room reserved.
         if (args.SizeInBytes < InstanceCull.ArgsBytes) return;
         if (visible.SizeInBytes < (uint)(InstanceCull.MaxSlots * capacity) * 4u) return;
         if (source.SizeInBytes < (uint)count * InstanceCull.WorldStride) return;
-        if (sorted.SizeInBytes < InstanceCull.SortedBytes(capacity)) return;
         if (info.SizeInBytes < (uint)primitives * InstanceCull.PrimitiveInfoStride) return;
+        // Every stream is checked before anything is dispatched: a stream found short after the cull already ran would leave the args
+        // saying "N visible" over a reordered segment that was never written, and the draw side would read last frame's records.
+        for (int s = 0; s < streams; s++)
+        {
+            var streamSource = target.CullStreamSource(s);
+            var streamSorted = target.CullStreamSorted(s);
+            if (streamSource == null || streamSorted == null) return;
+            if (streamSource.SizeInBytes < (uint)count * InstanceCull.WorldStride) return;
+            if (streamSorted.SizeInBytes < InstanceCull.SortedBytes(capacity)) return;
+        }
 
         // 1) reset: writes the index count and start offset for each entry, and zeroes InstanceCount.
         _resetParams[0] = (uint)primitives;
@@ -389,7 +483,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             Kernel = _reset!,
             Params = MemoryMarshal.AsBytes(_resetParams.AsSpan()),
             Resources = _resetRefs,
-            GroupsX = 1,
+            GroupsX = InstanceCull.ResetGroups,
             GroupsY = 1,
             GroupsZ = 1,
         });
@@ -432,7 +526,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
 
         // 3) finalize (indirect path only): reduces the per-slot visible counts into "how many groups to dispatch along X".
         //    The size can only come from the GPU -- the index table is compressed, and the CPU only has capacity as an upper bound.
-        //    It is the only [numthreads(1,1,1)] kernel among the four backends: the slot count is at most 4, and reading four uints serially
+        //    It is the only [numthreads(1,1,1)] kernel among the four backends: the slot count is at most 5, and reading five uints serially
         //    is far cheaper than opening a workgroup to do a reduction and then synchronize, and it avoids writing a threadsync dialect per backend.
         bool indirect = IndirectGather && _dispatchArgs != null;
         if (indirect)
@@ -465,27 +559,34 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         _gatherParams[0] = (uint)capacity;
         _gatherParams[1] = (uint)primitives;
         _gatherParams[2] = (uint)InstanceCull.MaxSlots;
-        _gatherParams[3] = 0;
+        // Tag mask: every slot's records get the original index written into M14 (see the gather kernel and InstanceCull.TagMask).
+        _gatherParams[3] = InstanceCull.TagMask;
         _gatherRefs[0] = visible;
-        _gatherRefs[1] = source;
-        _gatherRefs[2] = sorted;
         _gatherRefs[3] = args;
         // The counters sit at the dispatch point rather than at the branch test: if finalize is ever merged into another kernel in the future, the branch would still be there while gather might
         // no longer be dispatched, and only when the numbers correspond one-to-one with the real dispatches do they have diagnostic value.
+        // They count targets, not streams, so the per-frame ratio keeps meaning "targets culled" whatever mix of groups is on screen.
         if (indirect) InstanceCull.IndirectGatherDispatches++;
         else InstanceCull.FixedGatherDispatches++;
-        g.DispatchCompute(new ComputeDispatchArgs
+        // One gather per stream against the same index table, args and dispatch block: the visibility decision is made once, and each stream
+        // only replays it. The repeated fan-out is harmless (it reads primitive 0, which no gather writes), and the dispatch block is only read.
+        for (int s = 0; s < streams; s++)
         {
-            Kernel = _gather!,
-            Params = MemoryMarshal.AsBytes(_gatherParams.AsSpan()),
-            Resources = _gatherRefs,
-            // On the indirect path this dimension is superseded by the arg block; write 0 rather than a capacity that will never be used:
-            // during a frame capture "0 groups" is the shortest hint to "go look at the arg block".
-            GroupsX = indirect ? 0u : InstanceCull.GatherGroupsX(capacity),
-            GroupsY = InstanceCull.GatherGroupsY,
-            GroupsZ = 1,
-            Arguments = indirect ? _dispatchArgs : null,
-        });
+            _gatherRefs[1] = target.CullStreamSource(s)!;
+            _gatherRefs[2] = target.CullStreamSorted(s)!;
+            g.DispatchCompute(new ComputeDispatchArgs
+            {
+                Kernel = _gather!,
+                Params = MemoryMarshal.AsBytes(_gatherParams.AsSpan()),
+                Resources = _gatherRefs,
+                // On the indirect path this dimension is superseded by the arg block; write 0 rather than a capacity that will never be used:
+                // during a frame capture "0 groups" is the shortest hint to "go look at the arg block".
+                GroupsX = indirect ? 0u : InstanceCull.GatherGroupsX(capacity),
+                GroupsY = InstanceCull.GatherGroupsY,
+                GroupsZ = 1,
+                Arguments = indirect ? _dispatchArgs : null,
+            });
+        }
 
         // The handoff goes here rather than at draw time: draw happens inside the shadow Pass, and resource states cannot be switched inside a Pass.
         target.PrepareCullDraw();
@@ -532,7 +633,9 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferRead },
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferReadWrite },
         },
-        WorkgroupX = InstanceCull.ResetThreads,
+        // The group size is the shared 64 rather than ResetThreads: with the main-view slot the thread count is 80, past the 64 the
+        // HLSL/GLSL/WGSL sources declare, and Metal takes this value as its threadgroup width directly.
+        WorkgroupX = InstanceCull.CullGroupSize,
         WorkgroupY = 1,
         WorkgroupZ = 1,
     };
@@ -570,7 +673,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferRead },
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferReadWrite },
         },
-        // One thread. The reduction is over at most MaxSlots(4) uints; opening a whole workgroup just to synchronize four reads costs far more than the reads themselves,
+        // One thread. The reduction is over at most MaxSlots(5) uints; opening a whole workgroup just to synchronize five reads costs far more than the reads themselves,
         // to say nothing of writing a threadsync dialect per backend (GroupMemoryBarrierWithGroupSync / barrier /
         // threadgroup_barrier / workgroupBarrier), which would mean four implementations that can drift.
         WorkgroupX = 1,

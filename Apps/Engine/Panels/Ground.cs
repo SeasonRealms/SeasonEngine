@@ -56,43 +56,44 @@ internal class Ground : Panel
 
         // The procedural road is added right after the grass so it draws later and wins by stable depth testing
         // while remaining embedded in the grass surface.
+        // The road stops where the player spawns instead of running on to the southern range: the corridor south of
+        // that point is the branch river's bed now. Depth is left at the mesh's own length so scale stays 1, and PosZ
+        // puts the northern end at the room's south wall (z = 75) and the southern end on the origin.
         road = BuildRoad();
         road.PosX = 0;
         road.PosY = 0.05f;
-        road.PosZ = 0;
+        road.PosZ = 37.5f;
         road.Width = 2;
         road.Height = 0;
-        road.Depth = 150;
+        road.Depth = 75;
         AddControl(road);
 
     }
 
     /// <summary>
-    /// Procedural road: a 1.6m wide and 276m long subdivided plane with 111 segments of 2.5m
-    /// and a final 1m closing segment. It starts aligned with the south-wall doorway of the room,
-    /// where x is in [-0.8,0.8], runs along X=0 through the ground origin, and extends south until
-    /// it reaches the grass's southern edge at z=-120.
-    /// The old procedural grass kept that south edge unchanged. The grass GLB tile only covers +/-30m around the origin,
-    /// so the southern road segment beyond z=-30 lies outside the tile and the skybox closes the far view.
+    /// Procedural road: a 1.6m wide and 75m long subdivided plane with 30 segments of 2.5m.
+    /// It starts aligned with the south-wall doorway of the room, where x is in [-0.8,0.8], runs along X=0 from the
+    /// room's outer wall, and ends on the player's spawn point at z=0. The corridor south of that point is the branch
+    /// river's bed now, so the road no longer reaches the southern range.
     /// Height aligns with the grass: the road top is y=0.05, which is 5cm above the grass at y=0,
     /// preventing z-fighting while remaining visually embedded with no visible step.
     /// Under the unified placement convention, vertices are generated in local space with the anchor at the bounding-box center,
-    /// located at local (0.8, 0, 138). Coordinates span x in [0,1.6], y=0, and z in [0,276], which maps to world z from -120 to 156.
-    /// World placement is set once in the constructor with Pos=(0, 0.05, 18), while Width, Height, and Depth
+    /// located at local (0.8, 0, 37.5). Coordinates span x in [0,1.6], y=0, and z in [0,75], which maps to world z from 0 to 75.
+    /// World placement is set once in the constructor with Pos=(0, 0.05, 37.5), while Width, Height, and Depth
     /// stay at local size so scale remains 1.
-    /// With 111x4 = 444 vertices, the geometry stays far below the ushort limit of 65535 for Surface.Indices.
+    /// With 30x4 = 120 vertices, the geometry stays far below the ushort limit of 65535 for Surface.Indices.
     /// The surface texture is procedurally generated asphalt noise, using a dark gray base with white edge lines
     /// and a dashed center line, tiled per segment in UV [0,1].
-    /// CastShadows=false uses the same rationale as the grass: a 276m sheet would otherwise create a GI proxy
+    /// CastShadows=false uses the same rationale as the grass: an unbroken sheet would otherwise create a GI proxy
     /// that covers the whole SDF volume and collapses the distance field to a constant negative value.
     /// The road only needs to receive CSM shadows from the room.
     /// </summary>
     static Mesh3D BuildRoad()
     {
         const float width = 1.6f;       // Road width equals the doorway width on the room's south wall.
-        const float length = 276f;      // Road length from the outer south wall of the room to the grass's south edge.
+        const float length = 75f;       // Road length from the outer south wall of the room to the player's spawn point.
         const float cellSize = 2.5f;    // Each segment spans 2.5m and tiles UVs in [0,1].
-        int cells = (int)MathF.Ceiling(length / cellSize); // 276m becomes 111 segments, with the last one closing at the south edge.
+        int cells = (int)MathF.Ceiling(length / cellSize); // 75m becomes exactly 30 segments.
 
         // 1. Generate the procedural noise texture with deterministic value noise.
         var pixels = GenerateRoadTexturePixels(512);
@@ -103,14 +104,14 @@ internal class Ground : Panel
             CastShadows = false,
             CullingEnabled = false,
             // Unified placement convention: Pos is the world position of the anchor, namely the bounding-box center.
-            // The resulting world span is x in [-0.8,0.8], y=0.05, and z in [-120,156].
+            // The resulting world span is x in [-0.8,0.8], y=0.05, and z in [0,75].
             PosX = 0f,
             PosY = 0.05f,
-            PosZ = 18f,
+            PosZ = 37.5f,
         };
 
-        // 2. Subdivided plane in local space, with x in [0,1.6], y=0, and z in [0,276].
-        //    The anchor is the box center at (0.8,0,138). Each segment owns four vertices,
+        // 2. Subdivided plane in local space, with x in [0,1.6], y=0, and z in [0,75].
+        //    The anchor is the box center at (0.8,0,37.5). Each segment owns four vertices,
         //    UVs tile in [0,1], and winding uses the same {2,3,1,2,1,0} order as AddWallFace,
         //    where u=+X and v=+Z so -cross(u,v)=+Y and the front face points upward.
         var verts = new Vertex[cells * 4];

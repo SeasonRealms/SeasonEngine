@@ -266,7 +266,7 @@ internal unsafe class VKInstancedMesh3D : VKInstancedPrimitiveGroup
         Device.ResourceManager.UpdateBuffer(_instanceBuffer, _instanceData);
 
         // A7: the culling input is bit-for-bit identical to the IA instance stream, so this array is reused directly rather than storing a second copy.
-        UpdateCullUpload();
+        UpdateCullUpload(mesh);
 
         var matrices = new MatrixBuffer
         {

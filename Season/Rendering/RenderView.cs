@@ -152,7 +152,14 @@ public sealed class RenderView
     /// Culling, transparent sorting and screen-space effects should read view state through this instead of
     /// going to <see cref="BaseApp.CameraPos"/> directly.
     /// </summary>
-    public static RenderView Current => FrameSchedule.CurrentView ?? DeviceServices.BaseApp.MainView;
+    public static RenderView Current => CurrentOrNull!;
+
+    /// <summary>
+    /// <see cref="Current"/> without the assumption that one exists. Headless hosts - the math tests, and the acceptance
+    /// harness before a <see cref="BaseApp"/> is created - have neither a current view nor a main view, and the callers
+    /// that only need to pack per-view resources should skip the work instead of faulting on the missing app.
+    /// </summary>
+    public static RenderView? CurrentOrNull => FrameSchedule.CurrentView ?? DeviceServices.BaseApp?.MainView;
 
     /// <summary>Camera this view looks through. Switching cameras drops the temporal history, because the
     /// previous frame of another camera is not a valid reprojection source.</summary>

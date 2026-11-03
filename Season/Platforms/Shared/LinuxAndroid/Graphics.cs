@@ -2480,6 +2480,10 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             var vkInstancedModel = new VKInstancedModel(model.ModelName);
             vkInstancedModel.Load(template, wrapperModel);
 
+            // A7: replay the clips on the instance's own runtime asset before it is published through model.Asset (picking reads
+            // its node tree), since sampling poses it; nothing else holds it yet. The shared template's player is never touched.
+            var cullBounds = vkInstancedModel.Asset.ComputeClipUnionBounds(template.Asset.Model.LocalBounds);
+
             // v2 picking: inject the instanced GltfAsset
             // so the node tree / animation / bone palette share the same source as instanced rendering
             model.Asset = vkInstancedModel.Asset;
@@ -2490,6 +2494,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             // Unified transform convention: likewise copy back the raw bounds
             // as the data source for instance anchors / per-axis scaling, before animation expansion
             model.TemplateLocalBoundsRaw = template.Asset.Model.LocalBoundsRaw;
+            model.TemplateCullBounds = cullBounds;
 
             var animNames = vkInstancedModel.GetAnimationNames();
             model.AnimationClipCount = animNames.Count;

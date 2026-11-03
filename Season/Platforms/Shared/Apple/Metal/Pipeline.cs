@@ -662,6 +662,11 @@ internal static class Pipeline
     /// then call DrawIndexedPrimitives according to instanceCount, where 1 means non-instanced and N means instanced.
     /// When instanceBuffer is null, IdentityInstanceBuffer is used automatically.
     /// </summary>
+    /// <param name="indirectBuffer">
+    /// A7 main view: when set, the index count, instance count and baseVertex come from one 20-byte record at
+    /// <paramref name="indirectOffset"/>, and indexCount/instanceCount are ignored. instanceBufferOffset then selects the
+    /// main-view segment of the reordered stream, for the reason given on <see cref="DrawShadowPrimitiveIndirect"/>.
+    /// </param>
     public static void DrawPrimitive(
         IMTLRenderCommandEncoder enc,
         PrimitiveData primitiveData,
@@ -684,7 +689,9 @@ internal static class Pipeline
         IMTLBuffer? prevInstanceBuffer = null,
         IMTLBuffer? prevBoneBuffer = null,
         nuint prevBoneBufferOffset = 0,
-        IMTLBuffer? viewBuffer = null)
+        IMTLBuffer? viewBuffer = null,
+        IMTLBuffer? indirectBuffer = null,
+        nuint indirectOffset = 0)
     {
         // Work package D: this is the single exit for all 3D paths (model / instanced model / instanced mesh / highlight shell / sprite shell box),
         // so intercepting once covers all PrimitiveData draws. The collection phase submits no draw; it only hands immutable handles to the replay queue.
@@ -694,7 +701,7 @@ internal static class Pipeline
                 matrixBuffer, materialBuffer, lightBuffer, boneBuffer, morphBuffer, instanceBoneBuffer,
                 indexType, indexCount, indexBufferOffset, instanceBuffer, instanceBufferOffset, instanceCount,
                 instanceBoneBufferOffset, prevInstanceBuffer, prevBoneBuffer, prevBoneBufferOffset,
-                viewBuffer ?? ActiveViewBuffer);
+                viewBuffer ?? ActiveViewBuffer, indirectBuffer, indirectOffset);
             return;
         }
 
@@ -727,8 +734,17 @@ internal static class Pipeline
         // previous-state sources. Variants with VELOCITY_OUTPUT=0 do not declare buffer(9) or buffer(10),
         // so extra binding is harmless.
         // The default falls back to current-frame data, and the shader will not consume it while the hasPrev sentinels stay 0.
-        enc.SetVertexBuffer(prevInstanceBuffer ?? instBuf, instanceBufferOffset, 9);
+        // An indirect draw's reordered stream is offset to its segment, but the prev stream is still the CPU-ordered one the
+        // VS indexes by the decoded original instance, so it starts at 0.
+        enc.SetVertexBuffer(prevInstanceBuffer ?? instBuf, indirectBuffer != null ? 0 : instanceBufferOffset, 9);
         enc.SetVertexBuffer(prevBoneBuffer ?? boneBuffer, prevBoneBufferOffset, 10);
+
+        if (indirectBuffer != null)
+        {
+            enc.DrawIndexedPrimitives(primitiveType, indexType,
+                primitiveIndexBuffer, indexBufferOffset, indirectBuffer, indirectOffset);
+            return;
+        }
 
         enc.DrawIndexedPrimitives(primitiveType, indexCount, indexType,
             primitiveIndexBuffer, indexBufferOffset, instanceCount);
@@ -1375,6 +1391,19 @@ vertex VertexOut vertex_main(
     float3 normal = vin.inNormal;
     float3 tangentXYZ = vin.inTangent.xyz;
 
+    // Original instance index: what every per-instance buffer (glyphs, bone palettes, the prev instance stream) is laid out by.
+    // Direct draws reach it as [[instance_id]], which already includes the base instance. A7 indirect draws (main view and shadow slots alike)
+    // are compacted, so [[instance_id]] is only the position in the visible list there; their gather stamps float(original index + 1) into M14
+    // (instanceWorld0.w) instead, which is otherwise exactly 0 because every instance transform is affine. Decoding restores M14 to 0,
+    // so the world matrix below is bit-identical on both paths, and an untagged record -- every direct draw -- keeps the old index.
+    // The SHADOW_PASS variant compiles this same block, so a skinned group's shadow segment reads its own palette too. Mirrors the DX VS.
+    uint instanceSlot = instanceId;
+    float4 instanceRow0 = vin.instanceWorld0;
+    if (mparams.isInstanced == 1u && instanceRow0.w >= 1.0) {
+        instanceSlot = uint(instanceRow0.w) - 1u;
+        instanceRow0.w = 0.0;
+    }
+
     float4 curMorphW = mparams.isInstanced == 1u ? vin.instanceMorphWeights : mparams.morphWeights;
     if (mparams.hasMorphTargets != 0u && mparams.morphTargetCount > 0u) {
         float4 morphWeights = curMorphW;
@@ -1401,7 +1430,7 @@ vertex VertexOut vertex_main(
             if (w > 0.0) {
                 int idx = int(vin.inJoints[i]);
                 uint boneIndex = mparams.isInstanced == 1u
-                    ? instanceId * max(mparams.bonePaletteStride, 1u) + uint(idx)
+                    ? instanceSlot * max(mparams.bonePaletteStride, 1u) + uint(idx)
                     : uint(idx);
                 float4x4 B;
                 if (mparams.isInstanced == 1u)
@@ -1422,7 +1451,7 @@ vertex VertexOut vertex_main(
     float4x4 worldMatrix;
     if (mparams.isInstanced == 1u) {
         worldMatrix = transpose(float4x4(
-            vin.instanceWorld0,
+            instanceRow0,
             vin.instanceWorld1,
             vin.instanceWorld2,
             vin.instanceWorld3));
@@ -1490,11 +1519,11 @@ vertex VertexOut vertex_main(
         bool hasPrevInstance = false;
         float4 pr0 = float4(0.0), pr1 = float4(0.0), pr2 = float4(0.0), pr3 = float4(0.0), prMorphW = float4(0.0);
         if (mparams.isInstanced == 1u && mparams.hasPrevInstanceWorld != 0u) {
-            pr0 = prevInstanceStream[instanceId * 5u + 0u];
-            pr1 = prevInstanceStream[instanceId * 5u + 1u];
-            pr2 = prevInstanceStream[instanceId * 5u + 2u];
-            pr3 = prevInstanceStream[instanceId * 5u + 3u];
-            prMorphW = prevInstanceStream[instanceId * 5u + 4u];
+            pr0 = prevInstanceStream[instanceSlot * 5u + 0u];
+            pr1 = prevInstanceStream[instanceSlot * 5u + 1u];
+            pr2 = prevInstanceStream[instanceSlot * 5u + 2u];
+            pr3 = prevInstanceStream[instanceSlot * 5u + 3u];
+            prMorphW = prevInstanceStream[instanceSlot * 5u + 4u];
             hasPrevInstance = pr3.w != 0.0;
         }
 
@@ -1530,7 +1559,7 @@ vertex VertexOut vertex_main(
                 if (w > 0.0) {
                     int idx = int(vin.inJoints[i]);
                     uint boneIndex = mparams.isInstanced == 1u
-                        ? instanceId * max(mparams.bonePaletteStride, 1u) + uint(idx)
+                        ? instanceSlot * max(mparams.bonePaletteStride, 1u) + uint(idx)
                         : uint(idx);
                     float4x4 Bp;
                     if (mparams.isInstanced == 1u)
@@ -1578,7 +1607,7 @@ vertex VertexOut vertex_main(
     // Each instance stores 12 floats, uvRect(4), glyphColor(4), and metrics(4).
     float4 textColor_ = float4(1.0);
     if (mparams.renderMode == 2u && mparams.isInstanced == 1u) {
-        uint tBase = instanceId * 12u;
+        uint tBase = instanceSlot * 12u;
         float4 uvRect = float4(
             morphDeltas[tBase       ], morphDeltas[tBase + 1u],
             morphDeltas[tBase + 2u], morphDeltas[tBase + 3u]);

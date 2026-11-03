@@ -110,6 +110,65 @@ public sealed class ViewTargets
     /// first decal frame of this view.</summary>
     public StorageBuffer? DecalFrameBuffer;
 
+    /// <summary>
+    /// Particle transients owned by one (view, submitter) pair.
+    ///
+    /// Particle systems are the only multi-instance per-view effect in the engine: rain, snow, the campfire's
+    /// flame / sparks / smoke and the waterfall mist routinely coexist, and each of them compacts its own instance
+    /// table against this view's frustum and uploads its own frame block. The camera terms cannot be shared between
+    /// views (see <see cref="WaterFrameBuffer"/>), and the tables cannot be shared between submitters either: the
+    /// pass chain records every submitter first and only then issues the indirect draws, so a single table per view
+    /// holds nothing but the last submitter's result and every earlier draw would render that submitter's particles.
+    /// Allocation is lazy, on the first frame each pair is actually drawn.
+    /// </summary>
+    public sealed class ParticleBuffers
+    {
+        /// <summary>Instance table the compaction kernel appends survivors to. Recycled every frame.</summary>
+        public StorageBuffer? Instances;
+
+        /// <summary>Indirect argument block whose instance count this submitter's compaction raises.</summary>
+        public StorageBuffer? Args;
+
+        /// <summary>Frame constant block: VP, camera basis, spawn shape and appearance curve.</summary>
+        public StorageBuffer? Frame;
+    }
+
+    /// <summary>Per-(view, submitter) particle transients. See <see cref="ParticleBuffers"/>.</summary>
+    readonly Dictionary<object, ParticleBuffers> _particleBuffers = [];
+
+    /// <summary>
+    /// Transients for <paramref name="owner"/> in this view, allocated empty on first use. The owner is the
+    /// submitting effect, so two particle systems rendered by the same view never share a table.
+    /// </summary>
+    internal ParticleBuffers GetParticleBuffers(object owner)
+    {
+        if (_particleBuffers.TryGetValue(owner, out var buffers)) return buffers;
+        buffers = new ParticleBuffers();
+        _particleBuffers[owner] = buffers;
+        return buffers;
+    }
+
+    /// <summary>Drops <paramref name="owner"/>'s transients, e.g. when that particle system is disposed while the view lives on.</summary>
+    internal void ReleaseParticleBuffers(object owner)
+    {
+        if (!_particleBuffers.Remove(owner, out var buffers)) return;
+        buffers.Instances?.Dispose();
+        buffers.Args?.Dispose();
+        buffers.Frame?.Dispose();
+    }
+
+    /// <summary>Drops every particle transient this view allocated; called when the view retires.</summary>
+    internal void ReleaseParticleBuffers()
+    {
+        foreach (var buffers in _particleBuffers.Values)
+        {
+            buffers.Instances?.Dispose();
+            buffers.Args?.Dispose();
+            buffers.Frame?.Dispose();
+        }
+        _particleBuffers.Clear();
+    }
+
     /// <summary>Independent HDR target for the weather composite pass; null = single Scene route.</summary>
     public RenderTarget? WeatherCompositeTarget;
 

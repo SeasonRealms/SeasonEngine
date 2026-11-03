@@ -69,6 +69,24 @@ public class MeshInstanceTransform
 }
 
 /// <summary>
+/// How an instanced control draws its opaque body in the main view.
+/// </summary>
+public enum InstanceDrawPath
+{
+    /// <summary>Classic instanced draw: the CPU-built instance stream, one DrawIndexedInstanced per primitive. The behavior every control had before A7.</summary>
+    Direct,
+
+    /// <summary>
+    /// The A7 main-view segment: instances culled per instance against the main camera on the GPU, compacted, and drawn with indirect args.
+    /// Only the opaque body of the main view takes it. Transparent primitives keep their CPU back-to-front order, and the outline mask,
+    /// shell / bounds boxes and secondary views (mirrors, minimaps) keep the direct path, because each of them either needs per-instance
+    /// CPU control or looks through a camera other than the one the segment was culled for.
+    /// When the backend has no A7, or the group cannot join it this frame, the draw silently stays direct.
+    /// </summary>
+    Indirect,
+}
+
+/// <summary>
 /// Shared base class for GPU-instanced 3D controls, namely InstancedMesh3D and InstancedModel.
 /// It extracts the common framework that is structurally identical between the two controls:
 /// - Unified positioning model: template anchor (the geometric center of the raw template box)
@@ -116,6 +134,51 @@ public abstract class InstancedMesh3DBase : Control
                 ins.Highlight.CopyFrom(_highlight);
         }
     }
+
+    /// <summary>
+    /// Main-view draw path of the opaque body, see <see cref="InstanceDrawPath"/>. Defaults to <see cref="InstanceDrawPath.Direct"/>, so an
+    /// existing scene renders exactly as before until a control opts in. Picking, fading, highlights and outlines are independent of it:
+    /// they are driven by the CPU instance list, which both paths share.
+    /// Honored by both InstancedMesh3D and InstancedModel. For InstancedModel each opaque primitive draws from its own reordered stream,
+    /// all replaying one per-instance decision made against the clip-union box (<see cref="InstancedModel.TemplateCullBounds"/>), so a
+    /// skinned or node-animated model is culled by every pose its clips can reach rather than by the rest pose (morph displacement is not
+    /// replayed; the rest box it is unioned with is what covers it).
+    /// </summary>
+    public InstanceDrawPath DrawPath { get; set; } = InstanceDrawPath.Direct;
+
+    /// <summary>
+    /// Process-wide override of <see cref="DrawPath"/>, for A/B verification: <c>SEASON_INSTANCE_DRAW=indirect</c> or <c>=direct</c> forces
+    /// every instanced control onto one path without touching the scene code, so two runs of the same scene differ in nothing else.
+    /// Null leaves each control's own setting in effect.
+    /// </summary>
+    public static InstanceDrawPath? DrawPathOverride { get; set; } =
+        Environment.GetEnvironmentVariable("SEASON_INSTANCE_DRAW")?.Trim().ToLowerInvariant() switch
+        {
+            "indirect" => InstanceDrawPath.Indirect,
+            "direct" => InstanceDrawPath.Direct,
+            _ => null,
+        };
+
+    /// <summary>The draw path in effect this frame: the override when set, otherwise <see cref="DrawPath"/>.</summary>
+    public InstanceDrawPath EffectiveDrawPath =>
+        DrawPathOverride is { } forced && InDrawPathScope ? forced : DrawPath;
+
+    /// <summary>
+    /// Optional scope of <see cref="DrawPathOverride"/>, for A/B runs that must flip one control type at a time:
+    /// <c>SEASON_INSTANCE_DRAW_SCOPE=model</c> or <c>=mesh</c>. Without it the override flips every instanced control at once, which
+    /// answers "did the path change anything" but cannot say which control changed it -- and the two are verified separately.
+    /// Any other value (including none) keeps the unscoped behavior.
+    /// </summary>
+    public static string? DrawPathOverrideScope { get; set; } =
+        Environment.GetEnvironmentVariable("SEASON_INSTANCE_DRAW_SCOPE")?.Trim().ToLowerInvariant();
+
+    /// <summary>Whether <see cref="DrawPathOverride"/> applies to this control (see <see cref="DrawPathOverrideScope"/>).</summary>
+    bool InDrawPathScope => DrawPathOverrideScope switch
+    {
+        "model" => this is InstancedModel,
+        "mesh" => this is not InstancedModel,
+        _ => true,
+    };
 
     /// <summary>
     /// 1-3: Local AABB of the shared geometry template, filled once during loading per contract clause 2.

@@ -22,6 +22,10 @@ internal unsafe struct DXSceneDrawCommand : ISceneDrawCommand
     internal IndexBufferView Indices;
     internal ulong Matrix, View, Light, Material, Bones, Text;
     internal uint Count, InstanceCount, StartInstance, BoneBase;
+    // A7 main-view draw: non-null means the five draw parameters come from this GPU-written record rather than
+    // Count / InstanceCount / StartInstance. Only the reference is retained -- the record does not exist on the CPU to copy.
+    internal ID3D12Resource* Args;
+    internal uint ArgsOffset;
 
     public void Draw()
     {
@@ -40,7 +44,16 @@ internal unsafe struct DXSceneDrawCommand : ISceneDrawCommand
             if (Textures[(int)root].Ptr != 0) cmd->SetGraphicsRootDescriptorTable(root, Textures[(int)root]);
         if (Textures[(int)Pipeline.SkyViewRoot].Ptr != 0)
             cmd->SetGraphicsRootDescriptorTable(Pipeline.SkyViewRoot, Textures[(int)Pipeline.SkyViewRoot]);
-        if (Indexed)
+        if (Args != null)
+        {
+            // The capture side only takes this path once the signature exists, so null here would be a lifetime bug, not a fallback case.
+            var signature = Pipeline.EnsureShadowIndirectSignature();
+            if (signature == null) return;
+            var indices = Indices;
+            cmd->IASetIndexBuffer(&indices);
+            cmd->ExecuteIndirect(signature, 1, Args, ArgsOffset, null, 0);
+        }
+        else if (Indexed)
         {
             var indices = Indices;
             cmd->IASetIndexBuffer(&indices);
@@ -201,9 +214,10 @@ internal unsafe sealed class DXSceneDrawCollection
 
     internal void CapturePrimitive(PrimitiveData primitive, ID3D12Resource* light, ID3D12Resource* matrix,
         VertexBufferView* instanceView, ID3D12Resource* instanceResource, uint count, uint start,
-        GpuDescriptorHandle bones, GpuDescriptorHandle prevBones, GpuDescriptorHandle prevWorld, GpuDescriptorHandle prevMorph)
+        GpuDescriptorHandle bones, GpuDescriptorHandle prevBones, GpuDescriptorHandle prevWorld, GpuDescriptorHandle prevMorph,
+        ID3D12Resource* args = null, uint argsOffset = 0, ID3D12Resource* depthSource = null)
     {
-        if (count == 0) return;
+        if (count == 0 && args == null) return;
         var draw = State;
         int fi = (int)Device.FrameIndex;
         draw.Matrix = ConstantRef(matrix);
@@ -218,7 +232,6 @@ internal unsafe sealed class DXSceneDrawCollection
         Arena.Retain(geometry.IndexBuffer);
         draw.Vertex = primitive.VertexBufferView;
         draw.Indices = primitive.IndexBufferView;
-        draw.Instances = instanceView == null ? Pipeline.IdentityInstanceBufferView : Vertex(instanceResource, *instanceView);
         draw.Indexed = true;
         draw.Count = (uint)primitive.Indices.Length;
         draw.Textures[3] = Texture(primitive.BaseColorTexture);
@@ -233,6 +246,27 @@ internal unsafe sealed class DXSceneDrawCollection
         draw.Textures[16] = prevMorph.Ptr != 0 ? prevMorph : Pipeline.DefaultPrevMorphWeightsSrvHandle;
         CaptureSceneTextures(ref draw);
         var world = Matrix4x4.Transpose(ReadBuffer<MatrixBuffer>(matrix).World);
+        if (args != null && instanceView != null)
+        {
+            // A7 main-view segment: GPU-written by this frame's gather, which is recorded but has not executed when this capture runs,
+            // so neither the deep copy nor the depth read below can apply -- the bytes do not exist yet. Retaining the two buffers is enough:
+            // nothing else writes them before the replay (the next gather is recorded after it, on the same queue).
+            // The sort depth comes from instance 0 of the CPU stream, the same record the direct draw would use, so switching
+            // paths never reorders the opaque queue.
+            Arena.Retain(instanceResource);
+            Arena.Retain(args);
+            draw.Instances = *instanceView;
+            draw.Args = args;
+            draw.ArgsOffset = argsOffset;
+            draw.InstanceCount = 0;
+            draw.StartInstance = 0;
+            draw.BoneBase = 0;
+            if (depthSource != null)
+                world = ReadBuffer<Matrix4x4>(depthSource);
+            Add(draw, Depth(primitive.LocalBoundsCenter, world));
+            return;
+        }
+        draw.Instances = instanceView == null ? Pipeline.IdentityInstanceBufferView : Vertex(instanceResource, *instanceView);
         bool splitInstances = instanceView != null && draw.Mode != PipelineMode.Opaque;
         for (uint i = 0; i < (splitInstances ? count : 1); i++)
         {

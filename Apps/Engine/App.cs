@@ -30,6 +30,13 @@ internal class App : BaseApp
 
     internal float step = 0.1f;
 
+    /// <summary>
+    /// Player travel speed multiplier, 1 being the authored baseline. The settings panel offers 0.50x to 3.00x in
+    /// quarter steps and writes this field; Direction reads it on every move and scales the step there, so a 0.1 m tap
+    /// and a time-scaled held key speed up together instead of disagreeing.
+    /// </summary>
+    internal float playerSpeed = 1f;
+
     Sky sky;
 
     // Central celestial-lighting driver split out of Sky in 2026-08. It owns all lighting work:
@@ -74,7 +81,7 @@ internal class App : BaseApp
     internal Ground ground;
 
     // Procedural sea: a 1400x1400m noisy water surface around the land.
-    // Sea.SeaLevel is runtime-adjustable and defaults to y=-3.
+    // Sea.SeaLevel is runtime-adjustable and defaults to y=-1.5 (Sea.DefaultSeaLevel).
     // Together with the widened horizon and the mountain ring's east-west corridor,
     // this lets the sun and moon rise from the sea and set at the water-sky horizon.
     Sea sea;
@@ -104,8 +111,11 @@ internal class App : BaseApp
     // Night needs no special case: a patch that nothing lights is invisible, and the player's torch (5 cd, 12 m range,
     // registered in Player) turns it into a visible glow the moment they walk in. That is the intended behaviour.
     //
-    // MaxDistance is the froxel depth range and is deliberately short: the slices are distributed exponentially over it, so
-    // 140 m spends far more of them on a 20 m patch than the 320 m a scene-wide medium would want.
+    // MaxDistance is the froxel depth range, and it has to clear the longest distance the patch is expected to be seen
+    // from - which is not a ground-level camera. From directly above the island the grove sits 110-150 m away, so the
+    // previous 140 m put the patch inside the final fade band or past the end of the range entirely and it blinked in
+    // and out as the camera rose. 400 m covers the overhead view at almost no cost: the same 96 slices are spread
+    // exponentially, and a patch 20 m out only gives up about a sixth of its depth resolution.
     // A runtime flag rather than a const so the panel's two paths both stay real code to the compiler: a const would
     // fold the preset branch into unreachable code the moment anyone made this false on purpose.
     internal static bool FixedIslandFog { get; set; } = true;
@@ -116,12 +126,21 @@ internal class App : BaseApp
     // Anisotropy, depth range and wind are medium-wide by construction - the phase function and the froxel layout have no
     // per-volume counterpart - so they stay here even though the global extinction is zero.
     const float MistAnisotropy = 0.60f;    // Forward scattering: the sunlit side of the patch glows, the far side greys out.
-    const float MistMaxDistance = 140f;
+    const float MistMaxDistance = 400f;
     static readonly Vector3 MistWind = new(0.30f, 0f, 0.10f);
 
     // Density at the centre of the patch, before the density multiplier. Denser than a scene-wide medium on purpose: it
     // only has 22 m to work with, so the contrast has to come from the near field.
     const float ForestMistExtinction = 0.06f;
+
+    // Sky light the patch gets regardless of what lights it, in the same units as the shader's illumination accumulator:
+    // peak 0.55 is the order of the noon ambient, which is enough to lift a canopy-shadowed patch reading as black-grey
+    // smoke back to white mist, without outshining the sky. It only opens around dawn and dusk (see MistSkyWeight): at
+    // noon the ambient already does the job, and at night a constant floor would turn the patch into a glowing white box.
+    const float MistSkyFloorPeak = 0.55f;
+
+    // Slightly cool, matching forestMist.Albedo's blue-white instead of fighting the warm sunrise light.
+    static readonly Vector3 MistSkyTint = new(0.97f, 1.00f, 1.06f);
 
     readonly FogVolume forestMist = new()
     {
@@ -598,6 +617,23 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
 
         // The patch is the whole medium, so the density row scales it directly.
         forestMist.Extinction = ForestMistExtinction * density;
+        // 树冠在清晨把直射光整根砍掉，雾只剩很低的环境光，于是整片雾被压成黑灰烟；瀑布水汽有自发光下限所以仍是白的。
+        // 这里补的就是“雾被头顶天空照亮”的那部分，只在晨昏张开。
+        forestMist.SelfIllumination = MistSkyTint * (MistSkyFloorPeak * MistSkyWeight(HourOfDay));
+    }
+
+    /// <summary>
+    /// 晨昏权重：以日出（6 时）和日落（18 时）为中心的钟形，窗口边界处归零。
+    /// 用钟形而不是“日出后固定值”，是因为白天环境光会自己把雾抬亮，而夜里补光会让雾变成一块发光的白盒。
+    /// </summary>
+    static float MistSkyWeight(float hour)
+        => MathF.Max(Bell(hour, 6.3f, 2.6f), Bell(hour, 18.2f, 2.2f));
+
+    /// <summary>1 at <paramref name="centre"/>, 0 beyond the half width, flat at both ends so the patch never pops.</summary>
+    static float Bell(float hour, float centre, float halfWidth)
+    {
+        float t = Math.Clamp(MathF.Abs(hour - centre) / halfWidth, 0f, 1f);
+        return 1f - t * t * (3f - 2f * t);
     }
 
     // Fully synchronous and intentionally free of blocking loads.
@@ -705,13 +741,16 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         room.Depth = 12;
         AddPanel(room);
 
-        // Raised pond on the open grass southeast of the spawn: water test bed for the normal target, SSR, refraction,
-        // and depth absorption. PosY stays at the grass, the rim top is 0.5m and the water surface 0.4m above it,
-        // and the steps face north toward the spawn. See Pond.cs.
+        // The pond sits at the head of the south branch, on the grass just south of the spawn: it is the water test bed
+        // for the normal target, SSR, refraction and depth absorption, and it is also where the branch starts, so the
+        // two waters meet through an opening in its south rim. PosZ is authored so the bottom step's outer face lands
+        // exactly on the road's southern end (z = 0, the spawn itself), which is what lets the road run straight up the
+        // pond's north bank; the rim is a ring of the river's own bank pieces and the water surface 0.4 m above the
+        // grass. See Pond.cs and River.BranchCourse.
         pond = new Pond();
-        pond.PosX = 14;
+        pond.PosX = 0;
         pond.PosY = 0;
-        pond.PosZ = -12;
+        pond.PosZ = Pond.StairFootZ;
         AddPanel(pond);
 
         // P2: 水面几何由着色器按 SV_VertexID 现算，所以这里注册的是数据而不是控件 ——
@@ -881,6 +920,9 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // 面板上的 Pos/Width/Height/Depth/Rotation 直接写进这个实例（见 ObjectPanel 的实例分支）。
         // 这些改动在 SyncDikes 里被当成相对自动布局的偏移保留，所以挪动整段河道时堤坝不会回到原样。
         picker.InstancedTargets.Add(river.Dikes);
+        // 出海口的水汽盒也是同一类目标：不可见的盒子，拾取后在属性面板里改位置/长宽高/朝向，
+        // 下一帧就作用到三组粒子的出生矩形上（见 River.UpdateMouthSpray：雾与白沫走盒底面，水花走盒顶面）。
+        picker.Targets.Add(river.MouthMist);
         if (robots != null)
         {
             picker.InstancedTargets.Add(robots.robotField);
@@ -1581,8 +1623,8 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         {
             Mode = Season.Rendering.DecalMode.Modulate,
             Texture = "Assets/DecalWetGrass.png",
-            Position = new(1f, 0f, -16f),
-            Size = new(8f, 0.4f, 8f),
+            Position = new(-10f, 0f, -15f),
+            Size = new(7f, 0.4f, 7f),
             Tint = new(0.94f, 0.97f, 1.00f),
             Opacity = 0.9f,
             AngleFade = 0f,
@@ -1595,13 +1637,13 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         Decals.Add(wetGrass);
         RegisterNamedTexture(wetGrass.Texture);
 
-        // 北侧池沿顶面的苔藓：只调制颜色。池沿顶面在 Pond.RimTop=0.5，盒子以它为中心；
-        // 池沿内外侧壁有一截落进盒里，正好用来看掠射淡出。
+        // 北侧池沿顶面的苔藓：只调制颜色。池沿顶面在 Pond.RimTop（堤坝件高 0.86 米埋入 0.10 米后为 0.76），
+        // 盒子以它为中心；池沿内外侧壁有一截落进盒里，正好用来看掠射淡出。北带中心在池心 +4.775 米处。
         var moss = new Season.Rendering.DecalVolume
         {
             Mode = Season.Rendering.DecalMode.Modulate,
             Texture = "Assets/DecalMoss.png",
-            Position = new(14f, 0.5f, -7f),
+            Position = new(0f, Pond.RimTop, -2.275f),
             Size = new(9f, 0.2f, 1.6f),
             Tint = new(0.88f, 1.00f, 0.86f),
             Opacity = 0.85f,
@@ -1620,7 +1662,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         {
             Mode = Season.Rendering.DecalMode.Additive,
             Texture = "Assets/DecalCaustics.png",
-            Position = new(14f, 0f, -12f),
+            Position = new(0f, 0f, -7.05f),
             Size = new(9f, 0.3f, 7.2f),
             Tint = new(0.80f, 0.95f, 1.00f),
             Opacity = 0.5f,

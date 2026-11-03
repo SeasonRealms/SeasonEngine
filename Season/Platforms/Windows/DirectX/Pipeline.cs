@@ -1240,7 +1240,7 @@ TextGlyphData LoadTextGlyph(uint instanceID)
 }
 
 // Per-instance bone-matrix StructuredBuffer (GPU instancing path)
-// Layout: [(outlineMaskBoneBase.x + instanceID) * bonePaletteStride + jointIndex]
+// Layout: [instanceSlot * bonePaletteStride + jointIndex], instanceSlot being the original instance index decoded at the top of VSMain.
 // Regular and shadow passes always use boneBase=0. OutlineMask carries the slot base through root constants
 // for per-slot drawing.
 StructuredBuffer<float4x4> g_InstanceBoneMatrices : register(t6);
@@ -1331,6 +1331,20 @@ struct PSInput
 PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_InstanceID)
 {
     PSInput output;
+
+    // Original instance index: what every per-instance SB (t5 glyphs, t6/t8 palettes, t9 prev worlds, t10 prev morph weights) is laid out by.
+    // Direct draws reach it as boneBase + SV_InstanceID, since SV_InstanceID excludes StartInstanceLocation. A7 indirect draws (main view and
+    // shadow slots alike) are compacted, so SV_InstanceID is only the position in the visible list there; their gather stamps float(original
+    // index + 1) into M14 (row0.w) instead, which is otherwise exactly 0 because every instance transform is affine. Decoding restores M14 to 0,
+    // so the world matrix below is bit-identical on both paths, and an untagged record -- every direct draw -- keeps the old index.
+    // This runs before the SHADOW_PASS branch on purpose: a skinned group's shadow segment needs its own palette as much as the main view does.
+    uint instanceSlot = (uint)outlineMaskBoneBase.x + instanceID;
+    float4 instanceRow0 = input.instanceWorld0;
+    if (isInstanced && instanceRow0.w >= 1.0)
+    {
+        instanceSlot = (uint)instanceRow0.w - 1;
+        instanceRow0.w = 0.0;
+    }
     
     // Initial local position and normal
     // 2-3: restPosition is the rest-pose local position. The velocity path must reconstruct prev from it
@@ -1388,7 +1402,7 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
                 // Both regular models and GPU-instanced draws read from the dynamic bone StructuredBuffer.
                 if (isSkinned)
                 {
-                    int baseIdx = isInstanced ? ((int)outlineMaskBoneBase.x + (int)instanceID) * (int)bonePaletteStride + jointIndex : jointIndex;
+                    int baseIdx = isInstanced ? (int)instanceSlot * (int)bonePaletteStride + jointIndex : jointIndex;
                     float4x4 boneMatrix = g_InstanceBoneMatrices[baseIdx];
                     skinnedPosition += mul(localPosition, boneMatrix) * weight;
                     float3x3 boneMatrix3x3 = (float3x3)boneMatrix;
@@ -1418,7 +1432,7 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
     if (isInstanced)
     {
         worldMatrix = float4x4(
-            input.instanceWorld0,
+            instanceRow0,
             input.instanceWorld1,
             input.instanceWorld2,
             input.instanceWorld3);
@@ -1511,7 +1525,7 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
         if (hasMorphTargets != 0 && morphTargetCount > 0)
         {
             float4 prevW = hasPrevMorph != 0
-                ? (isInstanced != 0 ? g_PrevMorphWeights[(uint)outlineMaskBoneBase.x + instanceID] : g_PrevMorphWeights[0])
+                ? (isInstanced != 0 ? g_PrevMorphWeights[instanceSlot] : g_PrevMorphWeights[0])
                 : curMorphW;
             for (uint t = 0; t < morphTargetCount && t < 4; t++)
             {
@@ -1537,7 +1551,7 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
                 if (w <= 0.0)
                     continue;
                 int j = (int)input.jointIndices[i];
-                int idx = isInstanced != 0 ? (((int)outlineMaskBoneBase.x + (int)instanceID) * (int)bonePaletteStride + j) : j;
+                int idx = isInstanced != 0 ? ((int)instanceSlot * (int)bonePaletteStride + j) : j;
                 float4x4 bm;
                 if (hasPrevBones != 0)
                 {
@@ -1562,7 +1576,7 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
         if (isInstanced != 0 && hasPrevInstanceWorld != 0)
         {
                         // The CPU history instance stream is uploaded in original row order, so StructuredBuffer matrices must be transposed before row-vector multiplication.
-                        prevWorldMatrix = transpose(g_PrevInstanceWorlds[(uint)outlineMaskBoneBase.x + instanceID]);
+                        prevWorldMatrix = transpose(g_PrevInstanceWorlds[instanceSlot]);
             if (prevWorldMatrix._m33 == 0.0)
                 prevWorldMatrix = worldMatrix;
         }
@@ -1585,7 +1599,7 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
     float4 textColor = float4(1, 1, 1, 1);
     if (renderMode == 2 && isInstanced)
     {
-        TextGlyphData glyph = LoadTextGlyph((uint)outlineMaskBoneBase.x + instanceID);
+        TextGlyphData glyph = LoadTextGlyph(instanceSlot);
         float4 uvRect = glyph.uvRect;
         textColor = glyph.metrics.w > 0.5 ? glyph.color : textBaseColor;
         // Remap unit-quad UV (0..1) to the atlas sub-rectangle UV
@@ -3343,9 +3357,19 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
     // ============================================================
 
     /// <summary>
-    /// Draw a single primitive. The backend always uses DrawIndexedInstanced.
+    /// Draw a single primitive. The backend uses DrawIndexedInstanced, or ExecuteIndirect when <paramref name="argsResource"/> is given.
     /// When instanceBufferView is null, it automatically falls back to the identity instance buffer.
     /// </summary>
+    /// <param name="argsResource">
+    /// A7 main-view draw: the five draw parameters are read from this buffer at <paramref name="argsOffset"/> instead of
+    /// instanceCount / startInstanceLocation, which are then ignored. Every binding is identical to the direct draw -- indirect only
+    /// changes where the parameters come from -- so the instance stream must already be the compacted, tagged main-view segment
+    /// and the buffer must already be in INDIRECT_ARGUMENT (PrepareCullDraw).
+    /// </param>
+    /// <param name="depthSource">
+    /// Indirect draws only: a CPU-visible instance stream the scene collector reads the sort depth from, because
+    /// <paramref name="instanceResource"/> is then GPU-written and cannot be mapped.
+    /// </param>
     public static void DrawPrimitive(
         PrimitiveData primitiveData,
         ID3D12Resource* lightConstantBuffer,
@@ -3357,16 +3381,22 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         GpuDescriptorHandle prevBoneSrvHandle = default,
         GpuDescriptorHandle prevInstanceWorldSrvHandle = default,
         GpuDescriptorHandle prevMorphSrvHandle = default,
-        ID3D12Resource* instanceResource = null)
+        ID3D12Resource* instanceResource = null,
+        ID3D12Resource* argsResource = null,
+        uint argsOffset = 0,
+        ID3D12Resource* depthSource = null)
     {
         if (DXSceneDrawCollection.Active is { } collection)
         {
             collection.CapturePrimitive(primitiveData, lightConstantBuffer, matrixBuffer, instanceBufferView,
                 instanceResource, instanceCount, startInstanceLocation, instanceBoneSrvHandle, prevBoneSrvHandle,
-                prevInstanceWorldSrvHandle, prevMorphSrvHandle);
+                prevInstanceWorldSrvHandle, prevMorphSrvHandle, argsResource, argsOffset, depthSource);
             return;
         }
         var cmdList = Device.GraphicsCommandList;
+        ID3D12CommandSignature* indirectSignature = null;
+        if (argsResource != null && (indirectSignature = EnsureShadowIndirectSignature()) == null)
+            return;
 
         primitiveData.BaseColorTexture.EnsureReadyForRendering(cmdList);
         primitiveData.NormalTexture.EnsureReadyForRendering(cmdList);
@@ -3418,6 +3448,14 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
             prevMorphSrvHandle.Ptr != 0 ? prevMorphSrvHandle : DefaultPrevMorphWeightsSrvHandle);
 
         BindSceneTextures();
+        if (indirectSignature != null)
+        {
+            // The segment starts at its own first record and the vertex stage reads the original index from the M14 tag,
+            // so the base must be 0: a nonzero base would only matter for untagged records, and there are none here.
+            SetOutlineMaskBoneBase(0);
+            cmdList->ExecuteIndirect(indirectSignature, 1, argsResource, argsOffset, null, 0);
+            return;
+        }
         // SV_InstanceID does not include StartInstanceLocation; normal transparent per-instance drawing also
         // needs an explicit base address.
         SetOutlineMaskBoneBase(instanceBufferView != null ? startInstanceLocation : 0);
@@ -3753,11 +3791,13 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
     }
 
     /// <summary>
-    /// The command signature for the shadow indirect view: one DrawIndexed record that references no root
+    /// The command signature for A7 indirect draws: one DrawIndexed record that references no root
     /// signature (indirect only describes the draw parameters, it does not change the root parameters already
     /// bound). ByteStride uses the shared-layer constant directly, so any layout drift is exposed here immediately.
+    /// The name predates the main-view slot; the shadow view and the main-view body (direct and scene-collected) share it,
+    /// since neither adds a root argument to the record.
     /// </summary>
-    static ID3D12CommandSignature* EnsureShadowIndirectSignature()
+    internal static ID3D12CommandSignature* EnsureShadowIndirectSignature()
     {
         if (ShadowIndirectCommandSignature != null)
             return ShadowIndirectCommandSignature;

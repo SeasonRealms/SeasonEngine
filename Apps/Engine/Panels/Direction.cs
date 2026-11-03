@@ -158,6 +158,14 @@ internal class Direction : Panel
             yaw = yawCam;
         }
 
+        // Player speed multiplier from the settings panel. Applied here rather than at the call sites because
+        // Character mode rewrites dx/dz above from its own 0.1 m unit, which would discard a scale applied outside.
+        // Both input paths go through this method, so a tap and a held key speed up together, and 1.00x reproduces
+        // the authored step exactly. Collision still runs on the scaled step, so Sweep and the two retractions see
+        // the real displacement and a fast player stops at the same contact faces.
+        dx *= app.playerSpeed;
+        dz *= app.playerSpeed;
+
         // Turn first, then move. Facing always takes effect, even when blocked,
         // so the player can rotate in place. Collision uses the AABB under the new facing direction.
         model.Rotation = yaw;

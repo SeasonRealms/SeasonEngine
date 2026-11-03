@@ -1006,6 +1006,14 @@ public static VkPipeline TransparentBackFacePipelineState;
     /// the caller happens to have this instance's world matrix at hand, so it passes it in explicitly.
     /// NaN means "compute it yourself from the primitive matrix".
     /// </param>
+    /// <param name="indirectBuffer">
+    /// A7 main view: when set, the index count and instance count come from one VkDrawIndexedIndirectCommand at
+    /// <paramref name="indirectOffset"/>, and indexCount/instanceCount/firstInstance are ignored.
+    /// </param>
+    /// <param name="instanceOffset">
+    /// Byte offset of the instance stream binding. The main-view segment is selected here rather than through firstInstance
+    /// for the same reason as <see cref="DrawShadowPrimitiveIndirect"/>: firstInstance shifts gl_InstanceIndex.
+    /// </param>
     public static void DrawPrimitive(
         CommandBuffer cmd,
         PrimitiveData primitiveData,
@@ -1016,7 +1024,10 @@ public static VkPipeline TransparentBackFacePipelineState;
         VkBuffer instanceBuffer,
         uint instanceCount,
         uint firstInstance,
-        float sortDepth = float.NaN)
+        float sortDepth = float.NaN,
+        VkBuffer indirectBuffer = default,
+        ulong indirectOffset = 0,
+        ulong instanceOffset = 0)
     {
         // Work package C: the scene segmented collection phase submits no draws; it just hands immutable handles to the replay queue.
         // This is the single exit for all 3D paths (model / instanced model / instanced mesh / outline shell),
@@ -1024,12 +1035,14 @@ public static VkPipeline TransparentBackFacePipelineState;
         if (VKSceneDrawCollection.Active is { } collection)
         {
             collection.CapturePrimitive(cmd, primitiveData, primitiveVertexBuffer, primitiveIndexBuffer,
-                descriptorSet, indexCount, instanceBuffer, instanceCount, firstInstance, sortDepth);
+                descriptorSet, indexCount, instanceBuffer, instanceCount, firstInstance, sortDepth,
+                indirectBuffer, indirectOffset, instanceOffset);
             return;
         }
 
         DrawPrimitiveCore(cmd, primitiveData, primitiveVertexBuffer, primitiveIndexBuffer,
-            descriptorSet, indexCount, instanceBuffer, instanceCount, firstInstance, prepared: false);
+            descriptorSet, indexCount, instanceBuffer, instanceCount, firstInstance, prepared: false,
+            indirectBuffer: indirectBuffer, indirectOffset: indirectOffset, instanceOffset: instanceOffset);
     }
 
     /// <summary>
@@ -1176,7 +1189,10 @@ public static VkPipeline TransparentBackFacePipelineState;
         uint instanceCount,
         uint firstInstance,
         bool prepared,
-        DescriptorSet viewSet = default)
+        DescriptorSet viewSet = default,
+        VkBuffer indirectBuffer = default,
+        ulong indirectOffset = 0,
+        ulong instanceOffset = 0)
     {
         var vk = Device.Vk;
 
@@ -1198,7 +1214,7 @@ public static VkPipeline TransparentBackFacePipelineState;
 
         // Bind instance buffer slot 1, either identity or real instance data.
         var instBuf = instanceBuffer.Handle != 0 ? instanceBuffer : IdentityInstanceBuffer.Buffer;
-        ulong instOffset = 0;
+        ulong instOffset = instanceBuffer.Handle != 0 ? instanceOffset : 0;
         vk.CmdBindVertexBuffers(cmd, 1, 1, &instBuf, &instOffset);
 
         // Bind the index buffer.
@@ -1209,6 +1225,13 @@ public static VkPipeline TransparentBackFacePipelineState;
         var pipelineLayout = PipelineLayout;
         vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, pipelineLayout, 0, 1, &set, 0, null);
         BindViewSet(cmd, viewSet.Handle != 0 ? viewSet : ActiveViewSet);
+
+        if (indirectBuffer.Handle != 0)
+        {
+            vk.CmdDrawIndexedIndirect(cmd, indirectBuffer, indirectOffset, 1,
+                Season.Rendering.IndirectDrawIndexedArgs.SizeInBytes);
+            return;
+        }
 
         vk.CmdDrawIndexed(cmd, indexCount, instanceCount, 0, 0, firstInstance);
     }
@@ -2336,6 +2359,19 @@ void main() {
     vec4 localPos = restPos;
     vec3 normal = inNormal;
 
+    // Original instance index: what every per-instance SSBO (glyphs, bone palettes, prev worlds, prev morph weights) is laid out by.
+    // Direct draws reach it as gl_InstanceIndex, which already includes firstInstance. A7 indirect draws (main view and shadow slots alike)
+    // are compacted, so gl_InstanceIndex is only the position in the visible list there; their gather stamps float(original index + 1) into M14
+    // (instanceWorld0.w) instead, which is otherwise exactly 0 because every instance transform is affine. Decoding restores M14 to 0,
+    // so the world matrix below is bit-identical on both paths, and an untagged record -- every direct draw -- keeps the old index.
+    // It runs before the SHADOW_PASS branch so a skinned group's shadow segment reads its own palette too. Mirrors the DX VS.
+    uint instanceSlot = uint(gl_InstanceIndex);
+    vec4 instanceRow0 = instanceWorld0;
+    if (isInstanced == 1u && instanceRow0.w >= 1.0) {
+        instanceSlot = uint(instanceRow0.w) - 1u;
+        instanceRow0.w = 0.0;
+    }
+
     // Current-frame morph weights.
     // When prev data is not ready, the velocity path reuses them so prev == cur and velocity becomes zero.
     vec4 curMorphW = isInstanced == 1u ? instanceMorphWeights : morphWeights;
@@ -2367,7 +2403,7 @@ void main() {
             if (w > 0.0) {
                 int idx = int(inJoints[i]);
                 int baseIdx = isInstanced == 1u
-                    ? int(gl_InstanceIndex) * int(max(bonePaletteStride, 1u)) + idx
+                    ? int(instanceSlot) * int(max(bonePaletteStride, 1u)) + idx
                     : idx;
                 mat4 boneMatrix = instanceBoneMatrices[baseIdx];
 
@@ -2385,7 +2421,7 @@ void main() {
     if (isInstanced == 1u) {
         // DX-style row-vector post-multiply:
         // row vectors are uploaded, so GLSL must transpose back into column-major form.
-        worldMatrix = transpose(mat4(instanceWorld0, instanceWorld1, instanceWorld2, instanceWorld3));
+        worldMatrix = transpose(mat4(instanceRow0, instanceWorld1, instanceWorld2, instanceWorld3));
     } else {
         worldMatrix = world;
     }
@@ -2451,7 +2487,7 @@ void main() {
         vec4 prevLocalPos = restPos;
         if (hasMorphTargets != 0u && morphTargetCount > 0u) {
             vec4 prevW = hasPrevMorph != 0u
-                ? (isInstanced == 1u ? prevMorphWeights[gl_InstanceIndex] : prevMorphWeights[0])
+                ? (isInstanced == 1u ? prevMorphWeights[instanceSlot] : prevMorphWeights[0])
                 : curMorphW;
             for (uint t = 0u; t < morphTargetCount && t < 4u; ++t) {
                 float w = prevW[t];
@@ -2475,7 +2511,7 @@ void main() {
                 if (w <= 0.0) continue;
                 int idx = int(inJoints[i]);
                 int baseIdx = isInstanced == 1u
-                    ? int(gl_InstanceIndex) * int(max(bonePaletteStride, 1u)) + idx
+                    ? int(instanceSlot) * int(max(bonePaletteStride, 1u)) + idx
                     : idx;
                 mat4 bm;
                 if (hasPrevBones != 0u) {
@@ -2496,7 +2532,7 @@ void main() {
         // _m33==0 means not written and falls back to the current worldMatrix.
         mat4 prevWorldMatrix;
         if (isInstanced == 1u && hasPrevInstanceWorld != 0u) {
-            prevWorldMatrix = prevInstanceWorlds[gl_InstanceIndex];
+            prevWorldMatrix = prevInstanceWorlds[instanceSlot];
             if (prevWorldMatrix[3][3] == 0.0)
                 prevWorldMatrix = worldMatrix;
         } else {
@@ -2516,7 +2552,7 @@ void main() {
     // ── Text GPU Instancing: remap unit quad UV → atlas sub-rect ──
     vec4 textColor_ = vec4(1.0);
     if (renderMode == 2u && isInstanced == 1u) {
-        uint tBase = gl_InstanceIndex * 12u;
+        uint tBase = instanceSlot * 12u;
         vec4 uvRect = vec4(
             morphDeltas[tBase       ], morphDeltas[tBase + 1u],
             morphDeltas[tBase + 2u], morphDeltas[tBase + 3u]);

@@ -453,6 +453,18 @@ fn SwellEvaluate(p: vec2f, phase: f32, amp: f32, grad: ptr<function, vec2f>) -> 
 fn vs_main(input: VertexInput, @builtin(instance_index) instanceIndex: u32, @builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
     var output: VertexOutput;
 
+    // A7 (M14 tag): the gather kernel writes float(original + 1) into world row 0 .w of every culled segment, main view and shadow slots alike.
+    // An affine world never has anything there, so a direct stream and a non-instanced draw keep 0 and
+    // take instance_index as before. Under the tag instance_index is the compacted row, so every per-instance side table
+    // (bones, previous instance stream, glyphs) is addressed by the decoded original instead, and the tag is cleared before
+    // the row becomes part of the world matrix. The shadow pass runs this same entry point, so its segments decode identically.
+    var instanceSlot = instanceIndex;
+    var instanceRow0 = input.instanceWorld0;
+    if ((u.flags.w & 16) != 0 && instanceRow0.w >= 1.0) {
+        instanceSlot = u32(instanceRow0.w) - 1u;
+        instanceRow0.w = 0.0;
+    }
+
     var localPosition = vec4f(input.position, 1.0);
     var localNormal = input.normal;
     var localTangent = input.tangent;
@@ -485,7 +497,7 @@ fn vs_main(input: VertexInput, @builtin(instance_index) instanceIndex: u32, @bui
             var skinnedPosition = vec4f(0.0);
             var skinnedNormal = vec3f(0.0);
             var skinnedTangent = vec3f(0.0);
-            let boneBaseIndex: u32 = select(0u, instanceIndex * 100u, (u.flags.w & 16) != 0);
+            let boneBaseIndex: u32 = select(0u, instanceSlot * 100u, (u.flags.w & 16) != 0);
             for (var i: i32 = 0; i < 4; i = i + 1) {
                 let weight = input.weights[i];
                 if (weight > 0.0) {
@@ -510,7 +522,7 @@ fn vs_main(input: VertexInput, @builtin(instance_index) instanceIndex: u32, @bui
     // World matrix (bit 4=16: GPU-instancing path)
     var worldMatrix: mat4x4f;
     if ((u.flags.w & 16) != 0) {
-        worldMatrix = mat4x4f(input.instanceWorld0, input.instanceWorld1, input.instanceWorld2, input.instanceWorld3);
+        worldMatrix = mat4x4f(instanceRow0, input.instanceWorld1, input.instanceWorld2, input.instanceWorld3);
     } else {
         worldMatrix = u.world;
     }
@@ -560,13 +572,13 @@ fn vs_main(input: VertexInput, @builtin(instance_index) instanceIndex: u32, @bui
         if (any(uView.prevViewProjection[3] != vec4f(0.0))) {
             var prevWorldMatrix = worldMatrix;
             if ((u.flags.x & 2) != 0) {
-                let pb = instanceIndex * 5u;
+                let pb = instanceSlot * 5u;
                 prevWorldMatrix = mat4x4f(uPrevInstanceData[pb], uPrevInstanceData[pb + 1u],
                                           uPrevInstanceData[pb + 2u], uPrevInstanceData[pb + 3u]);
             } else if (u.prevWorld[3][3] != 0.0) {
                 prevWorldMatrix = u.prevWorld;
             }
-            let prevLocalPosition = computePrevLocalPosition(input, instanceIndex, vertexIndex);
+            let prevLocalPosition = computePrevLocalPosition(input, instanceSlot, vertexIndex);
             // The swell is time-varying geometry, so the previous-frame position needs the previous-frame phase.
             // Reusing the current height would cancel the wave's own motion out of the velocity buffer and leave the
             // one surface that should be streaking perfectly clean.
@@ -592,7 +604,7 @@ fn vs_main(input: VertexInput, @builtin(instance_index) instanceIndex: u32, @bui
     // The text path never sets the morph bit (64), so the two modes are mutually exclusive.
     var instanceColor = u.baseColor;
     if (u.flags.y == 2 && (u.flags.w & 16) != 0) {
-        let gBase = instanceIndex * 12u;
+        let gBase = instanceSlot * 12u;
         let uvRect = vec4f(uMorphValues[gBase], uMorphValues[gBase + 1u],
                            uMorphValues[gBase + 2u], uMorphValues[gBase + 3u]);
         output.uv = uvRect.xy + input.uv * uvRect.zw;

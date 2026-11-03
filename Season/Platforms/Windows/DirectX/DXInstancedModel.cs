@@ -423,6 +423,18 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         return _primitiveInstanceStreams[index];
     }
 
+    /// <summary>
+    /// A7: every opaque primitive draws its own instance stream (node world × instance world, plus its own morph weights), so gather
+    /// materializes one reordered stream per opaque primitive. The visibility decision itself is made once per instance from the
+    /// root instance worlds in the base <see cref="DXInstancedPrimitiveGroup._instanceData"/> against the model-space clip-union box.
+    /// </summary>
+    protected override bool CullPerPrimitiveStreams => true;
+
+    protected override ReadOnlySpan<InstanceTransformData> GetCullDrawStream(int stream)
+        => (uint)stream < (uint)_opaquePrimitives.Count && GetPrimitiveInstanceStream(_opaquePrimitives[stream]) is { } s
+            ? s.Data
+            : default;
+
     void SyncInstancedSkinningMaterialParams()
     {
         for (int i = 0; i < _primitives.Count; i++)
@@ -637,6 +649,8 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         bool wasInitialized = _transformInitialized;
         _wireframeActive = false;
         _instanceCount = 0;
+        // Latched before the early return below, so a frame with no instances can never inherit last frame's indirect authorization.
+        BeginCullFrame(model);
 
         // Unified highlighting: clear this frame's per-instance draw lists
         // (rebuilt every frame; _boundsActive / _wireframeActive are set by the
@@ -668,6 +682,12 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         EnsureInstanceBoneCapacity((uint)Math.Max(_instanceCount, 1));
         EnsurePrevInstanceBoneCapacity((uint)Math.Max(_instanceCount, 1));
         EnsurePrevMorphWeightsCapacity(_instanceCount);
+
+        // A7 cull input: one root instance world per enabled instance, in write order. The per-primitive streams below hold
+        // "node world × instance world", which differs per primitive, so none of them can stand in for the instance as a whole;
+        // the cull box (model.TemplateCullBounds) is in the same model space as this root world.
+        if (_instanceData.Length != _instanceCount)
+            _instanceData = new InstanceTransformData[_instanceCount];
 
         bool hasAnimation = _asset._animations.Count > 0;
         bool hasSkin = _skins.Count > 0;
@@ -717,6 +737,7 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
             // Unified transform convention: route everything through
             // BuildInstanceMatrix (anchor pivot, see InstancedMesh3DBase)
             var instanceWorld = model.BuildInstanceMatrix(instance);
+            _instanceData[writeIndex] = InstanceTransformData.FromWorld(instanceWorld);
             bool instWire = instance.Highlight.Wireframe;
             _wireframeActive |= instWire;
 
@@ -860,6 +881,11 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
                 Device.SetVertexBuffer(stream.Buffer, stream.View, stream.Data);
         }
 
+        // A7: the box must be in the root instance's model space and cover every clip pose, because the kernel culls the whole
+        // instance with it once and every primitive stream only replays that decision.
+        SetCullLocalBounds(model.TemplateCullBounds);
+        EnsureCullResources(_instanceCount);
+
         int fi = (int)Device.FrameIndex;
         var matrices = new MatrixBuffer
         {
@@ -961,12 +987,27 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         var lightCB = DXPrimitiveGroup.lightConstantBuffers[fi];
         bool forceFadeByAlpha = _currentAlpha < 1f;
 
+        // A7 main view: each opaque primitive reads the main-view segment of its own reordered stream, with the instance count from
+        // the args entry (MainViewSlot, i). The bone / prev-bone / prev-world / prev-morph tables stay indexed by the original instance:
+        // the VS recovers it from the tag gather writes into each record, so skinned and morphing models need nothing extra here.
+        // Fade stays direct for the same reason as the base class (per-instance back-to-front splitting).
         for (int i = 0; i < _opaquePrimitives.Count; i++)
         {
             var primitive = _opaquePrimitives[i];
             var stream = GetPrimitiveInstanceStream(primitive);
             if (stream == null || stream.Buffer == null)
                 continue;
+
+            if (!forceFadeByAlpha && TryGetMainViewSegment(i, out var segment, out var sortedResource, out var argsResource))
+            {
+                Pipeline.SetPipeline(PipelineMode.Opaque, primitive.DoubleSided);
+                Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], &segment, 0, 0,
+                    GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(),
+                    sortedResource, argsResource,
+                    Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i), stream.Buffer);
+                Season.Rendering.InstanceCull.MainViewDraws++;
+                continue;
+            }
 
             Pipeline.SetPipeline(forceFadeByAlpha ? PipelineMode.Fade : PipelineMode.Opaque, primitive.DoubleSided);
             fixed (VertexBufferView* instanceVB = &stream.View)
@@ -1071,6 +1112,17 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
             if (stream == null || stream.Buffer == null)
                 continue;
 
+            // A7: this slot's segment of primitive i's own reordered stream, instance count from args (slot, i). Decided per
+            // primitive, but every stream is built in the same PrepareCullDraw, so in practice the whole group goes one way.
+            if (TryGetShadowSegment(i, out var slotView, out var argsResource, out int slot))
+            {
+                Pipeline.DrawShadowPrimitiveIndirect(primitive, _matrixBuffers[fi], &slotView,
+                    argsResource, Season.Rendering.InstanceCull.ArgsOffset(slot, i),
+                    bindMaterial: !shareMaterial || !materialBound);
+                materialBound = true;
+                continue;
+            }
+
             fixed (VertexBufferView* instanceVB = &stream.View)
             {
                 Pipeline.DrawShadowPrimitive(primitive, _matrixBuffers[fi], instanceVB,
@@ -1153,6 +1205,9 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
     /// </summary>
     public override void Dispose()
     {
+        // This override does not chain to the base Dispose, so the A7 buffers (and the registration that would otherwise keep a
+        // disposed group in the cull dispatch list) must be released here explicitly.
+        ReleaseCullResources();
         ReleasePrimitiveInstanceBuffers();
 
         foreach (var primitive in _primitives)

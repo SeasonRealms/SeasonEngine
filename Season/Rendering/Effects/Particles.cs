@@ -145,10 +145,20 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
 
     IGraphics? _graphics;
     ComputeKernel? _reset, _compact;
+    /// <summary>Buffers for a view slot that has no <see cref="ViewTargets"/> registered (the single-view shape);
+    /// a registered view keeps one set per submitter on the view. See <see cref="ViewTargets.ParticleBuffers"/>.</summary>
     StorageBuffer? _instances, _args, _frameBuffer;
+    /// <summary>The three buffers of the view being recorded, handed to <see cref="IParticleSubmitter.Prepare"/>.</summary>
+    StorageBuffer? _currentInstances, _currentArgs, _currentFrame;
     ParticleDrawPipeline? _pipeline;
     double _lastSeconds;
     float _phase;
+    /// <summary>Frame token whose phase advance was already applied: the clock is a property of the frame, not of
+    /// a view, and a second view would otherwise advance the whole field twice per frame. Starts out of range so the
+    /// very first frame (token 0) still advances. See <see cref="Record"/> for how the token is formed.</summary>
+    ulong _timeFrame = ulong.MaxValue;
+    /// <summary>Record counter used as the frame token when no prepared view identifies the frame itself.</summary>
+    ulong _recordSerial;
     bool _ready;
     // Whether the previous frame's submission failed. Draw returning false has several legitimate causes (pass identity mismatch, PSO still being asynchronously compiled),
     // a single-frame failure is not worth logging, but consecutive failures mean this system has not drawn a single frame all session -- and reporting every frame would flood the log.
@@ -302,6 +312,15 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
 
     public override ComputePhase Phase => ComputePhase.FrameStart;
 
+    /// <summary>
+    /// Per view: the compaction kernel culls against the current camera and the instance table is the result of that
+    /// cull, so every view needs its own record. The feature switch keeps a view that turned particles off from even
+    /// dispatching - no compaction, no indirect draw.
+    /// </summary>
+    public override ComputeScope Scope => ComputeScope.View;
+
+    public override ViewFeature RequiredFeature => ViewFeature.Particles;
+
     public override bool Initialize(IGraphics g)
     {
         if (_graphics != null) throw new InvalidOperationException("Particle system is already initialized.");
@@ -314,17 +333,11 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
             _reset = g.CreateComputeKernel(CreateArgsKernel("particleReset"));
             _compact = g.CreateComputeKernel(CreateCompactKernel());
             if (_reset == null || _compact == null) { Dispose(); return false; }
-            _frameBuffer = g.CreateStorageBuffer(ParticleDraw.FrameBytes);
-            _instances = g.CreateStorageBuffer(ParticleBudget * ParticleInstance.SizeInBytes);
             _regionBuffer = g.CreateStorageBuffer((uint)_regionData.Length * 16);
-            // This is the project's first indirect argument buffer; usage must be declared at creation and cannot be widened afterwards.
-            _args = g.CreateStorageBuffer(IndirectDrawIndexedArgs.SizeInBytes,
-                StorageBufferUsage.ComputeAndIndirectArgs);
-            _resetResources[0] = _args;
-            _compactResources[0] = _frameBuffer;
-            _compactResources[1] = _instances;
-            _compactResources[2] = _args;
-            _compactResources[3] = _regionBuffer;
+            if (_regionBuffer == null) { Dispose(); return false; }
+            // The instance table, its indirect arguments and the frame block are per view and per submitter, so they are
+            // allocated on the first Record of each pair rather than here: the main view no longer owns buffers that the
+            // secondary view would have to fight over (see ViewTargets.ParticleBuffers).
             FrameSchedule.ParticleSubmitters.Add(this);
             _routed = true;
             return true;
@@ -340,25 +353,77 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
     public override void Record(IGraphics g)
     {
         _ready = false;
-        if (!ReferenceEquals(g, _graphics)
-            || _reset == null || _compact == null || _args == null || _instances == null
-            || _frameBuffer == null) return;
+        if (!ReferenceEquals(g, _graphics) || _reset == null || _compact == null
+            || _regionBuffer == null) return;
 
+        // The view this block is packed for: every camera culls, packs and draws with its own matrices and its own
+        // instance table. A view slot without targets falls back to the effect's own buffers, which is the shape the
+        // single-view path had before secondary views existed.
+        //
+        // A host that never prepares a view (the headless acceptance harness) has no camera of its own, and skipping the
+        // record there would leave it with nothing to submit. The frame snapshot the backends publish is the only camera
+        // such a host has, and it is exactly the pair the single-view path packed; a prepared view always wins, because
+        // its own matrices are what a second camera has to cull and draw with.
+        var view = RenderView.CurrentOrNull;
+        bool perView = view is { Prepared: true };
+        var targets = perView ? view!.Targets : null;
+        StorageBuffer? instances, args, frame;
+        if (targets != null)
+        {
+            // Per (view, submitter): the pass chain records every particle system of the frame before it draws any of
+            // them, so one table per view would be overwritten in turn and each draw would render whichever system
+            // happened to record last - the campfire drawing the waterfall mist's instances, and no smoke anywhere.
+            var buffers = targets.GetParticleBuffers(this);
+            instances = buffers.Instances ??= g.CreateStorageBuffer(ParticleBudget * ParticleInstance.SizeInBytes);
+            // Usage must be declared at creation and cannot be widened afterwards: written by compute, read by an indirect draw.
+            args = buffers.Args ??= g.CreateStorageBuffer(IndirectDrawIndexedArgs.SizeInBytes,
+                StorageBufferUsage.ComputeAndIndirectArgs);
+            frame = buffers.Frame ??= g.CreateStorageBuffer(ParticleDraw.FrameBytes);
+        }
+        else
+        {
+            instances = _instances ??= g.CreateStorageBuffer(ParticleBudget * ParticleInstance.SizeInBytes);
+            args = _args ??= g.CreateStorageBuffer(IndirectDrawIndexedArgs.SizeInBytes,
+                StorageBufferUsage.ComputeAndIndirectArgs);
+            frame = _frameBuffer ??= g.CreateStorageBuffer(ParticleDraw.FrameBytes);
+        }
+        if (instances == null || args == null || frame == null) return;
+        _currentInstances = instances; _currentArgs = args; _currentFrame = frame;
+
+        // The clock and the weather region table belong to the frame rather than to a view: advancing the phase once
+        // per view would double the fall speed of the whole field as soon as a second camera renders.
+        //
+        // The frame token is the scheduler's counter only where several records really can share a frame, i.e. when a
+        // prepared view is being recorded. A host that drives effects by hand (the four acceptance harnesses) has no
+        // prepared view and never advances that counter, so there each record is a frame of its own -- gating on the
+        // counter alone froze the phase and the region table after the first record.
+        ulong frameToken = perView ? FrameSchedule.FrameIndex : ++_recordSerial;
+        bool newFrame = frameToken != _timeFrame;
         double now = _clock.Elapsed.TotalSeconds;
-        // The first frame and long hitches both produce anomalous dt; after clamping, phase advance is at most one fall cycle, so the whole field never skips.
-        float delta = ExternalTime ? _pendingDelta : (float)Math.Clamp(now - _lastSeconds, 0, 0.1);
-        _pendingDelta = 0;
-        _lastSeconds = now;
-        if (!Enabled || _regionBuffer == null) return;
+        float delta = 0f;
+        if (newFrame)
+        {
+            // The first frame and long hitches both produce anomalous dt; after clamping, phase advance is at most one fall cycle, so the whole field never skips.
+            delta = ExternalTime ? _pendingDelta : (float)Math.Clamp(now - _lastSeconds, 0, 0.1);
+            _pendingDelta = 0;
+            _lastSeconds = now;
+            _timeFrame = frameToken;
+        }
+        if (!Enabled) return;
         if (Weather != null)
         {
             if (WeatherChannel is not (1 or 2)) throw new InvalidOperationException("Weather channel must be rain or snow.");
+            // Every view makes the same decision; only the first one of the frame has to repack the table, because the
+            // regions are frame state and the upload would otherwise be repeated (and lost) per view.
             bool active = false;
             foreach (var region in Weather.Regions)
                 active |= WeatherChannel == 1 ? region.State.Rain > 0 : region.State.Snow > 0;
             if (!active) return;
-            int vectors = Weather.WriteParticleData(_regionData);
-            if (!g.TryUpdateStorageBuffer(_regionBuffer, MemoryMarshal.AsBytes(_regionData.AsSpan(0, vectors)))) return;
+            if (newFrame)
+            {
+                int vectors = Weather.WriteParticleData(_regionData);
+                if (!g.TryUpdateStorageBuffer(_regionBuffer, MemoryMarshal.AsBytes(_regionData.AsSpan(0, vectors)))) return;
+            }
         }
         float height = MathF.Max(BoxHeight, 0.01f);
         // Lifetime is the sole timebase for phase: an explicit Lifetime takes priority, otherwise it is derived from the drop height and fall speed, and if both are missing the phase freezes.
@@ -366,10 +431,18 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
         float fallSpeed = MathF.Max(FallSpeed, 0);
         float life = Lifetime > 0 ? Lifetime : (fallSpeed > 0 ? height / fallSpeed : 0);
         // Phase accumulates in normalized lifetime and wraps at 1; the shader only uses it inside frac() and a 2*pi sine, so the wrap is exactly continuous.
-        _phase += life > 0 ? delta / life : 0;
-        if (_phase >= 1f) _phase -= MathF.Floor(_phase);
+        if (newFrame)
+        {
+            _phase += life > 0 ? delta / life : 0;
+            if (_phase >= 1f) _phase -= MathF.Floor(_phase);
+        }
 
-        if (!Matrix4x4.Invert(FrameSchedule.RenderView, out var inverseView)) return;
+        // The camera terms come from the view being recorded, not from the frame snapshot: FrameSchedule.RenderView is
+        // captured once per frame at the main camera's update point, so a secondary view projecting through it would
+        // cull and draw the field where the *main* camera sees it (a mist bank in front of the player showing up in the
+        // rear mirror, and vanishing when it is behind him). view.View / RenderViewProjection are that view's own
+        // unjittered pair, the same values the snapshot holds for the main view.
+        if (!Matrix4x4.Invert(perView ? view!.View : FrameSchedule.RenderView, out var inverseView)) return;
         var position = inverseView.Translation;
         var right = new Vector3(inverseView.M11, inverseView.M12, inverseView.M13);
         var up = new Vector3(inverseView.M21, inverseView.M22, inverseView.M23);
@@ -378,7 +451,7 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
         up = Vector3.Normalize(up);
 
         // Use the unjittered VP for culling and projection: jitter belongs to TAA, and particle positions themselves should not wobble with it.
-        var vp = FrameSchedule.UnjitteredRenderViewProjection;
+        var vp = perView ? view!.RenderViewProjection : FrameSchedule.UnjitteredRenderViewProjection;
         _frame[0] = new Vector4(vp.M11, vp.M12, vp.M13, vp.M14);
         _frame[1] = new Vector4(vp.M21, vp.M22, vp.M23, vp.M24);
         _frame[2] = new Vector4(vp.M31, vp.M32, vp.M33, vp.M34);
@@ -417,7 +490,15 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
         // and can never flip the velocity into the opposite direction.
         _frame[18] = new Vector4(Math.Clamp(SpeedJitter, 0f, 1f),
             float.IsFinite(FloorY) ? FloorY : 0f, Math.Clamp(ToonEdge, 0f, 0.5f), 0f);
-        if (!g.TryUpdateStorageBuffer(_frameBuffer, MemoryMarshal.AsBytes(_frame.AsSpan()))) return;
+        if (!g.TryUpdateStorageBuffer(frame, MemoryMarshal.AsBytes(_frame.AsSpan()))) return;
+
+        // Bind the buffers of the view being recorded: the reset kernel zeroes this view's argument block, and the
+        // compaction kernel appends into this view's instance table.
+        _resetResources[0] = args;
+        _compactResources[0] = frame;
+        _compactResources[1] = instances;
+        _compactResources[2] = args;
+        _compactResources[3] = _regionBuffer;
 
         Span<float> reset = stackalloc float[4];
         reset.Clear();
@@ -497,9 +578,11 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
         if (!_ready) return false;
         _ready = false;
         if (!ReferenceEquals(g, _graphics) || _pipeline == null) return false;
-        if (!g.TryPrepareIndirectArgs(_args!)) return false;
-        return _pipeline.Prepare(new ParticleDrawInputs(color, FrameSchedule.SceneDepth,
-            _instances!, _args!, _frameBuffer!));
+        if (_currentInstances == null || _currentArgs == null || _currentFrame == null) return false;
+        if (!g.TryPrepareIndirectArgs(_currentArgs)) return false;
+        bool prepared = _pipeline.Prepare(new ParticleDrawInputs(color, FrameSchedule.SceneDepth,
+            _currentInstances, _currentArgs, _currentFrame));
+        return prepared;
     }
 
     bool IParticleSubmitter.Submit(IGraphics g)
@@ -540,6 +623,13 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
         _args = null;
         _frameBuffer?.Dispose();
         _frameBuffer = null;
+        // The per-view buffers are owned by their ViewTargets; dropping the references here only stops this effect
+        // from handing a stale one to the next Prepare. The entries themselves die with the view, and this release
+        // covers the other case: the effect is disposed while the views that drew it live on.
+        FrameSchedule.ForEachTargets(targets => targets.ReleaseParticleBuffers(this));
+        _currentInstances = null;
+        _currentArgs = null;
+        _currentFrame = null;
         _regionBuffer?.Dispose();
         _regionBuffer = null;
         _pendingDelta = 0;

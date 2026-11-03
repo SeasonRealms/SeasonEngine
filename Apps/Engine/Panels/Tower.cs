@@ -100,14 +100,14 @@ internal class Tower : Panel
     const float LampHeight = 0.3f;
     const int PostSegments = 20;
 
-    // The sea sits at y=-3 (see Sea.cs). A shallow 8 degree dip off the lamp axis travels 181m down the beam and
-    // lands it on open water 179m out, against the 100m a 14 degree dip reached. That is the whole point of the
+    // The sea sits at Sea.DefaultSeaLevel (see Sea.cs). A shallow 8 degree dip off the lamp axis travels 170m down the
+    // beam and lands it on open water 168m out, against the 95m a 14 degree dip reached. That is the whole point of the
     // angle: far enough out to read as a lighthouse reaching toward the horizon instead of lighting the rocks at
     // its foot. It is also what sets the shape of the pool, since the dip has to stay steeper than the cone.
-    const float SeaLevel = -3f;
+    const float SeaLevel = Sea.DefaultSeaLevel;
     const float BeamPitch = 8f * MathF.PI / 180f;
     const float LampAxis = PostTop + LampHeight * 0.5f;                                 // 22.15, beam origin
-    static readonly float LampDrop = LampAxis - SeaLevel;                               // 25.15, lamp above water
+    static readonly float LampDrop = LampAxis - SeaLevel;                               // 23.65, lamp above water
 
     // Half angle of the cone, and here the angle itself is a hard limit rather than a taste setting. A cone meeting
     // a plane cuts a conic section: with the dip steeper than the half angle the section closes into an ellipse,

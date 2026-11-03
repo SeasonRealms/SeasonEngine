@@ -34,6 +34,11 @@ namespace Engine.Panels;
 /// 所以盒子一动，雾与白沫一起动；水花仍绑在落点上。
 /// 首帧只按潭面摆一套默认值；之后盒子平面位置跟着潭心走，直到用户在面板里动过 Pos，才永久脱钩交给用户。
 ///
+/// 三组粒子都不设近景可见距离（ViewDistance = 0，即无限远）：那是一个以相机为圆心、超过就整簇淡出的固定半径，
+/// 曾经的 50 / 55 m 只够站在潭边看。从天空俯视整座岛时相机到潭的距离在百米以上，固定半径会把水花、白沫与
+/// 水汽一起抹成 0，画面里只剩一挂没有落点的水幕 —— 那不是「远处看不清」，而是地标凭空消失。
+/// 远处的粒子和别处的几何一样交给视锥剔除与寿命淡出，不需要第二道以相机为心的门。
+///
 /// 粒子不吃场景光照（Particles 的 Shade 只算 Color.rgb * alpha，Color 就是 albedo）：
 /// 所以 Update 每帧按太阳高度把作者色缩放一份写回去（见 <see cref="ApplyParticlesLighting"/>），
 /// 水雾白天夜晚才有明暗差。瀑布水幕那边不需要这个补丁：WaterfallEffect 已经把
@@ -57,9 +62,10 @@ internal class WaterfallPool : Panel
     // 作者色（正午满亮时的设计值，任何时刻都不再改）：粒子着色器把 Color 直接当 albedo，
     // 完全不参与场景光照（见 Particles 的 Shade，只有 Color.rgb * alpha），所以三个系统每帧要按太阳高度
     // 缩放一份写回去（见 ApplyParticlesLighting），否则白天夜晚的观感完全一样。
-    static readonly Vector4 SplashColor = new(0.82f, 0.93f, 0.98f, 0.75f);
-    static readonly Vector3 SplashMid = new(0.90f, 0.97f, 1.00f);
-    static readonly Vector3 SplashEnd = new(0.50f, 0.62f, 0.70f);
+    // 作者色供 River 的出海口水花与白沫同源复用（internal）：两处是同一类撞击效果，颜色只该有一份设计值。
+    internal static readonly Vector4 SplashColor = new(0.82f, 0.93f, 0.98f, 0.75f);
+    internal static readonly Vector3 SplashMid = new(0.90f, 0.97f, 1.00f);
+    internal static readonly Vector3 SplashEnd = new(0.50f, 0.62f, 0.70f);
 
     // 雾的 alpha 取 0.07：0.05 太淡，Haze 几乎看不出来，Height 旋钮也就失去了意义。
     static readonly Vector4 MistColor = new(0.92f, 0.96f, 1.00f, 0.07f);
@@ -68,9 +74,9 @@ internal class WaterfallPool : Panel
 
     // 白沫 alpha 从 0.42 提到 0.52：这条带子是画面里最白的一笔，压得太透会露出后面的水与石头，
     // 看起来“虚而不实”。
-    static readonly Vector4 FoamColor = new(0.95f, 0.98f, 1.00f, 0.52f);
-    static readonly Vector3 FoamMid = new(0.92f, 0.96f, 0.99f);
-    static readonly Vector3 FoamEnd = new(0.75f, 0.82f, 0.88f);
+    internal static readonly Vector4 FoamColor = new(0.95f, 0.98f, 1.00f, 0.52f);
+    internal static readonly Vector3 FoamMid = new(0.92f, 0.96f, 0.99f);
+    internal static readonly Vector3 FoamEnd = new(0.75f, 0.82f, 0.88f);
 
     /// <summary>夜间亮度下限：月光下水雾仍要看得出轮廓，而不是直接黑成剪影。</summary>
     const float NightParticleLight = 0.32f;
@@ -238,7 +244,7 @@ internal class WaterfallPool : Panel
         CurveMode = true,
         NoiseAmount = 0.3f,
         Turbulence = 0.15f,
-        ViewDistance = 50f,
+        ViewDistance = 0f,
     };
 
     /// <summary>
@@ -269,7 +275,7 @@ internal class WaterfallPool : Panel
         CurveMode = true,
         NoiseAmount = 0.6f,
         Turbulence = 0.15f,
-        ViewDistance = 55f,
+        ViewDistance = 0f,
     };
 
     /// <summary>
@@ -305,7 +311,7 @@ internal class WaterfallPool : Panel
         NoiseAmount = 0.35f,
         Turbulence = 0.25f,
         ToonEdge = 0.30f,
-        ViewDistance = 55f,
+        ViewDistance = 0f,
     };
 
     /// <summary>
@@ -590,7 +596,7 @@ internal class WaterfallPool : Panel
     /// 让水汽在寿命内爬到盒子顶附近：位移 = v·T + ½·a·T²，反解 v（再夹到实用区间防呆）。
     /// 于是 Height 就是“雾柱多高”，不必再单独调初速。
     /// </summary>
-    static float RiseSpeed(float height, float lifetime, float accelY)
+    internal static float RiseSpeed(float height, float lifetime, float accelY)
     {
         float t = MathF.Max(lifetime, 0.1f);
         return Math.Clamp((height - 0.5f * accelY * t * t) / t, 0.05f, 3f);
@@ -601,14 +607,14 @@ internal class WaterfallPool : Panel
     /// 与潭底焦散共用 App.SunlightFactor 这条太阳曲线：正午 => 1.10，夜里 => NightParticleLight。
     /// 用下限而不是归零，是因为全黑的水雾看起来像掉帧的黑块，而不是月光下的白雾。
     /// </summary>
-    static float ParticleLighting(float dayPhase)
+    internal static float ParticleLighting(float dayPhase)
     {
         float sun = App.SunlightFactor(dayPhase);
         return NightParticleLight + (1.10f - NightParticleLight) * sun;
     }
 
     /// <summary>把作者色乘上光照写回系统；只乘 RGB，alpha 不变（覆盖度不能跟着日光抖动）。</summary>
-    static void ApplyParticlesLighting(ParticleSystemEffect system, Vector4 color, Vector3 mid, Vector3 end, float light)
+    internal static void ApplyParticlesLighting(ParticleSystemEffect system, Vector4 color, Vector3 mid, Vector3 end, float light)
     {
         system.Color = new Vector4(color.X * light, color.Y * light, color.Z * light, color.W);
         system.ColorMid = mid * light;

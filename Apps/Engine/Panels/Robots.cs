@@ -45,6 +45,9 @@ internal class Robots : Panel
     Shape bubble;
     Texts bubbleText;
 
+    // Set by RestartAnimations and consumed by the next ApplyPersons. See there for why it takes two frames.
+    bool _restartAnimations;
+
     internal Robots()
     {
         robotField = new InstancedModel()
@@ -176,8 +179,22 @@ internal class Robots : Panel
 
             person.Rotation = Quaternion.CreateFromYawPitchRoll(person.Yaw, 0f, 0f);
             person.AnimationClip = ResolveAnimationClip(person.Animation);
+
+            // Park every person on a neighbouring clip for exactly one frame; the next frame resolves the real clip again and the
+            // clip change makes the platform group restart playback from AnimationTimeOffset. A same-clip write would not do it,
+            // because the playback state only re-initializes when the clip index it stored differs from the incoming one.
+            if (_restartAnimations && robotField.AnimationNames.Count > 1)
+                person.AnimationClip = (person.AnimationClip + 1) % robotField.AnimationNames.Count;
         }
+        _restartAnimations = false;
     }
+
+    /// <summary>
+    /// Restarts every person's animation from its time offset, two frames from now. Only the per-pixel A/B harness calls it:
+    /// playback time accumulates from the frame the model finished its asynchronous load, which differs per run, so without a
+    /// restart at a fixed frame number two otherwise identical runs capture the robots in different poses.
+    /// </summary>
+    internal void RestartAnimations() => _restartAnimations = true;
 
     /// <summary>Resolves an animation clip index by name. Null, empty, unmatched, or not-yet-loaded cases all fall back to 0, the default clip.</summary>
     int ResolveAnimationClip(string? name)

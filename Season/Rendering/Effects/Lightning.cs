@@ -83,6 +83,15 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
 
     public override ComputePhase Phase => ComputePhase.FrameStart;
 
+    /// <summary>
+    /// Per view: the bolt geometry and its segment count are view independent, but the frame block carries this
+    /// camera's VP, viewport pixels and minimum line width, so a secondary view has to prepare its own draw.
+    /// </summary>
+    public override ComputeScope Scope => ComputeScope.View;
+
+    /// <summary>The ribbon is drawn by the particle pipeline and shares that feature switch.</summary>
+    public override ViewFeature RequiredFeature => ViewFeature.Particles;
+
     public override bool Initialize(IGraphics g)
     {
         if (_graphics != null) throw new InvalidOperationException("Lightning effect is already initialized.");
@@ -189,10 +198,22 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
     {
         if (!_ready) return false;
         _ready = false;
-        if (!ReferenceEquals(g, _graphics) || _pipeline == null || _frameBuffer == null) return false;
+        if (!ReferenceEquals(g, _graphics) || _pipeline == null) return false;
         if (color.Desc.Width == 0 || color.Desc.Height == 0) return false;
 
-        if (!Matrix4x4.Invert(FrameSchedule.RenderView, out var inverseView)) return false;
+        // The frame block carries this view's VP, viewport pixels and minimum line width, so it lives on the view:
+        // on backends whose staging keeps only a frame's last write, a shared block would leave the main view drawing
+        // with the secondary view's matrices (see ViewTargets.ParticleBuffers).
+        var view = RenderView.Current;
+        if (view == null) return false;
+        var frameBuffer = view.Targets != null
+            ? view.Targets.GetParticleBuffers(this).Frame ??= g.CreateStorageBuffer(ParticleDraw.FrameBytes)
+            : _frameBuffer;
+        if (frameBuffer == null) return false;
+
+        // Same reason as the frame block: the snapshot matrices are captured once per frame at the main camera's update
+        // point, so projecting through them would place a secondary view's bolt wherever the main camera sees it.
+        if (!Matrix4x4.Invert(view.View, out var inverseView)) return false;
         var position = inverseView.Translation;
         var right = new Vector3(inverseView.M11, inverseView.M12, inverseView.M13);
         var up = new Vector3(inverseView.M21, inverseView.M22, inverseView.M23);
@@ -200,7 +221,7 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
         right = Vector3.Normalize(right);
         up = Vector3.Normalize(up);
 
-        var vp = FrameSchedule.UnjitteredRenderViewProjection;
+        var vp = view.RenderViewProjection;
         _frame[0] = new Vector4(vp.M11, vp.M12, vp.M13, vp.M14);
         _frame[1] = new Vector4(vp.M21, vp.M22, vp.M23, vp.M24);
         _frame[2] = new Vector4(vp.M31, vp.M32, vp.M33, vp.M34);
@@ -222,11 +243,11 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
         _frame[13] = new Vector4(MathF.Max(Intensity, 0f) * envelope, MathF.Max(FogExtinction, 0f), 0f, 0f);
         _frame[14] = default;
         _frame[15] = default;
-        if (!g.TryUpdateStorageBuffer(_frameBuffer, MemoryMarshal.AsBytes(_frame.AsSpan()))) return false;
+        if (!g.TryUpdateStorageBuffer(frameBuffer, MemoryMarshal.AsBytes(_frame.AsSpan()))) return false;
 
         if (!g.TryPrepareIndirectArgs(_args!)) return false;
         if (!_pipeline.Prepare(new ParticleDrawInputs(color, FrameSchedule.SceneDepth,
-            _instancesBuffer!, _args!, _frameBuffer!))) return false;
+            _instancesBuffer!, _args!, frameBuffer))) return false;
 
         // Only once the draw will really happen may TAA disable history reuse inside this frame's
         // reactive rect. Placed after all failure paths: a frame that was not drawn should not cost any
@@ -364,6 +385,9 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
         _instancesBuffer = null;
         _args?.Dispose();
         _args = null;
+        // The per-view frame blocks are owned by their ViewTargets; this release covers the case where the
+        // lightning channel retires while the views that drew it live on.
+        FrameSchedule.ForEachTargets(targets => targets.ReleaseParticleBuffers(this));
         _frameBuffer?.Dispose();
         _frameBuffer = null;
         _graphics = null;

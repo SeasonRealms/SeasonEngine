@@ -430,6 +430,18 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         return _primitiveInstanceStreams[index];
     }
 
+    /// <summary>
+    /// A7: every opaque primitive draws its own instance stream (node world × instance world, plus its own morph weights), so gather
+    /// materializes one reordered stream per opaque primitive. The visibility decision itself is made once per instance from the
+    /// root instance worlds in the base <see cref="VKInstancedPrimitiveGroup._instanceData"/> against the model-space clip-union box.
+    /// </summary>
+    protected override bool CullPerPrimitiveStreams => true;
+
+    protected override ReadOnlySpan<InstanceTransformData> GetCullDrawStream(int stream)
+        => (uint)stream < (uint)_opaquePrimitives.Count && GetPrimitiveInstanceStream(_opaquePrimitives[stream]) is { } s
+            ? s.Data
+            : default;
+
     void SyncInstancedSkinningMaterialParams()
     {
         for (int i = 0; i < _primitives.Count; i++)
@@ -738,6 +750,12 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         EnsurePrevInstanceWorldCapacity(_instanceCount);
         EnsurePrevMorphWeightsCapacity(_instanceCount);
 
+        // A7 cull input: one root instance world per enabled instance, in write order. The per-primitive streams below hold
+        // "node world × instance world", which differs per primitive, so none of them can stand in for the instance as a whole;
+        // the cull box (model.TemplateCullBounds) is in the same model space as this root world.
+        if (_instanceData.Length != _instanceCount)
+            _instanceData = new InstanceTransformData[_instanceCount];
+
         bool hasAnimation = _asset._animations.Count > 0;
         bool hasSkin = _skins.Count > 0;
         float deltaTime = Math.Max(time, 0f);
@@ -791,6 +809,7 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
             // Unified transform convention: converge on BuildInstanceMatrix
             // (anchor pivot, see InstancedMesh3DBase)
             var instanceWorld = model.BuildInstanceMatrix(instance);
+            _instanceData[writeIndex] = InstanceTransformData.FromWorld(instanceWorld);
             RestoreNodesToRestPose();
 
             if (hasAnimation)
@@ -925,6 +944,12 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
                 Device.ResourceManager.UpdateBuffer(stream.Buffer, stream.Data);
         }
 
+        // A7: the box must be in the root instance's model space and cover every clip pose, because the kernel culls the whole
+        // instance with it once and every primitive stream only replays that decision. The cull-side uploads themselves wait for
+        // PrepareCullInputs (the command buffer is not recording yet during Update).
+        SetCullLocalBounds(model.TemplateCullBounds);
+        UpdateCullUpload(model);
+
         fi = (int)Device.FrameIndex;
         var matrices = new MatrixBuffer
         {
@@ -968,12 +993,28 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         bool forceFadeByAlpha = _currentAlpha < 1.0f;
         int fi = (int)Device.FrameIndex;
 
+        // A7 main view: each opaque primitive reads the main-view segment of its own reordered stream, with the instance count from
+        // the args entry (MainViewSlot, i). The bone / prev-bone / prev-world / prev-morph tables stay indexed by the original instance:
+        // the VS recovers it from the tag gather writes into each record, so skinned and morphing models need nothing extra here.
+        // Fade stays direct for the same reason as the base class (per-instance back-to-front splitting).
         for (int i = 0; i < _opaquePrimitives.Count; i++)
         {
             var primitive = _opaquePrimitives[i];
             var stream = GetPrimitiveInstanceStream(primitive);
             if (stream == null || stream.Buffer.Buffer.Handle == 0)
                 continue;
+
+            if (!forceFadeByAlpha && TryGetMainViewSegment(i, out var sortedBuffer, out ulong segmentOffset, out var argsBuffer))
+            {
+                Pipeline.SetPipeline(cmd, PipelineMode.Opaque, primitive.DoubleSided);
+                Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
+                    primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
+                    sortedBuffer, 0, 0, float.NaN,
+                    argsBuffer, Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i),
+                    segmentOffset);
+                Season.Rendering.InstanceCull.MainViewDraws++;
+                continue;
+            }
 
             Pipeline.SetPipeline(cmd, forceFadeByAlpha ? PipelineMode.Fade : PipelineMode.Opaque, primitive.DoubleSided);
             Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
@@ -1083,6 +1124,18 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
             var stream = GetPrimitiveInstanceStream(primitive);
             if (stream == null || stream.Buffer.Buffer.Handle == 0)
                 continue;
+
+            // A7: this slot's segment of primitive i's own reordered stream, instance count from args (slot, i). Decided per
+            // primitive, but every stream is built in the same PrepareCullDraw, so in practice the whole group goes one way.
+            if (TryGetShadowSegment(i, out var sortedBuffer, out ulong instanceOffset, out var argsBuffer, out int slot))
+            {
+                Pipeline.DrawShadowPrimitiveIndirect(cmd, primitive,
+                    primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
+                    primitive.DescriptorSets[fi],
+                    sortedBuffer, instanceOffset,
+                    argsBuffer, Season.Rendering.InstanceCull.ArgsOffset(slot, i));
+                continue;
+            }
 
             Pipeline.DrawShadowPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
                 primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,

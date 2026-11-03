@@ -1059,6 +1059,241 @@ internal class GltfAsset
             : BitConverter.SingleToInt32Bits(_animationPlayer.AnimationTime)
               ^ (_animationPlayer.CurrentAnimationIndex * 0x51ED2701);
 
+    /// <summary>Clip sampling rate of <see cref="ComputeClipUnionBounds"/> on top of the keyframe times themselves.</summary>
+    const float ClipBoundsSampleRate = 30f;
+
+    /// <summary>Upper bound on the poses sampled per clip, so a long baked clip cannot stall loading.</summary>
+    const int ClipBoundsMaxSamples = 1024;
+
+    /// <summary>
+    /// A7: model-space (LH) box that covers <paramref name="rest"/> and every pose the asset's clips reach, for the GPU instance
+    /// cull of InstancedModel. The kernel tests one box per instance transformed by the root instance world, and an instance it
+    /// rejects is simply not drawn - unlike the CPU sphere test, which only decides whether a whole batch is submitted - so a
+    /// box a swinging limb leaves turns into visible popping. <see cref="Season.Controls.Model.LocalBounds"/> only scales the
+    /// rest box by AnimatedBoundsScale, which is a guess; this replays the clips instead.
+    ///
+    /// Each clip is evaluated at its keyframe times plus a fixed-rate grid (capped at <see cref="ClipBoundsMaxSamples"/>), and
+    /// each pose contributes the same surface the renderer draws: a rigid PickMesh's local box through its node world, and a
+    /// skinned one's per-joint boxes through IBM × joint world × inv(bind node world) × node world - the bone palette the vertex
+    /// stage applies followed by the stream's node world. A skinned vertex is a weighted average of its joints' transforms, so it
+    /// always lies inside the union of those transformed boxes and the result stays conservative without visiting a vertex per
+    /// sample. Morph displacement is not replayed (PickMesh carries no deltas); the rest box joins the union, and it is already
+    /// the AnimatedBoundsScale-expanded one, which keeps the margin morph targets had before.
+    ///
+    /// Loading-time only. The node pose and the player's clip/clock are restored afterwards, so the asset is left as found.
+    /// </summary>
+    internal Season.Rendering.Bounds3D ComputeClipUnionBounds(Season.Rendering.Bounds3D rest)
+    {
+        if (_animations.Count == 0 || gltfNodes.Count == 0)
+            return rest;
+
+        // Per-mesh local boxes, computed once: rigid meshes get one, skinned meshes one per referenced joint plus one for the
+        // vertices with no weight at all, which the vertex stage leaves unskinned in node space.
+        var rigid = new List<(GltfNodeBase Node, Season.Rendering.Bounds3D Box)>();
+        var skinned = new List<(GltfNodeBase Node, GLTFSkin Skin, int Joint, Season.Rendering.Bounds3D Box)>();
+        foreach (var node in gltfNodes)
+        {
+            foreach (var mesh in node.PickMeshes)
+            {
+                var positions = mesh.Positions;
+                if (positions.Length == 0)
+                    continue;
+
+                var skin = node.Skin;
+                if (!mesh.IsSkinned || skin == null || skin.Joints.Count == 0)
+                {
+                    rigid.Add((node, BoxOf(positions)));
+                    continue;
+                }
+
+                int jointCount = skin.Joints.Count;
+                var mins = new System.Numerics.Vector3[jointCount + 1];
+                var maxs = new System.Numerics.Vector3[jointCount + 1];
+                var used = new bool[jointCount + 1];
+                int skinnedVertices = Math.Min(positions.Length, Math.Min(mesh.Joints.Length, mesh.Weights.Length));
+                for (int v = 0; v < positions.Length; v++)
+                {
+                    var p = positions[v];
+                    var w = v < skinnedVertices ? mesh.Weights[v] : System.Numerics.Vector4.Zero;
+                    if (w.X + w.Y + w.Z + w.W <= 0f)
+                    {
+                        Grow(jointCount, p);
+                        continue;
+                    }
+                    var j = mesh.Joints[v];
+                    if (w.X > 0f) GrowJoint((int)j.X, p);
+                    if (w.Y > 0f) GrowJoint((int)j.Y, p);
+                    if (w.Z > 0f) GrowJoint((int)j.Z, p);
+                    if (w.W > 0f) GrowJoint((int)j.W, p);
+                }
+
+                for (int k = 0; k <= jointCount; k++)
+                {
+                    if (!used[k])
+                        continue;
+                    var box = Season.Rendering.Bounds3D.FromMinMax(mins[k], maxs[k]);
+                    if (k == jointCount)
+                        rigid.Add((node, box));
+                    else
+                        skinned.Add((node, skin, k, box));
+                }
+
+                // A joint index past the skin's joints would read garbage on the GPU too; it cannot be placed, so it is dropped.
+                void GrowJoint(int k, System.Numerics.Vector3 p)
+                {
+                    if ((uint)k < (uint)jointCount)
+                        Grow(k, p);
+                }
+
+                void Grow(int k, System.Numerics.Vector3 p)
+                {
+                    if (!used[k]) { mins[k] = p; maxs[k] = p; used[k] = true; }
+                    else
+                    {
+                        mins[k] = System.Numerics.Vector3.Min(mins[k], p);
+                        maxs[k] = System.Numerics.Vector3.Max(maxs[k], p);
+                    }
+                }
+            }
+        }
+
+        if (rigid.Count == 0 && skinned.Count == 0)
+            return rest;
+
+        // Snapshot what sampling overwrites: every node's TRS and weights, and the player's clip, clock and loop flag.
+        var player = _animationPlayer;
+        int savedClip = player.CurrentAnimationIndex;
+        float savedTime = player.AnimationTime;
+        bool savedAnimating = player.IsAnimating;
+        bool savedLoop = player.Loop;
+        var savedTranslation = new System.Numerics.Vector3[gltfNodes.Count];
+        var savedRotation = new System.Numerics.Quaternion[gltfNodes.Count];
+        var savedScale = new System.Numerics.Vector3[gltfNodes.Count];
+        var savedWeights = new float[gltfNodes.Count][];
+        for (int n = 0; n < gltfNodes.Count; n++)
+        {
+            var node = gltfNodes[n];
+            savedTranslation[n] = node.Translation;
+            savedRotation[n] = node.Rotation;
+            savedScale[n] = node.Scale;
+            savedWeights[n] = node.Weights.Length == 0 ? Array.Empty<float>() : (float[])node.Weights.Clone();
+        }
+
+        var result = rest;
+        bool hasRest = rest.Extents != System.Numerics.Vector3.Zero;
+        var times = new List<float>();
+        try
+        {
+            // Clamp rather than wrap: with wrapping, the sample at exactly the clip end would evaluate the first frame instead.
+            player.Loop = false;
+            for (int clip = 0; clip < _animations.Count; clip++)
+            {
+                CollectClipSampleTimes(_animations[clip], times);
+                foreach (float t in times)
+                {
+                    player.Evaluate(clip, t, gltfNodes);
+                    foreach (var (node, box) in rigid)
+                        Accumulate(box.Transform(node.WorldTransform));
+                    foreach (var (node, skin, joint, box) in skinned)
+                    {
+                        var inverseBind = System.Numerics.Matrix4x4.Identity;
+                        if (skin.BindNode != null && !System.Numerics.Matrix4x4.Invert(skin.BindNode.WorldTransform, out inverseBind))
+                            inverseBind = System.Numerics.Matrix4x4.Identity;
+                        var ibm = joint < skin.InverseBindMatrices.Count ? skin.InverseBindMatrices[joint] : System.Numerics.Matrix4x4.Identity;
+                        var replay = ibm * skin.Joints[joint].WorldTransform * inverseBind * node.WorldTransform;
+                        if (float.IsNaN(replay.M11) || float.IsInfinity(replay.M11))
+                            continue;
+                        Accumulate(box.Transform(replay));
+                    }
+                }
+            }
+        }
+        finally
+        {
+            player.Loop = savedLoop;
+            if (savedClip != player.CurrentAnimationIndex)
+                player.Play(savedClip);
+            player.AnimationTime = savedTime;
+            player.IsAnimating = savedAnimating;
+            for (int n = 0; n < gltfNodes.Count; n++)
+            {
+                var node = gltfNodes[n];
+                node.Translation = savedTranslation[n];
+                node.Rotation = savedRotation[n];
+                node.Scale = savedScale[n];
+                node.Weights = savedWeights[n];
+            }
+            player.UpdateAllNodeTransforms(gltfNodes);
+        }
+
+        return result;
+
+        void Accumulate(Season.Rendering.Bounds3D box)
+        {
+            if (!hasRest) { result = box; hasRest = true; }
+            else result = Season.Rendering.Bounds3D.Union(result, box);
+        }
+
+        static Season.Rendering.Bounds3D BoxOf(System.Numerics.Vector3[] positions)
+        {
+            var min = positions[0];
+            var max = min;
+            for (int i = 1; i < positions.Length; i++)
+            {
+                min = System.Numerics.Vector3.Min(min, positions[i]);
+                max = System.Numerics.Vector3.Max(max, positions[i]);
+            }
+            return Season.Rendering.Bounds3D.FromMinMax(min, max);
+        }
+    }
+
+    /// <summary>
+    /// Sample times for one clip: every keyframe of every channel (where piecewise-linear tracks reach their extremes) plus a
+    /// <see cref="ClipBoundsSampleRate"/> grid over the duration for the spline and slerp arcs between them, sorted, deduplicated,
+    /// and thinned evenly down to <see cref="ClipBoundsMaxSamples"/>.
+    /// </summary>
+    static void CollectClipSampleTimes(GLTFAnimation animation, List<float> times)
+    {
+        times.Clear();
+        float duration = 0f;
+        foreach (var channel in animation.Channels)
+        {
+            var inputs = channel.Sampler?.Inputs;
+            if (inputs == null)
+                continue;
+            foreach (float t in inputs)
+            {
+                times.Add(t);
+                if (t > duration)
+                    duration = t;
+            }
+        }
+
+        int steps = (int)MathF.Ceiling(duration * ClipBoundsSampleRate);
+        for (int s = 0; s <= steps; s++)
+            times.Add(steps == 0 ? 0f : duration * s / steps);
+
+        times.Sort();
+        int write = 0;
+        for (int i = 0; i < times.Count; i++)
+        {
+            if (write > 0 && times[i] - times[write - 1] <= 1e-5f)
+                continue;
+            times[write++] = times[i];
+        }
+        times.RemoveRange(write, times.Count - write);
+
+        if (times.Count > ClipBoundsMaxSamples)
+        {
+            // Keep both ends and spread the rest evenly; the dropped samples are the dense ones, whose neighbours bound them closely.
+            var thinned = new List<float>(ClipBoundsMaxSamples);
+            for (int s = 0; s < ClipBoundsMaxSamples; s++)
+                thinned.Add(times[(int)((long)s * (times.Count - 1) / (ClipBoundsMaxSamples - 1))]);
+            times.Clear();
+            times.AddRange(thinned);
+        }
+    }
+
     public void StopAnimation()
     {
         _animationPlayer.Stop();

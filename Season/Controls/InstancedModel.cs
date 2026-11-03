@@ -37,6 +37,22 @@ public class InstancedModel : InstancedMesh3DBase
 
     protected override bool HasContent => !string.IsNullOrEmpty(ModelName);
 
+    Bounds3D _templateCullBounds;
+
+    /// <summary>
+    /// A7: model-space box the GPU instance cull tests against each instance's root world - <see cref="InstancedMesh3DBase.TemplateLocalBounds"/>
+    /// united with every pose the clips reach (see <c>GltfAsset.ComputeClipUnionBounds</c>). It is kept apart from the template box
+    /// because the two decide different things: the template box gates whole-batch submission and picking, where a slightly tight
+    /// box costs nothing visible, while this one removes individual instances, where a limb outside it is a limb that vanishes.
+    /// Filled once by each backend's LoadInstancedModel; until then (or for an asset without clips or pick meshes) it reads as the
+    /// template box, so a cull that runs before loading finishes never tests a zero box and drops everything.
+    /// </summary>
+    internal Bounds3D TemplateCullBounds
+    {
+        get => _templateCullBounds.Extents == Vector3.Zero ? TemplateLocalBounds : _templateCullBounds;
+        set => _templateCullBounds = value;
+    }
+
     public override async Task<bool> Load()
     {
         await Graphics.Instance.LoadInstancedModel(this);

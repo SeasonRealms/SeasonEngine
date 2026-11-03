@@ -429,6 +429,19 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
         return _primitiveInstanceStreams[index];
     }
 
+    /// <summary>
+    /// A7: every opaque primitive draws its own instance stream (node world × instance world, plus its own morph weights), so gather
+    /// materializes one reordered stream per opaque primitive. The visibility decision itself is made once per instance from the
+    /// root instance worlds in the base <see cref="MTLInstancedPrimitiveGroup._instanceData"/> against the model-space clip-union box.
+    /// The previous-frame side of each stream (buffer 9) needs no reordering: the VS indexes it by the decoded original instance.
+    /// </summary>
+    protected override bool CullPerPrimitiveStreams => true;
+
+    protected override ReadOnlySpan<InstanceTransformData> GetCullDrawStream(int stream)
+        => (uint)stream < (uint)_opaquePrimitives.Count && GetPrimitiveInstanceStream(_opaquePrimitives[stream]) is { } s
+            ? s.Data
+            : default;
+
     void SyncInstancedSkinningMaterialParams()
     {
         for (int i = 0; i < _primitives.Count; i++)
@@ -550,6 +563,12 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
         EnsurePrimitiveInstanceCapacity(_instanceCount);
         EnsureInstanceBoneCapacity((uint)Math.Max(_instanceCount, 1));
 
+        // A7 cull input: one root instance world per enabled instance, in write order. The per-primitive streams below hold
+        // "node world × instance world", which differs per primitive, so none of them can stand in for the instance as a whole;
+        // the cull box (model.TemplateCullBounds) is in the same model space as this root world.
+        if (_instanceData.Length != _instanceCount)
+            _instanceData = new InstanceTransformData[_instanceCount];
+
         bool hasAnimation = _asset._animations.Count > 0;
         bool hasSkin = _skins.Count > 0;
         float deltaTime = Math.Max(time, 0f);
@@ -564,6 +583,7 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
             // Unified positioning contract:
             // converge on BuildInstanceMatrix using the anchor pivot described by InstancedMesh3DBase.
             var instanceWorld = model.BuildInstanceMatrix(instance);
+            _instanceData[writeIndex] = InstanceTransformData.FromWorld(instanceWorld);
             RestoreNodesToRestPose();
 
             if (hasAnimation)
@@ -692,6 +712,12 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
             stream?.FlipAndUpload(_instanceCount);
         }
 
+        // A7: the box must be in the root instance's model space and cover every clip pose, because the kernel culls the whole
+        // instance with it once and every primitive stream only replays that decision. The cull-side uploads themselves wait for
+        // PrepareCullInputs (a blit encoder cannot be opened while a render encoder may still be open during Update).
+        SetCullLocalBounds(model.TemplateCullBounds);
+        UpdateCullUpload(model);
+
         int fi = Device.FrameIndex;
         var matrices = new MatrixBuffer
         {
@@ -725,12 +751,32 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
         // on cold slots using the per-joint Bh[3][3] == 0 sentinel.
         var prevInstanceBoneBuffer = GetInstanceBoneBuffer(PrevFrameIndex);
 
+        // A7 main view: each opaque primitive reads the main-view segment of its own reordered stream, with the instance count from
+        // the args entry (MainViewSlot, i). The bone / prev-bone / prev-instance buffers stay indexed by the original instance (bone
+        // offset 0): the VS recovers it from the tag gather writes into each record, so skinned and morphing models need nothing extra.
+        // Fade stays direct for the same reason as the base class (per-instance back-to-front splitting).
         for (int i = 0; i < _opaquePrimitives.Count; i++)
         {
             var primitive = _opaquePrimitives[i];
             var stream = GetPrimitiveInstanceStream(primitive);
             if (stream == null || stream.Buffer == null)
                 continue;
+
+            if (!forceFadeByAlpha && TryGetMainViewSegment(i, out var sortedBuffer, out nuint segmentOffset, out var argsBuffer))
+            {
+                Pipeline.SetPipeline(enc, PipelineMode.Opaque, primitive.DoubleSided);
+                Pipeline.DrawPrimitive(enc, primitive, primitive.VertexBuffer, primitive.IndexBuffer,
+                    primitive.MatrixBuffers[fi], primitive.MaterialBuffers[fi],
+                    LightConstantBuffers[fi], IdentityBoneBuffers[fi], primitive.MorphDeltasBuffer ?? morphFallback, instanceBoneBuffer,
+                    MTLPrimitiveType.Triangle, (nuint)primitive.Indices.Length,
+                    primitive.Use32BitIndices ? MTLIndexType.UInt32 : MTLIndexType.UInt16, 0,
+                    sortedBuffer, segmentOffset, 0, 0,
+                    stream.PrevBuffer, prevInstanceBoneBuffer,
+                    indirectBuffer: argsBuffer,
+                    indirectOffset: Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i));
+                Season.Rendering.InstanceCull.MainViewDraws++;
+                continue;
+            }
 
             Pipeline.SetPipeline(enc, forceFadeByAlpha ? PipelineMode.Fade : PipelineMode.Opaque, primitive.DoubleSided);
             Pipeline.DrawPrimitive(enc, primitive, primitive.VertexBuffer, primitive.IndexBuffer,
@@ -839,6 +885,21 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
             var stream = GetPrimitiveInstanceStream(primitive);
             if (stream == null || stream.Buffer == null)
                 continue;
+
+            // A7: this slot's segment of primitive i's own reordered stream, instance count from args (slot, i). Decided per
+            // primitive, but every stream is checked by the same PrepareCullDraw, so in practice the whole group goes one way.
+            if (TryGetShadowSegment(i, out var sortedBuffer, out nuint instanceOffset, out var argsBuffer, out int slot))
+            {
+                Pipeline.DrawShadowPrimitiveIndirect(enc, primitive, primitive.VertexBuffer, primitive.IndexBuffer,
+                    primitive.MatrixBuffers[fi], primitive.MaterialBuffers[fi], IdentityBoneBuffers[fi],
+                    primitive.MorphDeltasBuffer ?? morphFallback, instanceBoneBuffer,
+                    primitive.Use32BitIndices ? MTLIndexType.UInt32 : MTLIndexType.UInt16,
+                    sortedBuffer, instanceOffset, argsBuffer,
+                    Season.Rendering.InstanceCull.ArgsOffset(slot, i),
+                    bindMaterial: !shareMaterial || !materialBound);
+                materialBound = true;
+                continue;
+            }
 
             Pipeline.DrawShadowPrimitive(enc, primitive, primitive.VertexBuffer, primitive.IndexBuffer,
                 primitive.MatrixBuffers[fi], primitive.MaterialBuffers[fi], IdentityBoneBuffers[fi],

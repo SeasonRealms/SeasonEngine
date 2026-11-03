@@ -60,6 +60,9 @@ internal struct MTLSceneDrawCommand : ISceneDrawCommand
     internal nuint InstanceBufferOffset;
     internal nuint InstanceBoneOffset;
     internal nuint PrevBoneOffset;
+    // A7 main view: the GPU-written args replace IndexCount/InstanceCount. Owned by the instanced group, which outlives the frame.
+    internal IMTLBuffer? IndirectArgs;
+    internal nuint IndirectOffset;
 
     // -- Sprite quad: no IB, six non-indexed vertices
     internal IMTLBuffer? QuadVertex;
@@ -104,7 +107,8 @@ internal struct MTLSceneDrawCommand : ISceneDrawCommand
             case MTLSceneDrawKind.Primitive:
                 Pipeline.DrawPrimitive(enc, Primitive!, Vertex!, IndexBuffer!, Matrix!, Material!, Light!, Bones!,
                     Morph!, InstanceBones!, MTLPrimitiveType.Triangle, IndexCount, IndexKind, IndexBufferOffset,
-                    Instances, InstanceBufferOffset, InstanceCount, InstanceBoneOffset, PrevInstances, PrevBones, PrevBoneOffset, View);
+                    Instances, InstanceBufferOffset, InstanceCount, InstanceBoneOffset, PrevInstances, PrevBones, PrevBoneOffset, View,
+                    IndirectArgs, IndirectOffset);
                 break;
 
             case MTLSceneDrawKind.Quad:
@@ -266,7 +270,8 @@ internal sealed class MTLSceneDrawCollection
         IMTLBuffer matrix, IMTLBuffer material, IMTLBuffer light, IMTLBuffer bones, IMTLBuffer morph,
         IMTLBuffer instanceBones, MTLIndexType indexKind, nuint indexCount, nuint indexBufferOffset,
         IMTLBuffer? instances, nuint instanceBufferOffset, nuint instanceCount, nuint instanceBoneOffset,
-        IMTLBuffer? prevInstances, IMTLBuffer? prevBones, nuint prevBoneOffset, IMTLBuffer view)
+        IMTLBuffer? prevInstances, IMTLBuffer? prevBones, nuint prevBoneOffset, IMTLBuffer view,
+        IMTLBuffer? indirectArgs = null, nuint indirectOffset = 0)
     {
         if (indexCount == 0) return;
         var draw = State;
@@ -291,6 +296,8 @@ internal sealed class MTLSceneDrawCollection
         draw.InstanceBufferOffset = instanceBufferOffset;
         draw.InstanceBoneOffset = instanceBoneOffset;
         draw.PrevBoneOffset = prevBoneOffset;
+        draw.IndirectArgs = indirectArgs;
+        draw.IndirectOffset = indirectOffset;
         draw.Albedo = primitive.BaseColorTexture;
         draw.Normal = primitive.NormalTexture;
         draw.Metallic = primitive.MetallicRoughnessTexture;

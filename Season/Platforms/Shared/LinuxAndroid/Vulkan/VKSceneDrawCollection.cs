@@ -47,6 +47,12 @@ internal unsafe struct VKSceneDrawCommand : ISceneDrawCommand
     internal uint IndexCount;
     internal uint InstanceCount;
     internal uint FirstInstance;
+    // A7 main view: the GPU-written args replace IndexCount/InstanceCount/FirstInstance, and InstanceOffset selects the
+    // main-view segment of the reordered stream. Only handles are stored, as for every other field: the args and the
+    // stream belong to the group pinned through RetainOwner.
+    internal VkBuffer IndirectArgs;
+    internal ulong IndirectOffset;
+    internal ulong InstanceOffset;
 
     public void Draw()
     {
@@ -59,7 +65,8 @@ internal unsafe struct VKSceneDrawCommand : ISceneDrawCommand
                 // Texture readiness and descriptor refresh are already done in the collection phase:
                 // those operations include layout transitions and can only be called outside the render pass.
                 Pipeline.DrawPrimitiveCore(cmd, Primitive!, Vertex, Index, Set, IndexCount,
-                    Instances, InstanceCount, FirstInstance, prepared: true, View);
+                    Instances, InstanceCount, FirstInstance, prepared: true, View,
+                    IndirectArgs, IndirectOffset, InstanceOffset);
                 break;
 
             case VKSceneDrawKind.Quad:
@@ -281,9 +288,11 @@ internal sealed unsafe class VKSceneDrawCollection
 
     internal void CapturePrimitive(CommandBuffer cmd, PrimitiveData primitive, VkBuffer vertex, VkBuffer index,
         DescriptorSet set, uint indexCount, VkBuffer instanceBuffer, uint instanceCount, uint firstInstance,
-        float sortDepth)
+        float sortDepth, VkBuffer indirectArgs = default, ulong indirectOffset = 0, ulong instanceOffset = 0)
     {
-        if (indexCount == 0 || instanceCount == 0) return;
+        // An indirect draw's instance count is only known on the GPU, so a zero CPU count does not mean an empty draw.
+        bool indirect = indirectArgs.Handle != 0;
+        if (indexCount == 0 || (instanceCount == 0 && !indirect)) return;
 
         // Texture readiness and the refresh of bindings 16-20 must be done outside the pass, see the notes on PreparePrimitive.
         Pipeline.PreparePrimitive(cmd, primitive, set);
@@ -301,6 +310,9 @@ internal sealed unsafe class VKSceneDrawCollection
         draw.Instances = instanceBuffer;
         draw.IndexKind = primitive.Use32BitIndices ? IndexType.Uint32 : IndexType.Uint16;
         draw.IndexCount = indexCount;
+        draw.IndirectArgs = indirectArgs;
+        draw.IndirectOffset = indirectOffset;
+        draw.InstanceOffset = instanceOffset;
 
         if (!float.IsNaN(sortDepth))
         {
@@ -313,9 +325,11 @@ internal sealed unsafe class VKSceneDrawCollection
 
         // Instance split: the transparent phase must draw per instance so that the two instances in front and behind blend colors correctly;
         // the opaque phase's whole-batch instanced draw stays as is (drawing the same instance repeatedly is meaningless).
+        // An indirect draw is never split: its instances are only known on the GPU. The caller keeps it opaque, so the
+        // depth below is the same primitive-level depth the direct opaque draw gets and the opaque queue order is unchanged.
         int frameIndex = (int)Device.FrameIndex;
         var world = PrimitiveWorld(primitive, frameIndex);
-        bool split = instanceBuffer.Handle != 0 && draw.Mode != PipelineMode.Opaque;
+        bool split = instanceBuffer.Handle != 0 && draw.Mode != PipelineMode.Opaque && !indirect;
         uint slices = split ? instanceCount : 1;
         for (uint i = 0; i < slices; i++)
         {

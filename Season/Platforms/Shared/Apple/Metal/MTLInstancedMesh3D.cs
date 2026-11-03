@@ -243,7 +243,7 @@ internal sealed class MTLInstancedMesh3D : MTLInstancedPrimitiveGroup
         // A7: the cull input is bit-for-bit identical to the IA instance stream, so this array is reused directly without storing an extra copy.
         // Only this class wires it up: MTLInstancedModel's instance stream is split per surface and does not go through the base class _instanceBuffer,
         // so that group's _cullSource stays null, the shared layer early-returns, and it safely falls back to a full-batch CPU cull.
-        UpdateCullUpload();
+        UpdateCullUpload(mesh);
 
         int fi = Device.FrameIndex;
         var matrices = new MatrixBuffer

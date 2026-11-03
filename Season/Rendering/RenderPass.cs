@@ -744,7 +744,8 @@ public static class FrameSchedule
 
     /// <summary>
     /// Releases the per-view transients the shared pass chain allocated on a view's behalf: the water refraction
-    /// snapshot and the water / waterfall / river / decal frame blocks. Idempotent, so every owner can call it on the way out.
+    /// snapshot, the water / waterfall / river / decal frame blocks, and every particle transient this view holds on
+    /// behalf of the submitters that drew into it. Idempotent, so every owner can call it on the way out.
     /// </summary>
     internal static void ReleaseViewTransients(ViewTargets targets)
     {
@@ -757,6 +758,7 @@ public static class FrameSchedule
         targets.RiverFrameBuffer = null;
         targets.DecalFrameBuffer?.Dispose();
         targets.DecalFrameBuffer = null;
+        targets.ReleaseParticleBuffers();
     }
 
     /// <summary>

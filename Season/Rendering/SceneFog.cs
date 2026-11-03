@@ -111,25 +111,65 @@ public sealed class SceneFog
     {
         FogMath.Finite(position);
         if (!Enabled) return (0f, Vector3.Zero);
-        float density = Extinction * MathF.Exp(-HeightFalloff * Math.Max(position.Y - BaseHeight, 0f));
-        density *= FogMath.DensityNoise(position - WindOffset, NoiseScale, NoiseAmount);
-        var scattering = Albedo * density;
+        var (density, scattering) = GlobalMedium(position);
         float exclusion = 1f;
         for (int i = 0; i < _volumes.Count; i++)
         {
             var volume = _volumes[i];
             if (!volume.Enabled) continue;
-            float weight = volume.WeightAt(position);
-            if (volume.Mode == FogVolumeMode.Exclude)
-            {
-                exclusion *= 1f - weight;
-                continue;
-            }
-            float local = volume.Extinction * weight
-                * FogMath.DensityNoise(position - WindOffset, volume.NoiseScale, volume.NoiseAmount);
-            density += local;
-            scattering += volume.Albedo * local;
+            Accumulate(volume, volume.WeightAt(position), position, ref density, ref scattering, ref exclusion);
         }
         return (density * exclusion, scattering * exclusion);
+    }
+
+    /// <summary>
+    /// CPU reference for one injected froxel slice, matching the injection shader. The global medium varies smoothly, so
+    /// it is sampled at the slice centre; a local volume has a hard boundary, and a slice near the far end of the depth
+    /// range is several metres thick - more than a thin patch is tall - so one centre sample there makes the patch
+    /// alternate between hit and missed as the camera moves. Each volume is therefore intersected with the ray and its
+    /// weight scaled by the fraction of the slice it fills, read at the middle of that span.
+    /// </summary>
+    /// <param name="origin">Camera position.</param>
+    /// <param name="ray">World-space ray per meter of forward depth, the same ray the froxels are built from.</param>
+    /// <param name="start">Forward depth where the slice starts.</param>
+    /// <param name="end">Forward depth where the slice ends.</param>
+    /// <param name="center">Forward depth of the slice centre, where the global medium is sampled.</param>
+    public (float Extinction, Vector3 Scattering) SampleSlice(Vector3 origin, Vector3 ray, float start, float end, float center)
+    {
+        FogMath.Finite(origin); FogMath.Finite(ray); FogMath.Finite(start);
+        FogMath.Finite(end); FogMath.Finite(center);
+        if (!(end > start)) throw new ArgumentOutOfRangeException(nameof(end), "A fog slice needs a positive depth range.");
+        if (!Enabled) return (0f, Vector3.Zero);
+        var (density, scattering) = GlobalMedium(origin + ray * center);
+        float exclusion = 1f;
+        for (int i = 0; i < _volumes.Count; i++)
+        {
+            var volume = _volumes[i];
+            if (!volume.Enabled) continue;
+            if (!volume.SliceCoverage(origin, ray, start, end, out float coverage, out var position)) continue;
+            Accumulate(volume, volume.WeightAt(position) * coverage, position, ref density, ref scattering, ref exclusion);
+        }
+        return (density * exclusion, scattering * exclusion);
+    }
+
+    (float Density, Vector3 Scattering) GlobalMedium(Vector3 position)
+    {
+        float density = Extinction * MathF.Exp(-HeightFalloff * Math.Max(position.Y - BaseHeight, 0f));
+        density *= FogMath.DensityNoise(position - WindOffset, NoiseScale, NoiseAmount);
+        return (density, Albedo * density);
+    }
+
+    void Accumulate(FogVolume volume, float weight, Vector3 position,
+        ref float density, ref Vector3 scattering, ref float exclusion)
+    {
+        if (volume.Mode == FogVolumeMode.Exclude)
+        {
+            exclusion *= 1f - weight;
+            return;
+        }
+        float local = volume.Extinction * weight
+            * FogMath.DensityNoise(position - WindOffset, volume.NoiseScale, volume.NoiseAmount);
+        density += local;
+        scattering += volume.Albedo * local;
     }
 }

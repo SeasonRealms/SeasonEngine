@@ -6,11 +6,12 @@ namespace Season.Rendering;
 
 public sealed partial class InstanceCullEffect
 {
-    // A7's four D3D12 kernels. The [numthreads] of reset and cull must equal the C# values
-    // InstanceCull.ResetThreads(64) and InstanceCull.CullGroupSize(64), and MAX_PRIMITIVES must equal
-    // InstanceCull.MaxPrimitives(16): these two sets of numbers are the entire basis for "fixed-stride addressing", and any drift
-    // shows up as an arg-table misalignment rather than a compile error. gather's [numthreads] is likewise 64, but its group count is given in the X/Y dimensions,
-    // and finalize is fixed single-threaded -- it only reads 4 uints and reduces them into a dispatch size, with nothing to parallelize.
+    // A7's four D3D12 kernels. The [numthreads] of reset and cull must equal the C# value
+    // InstanceCull.CullGroupSize(64), and MAX_PRIMITIVES must equal InstanceCull.MaxPrimitives(16): these two numbers are the entire
+    // basis for "fixed-stride addressing", and any drift shows up as an arg-table misalignment rather than a compile error. reset covers
+    // InstanceCull.ResetThreads(80) entries in InstanceCull.ResetGroups(2) groups; the threads past the last slot exit on the slot test.
+    // gather's [numthreads] is likewise 64, but its group count is given in the X/Y dimensions,
+    // and finalize is fixed single-threaded -- it only reads 5 uints and reduces them into a dispatch size, with nothing to parallelize.
     //
     // Parameters always go through a cbuffer + struct instance rather than SM5.1's ConstantBuffer<T> template: the DX12 backend compiles cs_5_0 with fxc,
     // where the template form reports "unrecognized identifier 'ConstantBuffer'", and all four kernels would fail registration together,
@@ -161,7 +162,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 // Why it is needed: the index table is compressed, so the CPU has no way to know how many are visible, and gather can only dispatch by the capacity upper bound.
 // This step replaces the "upper bound" with the "actual maximum visible count", letting gather skip that batch of threads that are bound to exit early.
 //
-// Single-threaded is deliberate. The slot count is at most 4; reading four uints serially is far below the cost of opening a workgroup and doing a reduction with synchronization,
+// Single-threaded is deliberate. The slot count is at most 5; reading five uints serially is far below the cost of opening a workgroup and doing a reduction with synchronization,
 // and it avoids writing a threadsync dialect per backend -- exactly that kind of duplication is the source of drift.
 
 struct FinalizeParams
@@ -201,6 +202,18 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 // This stage is necessary, not gratuitous: IA's instance stepping is linear and cannot be indexed by original index,
 // and having the vertex stage index the table itself would need two new SRVs -- the D3D12 root signature has only 3 DWORDs left, which cannot afford them.
 // The cost is writing "visible count" extra 80-byte records per frame, all done entirely on the GPU, producing no CPU upload or readback.
+//
+// Every slot in the tag mask additionally overwrites M14 of each record with float(original index + 1). Indirect draws are compressed, so
+// SV_InstanceID is the position in the visible list, while motion vectors (t9/t10), per-instance bone palettes (t6/t8) and per-instance
+// glyph tables are laid out by original index; the vertex stage decodes the tag back into that index and restores M14 to 0. M14 is free to
+// carry it: every instance transform is affine, so M14 is exactly 0 in the source stream and an untagged record decodes as "no remap".
+// The index is stored as a float rather than asuint: a small integer bit pattern is a denormal, which a vertex fetch is allowed to flush to
+// zero, while float is exact up to 2^24.
+// The shadow slots are tagged too, not only the main view: the shadow vertex stage is the same source under SHADOW_PASS and decodes before
+// branching, so a tagged shadow record yields the very world matrix an untagged one did, and only then can a skinned group read its own
+// palette from a compacted shadow segment. A mask rather than a single slot keeps "which slots are tagged" a caller decision.
+// Several gathers may run against one visible/args pair (one per instance stream of a group): the fan-out only reads primitive 0, which no
+// gather writes, so repeating it rewrites the same values.
 
 #define MAX_PRIMITIVES 16
 #define WORLD_STRIDE 80
@@ -211,7 +224,7 @@ struct GatherParams
     uint capacity;
     uint primCount;
     uint slotCount;
-    uint pad;
+    uint tagMask;
 };
 
 cbuffer GatherParamsCB : register(b0)
@@ -252,6 +265,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     uint dst = ((slot * p.capacity) + k) * WORLD_STRIDE;
     for (uint o = 0; o < WORLD_STRIDE; o += 16)
         sortedWorlds.Store4(dst + o, sourceWorlds.Load4(src + o));
+    if (((p.tagMask >> slot) & 1u) != 0u)
+        sortedWorlds.Store(dst + 12, asuint(float(vis + 1)));
 }
 """;
 }

@@ -3621,8 +3621,22 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         CopyMatrixTransposed(Matrix4x4.Identity, matrixData, 0);
         PrepareSceneDraw();
 
+        // A7 main view: the opaque body reads the culled, compacted main-view segment and takes its instance count from the
+        // indirect args. Fade stays direct: a fading mesh is drawn in a non-opaque mode, which the scene collector splits per
+        // instance for back-to-front order - something a GPU-sized draw cannot be - and it is about to change visibility anyway.
+        // Blend surfaces have no args record and are never in the mask, so they keep their CPU-sorted per-instance draws.
+        string mainSortedId = string.Empty, mainArgsId = string.Empty;
+        long mainVertexOffset = 0;
+        int mainSlotBytes = 0, mainPrimitiveMask = 0;
+        bool mainIndirect = wgpuMesh.MeshAlpha >= 1f
+            && wgpuMesh.TryGetMainViewDrawHandles(mesh, out mainSortedId, out mainArgsId,
+                out mainVertexOffset, out mainSlotBytes, out mainPrimitiveMask);
+        int mainPrimitive = 0;
+        int surfaceIndex = -1;
+
         foreach (var surface in mesh.Surfaces)
         {
+            surfaceIndex++;
             if (surface.Vertices == null || surface.Indices == null || surface.Vertices.Length == 0)
                 continue;
 
@@ -3658,7 +3672,18 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             // frame's world, yielding camera-motion velocity only.
             WritePrevMatrices(uniformData);
 
-            if (blendSurface && !_sceneCollecting)
+            // The args record order is the table's order, so the counter only advances on masked surfaces. The prev stream goes
+            // down whole: the VS indexes it by the original instance decoded from the reordered row, not by the compacted one.
+            if (mainIndirect && (mainPrimitiveMask & (1 << surfaceIndex)) != 0)
+            {
+                _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3DIndirect",
+                    cache.CacheKey, uniformData, mainSortedId, mainVertexOffset, (long)mainSlotBytes, mainArgsId,
+                    (long)Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, mainPrimitive),
+                    prevInstanceBytes);
+                mainPrimitive++;
+                Season.Rendering.InstanceCull.MainViewDraws++;
+            }
+            else if (blendSurface && !_sceneCollecting)
             {
                 var orderedInstances = Enumerable.Range(0, wgpuMesh.EnabledInstanceCount)
                     .OrderByDescending(index => ComputeTransparentDepth(wgpuMesh.InstanceWorlds[index], cache.LocalBoundsCenter));
@@ -3730,6 +3755,10 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         var wgpuInstancedModel = new WGPUInstancedModel(model.ModelName);
         wgpuInstancedModel.Load(template, model);
 
+        // A7: replay the clips on the instance's own runtime asset before it is published through model.Asset (picking reads
+        // its node tree), since sampling poses it; nothing else holds it yet. The shared template's player is never touched.
+        var cullBounds = wgpuInstancedModel.Asset.ComputeClipUnionBounds(template.Asset.Model.LocalBounds);
+
         // v2 picking: inject the instanced GltfAsset. The cloned node tree / animation / bone palette comes
         // from the same source as instance rendering, matching the runtime-asset injection model on VK/Metal/DX.
         // The template Asset's player is never evaluated, and narrow-phase skinning would otherwise skip
@@ -3742,6 +3771,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         // Unified transform convention: likewise copy back the raw bounds
         // for instance anchors / per-axis scaling before animation expansion.
         model.TemplateLocalBoundsRaw = template.Asset.Model.LocalBoundsRaw;
+        model.TemplateCullBounds = cullBounds;
         model.AnimationNames = wgpuInstancedModel.GetAnimationNames();
         model.AnimationClipCount = model.AnimationNames.Count;
 
@@ -3788,6 +3818,15 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         PrepareSceneDraw();
         var opaquePrimitives = new List<WGPUPrimitiveData>();
         var transparentPrimitives = new List<WGPUPrimitiveData>();
+
+        // A7 main view: taken before the loop below uploads anything, because the records were built from the primitives that were
+        // already uploaded when the table went up; each primitive is then resolved on its own through TryGetCullStream, so one that
+        // uploads this frame just has no record yet and stays direct. Fade stays direct for the same reason as InstancedMesh3D.
+        string mainArgsId = string.Empty;
+        long mainVertexOffset = 0;
+        int mainSlotBytes = 0;
+        bool mainIndirect = wgpuModel.ModelAlpha >= 1f
+            && wgpuModel.TryGetMainViewDrawHandles(out mainArgsId, out mainVertexOffset, out mainSlotBytes);
 
         foreach (var prim in wgpuModel.Primitives)
         {
@@ -3838,6 +3877,24 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             // 2-3 Contract Clause 8(d): instanced models keep PrevWorld all-zero, and per-instance history
             // travels through binding 14.
             WritePrevMatrices(uniformData);
+
+            // A7 main view: the primitive's own reordered stream at the main-view segment, with its args record. The prev stream and the
+            // bone palette go down whole: the VS indexes both by the original instance decoded from the reordered row. A primitive whose
+            // own base-color alpha is below one is drawn by JS in a fade mode, which the indirect entry refuses (a GPU-sized draw cannot be
+            // split back to front), so it keeps the direct draw even inside an opaque model; collection also hands transparent
+            // primitives through this loop, and those have no record.
+            if (mainIndirect && !prim.IsTransparent
+                && prim.OriginalBaseColorAlpha * modelAlpha >= 0.999f
+                && wgpuModel.TryGetCullStream(prim, out var mainSortedId, out int mainEntry))
+            {
+                _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3DIndirect",
+                    prim.CacheKey, uniformData, mainSortedId, mainVertexOffset, (long)mainSlotBytes, mainArgsId,
+                    (long)Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, mainEntry),
+                    prevInstanceBytes, wgpuModel.SkinKey);
+                Season.Rendering.InstanceCull.MainViewDraws++;
+                continue;
+            }
+
             _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3D", prim.CacheKey, uniformData, instanceBytes, wgpuModel.EnabledInstanceCount, wgpuModel.SkinKey, prevInstanceBytes);
         }
 
@@ -3975,11 +4032,15 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public void DisposeInstancedModel(InstancedModel model)
     {
         var key = (model.ModelName, model.ID);
+        WGPUInstancedModel? dropped = null;
         lock (DictionaryInstancedModel)
         {
-            if (DictionaryInstancedModel.ContainsKey(key))
+            if (DictionaryInstancedModel.TryGetValue(key, out dropped))
                 DictionaryInstancedModel.Remove(key);
         }
+
+        // A7: leave the shared cull registry, which would otherwise keep dispatching for dead JS handles.
+        dropped?.Dispose();
 
         model.Ready = false;
     }
@@ -4157,6 +4218,18 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         if (isSkinned && wgpuModel.BoneMatricesBytes.Length > 0)
             WebGPUInterop.UploadSkinnedBones(wgpuModel.SkinKey, wgpuModel.BoneMatricesBytes);
 
+        // A7: each primitive with a record draws its own reordered stream at this slot's segment; the rest keep the direct draw. Unlike
+        // the mesh this needs no all-or-nothing fallback, because a record and its stream are both addressed by the primitive's own entry,
+        // so mixing the two paths inside one model cannot shift anyone else's range. Skinned primitives come along: the shadow VS decodes
+        // the original instance from the reordered row and addresses the palette with it, exactly like the main view.
+        int cullSlot = Season.Rendering.CascadedShadow.ActiveSlot;
+        string cullArgsId = string.Empty;
+        int cullCapacity = 0;
+        bool shadowIndirect = cullSlot >= 0 && cullSlot < Season.Rendering.InstanceCull.MaxSlots
+            && wgpuModel.TryGetCullDrawHandles(out cullArgsId, out cullCapacity);
+        long cullVertexOffset = shadowIndirect ? (long)cullSlot * cullCapacity * Season.Rendering.InstanceCull.WorldStride : 0;
+        int cullSlotBytes = cullCapacity * (int)Season.Rendering.InstanceCull.WorldStride;
+
         foreach (var prim in wgpuModel.Primitives)
         {
             if (prim.VertexData == null || prim.IndexData == null || prim.VertexData.Length == 0)
@@ -4170,6 +4243,14 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
                 continue;
 
             var uniformData = BuildModelPrimitiveUniform(matrixData, prim, modelAlpha, isSkinned);
+            if (shadowIndirect && wgpuModel.TryGetCullStream(prim, out var cullSortedId, out int cullEntry))
+            {
+                _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3DIndirect",
+                    prim.CacheKey, uniformData, cullSortedId, cullVertexOffset, (long)cullSlotBytes, cullArgsId,
+                    (long)Season.Rendering.InstanceCull.ArgsOffset(cullSlot, cullEntry), null, wgpuModel.SkinKey);
+                continue;
+            }
+
             _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3D", prim.CacheKey, uniformData, instanceBytes, wgpuModel.EnabledInstanceCount, wgpuModel.SkinKey);
         }
     }

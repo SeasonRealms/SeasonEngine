@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 // https://github.com/SeasonRealms/SeasonEngine
 
+using Season.Rendering.Effects;
+
 namespace Engine.Panels;
 
 /// <summary>
@@ -33,6 +35,16 @@ namespace Engine.Panels;
 /// centimetres inside the shoulder. Everything between that intersection and ±hw lies under the face and is removed by
 /// the ribbon's software depth test, so the visible shoreline is the intersection of the water plane with the terrain -
 /// not the edge of a polygon. That is what keeps it from reading as a decal with a hard cut.</para>
+///
+/// <para><b>Both ends of the course are cut, per row.</b> Downstream the water runs a few metres past the coast line so
+/// the mouth's diagonal cut lands out over the sea, while the bed and the levee stop on the line itself; the estuary's
+/// spray covers the seam - it used to carry on over the edge as a 3.7 m cascade into the sea. Upstream - the "mouth" of
+/// the first stretch, which starts inside the waterfall pool - the same
+/// cut runs the other way: over the first <see cref="MouthReach"/> metres only the ribbon draws, because the pool's
+/// water is a five centimetre film lying on the very grass the ribbon then lies on, so the bed has nothing to add there
+/// and would only butt a 22 cm step into the pool. The bed starts where that film ends, and the levee grows back to its
+/// full section over <see cref="MouthRamp"/>. Tapering the section matters for a second reason: the pool's rim rocks
+/// stand along the film's edge, and a 66 cm levee running out of the pool would stand up in front of them.</para>
 ///
 /// <para><b>Why this is a <see cref="Mesh3D"/>:</b> the whole shape is authored in world coordinates, so
 /// <see cref="Mesh3DBase.Load"/> establishes the bounding box and <see cref="Load"/> then sets Pos to the anchor, which
@@ -72,43 +84,148 @@ internal sealed class RiverSegment : Mesh3D
     /// <summary>
     /// A row whose water surface is below this is past the shore lip: the bank and bed stop there and only the water
     /// ribbon continues. Two centimetres of slack absorbs the interpolation between the last on-land point and the first
-    /// falling one.
+    /// falling one. The main course never falls - it runs out over the coast at a constant height - so the only thing
+    /// still using the height cut is the south branch, whose tail sinks into the foot of the range, see
+    /// <see cref="BranchCourse"/>; the estuary stretch is cut by the coast line instead, see
+    /// <see cref="RiverSegment.BuildSurface"/>.
     /// </summary>
     const float LandLimit = -0.02f;
 
     // -- Bank pieces (Assets/RiverBank.glb), one pair per DikeSpacing metres. --
 
-    /// <summary>World size of one piece: across the bank, up, and along the flow. Stretched from the asset's own aspect.</summary>
-    const float DikeWidth = 1.55f;
-    const float DikeHeight = 0.86f;
-    const float DikeLength = 4.0f;
+    /// <summary>
+    /// World size of one piece: across the bank, up, and along the flow. Stretched from the asset's own aspect.
+    /// Internal because <see cref="Pond"/> rings its basin with the very same piece, and a rim that did not stand at
+    /// exactly the height and width a river bank does would read as a different material.
+    /// </summary>
+    internal const float DikeWidth = 1.55f;
+    internal const float DikeHeight = 0.86f;
+    internal const float DikeLength = 4.0f;
 
     /// <summary>
     /// Center-to-center spacing along the course, shorter than <see cref="DikeLength"/> on purpose: neighbours overlap, so
     /// the outside of a bend never opens a wedge between two pieces.
     /// </summary>
-    const float DikeSpacing = 3.20f;
+    internal const float DikeSpacing = 3.20f;
 
-    /// <summary>How far a piece is buried, measured from the grass to its anchor (the template-box center).</summary>
-    const float DikeSink = 0.10f;
+    /// <summary>
+    /// How far a piece is buried, measured from the grass to its anchor (the template-box center). Internal because
+    /// <see cref="Pond"/> derives the top of its rim from it: the rim is the top of a piece standing on the grass.
+    /// </summary>
+    internal const float DikeSink = 0.10f;
 
     /// <summary>How far the piece's inner edge sits behind the crest shoulder, i.e. how much it overlaps the levee.</summary>
     const float DikeInset = 0.06f;
 
     /// <summary>
+    /// How far a piece may reach into the other channel's water before it is refused, in meters. Not zero: the search in
+    /// <see cref="BuildDikeSlots"/> steps by <see cref="PinStep"/>, so a piece landing exactly on that waterline would be
+    /// luck rather than rule, and the centimetres it holds back are a gap between two bank ends. Four is small enough that
+    /// the rounded, soil-sided corner of a piece over the waterline still reads as the corner of the bank.
+    /// </summary>
+    const float DikeOverhang = 0.04f;
+
+    /// <summary>
     /// Half-turn (0 or pi) that decides which face of the piece looks at the water. The asset is asymmetric - one long
     /// grass slope against one cut soil face - and which of the two ends up on the water side depends on how it was
     /// modelled, so this is the single knob to turn if a regenerated piece comes back with its cut face to the river.
+    /// <see cref="Pond"/> turns its own pieces by the same number, so the two lines of bank always face the same way.
     /// </summary>
-    const float DikeFacing = 0f;
+    internal const float DikeFacing = 0f;
 
-    // -- The road crossing. --
+    /// <summary>
+    /// Where the island's east edge runs, i.e. where the grass tile stops and the sea begins - the tile is 150 m across
+    /// (see <c>Rocks.CoastHalf</c>), pulled in 15 cm so a piece's foot lands on the grass and not on its last blade. Only
+    /// the stretch that reaches the sea tests against it: bank pieces are dropped one by one where their footprint would
+    /// cross the line (<see cref="AddDikePair"/>), and the bed and the levee stop at the last row before it
+    /// (<see cref="RiverSegment.BuildSurface"/>).
+    /// </summary>
+    const float CoastEdge = 74.85f;
 
-    /// <summary>Half width of the flat apron the levee opens into where the road crosses, measured along the course.</summary>
-    const float FordHalf = 3.0f;
+    // -- Confluences, where the south branch crosses the main course. --
+    //
+    // Both channels stand on their own levee, so a crossing is not two water planes laid over each other: each river's
+    // berm physically crosses the other's channel. Each one therefore opens along its own course where the other passes -
+    // the branch over its last metres before the main channel and its first after, the main course on both its banks.
 
-    /// <summary>Length of the ramp from that apron back to the full levee on each side.</summary>
-    const float FordFeather = 2.0f;
+    /// <summary>
+    /// Half length of the branch's own opening, measured along its course from the end that meets the main channel. Just
+    /// long enough to hold the flat apron under the main channel's water film: the five metres this used to take pulled
+    /// the branch's berms back that far from the crossing and left a bare meadow bowl where the two channels meet.
+    /// </summary>
+    internal const float JunctionHalf = 1.20f;
+
+    /// <summary>
+    /// Length of the ramp from that opening back out to the full branch levee. It ends roughly a metre outside the main
+    /// course's outer toe, so each branch berm rises straight off the main bank and the two levee lines meet in a corner
+    /// rather than stopping in mid-meadow.
+    /// </summary>
+    internal const float JunctionFeather = 1.80f;
+
+    /// <summary>
+    /// Half length of the main course's opening on each bank. The branch's channel is 4.5 m of water plus a 0.35 m inner
+    /// face on each side, so this clears it with about a metre of apron either side for the two waters to read as one.
+    ///
+    /// <para>This shapes the berm only. Where the line of bank pieces stops is a different question with a different
+    /// answer: not this far from the crossing, but wherever a piece's footprint first reaches the branch's water. The two
+    /// courses cross at an angle and both lines of pieces stand a lateral offset away from their own centerline, so that
+    /// point is about a metre short of this on one bank and a metre past it on the opposite one - which is why one fixed
+    /// distance cannot close all four corners. See <see cref="WaterBand"/>.</para>
+    /// </summary>
+    internal const float CrossingHalf = 3.00f;
+
+    /// <summary>
+    /// Length of the ramp from the crossing opening back out to the full levee. Kept near <see cref="JunctionFeather"/>:
+    /// the two ramps face each other across the confluence, and one much longer than the other leaves the wider side's
+    /// bank looking cut back.
+    /// </summary>
+    internal const float CrossingFeather = 1.80f;
+
+    /// <summary>
+    /// Step of the search that places the last pair on each side of an opening, in meters. A piece's inner corner has to
+    /// land on the other channel's waterline, and the spacing walk never lands there, so the search walks outward from the
+    /// opening's edge until a piece fits - this is how finely that landing resolves.
+    /// </summary>
+    const float PinStep = 0.05f;
+
+    /// <summary>
+    /// How far the bed rises at a junction, above the course's usual <see cref="WaterDepth"/>. The branch bed and the main
+    /// bed would otherwise land on the same absolute height and z-fight across the whole crossing; lifting the branch a few
+    /// centimetres keeps the difference a step under the water instead of a shimmer on it. Only the branch lifts - the
+    /// main bed is the lower of the two by construction.
+    /// </summary>
+    internal const float JunctionBedLift = 0.08f;
+
+    // -- The mouth, where the first stretch meets the waterfall pool. --
+
+    /// <summary>
+    /// Arc length from the start of the course that only the ribbon covers. On the main course everything before it
+    /// lies inside the waterfall pool's water film, which the pool already draws, so the bed and the levee begin where
+    /// that film ends; on the branch the same metres are the film lying on the grass at the source. Either way the bed
+    /// would add nothing there and a 22 cm step would show, so it waits.
+    ///
+    /// <para>The pool's film edge measures 1.2 m along the first stretch and its sampled rows land at 1.18 m and
+    /// 2.94 m, so this is the smallest value that still starts the mesh on the edge instead of inside the pool. The
+    /// branch's rows are denser, so it would cut a little earlier there - but the branch is not a mouth at all, see
+    /// <see cref="RiverSegment"/>: it leaves the pond through the opening in the pond's rim, at the same level, and
+    /// keeps that bank.</para>
+    /// </summary>
+    internal const float MouthReach = 1.10f;
+
+    /// <summary>
+    /// Length of the ramp from the flat mouth apron back out to the full levee section. Deliberately shorter than the
+    /// rocks: the pool's rim stands from 0.3 m to 3.3 m along the course, so the levee is already at full height among
+    /// them. The four metres this used to take left the bank visibly cut off two to three metres short of the rim.
+    /// </summary>
+    const float MouthRamp = 1.20f;
+
+    /// <summary>
+    /// Crest height over the water where the channel leaves the pool. Not an opening's drop onto the bed: down here the
+    /// water is only five centimetres above the grass, so a crest at the bed would leave the band's edge hanging in the
+    /// air. Two centimetres of lip instead puts the shoreline back where the rest of the course keeps it - the intersection
+    /// of the water plane with the section - while standing far too low to hide the pool's rim rocks.
+    /// </summary>
+    const float MouthLip = 0.02f;
 
     const int BandCount = 7;
     const int SectionPoints = 8;
@@ -120,6 +237,33 @@ internal sealed class RiverSegment : Mesh3D
     static byte[] bedPixels;
 
     readonly WaterRibbonPoint[] _points;
+
+    /// <summary>
+    /// One place where a stretch opens its levee out because another channel crosses it: arc metres from the stretch's
+    /// first point, the half length of the flat apron, and the ramp back to the full section.
+    /// </summary>
+    internal readonly record struct Opening(float Along, float Half, float Feather);
+
+    // True on a stretch that starts at a source - the waterfall pool on the main course.
+    // Only such a stretch opens its levee out over its first metres, see MouthReach and MouthFactor. The branch does not:
+    // it leaves the pond through the opening in the pond's own rim, which is the bank it should keep, and a mouth lip
+    // there would lay a grass shelf across the outlet instead of meeting the pond's water plain.
+    readonly bool _mouth;
+
+    // Where this stretch opens its levee out; empty on a stretch that no other channel meets.
+    readonly Opening[] _openings;
+
+    // The other route's channel, which this stretch's bank pieces have to stop on rather than cross. Every stretch carries
+    // it, including the ones far from the junction where it never binds.
+    readonly WaterBand _counter;
+
+    // How far this stretch's bed rises inside an opening, see JunctionBedLift. Zero on the main course.
+    readonly float _bedLift;
+
+    // True on the stretch that runs to the island edge: its bank pieces are dropped wherever one's footprint would
+    // cross the coast, see AddDikePair, and its bed and levee stop on the line while the water runs on past it, see
+    // BuildSurface.
+    readonly bool _shore;
 
     // One axis-aligned rectangle per row pair, in author space, for the movement footprint test.
     readonly List<WaterSlab> _slabs = new();
@@ -154,11 +298,40 @@ internal sealed class RiverSegment : Mesh3D
     /// <param name="name">Control name, also the row label in the property panel.</param>
     /// <param name="points">This stretch's control points, shared verbatim with its neighbours at both joints.</param>
     /// <param name="phase">Arc length in meters from the river source to <paramref name="points"/>[0], see <see cref="WaterRibbon.Phase"/>.</param>
+    /// <param name="flowSpeed">
+    /// Current speed in m/s, see <see cref="WaterRibbon.FlowSpeed"/>. Zero draws standing water: the shader samples at
+    /// <c>phase + arc - time * speed</c>, so a speed of zero freezes the pattern, while each point's flow direction keeps
+    /// its other job - it is still the band's lateral axis.
+    /// </param>
     /// <param name="sortOrder">Draw order among ribbons; steady and increasing downstream so the blend order never flips.</param>
-    internal RiverSegment(string name, WaterRibbonPoint[] points, float phase, float sortOrder)
+    /// <param name="mouth">
+    /// Whether this stretch starts in the waterfall pool rather than at the tail of another stretch. Only the first
+    /// stretch of the main course does, and it is the only one whose levee is opened out at its own start.
+    /// </param>
+    /// <param name="openings">
+    /// Where this stretch opens its levee out because another channel crosses it, in arc metres from its first point. Empty
+    /// when nothing does; see <see cref="JunctionHalf"/> and <see cref="CrossingHalf"/> for how wide each opening is.
+    /// </param>
+    /// <param name="counter">
+    /// The other route's water. Every bank piece is tested against it, so the line of pieces on this stretch ends on that
+    /// channel's waterline instead of at a fixed distance from the crossing; see <see cref="CanStand"/>.
+    /// </param>
+    /// <param name="bedLift">How far the bed rises inside an opening, or zero to leave it at <see cref="WaterDepth"/>.</param>
+    /// <param name="shore">
+    /// Whether this stretch runs to the island edge. Only then does the bank test each piece against the coast line,
+    /// see <see cref="CoastEdge"/>, so the line of pieces ends at the edge instead of stepping off it.
+    /// </param>
+    internal RiverSegment(
+        string name, WaterRibbonPoint[] points, float phase, float flowSpeed, float sortOrder, bool mouth,
+        Opening[] openings, WaterBand counter, float bedLift, bool shore)
     {
         Name = name;
         _points = points;
+        _mouth = mouth;
+        _openings = openings;
+        _counter = counter;
+        _bedLift = bedLift;
+        _shore = shore;
 
         // See the class header: a long strip must not use the world bounds box.
         Highlight = new Highlight { Style = HighlightStyle.Wireframe, EdgeWidth = 0.004f };
@@ -174,10 +347,11 @@ internal sealed class RiverSegment : Mesh3D
             Phase = phase,
             SortOrder = sortOrder,
 
-            // Every segment shares the speed. Together with the accumulated phase this is the whole trick that keeps the
-            // current continuous across a joint: the shader samples at "phase + arc - time * speed", so two neighbours
-            // read the same world distance on every frame and the texture never jumps at the seam.
-            FlowSpeed = 0.75f,
+            // One speed for a whole route, which is the first of the three numbers (speed, phase, shared control point) the
+            // shader needs to make the current pass a joint without a jump, and the reason a stretch with no source can
+            // simply be given zero and read as standing water. See <see cref="River.FlowSpeed"/> and
+            // <see cref="River.StillSpeed"/>.
+            FlowSpeed = flowSpeed,
 
             // The band is flat, so columns only interpolate the texture; three is plenty for a channel this wide.
             Columns = 3,
@@ -278,13 +452,27 @@ internal sealed class RiverSegment : Mesh3D
         for (int row = 0; row < rows; row++)
             sampled[row] = WaterRibbonMath.SampleRow(_points, row / (float)subdiv);
 
-        // The channel only exists where the water is still on land. Past the shore lip the ground ends and the water
-        // leaves it, so the bank and bed mesh stops at the last on-land row and only the ribbon continues. That is what
-        // makes the mouth a cascade instead of a flume hanging off the cliff, and it self-hides: the rows just past the
-        // lip are already below the grass, so the opaque ground covers them until the water is past the island edge.
+        // The channel only exists where the water is still on land, so a course that falls ends its bank and bed at the
+        // last on-land row and lets only the ribbon continue - the south branch's tail, which sinks into the range. The
+        // estuary stretch is cut in the same spirit at the coast: its course now runs a stretch past the line so the
+        // mouth's diagonal cut lands out over the water, but earth carried that far would be a slab of island hanging
+        // over the sea, so the bed and the levee stop at the last row before CoastEdge and the ribbon alone goes on.
         int landRows = rows;
-        while (landRows > 1 && sampled[landRows - 1].Center.Y < LandLimit)
+        while (landRows > 1 && (sampled[landRows - 1].Center.Y < LandLimit
+            || (_shore && sampled[landRows - 1].Center.X > CoastEdge)))
             landRows--;
+
+        // Arc length per row, measured on the sampled curve. The mouth taper needs metres, and the control point index
+        // says nothing about them - the runs between two points are not equally long.
+        var along = new float[rows];
+        for (int row = 1; row < rows; row++)
+            along[row] = along[row - 1] + Vector3.Distance(sampled[row - 1].Center, sampled[row].Center);
+
+        // The upstream cut described in the class header: skip the rows the pool's water film already covers, so the
+        // bed begins at the film's edge instead of inside the pool. At least two rows stay, otherwise there is no mesh.
+        int firstRow = 0;
+        while (_mouth && firstRow < landRows - 2 && along[firstRow] < MouthReach)
+            firstRow++;
 
         // Eight section points per row plus one normal per band per row: built once, then the cell loop is a pure copy.
         var section = new Vector3[rows * SectionPoints];
@@ -292,20 +480,34 @@ internal sealed class RiverSegment : Mesh3D
         var lateral = new float[SectionPoints];
         var height = new float[SectionPoints];
 
-        for (int row = 0; row < landRows; row++)
+        for (int row = firstRow; row < landRows; row++)
         {
             var line = sampled[row];
             var side = WaterRibbonMath.Lateral(line.Flow);
             float halfWidth = line.HalfWidth;
             float bedEdge = MathF.Max(halfWidth - WallWidth, 0.05f);
 
-            // The road crosses the channel at x = 0. Standing a 66 cm berm across the asphalt would read as a wall
-            // rather than a crossing, so the levee opens into a flat apron there: the crest drops below the water and
-            // the outer slope flattens out, and the water spills across the road as a widened ford. The same factor
-            // skips the bank pieces and widens the collision footprint further down.
-            float ford = FordFactor(line.Center.X);
-            float crest = CrestRise - ford * (CrestRise + WaterDepth + 0.06f);
-            float skirt = SkirtWidth + ford * 1.6f;
+            // An opening is where the other channel crosses this one, and it opens the levee out along the course rather
+            // than across it: a 66 cm berm standing in the other channel's water would read as a dam. The crest drops all
+            // the way onto the bed there, so crest, inner faces and bed become one flat shelf a full water depth down.
+            //
+            // Stopping that drop at the waterline, as it used to, left the berm standing two centimetres under the other
+            // channel's surface: a shelf you look straight through the water at, which reads as the dam the opening was
+            // supposed to remove. On the bed there is nothing left to see but bed, and the shelf is deep enough that the
+            // water hides its own edge. The outer slope keeps its shape and leans out to the meadow, which is what keeps
+            // the shelf from ending in a step.
+            //
+            // The pool mouth is the second such opening, but it drops the crest only to a low lip above the water, see
+            // MouthLip: down there the water is a film on the grass and a crest at the surface would hang in the air.
+            float junction = OpeningFactor(along[row]);
+            float mouth = MouthFactor(along[row]);
+            float skirt = SkirtWidth + junction * 1.6f;
+
+            // A junction row lifts its bed clear of the other channel's: both beds otherwise land on exactly
+            // water - WaterDepth and z-fight across the whole crossing.
+            float bed = -WaterDepth + junction * _bedLift;
+
+            float crest = CrestRise + junction * (bed - CrestRise) + mouth * (MouthLip - CrestRise);
 
             // The toe always ends the same distance under the grass, whatever this row's water height is, so the last
             // rows before the lip cannot leave the skirt hanging in the air.
@@ -317,8 +519,8 @@ internal sealed class RiverSegment : Mesh3D
             lateral[6] = halfWidth + CrestWidth;           lateral[7] = halfWidth + CrestWidth + skirt;
 
             height[0] = toe;           height[1] = crest;
-            height[2] = crest;         height[3] = -WaterDepth;
-            height[4] = -WaterDepth;   height[5] = crest;
+            height[2] = crest;         height[3] = bed;
+            height[4] = bed;           height[5] = crest;
             height[6] = crest;         height[7] = toe;
 
             for (int point = 0; point < SectionPoints; point++)
@@ -340,12 +542,18 @@ internal sealed class RiverSegment : Mesh3D
         var bedVertices = new List<Vertex>();
         var bedIndices = new List<ushort>();
 
-        for (int row = 0; row < landRows - 1; row++)
+        for (int row = firstRow; row < landRows - 1; row++)
         {
+            // Inside a crossing the crest has dropped onto the bed, so its two bands belong to the bed's material: kept
+            // on the bank's they drew two grass-green stripes running across the other channel's water, which is the
+            // same berm the geometry no longer builds, only painted.
+            bool opened = OpeningFactor((along[row] + along[row + 1]) * 0.5f) > 0.5f;
+
             for (int band = 0; band < BandCount; band++)
             {
                 // Outer slopes and crests vs. inner faces and bed: two materials, so two Surfaces.
-                bool isBank = band <= 1 || band >= BandCount - 2;
+                bool crestBand = band == 1 || band == BandCount - 2;
+                bool isBank = band == 0 || band == BandCount - 1 || (crestBand && !opened);
                 var vertices = isBank ? bankVertices : bedVertices;
                 var indices = isBank ? bankIndices : bedIndices;
 
@@ -412,8 +620,8 @@ internal sealed class RiverSegment : Mesh3D
         // Approximate albedo for the DDGI proxy, so the banks do not bounce back as neutral grey.
         GiAlbedo = new Vector3(0.22f, 0.26f, 0.16f);
 
-        BuildSlabs(sampled, landRows);
-        BuildDikeSlots(sampled, landRows);
+        BuildSlabs(sampled, along, landRows);
+        BuildDikeSlots(sampled, along, landRows);
     }
 
     /// <summary>
@@ -424,7 +632,7 @@ internal sealed class RiverSegment : Mesh3D
     /// then meeting the water. Overshooting by a few centimetres is harmless, because the corners this samples are
     /// already a footprint radius away from the body.
     /// </summary>
-    void BuildSlabs(WaterRibbonRow[] sampled, int rows)
+    void BuildSlabs(WaterRibbonRow[] sampled, float[] arc, int rows)
     {
         for (int row = 0; row < rows - 1; row++)
         {
@@ -440,11 +648,11 @@ internal sealed class RiverSegment : Mesh3D
 
             // How far out the stretch blocks the player. Two things have to be inside the footprint: the levee's outer
             // toe, and the bank pieces standing on the outer slope - they are visual only, so a footprint that stopped
-            // at the toe would let the player walk straight into a 76 cm bank. At the ford neither exists: there the
-            // levee is flat and the road crossing has to stay walkable, which is what the extra ramp width is for.
-            float ford = FordFactor(start.Center.X);
-            float levee = CrestWidth + SkirtWidth + ford * 1.6f;
-            float dike = (1f - ford) * (CrestWidth - DikeInset + DikeWidth);
+            // at the toe would let the player walk straight into a 76 cm bank. At an opening neither exists: there the
+            // levee is flat and the junction has to stay open water, which is what the extra ramp width is for.
+            float junction = OpeningFactor((arc[row] + arc[row + 1]) * 0.5f);
+            float levee = CrestWidth + SkirtWidth + junction * 1.6f;
+            float dike = (1f - junction) * (CrestWidth - DikeInset + DikeWidth);
 
             _slabs.Add(new WaterSlab(
                 (start.Center + end.Center) * 0.5f,
@@ -463,10 +671,25 @@ internal sealed class RiverSegment : Mesh3D
     ///
     /// The slots stay in author space until <see cref="AddDikes"/> runs, because the shared template's bounds are what
     /// decide which way the asset's long axis points.
+    ///
+    /// <para><b>Nothing hangs over the shore lip.</b> A piece is <see cref="DikeLength"/> long and anchored at its center, so
+    /// the last one allowed on land would reach two metres past the cliff edge and stand in the sea. On the stretch that ends
+    /// at the sea the walk therefore stops half a piece short of the lip and one pair is pinned right there, so the bank line
+    /// reads as ending at the edge instead of stepping off it. That cut runs <i>along</i> the course; the coast runs across
+    /// it, so <see cref="AddDikePair"/> also drops the individual piece whose own footprint would cross
+    /// <see cref="CoastEdge"/>.</para>
     /// </summary>
-    void BuildDikeSlots(WaterRibbonRow[] sampled, int rows)
+    void BuildDikeSlots(WaterRibbonRow[] sampled, float[] arc, int rows)
     {
         _slots.Clear();
+
+        // Arc metres of every pair laid down so far. The opening pins below read it to tell a gap from a piece they would
+        // only land on top of.
+        var standing = new List<float>();
+
+        // How far along the course a piece may still be anchored: its far end lands exactly on the last on-land row. On a
+        // stretch that stays on land the lip never happens and the walk is only bounded by the rows themselves.
+        float limit = _shore && rows < arc.Length ? arc[rows - 1] - DikeLength * 0.5f : float.PositiveInfinity;
 
         float placement = DikeSpacing * 0.5f;
         float travelled = 0f;
@@ -481,17 +704,12 @@ internal sealed class RiverSegment : Mesh3D
             if (chord < 1e-4f)
                 continue;
 
-            while (placement <= travelled + chord)
+            while (placement <= travelled + chord && placement <= limit)
             {
-                float t = (placement - travelled) / chord;
-                var center = Vector3.Lerp(start.Center, end.Center, t);
-                float halfWidth = start.HalfWidth + (end.HalfWidth - start.HalfWidth) * t;
-                var flow = Flatten(Vector3.Lerp(start.Flow, end.Flow, t));
-
-                if (CanStand(center))
+                if (PlaceAt(sampled, rows, placement))
                 {
-                    AddDikePair(center, flow, halfWidth);
                     placed = placement;
+                    standing.Add(placement);
                 }
 
                 placement += DikeSpacing;
@@ -504,24 +722,187 @@ internal sealed class RiverSegment : Mesh3D
         // whole spacing short of the joint, which is far enough to open a gap wider than nothing between two 4 m
         // pieces. Pin one pair on the last row. It cannot coincide with the next stretch's first piece, because that
         // one starts half a spacing in, so the two overlap instead of z-fighting.
-        if (travelled - placed > DikeSpacing * 0.5f)
+        //
+        // At the shore the same pin runs at the limit instead of the last row, which is what keeps the bank short of
+        // the edge: the pin's far end is the lip row itself.
+        float tail = MathF.Min(travelled, limit);
+        if (tail - placed > DikeSpacing * 0.5f && PlaceAt(sampled, rows, tail))
+            standing.Add(tail);
+
+        // An opening's two edges rarely land on the spacing either, and what the walk leaves out there is a whole piece of
+        // missing bank. Nor sits the missing piece at a fixed distance from the edge: a piece fits up to the other
+        // channel's water, and how far along the course that is depends on where that water runs, not on the opening. On
+        // one bank of the confluence it is a metre short of the edge - which left the corner bare - and on the opposite
+        // one a metre past it - which let the piece overshoot the other water. So each edge is walked outward in
+        // <see cref="PinStep"/> steps for the first spot a piece still fits, i.e. its inner corner on that waterline, and
+        // one pair goes there.
+        for (int i = 0; i < _openings.Length; i++)
         {
-            var tail = sampled[rows - 1];
-            if (CanStand(tail.Center))
-                AddDikePair(tail.Center, Flatten(tail.Flow), tail.HalfWidth);
+            var opening = _openings[i];
+
+            for (int side = -1; side <= 1; side += 2)
+            {
+                float edge = Math.Clamp(opening.Along + side * opening.Half, 0f, tail);
+
+                for (float step = 0f; step <= DikeLength * 2f; step += PinStep)
+                {
+                    float anchor = edge + side * step;
+                    if (anchor < 0f || anchor > tail)
+                        break;
+
+                    if (!Locate(sampled, rows, anchor, out var center, out var flow, out float halfWidth))
+                        break;
+
+                    if (Taken(standing, anchor))
+                        break;
+
+                    if (!AddDikePair(center, flow, halfWidth, anchor))
+                        continue;
+
+                    standing.Add(anchor);
+                    break;
+                }
+            }
         }
     }
 
-    /// <summary>A pair of slots, one per bank, sharing the row's frame. The side sign is the only difference.</summary>
-    void AddDikePair(Vector3 center, Vector3 flow, float halfWidth)
+    /// <summary>
+    /// Whether one of the pairs already laid down sits within a hand's width of <paramref name="along"/>. Overlapping
+    /// neighbours are the normal state of this bank; what this rejects is a second piece on almost the same spot, which
+    /// shimmers instead of reading as one bank.
+    /// </summary>
+    static bool Taken(List<float> standing, float along)
     {
-        var lateral = WaterRibbonMath.Lateral(flow);
-        _slots.Add(new DikeSlot(center, lateral, flow, halfWidth, 1));
-        _slots.Add(new DikeSlot(center, lateral, flow, halfWidth, -1));
+        for (int i = 0; i < standing.Count; i++)
+        {
+            if (MathF.Abs(standing[i] - along) < DikeLength * 0.1f)
+                return true;
+        }
+
+        return false;
     }
 
-    /// <summary>No bank past the lip, and none across the ford: there the pieces would stand in the road crossing.</summary>
-    static bool CanStand(Vector3 center) => center.Y >= LandLimit && FordFactor(center.X) < 0.001f;
+    /// <summary>
+    /// One pair at an exact arc length: <see cref="Locate"/> the row, lay down whichever banks fit. False when no row pair
+    /// covers that length, or when neither bank fits.
+    /// </summary>
+    bool PlaceAt(WaterRibbonRow[] sampled, int rows, float along)
+    {
+        if (!Locate(sampled, rows, along, out var center, out var flow, out float halfWidth))
+            return false;
+
+        return AddDikePair(center, flow, halfWidth, along);
+    }
+
+    /// <summary>
+    /// The row pair that covers <paramref name="along"/>, interpolated: the center point, the heading and the half width a
+    /// piece at that exact arc length stands on.
+    /// </summary>
+    static bool Locate(
+        WaterRibbonRow[] sampled, int rows, float along, out Vector3 center, out Vector3 flow, out float halfWidth)
+    {
+        float walk = 0f;
+
+        for (int row = 0; row < rows - 1; row++)
+        {
+            var start = sampled[row];
+            var end = sampled[row + 1];
+
+            float chord = Vector3.Distance(start.Center, end.Center);
+            if (chord < 1e-4f)
+                continue;
+
+            if (along < walk || along > walk + chord)
+            {
+                walk += chord;
+                continue;
+            }
+
+            float t = (along - walk) / chord;
+            center = Vector3.Lerp(start.Center, end.Center, t);
+            flow = Flatten(Vector3.Lerp(start.Flow, end.Flow, t));
+            halfWidth = start.HalfWidth + (end.HalfWidth - start.HalfWidth) * t;
+            return true;
+        }
+
+        center = default;
+        flow = Vector3.UnitZ;
+        halfWidth = 0f;
+        return false;
+    }
+
+    /// <summary>
+    /// A pair of slots, one per bank, sharing the row's frame - each bank decided on its own. The two sides are not
+    /// equivalent near an opening: the other channel crosses this course at an angle, so its water reaches a metre further
+    /// along the course on one bank than on the other, and a test that asked both together would stop both on the stricter
+    /// one's spot - which is a whole piece of missing bank on the looser side. The same holds near the sea, where the coast
+    /// crosses the course at an angle: the piece on the seaward bank reaches past <see cref="CoastEdge"/> while its mirror
+    /// stays well inside it. Such a piece is dropped rather than added, which is what keeps the bank from ending in a block
+    /// standing over open water.
+    ///
+    /// <para>Returns whether anything was added, so a caller walking the course can tell "spacing says place here" from
+    /// "this spot is refused".</para>
+    /// </summary>
+    bool AddDikePair(Vector3 center, Vector3 flow, float halfWidth, float along)
+    {
+        var lateral = WaterRibbonMath.Lateral(flow);
+
+        // From the row's center out to the piece's outer edge: the water line, the crest, then the whole piece.
+        float reach = halfWidth + CrestWidth - DikeInset + DikeWidth;
+
+        // Half the piece projected onto X: it is laid along the flow, so this is how far its far end runs ahead of the
+        // anchor. Only the seaward direction matters, and the footprint is symmetric, so the sign is dropped.
+        float run = MathF.Abs(flow.X) * DikeLength * 0.5f;
+
+        bool added = false;
+
+        for (int side = -1; side <= 1; side += 2)
+        {
+            if (_shore && center.X + lateral.X * side * reach + run > CoastEdge)
+                continue;
+
+            if (!CanStand(center, flow, halfWidth, lateral, side, along))
+                continue;
+
+            _slots.Add(new DikeSlot(center, lateral, flow, halfWidth, side));
+            added = true;
+        }
+
+        return added;
+    }
+
+    /// <summary>
+    /// Whether the piece on one bank, <paramref name="side"/>, fits at <paramref name="center"/>. Two things rule a spot
+    /// out: it is past the shore lip (<see cref="LandLimit" />) or in the mouth apron, or the piece would stand in the other
+    /// channel's water.
+    ///
+    /// <para>The last one tests the piece's <b>whole footprint</b> - the 4 x 1.55 m rectangle it stands in - against that
+    /// channel's water, see <see cref="WaterBand"/>. That is what puts both routes' lines of pieces on one another's
+    /// waterline: a distance along the course cannot express where an obliquely crossing channel's edge runs, which is why
+    /// the opening's half length alone left two corners of the confluence bare and let the opposite two overshoot.</para>
+    /// </summary>
+    bool CanStand(Vector3 center, Vector3 flow, float halfWidth, Vector3 lateral, int side, float along)
+    {
+        if (center.Y < LandLimit || MouthFactor(along) >= 0.001f)
+            return false;
+
+        float offset = halfWidth + CrestWidth - DikeInset + DikeWidth * 0.5f;
+        var middle = center + lateral * (side * offset);
+
+        // Nine points - corners, edge midpoints and the center - because a piece is four metres long and a channel four and
+        // a half wide, so a channel cutting across a piece at an angle can miss all four corners.
+        for (int a = -1; a <= 1; a++)
+        {
+            for (int b = -1; b <= 1; b++)
+            {
+                var point = middle + flow * (DikeLength * 0.5f * a) + lateral * (DikeWidth * 0.5f * b);
+                if (_counter.Clearance(point) < -DikeOverhang)
+                    return false;
+            }
+        }
+
+        return true;
+    }
 
     /// <summary>A row's flow with the vertical part dropped; the sampled tangents carry a slope on the falling rows.</summary>
     static Vector3 Flatten(Vector3 flow)
@@ -703,17 +1084,87 @@ internal sealed class RiverSegment : Mesh3D
     readonly record struct DikeSlot(Vector3 Center, Vector3 Lateral, Vector3 Flow, float HalfWidth, int Side);
 
     /// <summary>
-    /// How far the levee has opened into a ford at this world X: 1 across the road corridor, 0 on the full levee, and a
-    /// smooth ramp in between. The road runs along Z at x = 0, so the factor depends on X alone.
+    /// The other route's channel, as the bank pieces have to see it: its control points with the half width each one
+    /// carries, i.e. the swept strip of water. Not the route's <see cref="RiverSegment"/>s on purpose - a line of pieces
+    /// has to stop on the <i>water</i> of the channel it meets, and where that water runs is the only thing about it they
+    /// need to know.
     /// </summary>
-    static float FordFactor(float x)
+    internal readonly record struct WaterBand(WaterRibbonPoint[] Points)
     {
-        float distance = MathF.Abs(x);
-        if (distance <= FordHalf) return 1f;
-        if (distance >= FordHalf + FordFeather) return 0f;
+        /// <summary>
+        /// Distance from <paramref name="point"/> to this band's water, measured in the ground plane: positive outside,
+        /// negative inside, in meters. Nearest point of the swept strip rather than of the centerline, so a bend reads as
+        /// the union of its own quads; each edge is clamped, which makes the ends of the band rounded instead of open.
+        /// </summary>
+        internal float Clearance(Vector3 point)
+        {
+            float best = float.MaxValue;
 
-        float t = (distance - FordHalf) / FordFeather;
+            for (int i = 1; i < Points.Length; i++)
+            {
+                var start = Points[i - 1];
+                var end = Points[i];
+
+                float dx = end.Position.X - start.Position.X;
+                float dz = end.Position.Z - start.Position.Z;
+                float length = MathF.Sqrt(dx * dx + dz * dz);
+                if (length < 1e-4f)
+                    continue;
+
+                // How far along the edge the point's own projection lands, clamped to the edge's ends.
+                float reach = Math.Clamp(
+                    ((point.X - start.Position.X) * dx + (point.Z - start.Position.Z) * dz) / length, 0f, length);
+
+                float half = start.HalfWidth + (end.HalfWidth - start.HalfWidth) * (reach / length);
+
+                float ox = point.X - (start.Position.X + dx / length * reach);
+                float oz = point.Z - (start.Position.Z + dz / length * reach);
+                float clearance = MathF.Sqrt(ox * ox + oz * oz) - half;
+
+                if (clearance < best)
+                    best = clearance;
+            }
+
+            return best;
+        }
+    }
+
+    /// <summary>
+    /// How far the levee is still opened out at arc length <paramref name="along"/>: 1 over the first
+    /// <see cref="MouthReach"/> metres, then a smoothstep back to the full section over <see cref="MouthRamp"/>, and
+    /// always 0 on a stretch that does not start at a source. Same contract as <see cref="JunctionFactor"/>.
+    /// </summary>
+    float MouthFactor(float along)
+    {
+        if (!_mouth || along >= MouthReach + MouthRamp) return 0f;
+        if (along <= MouthReach) return 1f;
+
+        float t = (along - MouthReach) / MouthRamp;
         return 1f - t * t * (3f - 2f * t);
+    }
+
+    /// <summary>
+    /// How far the levee is still opened out at arc length <paramref name="along"/>: 1 inside an opening's half length,
+    /// then a smoothstep back to the full section over its feather, and 0 when no opening is near. Same contract as
+    /// <see cref="MouthFactor"/>, which does the same for a stretch that starts at a source.
+    /// </summary>
+    float OpeningFactor(float along)
+    {
+        float factor = 0f;
+
+        for (int i = 0; i < _openings.Length; i++)
+        {
+            var opening = _openings[i];
+            float distance = MathF.Abs(along - opening.Along);
+            if (distance >= opening.Half + opening.Feather) continue;
+            if (distance <= opening.Half) return 1f;
+
+            float t = (distance - opening.Half) / opening.Feather;
+            float value = 1f - t * t * (3f - 2f * t);
+            if (value > factor) factor = value;
+        }
+
+        return factor;
     }
 
     // ── Procedural ground textures ───────────────────────────────────────────────────────────────────────────────────
@@ -838,16 +1289,29 @@ internal sealed class RiverSegment : Mesh3D
 ///
 /// <para><b>Flow continuity is derived, not authored.</b> Every control point gets one flow direction from the central
 /// difference of the <b>global</b> centerline, so a point shared by two stretches carries the same direction on both sides.
-/// Each stretch then starts at the arc length its predecessors covered, and all of them share one
+/// Each stretch then starts at the arc length its predecessors covered, and all stretches of a route share one
 /// <see cref="WaterRibbon.FlowSpeed"/>; that is the complete set of conditions the shader needs to make the current pass a
-/// joint without a jump in direction, speed or phase.</para>
+/// joint without a jump in direction, speed or phase. The speed is the one number that differs between the two routes:
+/// the main course runs at <see cref="FlowSpeed"/> because the waterfall feeds it, the branch at <see cref="StillSpeed"/>
+/// because nothing does.</para>
 ///
 /// <para><b>Geography:</b> the course leaves the pool at the mountain foot in the south-west, runs east while steadily
 /// pulling away from the southern range so it never hugs the rock face, stays well south of the pond and the observation
-/// tower, and turns south-east over the last stretches to reach the shore in the one gap the east rock line has. The two
-/// places it deliberately touches existing geometry are the road at x = 0 (the river is shallower than the asphalt lip,
-/// so the crossing reads as a ford) and the shore rocks flanking the mouth (water lapping at a boulder's base is what a
-/// river mouth looks like).</para>
+/// tower, and turns south-east over the last stretches to reach the shore in the one gap the east rock line has. The
+/// place it deliberately touches existing geometry is the shore rocks flanking the mouth (water lapping at a boulder's
+/// base is what a river mouth looks like).</para>
+///
+/// <para><b>The branch is the second route.</b> It takes over the corridor the road used to run through south of the
+/// player's spawn, from the meadow down to the foot of the southern range, and crosses the main course at z = -47.5.
+/// At that crossing the two berms have to give way to each other - each river is a raised section, so each one would
+/// otherwise stand a 66 cm bank across the other's channel - which is what <see cref="RiverSegment.OpeningFactor"/> is
+/// for. There the berm does not merely drop to the waterline: it drops onto its own bed, so both channels read as one
+/// wide shallow shelf instead of one crossing the other on a submerged shelf. The two lines of bank pieces close the four
+/// corners for the same reason: each route's pieces are tested against the other's water and stop on it, so neither line
+/// ends short of the corner nor runs into the other channel. The two routes share only the bank batch and
+/// the ribbon table - six stretches plus two, which is exactly
+/// <see cref="Season.Rendering.SceneWaterRibbons.MaxActiveRibbons"/> - so the whole river still costs one instanced
+/// draw.</para>
 /// </summary>
 internal sealed class River : Panel
 {
@@ -872,6 +1336,21 @@ internal sealed class River : Panel
     internal const string DikeGlbPath = "Assets/RiverBank.glb";
 
     /// <summary>
+    /// Current speed of the main course, in metres per second. The waterfall is the source: the pool drains through the
+    /// channel and out over the coast, so every stretch of that route carries the same speed - the speed is also the first
+    /// of the three numbers that keeps the current from jumping at the seams between stretches.
+    /// </summary>
+    internal const float FlowSpeed = 0.75f;
+
+    /// <summary>
+    /// Current speed of the south branch: zero, i.e. standing water. Nothing feeds that route through a fall - it is the
+    /// pond's own level that stands at its head and the meadow that swallows its tail beyond the main course - so a
+    /// scrolling current on it would be a current with no source behind it. Only the scroll stops: its control points
+    /// still carry a flow direction, which is what lays the band's lateral axis and its bank pieces.
+    /// </summary>
+    internal const float StillSpeed = 0f;
+
+    /// <summary>
     /// The three ribbon textures, in the order the backend looks them up. Same names as the waterfall uses, so a scene with
     /// both registers them once; <see cref="App"/> still registers them for the river, so a river without a waterfall draws.
     /// </summary>
@@ -894,65 +1373,134 @@ internal sealed class River : Panel
     /// point so the chord between their two ends really is straight; a bend's vertex is the point its two runs share, and
     /// the ribbon's Catmull-Rom rounds it.
     ///
-    /// <para>Fifteen of the sixteen control points the shader can hold, six stretches, one ribbon slot each - the whole
-    /// course fits inside the per-scene ribbon table with two slots to spare.</para>
+    /// <para>Six stretches, one ribbon slot each, out of the sixteen the shader can hold.</para>
     ///
-    /// <para><b>The two ends are special.</b> Point 0 sits in the pool's outflow at the pool's own surface, so the two
-    /// waters meet flush. Points 13 and 14 are past the island edge (x = 75) and drop below the sea surface: the bank
-    /// mesh stops at the lip ("still on land") and only the water continues, so the mouth ends as a cascade into the sea
-    /// instead of a cut-off polygon. Points 12-14 also aim the mouth between the shore rocks at z = -38 and z = -54,
-    /// which is the only gap in the east rock line wide enough for a river.</para>
+    /// <para><b>The two ends are special.</b> Points 0 and 1 sit at the pool's own surface, so the two waters meet flush:
+    /// point 0 is inside the pool's water film and point 1 is the outlet just clear of it, which is where the first
+    /// stretch starts. Over the metres between them only the ribbon draws - the bed starts at the film's edge, see
+    /// <see cref="RiverSegment"/> - so the channel leaves the pool as open water instead of ending in a levee wall that
+    /// would stand in front of the pool's rim rocks.</para>
+    ///
+    /// <para><b>Point 14 is the mouth, and the course ends there.</b> Point 13 sits on the coast line (x = 74.85, see
+    /// <see cref="CoastEdge"/>) and the water runs about three metres past it, because the mouth crosses that line at 32
+    /// degrees: a course stopping on the line ends on a diagonal, and the inland half of that cut left a triangular wedge
+    /// of dry bed where the water never arrived. Carrying the last point out over the water puts the whole cut past the
+    /// coast, where the estuary's cloud stands over it. Only the water goes that far - the bed and the levee still stop on
+    /// the line, see <see cref="RiverSegment.BuildSurface"/>, or the island would end in a slab of earth hanging over the
+    /// sea. Points 12 to 14 aim the mouth between the shore rocks at z = -38 and z = -54, which is the only gap in the
+    /// east rock line wide enough for a river.</para>
     /// </summary>
     static readonly CoursePoint[] Course =
     {
-        // Straight 1 - away from the pool. Point 1 is the exact midpoint of 0 and 2.
-        new(-64.00f, -63.60f, PoolWaterY, 1.90f),   // 0: in the pool's outflow
-        new(-54.00f, -60.15f, 0.195f, 2.00f),       // 1
-        new(-44.00f, -56.70f, WaterY, 2.10f),       // 2: bend 1 vertex, the first turn away from the range
+        // The pool outlet - water only for the first couple of metres; see RiverSegment.MouthReach.
+        new(-68.20f, -66.70f, PoolWaterY, 2.00f),   // 0: inside the waterfall pool's water film
+        new(-64.00f, -63.60f, PoolWaterY, 1.90f),   // 1: the outlet, just clear of that film
+
+        // Straight 1 - away from the pool. Point 2 is the exact midpoint of 1 and 3.
+        new(-54.00f, -60.15f, 0.195f, 2.00f),       // 2
+        new(-44.00f, -56.70f, WaterY, 2.10f),       // 3: bend 1 vertex, the first turn away from the range
 
         // Bend 1 - the heading eases from 19 to 8 degrees, opening the angle against the southern range.
-        new(-26.00f, -51.00f, WaterY, 2.20f),       // 3
-        new(-8.00f, -48.60f, WaterY, 2.30f),        // 4: straight 2 begins
+        new(-26.00f, -51.00f, WaterY, 2.20f),       // 4
+        new(-8.00f, -48.60f, WaterY, 2.30f),        // 5: straight 2 begins
 
-        // Straight 2 - crosses the road at x = 0, which reads as a ford. Point 5 is the exact midpoint of 4 and 6.
-        new(3.00f, -47.10f, WaterY, 2.40f),         // 5
-        new(14.00f, -45.60f, WaterY, 2.50f),        // 6
+        // Straight 2 - crosses the x = 0 axis, which is where the south branch joins. Point 6 is the exact midpoint
+        // of 5 and 7.
+        new(3.00f, -47.10f, WaterY, 2.40f),         // 6
+        new(14.00f, -45.60f, WaterY, 2.50f),        // 7
 
         // Bend 2 - the meadow bend, straightening the long run toward the east shore.
-        new(30.00f, -43.40f, WaterY, 2.80f),        // 7
-        new(46.00f, -40.60f, WaterY, 3.10f),        // 8: straight 3 begins
+        new(30.00f, -43.40f, WaterY, 2.80f),        // 8
+        new(46.00f, -40.60f, WaterY, 3.10f),        // 9: straight 3 begins
 
         // Straight 3 - past the observation tower, still more than ten metres off its footprint.
-        new(53.00f, -39.60f, WaterY, 3.30f),        // 9: exact midpoint of 8 and 10
-        new(60.00f, -38.60f, WaterY, 3.50f),        // 10
+        new(53.00f, -39.60f, WaterY, 3.30f),        // 10: exact midpoint of 9 and 11
+        new(60.00f, -38.60f, WaterY, 3.50f),        // 11
 
-        // Bend 3 - the estuary turn, south-east into the gap in the shore rocks.
-        new(68.50f, -42.40f, WaterY, 3.90f),        // 11
-        new(74.00f, -45.80f, WaterY, 4.30f),        // 12: the lip, just inside the island edge
-
-        // Mouth - over the edge and into the sea. No banks here; see the class header.
-        new(76.55f, -47.38f, -1.05f, 4.20f),        // 13
-        new(79.10f, -49.00f, -3.25f, 4.00f),        // 14: below the sea surface
+        // Bend 3 - the estuary turn, south-east into the gap in the shore rocks and out past the coast line.
+        new(68.50f, -42.40f, WaterY, 3.90f),        // 12
+        new(74.85f, -46.32f, WaterY, 4.30f),        // 13: the coast edge
+        new(77.41f, -47.90f, WaterY, 4.30f),        // 14: the mouth, out over the water
     };
 
     /// <summary>
     /// Split table: first and last course index of each selectable stretch. Neighbouring stretches share their joint
     /// point, which is what makes the water meet the water instead of meeting a gap.
     ///
-    /// The mouth is part of the last stretch rather than its own: only one course point of it is on land, so a separate
-    /// segment would have a single row of bank - a pick target too small to hit. Keeping the estuary turn in the same
-    /// stretch gives it six metres of bank to select and drag while the bank still stops at the lip, because the cut is
-    /// per row, not per segment.
+    /// The mouth is part of the last stretch rather than its own: a separate segment would be one bend, a pick target
+    /// too small to hit and too short to drag with any precision. Keeping the estuary turn in the same stretch gives it
+    /// ten metres of bank to select, while the bank pieces still stop at the coast - that cut is per piece against
+    /// <see cref="CoastEdge"/>, not per segment - and the bed ends there too even though the water runs on.
     /// </summary>
     static readonly (int First, int Last, string Name)[] Splits =
     {
-        (0, 2, "RiverStraightPool"),      // straight: the run away from the waterfall
-        (2, 4, "RiverBendWest"),          // bend: the first turn away from the range
-        (4, 6, "RiverStraightFord"),      // straight: the ford at x = 0
-        (6, 8, "RiverBendMeadow"),        // bend
-        (8, 10, "RiverStraightEast"),     // straight: the long run past the tower
-        (10, 14, "RiverEstuary"),         // bend into the shore gap, then over the lip into the sea
+        (0, 3, "RiverStraightPool"),      // straight: out of the pool and away from the waterfall
+        (3, 5, "RiverBendWest"),          // bend: the first turn away from the range
+        (5, 7, "RiverStraightFord"),      // straight: the junction with the branch at x = 0
+        (7, 9, "RiverBendMeadow"),        // bend
+        (9, 11, "RiverStraightEast"),     // straight: the long run past the tower
+        (11, 14, "RiverEstuary"),         // bend into the shore gap and out to the mouth
     };
+
+    /// <summary>
+    /// The south branch: the channel that drains the pond and runs due south along the x = 0 axis. It leaves the pond's
+    /// south rim through the opening cut in it, crosses the main course at z = -47.5 and sinks into the range at its
+    /// foot, where the ground rises and only the water ribbon continues into the hillside.
+    ///
+    /// <para><b>Two stretches and no shared point.</b> The main channel is 4.7 m wide across the crossing and this
+    /// one's band is 4.5 m, so the branch simply stops inside it and resumes on the far side: the main water covers the
+    /// gap, and the main course cuts its own bank across the branch with <see cref="CrossingHalf"/>. A shared control point
+    /// would force one tangent through a right angle, which would bend both stretches at their joint.</para>
+    ///
+    /// <para><b>The upstream end is the pond, not the meadow.</b> Point 0 lies a hand's width inside the pond's own
+    /// water, at <see cref="Pond.WaterY"/> less five millimetres: the two surfaces overlap there instead of meeting at a
+    /// seam, and that gap keeps them from z-fighting across the overlap. The route is not a mouth (see
+    /// <see cref="RiverSegment"/>), so its bank starts at full height on the very first row and the two berms simply
+    /// continue the pond's rim out of the opening in it. The first three points keep a slow fall instead of a step, so
+    /// the pond's surface reaches the channel's own <see cref="WaterY"/> over four metres.</para>
+    ///
+    /// <para><b>The downstream end is cut per row.</b> The last points drop below the ground, so the levee stops and the
+    /// ribbon disappears under the meadow at the foot of the range.</para>
+    /// </summary>
+    static readonly CoursePoint[] BranchCourse =
+    {
+        // The outlet, inside the pond's water; see Pond.SouthEdgeZ. Only the ribbon covers its first hand's width.
+        new(0f, Pond.SouthEdgeZ + 0.10f, Pond.WaterY - 0.005f, BranchHalfWidth),  // 0
+        new(0f, -12.60f, 0.375f, 1.70f),    // 1: the channel proper resumes below the pond's rim
+        new(0f, -13.80f, 0.355f, 1.80f),    // 2
+        new(0f, -15.00f, WaterY, 1.95f),    // 3: full depth from here on
+        new(0f, -25.00f, WaterY, 2.05f),    // 4
+        new(0f, -35.00f, WaterY, 2.15f),    // 5
+        new(0f, -45.90f, WaterY, 2.25f),    // 6: stops inside the main channel's water film
+        new(0f, -49.35f, WaterY, 2.25f),    // 7: resumes on the far side of it
+        new(0f, -56.00f, WaterY, 2.15f),    // 8
+        new(0f, -63.00f, 0.30f, 2.05f),     // 9: the ground starts to rise toward the range
+        new(0f, -69.50f, -0.10f, 2.00f),    // 10: crossing grass level here
+        new(0f, -72.00f, -1.80f, 2.00f),    // 11: below the ground, inside the hillside
+    };
+
+    /// <summary>
+    /// Half the branch's water width where it leaves the pond, in meters. <see cref="Pond"/> opens its rim by this much
+    /// plus a hand's width either side, so the two waters meet through the opening instead of the rim pinching the
+    /// channel; the same number is the half width of <see cref="BranchCourse"/>[0].
+    /// </summary>
+    internal const float BranchHalfWidth = 1.60f;
+
+    /// <summary>
+    /// Split table of the branch. The two stretches deliberately do not share a point: the gap between them is the
+    /// main channel, and the main water is what joins the two halves.
+    /// </summary>
+    static readonly (int First, int Last, string Name)[] BranchSplits =
+    {
+        (0, 6, "RiverBranchSpring"),      // from the source down to the main course
+        (7, 11, "RiverBranchSink"),       // out of the main course and under the range
+    };
+
+    /// <summary>
+    /// Where the branch passes through the main course: the middle of the gap between its two stretches, which sits on the
+    /// main channel's centerline. The main course reads it to cut its own bank there, see <see cref="CrossingHalf"/>.
+    /// </summary>
+    static readonly Vector3 BranchCrossing = new(0f, WaterY, (BranchCourse[6].Z + BranchCourse[7].Z) * 0.5f);
 
     /// <summary>Selectable stretches in flow order. Add them all to the picker to edit the course in the property panel.</summary>
     internal RiverSegment[] Segments { get; }
@@ -971,31 +1519,84 @@ internal sealed class River : Panel
     /// <summary>One-shot flag: the template bounds arrive asynchronously with the queued load.</summary>
     bool dikesSettled;
 
+    // -- The mouth spray, where the river meets the sea. --
+
+    /// <summary>
+    /// Spray at the estuary: the waterfall pool's three particle systems copied onto the river's last metres - mist,
+    /// splash and foam. Same device as the pool's mist: an invisible, pickable
+    /// <see cref="Season.Controls.MistVolume"/> whose center, yaw and size <i>are</i> the parameters, so the whole effect
+    /// can be dragged, turned and resized in the property panel like any other object.
+    ///
+    /// <para>Why it is needed at all: the bed is cut off on the coast line 1.8 m above the sea and the water
+    /// breaks off one stretch further out, and a flat water surface meeting a flat plane with nothing in between
+    /// reads as two pictures side by side. The cloud joins them: its foot sits on the water and its body swallows
+    /// both cuts.</para>
+    ///
+    /// <para><b>The box is the only source.</b> The mouth crosses a straight coast at an angle, so the frame the bank
+    /// stops at is not where the haze has to sit: measured off the lip it came out barely 2 m tall and could not cover the
+    /// seam. The three numbers below are what the property panel shows - Pos, Rotation and Width/Height/Depth - hand tuned
+    /// into a 12 x 5 x 5 cloud standing over the estuary, and they are what <see cref="MouthMist"/> is placed with. All
+    /// three systems read that box and nothing else, so dragging, turning or resizing it moves the whole spray, and the
+    /// course geometry no longer feeds the emitters at all.</para>
+    /// </summary>
+    internal readonly Season.Controls.MistVolume MouthMist = new("RiverMouthMist");
+
+    /// <summary>Authored center of the spray box, i.e. the panel's PosX/PosY/PosZ.</summary>
+    static readonly Vector3 SprayPos = new(75f, 2f, -46f);
+
+    /// <summary>Authored yaw of the spray box, in degrees about Y: the panel's Rotation.</summary>
+    const float SprayYawDegrees = 100f;
+
+    /// <summary>Authored size of the spray box: the panel's Width/Height/Depth, in meters.</summary>
+    static readonly Vector3 SpraySize = new(12f, 3f, 6f);
+
+    /// <summary>
+    /// Sea surface height, taken from <see cref="Sea.DefaultSeaLevel"/> rather than repeated: one number moves the water
+    /// plane and the droplets' floor together. The splash no longer starts there - it starts on the lid of the box - but
+    /// it is still the plane that kills a droplet, so spray that falls out of the cloud ends in the water rather than
+    /// sinking through it.
+    /// </summary>
+    const float SeaY = Sea.DefaultSeaLevel;
+
+    /// <summary>
+    /// Where the splash sits in the box, as a fraction of the box's height measured down from the top face, and how far it
+    /// climbs, as a fraction of the same height. Both are the waterfall's own proportions: the pool's splash is born 8 cm
+    /// over its cloud's floor and crests at 0.71 m in a 2.6 m box, i.e. 3% and 27% of the height. Scaled by this box - 5 m
+    /// against the pool's 2.6 - that puts the band at 38% of the height (0.43 m, just over the river's own surface at
+    /// 0.34) and its crest at 1.78 m, in the body of the vapour. Floating over the lid, where it was, it read as a band of
+    /// its own with nothing to do with the cloud underneath.
+    /// </summary>
+    const float SplashDrop = 0.615f;
+
+    /// <summary>The climb, same units: 1.35 m on the authored 5 m box, the pool's 27%.</summary>
+    const float SplashRise = 0.27f;
+
+    // Null when the backend declined compute support; the update loop then has nothing to tick.
+    ParticleSystemEffect? mist;
+    ParticleSystemEffect? splash;
+    ParticleSystemEffect? foam;
+
+    /// <summary>Only the systems that actually registered; a backend without compute leaves this empty.</summary>
+    readonly List<ParticleSystemEffect> systems = new();
+
+    /// <summary>
+    /// One puff: alpha 0.10, up from 0.075. The authored box covers a 12 x 5 m footprint, and a thin puff over that reads
+    /// as haze rather than the solid white cloud an estuary wants; together with the density in
+    /// <see cref="CreateMouthMist"/> that is what makes it read as one body.
+    /// </summary>
+    static readonly Vector4 SprayColor = new(0.92f, 0.96f, 1.00f, 0.10f);
+    static readonly Vector3 SprayMid = new(0.95f, 0.97f, 1.00f);
+    static readonly Vector3 SprayEnd = new(1.00f, 1.00f, 1.00f);
+
+    /// <summary>Same wind as the scene fog and the waterfall's spray, so one wind field covers the whole picture.</summary>
+    static readonly Vector3 SprayWind = new(0.30f, 0f, 0.10f);
+
     /// <param name="registry">
     /// Scene ribbon registry the water is registered into. Registration happens here rather than in <see cref="App"/> so the
     /// segment and its water can never end up on different sides of the list.
     /// </param>
     internal River(SceneWaterRibbons registry)
     {
-        int points = Course.Length;
-        var flowPoints = new WaterRibbonPoint[points];
-
-        for (int i = 0; i < points; i++)
-        {
-            // Central difference of the global course: endpoints fall back to the one-sided difference. Computing the
-            // direction here, once, for the whole course is what makes two neighbours agree at a shared point.
-            var before = Course[Math.Max(i - 1, 0)];
-            var after = Course[Math.Min(i + 1, points - 1)];
-            var direction = new Vector3(after.X - before.X, 0f, after.Z - before.Z);
-
-            flowPoints[i] = new WaterRibbonPoint(
-                new Vector3(Course[i].X, Course[i].Y, Course[i].Z),
-                Course[i].HalfWidth,
-                direction);
-        }
-
-        Segments = new RiverSegment[Splits.Length];
-
         // AddControl queues the template load and takes ownership of the instance list, so the batch is created before
         // the stretches, which only ever append to it later.
         Dikes = new InstancedModel
@@ -1011,21 +1612,169 @@ internal sealed class River : Panel
         };
         AddControl(Dikes);
 
-        float phase = 0f;
-        for (int i = 0; i < Splits.Length; i++)
+        // Both routes are resolved to ribbon points first, so each can be handed to the other as the water its bank pieces
+        // have to stop on: a line of pieces has to end on the other channel's waterline, and only that channel's own
+        // polyline can say where that runs. See RiverSegment.WaterBand.
+        var main = FlowPoints(Course);
+        var branch = FlowPoints(BranchCourse);
+
+        // One flat array for both routes: the picker, the collider and the per-frame update only ever walk Segments,
+        // so a branch that is built the same way as the main course needs no plumbing of its own.
+        var segments = new List<RiverSegment>(Splits.Length + BranchSplits.Length);
+        AddRoute(main, branch, Splits, FlowSpeed, 0f, BranchCrossing, bedLift: 0f, shore: true, mouth: true, registry, segments);
+        AddRoute(branch, main, BranchSplits, StillSpeed, 0.5f, null, RiverSegment.JunctionBedLift, shore: false, mouth: false, registry, segments);
+        Segments = segments.ToArray();
+
+        // The spray where the river meets the sea: the same invisible, pickable box the waterfall pool drives its mist and
+        // foam from, placed with the authored numbers above, and all three particle systems spawned off its faces.
+        AddControl(MouthMist);
+        MouthMist.Place(SprayPos, SprayYawDegrees, SpraySize);
+
+        mist = Register(CreateMouthMist());
+        splash = Register(CreateMouthSplash());
+        foam = Register(CreateMouthFoam());
+    }
+
+    /// <summary>
+    /// A route's control points as ribbon points: position, half width, and one flow direction per point taken as the
+    /// central difference of the <b>whole</b> course - computing it here, once, is what makes two neighbours agree at a
+    /// shared point.
+    ///
+    /// <para>Both routes are resolved before either is split, because each one is handed to the other as the water its
+    /// bank pieces have to stop against; see <see cref="RiverSegment.WaterBand"/>.</para>
+    /// </summary>
+    static WaterRibbonPoint[] FlowPoints(CoursePoint[] course)
+    {
+        var flowPoints = new WaterRibbonPoint[course.Length];
+
+        for (int i = 0; i < course.Length; i++)
         {
-            var (first, last, name) = Splits[i];
+            // Endpoints fall back to the one-sided difference.
+            var before = course[Math.Max(i - 1, 0)];
+            var after = course[Math.Min(i + 1, course.Length - 1)];
+            var direction = new Vector3(after.X - before.X, 0f, after.Z - before.Z);
+
+            flowPoints[i] = new WaterRibbonPoint(
+                new Vector3(course[i].X, course[i].Y, course[i].Z),
+                course[i].HalfWidth,
+                direction);
+        }
+
+        return flowPoints;
+    }
+
+    /// <summary>
+    /// Splits one route's ribbon points into its selectable stretches and registers their water. Runs once per route from
+    /// the constructor, so both channels are built and phased the same way.
+    /// </summary>
+    /// <param name="flowPoints">This route's control points, see <see cref="FlowPoints"/>.</param>
+    /// <param name="other">
+    /// The other route's control points, handed to every stretch as the water its bank pieces stop against.
+    /// </param>
+    /// <param name="flowSpeed">
+    /// Current speed of the whole route, see <see cref="FlowSpeed"/> and <see cref="StillSpeed"/>. It is a route-wide
+    /// number, not a per-stretch one: two neighbours reading different speeds would put a visible jump in the current at
+    /// their joint, which is the one thing the split must never do.
+    /// </param>
+    /// <param name="sortBase">
+    /// First ribbon blend order of this route. The two routes are drawn independently - nothing crosses between them
+    /// except at the junction, where both waters are the same height - so the only requirement is that one route's own
+    /// order keeps increasing downstream.
+    /// </param>
+    /// <param name="crossing">
+    /// Optional world point where the other route crosses this one. The stretch that contains it opens its levee there on
+    /// both banks, so the other channel is not walled off by a berm it never asked for.
+    /// </param>
+    /// <param name="bedLift">How far this route's bed rises inside its openings, see <see cref="JunctionBedLift"/>.</param>
+    /// <param name="mouth">
+    /// Whether this route starts in a source's own water rather than at the tail of another stretch - true only for the
+    /// main course, whose first metres lie inside the waterfall pool's film. The branch passes false: it leaves the pond
+    /// through the opening in the pond's rim, level with the pond's surface, so there is nothing to open out.
+    /// </param>
+    /// <param name="shore">Whether this route's last stretch leaves the island edge and runs into the sea.</param>
+    void AddRoute(
+        WaterRibbonPoint[] flowPoints,
+        WaterRibbonPoint[] other,
+        (int First, int Last, string Name)[] splits,
+        float flowSpeed,
+        float sortBase,
+        Vector3? crossing,
+        float bedLift,
+        bool shore,
+        bool mouth,
+        SceneWaterRibbons registry,
+        List<RiverSegment> into)
+    {
+        // Arc position of the other route's channel, resolved against the whole course before it is split, so no stretch
+        // has to know how far along it starts.
+        float? crossingAlong = crossing is Vector3 point ? ArcOfNearest(flowPoints, point) : null;
+
+        float phase = 0f;
+        for (int i = 0; i < splits.Length; i++)
+        {
+            var (first, last, name) = splits[i];
 
             var slice = new WaterRibbonPoint[last - first + 1];
             Array.Copy(flowPoints, first, slice, 0, slice.Length);
 
-            var segment = new RiverSegment(name, slice, phase, i * 0.01f);
-            Segments[i] = segment;
+            float length = PolylineLength(slice);
+
+            // Where the split table skips a point, the two neighbours face each other across another channel: that gap
+            // is the junction. A stretch ending at one opens out at its own tail, one starting at it at its head.
+            var openings = new List<RiverSegment.Opening>(2);
+            if (i + 1 < splits.Length && splits[i + 1].First > last)
+                openings.Add(new RiverSegment.Opening(length, RiverSegment.JunctionHalf, RiverSegment.JunctionFeather));
+            else if (i > 0 && splits[i - 1].Last < first)
+                openings.Add(new RiverSegment.Opening(0f, RiverSegment.JunctionHalf, RiverSegment.JunctionFeather));
+
+            // The other route's channel, when it crosses inside this stretch: the berm has to give way there, or it would
+            // stand in the middle of that channel.
+            if (crossingAlong is float at && at >= phase && at <= phase + length)
+                openings.Add(new RiverSegment.Opening(at - phase, RiverSegment.CrossingHalf, RiverSegment.CrossingFeather));
+
+            var segment = new RiverSegment(
+                name, slice, phase, flowSpeed, sortBase + i * 0.01f, mouth: i == 0 && mouth,
+                openings.ToArray(), new RiverSegment.WaterBand(other), bedLift, shore: shore && i == splits.Length - 1);
+            into.Add(segment);
             AddControl(segment);
             registry.Add(segment.Water);
 
-            phase += PolylineLength(slice);
+            phase += length;
         }
+    }
+
+    /// <summary>
+    /// Arc length of the point on a route's polyline closest to <paramref name="target"/>, measured the same way the split
+    /// lengths are. Null when the route has no usable edge.
+    /// </summary>
+    static float? ArcOfNearest(WaterRibbonPoint[] points, Vector3 target)
+    {
+        float? result = null;
+        float arc = 0f;
+        float best = float.MaxValue;
+
+        for (int i = 1; i < points.Length; i++)
+        {
+            var start = points[i - 1].Position;
+            var edge = points[i].Position - start;
+            float length = edge.Length();
+            if (length < 1e-4f)
+                continue;
+
+            var direction = edge / length;
+            float reach = Math.Clamp(Vector3.Dot(target - start, direction), 0f, length);
+            float distance = (start + direction * reach - target).LengthSquared();
+
+            if (distance < best)
+            {
+                best = distance;
+                result = arc + reach;
+            }
+
+            arc += length;
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -1082,8 +1831,238 @@ internal sealed class River : Panel
         if (Dikes.Update(time))
             result = true;
 
+        if (UpdateMouthSpray(time))
+            result = true;
+
         return result;
     }
+
+    /// <summary>
+    /// Drives the estuary's three particle systems. Every one of them reads the authored box and nothing else - its center,
+    /// its yaw, its size - so whatever the property panel shows is what the emitters use and a change lands on the next
+    /// frame. Deriving the splash from the course instead was the bug: the box moved and the droplets stayed put.
+    ///
+    /// <para>The three are stacked inside the box rather than all on one face: the foam rides the bottom as the whitest
+    /// band, the mist is born on the same face and rises to the lid, and the splash - the only system that visibly goes up
+    /// and comes back down - is born low in the cloud, at the same fraction of the way up as the pool's, so it fizzes
+    /// inside the vapour instead of drifting over its top.</para>
+    /// </summary>
+    bool UpdateMouthSpray(float time)
+    {
+        if (MouthMist.Placed)
+        {
+            // The box's local +X is the long side, across the mouth, and its local +Z is the direction the mouth runs, out
+            // to sea: both come off the yaw, so turning the box turns the whole spray with it. Width is how far the cloud
+            // reaches across the mouth and Depth how far it reaches out to sea.
+            var axis = MouthMist.SpawnAxis;
+            var boxAxis = new Vector2(axis.X, axis.Z);
+            var downstream = new Vector3(-axis.Z, 0f, axis.X);
+            var bottom = new Vector3(MouthMist.PosX, MouthMist.BottomY, MouthMist.PosZ);
+            var seat = new Vector3(
+                MouthMist.PosX, MouthMist.PosY + MouthMist.WorldHeight * (0.5f - SplashDrop), MouthMist.PosZ);
+
+            if (mist != null)
+            {
+                mist.WorldOrigin = bottom;
+                mist.SpawnAxis = boxAxis;
+                mist.SpawnHalfLength = MouthMist.HalfLength;
+                mist.SpawnHalfDepth = MouthMist.HalfDepth;
+
+                // Rise speed solved from the box height, so pulling the box up is what makes the spray taller.
+                mist.InitialVelocity = new Vector3(
+                    0f,
+                    WaterfallPool.RiseSpeed(MouthMist.WorldHeight, mist.Lifetime, mist.Acceleration.Y),
+                    0f) + SprayWind * 0.1f;
+            }
+
+            if (foam != null)
+            {
+                // The whitest stroke in the picture, spread over the same rect and only floated up rather than climbed -
+                // the pool's foam, and the reason one box moves both of them.
+                foam.WorldOrigin = new Vector3(bottom.X, bottom.Y + 0.02f, bottom.Z);
+                foam.SpawnAxis = boxAxis;
+                foam.SpawnHalfLength = MouthMist.HalfLength;
+                foam.SpawnHalfDepth = MouthMist.HalfDepth;
+                foam.InitialVelocity = new Vector3(downstream.X * 0.8f, 0.3f, downstream.Z * 0.8f);
+            }
+
+            if (splash != null)
+            {
+                // Born low in the cloud and thrown up and downstream at the speed that buys SplashRise of climb: the same
+                // fractions of the box the pool uses, so the crest lands in the vapour instead of over it. FloorY still
+                // buries any droplet that reaches the sea.
+                splash.WorldOrigin = seat;
+                splash.SpawnAxis = boxAxis;
+                splash.SpawnHalfLength = MouthMist.HalfLength;
+
+                // Capped, unlike the other two: the droplet budget is the pool's, and spread over the whole lid it thins
+                // to confetti. A metre and a bit of depth keeps it a crest of spray - and a narrower box still narrows it.
+                splash.SpawnHalfDepth = MathF.Min(MouthMist.HalfDepth, 0.6f);
+                splash.InitialVelocity = new Vector3(
+                    downstream.X * 1.5f,
+                    MathF.Sqrt(2f * -splash.Acceleration.Y * SplashRise * MathF.Max(MouthMist.WorldHeight, 0.2f)),
+                    downstream.Z * 1.5f);
+                splash.FloorY = SeaY;
+            }
+        }
+
+        // Particles are self-lit and never sample the scene, so the authored colours are scaled by the sun here or the
+        // spray would stay noon-white at night. Splash and foam reuse the pool's colours outright: same material, two
+        // places.
+        float light = WaterfallPool.ParticleLighting(App.Instance.DayPhase);
+        if (mist != null)
+            WaterfallPool.ApplyParticlesLighting(mist, SprayColor, SprayMid, SprayEnd, light);
+        if (splash != null)
+            WaterfallPool.ApplyParticlesLighting(
+                splash, WaterfallPool.SplashColor, WaterfallPool.SplashMid, WaterfallPool.SplashEnd, light);
+        if (foam != null)
+            WaterfallPool.ApplyParticlesLighting(
+                foam, WaterfallPool.FoamColor, WaterfallPool.FoamMid, WaterfallPool.FoamEnd, light);
+
+        bool result = false;
+
+        // Frame delta clamped exactly like the pool's: a long stall must not jump the whole phase field past one lifetime.
+        float delta = float.IsFinite(time) ? Math.Clamp(time, 0f, 0.1f) : 0f;
+
+        // All three systems spawn off the box, so one gate covers them. An unplaced box has no usable spawn face, and the
+        // alternative is the old "no origin means follow the camera" behaviour - a cloud bursting at the world origin or
+        // under the player's feet while the course is still being built.
+        bool on = Enable && Alpha > 0f && MouthMist.Placed;
+        for (int i = 0; i < systems.Count; i++)
+        {
+            systems[i].Enabled = on;
+            if (on)
+                systems[i].Advance(delta);
+        }
+
+        // The box is a control in its own right, and Panel.Update does not recurse: without this its world matrix never
+        // reaches the backend and selecting it would draw no highlight.
+        if (MouthMist.Update(time))
+            result = true;
+
+        return result;
+    }
+
+    /// <summary>
+    /// Registers one particle system, keeps it in the tick list and returns it, or disposes it and returns null when the
+    /// backend declines. Same contract as <see cref="WaterfallPool"/>: an Initialize the backend rejected has already torn
+    /// its own resources down, so there is nothing left to do but drop the reference.
+    /// </summary>
+    ParticleSystemEffect? Register(ParticleSystemEffect effect)
+    {
+        if (Season.Rendering.FrameSchedule.RegisterCompute(Season.Basic.Graphics.Instance, effect))
+        {
+            systems.Add(effect);
+            return effect;
+        }
+
+        effect.Dispose();
+        return null;
+    }
+
+    /// <summary>
+    /// The estuary's mist: a solid white cloud, not a wisp. The authored box is 12 x 5 m at its foot, so the density had to
+    /// come up with it - 1024 x 0.95 is roughly 970 puffs, one every 0.25 m of that footprint, while a puff is 0.45 m across
+    /// at birth and 1.25 m at death. Any point in the cloud is therefore behind five or six puffs, which is what "实" means
+    /// here: the body reads as one mass of spray rather than a countable row of balls.
+    ///
+    /// <para>Noise is down to 0.35 for the same reason the waterfall's foam keeps its own low: more than that shreds every
+    /// edge and puts the point cloud back. Alpha sits at 0.10 (<see cref="SprayColor"/>) because it now stacks that deep.</para>
+    ///
+    /// <para>Lifetime 3.4 s is the time a puff needs to climb the height its box gives it, which is what ties the vertical
+    /// speed to the cascade's own height; see <see cref="WaterfallPool.RiseSpeed"/>.</para>
+    /// </summary>
+    ParticleSystemEffect CreateMouthMist() => new(1024)
+    {
+        ExternalTime = true,
+        CameraWindow = false,
+        Seed = 0x52495601,   // "RIV\u0001"
+        Density = 1, // 0.95f,
+        SpawnRect = true,
+        Lifetime = 3.4f,
+        Acceleration = new Vector3(0f, 0.16f, 0f),
+        WindVelocity = SprayWind,
+        ConeJitter = 0.22f,
+        ParticleSize = 0.45f,
+        SizeEnd = 1.25f,
+        Color = SprayColor,
+        ColorMid = SprayMid,
+        ColorEnd = SprayEnd,
+        FadeIn = 0.15f,
+        FadeOut = 0.45f,
+        Additive = false,
+        CurveMode = true,
+        NoiseAmount = 0.35f,
+        Turbulence = 0.14f,
+        ViewDistance = 0f,
+    };
+
+    /// <summary>
+    /// The estuary's splash: the waterfall pool's numbers copied over, with its own seed so the two sprays never burst in
+    /// lockstep. Thrown up and out along the mouth at 3.5 m/s against -9.8 gravity over 0.9 s, stretched along its own
+    /// motion, and killed by DieOnFloor if it ever falls back through the sea.
+    ///
+    /// <para>Capacity is a third higher than the pool's because the spray is a crest across a 12 m mouth rather than a
+    /// line at one foot, and the droplets are spread over the lid's whole length.</para>
+    /// </summary>
+    ParticleSystemEffect CreateMouthSplash() => new(2048)
+    {
+        ExternalTime = true,
+        CameraWindow = false,
+        Seed = 0x52495602,
+        Density = 0.8f,
+        SpawnRect = true,
+        Lifetime = 0.9f,
+        Acceleration = new Vector3(0f, -9.8f, 0f),
+        ConeJitter = 0.42f,
+        SpeedJitter = 0.20f,
+        DieOnFloor = true,
+        Stretch = 0.04f,
+        ParticleSize = 0.05f,
+        SizeEnd = 0.02f,
+        Color = WaterfallPool.SplashColor,
+        ColorMid = WaterfallPool.SplashMid,
+        ColorEnd = WaterfallPool.SplashEnd,
+        FadeIn = 0.05f,
+        FadeOut = 0.30f,
+        Additive = false,
+        CurveMode = true,
+        NoiseAmount = 0.3f,
+        Turbulence = 0.15f,
+        ViewDistance = 0f,
+    };
+
+    /// <summary>
+    /// The estuary's foam: the whitest stroke in the picture, born on the mist box's bottom face so one object moves both
+    /// clouds - the same coupling the pool has, where pulling the box widens the band and moving it drags the foam along.
+    /// 768 x 0.80 is about 610 puffs on that face, 0.36 m at birth and 0.92 m at death, so they press into one continuous
+    /// band instead of a row of dots, and ToonEdge 0.30 clips the radial falloff to a clean round edge - soap bubbles rather
+    /// than grey smoke.
+    /// </summary>
+    ParticleSystemEffect CreateMouthFoam() => new(768)
+    {
+        ExternalTime = true,
+        CameraWindow = false,
+        Seed = 0x52495603,
+        Density = 0.80f,
+        SpawnRect = true,
+        Lifetime = 1.6f,
+        Acceleration = new Vector3(0f, 0.08f, 0f),
+        SpeedJitter = 0.3f,
+        ParticleSize = 0.36f,
+        SizeEnd = 0.92f,
+        Color = WaterfallPool.FoamColor,
+        ColorMid = WaterfallPool.FoamMid,
+        ColorEnd = WaterfallPool.FoamEnd,
+        FadeIn = 0.08f,
+        FadeOut = 0.32f,
+        Additive = false,
+        CurveMode = true,
+        NoiseAmount = 0.35f,
+        Turbulence = 0.25f,
+        ToonEdge = 0.30f,
+        ViewDistance = 0f,
+    };
 
     /// <summary>Arc length of a control point polyline, i.e. the phase advance a stretch contributes to its successor.</summary>
     static float PolylineLength(ReadOnlySpan<WaterRibbonPoint> points)

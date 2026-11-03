@@ -12,6 +12,7 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
     // 11 density/height/falloff/noise, 12 albedo/scale, 13 wind/count, 14 environment/PCF,
     // 15 previousCamera/valid, 16 previousForward/cloudReady, 18..21 inverseJitteredVP, 22..25 currentVP,
     // 32..185 final SceneLightParams (including regional weather and the 2-8 virtual ground), 192..447 for 32 local volumes.
+    // Each local volume is 8 rows: matrix (4), albedo/extinction, shape/mode/feather/noise, noise scale, self-illumination.
     // 186..191 is headroom reserved for SceneLightParams to keep appending: appended fields only grow here and never reach 192.
     public const int FrameVectorCount = 448;
     public const int LightingOffset = 32;
@@ -309,10 +310,22 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
         // Lazily allocate per-view fog resources for secondary views.
         if (!EnsureViewFogResources(targets, g))
         { ResetOutput(targets); return; }
-        var vp = FrameSchedule.UnjitteredRenderViewProjection;
-        var view = FrameSchedule.RenderView;
-        if (!Matrix4x4.Invert(vp, out var inverse) || !Matrix4x4.Invert(view, out var inverseView)
-            || !Matrix4x4.Invert(view * FrameSchedule.RenderProjection, out var inverseJittered))
+        // The camera terms belong to the view being recorded. The frame snapshot (FrameSchedule.RenderView /
+        // RenderProjection / UnjitteredRenderViewProjection) is captured once per frame at the main camera's update
+        // point, so a secondary view would otherwise rebuild its rays, orient its volume and judge its history
+        // against the main camera. view.View / RenderViewProjection / RenderProjection are that view's own triple,
+        // identical to the snapshot's for the main view.
+        //
+        // A host that never prepares a view (the acceptance harnesses) has no camera of its own, and the snapshot it
+        // captures is the only one both it and the scheduler know about; reading the app's MainView there would make
+        // the fog ignore the matrices the harness just fed in, and history would never be reset on a camera jump.
+        var currentView = RenderView.CurrentOrNull;
+        bool ownCamera = currentView is { Prepared: true };
+        var viewMatrix = ownCamera ? currentView!.View : FrameSchedule.RenderView;
+        var vp = ownCamera ? currentView!.RenderViewProjection : FrameSchedule.UnjitteredRenderViewProjection;
+        var jitteredProjection = ownCamera ? currentView!.RenderProjection : FrameSchedule.RenderProjection;
+        if (!Matrix4x4.Invert(vp, out var inverse) || !Matrix4x4.Invert(viewMatrix, out var inverseView)
+            || !Matrix4x4.Invert(viewMatrix * jitteredProjection, out var inverseJittered))
         { ResetOutput(targets); return; }
         var position = inverseView.Translation;
         var forward = Vector3.Normalize(new Vector3(inverseView.M31, inverseView.M32, inverseView.M33));
@@ -500,6 +513,8 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
             data[index + 4] = new(volume.Albedo, volume.Extinction);
             data[index + 5] = new((int)volume.Shape, (int)volume.Mode, volume.EdgeFeather, volume.NoiseAmount);
             data[index + 6] = new(volume.NoiseScale, 0, 0, 0);
+            // Row 7 was padding: it now carries the self-illumination floor, so the stride and every existing index stay put.
+            data[index + 7] = new(volume.SelfIllumination, 0);
             index += VolumeStride;
         }
     }

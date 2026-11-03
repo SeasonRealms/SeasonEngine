@@ -2886,7 +2886,7 @@ window.seasonWebGPU = (() => {
         if (!c) return;
         for (let i = 0; i < c.count; i++) {
             const entry = c.entries[i];
-            entry.group = entry.instances = entry.vertices = entry.indices = null;
+            entry.group = entry.instances = entry.vertices = entry.indices = entry.indirectArgs = null;
         }
         c.opaque.length = c.transparent.length = c.priorities.length = 0;
         c.count = c.stage = 0; c.command = null;
@@ -2896,12 +2896,18 @@ window.seasonWebGPU = (() => {
         const pipelines = _activeMeshPipelines();
         const draw = pipeline => {
             _setMeshPipeline(pipeline);
-            if (entry.instances) _passEncoder.setVertexBuffer(0, entry.instances);
+            // A7 main view: an indirect entry binds only its slot segment of the reordered stream, for the reason given on
+            // drawInstancedMesh3DIndirect; counts come from the args record.
+            if (entry.instances) {
+                if (entry.indirectArgs) _passEncoder.setVertexBuffer(0, entry.instances, entry.instanceOffset, entry.instanceSize);
+                else _passEncoder.setVertexBuffer(0, entry.instances);
+            }
             if (entry.vertices) _passEncoder.setVertexBuffer(1, entry.vertices);
             _passEncoder.setBindGroup(0, entry.group);
             if (entry.indices) {
                 _passEncoder.setIndexBuffer(entry.indices, entry.indexFormat);
-                _passEncoder.drawIndexed(entry.count, entry.instanceCount, 0, 0, entry.firstInstance);
+                if (entry.indirectArgs) _passEncoder.drawIndexedIndirect(entry.indirectArgs, entry.indirectOffset);
+                else _passEncoder.drawIndexed(entry.count, entry.instanceCount, 0, 0, entry.firstInstance);
             } else _passEncoder.draw(entry.count, entry.instanceCount, 0, entry.firstInstance);
         };
         if (entry.indices) _drawIndexedWithOptionalDoubleSidedTransparency(pipelines, entry.mode, entry.doubleSided, draw);
@@ -2909,7 +2915,8 @@ window.seasonWebGPU = (() => {
     }
 
     function _submitSceneDraw(mode, doubleSided, group, instances, vertices, indices, indexFormat, count,
-        instanceCount = 1, firstInstance = 0, depth = 0) {
+        instanceCount = 1, firstInstance = 0, depth = 0,
+        indirectArgs = null, indirectOffset = 0, instanceOffset = 0, instanceSize = undefined) {
         if (!Number.isFinite(depth)) throw new Error('场景绘制深度必须有限');
         const c = _isSceneCollecting() ? _requireSceneCollection(1) : null;
         const entry = c ? (c.entries[c.count] ??= {}) : _sceneImmediateDraw;
@@ -2917,12 +2924,14 @@ window.seasonWebGPU = (() => {
         entry.instances = _readSceneBuffer(instances); entry.vertices = _readSceneBuffer(vertices);
         entry.indices = _readSceneBuffer(indices); entry.indexFormat = indexFormat;
         entry.count = count; entry.instanceCount = instanceCount; entry.firstInstance = firstInstance; entry.depth = depth;
+        entry.indirectArgs = _readSceneBuffer(indirectArgs); entry.indirectOffset = indirectOffset;
+        entry.instanceOffset = instanceOffset; entry.instanceSize = instanceSize;
         if (c) {
             entry.priorityOffset = c.priorityOffset; entry.priorityCount = c.priorityCount;
             (mode.startsWith('opaque') ? c.opaque : c.transparent).push(c.count++);
         } else {
             try { _executeSceneDraw(entry); }
-            finally { entry.group = entry.instances = entry.vertices = entry.indices = null; }
+            finally { entry.group = entry.instances = entry.vertices = entry.indices = entry.indirectArgs = null; }
         }
     }
 
@@ -3757,8 +3766,15 @@ window.seasonWebGPU = (() => {
 // 参数缓冲里的 indexCount/baseVertex 由 reset 内核按 primitive 表写入，startInstanceLocation 恒为 0：
 // 槽位偏移走 setVertexBuffer 的 offset，因为 WebGPU 的 firstInstance 会平移 instance_index，
 // 放参数里会让实例流下标整体错位，与 Vulkan/Metal 同理。
-function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffset, vertexBytes, argsId, argsOffset) {
-    if (!_frameStarted || !_passEncoder || !_passDepthOnly) return;
+// A7 main view: outside the shadow pass the same entry draws the opaque body of the main view, routed implicitly by pass
+// state exactly like drawInstancedMesh3D. The reordered rows carry the original instance in world row 0 .w (see vs_main),
+// which is why prevInstanceBytes goes down whole and binds from offset 0 at binding 14 rather than following the segment.
+// The outline mask never comes here: C# keeps that pass on the direct full stream, where instance_index is the slot.
+// skinKey (InstancedModel): bone palette of a skinned instanced model, resolved exactly as drawInstancedMesh3D does. The palette
+// is laid out by original instance (slot x 100 + joint), which the VS addresses through the same decoded tag as the prev stream,
+// so the compacted rows need nothing else; null keeps the default bones of a rigid mesh.
+function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffset, vertexBytes, argsId, argsOffset, prevInstanceBytes = null, skinKey = null) {
+    if (!_frameStarted || (!_passEncoder && !_isSceneCollecting())) return;
 
     const mesh = _staticMeshes[cacheKey];
     if (!mesh) return;
@@ -3766,18 +3782,67 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
     const argsBuffer = _storageBuffers[argsId];
     if (!sortedBuffer || !argsBuffer) return;
 
+    const boneBuffer = skinKey ? (_skinnedBoneBuffers[skinKey] || _defaultBoneBuffer) : _defaultBoneBuffer;
+    const prevBoneBuffer = skinKey ? (_prevSkinnedBoneBuffers[skinKey] || boneBuffer) : _defaultBoneBuffer;
+
     if (!ArrayBuffer.isView(uniformData)) uniformData = new Float32Array(uniformData);
 
     const uBuffer = _acquireBuffer('uniform', uniformData.byteLength, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     _device.queue.writeBuffer(uBuffer, 0, uniformData);
 
-    const sBindGroup = _createShadowBindGroup(uBuffer, _defaultBoneBuffer, mesh.morphMetaBuffer, mesh.morphDataBuffer);
-    _passEncoder.setPipeline(_shadowPipeline);
-    _passEncoder.setVertexBuffer(0, sortedBuffer, vertexOffset, vertexBytes);
-    _setSceneVertexBuffer(1, mesh.vBuffer);
-    _passEncoder.setIndexBuffer(mesh.iBuffer, mesh.indexFormat || 'uint16');
-    _passEncoder.setBindGroup(0, sBindGroup);
-    _passEncoder.drawIndexedIndirect(argsBuffer, argsOffset);
+    if (_passDepthOnly) {
+        if (!_passEncoder) return;
+        const sBindGroup = _createShadowBindGroup(uBuffer, boneBuffer, mesh.morphMetaBuffer, mesh.morphDataBuffer);
+        _passEncoder.setPipeline(_shadowPipeline);
+        _passEncoder.setVertexBuffer(0, sortedBuffer, vertexOffset, vertexBytes);
+        _setSceneVertexBuffer(1, mesh.vBuffer);
+        _passEncoder.setIndexBuffer(mesh.iBuffer, mesh.indexFormat || 'uint16');
+        _passEncoder.setBindGroup(0, sBindGroup);
+        _passEncoder.drawIndexedIndirect(argsBuffer, argsOffset);
+        return;
+    }
+    if (_passOutlineMask) return;
+
+    // C# only sends opaque, non-fading surfaces; a non-opaque mode here would be sorted per instance, which a GPU-sized
+    // draw cannot be, so it is refused rather than drawn out of order.
+    const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[46], _getUniformI32View(uniformData)[50], _getUniformI32View(uniformData)[51]);
+    if (!modeKey.startsWith('opaque')) return;
+
+    let prevInstanceBuffer = null;
+    if (prevInstanceBytes) {
+        let prevView = prevInstanceBytes;
+        if (prevView instanceof Uint8Array) {
+            prevView = new Float32Array(prevView.buffer, prevView.byteOffset, prevView.byteLength / 4);
+        } else if (!ArrayBuffer.isView(prevView)) {
+            prevView = new Float32Array(prevView);
+        }
+        if (prevView.byteLength > 0) {
+            prevInstanceBuffer = _acquireBuffer('storage', prevView.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+            _device.queue.writeBuffer(prevInstanceBuffer, 0, prevView);
+        }
+    }
+
+    const whiteView = _textureViews['White'];
+    const texView = _textureViews[mesh.textureName] || whiteView;
+    const bindGroup = _createMeshBindGroup(
+        _mesh3DPipeline.bindGroupLayout,
+        _currentViewSlot,
+        uBuffer,
+        texView,
+        _textureViews[mesh.normalTextureName] || whiteView || texView,
+        _textureViews[mesh.mrTextureName] || whiteView || texView,
+        _textureViews[mesh.aoTextureName] || whiteView || texView,
+        _textureViews[mesh.emissiveTextureName] || whiteView || texView,
+        boneBuffer,
+        mesh.morphMetaBuffer,
+        mesh.morphDataBuffer,
+        prevBoneBuffer,
+        prevInstanceBuffer);
+
+    // Opaque collection order ignores depth (_compareSceneDraws), and the compacted rows are not on the CPU anyway, so 0.
+    _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, sortedBuffer, mesh.vBuffer, mesh.iBuffer,
+        mesh.indexFormat || 'uint16', mesh.indexCount, 0, 0, 0,
+        argsBuffer, argsOffset, vertexOffset, vertexBytes);
 }
 
 

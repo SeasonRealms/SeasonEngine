@@ -192,17 +192,41 @@ fn Visibility(p: vec3f,depth: f32,light: i32) -> f32 {
 @compute @workgroup_size(4,4,4) fn CSMain(@builtin(global_invocation_id) id: vec3u) {
     if(all(vec3f(id)<F(10u).xyz)) {
         let ray=Ray((vec2f(id.xy)+0.5)/F(10u).xy); let depth=Z(f32(id.z)+0.5);
+        // A slice near the far end of the range is several metres thick, which is taller than a thin mist patch, so a
+        // single centre sample makes that patch snap between hit and missed as the camera moves. Each volume is
+        // therefore intersected with the ray and its weight scaled by the fraction of the slice it actually fills.
+        let z0=Z(f32(id.z)); let span=max(Z(f32(id.z)+1.0)-z0,1e-6);
         let p=F(8u).xyz+ray*depth; let windP=p-F(13u).xyz; let density=F(11u);
         var sigma=density.x*exp(-density.z*max(p.y-density.y,0.0))*Noise(windP,F(12u).w,density.w);
-        var scattering=F(12u).xyz*sigma; var exclusion=1.0;
+        var scattering=F(12u).xyz*sigma; var exclusion=1.0; var emission=vec3f(0.0);
         for(var i=0u;i<min(u32(F(13u).w),32u);i++) {
-            let base=192u+i*8u; let local=Transform(vec4f(p,1),base).xyz; let shape=F(base+5u); let medium=F(base+4u);
-            let r=select(max(abs(local.x),max(abs(local.y),abs(local.z))),length(local),shape.x>0.5);
-            let edge=Sat((1.0-r)/max(shape.z,1e-6)); let weight=select(0.0,edge*edge*(3.0-2.0*edge),r<1);
+            let base=192u+i*8u; let shape=F(base+5u); let medium=F(base+4u);
+            let lo=Transform(vec4f(F(8u).xyz,1),base).xyz; let ld=Transform(vec4f(ray,0),base).xyz;
+            var t0: f32; var t1: f32;
+            if(shape.x>0.5) {
+                let a=dot(ld,ld); let b=dot(lo,ld); let disc=b*b-a*(dot(lo,lo)-1.0);
+                if(a<=1e-12 || disc<=0.0) { continue; }
+                let s=sqrt(disc); t0=(-b-s)/a; t1=(-b+s)/a;
+            }
+            else {
+                let inv=vec3f(1.0)/ld; let ta=(-1.0-lo)*inv; let tb=(1.0-lo)*inv;
+                let tn=min(ta,tb); let tf=max(ta,tb);
+                t0=max(max(tn.x,tn.y),tn.z); t1=min(min(tf.x,tf.y),tf.z);
+            }
+            t0=max(t0,z0); t1=min(t1,z0+span);
+            if(!(t1>t0)) { continue; }
+            let coverage=(t1-t0)/span; let ts=0.5*(t0+t1);
+            let pl=lo+ld*ts; let pw=F(8u).xyz+ray*ts;
+            let r=select(max(abs(pl.x),max(abs(pl.y),abs(pl.z))),length(pl),shape.x>0.5);
+            let edge=Sat((1.0-r)/max(shape.z,1e-6)); let weight=select(0.0,edge*edge*(3.0-2.0*edge),r<1)*coverage;
             if(shape.y>0.5) { exclusion*=1.0-weight; }
-            else { let d=medium.w*weight*Noise(windP,F(base+6u).x,shape.w); sigma+=d; scattering+=medium.xyz*d; }
+            else {
+                let d=medium.w*weight*Noise(pw-F(13u).xyz,F(base+6u).x,shape.w); sigma+=d; scattering+=medium.xyz*d;
+                emission+=F(base+7u).xyz*d;
+            }
         }
-        let fade=1.0-smoothstep(F(8u).w*0.9,F(8u).w,depth); sigma*=exclusion*fade; scattering*=exclusion*fade;
+        let fade=1.0-smoothstep(F(8u).w*0.9,F(8u).w,depth);
+        sigma*=exclusion*fade; scattering*=exclusion*fade; emission*=exclusion*fade;
         var illumination=F(14u).xyz; let viewRay=normalize(ray); let g=F(9u).w;
         for(var i=0;i<clamp(i32(F(34u).x),0,8);i++) {
             let b=u32(35+i*4); let pos=F(b); let color=F(b+1u); let direction=F(b+2u); let spot=F(b+3u);
@@ -216,7 +240,7 @@ fn Visibility(p: vec3f,depth: f32,light: i32) -> f32 {
             let phase=(1.0-g*g)/(12.5663706144*pow(max(1.0+g*g-2.0*g*dot(viewRay,l),1e-4),1.5));
             illumination+=color.xyz*color.w*attenuation*phase*Visibility(p,depth,i);
         }
-        textureStore(outputVolume,vec3i(id),min(vec4f(scattering*illumination,sigma),vec4f(65000)));
+        textureStore(outputVolume,vec3i(id),min(vec4f(scattering*illumination+emission,sigma),vec4f(65000)));
     }
 }
 """;

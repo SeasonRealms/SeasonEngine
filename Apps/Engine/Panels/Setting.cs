@@ -51,9 +51,9 @@ internal class SettingPanel : BoardPanel
     Input inputPage;
     int page, pageCount = 1;
 
-    Texts textsMode, textsMovement, textsFov, textsDayNightSpeed, textsStartHour, textsStep, textsAntiAliasing, textsGi, textsShadows, textsAo, textsSea, textsWaveHeight, textsWaveSpeed, textsFog, textsFogPreset, textsFogDensity, textsFogQuality, textsFogHistory, textsFogInfo, textsShadowOffset, textsShadowSoftness, textsShadowContact, textsNormalVariance, textsSceneNormals, textsLog;
+    Texts textsMode, textsMovement, textsPlayerSpeed, textsFov, textsDayNightSpeed, textsStartHour, textsStep, textsAntiAliasing, textsGi, textsShadows, textsAo, textsSea, textsWaveHeight, textsWaveSpeed, textsFog, textsFogPreset, textsFogDensity, textsFogQuality, textsFogHistory, textsFogInfo, textsShadowOffset, textsShadowSoftness, textsShadowContact, textsNormalVariance, textsSceneNormals, textsLog;
 
-    Input inputMode, inputMovement, inputFov, inputDayNightSpeed, inputStartHour, inputStep, inputAntiAliasing, inputGi, inputShadows, inputAo, inputSea, inputWaveHeight, inputWaveSpeed, inputFog, inputFogPreset, inputFogDensity, inputFogQuality, inputFogHistory, inputFogInfo, inputShadowOffset, inputShadowSoftness, inputShadowContact, inputNormalVariance, inputSceneNormals, inputLog;
+    Input inputMode, inputMovement, inputPlayerSpeed, inputFov, inputDayNightSpeed, inputStartHour, inputStep, inputAntiAliasing, inputGi, inputShadows, inputAo, inputSea, inputWaveHeight, inputWaveSpeed, inputFog, inputFogPreset, inputFogDensity, inputFogQuality, inputFogHistory, inputFogInfo, inputShadowOffset, inputShadowSoftness, inputShadowContact, inputNormalVariance, inputSceneNormals, inputLog;
 
     BaseControl current = null;
 
@@ -104,6 +104,18 @@ internal class SettingPanel : BoardPanel
             Scale = Vector2.One * 1f
         };
         AddControl(textsMovement);
+
+        // Player travel speed, sited next to the movement mode because the two are read together: the mode says which
+        // rig moves and this says how fast it goes. A multiplier rather than plain metres per second because the player
+        // is driven by two inputs that have to agree - a fixed 0.1 m tap and a time-scaled held key - and only their ratio
+        // expresses one speed for both. 1.00x is the authored baseline, so the row opens where the sample always was.
+        textsPlayerSpeed = new Texts()
+        {
+            Content = "Move speed",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsPlayerSpeed);
 
         textsFov = new Texts()
         {
@@ -493,6 +505,60 @@ internal class SettingPanel : BoardPanel
             }
         };
         AddPanel(inputMovement);
+
+        inputPlayerSpeed = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                // Generated from the range instead of listed out, so the choices offered and the range they are documented
+                // as covering cannot drift apart. Quarters from 0.50x to 3.00x, baseline included, which is eleven entries.
+                var sources = new List<Season.Entities.EData>();
+
+                for (var i = 2; i <= 12; i++)
+                {
+                    var scale = i * 0.25f;
+                    var text = scale.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture);
+
+                    sources.Add(new Season.Entities.EData()
+                    {
+                        Key = text,
+                        Title = text + "x"
+                    });
+                }
+
+                current = inputPlayerSpeed;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null)
+                        {
+                            // Invariant culture because the keys are authored with a dot. Live immediately and not
+                            // persisted, the same as the dolly Step row above: Direction reads the field on every move,
+                            // so there is nothing to rebuild and nothing a restart would have to restore.
+                            App.Instance.playerSpeed = float.Parse(picked.Key,
+                                System.Globalization.CultureInfo.InvariantCulture);
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputPlayerSpeed);
 
         inputFov = new Input()
         {
@@ -1607,7 +1673,7 @@ internal class SettingPanel : BoardPanel
 
         // 同时限制列宽和行高，避免新增天气行后越出面板。短窗口压缩行距，放不下时分页。
         // 非当前页的输入停用且透明，防止看不见的旧位置仍参与命中。
-        const int rowCount = 28;
+        const int rowCount = 29;
         var rowTop = (int)(title.PosY + padding + paddingH);
         var rowWidth = inputLeft + width0 + 100;
         var panelWidth = (int)(width ?? App.Instance.ExtendResolution.X - 200);
@@ -1660,6 +1726,10 @@ internal class SettingPanel : BoardPanel
 
         Place(textsMode, inputMode, App.Instance.Mode.ToString());
         Place(textsMovement, inputMovement, App.Instance.Movement.ToString());
+        // Two decimals because the picker is authored in quarters: printing 1.5 in a box that offers 1.50 would read as a
+        // different resolution than the list the value came from.
+        Place(textsPlayerSpeed, inputPlayerSpeed, App.Instance.playerSpeed.ToString("0.00",
+            System.Globalization.CultureInfo.InvariantCulture) + "x");
         Place(textsFov, inputFov, ((int)(App.Instance.Camera.FovY * 36f * 5 / MathF.PI)).ToString() + "°");
         // The authored rate, not the eased one, so the box does not scroll while a change ramps in. Printed as a bare
         // invariant number with no unit suffix, unlike the row above: this one is fed straight back to ShowKeyboard as

@@ -2758,6 +2758,10 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             var dxInstancedModel = new DXInstancedModel(model.ModelName);
             dxInstancedModel.Load(template, wrapperModel);
 
+            // A7: replay the clips on the instance's own runtime asset before it is published through model.Asset (picking reads
+            // its node tree), since sampling poses it; nothing else holds it yet. The shared template's player is never touched.
+            var cullBounds = dxInstancedModel._asset.ComputeClipUnionBounds(template._asset.Model.LocalBounds);
+
             // v2 picking: inject the instantiated GltfAsset so the node tree, animation, and bone
             // palette share the same source as instanced rendering.
             model.Asset = dxInstancedModel._asset;
@@ -2768,6 +2772,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             // Unified placement convention: likewise backfill the original box
             // (data source for instance anchors and per-axis scaling, before animation expansion).
             model.TemplateLocalBoundsRaw = template._asset.Model.LocalBoundsRaw;
+            model.TemplateCullBounds = cullBounds;
 
             // Fill animation metadata.
             var animNames = dxInstancedModel.GetAnimationNames();

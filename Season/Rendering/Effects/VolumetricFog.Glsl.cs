@@ -197,17 +197,43 @@ void main() {
     uvec3 id=gl_GlobalInvocationID;
     if(all(lessThan(vec3(id),F(10).xyz))) {
         vec3 ray=Ray((vec2(id.xy)+0.5)/F(10).xy); float depth=Z(float(id.z)+0.5);
+        // A slice near the far end of the range is several metres thick, which is taller than a thin mist patch, so a
+        // single centre sample makes that patch snap between hit and missed as the camera moves. Each volume is
+        // therefore intersected with the ray and its weight scaled by the fraction of the slice it actually fills.
+        float z0=Z(float(id.z)),span=max(Z(float(id.z)+1.0)-z0,1e-6);
         vec3 p=F(8).xyz+ray*depth,windP=p-F(13).xyz; vec4 global=F(11);
         float sigma=global.x*exp(-global.z*max(p.y-global.y,0.0))*Noise(windP,F(12).w,global.w);
         vec3 scattering=F(12).xyz*sigma; float exclude=1;
+        // Per-volume self-illumination (row 7): radiance the patch emits regardless of what lights it.
+        vec3 emission=vec3(0.0);
         for(int i=0;i<min(int(F(13).w),32);i++) {
-            int base=192+i*8; vec3 local=Transform(vec4(p,1),base).xyz; vec4 shape=F(base+5),medium=F(base+4);
-            float r=shape.x>0.5?length(local):max(abs(local.x),max(abs(local.y),abs(local.z)));
-            float edge=Sat((1.0-r)/max(shape.z,1e-6)),weight=r<1?edge*edge*(3.0-2.0*edge):0;
+            int base=192+i*8; vec4 shape=F(base+5),medium=F(base+4);
+            vec3 lo=Transform(vec4(F(8).xyz,1),base).xyz,ld=Transform(vec4(ray,0),base).xyz;
+            float t0,t1;
+            if(shape.x>0.5) {
+                float a=dot(ld,ld),b=dot(lo,ld),disc=b*b-a*(dot(lo,lo)-1.0);
+                if(a<=1e-12 || disc<=0.0) continue;
+                float s=sqrt(disc); t0=(-b-s)/a; t1=(-b+s)/a;
+            }
+            else {
+                vec3 inv=vec3(1.0)/ld,ta=(-1.0-lo)*inv,tb=(1.0-lo)*inv;
+                vec3 tn=min(ta,tb),tf=max(ta,tb);
+                t0=max(max(tn.x,tn.y),tn.z); t1=min(min(tf.x,tf.y),tf.z);
+            }
+            t0=max(t0,z0); t1=min(t1,z0+span);
+            if(!(t1>t0)) continue;
+            float coverage=(t1-t0)/span,ts=0.5*(t0+t1);
+            vec3 pl=lo+ld*ts,pw=F(8).xyz+ray*ts;
+            float r=shape.x>0.5?length(pl):max(abs(pl.x),max(abs(pl.y),abs(pl.z)));
+            float edge=Sat((1.0-r)/max(shape.z,1e-6)),weight=(r<1?edge*edge*(3.0-2.0*edge):0.0)*coverage;
             if(shape.y>0.5) exclude*=1.0-weight;
-            else { float d=medium.w*weight*Noise(windP,F(base+6).x,shape.w); sigma+=d; scattering+=medium.xyz*d; }
+            else {
+                float d=medium.w*weight*Noise(pw-F(13).xyz,F(base+6).x,shape.w); sigma+=d; scattering+=medium.xyz*d;
+                emission+=F(base+7).xyz*d;
+            }
         }
-        float fade=1.0-smoothstep(F(8).w*0.9,F(8).w,depth); sigma*=exclude*fade; scattering*=exclude*fade;
+        float fade=1.0-smoothstep(F(8).w*0.9,F(8).w,depth);
+        sigma*=exclude*fade; scattering*=exclude*fade; emission*=exclude*fade;
         vec3 illumination=F(14).xyz,viewRay=normalize(ray); float g=F(9).w;
         for(int i=0;i<clamp(int(F(34).x),0,8);i++) {
             int b=35+i*4; vec4 pos=F(b),color=F(b+1),direction=F(b+2),spot=F(b+3);
@@ -221,7 +247,7 @@ void main() {
             float phase=(1.0-g*g)/(12.5663706144*pow(max(1.0+g*g-2.0*g*dot(viewRay,l),1e-4),1.5));
             illumination+=color.xyz*color.w*attenuation*phase*Visibility(p,depth,i);
         }
-        imageStore(outputVolume,ivec3(id),min(vec4(scattering*illumination,sigma),vec4(65000)));
+        imageStore(outputVolume,ivec3(id),min(vec4(scattering*illumination+emission,sigma),vec4(65000)));
     }
 }
 """;

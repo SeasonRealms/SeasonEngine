@@ -186,6 +186,11 @@ internal static class AbCapture
             }
         // 记录实际重置了几套：为 0 说明归零帧来临时粒子系统还没注册进来，那之后的相位仍然是错的。
         _particleResets = reset;
+
+        // 机器人的动画相位是同一类累积器：它从模型异步加载落地那一帧起按固定步长累加，各轮落地帧不同，
+        // 取证时的姿态就永久错开。主视图 A/B 里跨路径的差异全部落在机器人和它们的影子上，就是这个签名。
+        // 与粒子在同一个固定帧号上重启，才能让它与绘制路径的差异分开。
+        App.Instance?.robots?.RestartAnimations();
     }
 
     /// <summary>
@@ -316,6 +321,11 @@ internal static class AbCapture
                 + $"indirect={(InstanceCullEffect.IndirectGather ? 1 : 0)} "
                 + $"indirectDispatches={InstanceCull.IndirectGatherDispatches} "
                 + $"fixedDispatches={InstanceCull.FixedGatherDispatches} "
+                // The main-view slot is only in the mask when some target asked for the indirect draw path, so this is the cull-side
+                // evidence that a b-run built the segment its InstancedMesh3D bodies are meant to draw from.
+                + $"mainView={(InstanceCull.MainViewCulled ? 1 : 0)} "
+                // mainViewDraws is the draw-side half of that evidence: the slot can be culled while every draw still falls back.
+                + $"mainViewDraws={InstanceCull.MainViewDraws} "
                 + $"a7=(enabled={InstanceCull.Enabled},targets={InstanceCull.Targets.Count},"
                 + $"sun={CascadedShadow.SunActive},spot={CascadedShadow.SpotActive},reuse={CascadedShadow.ReuseActive}) "
                 + $"size={image.Width}x{image.Height}");

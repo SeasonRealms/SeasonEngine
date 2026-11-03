@@ -76,6 +76,8 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     Vector3 _cullLocalCenter;
     Vector3 _cullLocalExtents;
     bool _cullDrawReady;
+    /// <summary>Latched from the owner's draw path once per Update, so the cull record and the draw side of one frame agree on it.</summary>
+    bool _cullMainView;
 
     /// <summary>
     /// Parameter-table signature: one bit per surface, using exactly the same predicate as <c>DrawInstancedMesh3DShadow</c> (opaque + has geometry + uploaded).
@@ -129,6 +131,7 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
             Outline2DMaskColor = default;
             Outline2DMaskWidth = 0f;
             _cullDrawReady = false;
+            _cullMainView = false;
             return;
         }
 
@@ -298,7 +301,13 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSourceWorlds => _cullSource;
 
-    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSortedWorlds => _cullSorted;
+    /// <summary>Single stream: every surface reads the one instance stream, which is also the cull input, so gather reads it straight
+    /// from <see cref="_cullSource"/> and writes the one reordered stream.</summary>
+    int Season.Rendering.IInstanceCullTarget.CullStreamCount => _cullSorted != null ? 1 : 0;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullStreamSource(int stream) => stream == 0 ? _cullSource : null;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullStreamSorted(int stream) => stream == 0 ? _cullSorted : null;
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullPrimitiveInfo => _cullPrimInfo;
 
@@ -309,6 +318,8 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     Vector3 Season.Rendering.IInstanceCullTarget.CullLocalCenter => _cullLocalCenter;
 
     Vector3 Season.Rendering.IInstanceCullTarget.CullLocalExtents => _cullLocalExtents;
+
+    bool Season.Rendering.IInstanceCullTarget.CullMainView => _cullMainView;
 
     /// <summary>Whether this frame can go straight to indirect shadow drawing: false when any of capacity, handles, or the parameter table is not ready.</summary>
     internal bool TryGetCullDrawHandles(out string sortedId, out string argsId, out int capacity)
@@ -328,11 +339,69 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
         return true;
     }
 
+    /// <summary>
+    /// A7 main view: whether the opaque body may draw from the main-view segment right now, and where it is.
+    /// Every condition is a reason the segment would be wrong rather than merely slower, so any miss falls back to the direct draw:
+    /// the owner did not ask for it; this frame's chain did not run or did not include the main-view slot (its args would still
+    /// hold reset's zero instances and the mesh would vanish); the view being drawn is not the one the segment was culled for
+    /// (mirrors, minimaps); or the uploaded parameter table no longer covers the surfaces the caller is about to walk.
+    /// </summary>
+    /// <param name="primitiveMask">
+    /// One bit per surface that has an args record, in the table's own order. The caller must pick indirect surfaces by this mask
+    /// rather than re-evaluating "uploaded", because its loop uploads surfaces as it goes and would otherwise count a surface the
+    /// table does not have.
+    /// </param>
+    internal bool TryGetMainViewDrawHandles(Season.Controls.InstancedMesh3D mesh,
+        out string sortedId, out string argsId, out long vertexOffset, out int slotBytes, out int primitiveMask)
+    {
+        vertexOffset = 0;
+        slotBytes = 0;
+        primitiveMask = 0;
+        if (!_cullMainView || !Season.Rendering.InstanceCull.MainViewCulled
+            || !TryGetCullDrawHandles(out sortedId, out argsId, out int capacity))
+        {
+            sortedId = string.Empty;
+            argsId = string.Empty;
+            return false;
+        }
+        if (!ReferenceEquals(Season.Rendering.RenderView.CurrentOrNull, DeviceServices.BaseApp?.MainView))
+            return false;
+        if (CurrentCullPrimitiveMask(mesh) != _cullPrimMask)
+            return false;
+
+        vertexOffset = (long)Season.Rendering.InstanceCull.MainViewSlot * capacity * Season.Rendering.InstanceCull.WorldStride;
+        slotBytes = capacity * (int)Season.Rendering.InstanceCull.WorldStride;
+        primitiveMask = _cullPrimMask;
+        return true;
+    }
+
+    /// <summary>The surface mask the parameter table would have if it were built now, with the predicate of <see cref="EnsureCullPrimitiveInfo"/>.</summary>
+    int CurrentCullPrimitiveMask(Season.Controls.InstancedMesh3D mesh)
+    {
+        int surfaces = mesh.Surfaces.Count;
+        if (surfaces > 31)
+            return -1;
+        int mask = 0;
+        for (int i = 0; i < surfaces; i++)
+        {
+            var surface = mesh.Surfaces[i];
+            if (surface.Vertices == null || surface.Indices == null || surface.Vertices.Length == 0)
+                continue;
+            if (surface.Mode == SurfaceBlendMode.Blend)
+                continue;
+            if (!SurfaceCaches.TryGetValue(surface, out var cache) || !cache.Uploaded)
+                continue;
+            mask |= 1 << i;
+        }
+        return mask;
+    }
+
     /// <summary>Called once at the end of each frame's Update: only prepares resources. The matrix-stream upload is deferred to the Record phase,
     /// see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>.</summary>
     void UpdateCullUpload(Season.Controls.InstancedMesh3D mesh)
     {
         _cullDrawReady = false;
+        _cullMainView = mesh.EffectiveDrawPath == Season.Controls.InstanceDrawPath.Indirect;
         if (EnabledInstanceCount <= 0)
             return;
 

@@ -9,8 +9,9 @@ namespace Season.Platforms.Web;
 /// Owns the cloned glTF runtime plus per-primitive instance streams.
 /// The current implementation already includes per-instance animation state,
 /// aggregated bone matrices, and morph-weight writes for the unified WGSL pipeline on Web.
+/// A7: also the GPU cull target of the model (see the A7 section below), since the Web side has no primitive-group object to hang it on.
 /// </summary>
-internal sealed class WGPUInstancedModel
+internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
 {
     const int MaxBonesPerInstance = 100;
 
@@ -122,6 +123,43 @@ internal sealed class WGPUInstancedModel
     /// <summary>Bone identifier for a skinned model. When non-null, rendering goes through the skinned path.</summary>
     public string? SkinKey { get; set; }
 
+    // === A7 per-instance GPU culling ===
+    // Same shape as WGPUInstancedMesh3D (JS handles only, uploads deferred to PrepareCullInputs outside any Pass), with the multi-stream
+    // difference of a glTF model: the visibility decision is made once per instance from the root instance world against the model-space
+    // clip-union box (InstancedModel.TemplateCullBounds), while every opaque primitive draws its own instance stream (node world x instance
+    // world, plus its own morph weights), so gather materializes one reordered stream per primitive in the parameter table.
+
+    /// <summary>Position of each primitive in <see cref="_primitives"/>, i.e. its bit in the parameter-table mask. Built once in Load.</summary>
+    readonly Dictionary<WGPUPrimitiveData, int> _primitiveIndex = new();
+    /// <summary>Root instance worlds in write order, 80B per instance like every instance stream (four rows + a zero vec4). None of the
+    /// primitive streams can stand in for it: each one is pre-multiplied by its own node world, which the cull box is not expressed in.</summary>
+    byte[] _cullSourceBytes = Array.Empty<byte>();
+    Season.Rendering.StorageBuffer? _cullSource;
+    Season.Rendering.StorageBuffer? _cullArgs;
+    Season.Rendering.StorageBuffer? _cullVisible;
+    Season.Rendering.StorageBuffer? _cullPrimInfo;
+    /// <summary>Per gather stream, in parameter-table order: the primitive's own instance stream as uploaded for gather to read.</summary>
+    readonly Season.Rendering.StorageBuffer?[] _cullStreamSources = new Season.Rendering.StorageBuffer?[Season.Rendering.InstanceCull.MaxPrimitives];
+    /// <summary>Per gather stream, in parameter-table order: the slot-tiled reordered stream the draw side binds as its instance stream.</summary>
+    readonly Season.Rendering.StorageBuffer?[] _cullStreamSorted = new Season.Rendering.StorageBuffer?[Season.Rendering.InstanceCull.MaxPrimitives];
+    int _cullCapacity = -1;
+    /// <summary>Number of parameter-table entries (and therefore gather streams) already uploaded to the GPU.</summary>
+    int _cullPrimitiveCount = -1;
+    byte[]? _cullPrimPendingBytes;
+    int _cullPrimPendingCount = -1;
+    /// <summary>Uploaded parameter-table signature, one bit per entry of <see cref="_primitives"/>; the draw side derives each primitive's
+    /// args record and reordered stream from it, so it only ever changes together with the table it describes.</summary>
+    int _cullPrimMask = -1;
+    /// <summary>Mask of the table built on the CPU but not uploaded yet (see WGPUInstancedMesh3D for why the two are kept apart).</summary>
+    int _cullPrimPendingMask = -1;
+    readonly int[] _cullPrimIndexCounts = new int[Season.Rendering.InstanceCull.MaxPrimitives];
+    bool _cullRegistered;
+    Vector3 _cullLocalCenter;
+    Vector3 _cullLocalExtents;
+    bool _cullDrawReady;
+    /// <summary>Latched from the owner's draw path once per Update, so the cull record and the draw side of one frame agree on it.</summary>
+    bool _cullMainView;
+
     public WGPUInstancedModel(string name)
     {
         Name = name;
@@ -134,6 +172,9 @@ internal sealed class WGPUInstancedModel
 
         _primitives.Clear();
         _primitives.AddRange(runtimeModel.GetAllPrimitives());
+        _primitiveIndex.Clear();
+        for (int i = 0; i < _primitives.Count; i++)
+            _primitiveIndex[_primitives[i]] = i;
 
         _primitiveStreams.Clear();
         foreach (var primitive in _primitives)
@@ -231,6 +272,8 @@ internal sealed class WGPUInstancedModel
             Outline2DHostActive = false;
             Outline2DMaskColor = default;
             Outline2DMaskWidth = 0f;
+            _cullDrawReady = false;
+            _cullMainView = false;
             return;
         }
 
@@ -252,6 +295,12 @@ internal sealed class WGPUInstancedModel
         bool hasAnimation = _runtimeModel.Asset._animations.Count > 0;
         bool hasSkinning = !string.IsNullOrEmpty(SkinKey) && _skins.Count > 0;
 
+        // A7 cull input: every 80B record is fully overwritten below, so the buffer is only reallocated when the instance count changes.
+        int cullSourceBytes = EnabledInstanceCount * (int)Season.Rendering.InstanceCull.WorldStride;
+        if (_cullSourceBytes.Length != cullSourceBytes)
+            _cullSourceBytes = new byte[cullSourceBytes];
+        var cullRoots = MemoryMarshal.Cast<byte, float>(_cullSourceBytes.AsSpan());
+
         int writeIndex = 0;
         for (int i = 0; i < model.Instances.Count; i++)
         {
@@ -261,6 +310,7 @@ internal sealed class WGPUInstancedModel
 
             // Unified transform pattern: converge on BuildInstanceMatrix (anchor-pivot semantics, see InstancedMesh3DBase).
             var instanceWorld = model.BuildInstanceMatrix(instance);
+            WriteCullRoot(cullRoots, writeIndex, instanceWorld);
 
             RestoreNodesToRestPose();
 
@@ -377,6 +427,9 @@ internal sealed class WGPUInstancedModel
         foreach (var stream in _primitiveStreams.Values)
             FillInstanceBytes(stream);
 
+        // A7: resources and the parameter table only; every upload waits for PrepareCullInputs (writeBuffer is not allowed inside a Pass).
+        UpdateCullUpload(model);
+
         if (hasSkinning)
         {
             // Reinterpret as bytes and write into the persistent buffer to avoid a per-frame ToByteArray allocation.
@@ -393,6 +446,394 @@ internal sealed class WGPUInstancedModel
         TransformInitialized = true;
         PrevBonesReady = wasInitialized && hasSkinning;
         ModelAlpha = model.Alpha;
+    }
+
+    // ============================================================
+    // A7 per-instance GPU culling
+    // ============================================================
+
+    int Season.Rendering.IInstanceCullTarget.CullInstanceCount => EnabledInstanceCount;
+
+    int Season.Rendering.IInstanceCullTarget.CullCapacity => _cullCapacity;
+
+    /// <summary>Falls back to 0 while the parameter table is not yet aligned with the draw side, so the shared layer early-returns and the
+    /// model keeps its direct draws, rather than drawing with a misaligned index range.</summary>
+    int Season.Rendering.IInstanceCullTarget.CullPrimitiveCount => _cullPrimitiveCount;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSourceWorlds => _cullSource;
+
+    /// <summary>One gather stream per parameter-table entry: entry n is the n-th primitive of the uploaded mask, and its reordered stream
+    /// is what that primitive binds when it draws from args record n. Read by the shared layer only after PrepareCullInputs.</summary>
+    int Season.Rendering.IInstanceCullTarget.CullStreamCount => _cullPrimitiveCount > 0 ? _cullPrimitiveCount : 0;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullStreamSource(int stream)
+        => (uint)stream < (uint)_cullStreamSources.Length ? _cullStreamSources[stream] : null;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullStreamSorted(int stream)
+        => (uint)stream < (uint)_cullStreamSorted.Length ? _cullStreamSorted[stream] : null;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullPrimitiveInfo => _cullPrimInfo;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullArgs => _cullArgs;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullVisible => _cullVisible;
+
+    Vector3 Season.Rendering.IInstanceCullTarget.CullLocalCenter => _cullLocalCenter;
+
+    Vector3 Season.Rendering.IInstanceCullTarget.CullLocalExtents => _cullLocalExtents;
+
+    bool Season.Rendering.IInstanceCullTarget.CullMainView => _cullMainView;
+
+    /// <summary>Whether this frame's indirect records exist at all: false when any of capacity, handles, or the parameter table is not ready.
+    /// Which primitives may use them is a separate, per-primitive question (see <see cref="TryGetCullStream"/>).</summary>
+    internal bool TryGetCullDrawHandles(out string argsId, out int capacity)
+    {
+        argsId = string.Empty;
+        capacity = 0;
+        if (!_cullDrawReady || _cullCapacity <= 0 || _cullCapacity < EnabledInstanceCount)
+            return false;
+        if (_cullPrimitiveCount <= 0 || _cullArgs is not WGPUStorageBuffer args)
+            return false;
+        argsId = args.Id;
+        capacity = _cullCapacity;
+        return true;
+    }
+
+    /// <summary>
+    /// A7 main view: whether the opaque body may draw from the main-view segment right now, and where that segment sits in every
+    /// reordered stream. Same reasons to fall back as WGPUInstancedMesh3D (owner did not ask, the chain skipped the main-view slot, or a
+    /// view other than the culled one is being drawn). Unlike the mesh there is no "current mask must equal uploaded mask" check: the
+    /// caller resolves every primitive through <see cref="TryGetCullStream"/>, which reads the uploaded mask itself, so a primitive that
+    /// became drawable after the upload simply has no record and stays direct for one frame instead of shifting everyone's record.
+    /// </summary>
+    internal bool TryGetMainViewDrawHandles(out string argsId, out long vertexOffset, out int slotBytes)
+    {
+        vertexOffset = 0;
+        slotBytes = 0;
+        if (!_cullMainView || !Season.Rendering.InstanceCull.MainViewCulled
+            || !TryGetCullDrawHandles(out argsId, out int capacity))
+        {
+            argsId = string.Empty;
+            return false;
+        }
+        if (!ReferenceEquals(Season.Rendering.RenderView.CurrentOrNull, DeviceServices.BaseApp?.MainView))
+            return false;
+
+        vertexOffset = (long)Season.Rendering.InstanceCull.MainViewSlot * capacity * Season.Rendering.InstanceCull.WorldStride;
+        slotBytes = capacity * (int)Season.Rendering.InstanceCull.WorldStride;
+        return true;
+    }
+
+    /// <summary>
+    /// Resolves a primitive to its parameter-table entry and reordered stream, from the uploaded mask: the entry is the number of masked
+    /// primitives before it, which is exactly the order <see cref="EnsureCullPrimitiveInfo"/> wrote the table and gather wrote the streams in.
+    /// False means the primitive has no record this frame and must take its direct draw.
+    /// </summary>
+    internal bool TryGetCullStream(WGPUPrimitiveData primitive, out string sortedId, out int entry)
+    {
+        sortedId = string.Empty;
+        entry = -1;
+        // A valid mask uses at most bits 0..30, so -1 (abandoned) and 0 (empty) both mean "no records".
+        if (_cullPrimMask <= 0 || _cullPrimitiveCount <= 0)
+            return false;
+        if (!_primitiveIndex.TryGetValue(primitive, out int index) || (_cullPrimMask & (1 << index)) == 0)
+            return false;
+
+        int n = System.Numerics.BitOperations.PopCount((uint)(_cullPrimMask & ((1 << index) - 1)));
+        if (n >= _cullPrimitiveCount || _cullStreamSorted[n] is not WGPUStorageBuffer sorted)
+            return false;
+        sortedId = sorted.Id;
+        entry = n;
+        return true;
+    }
+
+    /// <summary>
+    /// The predicate of a parameter-table entry, identical to the one <c>DrawInstancedModelShadow</c> uses to pick primitives (has geometry,
+    /// skin palette available when skinned, opaque, uploaded) plus having an instance stream to gather. The main view walks a superset of
+    /// these and narrows per primitive through <see cref="TryGetCullStream"/>.
+    /// </summary>
+    bool IsCullPrimitive(WGPUPrimitiveData prim)
+        => prim.VertexData != null && prim.IndexData != null && prim.VertexData.Length > 0
+            && !(prim.HasSkinning && string.IsNullOrEmpty(SkinKey))
+            && !prim.IsTransparent && prim.Uploaded && prim.IndexBytes != null
+            && _primitiveStreams.ContainsKey(prim);
+
+    /// <summary>Called once at the end of each frame's Update: only prepares resources. Every upload is deferred to the Record phase,
+    /// see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>.</summary>
+    void UpdateCullUpload(Season.Controls.InstancedModel model)
+    {
+        _cullDrawReady = false;
+        _cullMainView = model.EffectiveDrawPath == Season.Controls.InstanceDrawPath.Indirect;
+        if (EnabledInstanceCount <= 0)
+            return;
+
+        EnsureCullResources(EnabledInstanceCount);
+        if (_cullSource == null)
+            return;
+
+        // The kernel culls the whole instance once with this box, and every primitive stream only replays that decision, so it must be in
+        // the root instance's model space and cover every clip pose; TemplateCullBounds is that box (the rest box when nothing animates).
+        var bounds = model.TemplateCullBounds;
+        _cullLocalCenter = bounds.Center;
+        _cullLocalExtents = bounds.Extents;
+
+        if (!_cullRegistered)
+        {
+            Season.Rendering.InstanceCull.Register(this);
+            _cullRegistered = true;
+        }
+    }
+
+    /// <summary>
+    /// Prepares the shared cull buffers for the instance count, then the parameter table and its per-entry streams. Capacity is aligned to 64
+    /// as on the mesh; a capacity change rebuilds every stream too, since gather addresses each reordered stream by the same capacity.
+    /// </summary>
+    void EnsureCullResources(int count)
+    {
+        if (!Season.Rendering.InstanceCull.Enabled)
+        {
+            ReleaseCullResources();
+            return;
+        }
+        if (count <= 0)
+            return;
+
+        int capacity = (count + 63) / 64 * 64;
+        if (_cullCapacity != capacity || _cullSource == null)
+        {
+            ReleaseCullResources();
+            try
+            {
+                var g = Season.Basic.Graphics.Instance;
+                _cullSource = g.CreateStorageBuffer((uint)capacity * Season.Rendering.InstanceCull.WorldStride);
+                _cullVisible = g.CreateStorageBuffer((uint)(Season.Rendering.InstanceCull.MaxSlots * capacity) * 4u);
+                _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsBytes,
+                    Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs);
+                _cullPrimInfo = g.CreateStorageBuffer(
+                    (uint)Season.Rendering.InstanceCull.MaxPrimitives * Season.Rendering.InstanceCull.PrimitiveInfoStride);
+            }
+            catch (Exception ex)
+            {
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] Buffer creation failed: {ex.Message}");
+            }
+
+            if (_cullSource == null || _cullVisible == null || _cullArgs == null || _cullPrimInfo == null)
+            {
+                ReleaseCullResources();
+                return;
+            }
+
+            _cullCapacity = capacity;
+            _cullPrimitiveCount = -1;
+            _cullPrimMask = -1;
+        }
+
+        EnsureCullPrimitiveInfo();
+    }
+
+    /// <summary>
+    /// Builds the parameter-table bytes and makes sure every entry has its stream pair, without touching the GPU contents. One entry per
+    /// primitive passing <see cref="IsCullPrimitive"/>, in <see cref="_primitives"/> order. indexCount is counted the way JS does for the
+    /// primitive's own index buffer (IndexBytes reinterpreted by format); startIndex and baseVertex are 0 because every primitive owns its
+    /// vertex and index buffers, so its range always starts at the beginning of them.
+    /// </summary>
+    void EnsureCullPrimitiveInfo()
+    {
+        if (_cullPrimInfo == null)
+            return;
+
+        if (_primitives.Count > 31)
+        {
+            // One bit per primitive is the only way the mask fits; past that the model explicitly leaves GPU culling rather than half-joining it.
+            AbandonCullPrimitiveInfo();
+            return;
+        }
+
+        int mask = 0;
+        int n = 0;
+        for (int i = 0; i < _primitives.Count; i++)
+        {
+            var prim = _primitives[i];
+            if (!IsCullPrimitive(prim))
+                continue;
+            if (n >= Season.Rendering.InstanceCull.MaxPrimitives)
+            {
+                AbandonCullPrimitiveInfo();
+                return;
+            }
+
+            _cullPrimIndexCounts[n] = prim.IndexBytes.Length / (prim.Use32BitIndices ? 4 : 2);
+            mask |= 1 << i;
+            n++;
+        }
+
+        if (mask == _cullPrimPendingMask && _cullPrimPendingCount == n)
+            return;
+
+        if (n <= 0 || !EnsureCullStreams(n))
+        {
+            AbandonCullPrimitiveInfo();
+            return;
+        }
+
+        int stride = (int)Season.Rendering.InstanceCull.PrimitiveInfoStride;
+        var bytes = new byte[n * stride];
+        for (int i = 0; i < n; i++)
+            Season.Rendering.InstanceCull.WritePrimitiveInfo(bytes, i * stride, (uint)_cullPrimIndexCounts[i], 0u, 0);
+
+        _cullPrimPendingBytes = bytes;
+        _cullPrimPendingCount = n;
+        _cullPrimPendingMask = mask;
+    }
+
+    /// <summary>
+    /// Makes sure entries 0..count-1 each have a gather source (this primitive's instance stream, compute-only) and a reordered stream
+    /// (also bound as a vertex buffer, a usage WebGPU bakes in at creation). Streams past count are kept: a primitive that drops out of the
+    /// table and comes back would otherwise rebuild them, and the shared layer only walks CullStreamCount of them.
+    /// </summary>
+    bool EnsureCullStreams(int count)
+    {
+        var g = Season.Basic.Graphics.Instance;
+        for (int s = 0; s < count; s++)
+        {
+            if (_cullStreamSources[s] != null && _cullStreamSorted[s] != null)
+                continue;
+            try
+            {
+                _cullStreamSources[s] ??= g.CreateStorageBuffer((uint)_cullCapacity * Season.Rendering.InstanceCull.WorldStride);
+                _cullStreamSorted[s] ??= g.CreateStorageBuffer(Season.Rendering.InstanceCull.SortedBytes(_cullCapacity),
+                    Season.Rendering.StorageBufferUsage.ComputeAndVertexInput);
+            }
+            catch (Exception ex)
+            {
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] Stream buffer creation failed: {ex.Message}");
+            }
+            if (_cullStreamSources[s] == null || _cullStreamSorted[s] == null)
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>The parameter table is unusable: clear the pending value together with the uploaded value, so the draw side stops resolving
+    /// primitives against a stale table (see WGPUInstancedMesh3D.AbandonCullPrimitiveInfo).</summary>
+    void AbandonCullPrimitiveInfo()
+    {
+        _cullPrimPendingBytes = null;
+        _cullPrimPendingCount = 0;
+        _cullPrimPendingMask = -1;
+        _cullPrimitiveCount = 0;
+        _cullPrimMask = -1;
+    }
+
+    /// <summary>
+    /// A7: uploads the cull CPU-side inputs, called back by InstanceCullEffect outside all Passes: the parameter table when it changed, the
+    /// root worlds, then each entry's primitive stream from the mask just made current, so the streams gather reads always match the table
+    /// it reads them with. Uploads cover this frame's instances only, with no slack.
+    /// </summary>
+    bool Season.Rendering.IInstanceCullTarget.PrepareCullInputs()
+    {
+        int count = EnabledInstanceCount;
+        if (!Season.Rendering.InstanceCull.Enabled || count <= 0)
+            return false;
+
+        var g = Season.Basic.Graphics.Instance;
+
+        if (_cullPrimPendingCount != _cullPrimitiveCount || _cullPrimPendingMask != _cullPrimMask)
+        {
+            if (_cullPrimPendingCount <= 0 || _cullPrimPendingBytes == null || _cullPrimInfo == null)
+                return false;
+            int primBytes = _cullPrimPendingCount * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride;
+            if (!g.TryUpdateStorageBuffer(_cullPrimInfo,
+                    new ReadOnlySpan<byte>(_cullPrimPendingBytes, 0, primBytes)))
+                return false;
+            _cullPrimitiveCount = _cullPrimPendingCount;
+            _cullPrimMask = _cullPrimPendingMask;
+        }
+
+        if (_cullSource == null || _cullPrimitiveCount <= 0 || _cullPrimMask <= 0)
+            return false;
+        int sourceBytes = count * (int)Season.Rendering.InstanceCull.WorldStride;
+        if (sourceBytes > _cullSourceBytes.Length)
+            return false;
+        if (!g.TryUpdateStorageBuffer(_cullSource, new ReadOnlySpan<byte>(_cullSourceBytes, 0, sourceBytes)))
+            return false;
+
+        // Same 80B record as the root worlds, so the per-primitive IA bytes go to gather as they are.
+        int entry = 0;
+        for (int i = 0; i < _primitives.Count && entry < _cullPrimitiveCount; i++)
+        {
+            if ((_cullPrimMask & (1 << i)) == 0)
+                continue;
+            var streamSource = _cullStreamSources[entry];
+            if (streamSource == null || !_primitiveStreams.TryGetValue(_primitives[i], out var stream)
+                || stream.InstanceBytes.Length < sourceBytes)
+                return false;
+            if (!g.TryUpdateStorageBuffer(streamSource, new ReadOnlySpan<byte>(stream.InstanceBytes, 0, sourceBytes)))
+                return false;
+            entry++;
+        }
+        return entry == _cullPrimitiveCount;
+    }
+
+    /// <summary>
+    /// A7: called back by InstanceCullEffect after the dispatches. As on the mesh, WebGPU's command and submission order is the
+    /// synchronization point, so this is only an admission check over the args and every reordered stream the table refers to.
+    /// </summary>
+    public bool PrepareCullDraw()
+    {
+        _cullDrawReady = false;
+        if (_cullArgs is not WGPUStorageBuffer args) return false;
+        if (_cullCapacity <= 0 || _cullPrimitiveCount <= 0) return false;
+        for (int s = 0; s < _cullPrimitiveCount; s++)
+        {
+            if (_cullStreamSorted[s] is not WGPUStorageBuffer) return false;
+        }
+
+        if (!Season.Basic.Graphics.Instance.TryPrepareIndirectArgs(args)) return false;
+
+        _cullDrawReady = true;
+        return true;
+    }
+
+    void ReleaseCullResources()
+    {
+        if (_cullRegistered)
+        {
+            Season.Rendering.InstanceCull.Unregister(this);
+            _cullRegistered = false;
+        }
+        _cullSource?.Dispose(); _cullSource = null;
+        _cullArgs?.Dispose(); _cullArgs = null;
+        _cullVisible?.Dispose(); _cullVisible = null;
+        _cullPrimInfo?.Dispose(); _cullPrimInfo = null;
+        for (int s = 0; s < _cullStreamSources.Length; s++)
+        {
+            _cullStreamSources[s]?.Dispose(); _cullStreamSources[s] = null;
+            _cullStreamSorted[s]?.Dispose(); _cullStreamSorted[s] = null;
+        }
+        _cullCapacity = -1;
+        _cullPrimitiveCount = -1;
+        _cullPrimMask = -1;
+        _cullPrimPendingBytes = null;
+        _cullPrimPendingCount = -1;
+        _cullPrimPendingMask = -1;
+        _cullLocalCenter = Vector3.Zero;
+        _cullLocalExtents = Vector3.Zero;
+        _cullDrawReady = false;
+    }
+
+    /// <summary>On unload, remove the cull target from the shared layer, otherwise the list would keep a reference to dead JS handles.</summary>
+    public void Dispose() => ReleaseCullResources();
+
+    /// <summary>Writes one root instance world as an 80B cull record: four matrix rows plus a zero vec4, the layout of every instance stream.</summary>
+    static void WriteCullRoot(Span<float> data, int index, in Matrix4x4 world)
+    {
+        int o = index * 20;
+        data[o] = world.M11; data[o + 1] = world.M12; data[o + 2] = world.M13; data[o + 3] = world.M14;
+        data[o + 4] = world.M21; data[o + 5] = world.M22; data[o + 6] = world.M23; data[o + 7] = world.M24;
+        data[o + 8] = world.M31; data[o + 9] = world.M32; data[o + 10] = world.M33; data[o + 11] = world.M34;
+        data[o + 12] = world.M41; data[o + 13] = world.M42; data[o + 14] = world.M43; data[o + 15] = world.M44;
+        data[o + 16] = 0f; data[o + 17] = 0f; data[o + 18] = 0f; data[o + 19] = 0f;
     }
 
     void SaveRestPoseSnapshots(List<GltfNodeBase> nodes)

@@ -93,7 +93,12 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     // and it has no usage bits that must be baked in at creation time, so sorted declaring ComputeAndVertexInput is only for the four-backend validation symmetry.
 
     Season.Rendering.StorageBuffer? _cullSource;
-    Season.Rendering.StorageBuffer? _cullSorted;
+    /// <summary>One reorder stream per gather stream (see <see cref="Season.Rendering.IInstanceCullTarget.CullStreamCount"/>): length 1 for a
+    /// group whose primitives share one instance stream, one per opaque primitive when <see cref="CullPerPrimitiveStreams"/>. Empty means no A7.</summary>
+    Season.Rendering.StorageBuffer?[] _cullSorted = Array.Empty<Season.Rendering.StorageBuffer?>();
+    /// <summary>Per-primitive-stream gather sources, parallel to <see cref="_cullSorted"/>. Empty for a single-stream group, whose one gather
+    /// source is the cull input <see cref="_cullSource"/> itself -- uploading the same bytes twice would buy nothing.</summary>
+    Season.Rendering.StorageBuffer?[] _cullStreamSources = Array.Empty<Season.Rendering.StorageBuffer?>();
     Season.Rendering.StorageBuffer? _cullArgs;
     Season.Rendering.StorageBuffer? _cullVisible;
     Season.Rendering.StorageBuffer? _cullPrimInfo;
@@ -109,10 +114,49 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     Vector3 _cullLocalCenter;
     Vector3 _cullLocalExtents;
     bool _cullDrawReady;
+    /// <summary>The owner's effective draw path is <see cref="Season.Controls.InstanceDrawPath.Indirect"/>, latched in Update so the cull dispatch and the draw see the same answer.</summary>
+    bool _cullMainView;
 
     protected MTLInstancedPrimitiveGroup(string name)
     {
         Name = name;
+    }
+
+    /// <summary>
+    /// A7 multi-stream hook. False (default): every primitive reads the one group instance stream, which is also the cull input.
+    /// True: opaque primitive i reads its own instance stream i (a glTF model, whose stream is "node world × instance world" plus that
+    /// primitive's morph weights), so gather materializes one reordered stream per opaque primitive from the shared index table, and
+    /// the derived class supplies each stream's bytes through <see cref="GetCullDrawStream"/>. The cull input stays the base
+    /// <see cref="_instanceData"/>, which the derived class fills with the root instance worlds.
+    /// </summary>
+    protected virtual bool CullPerPrimitiveStreams => false;
+
+    /// <summary>CPU bytes of per-primitive stream <paramref name="stream"/> (index into <see cref="_opaquePrimitives"/>), in the same
+    /// instance order as <see cref="_instanceData"/>. Only called when <see cref="CullPerPrimitiveStreams"/> is true.</summary>
+    protected virtual ReadOnlySpan<InstanceTransformData> GetCullDrawStream(int stream) => default;
+
+    /// <summary>
+    /// The index range the indirect args must replay for <paramref name="primitive"/>. The reset kernel writes it into every slot's
+    /// args and the indirect draw no longer passes a range of its own, so it must come from the same source as the direct draw's
+    /// drawIndexedPrimitives arguments -- a group drawing a sub-range of a shared index buffer overrides this, otherwise its indirect
+    /// draws would replay the whole buffer from index 0. The default mirrors the indexCount every direct call site passes.
+    /// </summary>
+    protected virtual void GetCullPrimitiveRange(PrimitiveData primitive, out uint indexCount, out uint startIndex, out int baseVertex)
+    {
+        indexCount = (uint)primitive.Indices.Length;
+        startIndex = 0u;
+        baseVertex = 0;
+    }
+
+    /// <summary>
+    /// Override the cull box with a caller-computed one. A glTF model must: its primitives' local boxes live in their own node spaces
+    /// and ignore animation, while the kernel transforms the box by the root instance world, so the box has to be in model space and
+    /// cover every pose the clips can reach (see <see cref="Season.Controls.InstancedModel.TemplateCullBounds"/>).
+    /// </summary>
+    protected void SetCullLocalBounds(Season.Rendering.Bounds3D bounds)
+    {
+        _cullLocalCenter = bounds.Center;
+        _cullLocalExtents = bounds.Extents;
     }
 
     protected void RebuildPrimitiveBuckets()
@@ -204,17 +248,41 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
         int fi = Device.FrameIndex;
 
         // 1. Opaque, using the Opaque PSO when overall alpha is at least 1, otherwise using Fade.
-        for (int i = 0; i < _opaquePrimitives.Count; i++)
+        // A7 main view: the opaque body reads the culled, compacted main-view segment and takes its instance count from the
+        // indirect args. Fade stays direct: a GPU-sized draw cannot be split per instance, and a fading group is about to
+        // change visibility anyway.
+        if (!forceFadeByAlpha && TryGetMainViewSegment(0, out var sortedBuffer, out nuint segmentOffset, out var argsBuffer))
         {
-            var primitive = _opaquePrimitives[i];
-            Pipeline.SetPipeline(enc, forceFadeByAlpha ? PipelineMode.Fade : PipelineMode.Opaque, primitive.DoubleSided);
-            Pipeline.DrawPrimitive(enc, primitive, primitive.VertexBuffer, primitive.IndexBuffer,
-                primitive.MatrixBuffers[fi], primitive.MaterialBuffers[fi],
+            for (int i = 0; i < _opaquePrimitives.Count; i++)
+            {
+                var primitive = _opaquePrimitives[i];
+                Pipeline.SetPipeline(enc, PipelineMode.Opaque, primitive.DoubleSided);
+                Pipeline.DrawPrimitive(enc, primitive, primitive.VertexBuffer, primitive.IndexBuffer,
+                    primitive.MatrixBuffers[fi], primitive.MaterialBuffers[fi],
                     LightConstantBuffers[fi], IdentityBoneBuffers[fi], primitive.MorphDeltasBuffer ?? DefaultMorphDeltasBuffers[fi], IdentityInstanceBoneBuffers[fi],
-                MTLPrimitiveType.Triangle, (nuint)primitive.Indices.Length,
+                    MTLPrimitiveType.Triangle, (nuint)primitive.Indices.Length,
                     primitive.Use32BitIndices ? MTLIndexType.UInt32 : MTLIndexType.UInt16, 0,
-                    _instanceBuffer, 0, (nuint)_instanceCount, 0,
-                    PrevInstanceBuffer);
+                    sortedBuffer, segmentOffset, 0, 0,
+                    PrevInstanceBuffer,
+                    indirectBuffer: argsBuffer,
+                    indirectOffset: Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i));
+                Season.Rendering.InstanceCull.MainViewDraws++;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < _opaquePrimitives.Count; i++)
+            {
+                var primitive = _opaquePrimitives[i];
+                Pipeline.SetPipeline(enc, forceFadeByAlpha ? PipelineMode.Fade : PipelineMode.Opaque, primitive.DoubleSided);
+                Pipeline.DrawPrimitive(enc, primitive, primitive.VertexBuffer, primitive.IndexBuffer,
+                    primitive.MatrixBuffers[fi], primitive.MaterialBuffers[fi],
+                        LightConstantBuffers[fi], IdentityBoneBuffers[fi], primitive.MorphDeltasBuffer ?? DefaultMorphDeltasBuffers[fi], IdentityInstanceBoneBuffers[fi],
+                    MTLPrimitiveType.Triangle, (nuint)primitive.Indices.Length,
+                        primitive.Use32BitIndices ? MTLIndexType.UInt32 : MTLIndexType.UInt16, 0,
+                        _instanceBuffer, 0, (nuint)_instanceCount, 0,
+                        PrevInstanceBuffer);
+            }
         }
 
         // 2. Transparent, for true BLEND materials drawn per instance from back to front.
@@ -262,6 +330,62 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     }
 
     /// <summary>
+    /// A7: whether the opaque body may draw from the main-view segment right now, and where it is.
+    /// Every condition is a reason the segment would be wrong rather than merely slower, so any miss falls back to the direct draw:
+    /// the owner did not ask for it; this frame's chain did not run or did not include the main-view slot (its args would still
+    /// hold reset's zero instances and the group would vanish); or the view being drawn is not the one the segment was culled for
+    /// (mirrors, minimaps).
+    /// <paramref name="stream"/> is the gather stream: 0 for a single-stream group, the opaque-primitive index for a per-primitive one.
+    /// </summary>
+    protected bool TryGetMainViewSegment(int stream, out IMTLBuffer sortedBuffer, out nuint segmentOffset, out IMTLBuffer argsBuffer)
+    {
+        sortedBuffer = null!;
+        segmentOffset = 0;
+        argsBuffer = null!;
+        if (!_cullMainView || !_cullDrawReady || !Season.Rendering.InstanceCull.MainViewCulled || _cullCapacity < _instanceCount)
+            return false;
+        if (!ReferenceEquals(RenderView.CurrentOrNull, DeviceServices.BaseApp?.MainView))
+            return false;
+        if ((uint)stream >= (uint)_cullSorted.Length
+            || _cullSorted[stream] is not MTLStorageBuffer sorted || sorted.Buffer == null
+            || _cullArgs is not MTLStorageBuffer args || args.Buffer == null)
+            return false;
+
+        sortedBuffer = sorted.Buffer;
+        segmentOffset = (nuint)Season.Rendering.InstanceCull.MainViewSlot * (nuint)_cullCapacity
+            * Season.Rendering.InstanceCull.WorldStride;
+        argsBuffer = args.Buffer;
+        return true;
+    }
+
+    /// <summary>
+    /// A7 shadow: when this frame's culling chain is ready, the slot segment of gather stream <paramref name="stream"/> for the shadow
+    /// view being drawn (<see cref="Season.Rendering.CascadedShadow.ActiveSlot"/>) and the args buffer its counts come from. Any miss
+    /// falls back to the direct whole-batch shadow draw, never to an empty one.
+    /// The segment is selected by the SetVertexBuffer offset, not by baseInstance, matching the main-view segment.
+    /// </summary>
+    protected bool TryGetShadowSegment(int stream, out IMTLBuffer sortedBuffer, out nuint instanceOffset, out IMTLBuffer argsBuffer, out int slot)
+    {
+        sortedBuffer = null!;
+        instanceOffset = 0;
+        argsBuffer = null!;
+        slot = Season.Rendering.CascadedShadow.ActiveSlot;
+        if (!_cullDrawReady || _cullCapacity < _instanceCount)
+            return false;
+        if (slot < 0 || slot >= Season.Rendering.InstanceCull.MaxSlots)
+            return false;
+        if ((uint)stream >= (uint)_cullSorted.Length
+            || _cullSorted[stream] is not MTLStorageBuffer sorted || sorted.Buffer == null
+            || _cullArgs is not MTLStorageBuffer args || args.Buffer == null)
+            return false;
+
+        sortedBuffer = sorted.Buffer;
+        instanceOffset = (nuint)slot * (nuint)_cullCapacity * Season.Rendering.InstanceCull.WorldStride;
+        argsBuffer = args.Buffer;
+        return true;
+    }
+
+    /// <summary>
     /// Instanced shadow rendering for 1-5, drawing all instances in one draw call.
     /// Only opaque buckets are rendered because true BLEND materials do not cast shadows under contract clause 7.
     /// The shadow PSO is already bound by RenderShadowPass, so this path neither switches PSOs nor sorts.
@@ -281,29 +405,21 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
 
         // A7: when the whole group takes the indirect path, index count / instance count / baseVertex all come from the GPU-side parameter buffer,
         // and the instance stream is replaced by the reorder block produced by gather -- segmented by slot, so the offset is set on SetVertexBuffer.
-        if (_cullDrawReady && _cullCapacity >= _instanceCount
-            && _cullSorted is MTLStorageBuffer sorted && sorted.Buffer != null
-            && _cullArgs is MTLStorageBuffer args && args.Buffer != null)
+        if (TryGetShadowSegment(0, out var sortedBuffer, out nuint instanceOffset, out var argsBuffer, out int slot))
         {
-            int slot = Season.Rendering.CascadedShadow.ActiveSlot;
-            if (slot >= 0 && slot < Season.Rendering.InstanceCull.MaxSlots)
+            for (int i = 0; i < _opaquePrimitives.Count; i++)
             {
-                nuint instanceOffset = (nuint)slot * (nuint)_cullCapacity
-                    * Season.Rendering.InstanceCull.WorldStride;
-                for (int i = 0; i < _opaquePrimitives.Count; i++)
-                {
-                    var primitive = _opaquePrimitives[i];
-                    Pipeline.DrawShadowPrimitiveIndirect(enc, primitive, primitive.VertexBuffer, primitive.IndexBuffer,
-                        primitive.MatrixBuffers[fi], primitive.MaterialBuffers[fi], IdentityBoneBuffers[fi],
-                        primitive.MorphDeltasBuffer ?? DefaultMorphDeltasBuffers[fi], IdentityInstanceBoneBuffers[fi],
-                        primitive.Use32BitIndices ? MTLIndexType.UInt32 : MTLIndexType.UInt16,
-                        sorted.Buffer, instanceOffset, args.Buffer,
-                        Season.Rendering.InstanceCull.ArgsOffset(slot, i),
-                        bindMaterial: !shareMaterial || !materialBound);
-                    materialBound = true;
-                }
-                return;
+                var primitive = _opaquePrimitives[i];
+                Pipeline.DrawShadowPrimitiveIndirect(enc, primitive, primitive.VertexBuffer, primitive.IndexBuffer,
+                    primitive.MatrixBuffers[fi], primitive.MaterialBuffers[fi], IdentityBoneBuffers[fi],
+                    primitive.MorphDeltasBuffer ?? DefaultMorphDeltasBuffers[fi], IdentityInstanceBoneBuffers[fi],
+                    primitive.Use32BitIndices ? MTLIndexType.UInt32 : MTLIndexType.UInt16,
+                    sortedBuffer, instanceOffset, argsBuffer,
+                    Season.Rendering.InstanceCull.ArgsOffset(slot, i),
+                    bindMaterial: !shareMaterial || !materialBound);
+                materialBound = true;
             }
+            return;
         }
 
         for (int i = 0; i < _opaquePrimitives.Count; i++)
@@ -412,7 +528,14 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSourceWorlds => _cullSource;
 
-    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSortedWorlds => _cullSorted;
+    int Season.Rendering.IInstanceCullTarget.CullStreamCount => _cullSorted.Length;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullStreamSource(int stream)
+        => _cullStreamSources.Length == 0 ? (stream == 0 ? _cullSource : null)
+            : (uint)stream < (uint)_cullStreamSources.Length ? _cullStreamSources[stream] : null;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullStreamSorted(int stream)
+        => (uint)stream < (uint)_cullSorted.Length ? _cullSorted[stream] : null;
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullPrimitiveInfo => _cullPrimInfo;
 
@@ -424,13 +547,16 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
 
     Vector3 Season.Rendering.IInstanceCullTarget.CullLocalExtents => _cullLocalExtents;
 
+    bool Season.Rendering.IInstanceCullTarget.CullMainView => _cullMainView;
+
     /// <summary>
     /// Derived classes call this after uploading the instance stream, to prepare resources only. The matrix stream upload is deferred to the Record phase: during a control's Update stage
     /// the render encoder may still be open, in which case CreateBlitCommandEncoder fails outright, the upload is discarded, and only one log line remains.
     /// </summary>
-    protected void UpdateCullUpload()
+    protected void UpdateCullUpload(Season.Controls.InstancedMesh3DBase owner)
     {
         _cullDrawReady = false;
+        _cullMainView = owner.EffectiveDrawPath == Season.Controls.InstanceDrawPath.Indirect;
         if (_instanceCount <= 0)
             return;
 
@@ -440,6 +566,9 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     /// <summary>
     /// Prepare cull resources according to the instance count. Capacity is aligned to 64, so a small jitter in instance count does not rebuild the five buffers every frame;
     /// but the capacity reported through the interface must be the true capacity, otherwise the index table would be addressed by this frame's instance count and become misaligned with the kernel's writes.
+    /// A per-primitive-stream group also rebuilds when its opaque-primitive count changes, since each of those owns a stream pair; a
+    /// group with more primitives than <see cref="Season.Rendering.InstanceCull.MaxPrimitives"/>, or with no opaque primitive at all,
+    /// cannot join and releases instead, so it keeps the direct path rather than registering buffers nothing will read.
     /// </summary>
     void EnsureCullResources(int count)
     {
@@ -452,16 +581,33 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
         if (count <= 0)
             return;
 
-        int capacity = (count + 63) / 64 * 64;
-        if (_cullCapacity != capacity || _cullSorted == null)
+        bool perPrimitive = CullPerPrimitiveStreams;
+        int streams = perPrimitive ? _opaquePrimitives.Count : 1;
+        if (perPrimitive && (streams <= 0 || streams > Season.Rendering.InstanceCull.MaxPrimitives))
         {
             ReleaseCullResources();
+            return;
+        }
+
+        int capacity = (count + 63) / 64 * 64;
+        if (_cullCapacity != capacity || _cullSorted.Length != streams
+            || _cullStreamSources.Length != (perPrimitive ? streams : 0))
+        {
+            ReleaseCullResources();
+            var sorted = new Season.Rendering.StorageBuffer?[streams];
+            var streamSources = perPrimitive ? new Season.Rendering.StorageBuffer?[streams] : Array.Empty<Season.Rendering.StorageBuffer?>();
+            bool complete = true;
             try
             {
                 var g = Season.Basic.Graphics.Instance;
                 _cullSource = g.CreateStorageBuffer((uint)capacity * Season.Rendering.InstanceCull.WorldStride);
-                _cullSorted = g.CreateStorageBuffer(Season.Rendering.InstanceCull.SortedBytes(capacity),
-                    Season.Rendering.StorageBufferUsage.ComputeAndVertexInput);
+                for (int s = 0; s < streams; s++)
+                {
+                    sorted[s] = g.CreateStorageBuffer(Season.Rendering.InstanceCull.SortedBytes(capacity),
+                        Season.Rendering.StorageBufferUsage.ComputeAndVertexInput);
+                    if (perPrimitive)
+                        streamSources[s] = g.CreateStorageBuffer((uint)capacity * Season.Rendering.InstanceCull.WorldStride);
+                }
                 _cullVisible = g.CreateStorageBuffer((uint)(Season.Rendering.InstanceCull.MaxSlots * capacity) * 4u);
                 _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsBytes,
                     Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs);
@@ -473,7 +619,15 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
                 DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] Buffer creation failed: {ex.Message}");
             }
 
-            if (_cullSource == null || _cullSorted == null || _cullVisible == null
+            // Hand the arrays over before checking, so a partial failure is released through the one path below.
+            _cullSorted = sorted;
+            _cullStreamSources = streamSources;
+            foreach (var b in sorted)
+                complete &= b != null;
+            foreach (var b in streamSources)
+                complete &= b != null;
+
+            if (!complete || _cullSource == null || _cullVisible == null
                 || _cullArgs == null || _cullPrimInfo == null)
             {
                 ReleaseCullResources();
@@ -497,7 +651,7 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     /// Construct the parameter-table bytes only, without touching the GPU -- the safe timing for construction and upload differs: construction can happen at any time,
     /// while the upload must wait until a blit encoder can be opened (see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>).
     /// If the primitive set is unchanged, do not rebuild. The index range and the draw side must share the same source: the reset kernel writes this
-    /// indexCount into the indirect parameters, and the draw side no longer supplies the index count itself.
+    /// range into the indirect parameters, and the draw side no longer supplies it itself -- hence <see cref="GetCullPrimitiveRange"/>.
     /// </summary>
     void EnsureCullPrimitiveInfo()
     {
@@ -519,10 +673,10 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
         var bytes = new byte[n * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride];
         for (int i = 0; i < n; i++)
         {
-            var primitive = _opaquePrimitives[i];
+            GetCullPrimitiveRange(_opaquePrimitives[i], out uint indexCount, out uint startIndex, out int baseVertex);
             Season.Rendering.InstanceCull.WritePrimitiveInfo(bytes,
                 i * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride,
-                (uint)primitive.Indices.Length, 0u, 0);
+                indexCount, startIndex, baseVertex);
         }
 
         _cullPrimInfoBytes = bytes;
@@ -534,7 +688,8 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     /// that phase is outside all Passes -- Metal's compute and render encoders are mutually exclusive,
     /// and opening a blit encoder while a render encoder is open is bound to fail, so this is this backend's only reliable upload timing.
     /// The input is bit-for-bit identical to the IA instance stream (both are InstanceTransformData, stride 80 matching WorldStride),
-    /// so the same array is reused directly without storing an extra copy.
+    /// so the same array is reused directly without storing an extra copy. A per-primitive-stream group additionally uploads each
+    /// primitive's own stream as that stream's gather source (see <see cref="CullPerPrimitiveStreams"/>).
     /// </summary>
     bool Season.Rendering.IInstanceCullTarget.PrepareCullInputs()
     {
@@ -555,8 +710,22 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
         }
 
         // The matrix stream changes every frame, so only the valid segment is uploaded, with no slack left.
-        return _cullSource != null && g.TryUpdateStorageBuffer(_cullSource,
-            MemoryMarshal.AsBytes(_instanceData.AsSpan(0, _instanceCount)));
+        if (_cullSource == null || !g.TryUpdateStorageBuffer(_cullSource,
+                MemoryMarshal.AsBytes(_instanceData.AsSpan(0, _instanceCount))))
+            return false;
+
+        // Per-primitive streams: gather replays the one visibility decision onto each primitive's own stream, so each must hold
+        // this frame's instances in the cull input's order. A stream shorter than the instance count would make gather read past
+        // what the CPU wrote, so the whole group skips A7 this frame instead.
+        for (int s = 0; s < _cullStreamSources.Length; s++)
+        {
+            var data = GetCullDrawStream(s);
+            var source = _cullStreamSources[s];
+            if (source == null || data.Length < _instanceCount
+                || !g.TryUpdateStorageBuffer(source, MemoryMarshal.AsBytes(data.Slice(0, _instanceCount))))
+                return false;
+        }
+        return true;
     }
 
     /// <summary>
@@ -568,8 +737,13 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     public bool PrepareCullDraw()
     {
         _cullDrawReady = false;
-        if (_cullSorted is not MTLStorageBuffer sorted || sorted.Buffer == null)
+        if (_cullSorted.Length == 0)
             return false;
+        foreach (var s in _cullSorted)
+        {
+            if (s is not MTLStorageBuffer sorted || sorted.Buffer == null)
+                return false;
+        }
         if (_cullArgs is not MTLStorageBuffer args || args.Buffer == null)
             return false;
         if (_cullCapacity <= 0)
@@ -582,7 +756,7 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
         return true;
     }
 
-    void ReleaseCullResources()
+    protected void ReleaseCullResources()
     {
         if (_cullRegistered)
         {
@@ -590,7 +764,12 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
             _cullRegistered = false;
         }
         _cullSource?.Dispose(); _cullSource = null;
-        _cullSorted?.Dispose(); _cullSorted = null;
+        foreach (var s in _cullSorted)
+            s?.Dispose();
+        _cullSorted = Array.Empty<Season.Rendering.StorageBuffer?>();
+        foreach (var s in _cullStreamSources)
+            s?.Dispose();
+        _cullStreamSources = Array.Empty<Season.Rendering.StorageBuffer?>();
         _cullArgs?.Dispose(); _cullArgs = null;
         _cullVisible?.Dispose(); _cullVisible = null;
         _cullPrimInfo?.Dispose(); _cullPrimInfo = null;

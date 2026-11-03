@@ -77,7 +77,12 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     // are null this group does not participate in A7, and shadows fall back to whole-batch CPU culling rather
     // than drawing with empty buffers.
     Season.Rendering.StorageBuffer? _cullSource;
-    Season.Rendering.StorageBuffer? _cullSorted;
+    /// <summary>One reorder stream per gather stream (see <see cref="Season.Rendering.IInstanceCullTarget.CullStreamCount"/>): length 1 for a
+    /// group whose primitives share one instance stream, one per opaque primitive when <see cref="CullPerPrimitiveStreams"/>. Empty means no A7.</summary>
+    Season.Rendering.StorageBuffer?[] _cullSorted = Array.Empty<Season.Rendering.StorageBuffer?>();
+    /// <summary>Per-primitive-stream gather sources, parallel to <see cref="_cullSorted"/>. Empty for a single-stream group, whose one gather
+    /// source is the cull input <see cref="_cullSource"/> itself -- uploading the same bytes twice would buy nothing.</summary>
+    Season.Rendering.StorageBuffer?[] _cullStreamSources = Array.Empty<Season.Rendering.StorageBuffer?>();
     Season.Rendering.StorageBuffer? _cullArgs;
     Season.Rendering.StorageBuffer? _cullVisible;
     Season.Rendering.StorageBuffer? _cullPrimInfo;
@@ -97,6 +102,35 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
 
     /// <summary>Whether this frame has transitioned the reorder stream and indirect args into a drawable state. Cleared at the start of Update, set by PrepareCullDraw.</summary>
     bool _cullDrawReady;
+
+    /// <summary>The owner's effective draw path is <see cref="InstanceDrawPath.Indirect"/>, latched in Update so the cull dispatch and the draw see the same answer.</summary>
+    bool _cullMainView;
+
+    /// <summary>
+    /// A7 multi-stream hook. False (default): every primitive reads the one group instance stream, which is also the cull input.
+    /// True: opaque primitive i reads its own instance stream i (a glTF model, whose stream is "node world × instance world" plus that
+    /// primitive's morph weights), so gather materializes one reordered stream per opaque primitive from the shared index table, and
+    /// the derived class supplies each stream's bytes through <see cref="GetCullDrawStream"/>. The cull input stays the base
+    /// <see cref="_instanceData"/>, which the derived class fills with the root instance worlds.
+    /// </summary>
+    protected virtual bool CullPerPrimitiveStreams => false;
+
+    /// <summary>CPU bytes of per-primitive stream <paramref name="stream"/> (index into <see cref="_opaquePrimitives"/>), in the same
+    /// instance order as <see cref="_instanceData"/>. Only called when <see cref="CullPerPrimitiveStreams"/> is true.</summary>
+    protected virtual ReadOnlySpan<InstanceTransformData> GetCullDrawStream(int stream) => default;
+
+    /// <summary>
+    /// The index range the indirect args must replay for <paramref name="primitive"/>. The reset kernel writes it into every slot's
+    /// args and the indirect draw no longer passes a range of its own, so it must come from the same source as the direct draw's
+    /// DrawIndexedInstanced arguments -- a group drawing a sub-range of a shared index buffer overrides this, otherwise its
+    /// indirect draws would replay the whole buffer from index 0. The default mirrors <see cref="Pipeline.DrawPrimitive"/>.
+    /// </summary>
+    protected virtual void GetCullPrimitiveRange(PrimitiveData primitive, out uint indexCount, out uint startIndex, out int baseVertex)
+    {
+        indexCount = (uint)primitive.Indices.Length;
+        startIndex = 0u;
+        baseVertex = 0;
+    }
 
     protected DXInstancedPrimitiveGroup(string name)
     {
@@ -157,6 +191,27 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         }
 
         UpdateCullLocalBounds();
+    }
+
+    /// <summary>
+    /// Override the cull box with a caller-computed one. A glTF model must: its primitives' local boxes live in their own node spaces
+    /// and ignore animation, while the kernel transforms the box by the root instance world, so the box has to be in model space and
+    /// cover every pose the clips can reach (see <see cref="InstancedModel.TemplateCullBounds"/>).
+    /// </summary>
+    protected void SetCullLocalBounds(Season.Rendering.Bounds3D bounds)
+    {
+        _cullLocalCenter = bounds.Center;
+        _cullLocalExtents = bounds.Extents;
+    }
+
+    /// <summary>
+    /// Latch this frame's A7 state at the top of Update. The transition state is recomputed each frame: last frame's true must not
+    /// keep authorizing this frame's indirect draw.
+    /// </summary>
+    protected void BeginCullFrame(InstancedMesh3DBase owner)
+    {
+        _cullDrawReady = false;
+        _cullMainView = owner.EffectiveDrawPath == InstanceDrawPath.Indirect;
     }
 
     /// <summary>
@@ -274,8 +329,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         bool wasInitialized = _transformInitialized;
         _wireframeActive = false;
         _instanceCount = 0;
-        // The transition state is recomputed each frame: last frame's true must not keep authorizing this frame's indirect draw.
-        _cullDrawReady = false;
+        BeginCullFrame(owner);
 
         // Unified highlighting: clear this frame's per-instance draw lists
         // (rebuilt every frame; _boundsActive / _wireframeActive are set by the
@@ -577,12 +631,33 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         bool forceFadeByAlpha = _currentAlpha < 1f;
 
         // 1. Opaque (use the Opaque PSO when overall alpha >= 1, otherwise Fade)
-        for (int i = 0; i < _opaquePrimitives.Count; i++)
+        // A7 main view: the opaque body reads the culled, compacted main-view segment and takes its instance count from the
+        // indirect args. Fade stays direct: the scene collector splits a Fade draw per instance for back-to-front order,
+        // which a GPU-sized draw cannot be, and a fading group is about to change visibility anyway.
+        if (!forceFadeByAlpha && TryGetMainViewSegment(0, out var segment, out var sortedResource, out var argsResource))
         {
-            var primitive = _opaquePrimitives[i];
-            Pipeline.SetPipeline(forceFadeByAlpha ? PipelineMode.Fade : PipelineMode.Opaque, primitive.DoubleSided);
-            OnBeforeDraw();
-            DrawPrimitiveInstances(primitive, lightCB, (uint)_instanceCount, 0);
+            int fiMain = (int)Device.FrameIndex;
+            for (int i = 0; i < _opaquePrimitives.Count; i++)
+            {
+                var primitive = _opaquePrimitives[i];
+                Pipeline.SetPipeline(PipelineMode.Opaque, primitive.DoubleSided);
+                OnBeforeDraw();
+                Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fiMain], &segment, 0, 0,
+                    GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(),
+                    sortedResource, argsResource,
+                    Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i), _instanceBuffer);
+                Season.Rendering.InstanceCull.MainViewDraws++;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < _opaquePrimitives.Count; i++)
+            {
+                var primitive = _opaquePrimitives[i];
+                Pipeline.SetPipeline(forceFadeByAlpha ? PipelineMode.Fade : PipelineMode.Opaque, primitive.DoubleSided);
+                OnBeforeDraw();
+                DrawPrimitiveInstances(primitive, lightCB, (uint)_instanceCount, 0);
+            }
         }
 
         // 2. Transparent (actual BLEND materials)
@@ -648,6 +723,73 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     }
 
     /// <summary>
+    /// A7: whether the opaque body may draw from the main-view segment right now, and where it is.
+    /// Every condition is a reason the segment would be wrong rather than merely slower, so any miss falls back to the direct draw:
+    /// the owner did not ask for it; this frame's chain did not run or did not include the main-view slot (its args would still
+    /// hold reset's zero instances and the group would vanish); the view being drawn is not the one the segment was culled for
+    /// (mirrors, minimaps); or the command signature could not be created.
+    /// <paramref name="stream"/> is the gather stream: 0 for a single-stream group, the opaque-primitive index for a per-primitive one.
+    /// </summary>
+    protected bool TryGetMainViewSegment(int stream, out VertexBufferView segment, out ID3D12Resource* sortedResource, out ID3D12Resource* argsResource)
+    {
+        segment = default;
+        sortedResource = null;
+        argsResource = null;
+        if (!_cullMainView || !_cullDrawReady || !Season.Rendering.InstanceCull.MainViewCulled || _cullCapacity < _instanceCount)
+            return false;
+        if (!ReferenceEquals(RenderView.CurrentOrNull, DeviceServices.BaseApp?.MainView))
+            return false;
+        if ((uint)stream >= (uint)_cullSorted.Length
+            || _cullSorted[stream] is not DXStorageBuffer sorted || sorted.Resource == null
+            || _cullArgs is not DXStorageBuffer args || args.Resource == null)
+            return false;
+        if (Pipeline.EnsureShadowIndirectSignature() == null)
+            return false;
+
+        segment = new VertexBufferView
+        {
+            BufferLocation = sorted.Resource->GetGPUVirtualAddress()
+                + (ulong)(Season.Rendering.InstanceCull.MainViewSlot * _cullCapacity) * Season.Rendering.InstanceCull.WorldStride,
+            SizeInBytes = (uint)_cullCapacity * Season.Rendering.InstanceCull.WorldStride,
+            StrideInBytes = Season.Rendering.InstanceCull.WorldStride,
+        };
+        sortedResource = sorted.Resource;
+        argsResource = args.Resource;
+        return true;
+    }
+
+    /// <summary>
+    /// A7 shadow: when this frame's culling chain is ready, the slot segment of gather stream <paramref name="stream"/> for the shadow
+    /// view being drawn (<see cref="Season.Rendering.CascadedShadow.ActiveSlot"/>) and the args buffer its counts come from. Any miss
+    /// falls back to the direct whole-batch shadow draw, never to an empty one.
+    /// </summary>
+    protected bool TryGetShadowSegment(int stream, out VertexBufferView slotView, out ID3D12Resource* argsResource, out int slot)
+    {
+        slotView = default;
+        argsResource = null;
+        slot = Season.Rendering.CascadedShadow.ActiveSlot;
+        if (!_cullDrawReady || _cullCapacity < _instanceCount)
+            return false;
+        if (slot < 0 || slot >= Season.Rendering.InstanceCull.MaxSlots)
+            return false;
+        if ((uint)stream >= (uint)_cullSorted.Length
+            || _cullSorted[stream] is not DXStorageBuffer sorted || sorted.Resource == null
+            || _cullArgs is not DXStorageBuffer args || args.Resource == null)
+            return false;
+
+        // Slot segment: capacity is in instances, 80 bytes per instance, one definition across all four backends.
+        slotView = new VertexBufferView
+        {
+            BufferLocation = sorted.Resource->GetGPUVirtualAddress()
+                + (ulong)(slot * _cullCapacity) * Season.Rendering.InstanceCull.WorldStride,
+            SizeInBytes = (uint)_cullCapacity * Season.Rendering.InstanceCull.WorldStride,
+            StrideInBytes = Season.Rendering.InstanceCull.WorldStride,
+        };
+        argsResource = args.Resource;
+        return true;
+    }
+
+    /// <summary>
     /// 1-5 shadow pass: draw all opaque primitives for all instances in one
     /// batch, with no culling and no sorting. Transparent buckets are skipped.
     /// Uses the same group-level Matrix CB + instance buffer as the main pass.
@@ -675,31 +817,16 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         // the instance count comes from the indirect args. The parameter table is addressed at a fixed length per
         // (slot, primitive), so one ExecuteIndirect still maps to exactly one primitive: indirect only changes
         // where the parameters come from, it does not merge draws.
-        if (_cullDrawReady && _cullCapacity >= _instanceCount
-            && _cullSorted is DXStorageBuffer sorted && sorted.Resource != null
-            && _cullArgs is DXStorageBuffer args && args.Resource != null)
+        if (TryGetShadowSegment(0, out var slotView, out var argsResource, out int slot))
         {
-            int slot = Season.Rendering.CascadedShadow.ActiveSlot;
-            if (slot >= 0 && slot < Season.Rendering.InstanceCull.MaxSlots)
+            for (int i = 0; i < _opaquePrimitives.Count; i++)
             {
-                // Slot segment: capacity is in instances, 80 bytes per instance, one definition across all four backends.
-                var slotView = new VertexBufferView
-                {
-                    BufferLocation = sorted.Resource->GetGPUVirtualAddress()
-                        + (ulong)(slot * _cullCapacity) * Season.Rendering.InstanceCull.WorldStride,
-                    SizeInBytes = (uint)_cullCapacity * Season.Rendering.InstanceCull.WorldStride,
-                    StrideInBytes = Season.Rendering.InstanceCull.WorldStride,
-                };
-
-                for (int i = 0; i < _opaquePrimitives.Count; i++)
-                {
-                    Pipeline.DrawShadowPrimitiveIndirect(_opaquePrimitives[i], _matrixBuffers[fi], &slotView,
-                        args.Resource, Season.Rendering.InstanceCull.ArgsOffset(slot, i),
-                        bindMaterial: !shareMaterial || !materialBound);
-                    materialBound = true;
-                }
-                return;
+                Pipeline.DrawShadowPrimitiveIndirect(_opaquePrimitives[i], _matrixBuffers[fi], &slotView,
+                    argsResource, Season.Rendering.InstanceCull.ArgsOffset(slot, i),
+                    bindMaterial: !shareMaterial || !materialBound);
+                materialBound = true;
             }
+            return;
         }
 
         for (int i = 0; i < _opaquePrimitives.Count; i++)
@@ -805,7 +932,14 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSourceWorlds => _cullSource;
 
-    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSortedWorlds => _cullSorted;
+    int Season.Rendering.IInstanceCullTarget.CullStreamCount => _cullSorted.Length;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullStreamSource(int stream)
+        => _cullStreamSources.Length == 0 ? (stream == 0 ? _cullSource : null)
+            : (uint)stream < (uint)_cullStreamSources.Length ? _cullStreamSources[stream] : null;
+
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullStreamSorted(int stream)
+        => (uint)stream < (uint)_cullSorted.Length ? _cullSorted[stream] : null;
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullPrimitiveInfo => _cullPrimInfo;
 
@@ -817,13 +951,18 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
 
     Vector3 Season.Rendering.IInstanceCullTarget.CullLocalExtents => _cullLocalExtents;
 
+    bool Season.Rendering.IInstanceCullTarget.CullMainView => _cullMainView;
+
     /// <summary>
     /// Prepare culling resources for the given instance count. Capacity is aligned to 64 so small instance-count
     /// jitter does not recreate the five buffers every frame; but the capacity reported through the interface must
     /// be the real capacity, otherwise the index table would address by this frame's instance count and get out of
     /// sync with what the kernel writes.
+    /// A per-primitive-stream group also rebuilds when its opaque-primitive count changes, since each of those owns a stream pair; a
+    /// group with more primitives than <see cref="Season.Rendering.InstanceCull.MaxPrimitives"/>, or with no opaque primitive at all,
+    /// cannot join and releases instead, so it keeps the direct path rather than registering buffers nothing will read.
     /// </summary>
-    void EnsureCullResources(int count)
+    protected void EnsureCullResources(int count)
     {
         if (!Season.Rendering.InstanceCull.Enabled)
         {
@@ -835,16 +974,33 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         if (count <= 0)
             return;
 
-        int capacity = (count + 63) / 64 * 64;
-        if (_cullCapacity != capacity || _cullSorted == null)
+        bool perPrimitive = CullPerPrimitiveStreams;
+        int streams = perPrimitive ? _opaquePrimitives.Count : 1;
+        if (perPrimitive && (streams <= 0 || streams > Season.Rendering.InstanceCull.MaxPrimitives))
         {
             ReleaseCullResources();
+            return;
+        }
+
+        int capacity = (count + 63) / 64 * 64;
+        if (_cullCapacity != capacity || _cullSorted.Length != streams
+            || _cullStreamSources.Length != (perPrimitive ? streams : 0))
+        {
+            ReleaseCullResources();
+            var sorted = new Season.Rendering.StorageBuffer?[streams];
+            var streamSources = perPrimitive ? new Season.Rendering.StorageBuffer?[streams] : Array.Empty<Season.Rendering.StorageBuffer?>();
+            bool complete = true;
             try
             {
                 var g = Season.Basic.Graphics.Instance;
                 _cullSource = g.CreateStorageBuffer((uint)capacity * Season.Rendering.InstanceCull.WorldStride);
-                _cullSorted = g.CreateStorageBuffer(Season.Rendering.InstanceCull.SortedBytes(capacity),
-                    Season.Rendering.StorageBufferUsage.ComputeAndVertexInput);
+                for (int s = 0; s < streams; s++)
+                {
+                    sorted[s] = g.CreateStorageBuffer(Season.Rendering.InstanceCull.SortedBytes(capacity),
+                        Season.Rendering.StorageBufferUsage.ComputeAndVertexInput);
+                    if (perPrimitive)
+                        streamSources[s] = g.CreateStorageBuffer((uint)capacity * Season.Rendering.InstanceCull.WorldStride);
+                }
                 _cullVisible = g.CreateStorageBuffer((uint)(Season.Rendering.InstanceCull.MaxSlots * capacity) * 4u);
                 // The args buffer is the only one that must declare the indirect usage: all four backends bake that
                 // usage into the native object, and it cannot be added afterward.
@@ -858,7 +1014,15 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
                 DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] Buffer creation failed: {ex.Message}");
             }
 
-            if (_cullSource == null || _cullSorted == null || _cullVisible == null
+            // Hand the arrays over before checking, so a partial failure is released through the one path below.
+            _cullSorted = sorted;
+            _cullStreamSources = streamSources;
+            foreach (var b in sorted)
+                complete &= b != null;
+            foreach (var b in streamSources)
+                complete &= b != null;
+
+            if (!complete || _cullSource == null || _cullVisible == null
                 || _cullArgs == null || _cullPrimInfo == null)
             {
                 ReleaseCullResources();
@@ -883,7 +1047,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     /// uploading differs: building can be done anytime, but uploading must wait until the command list is open
     /// (see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>). If the primitive set does not
     /// change, do not rebuild. The index range must share one source with the draw side: the reset kernel writes
-    /// this indexCount into the indirect args, and the draw side no longer provides the index count itself.
+    /// this range into the indirect args, and the draw side no longer provides one itself (see <see cref="GetCullPrimitiveRange"/>).
     /// </summary>
     void EnsureCullPrimitiveInfo()
     {
@@ -905,10 +1069,10 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         var bytes = new byte[n * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride];
         for (int i = 0; i < n; i++)
         {
-            var primitive = _opaquePrimitives[i];
+            GetCullPrimitiveRange(_opaquePrimitives[i], out uint indexCount, out uint startIndex, out int baseVertex);
             Season.Rendering.InstanceCull.WritePrimitiveInfo(bytes,
                 i * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride,
-                (uint)primitive.Indices.Length, 0u, 0);
+                indexCount, startIndex, baseVertex);
         }
 
         _cullPrimInfoBytes = bytes;
@@ -940,8 +1104,22 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         }
 
         // The matrix stream changes every frame; upload only the valid range and leave no slack.
-        return _cullSource != null && g.TryUpdateStorageBuffer(_cullSource,
-            MemoryMarshal.AsBytes(_instanceData.AsSpan(0, _instanceCount)));
+        if (_cullSource == null || !g.TryUpdateStorageBuffer(_cullSource,
+                MemoryMarshal.AsBytes(_instanceData.AsSpan(0, _instanceCount))))
+            return false;
+
+        // Per-primitive streams: gather replays the one visibility decision onto each primitive's own stream, so each must hold
+        // this frame's instances in the cull input's order. A stream shorter than the instance count would make gather read past
+        // what the CPU wrote, so the whole group skips A7 this frame instead.
+        for (int s = 0; s < _cullStreamSources.Length; s++)
+        {
+            var data = GetCullDrawStream(s);
+            var source = _cullStreamSources[s];
+            if (source == null || data.Length < _instanceCount
+                || !g.TryUpdateStorageBuffer(source, MemoryMarshal.AsBytes(data.Slice(0, _instanceCount))))
+                return false;
+        }
+        return true;
     }
 
     /// <summary>
@@ -952,8 +1130,13 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     public bool PrepareCullDraw()
     {
         _cullDrawReady = false;
-        if (_cullSorted is not DXStorageBuffer sorted || sorted.Resource == null)
+        if (_cullSorted.Length == 0)
             return false;
+        foreach (var s in _cullSorted)
+        {
+            if (s is not DXStorageBuffer sb || sb.Resource == null)
+                return false;
+        }
         if (_cullArgs is not DXStorageBuffer args || args.Resource == null)
             return false;
         if (_cullCapacity <= 0)
@@ -963,9 +1146,10 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         if (cmd == null)
             return false;
 
-        // The vertex stage needs to read it; the next gather transitions it back to UnorderedAccess through
+        // The vertex stage needs to read them; the next gather transitions each back to UnorderedAccess through
         // DispatchCompute's gated transition.
-        sorted.TransitionTo(cmd, ResourceStates.VertexAndConstantBuffer);
+        foreach (var s in _cullSorted)
+            ((DXStorageBuffer)s!).TransitionTo(cmd, ResourceStates.VertexAndConstantBuffer);
 
         // The args buffer goes through the unified entry point, which also checks the usage and "not currently inside a Pass".
         if (!Season.Basic.Graphics.Instance.TryPrepareIndirectArgs(args))
@@ -975,7 +1159,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         return true;
     }
 
-    void ReleaseCullResources()
+    protected void ReleaseCullResources()
     {
         if (_cullRegistered)
         {
@@ -983,7 +1167,12 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             _cullRegistered = false;
         }
         _cullSource?.Dispose(); _cullSource = null;
-        _cullSorted?.Dispose(); _cullSorted = null;
+        foreach (var s in _cullSorted)
+            s?.Dispose();
+        _cullSorted = Array.Empty<Season.Rendering.StorageBuffer?>();
+        foreach (var s in _cullStreamSources)
+            s?.Dispose();
+        _cullStreamSources = Array.Empty<Season.Rendering.StorageBuffer?>();
         _cullArgs?.Dispose(); _cullArgs = null;
         _cullVisible?.Dispose(); _cullVisible = null;
         _cullPrimInfo?.Dispose(); _cullPrimInfo = null;

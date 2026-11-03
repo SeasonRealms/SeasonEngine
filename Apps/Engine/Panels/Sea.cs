@@ -12,8 +12,8 @@ namespace Engine.Panels;
 /// because the large mesh was too complex and hard to compose, and small instanced tiles work better.
 /// Heights and normals are baked once on the CPU from deterministic noise, using a fixed seed that stays stable across launches.
 /// Sea height can be adjusted at runtime through <see cref="SeaLevel"/>,
-/// with a default of y=-3, three units below grass at y=0. With Mountains using Sink=10, their lower edges remain submerged,
-/// making the ring read as island chains in the sea.
+/// with a default of y=-1.5, a metre and a half below grass at y=0. With Mountains using Sink=10, their lower edges remain
+/// submerged, making the ring read as island chains in the sea.
 ///
 /// Three presentations, chosen by <see cref="Season.Rendering.SeaMode"/>. The geometry below serves all of them; only
 /// the material, the Y offset, and the two swell scalars differ, and both variants are built once at startup, so
@@ -61,8 +61,11 @@ namespace Engine.Panels;
 /// The vertex wave uses a much narrower band of its own (SwellMaskStart=6m, ramping to full amplitude by 24m): the
 /// relief never has to be visible from the shore, the wave does. Sharing the 60m band held the first crest 135m out
 /// and left the water around the east-coast rocks perfectly still.
-/// The useful SeaLevel range is roughly [-7,-1]. Beach tiles are static instances and do not track SeaLevel,
-/// with their top pinned near y=-0.4 and bottoms around y=-11 to -17, so raising the sea too much will flood over the beach top onto the grass seam.
+/// The useful SeaLevel range is roughly [-6,-1]. Beach tiles are static instances and do not track SeaLevel, with their
+/// top pinned at -0.4 and bottoms around -11 to -17, so a level above about -1 floods the sand up to the grass seam.
+/// The default sits at -1.5 for three reasons: it leaves 1.1 m of dry sand, it buries the shore rocks to the knee, and
+/// it is exactly the bottom face of the estuary's spray box (River.SprayPos.Y 1 minus SpraySize.Y 5 / 2), so the
+/// river's foam band lands on the water instead of hovering over it or sinking under it.
 ///
 /// P4 (dynamic path only): the swell is not baked into geometry. The visible surface is a Gerstner water plane whose displacement,
 /// analytic normals, and phase speed all come from <see cref="Water"/>; the 1420m rectangle is cut into 8x8 tiles of
@@ -74,7 +77,13 @@ internal class Sea : Panel
 {
     const int GridSize = 255;                       // Vertex count per side: 255x255 = 65025, below the ushort index hard limit.
     const float Size = 1400f;                       // Sea side length in meters after the three-stage expansion to 1400x1400.
-    const float DefaultSeaLevel = -3f;              // Default sea height in world Y, three units below the ground.
+    /// <summary>
+    /// Default sea height in world Y: 1.5 m below the grass, against the 3 m it used to be. Not a taste setting - it is
+    /// the level where the beach's top edge, the shore rocks and the estuary's spray box all agree, see the class header.
+    /// Shared rather than repeated so one number moves the water plane, the droplets' floor (River.SeaY) and the
+    /// lighthouse's pool together.
+    /// </summary>
+    internal const float DefaultSeaLevel = -1.5f;
     const float SeaDepth = 12f;                     // Distance from the water surface down to the baked floor mesh, in meters.
     const uint Seed = 0x0CEA2026u;                  // Fixed seed so sea shape stays reproducible across launches.
 
@@ -150,11 +159,11 @@ internal class Sea : Panel
     internal Season.Rendering.WaterPlane Water { get; }
 
     /// <summary>
-    /// Sea height in world Y, defaulting to -3. The water plane sits at this height on the dynamic path, and on both
+    /// Sea height in world Y, defaulting to -1.5. The water plane sits at this height on the dynamic path, and on both
     /// paths it is the reference the mesh offset is measured from: the floor follows <see cref="SeaDepth"/> below it,
     /// the static surface sits exactly on it.
-    /// The change takes effect on the next Update. The practical range is about [-7,-1],
-    /// since higher values flood over the beach top and onto the grass seam while beach tiles remain static.
+    /// The change takes effect on the next Update. The practical range is about [-6,-1],
+    /// since higher values flood over the beach top at -0.4 and onto the grass seam while beach tiles remain static.
     /// </summary>
     internal float SeaLevel
     {
