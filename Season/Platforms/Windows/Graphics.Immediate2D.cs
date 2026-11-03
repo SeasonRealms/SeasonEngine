@@ -175,7 +175,7 @@ internal unsafe partial class Graphics
                 Clip = new(command.Clip.X * toTarget.X, command.Clip.Y * toTarget.Y,
                     command.Clip.Right * toTarget.X, command.Clip.Bottom * toTarget.Y),
                 Parameters = new(command.Sampling == Sampling2D.Point ? 1 : 0, pixelRange, invW, invH),
-                // Limit the filtering to the source area of the current frame to prevent high-definition atlas frame串色.
+                // Limit the filtering to the source area of the current frame to prevent atlas frame color bleed in the high-definition atlas.
                 UvClamp = new((source.X + insetX) * invW, (source.Y + insetY) * invH,
                     (source.Right - insetX) * invW, (source.Bottom - insetY) * invH)
             };

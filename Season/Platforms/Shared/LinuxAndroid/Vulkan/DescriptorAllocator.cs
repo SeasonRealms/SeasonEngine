@@ -63,15 +63,15 @@ internal unsafe sealed class DescriptorAllocator : IDisposable
     /// 2-4 adds 17 and 18 to reach 9, and 2-5 adds 19 and 20 to reach 11.
     /// 1-5 clause 15 adds binding 21 to reach 12: it is the shadow atlas a second time, through a point sampler instead of
     /// the comparison one, so it consumes a pool slot even though no new image is involved.
-    /// 工作包 C 再把 23/24（两张雾体积纹理）算上，达到 14：
-    /// 少算会让首池提前耗尽，只能靠溢出池容错，白白多建池。
+    /// Work package C then also counts 23/24 (two fog volume textures), reaching 14:
+    /// undercounting would exhaust the first pool early, leaving only the overflow pool as fallback and creating pools for nothing.
     /// </summary>
     public const uint SampledImagesPerSet = 14;
 
     /// <summary>Number of storage buffers per set, aligned with PipelineLayout.</summary>
     /// <remarks>
-    /// 9 是实例骨骼，10 是形变增量，13/14/15 是上一帧的骨骼/实例世界/形变权重，
-    /// 22 是雾帧常量（工作包 C 新增）。合计 6；原先只算 2，导致首池按 1/3 容量提前耗尽。
+    /// 9 is the instance skeleton, 10 is the morph delta, 13/14/15 are the previous frame's skeleton/instance world/morph weights,
+    /// 22 is the fog frame constants (a new work package C addition). Total 6; previously only 2 were counted, causing the first pool to exhaust early at 1/3 capacity.
     /// </remarks>
     public const uint StorageBuffersPerSet = 6;
 

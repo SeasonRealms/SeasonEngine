@@ -6,7 +6,7 @@ namespace Season.Rendering.Effects;
 
 public sealed partial class VolumetricFogEffect
 {
-    /// <summary>后端声明 vec4 fogFrame[] 与 sampler3D fogIntegrated/fogLocal；每列先补积分再做 XY 插值。</summary>
+    /// <summary>The backend declares vec4 fogFrame[] and sampler3D fogIntegrated/fogLocal; each column completes integration first, then performs XY interpolation.</summary>
     public const string SamplingGlsl = """
 vec4 FogF(int i) { return fogFrame[i]; }
 vec4 FogTransform(vec4 p,int i) { return p.x*FogF(i)+p.y*FogF(i+1)+p.z*FogF(i+2)+p.w*FogF(i+3); }
@@ -140,8 +140,8 @@ vec4 CloudSample(vec2 uv) {
 }
 vec4 WeatherH(int i) { vec4 h=F(118+i); if(i==0 && F(16).w<0.5) h.y=0; return h; }
 vec4 WeatherR(int i,int row) { return F(120+i*8+row); }
-// 2-7 雷电：雾帧里 SceneLightParams 从索引 32 起，WeatherFlash 是其中第 152 行，所以绝对位置是 184。
-// 图形管线读的是 UBO 同名成员，两边是同一份数据。
+// 2-7 lightning: in the fog frame SceneLightParams starts at index 32, and WeatherFlash is row 152 within it, so the absolute position is 184.
+// The graphics pipeline reads the same-named UBO member; both sides are the same data.
 vec4 WeatherFlash() { return F(184); }
 vec4 WeatherNoise(vec2 uv) { return CloudSample(uv); }
 """ + WeatherShaders.CommonGlsl + WeatherShaders.CloudGlsl + """

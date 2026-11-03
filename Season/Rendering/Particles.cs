@@ -59,28 +59,39 @@ public static class ParticleDraw
     /// Per-frame constants read by both the compaction kernel and the vertex shader:
     /// rows 0..3 are the unjittered view-projection in System.Numerics row order,
     /// row 4 is the camera right basis, row 5 the camera up basis, row 6 the camera position,
-    /// 第 7 行为 fadeIn、fadeOut、stretch、viewDistance（0 表示不限制距离）。
+    /// row 7 is fadeIn, fadeOut, stretch, viewDistance (0 means no distance limit).
     /// Kept as one buffer rather than a Params block because the vertex shader has no access to
     /// compute push constants.
     ///
-    /// 第 7 行的寿命淡入淡出由顶点阶段消费；拉伸剔除余量与近景距离淡出由 compaction 消费。
-    /// 复用帧缓冲，不占用上限为 128B 的跨端 compute Params。
+    /// The lifetime fade in/out of row 7 is consumed by the vertex stage; the stretch cull margin and
+    /// the near-distance fade-out are consumed by compaction. Reusing the frame buffer avoids spending
+    /// the cross-backend compute Params, whose limit is 128B.
     ///
-    /// 第 8..11 行是外观曲线与出生形状，只在曲线模式下有意义：
-    /// row 8  = 起点颜色 rgb / 加法混合标志，row 9 = 中点颜色 rgb / 噪声强度，
-    /// row 10 = 终点颜色 rgb / 终点半尺寸，row 11 = 圆盘半径 / 径向速度 / 摆动幅度 / 曲线模式标志。
-    /// 关闭曲线模式时这四行仍会被写入，但两端都不读，于是旧路径的每个字节都与扩容前一致。
-    /// 之所以放在帧缓冲而不是 Params：顶点与片元阶段都读不到 compute Params，而这几项恰好都要跨阶段用。
+    /// Rows 8..11 are the appearance curve and spawn shape, meaningful only in curve mode:
+    /// row 8  = start colour rgb / additive-blend flag, row 9 = mid colour rgb / noise strength,
+    /// row 10 = end colour rgb / end half-size, row 11 = disk radius / radial velocity / sway amplitude / curve-mode flag.
+    /// With curve mode off these four rows are still written, but neither end reads them, so every byte of the old path matches the pre-extension state.
+    /// They live in the frame buffer rather than Params because the vertex and fragment stages cannot read compute Params, yet exactly these values must cross stages.
     ///
-    /// 第 12..15 行给 ribbon 带（闪电通道）用，粒子系统一律写零：
-    /// row 12 = 视口宽 / 视口高 / 最小半宽（像素）/ ribbon 标志，
-    /// row 13 = 强度 / 雾消光系数（每米）/ 保留 / 保留，row 14、15 保留。
-    /// ribbon 标志为 0 时顶点阶段不进新分支，于是粒子路径的每个字节仍与扩容前一致。
-    /// 最小半宽按像素给而不是按世界单位：远处的一道闪电必须保底有若干像素宽，
-    /// 否则光栅化在亚像素宽度上会时有时无——有些帧产生片元、有些帧整段消失。
-    /// 那是「像素根本不发生」的丢失，TAA 的反应矩形补不上：它只保护已经画出来的像素。
+    /// Rows 12..15 are used by the ribbon strip (lightning channel), and particle systems always write zero:
+    /// row 12 = viewport width / viewport height / minimum half-width (pixels) / ribbon flag,
+    /// row 13 = intensity / fog extinction (per metre) / reserved / reserved, rows 14 and 15 reserved.
+    /// When the ribbon flag is 0 the vertex stage takes no new branch, so every byte of the particle path still matches the pre-extension state.
+    /// The minimum half-width is given in pixels rather than world units: a distant lightning bolt must keep a guaranteed number of pixels of width,
+    /// otherwise rasterization flickers on and off at sub-pixel widths -- some frames produce fragments, some frames the whole thing disappears.
+    /// That is a loss where "the pixel never happens at all", and TAA's reactive rect cannot compensate: it only protects pixels that were already drawn.
+    ///
+    /// Rows 16..19 are the spawn-shape extension (rect spawn, initial-velocity cone jitter, speed jitter, die on floor, toon edge):
+    /// row 16 = initial velocity xyz / cone jitter (as a fraction of the initial velocity length),
+    /// row 17 = spawn axis x / spawn axis z / half-length along the axis / half-depth across it,
+    /// row 18 = speed jitter (relative fraction) / floor height / toon edge width (0 means off) / reserved,
+    /// row 19 = reserved.
+    /// These rows are read by any stage only when the flags' rect-spawn bit (32) and die-on-floor bit (64) are set, or when row 18's edge width is non-zero;
+    /// under the default parameters all four rows are zero and both bits are off, so every byte of the old path still matches the pre-extension state.
+    /// They are not squeezed into 12..15 because those four rows already belong to the ribbon strip: once cone jitter writes row 12.w's ribbon flag to non-zero,
+    /// it would wrongly route ordinary particles into the ribbon branch.
     /// </summary>
-    public const uint FrameVectorCount = 16;
+    public const uint FrameVectorCount = 20;
 
     /// <summary>Byte size of the frame buffer described by <see cref="FrameVectorCount"/>.</summary>
     public const uint FrameBytes = FrameVectorCount * 16;
@@ -148,9 +159,11 @@ public interface IParticleSubmitter
 
     /// <summary>
     /// Submits the indirect draw inside the pass. Called only after Prepare returned true, exactly once per Prepare.
-    /// 返回 false 表示这一帧没有真的画出来。合法成因不止一种（Prepare 与 Draw 之间 Pass 身份变了、
-    /// PSO 还在异步烘焙、资源在手交之后失效），调用方无法据此做任何补救，所以这里返回而不是抛：
-    /// 谁有历史状态谁决定要不要记日志，避免每帧刷同一行。
+    /// Returning false means this frame was not actually drawn. There is more than one legitimate cause
+    /// (the pass identity changed between Prepare and Draw, the PSO is still baking asynchronously, the
+    /// resources went stale after the handoff), and the caller can take no remedial action from it, so
+    /// this returns rather than throws: whoever holds the history state decides whether to log, avoiding
+    /// the same line being spammed every frame.
     /// </summary>
     bool Submit(IGraphics g);
 }

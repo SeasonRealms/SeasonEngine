@@ -7,7 +7,7 @@ using System.Numerics;
 
 namespace Season.Rendering;
 
-/// <summary>场景自己的近地介质。单位为米、秒、1/m；颜色为线性 RGB。类库默认关闭。</summary>
+/// <summary>The scene's own near-ground medium. Units are meters, seconds, 1/m; colors are linear RGB. Disabled by default in the class library.</summary>
 public sealed class SceneFog
 {
     public const int MaxActiveVolumes = 32;
@@ -36,7 +36,7 @@ public sealed class SceneFog
         get => _maxDistance;
         set
         {
-            // 上界限制浮点投影的数值范围，不用于控制画质预算。
+            // The upper bound limits the numeric range of the floating-point projection; it is not used to control the quality budget.
             float distance = Math.Clamp(FogMath.Finite(value), 0.01f, 1_000_000f);
             if (distance != _maxDistance) { _maxDistance = distance; ResetHistory(); }
         }
@@ -61,7 +61,7 @@ public sealed class SceneFog
     internal void EnsureActiveCapacity()
     {
         if (ActiveVolumeCount >= MaxActiveVolumes)
-            throw new InvalidOperationException($"每个场景最多支持 {MaxActiveVolumes} 个活动局部雾体。");
+            throw new InvalidOperationException($"A scene supports at most {MaxActiveVolumes} active local fog volumes.");
     }
 
     public void Add(FogVolume volume)
@@ -69,7 +69,7 @@ public sealed class SceneFog
         ArgumentNullException.ThrowIfNull(volume);
         if (ReferenceEquals(volume.Owner, this)) return;
         if (volume.Owner != null)
-            throw new InvalidOperationException("同一局部雾体不能同时注册到多个场景。");
+            throw new InvalidOperationException("The same local fog volume cannot be registered with multiple scenes at once.");
         if (volume.Enabled) EnsureActiveCapacity();
         _volumes.Add(volume);
         volume.Owner = this;
@@ -91,7 +91,7 @@ public sealed class SceneFog
         ResetHistory();
     }
 
-    /// <summary>模拟时钟调用一次；暂停传 0，调速只改变后续增量，跳时另调用 ResetHistory。</summary>
+    /// <summary>Called once per simulated clock step; pass 0 when paused, changing speed only affects subsequent increments, and a jump should call ResetHistory separately.</summary>
     public void Advance(double deltaSeconds)
     {
         if (!double.IsFinite(deltaSeconds) || deltaSeconds < 0)
@@ -100,13 +100,13 @@ public sealed class SceneFog
         double y = _windY + deltaSeconds * WindVelocity.Y;
         double z = _windZ + deltaSeconds * WindVelocity.Z;
         if (Math.Abs(x) > float.MaxValue || Math.Abs(y) > float.MaxValue || Math.Abs(z) > float.MaxValue)
-            throw new ArgumentOutOfRangeException(nameof(deltaSeconds), "雾的风偏移超出可表示范围。");
+            throw new ArgumentOutOfRangeException(nameof(deltaSeconds), "Fog wind offset is out of representable range.");
         _windX = x; _windY = y; _windZ = z;
     }
 
     public void ResetHistory() => HistoryRevision = unchecked(HistoryRevision + 1);
 
-    /// <summary>CPU 参考介质采样。先累加消光与 RGB 散射系数，最后应用排除区。</summary>
+    /// <summary>CPU reference medium sample. Extinction and RGB scattering coefficients are accumulated first, then the exclusion regions are applied.</summary>
     public (float Extinction, Vector3 Scattering) SampleMedium(Vector3 position)
     {
         FogMath.Finite(position);

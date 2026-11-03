@@ -87,10 +87,10 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     /// If no history exists yet, it falls back to the write side so the shader uses current values through the r3.w == 0 sentinel.</summary>
     protected IMTLBuffer PrevInstanceBuffer => _instanceBuffers[_instanceWriteIndex ^ 1] ?? _instanceBuffer;
 
-    // === A7 逐实例 GPU 剔除 ===
-    // 与 DXInstancedPrimitiveGroup / VKInstancedPrimitiveGroup 逐项对应：五个缓冲只在容量变化时重建，“只增不减”。
-    // 相对另外两端这里少了两件事：Metal 没有缓冲状态机（写后读由驱动 hazard tracking 兑现），
-    // 也没有需要在创建期烘死的 usage 位，所以 sorted 声明 ComputeAndVertexInput 只是为了四端校验对称。
+    // === A7 per-instance GPU culling ===
+    // Corresponds item-by-item to DXInstancedPrimitiveGroup / VKInstancedPrimitiveGroup: the five buffers are rebuilt only when capacity changes, "grow-only".
+    // Compared with the other two backends, two things are missing here: Metal has no buffer state machine (read-after-write is honored by the driver's hazard tracking),
+    // and it has no usage bits that must be baked in at creation time, so sorted declaring ComputeAndVertexInput is only for the four-backend validation symmetry.
 
     Season.Rendering.StorageBuffer? _cullSource;
     Season.Rendering.StorageBuffer? _cullSorted;
@@ -98,12 +98,12 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     Season.Rendering.StorageBuffer? _cullVisible;
     Season.Rendering.StorageBuffer? _cullPrimInfo;
     int _cullCapacity = -1;
-    /// <summary>已上传到 GPU 的参数表条数。与 <see cref="_cullPrimInfoPending"/> 不等时说明本帧要重传。</summary>
+    /// <summary>Number of parameter-table entries already uploaded to the GPU. When it differs from <see cref="_cullPrimInfoPending"/>, this frame needs a re-upload.</summary>
     int _cullPrimitiveCount = -1;
-    /// <summary>CPU 侧已构造好的参数表字节：构造随时可做，上传要等 blit encoder 能开出来
-    ///（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。</summary>
+    /// <summary>Parameter-table bytes already constructed on the CPU side: construction can happen at any time, but the upload must wait until a blit encoder can be opened
+    /// (see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>).</summary>
     byte[]? _cullPrimInfoBytes;
-    /// <summary>CPU 侧参数表的条数，-1 表示还没构造过。</summary>
+    /// <summary>Number of entries in the CPU-side parameter table; -1 means it has never been constructed.</summary>
     int _cullPrimInfoPending = -1;
     bool _cullRegistered;
     Vector3 _cullLocalCenter;
@@ -132,8 +132,8 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     }
 
     /// <summary>
-    /// 把全部 primitive 的局部包围盒并成组级合并盒。剔除内核只收一个盒，所以并集是必填项：
-    /// 传某个 surface 的盒会让其余 surface 的实例在盒外被成批误剔。
+    /// Merge all primitives' local bounding boxes into a group-level merged box. The cull kernel accepts only one box, so the union is mandatory:
+    /// passing one surface's box would cause the other surfaces' instances to be culled wholesale while outside the box.
     /// </summary>
     void UpdateCullLocalBounds()
     {
@@ -279,8 +279,8 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
         bool shareMaterial = CanShareShadowMaterial(_opaquePrimitives);
         bool materialBound = false;
 
-        // A7：整组走间接路径时，索引数/实例数/baseVertex 全由 GPU 侧参数缓冲给出，
-        // 实例流换成 gather 产出的重排块——按槽位分段，所以偏移设在 SetVertexBuffer 上。
+        // A7: when the whole group takes the indirect path, index count / instance count / baseVertex all come from the GPU-side parameter buffer,
+        // and the instance stream is replaced by the reorder block produced by gather -- segmented by slot, so the offset is set on SetVertexBuffer.
         if (_cullDrawReady && _cullCapacity >= _instanceCount
             && _cullSorted is MTLStorageBuffer sorted && sorted.Buffer != null
             && _cullArgs is MTLStorageBuffer args && args.Buffer != null)
@@ -401,7 +401,7 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     }
 
     // ============================================================
-    // A7 逐实例 GPU 剔除
+    // A7 per-instance GPU culling
     // ============================================================
 
     int Season.Rendering.IInstanceCullTarget.CullInstanceCount => _instanceCount;
@@ -425,8 +425,8 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     Vector3 Season.Rendering.IInstanceCullTarget.CullLocalExtents => _cullLocalExtents;
 
     /// <summary>
-    /// 派生类在实例流上传之后调用，只备资源。矩阵流上传延后到 Record 相位：控制件的 Update 阶段
-    /// render encoder 可能还开着，那时 CreateBlitCommandEncoder 直接失败，上传被丢弃且只留一行日志。
+    /// Derived classes call this after uploading the instance stream, to prepare resources only. The matrix stream upload is deferred to the Record phase: during a control's Update stage
+    /// the render encoder may still be open, in which case CreateBlitCommandEncoder fails outright, the upload is discarded, and only one log line remains.
     /// </summary>
     protected void UpdateCullUpload()
     {
@@ -438,8 +438,8 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     }
 
     /// <summary>
-    /// 按实例数准备剔除资源。容量按 64 对齐，于是实例数小幅抖动不会每帧重建五个缓冲；
-    /// 但接口上报的容量必须是真实容量，否则序号表会按本帧实例数寻址而与内核写入错位。
+    /// Prepare cull resources according to the instance count. Capacity is aligned to 64, so a small jitter in instance count does not rebuild the five buffers every frame;
+    /// but the capacity reported through the interface must be the true capacity, otherwise the index table would be addressed by this frame's instance count and become misaligned with the kernel's writes.
     /// </summary>
     void EnsureCullResources(int count)
     {
@@ -448,7 +448,7 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
             ReleaseCullResources();
             return;
         }
-        // 实例数掉到 0 不等于要释放：隐藏再显示会因此每帧重建五个缓冲。
+        // An instance count dropping to 0 does not mean release: hiding and re-showing would otherwise rebuild the five buffers every frame.
         if (count <= 0)
             return;
 
@@ -470,7 +470,7 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
             }
             catch (Exception ex)
             {
-                DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] 缓冲创建失败：{ex.Message}");
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] Buffer creation failed: {ex.Message}");
             }
 
             if (_cullSource == null || _cullSorted == null || _cullVisible == null
@@ -494,10 +494,10 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     }
 
     /// <summary>
-    /// 只构造参数表字节，不碰 GPU —— 构造与上传的安全时机不同：构造随时可做，
-    /// 上传要等 blit encoder 能开出来（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。
-    /// primitive 集合不变就不重建。索引区间与绘制端必须同源：reset 内核把这里的
-    /// indexCount 写进间接参数，而绘制端不再自己提供索引数。
+    /// Construct the parameter-table bytes only, without touching the GPU -- the safe timing for construction and upload differs: construction can happen at any time,
+    /// while the upload must wait until a blit encoder can be opened (see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>).
+    /// If the primitive set is unchanged, do not rebuild. The index range and the draw side must share the same source: the reset kernel writes this
+    /// indexCount into the indirect parameters, and the draw side no longer supplies the index count itself.
     /// </summary>
     void EnsureCullPrimitiveInfo()
     {
@@ -506,8 +506,8 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
         int n = _opaquePrimitives.Count;
         if (n <= 0 || n > Season.Rendering.InstanceCull.MaxPrimitives)
         {
-            // 明确记下"没有可传的参数表"：否则 PrepareCullInputs 会拿上一次的字节反复上传，
-            // 条数看起来对得上，内容却是过期的那一份。
+            // Explicitly record "there is no parameter table to upload": otherwise PrepareCullInputs would repeatedly upload the previous bytes,
+            // whose count looks matching but whose contents are the stale copy.
             _cullPrimInfoBytes = null;
             _cullPrimInfoPending = 0;
             _cullPrimitiveCount = 0;
@@ -530,11 +530,11 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     }
 
     /// <summary>
-    /// A7：把剔除的 CPU 侧输入传到 GPU。由 InstanceCullEffect 在每次派发之前回调，
-    /// 那个相位在所有 Pass 之外 —— Metal 的 compute 与 render encoder 互斥，
-    /// render encoder 开着时开 blit encoder 必失败，所以这是本端唯一可靠的上传时机。
-    /// 输入与 IA 实例流逐位相同（都是 InstanceTransformData，步长 80 与 WorldStride 一致），
-    /// 所以直接复用同一份数组，不多存副本。
+    /// A7: upload the cull CPU-side inputs to the GPU. Called back by InstanceCullEffect before each dispatch,
+    /// that phase is outside all Passes -- Metal's compute and render encoders are mutually exclusive,
+    /// and opening a blit encoder while a render encoder is open is bound to fail, so this is this backend's only reliable upload timing.
+    /// The input is bit-for-bit identical to the IA instance stream (both are InstanceTransformData, stride 80 matching WorldStride),
+    /// so the same array is reused directly without storing an extra copy.
     /// </summary>
     bool Season.Rendering.IInstanceCullTarget.PrepareCullInputs()
     {
@@ -543,7 +543,7 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
 
         var g = Season.Basic.Graphics.Instance;
 
-        // 参数表跟着几何走而不跟帧走，所以只在条数变了时重传。
+        // The parameter table follows the geometry rather than the frame, so it is re-uploaded only when the entry count changes.
         if (_cullPrimInfoPending != _cullPrimitiveCount)
         {
             if (_cullPrimInfoPending <= 0 || _cullPrimInfoBytes == null || _cullPrimInfo == null)
@@ -554,16 +554,16 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
             _cullPrimitiveCount = _cullPrimInfoPending;
         }
 
-        // 矩阵流每帧都变，只传有效段，不留余量。
+        // The matrix stream changes every frame, so only the valid segment is uploaded, with no slack left.
         return _cullSource != null && g.TryUpdateStorageBuffer(_cullSource,
             MemoryMarshal.AsBytes(_instanceData.AsSpan(0, _instanceCount)));
     }
 
     /// <summary>
-    /// A7：把 gather 写出的重排流与参数缓冲交接到绘制可读状态。必须在 Pass 之外执行，
-    /// 所以由 InstanceCullEffect 在三次派发之后回调，而不是等到 DrawShadow。
-    /// Metal 这一端无事可录：写后读依赖由驱动 hazard tracking 兑现，
-    /// 所以这里只核验句柄并走一次统一准入校验，"交接"即"准入"。
+    /// A7: hand over the reorder stream written by gather and the parameter buffer to a draw-readable state. Must run outside a Pass,
+    /// so it is called back by InstanceCullEffect after the three dispatches, rather than waiting until DrawShadow.
+    /// On the Metal backend there is nothing to record: read-after-write dependencies are honored by the driver's hazard tracking,
+    /// so here it only verifies the handles and runs the unified admission check once; the "handover" is the "admission".
     /// </summary>
     public bool PrepareCullDraw()
     {

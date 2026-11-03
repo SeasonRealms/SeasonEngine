@@ -4,16 +4,16 @@
 
 namespace Season.Rendering;
 
-/// <summary>后端已经捕获的单个绘制项；Draw 不得重新读取 Control 或消费其一次性覆盖。</summary>
+/// <summary>A single draw item already captured by the backend; Draw must not re-read the Control or consume its one-shot override.</summary>
 public interface ISceneDrawCommand
 {
     void Draw();
 
-    /// <summary>交还捕获时持有的资源引用；原生资源仍须遵循后端 fence 延迟释放规则。</summary>
+    /// <summary>Hands back the resource references held at capture time; native resources must still follow the backend's fence-deferred release rule.</summary>
     void Release();
 }
 
-/// <summary>收集时固定的层级优先级。默认容器不新增排序层级；外层显式优先级优先于内层。</summary>
+/// <summary>Hierarchical priority fixed at collection time. The default container adds no sort level; an outer explicit priority takes precedence over an inner one.</summary>
 public readonly struct SceneDrawPriority : IComparable<SceneDrawPriority>
 {
     readonly SceneDrawOrderContext? _owner;
@@ -38,7 +38,7 @@ public readonly struct SceneDrawPriority : IComparable<SceneDrawPriority>
     internal void Validate()
     {
         if (_owner != null && _owner.Generation != _generation)
-            throw new InvalidOperationException("绘制优先级已过期，不能跨帧使用。");
+            throw new InvalidOperationException("Draw priority has expired and cannot be used across frames.");
     }
 
     public int CompareTo(SceneDrawPriority other)
@@ -55,7 +55,7 @@ public readonly struct SceneDrawPriority : IComparable<SceneDrawPriority>
     }
 }
 
-/// <summary>一帧共用的优先级存储。每个显式容器/叶子复制短路径，图元只捕获值句柄；容量跨帧复用。</summary>
+/// <summary>Priority storage shared across one frame. Each explicit container/leaf copies the short path, and primitives capture only a value handle; capacity is reused across frames.</summary>
 public sealed class SceneDrawOrderContext
 {
     readonly List<(int Layer, int Order)> _components = new();
@@ -66,18 +66,18 @@ public sealed class SceneDrawOrderContext
     internal ulong Generation { get; private set; }
     public bool IsCollecting { get; private set; }
     public SceneDrawPriority Current => IsCollecting ? _current
-        : throw new InvalidOperationException("只能在收集阶段捕获绘制优先级。");
+        : throw new InvalidOperationException("Draw priority can only be captured during the collection phase.");
     internal (int Layer, int Order) Component(int index) => _components[index];
 
     public void BeginCollection()
     {
-        if (_live) throw new InvalidOperationException("上一帧排序上下文尚未释放。");
+        if (_live) throw new InvalidOperationException("The previous frame's sort context has not been released yet.");
         _live = IsCollecting = true;
     }
 
     public Scope Push(int layer, int order)
     {
-        if (!IsCollecting) throw new InvalidOperationException("当前不在绘制收集阶段。");
+        if (!IsCollecting) throw new InvalidOperationException("Not currently in the draw collection phase.");
         var previous = _current;
         if (layer != 0 || order != 0)
         {
@@ -94,11 +94,11 @@ public sealed class SceneDrawOrderContext
     public void Seal()
     {
         if (!IsCollecting || _depth != 0)
-            throw new InvalidOperationException("绘制作用域尚未结束或收集阶段已经结束。");
+            throw new InvalidOperationException("The draw scope has not ended or the collection phase has already ended.");
         IsCollecting = false;
     }
 
-    /// <summary>在队列释放之后调用，异常路径也必须重置；使所有旧句柄失效。</summary>
+    /// <summary>Call after the queue is released; the exception path must reset too, invalidating every old handle.</summary>
     public void Reset()
     {
         Generation++;
@@ -125,7 +125,7 @@ public sealed class SceneDrawOrderContext
         {
             if (_owner == null) return;
             if (!_owner.IsCollecting || _owner.Generation != _generation || _owner._depth != _depth || _owner._scopeToken != _token)
-                throw new InvalidOperationException("绘制作用域必须按嵌套顺序恰好结束一次。");
+                throw new InvalidOperationException("A draw scope must end exactly once in nesting order.");
             _owner._current = _previous;
             _owner._scopeToken = _parentToken;
             _owner._depth--;
@@ -133,7 +133,7 @@ public sealed class SceneDrawOrderContext
     }
 }
 
-/// <summary>按图元分类的复用队列。T 保存本帧绑定、材质、实例和蒙皮快照，不保存延迟调用 Control.Draw 的委托。</summary>
+/// <summary>Reuse queue classified by primitive. T stores this frame's bindings, material, instance and skinning snapshot, but not a delegate that defers a Control.Draw call.</summary>
 public sealed class SceneDrawQueue<T> where T : struct, ISceneDrawCommand
 {
     readonly List<Entry> _opaque = new();
@@ -160,19 +160,19 @@ public sealed class SceneDrawQueue<T> where T : struct, ISceneDrawCommand
     public void BeginCollection()
     {
         if (_collecting || _sealed || _opaque.Count != 0 || _transparent.Count != 0)
-            throw new InvalidOperationException("上一帧绘制项尚未释放。");
+            throw new InvalidOperationException("The previous frame's draw items have not been released yet.");
         _sequence = 0;
         _opaqueDrawn = _transparentDrawn = false;
         _collecting = true;
     }
 
-    /// <summary>成功加入后，队列持有命令的资源引用；失败时由调用者释放。</summary>
+    /// <summary>After a successful add, the queue holds the command's resource references; on failure the caller releases them.</summary>
     public void Add(in T command, bool transparent, int layer, int order, float depth)
         => Add(command, transparent, new SceneDrawPriority(layer, order), depth);
 
     public void Add(in T command, bool transparent, SceneDrawPriority priority, float depth)
     {
-        if (!_collecting) throw new InvalidOperationException("只能在场景收集阶段添加绘制项。");
+        if (!_collecting) throw new InvalidOperationException("Draw items can only be added during the scene collection phase.");
         if (!float.IsFinite(depth)) throw new ArgumentOutOfRangeException(nameof(depth));
         priority.Validate();
         var item = new Entry(command, priority, depth, _sequence++);
@@ -181,7 +181,7 @@ public sealed class SceneDrawQueue<T> where T : struct, ISceneDrawCommand
 
     public void Seal()
     {
-        if (!_collecting) throw new InvalidOperationException("当前不在场景收集阶段。");
+        if (!_collecting) throw new InvalidOperationException("Not currently in the scene collection phase.");
         for (int i = 0; i < _opaque.Count; i++) _opaque[i].Priority.Validate();
         for (int i = 0; i < _transparent.Count; i++) _transparent[i].Priority.Validate();
         _collecting = false;
@@ -192,7 +192,7 @@ public sealed class SceneDrawQueue<T> where T : struct, ISceneDrawCommand
 
     public void DrawOpaque()
     {
-        if (!_sealed || _opaqueDrawn) throw new InvalidOperationException("不透明队列未封存或已经消费。");
+        if (!_sealed || _opaqueDrawn) throw new InvalidOperationException("The opaque queue is not sealed or has already been consumed.");
         _opaqueDrawn = true;
         for (int i = 0; i < _opaque.Count; i++) _opaque[i].Command.Draw();
     }
@@ -200,24 +200,24 @@ public sealed class SceneDrawQueue<T> where T : struct, ISceneDrawCommand
     public void DrawTransparent()
     {
         if (!_sealed || !_opaqueDrawn || _transparentDrawn)
-            throw new InvalidOperationException("透明队列必须在不透明队列之后消费一次。");
+            throw new InvalidOperationException("The transparent queue must be consumed exactly once after the opaque queue.");
         _transparentDrawn = true;
         for (int i = 0; i < _transparent.Count; i++) _transparent[i].Command.Draw();
     }
 
     /// <summary>
-    /// 按最终绘制顺序读取透明队列中的一项，但不绘制。
-    /// 后端需要在透明 Pass 内先给每一项补齐该 Pass 专属的资源绑定（例如雾采样描述符），
-    /// 之后才能提交绘制，因此必须有一个不触发 Draw 的遍历入口。
+    /// Reads one item from the transparent queue in final draw order, without drawing it.
+    /// The backend needs to fill in each item's pass-specific resource bindings (for example the fog sampling descriptor) inside
+    /// the transparent pass before it can submit the draw, so there must be a traversal entry that does not trigger Draw.
     /// </summary>
     public T TransparentAt(int index)
     {
-        if (!_sealed) throw new InvalidOperationException("透明队列尚未封存。");
+        if (!_sealed) throw new InvalidOperationException("The transparent queue is not sealed yet.");
         if ((uint)index >= (uint)_transparent.Count) throw new ArgumentOutOfRangeException(nameof(index));
         return _transparent[index].Command;
     }
 
-    /// <summary>正常帧和异常帧均须在 finally 调用；列表容量保留，资源引用全部清除。</summary>
+    /// <summary>Must be called in a finally block for both normal and exceptional frames; list capacity is kept while every resource reference is cleared.</summary>
     public void Release()
     {
         Exception? failure = null;
@@ -239,7 +239,7 @@ public sealed class SceneDrawQueue<T> where T : struct, ISceneDrawCommand
     }
 }
 
-/// <summary>完整实现全部场景绘制路径的后端才实现此接口。收集期间不得提交 GPU 绘制。</summary>
+/// <summary>Only a backend that fully implements all scene draw paths implements this interface. No GPU draw may be submitted during collection.</summary>
 public interface ISegmentedSceneGraphics
 {
     void BeginSceneCollection();
@@ -249,14 +249,14 @@ public interface ISegmentedSceneGraphics
     void ReleaseSceneCollection();
 }
 
-/// <summary>合成成功后才发布颜色源与 AO 消费标记；失败时透明阶段继续使用原场景附件。</summary>
+/// <summary>The color source and AO-consumption flag are published only after a successful composite; on failure the transparent stage keeps using the original scene attachment.</summary>
 public readonly record struct FogCompositeResult(bool Success, bool AoApplied);
 
-/// <summary>独立合成绑定，不覆盖表面光照缓冲；ApplyAo 只能来自本帧已就绪且未消费的 AO。</summary>
+/// <summary>Independent composite binding that does not overwrite the surface lighting buffer; ApplyAo can only come from this frame's ready and unconsumed AO.</summary>
 public readonly record struct FogCompositeInputs(RenderTarget Color, RenderTarget Depth, StorageBuffer FrameBuffer,
     string IntegratedVolume, string LocalVolume, ComputeResourceRef Ao, float AoIntensity, bool ApplyAo);
 
-/// <summary>Prepare 在 Pass 外解析本帧资源；Draw 仅在独立 HDR FogComposite Pass 内消费一次。</summary>
+/// <summary>Prepare resolves this frame's resources outside the pass; Draw consumes them only once inside the independent HDR FogComposite pass.</summary>
 public abstract class FogCompositePipeline : IDisposable
 {
     public abstract bool Prepare(in FogCompositeInputs inputs, RenderTarget destination);
@@ -264,20 +264,21 @@ public abstract class FogCompositePipeline : IDisposable
     public abstract void Dispose();
 }
 
-/// <summary>P0 SSR 合成绑定：反射增量纹理名 + 它是被加进哪张场景色。</summary>
+/// <summary>P0 SSR composite binding: the reflection delta texture name + which scene color it is added into.</summary>
 public readonly record struct SsrCompositeInputs(RenderTarget Color, string ReflectionTexture);
 
 /// <summary>
-/// P0：把反射增量按加法并进场景色的后端入口。与雾合成不同，它不新开目标也不发布颜色源，
-/// 增量由 <see cref="Effects.SsrEffect"/> 的核直接算成最终值（含 (1-r)²、反射权重与置信度），
-/// 所以这里只剩一条全屏加法绘制 —— 权重不在这里重算，否则两处的 Fresnel 与粗糙度口径迟早会分叉。
+/// P0: the backend entry that adds the reflection delta into the scene color. Unlike the fog composite, it opens no new target and
+/// publishes no color source; the delta is computed directly into its final value by the <see cref="Effects.SsrEffect"/> kernel
+/// (including (1-r)^2, the reflection weight and the confidence), so all that is left here is a single full-screen additive draw -
+/// the weight is not recomputed here, otherwise the Fresnel and roughness conventions in the two places would inevitably diverge.
 /// </summary>
 public abstract class SsrCompositePipeline : IDisposable
 {
-    /// <summary>在 Pass 外解析本帧资源；false 表示这一帧不合成，场景保持原样。</summary>
+    /// <summary>Resolves this frame's resources outside the pass; false means this frame does not composite and the scene stays as is.</summary>
     public abstract bool Prepare(in SsrCompositeInputs inputs);
 
-    /// <summary>只在 <see cref="RenderPassId.SsrComposite"/> 内调用一次。</summary>
+    /// <summary>Called only once inside <see cref="RenderPassId.SsrComposite"/>.</summary>
     public abstract bool Draw();
 
     public abstract void Dispose();

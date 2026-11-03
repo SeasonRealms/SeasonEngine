@@ -341,11 +341,11 @@ public abstract class Panel : BaseControl, IRenderOrder
             ? VisibleInCurrentView(baseControl)
             : Season.Rendering.RenderView.IsLayerVisible(0u);
 
-    // 收集只调用一次叶子 Draw；材质分类与深度排序由后端图元队列完成。
-    // 复用成员列表固定本次成员与显式优先级，不在回放时访问控件或容器。
+    // Collection calls leaf Draw only once; material classification and depth sorting are done by the backend's primitive queue.
+    // The reused member list fixes this run's members and explicit priority, and does not access controls or containers during replay.
     void CollectScene(Season.Controls.RenderDomain inheritedDomain, int layer, int order)
     {
-        if (_collectingScene) throw new InvalidOperationException("场景容器不能在收集期间重入。");
+        if (_collectingScene) throw new InvalidOperationException("A scene container cannot be re-entered during collection.");
         _collectingScene = true;
         var controls = _sceneControls ??= new();
         var panels = _scenePanels ??= new();

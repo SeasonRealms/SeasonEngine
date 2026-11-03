@@ -26,9 +26,10 @@ namespace Season.Platforms.Shared.Apple;
 /// </summary>
 internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedSceneGraphics
 {
-    // 工作包 D：三段式场景队列。不透明与透明在同一帧里分两个 Metal Pass 重放，
-    // 中间插入雾合成，于是透明阶段能拿到本帧刚积分出的体积纹理。
-    // 收集本身不提交任何绘制，理由是 Metal 只有在 BeginPass 之后才存在 encoder。
+    // Work package D: three-stage scene queue. Opaque and transparent are replayed in two Metal Passes
+    // within the same frame, with fog compositing inserted in between, so the transparent stage can
+    // receive the volumetric texture just integrated this frame.
+    // Collection itself submits no draws, because on Metal an encoder only exists after BeginPass.
     readonly MTLSceneDrawCollection _sceneCollection = new();
 
     public void BeginSceneCollection() => _sceneCollection.Begin();
@@ -47,7 +48,7 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         try { return new(new MTLFogCompositePipeline(DictionaryMtlTexture, true)); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherComposite] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherComposite] creation failed: {ex.Message}");
             return null;
         }
     }
@@ -58,47 +59,58 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         try { return new MTLFogCompositePipeline(DictionaryMtlTexture); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[FogComposite] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[FogComposite] creation failed: {ex.Message}");
             return null;
         }
     }
 
-    /// <summary>P0 SSR 加法合成：一条全屏绘制把反射增量叠进 SceneColor，没有独立目标。</summary>
+    /// <summary>P0 SSR additive composite: a single full-screen draw blends the reflection increment into SceneColor, with no separate target.</summary>
     public Season.Rendering.SsrCompositePipeline? CreateSsrCompositePipeline()
     {
-        // 没有 compute 就没有增量纹理，合成无处可读。
+        // Without compute there is no increment texture, so the composite has nowhere to read from.
         if (!ComputeSupported) return null;
         try { return new MTLSsrCompositePipeline(DictionaryMtlTexture); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[SsrComposite] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[SsrComposite] creation failed: {ex.Message}");
             return null;
         }
     }
 
-    /// <summary>D1 屏幕空间贴花：只依赖图形阶段的深度采样，不需要 compute，所以没有 ComputeSupported 门控。</summary>
+    /// <summary>D1 screen-space decal: depends only on the graphics stage's depth sampling, requires no compute, so there is no ComputeSupported gate.</summary>
     public Season.Rendering.DecalPipeline? CreateDecalPipeline()
     {
         try { return new MTLDecalPipeline(DictionaryMtlTexture); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] creation failed: {ex.Message}");
             return null;
         }
     }
 
-    /// <summary>P2 水面：同样只靠图形阶段，构造失败时返回 null，调度器据此保持零残留。</summary>
+    /// <summary>P2 water surface: likewise relies only on the graphics stage; returns null on construction failure, and the scheduler keeps zero residue accordingly.</summary>
     public Season.Rendering.WaterPipeline? CreateWaterPipeline()
     {
         try { return new MTLWaterPipeline(DictionaryMtlTexture); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] creation failed: {ex.Message}");
             return null;
         }
     }
 
-    /// <summary>P2 水面折射用的场景色快照。转调后端 blit：水面 Pass 里 SceneColor 是颜色附件，不能同时被采样。</summary>
+    /// <summary>P1 waterfall curtain: only needs the graphics stage (depth sampling + color blending), no refraction snapshot, and no compute either.</summary>
+    public Season.Rendering.WaterfallPipeline? CreateWaterfallPipeline()
+    {
+        try { return new MTLWaterfallPipeline(DictionaryMtlTexture); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Waterfall] creation failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>Scene-color snapshot used for P2 water surface refraction. Dispatched to the backend blit: in the water surface Pass, SceneColor is a color attachment and cannot be sampled at the same time.</summary>
     public bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination)
         => Metal.Device.CopyRenderTarget(source, destination);
 
@@ -1168,7 +1180,7 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             }
 
             // Write TextDrawParams, using a per-Texts, per-frame dedicated UBO to prevent same-frame cross-control overwrites.
-            // 收集期也要写：重放读的是同一帧同一槽的 CPU 可见缓冲，写入与提交在同一条命令流里。
+            // Must also write during collection: replay reads the CPU-visible buffer of the same frame and same slot, and the write and commit are in the same command stream.
             var drawParams = new MTLTextDrawParams
             {
                 AtlasSize = new Vector2(atlasTexture.Width, atlasTexture.Height),
@@ -1178,9 +1190,9 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             };
             *(MTLTextDrawParams*)drawParamsBuffer.Contents = drawParams;
 
-            // 工作包 D：收集期没有 encoder，直接把这批不可变句柄交给透明队列。
-            // 直绘路径末尾的“恢复 VS buffer(4)”在重放里不需要：
-            // 每条命令重绑完整槽位，不存在跨命令残留。
+            // Work package D: there is no encoder during collection, so hand this batch of immutable handles directly to the transparent queue.
+            // The "restore VS buffer(4)" at the end of the direct-draw path is not needed during replay:
+            // each command rebinds the full set of slots, so there is no cross-command residue.
             if (Metal.MTLSceneDrawCollection.Active is { } collecting)
             {
                 collecting.CaptureText(_textQuadVertexBuffer, _textMatrixBuffer, instanceBuffer,
@@ -2537,7 +2549,7 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         mesh.Ready = false;
     }
 
-    // ── InstancedModel（GLB GPU Instancing）──
+    // ── InstancedModel (GLB GPU Instancing) ──
 
     public async Task<bool> LoadInstancedModel(InstancedModel model)
     {
@@ -2966,15 +2978,15 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         Season.Rendering.StorageBufferUsage usage = Season.Rendering.StorageBufferUsage.Compute)
         => new MTLStorageBuffer(sizeInBytes, usage);
 
-    // ── A0.1 间接绘制（契约在 IGraphics / Indirect.cs）──
-    // Metal 是四端里最轻的一端：既没有缓冲状态机，也不需要 MTLIndirectCommandBuffer——
-    // 单条间接绘制走 DrawIndexedPrimitives 的 indirectBuffer 重载即可，ICB 只在 A7 的 multi-draw 才需要。
-    // 所以 Prepare 阶段无事可做，只做与其他三端一致的准入校验；返回 true 代表“交接已完成”而非“已录制指令”。
+    // ── A0.1 indirect draw (contract in IGraphics / Indirect.cs) ──
+    // Metal is the lightest of the four backends: it has neither a buffer state machine nor any need for MTLIndirectCommandBuffer——
+    // a single indirect draw just goes through the indirectBuffer overload of DrawIndexedPrimitives; the ICB is only needed for A7's multi-draw.
+    // So the Prepare stage has nothing to do, only performing the same admission check as the other three backends; returning true means "handoff completed" rather than "instructions recorded".
 
     public bool IndirectDrawSupported => ComputeSupported;
 
-    /// <summary>A0.2：间接计算派发（dispatchThreadgroupsWithIndirectBuffer）。与间接绘制是两道独立能力位，
-    /// 但这里同源：两者都只需要 compute encoder 与一个已声明的参数缓冲。</summary>
+    /// <summary>A0.2: indirect compute dispatch (dispatchThreadgroupsWithIndirectBuffer). It is a separate capability bit from indirect draw,
+    /// but shares the same origin here: both only need a compute encoder and one declared argument buffer.</summary>
     public bool DispatchIndirectSupported => ComputeSupported;
 
     public bool TryPrepareIndirectArgs(Season.Rendering.StorageBuffer buffer)
@@ -2983,14 +2995,14 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             && mtlBuffer.Usage == Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs
             && mtlBuffer.SizeInBytes >= Season.Rendering.IndirectDrawIndexedArgs.SizeInBytes;
 
-    /// <summary>间接实例化四边形绘制管线。创建失败即返回 null，粒子效果据此整体不注册，画面退回改动前。</summary>
+    /// <summary>Indirect instanced quad draw pipeline. Returns null on creation failure, so the particle effect is not registered at all and the image falls back to before the change.</summary>
     public Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline()
     {
         if (!IndirectDrawSupported) return null;
         try { return new MTLParticleDrawPipeline(); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Particles] Metal 管线创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Particles] Metal pipeline creation failed: {ex.Message}");
             return null;
         }
     }
@@ -3083,7 +3095,7 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         var kernel = (MTLComputeKernel)args.Kernel;
         var bindings = kernel.Desc.Bindings;
 
-        // A0.2 的准入与另外三端一致：放在开编码器之前，失败时不留一个空 encoder 出去了。
+        // A0.2's admission is the same as the other three backends: placed before opening the encoder, so on failure an empty encoder is not left open.
         MTLStorageBuffer indirect = null;
         if (args.IsIndirect)
         {
@@ -3225,9 +3237,9 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         // This backend is the only one among the four that consumes this field at runtime.
         if (indirect != null)
         {
-            // Metal 是四端里唯一连 barrier 都不需要的一端：同一 command buffer 内的编码顺序
-            // 加上驱动的自动 hazard tracking 就是全部同步，所以这里只是换一个重载。
-            // 工作组长仍然是 kernel.ThreadsPerGroup —— 间接块只给组数，不给组长。
+            // Metal is the only one of the four backends that does not even need a barrier: the encoding order within the same command buffer
+            // plus the driver's automatic hazard tracking is all the synchronization, so here it is merely a different overload.
+            // The workgroup size is still kernel.ThreadsPerGroup —— the indirect block only provides the group count, not the group size.
             enc.DispatchThreadgroups(indirect.Buffer, (nuint)args.ArgumentsOffset, kernel.ThreadsPerGroup);
         }
         else

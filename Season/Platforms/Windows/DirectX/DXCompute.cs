@@ -182,7 +182,7 @@ internal sealed unsafe class DXComputeKernel : Season.Rendering.ComputeKernel
 
     public override void Dispose()
     {
-        // 注销阻止后续调度；已录制的命令仍持有原生句柄，等本帧 fence 完成后释放。
+        // Unregistration prevents further scheduling; already-recorded commands still hold the native handle, so it is released after this frame's fence completes.
         nint pipeline = (nint)PipelineState, signature = (nint)RootSignature;
         PipelineState = null;
         RootSignature = null;
@@ -249,9 +249,9 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
         Usage = usage;
         _alignedSize = alignedSize;
 
-        // A0.1：D3D12 不需要额外创建标志。任何缓冲都可转入 INDIRECT_ARGUMENT，
-        // AllowUnorderedAccess 已经允许 compute 写入，所以 usage 在这一端只影响
-        // TryPrepareIndirectArgs 的准入判定，不影响资源描述。
+        // A0.1: D3D12 needs no extra creation flags. Any buffer can be transitioned into INDIRECT_ARGUMENT,
+        // and AllowUnorderedAccess already allows compute writes, so on this backend usage only affects
+        // the admission test of TryPrepareIndirectArgs, not the resource description.
         var heapProps = new HeapProperties(HeapType.Default);
         var bufferDesc = new ResourceDesc
         {
@@ -411,7 +411,7 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
         SrvGpuHandle = UavGpuHandle = default;
         Array.Clear(_uploadHeaps);
         Array.Clear(_uploadHeapCapacities);
-        // 资源和描述符同时退休，防止后续分配覆盖在飞帧所绑定的 SRV/UAV。
+        // The resource and the descriptors retire together, to prevent a later allocation from overwriting the SRV/UAV bound by an in-flight frame.
         Device.EnqueueDeferredRelease(Device.GetCurrentRetireFenceValue(), () =>
         {
             if (resource != 0) ((ID3D12Resource*)resource)->Release();

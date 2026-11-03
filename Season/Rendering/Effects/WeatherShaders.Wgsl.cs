@@ -33,17 +33,21 @@ fn WeatherCloudDensity(p: vec3f,i: i32,layer: i32) -> f32 {
     let d=clamp((n.x*mix(1.0,n.w,0.7)-(1.0-coverage))/max(coverage,0.001),0.0,1.0);
     return d*clamp(1.0-0.175*(n.y+n.z),0.0,1.0);
 }
-// 光学厚度只取决于密度和视线倾角。密度单独传进来，远距 LOD 平滑过的密度才能和亮度用同一份，
-// 不会出现「亮度已经抹平、不透明度还留着摩尔纹」的半截处理。
+// Optical depth depends only on density and the view inclination angle. Density is passed in
+// separately so that the distance-LOD-smoothed density is shared with brightness, avoiding the
+// half-measure where brightness is already flattened but opacity still retains its moire.
 fn WeatherCloudTau(p: vec3f,density: f32,vertical: f32,i: i32,layer: i32) -> f32 {
     let shape=WeatherR(i,2);
     return density*WeatherContribution(p,i,true)*WeatherR(i,1).w
         *shape.y*shape.w/max(abs(vertical),0.05)/max(WeatherH(0).z,1.0);
 }
-// 一个像素在数公里外已经横跨数十米，512m 周期的云噪声在这个尺度上必然欠采样，点采会显出重复网格。
-// 按「像素在云平面上的足迹」取四个错开的样本求均值，相当于手工做一次 mip：云团的大尺度轮廓留住，
-// 低于一个像素的细纹被抹平。判据必须是足迹而不是纯视距——掠射时同一像素沿视线方向被拉长
-// 1/|dir.y|，只按视距切换会在地平线上留下一条断续的亮带。近处四个样本重合，退化为单次采样。
+// A pixel already spans tens of meters several kilometers out, and the 512m-period cloud noise is
+// necessarily undersampled at that scale, so point sampling reveals a repeating grid. Averaging four
+// offset samples by the pixel's footprint on the cloud plane amounts to a manual mip: the large-scale
+// cloud silhouettes survive while sub-pixel detail is flattened. The criterion must be the footprint,
+// not pure view distance -- under grazing angles the same pixel is stretched 1/|dir.y| along the view
+// direction, so switching on view distance alone leaves a broken bright band on the horizon. Nearby the
+// four samples coincide and it degenerates to a single sample.
 fn WeatherCloudDensityLod(p: vec3f,dir: vec3f,travel: f32,i: i32,layer: i32) -> f32 {
     var d=WeatherCloudDensity(p,i,layer);
     if(travel*inverseSqrt(max(abs(dir.y),0.02))>900.0) {
@@ -92,20 +96,25 @@ fn WeatherCloudComposite(sky: vec3f,origin: vec3f,dir: vec3f,sunDirection: vec3f
         let silver=0.25*pow((1.0-g)*(1.0-g)/dn,1.5);
         for(var k=0;k<count;k++) {
             let regionIndex=keys[k]>>1u; let layerIndex=keys[k]&1; let p=origin+dir*hits[k];
-            // 亮度与光学厚度共用同一份密度：alpha 若继续点采真实密度，地平线附近那一圈欠采样就会以
-            // 闪烁栅格的形式留在画面上——看着像云的结构，其实全是采样伪影。
+            // Brightness and optical depth share the same density: if alpha kept point-sampling the true
+            // density, the undersampling ring near the horizon would show up as a flickering grid -- it
+            // looks like cloud structure but is entirely a sampling artifact.
             let d=WeatherCloudDensityLod(p,dir,hits[k],regionIndex,layerIndex);
             let alpha=1.0-exp(-WeatherCloudTau(p,d,dir.y,regionIndex,layerIndex));
-            // 云板只在远裁剪面处有边界：末段距离把覆盖率淡出，云层改以天空底色收场，而不是截出一道硬弧。
+            // The cloud slab is bounded only at the far clip plane: the last stretch of distance fades
+            // out coverage so the cloud layer resolves into the sky color instead of a hard arc.
             let faded=alpha*(1.0-clamp((hits[k]-WeatherH(1).z*0.72)/max(WeatherH(1).z*0.28,0.001),0.0,1.0));
             let light=WeatherR(regionIndex,6);
             let radiance0=light.xyz*mix(light.w,1.0,1.0-d)*(1.0+silver);
-            // 大气透视：6km 尺度上云板收向同一像素的天空底色，地平线附近的云层才会自然消失，
-            // 而不是在覆盖率淡出处留下一条切边。
+            // Atmospheric perspective: at the 6km scale the cloud slab converges to the same pixel's
+            // sky color, so clouds near the horizon fade naturally instead of leaving a hard cut where
+            // the coverage fades out.
             var radiance=mix(sky,radiance0,exp(-hits[k]/6000.0));
-            // 2-7 雷电：云内发光。WeatherFlash 存的是主导雷击的世界坐标 + 回击包络亮度，
-            // 用 1/(1+d^2/L^2) 把点回击摊成一小片被照亮的云团；L=250m 与云板水平尺度同量级，
-            // 再远就退化成整片均匀提亮，不再是“云里闪了一下”。
+            // 2-7 Lightning: intra-cloud glow. WeatherFlash stores the dominant strike's world position
+            // plus the return-stroke envelope brightness; 1/(1+d^2/L^2) spreads the point strike into a
+            // small illuminated cloud volume. L=250m is on the order of the cloud slab's horizontal
+            // scale, and farther out it degenerates into uniform brightening rather than a "flash inside
+            // the cloud".
             let flashDelta=p-WeatherFlash().xyz;
             radiance+=WeatherFlash().w/(1.0+dot(flashDelta,flashDelta)/62500.0)*vec3f(0.55,0.62,0.85)*12.0;
             acc+=trans*faded*radiance; trans*=1.0-faded;
@@ -138,9 +147,11 @@ fn WeatherRainTexture(p: vec3f,i: i32) -> f32 {
     let b=sin(6.2831853*(q.y*0.5-q.x*0.25)+seed*0.37);
     return 0.55+0.25*a+0.2*b;
 }
-// 远景雨幕的层次不能交给 32m 周期雨纹：预算 24 步铺满上千米时步长已达 40~60m，采样必然落在
-// 相邻峰谷之间，只剩一条稳定的亮暗带。这里按步长把高频纹路淡到均值，再用 260m 周期的低频
-// 云团尺度起伏接管远层，两个分量的均值都是 0.55，切换处不会产生亮度跳变。
+// The distant rain curtain's structure cannot rely on the 32m-period rain pattern: with a budget of
+// 24 steps spanning over a kilometer the step length reaches 40-60m and samples land between adjacent
+// peaks and troughs, leaving only a stable bright/dark band. Here the high-frequency pattern is faded
+// toward its mean by step length and a 260m-period low-frequency cloud-scale swell takes over the far
+// layer; both components have a mean of 0.55, so no brightness jump appears at the switch.
 fn WeatherRainBank(p: vec3f,i: i32) -> f32 {
     let m=WeatherR(i,3); let q=(p.xz-m.xy)/260.0; let seed=m.z%127.0;
     let a=sin(6.2831853*(q.x*0.5+q.y*0.35)+seed*0.81);
@@ -178,7 +189,8 @@ fn WeatherRain(origin: vec3f,dir: vec3f,distance: f32) -> vec4f {
                 spans[at]=hit; count++;
             }
         }
-        // 合并交叠段，沿完整场采样，避免重复积分及漏掉狭窄区域。
+        // Merge overlapping spans and sample along the full field to avoid double integration and
+        // missing narrow regions.
         var merged=0;
         for(var mergeIndex=0;mergeIndex<8;mergeIndex++) {
             if(mergeIndex<count) {
@@ -197,8 +209,9 @@ fn WeatherRain(origin: vec3f,dir: vec3f,distance: f32) -> vec4f {
             if(segmentIndex==merged-1) { steps=left; }
             left-=steps; let ds=len/f32(steps);
             for(var k=0;k<steps;k++) {
-                // 固定格点在远距离会与雨纹周期拍频；逐像素逐段的确定性抖动把拍频换成细噪点，
-                // 积分仍无偏，且不需要额外 ABI 或随机表。
+                // Fixed lattice points beat against the rain pattern period at distance; a per-pixel,
+                // per-segment deterministic jitter turns the beating into fine noise. The integral stays
+                // unbiased and no extra ABI or random table is needed.
                 let jitter=fract(sin(dot(dir,vec3f(12.9898,78.233,37.719))+f32(k)*13.77+spans[segmentIndex].x*0.001)*43758.5453);
                 let t=spans[segmentIndex].x+(f32(k)+jitter)*ds;
                 let local=WeatherRainMedium(origin+dir*t,t,ds); let transmission=exp(-local.w*ds);
@@ -222,7 +235,8 @@ struct WeatherFrame { values: array<vec4f> }
 fn WF(i: i32) -> vec4f { return weatherFrame.values[i]; }
 fn WeatherH(i: i32) -> vec4f { return WF(94+i); }
 fn WeatherR(i: i32,row: i32) -> vec4f { return WF(96+i*8+row); }
-// 2-7 雷电：weatherFrame 的第 161 行（索引 160）= 主导雷击（xyz 世界坐标 + w 包络亮度）。
+// 2-7 Lightning: row 161 of weatherFrame (index 160) = dominant strike (xyz world position + w
+// envelope brightness).
 fn WeatherFlash() -> vec4f { return WF(160); }
 """ + CommonWgsl + RainWgsl + """
 @fragment fn PSMain(@builtin(position) position: vec4f) -> @location(0) vec4f {

@@ -8,29 +8,29 @@ using Metal;
 namespace Season.Platforms.Shared.Apple.Metal;
 
 /// <summary>
-/// A0.1 的 Metal 提交端：一次间接索引绘制画出 compute 决定数量的公告板。
+/// A0.1's Metal submission side: a single indirect indexed draw renders the number of billboards determined by compute.
 ///
-/// 这是四端里最轻的一端，相对 VKParticleDrawPipeline 少掉三样东西。
-/// 一是描述符：Metal 直接 SetVertexBuffer，没有 set 也没有按帧描述符环，于是连 Device.WaitForFrameSlot
-/// 那条"三帧前的 set 可能还被 pending 命令缓冲引用"的推理都不存在。
-/// 二是屏障：写后读的依赖由驱动 hazard tracking 兑现，所以 Prepare 不录任何东西，
-/// IGraphics.TryPrepareIndirectArgs 在这一端也只是做准入校验。
-/// 三是延迟释放：已编码资源由 command buffer 的 retained references 持有，Dispose 可以立即放手。
+/// This is the lightest of the four backends, missing three things compared to VKParticleDrawPipeline.
+/// First, descriptors: Metal calls SetVertexBuffer directly, with no set and no per-frame descriptor ring, so even the Device.WaitForFrameSlot
+/// reasoning that "a set from three frames ago may still be referenced by a pending command buffer" does not exist.
+/// Second, barriers: read-after-write dependencies are honored by the driver's hazard tracking, so Prepare records nothing,
+/// and on this backend IGraphics.TryPrepareIndirectArgs only performs an admission check.
+/// Third, deferred release: already-encoded resources are held by the command buffer's retained references, so Dispose can let go immediately.
 ///
-/// PSO 不在构造期烘焙而是在 Draw 里按需烘焙，理由与另外两端一致：决定附件形状的事实只在进入 Pass
-/// 之后才成立，而 Prepare 必须在 Pass 之外。创建 PSO 是设备调用不是编码器调用，在 Pass 内合法。
+/// The PSO is not baked at construction time but baked on demand inside Draw, for the same reason as the other two backends: the facts that determine the attachment shape only hold
+/// after entering the Pass, whereas Prepare must be outside the Pass. Creating a PSO is a device call, not an encoder call, so it is legal inside the Pass.
 ///
-/// "附件形状"在 Metal 就是字面意义上的三个像素格式——颜色、深度、速度——因为 Metal 把附件格式直接
-/// 烘进 PSO，不匹配即创建失败或绘制被丢弃。所以这里的 key 不像 Vulkan 那样是个枚举，而就是格式三元组：
-/// 深度为 Invalid 表示本 Pass 没有深度附件（NoImplicitDepth 的目标），此时开深度测试是非法的；
-/// 速度为 Invalid 表示单目标形状，PSO 只有一个颜色附件。三者都只能从 Device 记录的实际绑定反推。
+/// "Attachment shape" in Metal is literally three pixel formats — color, depth, velocity — because Metal bakes the attachment formats directly
+/// into the PSO, and a mismatch means creation failure or the draw being discarded. So the key here is not an enum like in Vulkan, but literally the format triple:
+/// Depth == Invalid means this Pass has no depth attachment (a NoImplicitDepth target), in which case enabling depth testing is illegal;
+/// Velocity == Invalid means a single-target shape, with the PSO having only one color attachment. All three can only be inferred from the actual bindings recorded by the Device.
 /// </summary>
 internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPipeline
 {
-    /// <summary>单位四边形的 6 个索引，绕序与另外三端共用的 0,1,2,1,3,2 一致；角点由 [[vertex_id]] 的低两位展开。</summary>
+    /// <summary>The 6 indices of the unit quad, with a winding order matching the 0,1,2,1,3,2 shared by the other three backends; the corners are expanded from the low two bits of [[vertex_id]].</summary>
     static readonly ushort[] QuadIndices = [0, 1, 2, 1, 3, 2];
 
-    /// <summary>PSO 签名。Metal 把附件格式烘进 PSO，所以签名就是实际附件的格式组合；采样数不进 key，见类注释。</summary>
+    /// <summary>PSO signature. Metal bakes the attachment formats into the PSO, so the signature is just the format combination of the actual attachments; the sample count does not enter the key, see the class comment.</summary>
     readonly record struct PipelineKey(MTLPixelFormat Color, MTLPixelFormat Depth, MTLPixelFormat Velocity,
         MTLPixelFormat Normal);
 
@@ -38,20 +38,20 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
 
     IMTLBuffer? _quadIndices;
 
-    // 着色器函数在构造期就编译好，与 DX 端同一选择。这是整条链里唯一没有任何离线编译手段的环节
-    // （Windows 上没有 xcrun metal），把它的失败留到 Draw 就是 Pass 内抛异常；放在构造期则由
-    // CreateParticleDrawPipeline 接住并返回 null，粒子效果整体不注册，画面退回改动前。
+    // The shader functions are compiled at construction time, the same choice as the DX backend. This is the only stage in the whole chain with no offline compilation means
+    // (there is no xcrun metal on Windows); leaving its failure to Draw means throwing an exception inside the Pass, whereas doing it at construction time lets
+    // CreateParticleDrawPipeline catch it and return null, so the particle effect is not registered at all and the image falls back to its state before the change.
     IMTLFunction? _vertexFunction, _fragmentFunction, _fragmentVelocityFunction;
 
-    /// <summary>深度测试开、深度写关：粒子互相之间不排序，写深度只会让后画的被先画的挡掉。
-    /// 场景深度是正向的（主管线用 Less/LessEqual），所以这里是 LessEqual，与 Pipeline.TransparentDepthState 同形。</summary>
+    /// <summary>Depth test on, depth write off: particles are not sorted among themselves, and writing depth would only let later-drawn ones be occluded by earlier-drawn ones.
+    /// Scene depth is forward (the main pipeline uses Less/LessEqual), so this uses LessEqual, matching the shape of Pipeline.TransparentDepthState.</summary>
     IMTLDepthStencilState? _depthState;
 
-    /// <summary>没有深度附件那一档。Metal 要求此时比较函数必须是 Always，否则是未定义行为，
-    /// 与 MTLFogCompositePipeline 的无深度全屏管线同一选择。</summary>
+    /// <summary>The variant with no depth attachment. Metal requires the compare function to be Always here, otherwise it is undefined behavior,
+    /// the same choice as MTLFogCompositePipeline's depth-less full-screen pipeline.</summary>
     IMTLDepthStencilState? _noDepthState;
 
-    // Prepare 的产物，Draw 消费且只消费一次。
+    // The product of Prepare, consumed by Draw and consumed only once.
     MTLRenderTarget? _color;
     Season.Rendering.RenderTarget? _depth;
     MTLStorageBuffer? _instances, _args, _frame;
@@ -68,8 +68,8 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
             _quadIndices = Device.ResourceManager.CreateIndexBuffer(QuadIndices);
             _quadIndices.Label = "Season-ParticleQuadIndices";
 
-            // MTLShaderCompiler 按源码字符串缓存 IMTLLibrary，所以两档片元共用同一份顶点库，
-            // 每份源码也只编译一次，哪怕后面因颜色格式不同而烘了多个 PSO。
+            // MTLShaderCompiler caches IMTLLibrary by source string, so both fragment variants share the same vertex library,
+            // and each source is compiled only once, even if multiple PSOs are later baked for different color formats.
             _vertexFunction = CreateFunction(Season.Rendering.Effects.ParticleSystemEffect.DrawVertexMsl,
                 "VSMain");
             _fragmentFunction = CreateFunction(Season.Rendering.Effects.ParticleSystemEffect.DrawFragmentMsl,
@@ -82,13 +82,13 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
                 DepthCompareFunction = MTLCompareFunction.LessEqual, DepthWriteEnabled = false,
             };
             _depthState = Device.MtlDevice.CreateDepthStencilState(depth)
-                ?? throw new InvalidOperationException("粒子深度状态创建失败。");
+                ?? throw new InvalidOperationException("Failed to create particle depth state.");
             using var noDepth = new MTLDepthStencilDescriptor
             {
                 DepthCompareFunction = MTLCompareFunction.Always, DepthWriteEnabled = false,
             };
             _noDepthState = Device.MtlDevice.CreateDepthStencilState(noDepth)
-                ?? throw new InvalidOperationException("粒子无深度状态创建失败。");
+                ?? throw new InvalidOperationException("Failed to create particle no-depth state.");
         }
         catch { Dispose(); throw; }
     }
@@ -96,9 +96,9 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
     static IMTLFunction CreateFunction(string source, string entryPoint)
     {
         var library = MTLShaderCompiler.Compile(Device.MtlDevice, source);
-        // MSL 保留真实入口名（不像 GLSL 恒为 main），所以找不到就是源码与这里的名字走样了。
+        // MSL preserves the real entry-point name (unlike GLSL, which is always main), so a failure to find it means the source and the name here have diverged.
         return library.CreateFunction(entryPoint)
-            ?? throw new InvalidOperationException($"粒子着色器未找到入口 {entryPoint}。");
+            ?? throw new InvalidOperationException($"Particle shader entry point not found: {entryPoint}.");
     }
 
     IMTLRenderPipelineState? GetOrCreatePipeline(in PipelineKey key)
@@ -106,10 +106,10 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
         if (_pipelines.TryGetValue(key, out var cached)) return cached;
         bool velocity = key.Velocity != MTLPixelFormat.Invalid;
 
-        // 函数已在构造期编译，此处只剩烘 PSO——因为只有它需要附件格式，而格式要到进了 Pass 才成立。
-        // 注意：函数不能在这里 dispose，它们还要给后续颜色格式的 PSO 用。
-        // 没有 VertexDescriptor：角点来自 [[vertex_id]]，实例值来自顶点阶段的只读缓冲，
-        // 所以顶点槽 0/1 在这条管线里不是 [[stage_in]] 流，不与主管线的顶点布局冲突。
+        // The functions were already compiled at construction time; only baking the PSO is left here — because only it needs the attachment formats, and the formats only hold once inside the Pass.
+        // Note: the functions must not be disposed here, as they are still needed for PSOs of subsequent color formats.
+        // No VertexDescriptor: the corners come from [[vertex_id]] and the instance values come from a read-only buffer in the vertex stage,
+        // so vertex slots 0/1 in this pipeline are not [[stage_in]] streams and do not conflict with the main pipeline's vertex layout.
         using var desc = new MTLRenderPipelineDescriptor
         {
             Label = velocity ? "Season-ParticleDraw-Vel" : "Season-ParticleDraw",
@@ -120,7 +120,7 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
         };
         var color = desc.ColorAttachments[0];
         color.PixelFormat = key.Color;
-        // 片元着色器输出预乘 alpha，所以源因子是 One 而不是 SourceAlpha。
+        // The fragment shader outputs premultiplied alpha, so the source factor is One rather than SourceAlpha.
         color.BlendingEnabled = true;
         color.RgbBlendOperation = MTLBlendOperation.Add;
         color.AlphaBlendOperation = MTLBlendOperation.Add;
@@ -130,15 +130,15 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
         color.DestinationAlphaBlendFactor = MTLBlendFactor.OneMinusSourceAlpha;
         if (velocity)
         {
-            // 速度槽写掩码置零，与主管线对透明几何的既有选择一致（Pipeline.CreatePipelineState 的
-            // slot 1）：保留下方不透明层的速度，比写 0 更好，后者会让 TAA 把运动的粒子当成静止背景去累积。
+            // The velocity slot write mask is zeroed, consistent with the main pipeline's existing choice for transparent geometry (slot 1
+            // of Pipeline.CreatePipelineState): preserving the velocity of the opaque layer below is better than writing 0, which would make TAA accumulate moving particles as if they were a static background.
             var motion = desc.ColorAttachments[1];
             motion.PixelFormat = key.Velocity;
             motion.BlendingEnabled = false;
             motion.WriteMask = MTLColorWriteMask.None;
 
-            // A0.2 法线槽同理：粒子不是 SSR/贴花要看到的表面。写掩码为零的附件不要求片元函数有
-            // 对应的 [[color(2)]] 输出，所以沿用速度版本的片元函数。
+            // Same for the A0.2 normal slot: particles are not a surface that SSR/decals should see. An attachment with a zero write mask does not require the fragment function to have
+            // a corresponding [[color(2)]] output, so the velocity variant's fragment function is reused.
             if (key.Normal != MTLPixelFormat.Invalid)
             {
                 var normal = desc.ColorAttachments[2];
@@ -150,7 +150,7 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
 
         var pipeline = Device.MtlDevice.CreateRenderPipelineState(desc, out NSError? error);
         if (pipeline == null)
-            throw new InvalidOperationException($"粒子 PSO 创建失败：{error?.LocalizedDescription ?? "(no NSError)"}");
+            throw new InvalidOperationException($"Failed to create particle PSO: {error?.LocalizedDescription ?? "(no NSError)"}");
         _pipelines[key] = pipeline;
         return pipeline;
     }
@@ -159,8 +159,8 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
     {
         ClearPrepared();
         var command = Device.GraphicsCommandBuffer;
-        // Metal 的 Pass 就是编码器，所以"在 Pass 之外"等价于当前没有渲染编码器；
-        // 有编码器时录制任何东西都违反 PassDesc 契约，宁可放弃本帧提交。
+        // A Metal Pass is an encoder, so "outside the Pass" is equivalent to there being no render encoder currently;
+        // recording anything while an encoder exists violates the PassDesc contract, so it is better to abandon this frame's submission.
         if (_disposed || Device.GraphicsEncoder != null || command == null || command.Handle == IntPtr.Zero
             || _quadIndices == null || _depthState == null || _noDepthState == null
             || _vertexFunction == null || _fragmentFunction == null || _fragmentVelocityFunction == null
@@ -193,8 +193,8 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
             || instances == null || args == null || frame == null) return false;
 
         var encoder = Device.GraphicsEncoder;
-        // Metal 没有 fence 退休值可比，身份核对因此是"同一条 command buffer 的托管引用 + 同一个
-        // FrameIndex"：command buffer 每帧新建，所以两者同时成立就排除了跨帧复用准备结果。
+        // Metal has no fence retirement value to compare against, so the identity check is "managed reference to the same command buffer + the same
+        // FrameIndex": the command buffer is recreated every frame, so both holding at once rules out reusing the prepare result across frames.
         if (encoder == null || encoder.Handle == IntPtr.Zero
             || command.Handle == IntPtr.Zero || !ReferenceEquals(command, Device.GraphicsCommandBuffer)
             || frameIndex != Device.FrameIndex
@@ -202,11 +202,11 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
                 or Season.Rendering.RenderPassId.SceneTransparent)
             || !ReferenceEquals(color, Device.ActiveColorTarget)
             || Device.ActiveColorTexture?.Handle != colorTexture.Handle) return false;
-        // null == 使用该目标自带的深度，这同样要求准备期看到的是 null，否则深度语义已经变了。
+        // null == use the depth built into that target, which likewise requires that null was seen during preparation, otherwise the depth semantics have already changed.
         if (!ReferenceEquals(Device.ActiveDepthTarget, depth)) return false;
 
-        // 附件形状只能从实际绑定反推：显式深度缺席不代表没有深度附件，目标自带的那张同样算；
-        // 速度槽只在三目标形状下存在，而准备期持有的 PassDesc 推不出这一点。
+        // The attachment shape can only be inferred from the actual bindings: the absence of an explicit depth does not mean there is no depth attachment, since the target's own one counts too;
+        // the velocity slot only exists in the three-target shape, and the PassDesc held during preparation cannot infer this.
         var velocityTexture = Device.ActiveVelocityTexture;
         var velocityFormat = MTLPixelFormat.Invalid;
         var normalFormat = MTLPixelFormat.Invalid;
@@ -221,17 +221,17 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
             normalFormat));
         if (pipeline == null) return false;
 
-        // 主管线每条绘制都重绑 PSO、深度状态、剔除与顶点槽 0..4（见 Pipeline.DrawPrimitive），
-        // 所以这里的覆写不会泄漏到后续绘制。
+        // The main pipeline rebinds the PSO, depth state, culling and vertex slots 0..4 on every draw (see Pipeline.DrawPrimitive),
+        // so the overrides here will not leak into subsequent draws.
         encoder.SetRenderPipelineState(pipeline);
         encoder.SetDepthStencilState(depthFormat == MTLPixelFormat.Invalid ? _noDepthState! : _depthState!);
-        // 公告板的绕序取决于相机基与索引顺序的组合，关掉剔除比在着色器里翻正负更可靠。
+        // The billboard winding order depends on the combination of the camera basis and the index order; turning off culling is more reliable than flipping the sign in the shader.
         encoder.SetCullMode(MTLCullMode.None);
         encoder.SetVertexBuffer(instances.Buffer, 0, 0);
         encoder.SetVertexBuffer(frame.Buffer, 0, 1);
-        // 实例数来自参数缓冲的第二个字段，CPU 这一侧从未知道过它的值。
-        // 重载是 drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset:
-        // —— 索引缓冲在前、参数缓冲在后，两个偏移都是 nuint。
+        // The instance count comes from the second field of the argument buffer, whose value the CPU side never knows.
+        // The overload is drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset:
+        // — the index buffer comes first and the argument buffer second, and both offsets are nuint.
         encoder.DrawIndexedPrimitives(MTLPrimitiveType.Triangle, MTLIndexType.UInt16,
             _quadIndices!, 0, args.Buffer, 0);
         return true;
@@ -250,13 +250,13 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
         if (_disposed) return;
         _disposed = true;
         ClearPrepared();
-        // 已编码资源由 command buffer 持有（Device 规则 5），所以立即释放包装对象是安全的，
-        // 不需要 DX 与 VK 那种按 fence 放行的延迟释放队列；未编码的准备结果已经失效。
+        // Already-encoded resources are held by the command buffer (Device rule 5), so releasing the wrapper objects immediately is safe,
+        // with no need for the DX and VK style fence-gated deferred release queue; the not-yet-encoded prepare result has already been invalidated.
         foreach (var pipeline in _pipelines.Values) pipeline?.Dispose();
         _pipelines.Clear();
         _depthState?.Dispose(); _depthState = null;
         _noDepthState?.Dispose(); _noDepthState = null;
-        // 函数是本类持有的，要放掉；库不是——它归 MTLShaderCompiler 的源码缓存所有。
+        // The functions are owned by this class and must be released; the library is not — it is owned by MTLShaderCompiler's source cache.
         _vertexFunction?.Dispose(); _vertexFunction = null;
         _fragmentFunction?.Dispose(); _fragmentFunction = null;
         _fragmentVelocityFunction?.Dispose(); _fragmentVelocityFunction = null;

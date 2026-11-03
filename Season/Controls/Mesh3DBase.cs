@@ -49,7 +49,7 @@ public abstract class Mesh3DBase : Control, ITransparentSortable
     /// When highlighted by selection, colors follow this configuration. ObjectPicker only overrides the pulsing value
     /// in SurfaceColor.W and does not touch RGB.
     /// Nested object-initializer assignment is supported:
-    /// Highlight = { Style = ..., SurfaceColor = ... }。
+    /// Highlight = { Style = ..., SurfaceColor = ... }.
     /// </summary>
     public Highlight Highlight { get; set; } = new();
 
@@ -117,7 +117,7 @@ public abstract class Mesh3DBase : Control, ITransparentSortable
 
     /// <summary>
     /// Unified positioning model for the world matrix, mapping model space to world space:
-    /// CreateTranslation(−AnchorLocal) × CreateScale(ComputedScale) × Rotation × CreateTranslation(PosX,PosY,PosZ)。
+    /// CreateTranslation(−AnchorLocal) × CreateScale(ComputedScale) × Rotation × CreateTranslation(PosX,PosY,PosZ).
     /// Under the row-vector convention (p * M), point evaluation becomes ((p - A) * S) * R + Pos.
     /// The anchor A, which is the geometric center of the bounding box, maps exactly to (PosX, PosY, PosZ),
     /// and the rotation pivot is fixed at the anchor. With a center anchor, rotation therefore happens around

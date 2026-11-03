@@ -71,30 +71,31 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     protected int _prevInstanceWorldCapacity;
 
     // ============================================================
-    // A7 逐实例 GPU 剔除
+    // A7 per-instance GPU culling
     // ============================================================
-    // 五个缓冲一起分配、一起释放，容量按 64 对齐只增不减。全为 null 即本组不参与 A7，
-    // 阴影自然退回 CPU 整批剔除，不会拿空缓冲去画。
+    // The five buffers are allocated and released together; capacity is aligned to 64 and only grows. When all
+    // are null this group does not participate in A7, and shadows fall back to whole-batch CPU culling rather
+    // than drawing with empty buffers.
     Season.Rendering.StorageBuffer? _cullSource;
     Season.Rendering.StorageBuffer? _cullSorted;
     Season.Rendering.StorageBuffer? _cullArgs;
     Season.Rendering.StorageBuffer? _cullVisible;
     Season.Rendering.StorageBuffer? _cullPrimInfo;
     int _cullCapacity = -1;
-    /// <summary>已上传到 GPU 的参数表条数。与 <see cref="_cullPrimInfoPending"/> 不等时说明本帧要重传。</summary>
+    /// <summary>Number of parameter-table entries already uploaded to the GPU. When it differs from <see cref="_cullPrimInfoPending"/> this frame must re-upload.</summary>
     int _cullPrimitiveCount = -1;
-    /// <summary>CPU 侧已构造好的参数表字节。放在这里而不是 UPDATE 里直接传，是因为构造不等同于上传：
-    /// 构造随时可做，上传要等命令列表打开（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。</summary>
+    /// <summary>Parameter-table bytes already built on the CPU side. Stored here instead of being uploaded directly in UPDATE because building is not the same as uploading:
+    /// building can happen anytime, but uploading must wait until the command list is open (see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>).</summary>
     byte[]? _cullPrimInfoBytes;
-    /// <summary>CPU 侧参数表的条数，-1 表示还没构造过。</summary>
+    /// <summary>Number of CPU-side parameter-table entries; -1 means it has not been built yet.</summary>
     int _cullPrimInfoPending = -1;
     bool _cullRegistered;
 
-    /// <summary>组局部合并包围盒。剔除内核用它把实例矩阵换算成世界包围球，多 surface 的组必须传并集。</summary>
+    /// <summary>Group-local merged bounding box. The culling kernel uses it to convert instance matrices into world bounding spheres, so a multi-surface group must pass the union.</summary>
     Vector3 _cullLocalCenter;
     Vector3 _cullLocalExtents;
 
-    /// <summary>本帧是否已把重排流与间接参数交接到可绘制状态。Update 开头清零，PrepareCullDraw 置位。</summary>
+    /// <summary>Whether this frame has transitioned the reorder stream and indirect args into a drawable state. Cleared at the start of Update, set by PrepareCullDraw.</summary>
     bool _cullDrawReady;
 
     protected DXInstancedPrimitiveGroup(string name)
@@ -159,8 +160,9 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     }
 
     /// <summary>
-    /// 把全部 primitive 的局部包围盒并成组级合并盒。剔除内核只收一个盒，所以并集是必填项：
-    /// 传某个 surface 的盒会让其余 surface 的实例在盒外被成批误剔。
+    /// Merge the local bounding boxes of all primitives into a group-level merged box. The culling kernel takes
+    /// only one box, so the union is mandatory: passing one surface's box would make the other surfaces' instances
+    /// outside the box get wrongly culled in batches.
     /// </summary>
     void UpdateCullLocalBounds()
     {
@@ -272,7 +274,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         bool wasInitialized = _transformInitialized;
         _wireframeActive = false;
         _instanceCount = 0;
-        // 交接状态每帧重算：上一帧的 true 不能继续授权本帧的间接绘制。
+        // The transition state is recomputed each frame: last frame's true must not keep authorizing this frame's indirect draw.
         _cullDrawReady = false;
 
         // Unified highlighting: clear this frame's per-instance draw lists
@@ -412,9 +414,10 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
 
         Device.SetVertexBuffer(_instanceBuffer, _instanceBufferView, _instanceData);
 
-        // A7：剔除内核的输入是与 IA 实例流逐位相同的 80 字节矩阵流，所以直接复用这份 CPU 数组，
-        // 不多存一份副本，也不额外计算包围球——球由 GPU 从矩阵与组级盒算出。
-        // 这里只备资源、不上传：上传要等 Record 相位，见 PrepareCullInputs 的说明。
+        // A7: the culling kernel's input is the same bit-for-bit 80-byte matrix stream as the IA instance stream,
+        // so reuse this CPU array directly -- no extra copy and no extra bounding-sphere computation (the sphere
+        // is computed on the GPU from the matrices and the group-level box). Only resources are prepared here,
+        // nothing is uploaded: uploading waits for the Record phase, see the notes on PrepareCullInputs.
         EnsureCullResources(_instanceCount);
 
         int fi = (int)Device.FrameIndex;
@@ -668,9 +671,10 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
 
         int fi = (int)Device.FrameIndex;
 
-        // A7：本帧剔除链路已就绪时，实例流改读本槽位的重排分段，实例数由间接参数给出。
-        // 参数表按 (slot, primitive) 定长寻址，所以一条 ExecuteIndirect 仍只对应一个 primitive：
-        // 间接只改变参数的来源，不合并绘制。
+        // A7: when this frame's culling chain is ready, the instance stream reads this slot's reorder segment and
+        // the instance count comes from the indirect args. The parameter table is addressed at a fixed length per
+        // (slot, primitive), so one ExecuteIndirect still maps to exactly one primitive: indirect only changes
+        // where the parameters come from, it does not merge draws.
         if (_cullDrawReady && _cullCapacity >= _instanceCount
             && _cullSorted is DXStorageBuffer sorted && sorted.Resource != null
             && _cullArgs is DXStorageBuffer args && args.Resource != null)
@@ -678,7 +682,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             int slot = Season.Rendering.CascadedShadow.ActiveSlot;
             if (slot >= 0 && slot < Season.Rendering.InstanceCull.MaxSlots)
             {
-                // 槽位分段：容量按实例计，每实例 80 字节，四端同一个定义。
+                // Slot segment: capacity is in instances, 80 bytes per instance, one definition across all four backends.
                 var slotView = new VertexBufferView
                 {
                     BufferLocation = sorted.Resource->GetGPUVirtualAddress()
@@ -790,7 +794,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     }
 
     // ============================================================
-    // A7 逐实例 GPU 剔除：资源面与交接
+    // A7 per-instance GPU culling: resources and transition
     // ============================================================
 
     int Season.Rendering.IInstanceCullTarget.CullInstanceCount => _instanceCount;
@@ -814,8 +818,10 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     Vector3 Season.Rendering.IInstanceCullTarget.CullLocalExtents => _cullLocalExtents;
 
     /// <summary>
-    /// 按实例数准备剔除资源。容量按 64 对齐，于是实例数小幅抖动不会每帧重建五个缓冲；
-    /// 但接口上报的容量必须是真实容量，否则序号表会按本帧实例数寻址而与内核写入错位。
+    /// Prepare culling resources for the given instance count. Capacity is aligned to 64 so small instance-count
+    /// jitter does not recreate the five buffers every frame; but the capacity reported through the interface must
+    /// be the real capacity, otherwise the index table would address by this frame's instance count and get out of
+    /// sync with what the kernel writes.
     /// </summary>
     void EnsureCullResources(int count)
     {
@@ -824,7 +830,8 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             ReleaseCullResources();
             return;
         }
-        // 实例数掉到 0 不等于要释放：隐藏再显示会因此每帧重建五个缓冲。
+        // The instance count dropping to 0 does not mean release: hiding and re-showing would otherwise recreate
+        // the five buffers every frame.
         if (count <= 0)
             return;
 
@@ -839,7 +846,8 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
                 _cullSorted = g.CreateStorageBuffer(Season.Rendering.InstanceCull.SortedBytes(capacity),
                     Season.Rendering.StorageBufferUsage.ComputeAndVertexInput);
                 _cullVisible = g.CreateStorageBuffer((uint)(Season.Rendering.InstanceCull.MaxSlots * capacity) * 4u);
-                // 参数缓冲是唯一必须声明间接用途的一个：三端都把这份用途烘进原生对象，事后加不回来。
+                // The args buffer is the only one that must declare the indirect usage: all four backends bake that
+                // usage into the native object, and it cannot be added afterward.
                 _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsBytes,
                     Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs);
                 _cullPrimInfo = g.CreateStorageBuffer(
@@ -847,7 +855,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             }
             catch (Exception ex)
             {
-                DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] 缓冲创建失败：{ex.Message}");
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] Buffer creation failed: {ex.Message}");
             }
 
             if (_cullSource == null || _cullSorted == null || _cullVisible == null
@@ -871,10 +879,11 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     }
 
     /// <summary>
-    /// 只构造参数表字节，不碰 GPU —— 构造与上传的安全时机不同：构造随时可做，
-    /// 上传必须等命令列表打开（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。
-    /// primitive 集合不变就不重建。索引区间与绘制端必须同源：reset 内核把这里的
-    /// indexCount 写进间接参数，而绘制端不再自己提供索引数。
+    /// Build only the parameter-table bytes, without touching the GPU -- the safe timing for building and
+    /// uploading differs: building can be done anytime, but uploading must wait until the command list is open
+    /// (see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>). If the primitive set does not
+    /// change, do not rebuild. The index range must share one source with the draw side: the reset kernel writes
+    /// this indexCount into the indirect args, and the draw side no longer provides the index count itself.
     /// </summary>
     void EnsureCullPrimitiveInfo()
     {
@@ -883,8 +892,8 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         int n = _opaquePrimitives.Count;
         if (n <= 0 || n > Season.Rendering.InstanceCull.MaxPrimitives)
         {
-            // 明确记下"没有可传的参数表"：否则 PrepareCullInputs 会拿上一次的字节反复上传，
-            // 条数看起来对得上，内容却是过期的那一份。
+            // Explicitly record "there is no parameter table to upload": otherwise PrepareCullInputs would
+            // re-upload last time's bytes over and over, where the entry count looks right but the content is stale.
             _cullPrimInfoBytes = null;
             _cullPrimInfoPending = 0;
             _cullPrimitiveCount = 0;
@@ -907,9 +916,10 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     }
 
     /// <summary>
-    /// A7：把剔除的 CPU 侧输入传到 GPU。由 InstanceCullEffect 在每次派发之前回调，
-    /// 那个相位在 BeforeRender 之后、所有 Pass 之外，是四端唯一共同满足上传前置条件的位置。
-    /// 控制件的 Update 不行：那时命令列表还没打开。
+    /// A7: upload the culling CPU-side inputs to the GPU. InstanceCullEffect calls this before each dispatch; that
+    /// phase runs after BeforeRender and outside all Passes, and is the only place across all four backends that
+    /// jointly satisfies the upload preconditions. The control's Update will not work: at that point the command
+    /// list is not yet open.
     /// </summary>
     bool Season.Rendering.IInstanceCullTarget.PrepareCullInputs()
     {
@@ -918,7 +928,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
 
         var g = Season.Basic.Graphics.Instance;
 
-        // 参数表跟着几何走而不跟帧走，所以只在条数变了时重传。
+        // The parameter table follows the geometry, not the frame, so re-upload only when the entry count changes.
         if (_cullPrimInfoPending != _cullPrimitiveCount)
         {
             if (_cullPrimInfoPending <= 0 || _cullPrimInfoBytes == null || _cullPrimInfo == null)
@@ -929,15 +939,15 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             _cullPrimitiveCount = _cullPrimInfoPending;
         }
 
-        // 矩阵流每帧都变，只传有效段，不留余量。
+        // The matrix stream changes every frame; upload only the valid range and leave no slack.
         return _cullSource != null && g.TryUpdateStorageBuffer(_cullSource,
             MemoryMarshal.AsBytes(_instanceData.AsSpan(0, _instanceCount)));
     }
 
     /// <summary>
-    /// A7：把 gather 写出的重排流与参数缓冲交接到绘制可读状态。必须在 Pass 之外执行，
-    /// 所以由 InstanceCullEffect 在三次派发之后回调，而不是等到 DrawShadow。
-    /// 任一环节不成就返回 false，本帧整组退回 CPU 剔除。
+    /// A7: transition the reorder stream written by gather and the args buffer into a draw-readable state. This
+    /// must run outside a Pass, so InstanceCullEffect calls it after the three dispatches rather than waiting until
+    /// DrawShadow. If any step fails it returns false and the whole group falls back to CPU culling for this frame.
     /// </summary>
     public bool PrepareCullDraw()
     {
@@ -953,10 +963,11 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         if (cmd == null)
             return false;
 
-        // 顶点阶段要读它；下一次 gather 会经 DispatchCompute 的门控转换送回 UnorderedAccess。
+        // The vertex stage needs to read it; the next gather transitions it back to UnorderedAccess through
+        // DispatchCompute's gated transition.
         sorted.TransitionTo(cmd, ResourceStates.VertexAndConstantBuffer);
 
-        // 参数缓冲走统一入口：它同时核对 usage 与"当前不在 Pass 内"。
+        // The args buffer goes through the unified entry point, which also checks the usage and "not currently inside a Pass".
         if (!Season.Basic.Graphics.Instance.TryPrepareIndirectArgs(args))
             return false;
 

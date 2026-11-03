@@ -913,19 +913,19 @@ internal unsafe static class Device
     /// It is read only inside the pass body with no concurrency.</summary>
     internal static Season.Rendering.RenderPassId ActivePassId;
 
-    /// <summary>用于独立全屏管线核对实际输出附件；仅在当前 Pass 内有效。</summary>
+    /// <summary>Used by standalone full-screen pipelines to verify the actual output attachment; valid only inside the current pass.</summary>
     internal static VKRenderTarget? ActiveColorTarget;
 
-    /// <summary>本 Pass 真正绑成深度附件的显式深度 RT，没有显式深度时为 null，与 DX Device.ActiveDepthTarget 同语义。
-    /// 侧路管线据此确认准备期看到的深度语义没有变。</summary>
+    /// <summary>The explicit depth RT actually bound as the depth attachment in this pass; null when there is no explicit depth, with the same semantics as DX Device.ActiveDepthTarget.
+    /// Side pipelines use it to confirm that the depth semantics seen during preparation have not changed.</summary>
     internal static VKRenderTarget? ActiveDepthTarget;
 
-    /// <summary>本 Pass 真正绑成颜色附件 1 的速度 RT，单目标形状时为 null。
-    /// 在 Pass 内自行录制绘制的侧路管线必须烘出附件数匹配的 PSO，而它们准备期持有的 PassDesc 不足以推断这一点：
-    /// 显式深度缺席时三目标分支根本不会走到，速度槽也就不存在。</summary>
+    /// <summary>The velocity RT actually bound as color attachment 1 in this pass; null in the single-target shape.
+    /// Side pipelines that record their own draws inside the pass must bake a PSO matching the attachment count, and the PassDesc they hold during preparation is not enough to infer this:
+    /// when explicit depth is absent the three-target branch is never taken, so the velocity slot does not exist.</summary>
     internal static VKRenderTarget? ActiveVelocityTarget;
 
-    /// <summary>A0.2：本 Pass 真正绑成颜色附件 2 的法线 RT，只在速度也成为附件时才可能非空。侧路管线据此烘四附件 PSO。</summary>
+    /// <summary>A0.2: the normal RT actually bound as color attachment 2 in this pass; it can only be non-null when velocity is also an attachment. Side pipelines use it to bake the four-attachment PSO.</summary>
     internal static VKRenderTarget? ActiveNormalTarget;
 
     // Pending texture layout transitions.
@@ -1042,7 +1042,7 @@ internal unsafe static class Device
                 MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit);
         }
 
-        // 1) Pipeline barrier：PresentSrcKHR → TransferSrcOptimal
+        // 1) Pipeline barrier: PresentSrcKHR → TransferSrcOptimal
         var preBarrier = new ImageMemoryBarrier
         {
             SType = StructureType.ImageMemoryBarrier,
@@ -1095,7 +1095,7 @@ internal unsafe static class Device
             _captureStagingBuffer.Buffer,
             1, in region);
 
-        // 3) Pipeline barrier：TransferSrcOptimal → PresentSrcKhr
+        // 3) Pipeline barrier: TransferSrcOptimal → PresentSrcKhr
         var postBarrier = new ImageMemoryBarrier
         {
             SType = StructureType.ImageMemoryBarrier,
@@ -1196,6 +1196,7 @@ internal unsafe static class Device
         "SceneDecal\0"u8.ToArray(),
         "SceneWater\0"u8.ToArray(),
         "SsrComposite\0"u8.ToArray(),
+        "SceneWaterfall\0"u8.ToArray(),
     ];
 
     internal static void PushDebugGroup(byte[] utf8LabelZ)
@@ -1345,8 +1346,8 @@ internal unsafe static class Device
     /// <summary>Registry of created offscreen RTs. During resize, members with MatchBackbufferSize are recreated in place. Accessed only by the render thread.</summary>
     internal static readonly List<VKRenderTarget> OffscreenTargets = new();
 
-    // 每个附件组合及 Load/Store 意图各有缓存；同帧切换雾合成目标不能销毁前一阶段的 framebuffer。
-    // RT 在 Resize/Dispose 之前主动失效缓存，不依赖可复用的原生 view 句柄。
+    // Each attachment combination and Load/Store intent has its own cache; switching the fog-composite target within a frame must not destroy the previous stage's framebuffer.
+    // RTs proactively invalidate the cache before Resize/Dispose rather than relying on reusable native view handles.
     readonly record struct ScenePassKey(VKRenderTarget Color, VKRenderTarget? Depth,
         VKRenderTarget? Velocity, VKRenderTarget? Normal, bool ClearColor, bool ClearDepth, bool StoreDepth);
     static readonly Dictionary<ScenePassKey, (RenderPass Pass, Framebuffer Framebuffer)> _sceneTargetPasses = new();
@@ -1369,11 +1370,11 @@ internal unsafe static class Device
     /// <summary>Cached depth-view version for the mask framebuffer.</summary>
     static ulong _outlineMaskDepthVersion;
 
-    // -- D1 屏幕空间贴花 Pass。
-    //    render pass 只由「是否挂法线附件」决定，一共两种形态，创建一次永久复用，同时充当贴花 PSO 的烘制锚点；
-    //    framebuffer 绑定当帧的 SceneColor（与可选的 SceneNormal），view 版本变化时重建。
-    //    与 OutlineMask 一样按引用相等比较 RT 身份，因为窗口重建会换掉原生 view。
-    //    仅渲染线程访问。 --
+    // -- D1 screen-space decal pass.
+    //    The render pass is determined solely by "whether a normal attachment is present", giving two shapes total; it is created once and reused permanently, and also serves as the baking anchor for decal PSOs;
+    //    the framebuffer binds the current frame's SceneColor (and optional SceneNormal) and is rebuilt when the view version changes.
+    //    As with OutlineMask, RT identity is compared by reference equality because a window rebuild replaces the native view.
+    //    Accessed only by the render thread. --
     static RenderPass _decalRenderPass;
 
     static RenderPass _decalRenderPassNormal;
@@ -1389,8 +1390,8 @@ internal unsafe static class Device
     static ulong _decalNormalVersion;
 
     /// <summary>
-    /// 取贴花 Pass 的 render pass。后端在烘 PSO 时据此锚定，<see cref="BeginPass"/> 用同一个对象建 framebuffer；
-    /// 两个形态各自缓存，返回后不再销毁（与 OutlineMask 的锚点契约相同）。
+    /// Gets the decal pass render pass. The backend anchors on it when baking PSOs, and <see cref="BeginPass"/> uses the same object to build the framebuffer;
+    /// the two shapes are cached separately and are not destroyed after being returned (the same anchor contract as OutlineMask).
     /// </summary>
     internal static RenderPass GetDecalRenderPass(bool withNormal)
     {
@@ -1406,8 +1407,8 @@ internal unsafe static class Device
     }
 
     /// <summary>
-    /// 备好贴花 Pass 的 render pass 与 framebuffer。颜色附件是当帧 SceneColor，
-    /// 法线附件按本帧是否写粗糙度决定 —— 它是颜色附件 1，不是采样源。
+    /// Prepares the decal pass render pass and framebuffer. The color attachment is the current frame's SceneColor,
+    /// and the normal attachment is determined by whether roughness is written this frame — it is color attachment 1, not a sampling source.
     /// </summary>
     static (RenderPass, Framebuffer) EnsureDecalPass(VKRenderTarget color, VKRenderTarget? normal)
     {
@@ -1415,7 +1416,7 @@ internal unsafe static class Device
             || (normal != null && (normal.ColorView.Handle == 0
                 || normal.Width != color.Width || normal.Height != color.Height
                 || normal.ColorFormat != Format.R16G16B16A16Sfloat)))
-            throw new InvalidOperationException("贴花 Pass 的附件无效或尺寸/格式不匹配。");
+            throw new InvalidOperationException("The decal pass attachments are invalid or the size/format does not match.");
 
         bool withNormal = normal != null;
         var renderPass = GetDecalRenderPass(withNormal);
@@ -1585,8 +1586,8 @@ internal unsafe static class Device
         uint attachmentCount;
         bool hasVelocity = desc.VelocityTarget is VKRenderTarget;
         var target = (desc.ColorTarget ?? desc.DepthTarget) as VKRenderTarget;
-        // 这两个字段记录的是“真的成了附件”，而不是 PassDesc 请求了什么：
-        // 下面只有三目标分支会把速度绑成颜色附件 1。
+        // These two fields record what "actually became an attachment", not what PassDesc requested:
+        // below, only the three-target branch binds velocity as color attachment 1.
         ActiveDepthTarget = null;
         ActiveVelocityTarget = null;
         ActiveNormalTarget = null;
@@ -1635,27 +1636,30 @@ internal unsafe static class Device
         }
         else if (desc.Id == Season.Rendering.RenderPassId.SceneDecal && desc.ColorTarget is VKRenderTarget decalColor)
         {
-            // D1: 贴花 Pass 没有深度附件（深度是采样源），也不清颜色 —— 它乘/加到上一段场景 Pass 的结果上。
-            // s9 只在确实要写粗糙度时才把 SceneNormal 挂成颜色附件 1，这是全工程唯一一种
-            // 「法线出现但不跟速度同时出现」的挂法；贴花不写速度，也不会动到不透明阶段写下的值。
+            // D1: the decal pass has no depth attachment (depth is a sampling source) and does not clear color — it multiplies/adds into the result of the previous scene pass.
+            // s9 only binds SceneNormal as color attachment 1 when it actually writes roughness; this is the only attachment scheme in the whole project
+            // where "the normal appears but does not appear together with velocity"; the decal does not write velocity, nor does it touch the values written during the opaque stage.
             var decalNormal = desc.NormalTarget as VKRenderTarget;
             (renderPass, framebuffer) = EnsureDecalPass(decalColor, decalNormal);
             extent = new Extent2D(decalColor.Width, decalColor.Height);
             attachmentCount = decalNormal != null ? 2u : 1u;
             ActiveNormalTarget = decalNormal;
         }
-        else if (desc.Id == Season.Rendering.RenderPassId.SceneWater && desc.ColorTarget is VKRenderTarget waterColor)
+        else if (desc.Id is Season.Rendering.RenderPassId.SceneWater or Season.Rendering.RenderPassId.SceneWaterfall
+            && desc.ColorTarget is VKRenderTarget waterColor)
         {
-            // P2: 水面 Pass 与贴花同形 —— 没有深度附件（深度是采样源），也不清颜色。
-            // 取到颜色附件的只有一个折射快照，那是采样源，在 Pass 外已经拷好。
+            // P2: the water surface pass is shaped the same as the decal — no depth attachment (depth is a sampling source) and no color clear.
+            // The only thing bound to the color attachment is a refraction snapshot, which is a sampling source already copied outside the pass.
+            // P1 water curtain: exactly the same attachment shape, only without the refraction snapshot — so it reuses the very
+            // same render pass object, which is also what its PSO was baked against.
             (renderPass, framebuffer) = EnsureWaterPass(waterColor);
             extent = new Extent2D(waterColor.Width, waterColor.Height);
             attachmentCount = 1u;
         }
         else if (desc.Id == Season.Rendering.RenderPassId.SsrComposite && desc.ColorTarget is VKRenderTarget ssrColor)
         {
-            // P0: SSR 合成与水面同形 —— 单颜色附件、Load、无深度。增量纹理是采样源，
-            // 颜色附件就是 SceneColor 本身，所以这里绝不能清屏。
+            // P0: SSR composite is shaped the same as the water surface — single color attachment, Load, no depth. The incremental texture is a sampling source,
+            // and the color attachment is SceneColor itself, so we absolutely must not clear here.
             (renderPass, framebuffer) = EnsureSsrCompositePass(ssrColor);
             extent = new Extent2D(ssrColor.Width, ssrColor.Height);
             attachmentCount = 1u;
@@ -1677,8 +1681,8 @@ internal unsafe static class Device
             framebuffer = target.Framebuffer;
             extent = new Extent2D(target.Width, target.Height);
             attachmentCount = 2u; // color + depth
-            // 颜色缺席时 target 就是那张深度图（Shadow），它确实是本 Pass 的深度附件；
-            // 否则用的是该 RT 自带的隐式深度，没有显式深度 RT 可记。
+            // When color is absent, target is that depth image (Shadow), which really is this pass's depth attachment;
+            // otherwise the RT's own implicit depth is used, and there is no explicit depth RT to record.
             if (desc.ColorTarget == null) ActiveDepthTarget = target;
         }
         else
@@ -1706,9 +1710,9 @@ internal unsafe static class Device
         var clearValues = stackalloc ClearValue[4];
         uint clearCount;
         if (desc.Id is Season.Rendering.RenderPassId.SceneDecal or Season.Rendering.RenderPassId.SceneWater
-            or Season.Rendering.RenderPassId.SsrComposite)
+            or Season.Rendering.RenderPassId.SsrComposite or Season.Rendering.RenderPassId.SceneWaterfall)
         {
-            // 这几个 Pass 的附件全是 Load，ClearValue 一个都不需要。
+            // These passes' attachments are all Load, so no ClearValue is needed at all.
             clearCount = 0u;
         }
         else if (depthOnly)
@@ -1771,7 +1775,7 @@ internal unsafe static class Device
             || (normal != null && (velocity == null || normal.ColorView.Handle == 0
                 || normal.Width != color.Width || normal.Height != color.Height
                 || normal.ColorFormat != Format.R16G16B16A16Sfloat)))
-            throw new InvalidOperationException("场景附件无效或尺寸/格式不匹配。");
+            throw new InvalidOperationException("The scene attachments are invalid or the size/format does not match.");
 
         var key = new ScenePassKey(color, depth, velocity, normal, clearColor, clearDepth, storeDepth);
         if (_sceneTargetPasses.TryGetValue(key, out var cached)) return cached;
@@ -1814,10 +1818,10 @@ internal unsafe static class Device
     }
 
     /// <summary>
-    /// P2 水面 Pass。render pass 只有一种形态（单颜色附件），烘焙一次永久复用；
-    /// framebuffer 绑定当帧 SceneColor，view 版本变化时重建。
-    /// 与贴花分开缓存，避免两者交替挂/不挂法线附件时互相把对方的 framebuffer 拆掉重建。
-    /// 仅渲染线程访问。
+    /// P2 water surface pass. The render pass has only one shape (single color attachment) and is baked once and reused permanently;
+    /// the framebuffer binds the current frame's SceneColor and is rebuilt when the view version changes.
+    /// It is cached separately from the decal to avoid the two tearing down and rebuilding each other's framebuffer when alternately attaching/not attaching the normal attachment.
+    /// Accessed only by the render thread.
     /// </summary>
     static RenderPass _waterRenderPass;
 
@@ -1828,8 +1832,8 @@ internal unsafe static class Device
     static ulong _waterColorVersion;
 
     /// <summary>
-    /// 取水面 Pass 的 render pass。后端在烘 PSO 时据此锚定，<see cref="BeginPass"/> 用同一个对象建 framebuffer；
-    /// 返回后不再销毁（与贴花、OutlineMask 的锚点契约相同）。
+    /// Gets the water surface pass render pass. The backend anchors on it when baking PSOs, and <see cref="BeginPass"/> uses the same object to build the framebuffer;
+    /// it is not destroyed after being returned (the same anchor contract as the decal and OutlineMask).
     /// </summary>
     internal static RenderPass GetWaterRenderPass()
     {
@@ -1839,13 +1843,13 @@ internal unsafe static class Device
     }
 
     /// <summary>
-    /// 备好水面 Pass 的 render pass 与 framebuffer。颜色附件是当帧 SceneColor：
-    /// 没有深度附件（深度与折射快照都是采样源），也不清颜色。
+    /// Prepares the water surface pass render pass and framebuffer. The color attachment is the current frame's SceneColor:
+    /// there is no depth attachment (both depth and the refraction snapshot are sampling sources), and no color clear.
     /// </summary>
     static (RenderPass, Framebuffer) EnsureWaterPass(VKRenderTarget color)
     {
         if (color.ColorView.Handle == 0 || color.Width == 0 || color.Height == 0)
-            throw new InvalidOperationException("水面 Pass 的附件无效。");
+            throw new InvalidOperationException("The water surface pass attachments are invalid.");
 
         var renderPass = GetWaterRenderPass();
         if (_waterFramebuffer.Handle == 0 || !ReferenceEquals(_waterColorRT, color)
@@ -1875,8 +1879,8 @@ internal unsafe static class Device
     }
 
     /// <summary>
-    /// P0 SSR 合成 Pass 的 render pass（单颜色附件、Load、无深度）。烘焙 PSO 时据此锚定，
-    /// <see cref="BeginPass"/> 用同一个对象建 framebuffer，与水面、贴花、OutlineMask 的锚点契约相同。
+    /// P0 SSR composite pass render pass (single color attachment, Load, no depth). It is anchored on when baking PSOs,
+    /// and <see cref="BeginPass"/> uses the same object to build the framebuffer, the same anchor contract as the water surface, decal, and OutlineMask.
     /// </summary>
     static RenderPass _ssrCompositeRenderPass;
 
@@ -1894,14 +1898,14 @@ internal unsafe static class Device
     }
 
     /// <summary>
-    /// 备好 SSR 合成的 render pass 与 framebuffer。颜色附件是当帧 SceneColor：
-    /// 没有深度附件，也不清颜色 —— 反射增量是加法叠上去的，清一下就什么都不剩了。
-    /// 与水面分开缓存，避免两个同样挂 SceneColor 的 Pass 每帧互相拆对方的 framebuffer。
+    /// Prepares the SSR composite render pass and framebuffer. The color attachment is the current frame's SceneColor:
+    /// there is no depth attachment and no color clear — the reflection increment is added on top, so clearing would leave nothing behind.
+    /// It is cached separately from the water surface to avoid two passes that both bind SceneColor tearing down each other's framebuffer every frame.
     /// </summary>
     static (RenderPass, Framebuffer) EnsureSsrCompositePass(VKRenderTarget color)
     {
         if (color.ColorView.Handle == 0 || color.Width == 0 || color.Height == 0)
-            throw new InvalidOperationException("SSR 合成 Pass 的附件无效。");
+            throw new InvalidOperationException("The SSR composite pass attachments are invalid.");
 
         var renderPass = GetSsrCompositeRenderPass();
         if (_ssrCompositeFramebuffer.Handle == 0 || !ReferenceEquals(_ssrCompositeColorRT, color)
@@ -1931,16 +1935,16 @@ internal unsafe static class Device
     }
 
     /// <summary>
-    /// P2: 把一张离屏颜色目标原样拷进另一张同形目标，供水面折射在「SceneColor 仍是颜色附件」
-    /// 的那一帧里拿到可采样的背景。
+    /// P2: copies an offscreen color target as-is into another target of the same shape, so that water refraction can obtain a samplable background
+    /// in the frame where "SceneColor is still a color attachment".
     ///
-    /// Vulkan 没有 CopyResource 这种一句到位的写法，但同格式同尺寸的 <c>vkCmdCopyImage</c>
-    /// 同样不经过滤波，也不需要额外管线；两侧都在 1 层 1 mip，所以 region 是整幅。
+    /// Vulkan has no one-liner equivalent of CopyResource, but <c>vkCmdCopyImage</c> on the same format and size
+    /// likewise bypasses filtering and needs no extra pipeline; both sides are 1 layer and 1 mip, so the region is the whole image.
     ///
-    /// 目标每次都声明 <c>Undefined</c> 作为旧布局：它只作为拷贝目标与采样源，永远不做附件，
-    /// 内容每一帧都被整幅覆盖，所以「旧内容可丢弃」正是事实。这同时省掉一张重命名后失效的
-    /// layout 记录表 —— 源阶段仍全面覆盖上一帧的采样读与上一段 Pass 的颜色写（WAR/WAW），
-    /// 所以这并不是一次“不走同步”的偷懒转换。
+    /// The destination always declares <c>Undefined</c> as its old layout: it is used only as a copy destination and a sampling source, never as an attachment,
+    /// and its content is fully overwritten every frame, so "old content is discardable" is precisely the truth. This also saves a
+    /// layout record table that would become invalid after renaming — the source stage still fully covers the previous frame's sampling read and the previous pass's color write (WAR/WAW),
+    /// so this is not a lazy transition that "skips synchronization".
     /// </summary>
     internal static bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination)
     {
@@ -1958,8 +1962,8 @@ internal unsafe static class Device
             BaseMipLevel = 0, LevelCount = 1, BaseArrayLayer = 0, LayerCount = 1
         };
 
-        // 源是上一段 Pass 发布的 ShaderReadOnlyOptimal，拷完必须原路送回 —— 水面 render pass
-        // 以这个布局作为 initialLayout，少这一次回来就会在验证层报 layout 不匹配。
+        // The source is the ShaderReadOnlyOptimal published by the previous pass, and after the copy it must be sent back along the same route — the water surface render pass
+        // uses this layout as its initialLayout, so missing this return would report a layout mismatch in the validation layer.
         var barriers = stackalloc ImageMemoryBarrier[2];
         barriers[0] = new ImageMemoryBarrier
         {
@@ -2006,7 +2010,7 @@ internal unsafe static class Device
         Vk.CmdCopyImage(command, src.ColorImage, ImageLayout.TransferSrcOptimal,
             dst.ColorImage, ImageLayout.TransferDstOptimal, 1, in region);
 
-        // 源回到水面的颜色附件前置状态；目标转到采样布局，紧接着作为折射源被读。
+        // The source returns to the color-attachment pre-state of the water surface; the destination transitions to the sampling layout and is read as the refraction source immediately after.
         barriers[0].OldLayout = ImageLayout.TransferSrcOptimal;
         barriers[0].NewLayout = ImageLayout.ShaderReadOnlyOptimal;
         barriers[0].SrcAccessMask = AccessFlags.TransferReadBit;
@@ -2021,10 +2025,10 @@ internal unsafe static class Device
         return true;
     }
 
-    /// <summary>RT 销毁时按 fence 退休；只有 Resize 的 GPU 空闲点允许立即清理。</summary>
+    /// <summary>RT destruction retires by fence; only the GPU-idle point of Resize allows immediate cleanup.</summary>
     internal static void ReleaseSceneTargetPasses(VKRenderTarget target, bool immediate = false)
     {
-        // 贴花 Pass 的 framebuffer 直接引用 RT 的 view，重建前必须先释放，否则会留下悬空的附件。
+        // The decal pass framebuffer directly references the RT's view, so it must be released before rebuilding; otherwise it would leave a dangling attachment.
         if (ReferenceEquals(_decalColorRT, target) || ReferenceEquals(_decalNormalRT, target))
         {
             var decalFramebuffer = _decalFramebuffer;
@@ -2043,7 +2047,7 @@ internal unsafe static class Device
             }
         }
 
-        // 水面 Pass 的 framebuffer 同样引用 RT 的 view，理由同上。
+        // The water surface pass framebuffer likewise references the RT's view, for the same reason as above.
         if (ReferenceEquals(_waterColorRT, target))
         {
             var waterFramebuffer = _waterFramebuffer;
@@ -2630,7 +2634,7 @@ internal unsafe static class Device
             }
             _sceneTargetPasses.Clear();
             // 2-3 triple-target velocity render pass and framebuffer.
-            // 速度附件与无深度雾合成的缓存已在上方统一销毁。
+            // The caches for the velocity attachment and the depth-less fog composite have already been uniformly destroyed above.
             // Deferred-release actions depend on LogicalDevice, so they must be drained before DestroyDevice.
             PumpDeferredReleases(force: true);
             Vk.DestroyDevice(LogicalDevice, null);

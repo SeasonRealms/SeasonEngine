@@ -14,11 +14,13 @@ public struct WeatherVisualArray
 }
 
 /// <summary>
-/// 区域视觉帧状态。Update 是唯一时钟入口，Apply 仅打包；所有调用均在帧线程。
-/// 每区域八行：0 云椭圆；1 旋转/云羽化/强度；2 云基/层距/噪声周期倒数/消光；
-/// 3 风偏移/种子/云影强度；4 雨椭圆/羽化/强度；5 底/雨幕顶/雪强/下落相位；
-/// 6 云颜色/云底亮度；7 雨幕颜色/消光系数。长度单位均为米。
-/// 雷电不占区域行：每次落雷只有一个主导点和一条包络，记在全局的 SceneLightParams.WeatherFlash。
+/// Regional visual frame state. Update is the only clock entry point; Apply only packs. All calls occur
+/// on the frame thread. Eight rows per region: 0 cloud ellipse; 1 rotation/cloud feathering/intensity;
+/// 2 cloud base/layer spacing/reciprocal noise period/extinction; 3 wind offset/seed/cloud shadow
+/// intensity; 4 rain ellipse/feathering/intensity; 5 bottom/rain curtain top/snow intensity/fall phase;
+/// 6 cloud color/cloud base brightness; 7 rain curtain color/extinction coefficient. All lengths are in
+/// meters. Lightning does not occupy a region row: each strike has a single dominant point and a single
+/// envelope, recorded globally in SceneLightParams.WeatherFlash.
 /// </summary>
 public sealed class WeatherVisualState
 {
@@ -31,7 +33,8 @@ public sealed class WeatherVisualState
     readonly float[] _phase = new float[WeatherField.MaxRegions];
     readonly WeatherRegion[] _regions = new WeatherRegion[WeatherField.MaxRegions];
     readonly int[] _slots = new int[WeatherField.MaxRegions];
-    // 雷电调度按槽位保留：切换天气不重建区域时，计数器和静默期不会被重置。
+    // Lightning scheduling is preserved per slot: when switching weather without rebuilding regions,
+    // the counter and quiet period are not reset.
     readonly bool[] _flashActive = new bool[WeatherField.MaxRegions];
     readonly float[] _flashDelay = new float[WeatherField.MaxRegions];
     readonly float[] _flashAge = new float[WeatherField.MaxRegions];
@@ -42,31 +45,36 @@ public sealed class WeatherVisualState
     float _far = 1300;
 
     /// <summary>
-    /// 本帧主导雷击：xyz 为云内外世界坐标，w 为回击包络亮度（0 表示无闪电）。
-    /// 与写入 GPU 的 <see cref="SceneLightParams.WeatherFlash"/> 同一份数据，供应用层驱动瞬态光与调试展示。
+    /// This frame's dominant strike: xyz is the world position inside/outside the cloud, w is the
+    /// return-stroke envelope brightness (0 means no lightning). Same data as the
+    /// <see cref="SceneLightParams.WeatherFlash"/> written to the GPU, used by the application layer to
+    /// drive transient light and debug displays.
     /// </summary>
     public Vector4 Flash { get; private set; }
 
     /// <summary>
-    /// 落雷计数：每发生一次新的雷击就自增。包络亮度分不清「新落雷」和「上一道雷的余辉」，
-    /// 所以应用层（雷声、震动）用这个单调计数做边沿检测，而不是看 <see cref="Flash"/> 的亮度。
-    /// 天气切出雷暴不回退，重新进入时从原值继续。
+    /// Strike counter: incremented for every new strike. Envelope brightness cannot distinguish a "new
+    /// strike" from the "afterglow of the previous one", so the application layer (thunder, shake) uses
+    /// this monotonic counter for edge detection instead of reading the brightness of <see cref="Flash"/>.
+    /// Switching weather out of a thunderstorm does not rewind it; re-entering continues from the value.
     /// </summary>
     public int StrikeSerial { get; private set; }
 
-    /// <summary>最近一次落雷的世界坐标，与 <see cref="StrikeSerial"/> 同步更新；用于按距离计算雷声延迟与音量。</summary>
+    /// <summary>World position of the most recent strike, updated in sync with <see cref="StrikeSerial"/>; used to compute thunder delay and volume by distance.</summary>
     public Vector3 StrikePoint { get; private set; }
 
     /// <summary>
-    /// 最近一次地闪的可见通道几何，与 <see cref="StrikeSerial"/> 同步重建。
+    /// Visible channel geometry of the most recent ground strike, rebuilt in sync with
+    /// <see cref="StrikeSerial"/>.
     ///
-    /// 挂在视觉状态上而不是挂在渲染效果上，是因为消费方有两个且都必须看到同一道雷：
-    /// 闪电效果拿它生成 ribbon 实例，雷声拿它算最近点距离。云内闪不重建几何，
-    /// 于是 <see cref="LightningChannel.Visible"/> 为假，只有 v1 的云内发光。
+    /// It lives on the visual state rather than on a render effect because there are two consumers and
+    /// both must see the same bolt: the lightning effect uses it to generate ribbon instances, and the
+    /// thunder uses it to compute nearest-point distance. An intra-cloud flash does not rebuild geometry,
+    /// so <see cref="LightningChannel.Visible"/> is false and only the v1 intra-cloud glow remains.
     /// </summary>
     public LightningChannel Channel { get; } = new();
 
-    /// <summary>通道在地面处的米制半宽。整条通道向上收窄到它的 45%。</summary>
+    /// <summary>Channel half-width in meters at the ground. The whole channel narrows upward to 45% of it.</summary>
     public float ChannelHalfWidth = 1.1f;
 
     public void Update(WeatherField field, float seconds, bool enabled, float farDistance)
@@ -75,7 +83,8 @@ public sealed class WeatherVisualState
         float dt = float.IsFinite(seconds) ? Math.Clamp(seconds, 0, 0.1f) : 0;
         _enabled = enabled;
         _far = float.IsFinite(farDistance) ? Math.Clamp(farDistance, 1, 100000) : 1300;
-        // 先释放已删除的 ID，再分配；重排和配方强度变化不影响运动状态。
+        // Release deleted IDs first, then allocate; reordering and recipe intensity changes do not
+        // affect motion state.
         for (int i = 0; i < _ids.Length; i++)
         {
             bool found = false;
@@ -101,7 +110,8 @@ public sealed class WeatherVisualState
 
     void ReleaseFlash(int slot)
     {
-        // 槽位释放后延迟归零，重新分配时按“首次进入雷暴”处理，不会继承上一轮雷击的计时。
+        // After a slot is released the delay is zeroed so reallocation is treated as "first entry into a
+        // thunderstorm" and does not inherit the previous round's strike timing.
         _flashActive[slot] = false;
         _flashDelay[slot] = 0;
         _flashAge[slot] = 1e4f;
@@ -110,9 +120,12 @@ public sealed class WeatherVisualState
     }
 
     /// <summary>
-    /// 落雷调度：电活动 &gt; 0 时按指数间隔排队，活度越低间隔越长；活度归零时立刻遣散，
-    /// 已经击中的包络继续按年龄自然衰减，所以天气切出雷暴时最后一道闪电不会硬切断。
-    /// 这里的 dt 已经在 Update 入口限制到 0.1s，所以卡顿帧不会一次跳过整段回击。
+    /// Strike scheduling: when electrical activity &gt; 0, strikes are queued at exponential intervals,
+    /// the lower the activity the longer the interval; when activity reaches zero they are dismissed
+    /// immediately, but envelopes already triggered keep decaying naturally with age, so the last
+    /// lightning is not hard-cut when weather switches out of a thunderstorm. The dt here is already
+    /// clamped to 0.1s at the Update entry point, so a stuttering frame cannot skip an entire
+    /// return-stroke sequence at once.
     /// </summary>
     void AdvanceFlash(int slot, in WeatherRegion region, float dt)
     {
@@ -124,7 +137,8 @@ public sealed class WeatherVisualState
         }
         if (!_flashActive[slot])
         {
-            // 进入雷暴先蓄一段静默再落第一道雷：否则切换天气的那一帧会跟着按钮闪一下。
+            // On entering a thunderstorm, hold a quiet period before the first strike: otherwise the
+            // frame that switches the weather flashes along with the button.
             _flashActive[slot] = true;
             _flashStrike[slot] = 0;
             _flashAge[slot] += dt;
@@ -138,25 +152,30 @@ public sealed class WeatherVisualState
         _flashAge[slot] = 0;
         _flashPoint[slot] = FlashPoint(region, _flashStrike[slot]);
         _flashDelay[slot] = StrikeInterval(region.Settings.Seed, _flashStrike[slot], region.State.Lightning);
-        // 通道几何在这里一次性生成。code 与 FlashPoint / FlashEnvelope 里的表达式必须逐字一致：
-        // 三者派生自同一枚种子，改动任何一处都会让"落点、包络、形状"来自三道不同的雷。
-        // 从云内击穿点到地面，地面高度取天空参数里那块虚拟地面，通道因此贴在地面而不是穿进去。
+        // The channel geometry is generated here in one shot. The code must match the expressions in
+        // FlashPoint / FlashEnvelope verbatim: all three derive from the same seed, and changing any one
+        // of them would make the "impact point, envelope, shape" come from three different bolts.
+        // From the in-cloud breakdown point down to the ground, where the ground height is the virtual
+        // ground from the sky parameters, so the channel rests on the ground instead of passing through it.
         Channel.Build((region.Settings.Seed * 0x9E3779B9u) ^ (_flashStrike[slot] * 0x85EBCA6Bu),
             _flashPoint[slot], region.Settings.CloudBase, SkyLighting.ReflectionGroundHeight, ChannelHalfWidth);
-        // 先落点、再发信号：消费方（雷声）读到的坐标一定属于刚刚计数的那道雷。
+        // Set the point first, then signal: the coordinates a consumer (thunder) reads always belong to
+        // the strike just counted.
         StrikePoint = _flashPoint[slot];
         StrikeSerial++;
     }
 
-    /// <summary>两次落雷之间的静默秒数。活度 1 时落在 2.6~9.0 秒，活度越低间隔按反比拉长。</summary>
+    /// <summary>Quiet seconds between strikes. At activity 1 it falls in 2.6-9.0 seconds; lower activity stretches the interval inversely.</summary>
     static float StrikeInterval(uint seed, uint strike, float activity)
         => (2.6f + 6.4f * Hash01(seed * 0x9E3779B9u + strike * 0x85EBCA6Bu))
             / Math.Clamp(activity, 0.2f, 1f);
 
     /// <summary>
-    /// 回击包络：一次落雷包含四道递减的回击，间隔与幅度都由种子决定，单道形状是 6ms 上升叠 75ms 指数衰减。
-    /// 人眼看到的雷电几乎全由包络而不是单帧脉冲决定，所以亮度必须是时间的连续函数，
-    /// 否则每帧随机取一个值就成了频闪噪声。返回值 clamp 到 1。
+    /// Return-stroke envelope: one strike contains four decaying return strokes whose spacing and
+    /// amplitude are determined by the seed, and each stroke's shape is a 6ms rise over a 75ms
+    /// exponential decay. Lightning as the eye perceives it is almost entirely governed by the envelope
+    /// rather than any single-frame pulse, so brightness must be a continuous function of time; otherwise
+    /// a random value per frame becomes strobing noise. The return value is clamped to 1.
     /// </summary>
     static float FlashEnvelope(float age, uint code)
     {
@@ -177,9 +196,11 @@ public sealed class WeatherVisualState
     }
 
     /// <summary>
-    /// 雷击点在云椭圆内的位置。半径取 sqrt 以保证在椭圆面积上均匀，否则会向中心聚集；
-    /// 高度取云基到第二层之间，留出 0.35 的余量避开云板底面的硬边。
-    /// 旋转约定与 shader 的 WeatherFootprint 一致：local = Rᵀ·(world-center)，这里做的是反变换。
+    /// Position of the strike point within the cloud ellipse. The radius uses sqrt so it is uniform over
+    /// the ellipse's area; otherwise it would cluster toward the center. The height ranges from the cloud
+    /// base to the second layer, leaving a 0.35 margin to avoid the hard edge of the cloud slab's
+    /// underside. The rotation convention matches the shader's WeatherFootprint:
+    /// local = Rᵀ·(world-center); this does the inverse transform.
     /// </summary>
     static Vector3 FlashPoint(in WeatherRegion region, uint strike)
     {
@@ -196,8 +217,9 @@ public sealed class WeatherVisualState
             s.CenterZ + n * lx + c * lz);
     }
 
-    /// <summary>整数雪崩哈希取 [0,1)。只用于调度与位置，不参与渲染积分，不需要任何分布性质。
-    /// 与通道几何共用同一条公式，见 <see cref="LightningChannel.Hash01"/>。</summary>
+    /// <summary>Integer avalanche hash returning [0,1). Used only for scheduling and position, not part of
+    /// the render integral, and needs no distribution properties. Shares the same formula as the channel
+    /// geometry, see <see cref="LightningChannel.Hash01"/>.</summary>
     static float Hash01(uint value) => LightningChannel.Hash01(value);
 
     public void Apply(ref SceneLightParams lights, RegionalWeatherQuality quality, bool cloudReady)
@@ -213,7 +235,8 @@ public sealed class WeatherVisualState
         {
             var region = _regions[i]; var s = region.Settings; var state = region.State;
             int b = i * RegionStride, slot = _slots[i];
-            // 不改变持久化云基；雨幕允许向上补到近景降水顶面。
+            // Does not change the persistent cloud base; the rain curtain is allowed to fill upward to
+            // the top of the near-field precipitation.
             float top = MathF.Max(s.CloudBase, s.Top);
             var illumination = SkyLighting.WeatherIllumination(s.CloudBase);
             if (!cloudReady)
@@ -227,11 +250,14 @@ public sealed class WeatherVisualState
                 Math.Clamp(s.EdgeFeather / MathF.Min(s.RadiusX, s.RadiusZ), 0.0001f, 1), state.Rain);
             lights.WeatherRegions[b + 5] = new(s.Bottom, top, state.Snow, _phase[slot]);
             lights.WeatherRegions[b + 6] = new(illumination * new Vector3(0.9f, 0.92f, 0.96f), 0.38f - 0.22f * state.Cloud);
-            // 雨幕的散射色由云底遮挡决定：厚云下雨幕只可能借到云底的亮度，不能按地面辐照度直射发亮，
-            // 否则远景会变成比天空更亮的灰墙，岛屿轮廓和近远交界被抹平。
+            // The rain curtain's scattering color is determined by cloud-base occlusion: under thick
+            // clouds the curtain can only borrow the cloud base's brightness and must not shine directly
+            // at ground irradiance, otherwise distant scenery becomes a gray wall brighter than the sky
+            // and island silhouettes and the near/far boundary are flattened.
             lights.WeatherRegions[b + 7] = new(illumination * new Vector3(0.92f, 0.97f, 1.08f) * (0.30f - 0.14f * state.Cloud), 0.006f);
-            // 取当前最亮的一路。同一帧出现两处可分辨的独立闪光在物理上可能，但在 8 区域的尺度下
-            // 观众只会看到同一片云的方向，多存一处换不到额外信息。
+            // Take the brightest one. Two distinguishable independent flashes in the same frame are
+            // physically possible, but at the scale of 8 regions the viewer only sees one cloud
+            // direction, so storing a second gains no extra information.
             float strength = state.Lightning > 0
                 ? FlashEnvelope(_flashAge[slot], (s.Seed * 0x9E3779B9u) ^ (_flashStrike[slot] * 0x85EBCA6Bu)) * state.Lightning
                 : 0;
@@ -245,7 +271,7 @@ public sealed class WeatherVisualState
         lights.WeatherParams1 = new(18, 40, _far, rain ? 1 : 0);
     }
 
-    /// <summary>与 shader 同形的有限椭圆柱求交，用于边界与深度裁剪验收。</summary>
+    /// <summary>Finite elliptical-cylinder intersection matching the shader, used for boundary and depth-clip validation.</summary>
     public static Vector2 Intersect(WeatherRegionSettings s, Vector3 origin, Vector3 direction, float distance)
     {
         if (!(distance > 0) || !float.IsFinite(distance)) return default;

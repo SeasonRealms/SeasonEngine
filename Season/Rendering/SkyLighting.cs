@@ -349,8 +349,8 @@ public static class SkyLighting
         ApplyAerial(ref lightParams);
         lightParams.WeatherParams0 = lightParams.WeatherParams1 = default;
         lightParams.WeatherRegions = default;
-        // 2-8 与上面几条同一纪律：先写零再按门控回填，避免运行期从程序化天空切回 StaticCube 之后，
-        // 消费端还拿着上一帧的地面辐亮度。
+        // 2-8 follows the same discipline as the lines above: write zero first, then backfill under the gate. Otherwise a runtime switch
+        // from the procedural sky back to StaticCube would leave consumers holding the previous frame's ground radiance.
         lightParams.ReflectionParams0 = default;
         FrameSchedule.WeatherVisuals?.Apply(ref lightParams, RenderQuality.Current.RegionalWeather,
             FrameSchedule.SkyViewTexture != null && FrameSchedule.CloudNoiseTexture != null);
@@ -400,8 +400,9 @@ public static class SkyLighting
         // Do not hardcode 6360 in the shader: GroundRadiusKm and ViewAltitudeKm are runtime knobs on Atmosphere, and hardcoding would create a second source of truth.
         lightParams.SkyParams4 = new Vector4(SafeNormalize(Atmosphere.StarPoleAxis, Vector3.UnitY), ViewRadiusKm);
 
-        // 2-8：镜面反射的虚拟地面。与上面的天空参数在同一处写入，保证"天空亮、地面暗"永远来自同一帧的同一套参数；
-        // 若让消费端自己从 Atmosphere 推，就会和 sunT 的两槽记忆化错开，出现日落时天空已橙而地面仍白的矛盾。
+        // 2-8: virtual ground for specular reflection. Written here together with the sky parameters above so that "bright sky, dark ground"
+        // always derives from the same parameter set in the same frame; letting consumers derive it from Atmosphere themselves would desync
+        // it from sunT's two-slot memoization, yielding contradictions like an orange sky over a still-white ground at sunset.
         lightParams.ReflectionParams0 = new Vector4(ReflectionGroundRadiance(), ReflectionGroundHeight);
 
         // [SkyDebug] Starfield-visibility diagnosis: log injected values every 90 frames in deep night (starVis>0.3) and every 900 frames otherwise.
@@ -514,7 +515,7 @@ public static class SkyLighting
             0f, 0f);
     }
 
-    /// <summary>区域云使用绝对海拔，不把相机高度再次加进云基。</summary>
+    /// <summary>Regional clouds use absolute altitude; the camera height is not added into the cloud base again.</summary>
     public static Vector3 WeatherIllumination(float altitudeMeters)
     {
         float radius = Atmosphere.GroundRadiusKm + MathF.Max(0.001f, altitudeMeters * 0.001f);
@@ -592,27 +593,29 @@ public static class SkyLighting
     }
 
     /// <summary>
-    /// 2-8：镜像反射下半球使用的地面反照率（线性）。
-    /// 与 <see cref="Atmosphere.GroundAlbedo"/> 分开是有意的：那一个是大气散射模型里的行星反照率
-    /// （灰度、0.1，只参与 MS LUT 的地面反弹与 SH9 的下半球），而镜面里看到的是场景地表本身
-    /// （草地、土路），颜色和亮度都该按美术意图给。两者共用一个数会让"天空底部的亮度"与
-    /// "球面里草地的颜色"互相绑架。
+    /// 2-8: ground albedo used by the lower hemisphere of mirror reflections (linear).
+    /// Keeping it separate from <see cref="Atmosphere.GroundAlbedo"/> is intentional: that one is the planetary albedo of the atmospheric
+    /// scattering model (grayscale, 0.1, participating only in the MS LUT ground bounce and the lower hemisphere of SH9), whereas what the
+    /// mirror sees is the scene's own ground surface (grass, dirt paths), whose color and brightness should follow art direction. Sharing one
+    /// value would let "the brightness at the bottom of the sky" and "the color of the grass in the sphere" hold each other hostage.
     /// </summary>
     public static Vector3 ReflectionGroundAlbedo = new(0.24f, 0.29f, 0.12f);
 
     /// <summary>
-    /// 2-8：虚拟地面所在的世界 Y（米），只用于"观察点是否在地面之上"这一个判断。
-    /// 消费端并不逐像素求交（那需要一次射线-平面求交加一次阴影采样），
-    /// 地面辐亮度是全帧一个值；这里的守卫只负责挡住贴地或穿地的相机，避免它们也拿到地面亮度。
-    /// 平面近似把地平线以下的一切压成同一种亮度，真正的局部反射要靠 SSR 或反射探针。
+    /// 2-8: world Y (meters) of the virtual ground, used only for the single test of whether the observer is above the ground.
+    /// Consumers do not intersect per pixel (that would need a ray-plane intersection plus a shadow sample), since the
+    /// ground radiance is a single per-frame value; this guard only rejects cameras sitting on or below the ground so they do not
+    /// receive the ground brightness too. The planar approximation flattens everything below the horizon to one brightness; true local
+    /// reflection relies on SSR or reflection probes.
     /// </summary>
     public static float ReflectionGroundHeight;
 
     /// <summary>
-    /// 2-8：虚拟地面的辐亮度，供 <see cref="Apply"/> 写入 <see cref="SceneLightParams.ReflectionParams0"/>。
-    /// 与 <see cref="GroundRadiance"/> 用同一套物理量：直射项 = 透射 × cos(天顶角) × 光源辐照度，
-    /// 天空项 = SH9 在 +Y 上的辐照度，最后一起乘 albedo/π 得到辐亮度。
-    /// 天空 SH9 尚未就绪时只剩直射项；日落之后直射随透射归零，于是夜里是一块很暗的地面，不会突然发亮。
+    /// 2-8: radiance of the virtual ground, written by <see cref="Apply"/> into <see cref="SceneLightParams.ReflectionParams0"/>.
+    /// Uses the same physical quantities as <see cref="GroundRadiance"/>: direct term = transmittance x cos(zenith) x light irradiance,
+    /// sky term = the SH9 irradiance along +Y, then both multiplied by albedo/pi to get radiance.
+    /// While the sky SH9 is not ready only the direct term remains; after sunset the direct term falls to zero with transmittance, so at night
+    /// it is a very dark ground that does not suddenly light up.
     /// </summary>
     public static Vector3 ReflectionGroundRadiance()
     {
@@ -624,7 +627,7 @@ public static class SkyLighting
                        + GroundIrradiance(up, SafeNormalize(Atmosphere.MoonDirection, -Vector3.UnitY),
                              Atmosphere.MoonColor * Atmosphere.MoonIrradiance);
 
-        // EvaluateIrradianceSh9 返回 E/pi，乘 pi 还原成辐照度，与直射项同一单位。
+        // EvaluateIrradianceSh9 returns E/pi; multiply by pi to recover irradiance, matching the direct term's units.
         if (_sh9Ready)
             irradiance += EvaluateIrradianceSh9(up) * MathF.PI;
 

@@ -689,12 +689,12 @@ public static class WindowsApp
         // fall back to the LDR baseline.
         DirectX.Device.HdrSceneColor = !immediate2D && UseOffscreenSceneColor && RenderQuality.Current.HdrSceneColor;
 
-        // D3D12 必然支持 Compute；在交换链、MRT 和 PSO 创建之前确定雾的单采样路径。
+        // D3D12 always supports compute; determine the fog's single-sampled path before creating the swap chain, MRTs, and PSOs.
         var fogAa = RenderQuality.Current.ResolveFogAntiAliasing(DirectX.Device.HdrSceneColor, immediate2D);
         if (fogAa != RenderQuality.Current.EffectiveAntiAliasing)
         {
             RenderQuality.Current.EffectiveAntiAliasing = fogAa;
-            DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] 体积雾需要单采样场景，Msaa4x 降为 {fogAa}");
+            DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] Volumetric fog requires a single-sampled scene; Msaa4x downgraded to {fogAa}");
         }
 
         // 2-1 contract clause 5: finalize the AA tier during initialization
@@ -997,85 +997,102 @@ public static class WindowsApp
 
                 clockTimer.Restart();
 
-                if (sizeChanged)
+                try
                 {
-                    // Rebuild SwapChain/Display/RTV/DSV on the render thread
-                    // to avoid GPU resource races with the UI thread's SizeChanged event.
-                    // HandleResize returning false means ResizeSemaphore timed out
-                    // (background Load is holding the lock) and the GPU is not idle yet.
-                    // Resize() must not be driven in that state because ResizeCompute would destroy
-                    // and recreate storage resources that may still be in flight, so keep
-                    // sizeChanged set and retry on the next frame.
-                    if (DirectX.Device.HandleResize((int)DeviceServices.BaseApp.DeviceResolution.X, (int)DeviceServices.BaseApp.DeviceResolution.Y))
+                    if (sizeChanged)
                     {
-                        DeviceServices.BaseApp?.Resize();
+                        // Rebuild SwapChain/Display/RTV/DSV on the render thread
+                        // to avoid GPU resource races with the UI thread's SizeChanged event.
+                        // HandleResize returning false means ResizeSemaphore timed out
+                        // (background Load is holding the lock) and the GPU is not idle yet.
+                        // Resize() must not be driven in that state because ResizeCompute would destroy
+                        // and recreate storage resources that may still be in flight, so keep
+                        // sizeChanged set and retry on the next frame.
+                        if (DirectX.Device.HandleResize((int)DeviceServices.BaseApp.DeviceResolution.X, (int)DeviceServices.BaseApp.DeviceResolution.Y))
+                        {
+                            DeviceServices.BaseApp?.Resize();
 
-                        sizeChanged = false;
+                            sizeChanged = false;
+                        }
                     }
-                }
 
-                if (_lastSwapChainChangeTime is null)
-                {
-
-                }
-                else
-                {
-                    if ((DateTime.Now - (DateTime)_lastSwapChainChangeTime).TotalSeconds >= SizeSettleDurationSeconds)
+                    if (_lastSwapChainChangeTime is null)
                     {
-                        _lastSwapChainChangeTime = null;
 
-                        //DeviceServices.BaseApp?.ResizeContent();
                     }
+                    else
+                    {
+                        if ((DateTime.Now - (DateTime)_lastSwapChainChangeTime).TotalSeconds >= SizeSettleDurationSeconds)
+                        {
+                            _lastSwapChainChangeTime = null;
+
+                            //DeviceServices.BaseApp?.ResizeContent();
+                        }
+                    }
+
+                    // Camera and lighting CBs, written before each frame.
+                    // Skipped in immediate-2D mode, where the lighting CB was never created because no 3D
+                    // pass consumes it.
+                    if (!Season.Rendering.Immediate2DMode.Enabled)
+                    {
+                        DXPrimitiveGroup.Update(elapsed, DeviceServices.BaseApp.CameraPos, DeviceServices.BaseApp.CameraTarget, DeviceServices.BaseApp.EffectiveSceneLights);
+                    }
+
+                    if (Season.Basic.Graphics.Instance is Graphics textFrameGraphics)
+                    {
+                        textFrameGraphics.BeginTextFrame();
+                    }
+
+                    DeviceServices.BaseApp.Update(elapsed);
+
+                    if (_closing || DeviceServices.BaseApp.Status is not null)
+                    {
+                        break;
+                    }
+
+                    var backgroundColor = DeviceServices.BaseApp.BackgroundColor;
+                    DirectX.Device.BackgroundColor = backgroundColor;
+                    DirectX.Device.Display?.SetClearColor(backgroundColor);
+
+                    DirectX.Device.BeforeRender();
+
+                    Season.Basic.Graphics.Instance.FlushTextAtlas();
+
+                    // Pass scheduling (Step 1): FrameSchedule drives Begin/End for the Scene pass.
+                    Season.Rendering.FrameSchedule.Execute(Season.Basic.Graphics.Instance, DeviceServices.BaseApp, backgroundColor);
+
+                    DirectX.Device.AfterRender();
+
+                    if (Season.Basic.Graphics.Instance is Graphics windowsGraphics)
+                    {
+                        windowsGraphics.PumpDeferredReleases();
+                    }
+
+                    //if (DeviceServices.BaseApp.TexturesCreated && !DeviceServices.BaseApp.FirstRendered)
+                    //{
+                    //    DeviceServices.BaseApp.FirstRendered = true;
+                    //}
                 }
-
-                // Camera and lighting CBs, written before each frame.
-                // Skipped in immediate-2D mode, where the lighting CB was never created because no 3D
-                // pass consumes it.
-                if (!Season.Rendering.Immediate2DMode.Enabled)
+                catch (Exception error) when (DirectX.Device.IsDeviceGone())
                 {
-                    DXPrimitiveGroup.Update(elapsed, DeviceServices.BaseApp.CameraPos, DeviceServices.BaseApp.CameraTarget, DeviceServices.BaseApp.EffectiveSceneLights);
-                }
-
-                if (Season.Basic.Graphics.Instance is Graphics textFrameGraphics)
-                {
-                    textFrameGraphics.BeginTextFrame();
-                }
-
-                DeviceServices.BaseApp.Update(elapsed);
-
-                if (_closing || DeviceServices.BaseApp.Status is not null)
-                {
+                    // 设备已被移除（TDR 超时或驱动重置）：此后任何一次 D3D12 调用都会失败，继续渲染只会
+                    // 产生级联异常并埋掉 DRED 报告里真正挂住的那个 Pass。停主循环，把原因写进日志，
+                    // 然后走正常的退出清理（清理已具备设备丢失早退，不会挂死）。
+                    DeviceServices.BaseApp.Status = "Failed";
+                    DeviceServices.BaseApp.AddLog(LogType.Error,
+                        $"{DateTime.UtcNow} [GPU] 设备已丢失（TDR 超时或驱动重置），渲染在此帧终止。{error.GetType().Name}: {error.Message} " +
+                        "建议：降低渲染质量（关闭阴影/环境光遮蔽/HDR 或降分辨率），关闭其他占用 GPU 的程序，并更新显卡驱动后重试。");
+                    System.Diagnostics.Trace.TraceError(error.ToString());
                     break;
                 }
-
-                var backgroundColor = DeviceServices.BaseApp.BackgroundColor;
-                DirectX.Device.BackgroundColor = backgroundColor;
-                DirectX.Device.Display?.SetClearColor(backgroundColor);
-
-                DirectX.Device.BeforeRender();
-
-                Season.Basic.Graphics.Instance.FlushTextAtlas();
-
-                // Pass scheduling (Step 1): FrameSchedule drives Begin/End for the Scene pass.
-                Season.Rendering.FrameSchedule.Execute(Season.Basic.Graphics.Instance, DeviceServices.BaseApp, backgroundColor);
-
-                DirectX.Device.AfterRender();
-
-                if (Season.Basic.Graphics.Instance is Graphics windowsGraphics)
-                {
-                    windowsGraphics.PumpDeferredReleases();
-                }
-
-                //if (DeviceServices.BaseApp.TexturesCreated && !DeviceServices.BaseApp.FirstRendered)
-                //{
-                //    DeviceServices.BaseApp.FirstRendered = true;
-                //}
             }
 
             },
             () =>
             {
                 if (!DirectX.Device.CanWaitForGpu()) return;
+                // WaitForGpu 在设备已移除时直接返回：栅栏不会再完成，但驱动在移除瞬间已丢弃所有记录中的
+                // 引用，因此这里可以按 GPU 空闲处理，让下面的强释放把资源真正回收，而不是泄漏到退出。
                 DirectX.Device.WaitForGpu();
                 // Command allocators must stop referencing textures before forced release.
                 DirectX.Device.ResetAllAllocatorsForShutdown();

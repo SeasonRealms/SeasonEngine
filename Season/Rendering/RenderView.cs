@@ -92,17 +92,20 @@ public enum ViewFeature
     /// <summary>The Post slot (tonemap composite). Off means FinalBlit takes the raw scene source.</summary>
     Post = 1 << 9,
 
-    /// <summary>D1 屏幕空间贴花。关闭时本视图不写贴花，也不会为了贴花把场景打散成不透明/透明两段。</summary>
+    /// <summary>D1 screen-space decals. When off, this view writes no decals and does not split the scene into opaque/transparent segments for them.</summary>
     Decals = 1 << 10,
 
-    /// <summary>P2 水面材质。关闭时本视图不画任何水面，也不会为了水面把场景打散成不透明/透明两段。</summary>
+    /// <summary>P2 water material. When off, this view draws no water and does not split the scene into opaque/transparent segments for it.</summary>
     Water = 1 << 11,
 
-    /// <summary>P3 屏幕空间反射（Hi-Z 金字塔 + 反射合成）。关闭时本视图既不建金字塔也不合成反射，
-    /// 水面退回只采天空 LUT。</summary>
+    /// <summary>P3 screen-space reflections (Hi-Z pyramid + reflection composite). When off, this view neither builds the
+    /// pyramid nor composites reflections, and the water falls back to sampling only the sky LUT.</summary>
     Reflections = 1 << 12,
 
-    All = Opaque | Transparent | Shadows | Fog | Weather | AmbientOcclusion | Bloom | AntiAliasing | Particles | Post | Decals | Water | Reflections,
+    /// <summary>P1 waterfall curtain material. When off, this view draws no curtain and does not split the scene into opaque/transparent segments for it.</summary>
+    Waterfalls = 1 << 13,
+
+    All = Opaque | Transparent | Shadows | Fog | Weather | AmbientOcclusion | Bloom | AntiAliasing | Particles | Post | Decals | Water | Reflections | Waterfalls,
 }
 
 /// <summary>How a view consumes the frame-wide cascaded shadow atlas.</summary>

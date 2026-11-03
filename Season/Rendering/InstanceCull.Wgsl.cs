@@ -6,8 +6,9 @@ namespace Season.Rendering;
 
 public sealed partial class InstanceCullEffect
 {
-    // A7 的 WebGPU 侧四份内核。WGSL 的 uniform 结构按 16 字节对齐，CullParams 正好 64 字节，
-    // 与 HLSL/GLSL/MSL 三端逐位一致；dispatch 的 workgroup 数由 C# 给出，与 @workgroup_size 必须相符。
+    // A7's four kernels on the WebGPU side. WGSL uniform structs are 16-byte aligned, and CullParams is
+    // exactly 64 bytes, bit-for-bit identical to the HLSL/GLSL/MSL sides; the dispatch workgroup count is
+    // supplied by C# and must match @workgroup_size.
 
     const string ResetWgsl = """
 struct ResetParams
@@ -61,7 +62,7 @@ struct CullParams
 @group(0) @binding(3) var<storage, read_write> drawArgs: array<u32>;
 @group(0) @binding(4) var<storage, read_write> visibleIds: array<u32>;
 
-// clip = pos * VP（行向量约定）：clip.x 是位置与第 0 列的点积，第 3 列就是 w。
+// clip = pos * VP (row-vector convention): clip.x is the dot product of the position with column 0, and column 3 is w.
 fn visibleInSlot(slot: u32, center: vec3<f32>, radius: f32) -> bool
 {
     let m: u32 = slot * 16u;
@@ -127,8 +128,9 @@ struct FinalizeParams
 @group(0) @binding(1) var<storage, read> drawArgs: array<u32>;
 @group(0) @binding(2) var<storage, read_write> dispatchArgs: array<u32>;
 
-// 单线程：槽位上限 4，串行读四个 uint 远低于开工作组再做归约同步的成本，
-// 也免去四端各写一遍 workgroup 同步方言（WGSL 没有跨 workgroup 的 device-scope fence）。
+// Single-threaded: the slot count is at most 4, and reading four uints serially is far cheaper than
+// launching a workgroup and then synchronizing a reduction. It also avoids writing a workgroup-sync
+// dialect for each of the four backends (WGSL has no cross-workgroup device-scope fence).
 @compute @workgroup_size(1, 1, 1)
 fn CSMain()
 {
@@ -163,8 +165,8 @@ struct GatherParams
 @compute @workgroup_size(64, 1, 1)
 fn CSMain(@builtin(global_invocation_id) id: vec3<u32>)
 {
-    // 二维映射：X = 槽位内序号，Y = 槽位。固定派发与间接派发共用它，
-    // 于是 A/B 的唯一变量是 X 维的组数。
+    // Two-dimensional mapping: X = index within the slot, Y = slot. Fixed dispatch and indirect dispatch
+    // share it, so the only variable in the A/B is the group count along the X dimension.
     let slot: u32 = id.y;
     let k: u32 = id.x;
     if (slot >= gatherParams.slotCount) { return; }
@@ -172,7 +174,7 @@ fn CSMain(@builtin(global_invocation_id) id: vec3<u32>)
     let argsBase: u32 = slot * 16u * 5u;
     let count: u32 = drawArgs[argsBase + 1u];
 
-    // 扇出：一个槽位的可见总数要写进该槽位每一条 primitive 的实例数。
+    // Fan-out: the total visible count of a slot must be written into the instance count of every primitive in that slot.
     if (k == 0u)
     {
         for (var q: u32 = 1u; q < gatherParams.primCount; q = q + 1u)

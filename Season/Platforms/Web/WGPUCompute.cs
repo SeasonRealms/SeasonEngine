@@ -92,7 +92,7 @@ internal sealed class WGPUStorageBuffer : Season.Rendering.StorageBuffer
     public override void Dispose() => WebGPUInterop.DisposeStorageBuffer(Id);
 }
 
-/// <summary>独立 HDR 雾合成句柄；原生 PSO、资源身份与同帧参数槽由 JS 管理。</summary>
+/// <summary>Standalone HDR fog composite handle; the native PSO, resource identity, and per-frame parameter slots are managed by JS.</summary>
 internal sealed class WGPUFogCompositePipeline(bool weather = false) : Season.Rendering.FogCompositePipeline
 {
     static int _nextId;
@@ -132,14 +132,14 @@ internal sealed class WGPUFogCompositePipeline(bool weather = false) : Season.Re
 }
 
 /// <summary>
-/// P0 SSR 加法合成句柄；原生 PSO、绑定组与 Pass 身份校对由 JS 管理。
-/// 片元只把增量读出来再叠加，权重在 <see cref="Season.Rendering.Effects.SsrEffect"/> 的核里已经算成最终值。
+/// P0 SSR additive composite handle; the native PSO, binding groups, and Pass identity check are managed by JS.
+/// The fragment only reads the delta and adds it, while the weights have already been computed to their final values in the kernel of <see cref="Season.Rendering.Effects.SsrEffect"/>.
 /// </summary>
 internal sealed class WGPUSsrCompositePipeline : Season.Rendering.SsrCompositePipeline
 {
     static int _nextId;
 
-    // 顶点复用雾合成那条全屏三角形；片元用 textureLoad 取整数像素，不需要采样器。
+    // The vertex reuses the full-screen triangle from the fog composite; the fragment uses textureLoad to fetch integer pixels and needs no sampler.
     const string Fragment = """
 @group(0) @binding(0) var reflectionDelta:texture_2d<f32>;
 
@@ -180,8 +180,8 @@ internal sealed class WGPUSsrCompositePipeline : Season.Rendering.SsrCompositePi
 }
 
 /// <summary>
-/// A0.1 粒子间接绘制句柄。原生 PSO、绑定组与 Pass 身份校对全在 JS 侧，这边只做类型下转与一次性消费。
-/// Depth 为空是合法输入：场景 Pass 此时跑在默认深度缓冲上，JS 侧改为只要求深度附件存在。
+/// A0.1 particle indirect draw handle. The native PSO, binding groups, and Pass identity check all live on the JS side; this side only does the type downcast and one-shot consumption.
+/// An empty Depth is a legal input: the Scene pass then runs on the default depth buffer, and the JS side relaxes to requiring only that a depth attachment exists.
 /// </summary>
 internal sealed class WGPUParticleDrawPipeline : Season.Rendering.ParticleDrawPipeline
 {
@@ -201,7 +201,7 @@ internal sealed class WGPUParticleDrawPipeline : Season.Rendering.ParticleDrawPi
             || inputs.Instances is not WGPUStorageBuffer instances
             || inputs.IndirectArgs is not WGPUStorageBuffer args
             || inputs.Frame is not WGPUStorageBuffer frame) return false;
-        // Depth 为空要走通，但类型不对不能当空处理：那是后端混用，不是质量档差异。
+        // An empty Depth must work, but a wrong type must not be treated as empty: that is backend mixing, not a quality-tier difference.
         if (inputs.Depth != null && inputs.Depth is not WGPURenderTarget) return false;
         _prepared = WebGPUInterop.PrepareParticleDraw(_name, color.Name,
             (inputs.Depth as WGPURenderTarget)?.Name, instances.Id, args.Id, frame.Id);
@@ -224,9 +224,9 @@ internal sealed class WGPUParticleDrawPipeline : Season.Rendering.ParticleDrawPi
 }
 
 /// <summary>
-/// D1 屏幕空间贴花句柄。四条 PSO、两级绑定组与 Pass 身份校对全在 JS 侧，这边只做类型下转与一次性消费。
-/// 与雾/粒子不同的是：它不依赖 compute（深度只做采样源），所以没有 ComputeSupported 门控。
-/// 顶点端靠 draw(36,1,0,slot) 的 firstInstance 携带贴花槽位 —— WebGPU 没有 push constant。
+/// D1 screen-space decal handle. Four PSOs, two binding groups, and the Pass identity check all live on the JS side; this side only does the type downcast and one-shot consumption.
+/// Unlike fog/particles, it does not depend on compute (depth is only a sampling source), so there is no ComputeSupported gate.
+/// The vertex stage carries the decal slot through the firstInstance of draw(36,1,0,slot) -- WebGPU has no push constant.
 /// </summary>
 internal sealed class WGPUDecalPipeline : Season.Rendering.DecalPipeline
 {
@@ -243,7 +243,7 @@ internal sealed class WGPUDecalPipeline : Season.Rendering.DecalPipeline
         if (_disposed || inputs.Color is not WGPURenderTarget color || inputs.Depth is not WGPURenderTarget depth
             || inputs.FrameBuffer is not WGPUStorageBuffer frame || destination is not WGPURenderTarget target)
             return false;
-        // 法线是可选输入（不改粗糙度时为 null），但类型不对不能当空处理：那是后端混用。
+        // The normal is an optional input (null when roughness is not modified), but a wrong type must not be treated as empty: that is backend mixing.
         if (inputs.Normal != null && inputs.Normal is not WGPURenderTarget) return false;
         if (inputs.Count <= 0 || inputs.Count > Season.Rendering.DecalMath.MaxDecals) return false;
         _prepared = WebGPUInterop.PrepareDecal(_name, color.Name, depth.Name,
@@ -252,7 +252,7 @@ internal sealed class WGPUDecalPipeline : Season.Rendering.DecalPipeline
         return _prepared;
     }
 
-    /// <summary>按绘制次序把 [槽位, 模式, 纹理名] 编成 JSON；纹理名为 null 表示着色器走程序化图案。</summary>
+    /// <summary>Encodes [slot, mode, texture name] into JSON in draw order; a null texture name means the shader uses a procedural pattern.</summary>
     string BuildDrawsJson(Season.Rendering.DecalDraw[] draws, int count)
     {
         _draws.Clear().Append('[');

@@ -8,36 +8,36 @@ using VkPipeline = Silk.NET.Vulkan.Pipeline;
 namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 
 /// <summary>
-/// A0.1 的 Vulkan 提交端：一次 vkCmdDrawIndexedIndirect 画出 compute 决定数量的公告板。
+/// A0.1's Vulkan submit side: one vkCmdDrawIndexedIndirect draws however many billboards the compute pass decided.
 ///
-/// 和 DXParticleDrawPipeline 的差别只有两处，都是 Vulkan 固有的：
-/// 一是需要描述符，于是照 VKFogCompositePipeline 的按帧描述符环管理 set，而 D3D12 用 root SRV 直吃
-/// GPU 虚拟地址，连堆都不需要；二是 Prepare 里一道 barrier 都不录，因为 TryDispatchCompute 尾部已经
-/// 为每个 ReadWrite 绑定发过 ShaderWrite -> ShaderRead（dstStage 含 VertexShaderBit），参数缓冲的
-/// IndirectCommandRead 又由 IGraphics.TryPrepareIndirectArgs 单独补过。Prepare 因此只做解析与校验。
+/// It differs from DXParticleDrawPipeline in only two ways, both inherent to Vulkan:
+/// first, descriptors are required, so sets are managed through a per-frame descriptor ring like VKFogCompositePipeline, whereas D3D12 consumes
+/// the GPU virtual address directly through a root SRV and needs no heap at all; second, Prepare records not a single barrier, because the tail of TryDispatchCompute already
+/// emits ShaderWrite -> ShaderRead for every ReadWrite binding (dstStage includes VertexShaderBit), and the IndirectCommandRead of the argument buffer
+/// is patched in separately by IGraphics.TryPrepareIndirectArgs. Prepare therefore only parses and validates.
 ///
-/// PSO 不在构造期烘焙而是在 Draw 里按需烘焙，理由与 D3D12 一致：决定附件形状的事实只在进入 Pass
-/// 之后才成立，而 Prepare 必须在 Pass 之外。创建 PSO 是设备调用不是命令录制，在 Pass 内合法。
+/// The PSO is baked on demand in Draw rather than at construction time, for the same reason as D3D12: the facts that determine the attachment shape only
+/// hold after entering the Pass, while Prepare must run outside it. Creating a PSO is a device call, not command recording, so it is legal inside a Pass.
 ///
-/// Vulkan 这边"附件形状"比 D3D12 多一维。D3D12 只需区分有没有速度槽，而这里 Scene Pass 在
-/// Device.BeginPass 下有三种真实形状：颜色+速度+深度（三目标）、颜色+深度（双目标或 RT 自带 RP）、
-/// 以及只有颜色（RT 声明了 NoImplicitDepth，自带 RP 就是 colorOnly）。最后一种下开深度测试是非法的，
-/// 所以形状必须从实际绑定反推而不是假定。采样数不进 key：上述三条 RP 全部硬编码 Count1Bit，
-/// 于是非单采样目标一律拒绝提交，而不是烘一个必然不匹配的 PSO。
+/// On the Vulkan side, "attachment shape" has one more dimension than in D3D12. D3D12 only needs to distinguish whether a velocity slot is present, whereas here the Scene Pass
+/// has three real shapes under Device.BeginPass: color + velocity + depth (three targets), color + depth (two targets or an RT with its own RP),
+/// and color only (the RT declares NoImplicitDepth, so its own RP is colorOnly). Enabling depth testing in the last case is illegal,
+/// so the shape must be inferred from the actual bindings rather than assumed. The sample count does not go into the key: all three RPs above hard-code Count1Bit,
+/// so any non-single-sampled target is rejected outright instead of baking a PSO that is guaranteed not to match.
 /// </summary>
 internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleDrawPipeline
 {
-    /// <summary>描述符槽序，与 ParticleSystemEffect.DrawVertexGlsl 的 binding 0/1 一一对应。</summary>
+    /// <summary>Descriptor slot order, mapping one-to-one to binding 0/1 of ParticleSystemEffect.DrawVertexGlsl.</summary>
     const uint InstancesBinding = 0;
     const uint FrameBinding = 1;
 
-    /// <summary>单位四边形索引只有 0..3，ResourceManager.CreateIndexBuffer 因此把它存成 16 位。</summary>
+    /// <summary>The unit-quad indices only range over 0..3, so ResourceManager.CreateIndexBuffer stores them as 16-bit.</summary>
     const ulong QuadIndexBytes = Season.Rendering.ParticleDraw.QuadIndexCount * sizeof(ushort);
 
-    /// <summary>当前 Pass 的真实附件形状，决定 PSO 的附件数与深度状态。</summary>
+    /// <summary>The real attachment shape of the current Pass, which determines the PSO's attachment count and depth state.</summary>
     enum Attachments { ColorOnly, ColorDepth, ColorVelocityDepth, ColorVelocityNormalDepth }
 
-    /// <summary>PSO 签名。采样数不在其中，见类注释。</summary>
+    /// <summary>PSO signature. The sample count is not part of it; see the class comment.</summary>
     readonly record struct PipelineKey(Format Color, Attachments Shape);
 
     readonly Dictionary<PipelineKey, (VkPipeline Pipeline, RenderPass Anchor)> _pipelines = [];
@@ -47,7 +47,7 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
     DescriptorSetLayout _setLayout;
     PipelineLayout _layout;
 
-    // Prepare 的产物，Draw 消费且只消费一次。
+    // Produced by Prepare and consumed by Draw exactly once.
     DescriptorSet _preparedSet;
     VKRenderTarget? _color;
     Season.Rendering.RenderTarget? _depth;
@@ -71,8 +71,8 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
     void Initialize()
     {
         var vk = Device.Vk; var device = Device.LogicalDevice;
-        // 两个只读 storage buffer，仅顶点阶段可见；没有 push constant，所以 binding 0 是空闲的，
-        // 而 compute 侧那套 binding 从 1 起算是因为 0 号位被 Params 的 push constant 占掉了语义。
+        // Two read-only storage buffers, visible only to the vertex stage; there is no push constant, so binding 0 is free,
+        // and the compute-side binding set starts at 1 because slot 0 is semantically occupied by Params' push constant.
         var bindings = stackalloc DescriptorSetLayoutBinding[2];
         bindings[0] = new() { Binding = InstancesBinding, DescriptorCount = 1,
             DescriptorType = DescriptorType.StorageBuffer, StageFlags = ShaderStageFlags.VertexBit };
@@ -81,12 +81,12 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
         var setInfo = new DescriptorSetLayoutCreateInfo { SType = StructureType.DescriptorSetLayoutCreateInfo,
             BindingCount = 2, PBindings = bindings };
         if (vk.CreateDescriptorSetLayout(device, in setInfo, null, out _setLayout) != Result.Success)
-            throw new InvalidOperationException("创建粒子描述符布局失败。");
+            throw new InvalidOperationException("Failed to create particle descriptor layout.");
         var setLayout = _setLayout;
         var layoutInfo = new PipelineLayoutCreateInfo { SType = StructureType.PipelineLayoutCreateInfo,
             SetLayoutCount = 1, PSetLayouts = &setLayout };
         if (vk.CreatePipelineLayout(device, in layoutInfo, null, out _layout) != Result.Success)
-            throw new InvalidOperationException("创建粒子管线布局失败。");
+            throw new InvalidOperationException("Failed to create particle pipeline layout.");
     }
 
     VkPipeline GetOrCreatePipeline(in PipelineKey key)
@@ -97,9 +97,9 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
         bool velocity = normal || key.Shape == Attachments.ColorVelocityDepth;
         bool depth = key.Shape != Attachments.ColorOnly;
 
-        // PSO 只要求与实际 render pass "兼容"，也就是附件的格式、采样数和 subpass 结构一致；
-        // LoadOp/StoreOp/layout 不参与判定。所以这里自造同构的锚点 RP 来烘焙，与 VKFogCompositePipeline
-        // 和 Pipeline.Init 的 HDR 锚点同一手法，不需要去借 Pass 正在用的那个句柄。
+        // A PSO only needs to be "compatible" with the actual render pass, i.e. the attachment formats, sample counts, and subpass structure must match;
+        // LoadOp/StoreOp/layout do not participate in the check. So an isomorphic anchor RP is synthesized here for baking, the same technique used by VKFogCompositePipeline
+        // and the HDR anchor in Pipeline.Init, without borrowing the handle the Pass is currently using.
         RenderPass anchor = velocity
             ? VKRenderTarget.CreateVelocityRenderPassForFormat(key.Color, withNormal: normal)
             : VKRenderTarget.CreateColorRenderPassForFormat(key.Color, colorOnly: !depth);
@@ -122,7 +122,7 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
                     Stage = ShaderStageFlags.VertexBit, Module = vertex, PName = name };
                 stages[1] = new() { SType = StructureType.PipelineShaderStageCreateInfo,
                     Stage = ShaderStageFlags.FragmentBit, Module = fragment, PName = name };
-                // 没有顶点缓冲也没有输入布局：角点来自 gl_VertexIndex，实例值来自 storage buffer。
+                // No vertex buffer and no input layout: corners come from gl_VertexIndex and instance values from a storage buffer.
                 var input = new PipelineVertexInputStateCreateInfo { SType = StructureType.PipelineVertexInputStateCreateInfo };
                 var assembly = new PipelineInputAssemblyStateCreateInfo { SType = StructureType.PipelineInputAssemblyStateCreateInfo,
                     Topology = PrimitiveTopology.TriangleList };
@@ -130,28 +130,28 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
                     ViewportCount = 1, ScissorCount = 1 };
                 var raster = new PipelineRasterizationStateCreateInfo { SType = StructureType.PipelineRasterizationStateCreateInfo,
                     PolygonMode = PolygonMode.Fill,
-                    // 公告板的绕序取决于相机基与索引顺序的组合，关掉剔除比在着色器里翻正负更可靠。
+                    // The billboard's winding order depends on the combination of the camera basis and index order, so disabling culling is more reliable than flipping signs in the shader.
                     CullMode = CullModeFlags.None, FrontFace = FrontFace.Clockwise, LineWidth = 1 };
                 var samples = new PipelineMultisampleStateCreateInfo { SType = StructureType.PipelineMultisampleStateCreateInfo,
                     RasterizationSamples = SampleCountFlags.Count1Bit };
-                // 深度测试开、深度写关：粒子互相之间不排序，写深度只会让后画的被先画的挡掉。
-                // 场景深度是正向的（Pipeline 主管线用 Less/LessOrEqual），所以这里是 LessOrEqual。
+                // Depth test on, depth write off: particles are not sorted against one another, and writing depth would only let later draws be occluded by earlier ones.
+                // Scene depth is forward (the main Pipeline uses Less/LessOrEqual), so LessOrEqual is used here.
                 var depthState = new PipelineDepthStencilStateCreateInfo { SType = StructureType.PipelineDepthStencilStateCreateInfo,
                     DepthTestEnable = true, DepthWriteEnable = false, DepthCompareOp = CompareOp.LessOrEqual };
                 var all = ColorComponentFlags.RBit | ColorComponentFlags.GBit
                     | ColorComponentFlags.BBit | ColorComponentFlags.ABit;
                 var attachmentBlends = stackalloc PipelineColorBlendAttachmentState[3];
-                // 片元着色器输出预乘 alpha，所以源因子是 One 而不是 SrcAlpha。
+                // The fragment shader outputs premultiplied alpha, so the source factor is One rather than SrcAlpha.
                 attachmentBlends[0] = new() { BlendEnable = true,
                     SrcColorBlendFactor = BlendFactor.One, DstColorBlendFactor = BlendFactor.OneMinusSrcAlpha,
                     ColorBlendOp = BlendOp.Add,
                     SrcAlphaBlendFactor = BlendFactor.One, DstAlphaBlendFactor = BlendFactor.OneMinusSrcAlpha,
                     AlphaBlendOp = BlendOp.Add, ColorWriteMask = all };
-                // 速度槽写掩码置零，与主管线对透明几何的既有选择一致：保留下方不透明层的速度，
-                // 比写 0 更好，后者会让 TAA 把运动的粒子当成静止背景去累积。
+                // The velocity slot's write mask is zeroed, consistent with the main pipeline's existing choice for transparent geometry: keeping the velocity of the opaque layer below
+                // is better than writing 0, which would make TAA accumulate moving particles as if they were a static background.
                 attachmentBlends[1] = new() { BlendEnable = false, ColorWriteMask = 0 };
-                // 法线槽同理：粒子不是 SSR/贴花要看到的表面，保留下方不透明层的法线。
-                // 写掩码为零的槽不要求片元着色器有对应输出，所以着色器沿用速度版本。
+                // Same for the normal slot: particles are not a surface that SSR/decals should see, so keep the normals of the opaque layer below.
+                // A slot with a zero write mask does not require a matching fragment shader output, so the shader reuses the velocity variant.
                 attachmentBlends[2] = attachmentBlends[1];
                 var blend = new PipelineColorBlendStateCreateInfo { SType = StructureType.PipelineColorBlendStateCreateInfo,
                     AttachmentCount = normal ? 3u : (velocity ? 2u : 1u), PAttachments = attachmentBlends };
@@ -164,7 +164,7 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
                     PDepthStencilState = depth ? &depthState : null,
                     PColorBlendState = &blend, PDynamicState = &dynamic, Layout = _layout, RenderPass = anchor };
                 if (vk.CreateGraphicsPipelines(device, default, 1, in info, null, out pipeline) != Result.Success)
-                    throw new InvalidOperationException("创建粒子图形管线失败。");
+                    throw new InvalidOperationException("Failed to create particle graphics pipeline.");
             }
         }
         catch
@@ -185,7 +185,7 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
     {
         _prepared = false;
         _color = null; _depth = null; _instances = null; _args = null; _frame = null; _preparedSet = default;
-        // InRenderPass 为真时录制任何东西都违反 PassDesc 契约，宁可放弃本帧提交。
+        // Recording anything while InRenderPass is true violates the PassDesc contract, so it is better to skip this frame's submission.
         if (_disposed || Device.InRenderPass || Device.GraphicsCommandBuffer.Handle == 0
             || Pipeline.UnitQuadIndexBuffer.Buffer.Handle == 0
             || Pipeline.UnitQuadIndexBuffer.Size < QuadIndexBytes
@@ -203,9 +203,9 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
         ulong stamp = Device.GetCurrentRetireFenceValue();
         if (_stamps[index] != stamp)
         {
-            // 本帧第一次 Prepare 会复用 ring[0]，也就是同一槽三帧前用过的那个 set。
-            // 那批提交可能仍在 GPU 上，而未声明 UPDATE_AFTER_BIND 的 set 被 pending
-            // 命令缓冲引用时改写会让那条缓冲整体失效；见 Device.WaitForFrameSlot。
+            // The first Prepare of a frame reuses ring[0], i.e. the set used by the same slot three frames ago.
+            // That batch of submissions may still be on the GPU, and rewriting a set that has not declared UPDATE_AFTER_BIND
+            // while it is referenced by a pending command buffer invalidates that whole buffer; see Device.WaitForFrameSlot.
             Device.WaitForFrameSlot(index);
             _stamps[index] = stamp; _cursors[index] = 0;
         }
@@ -242,14 +242,14 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
             || Device.GraphicsCommandBuffer.Handle != _command.Handle
             || Device.FrameIndex != _frameIndex
             || Device.GetCurrentRetireFenceValue() != _stamp) return false;
-        // Vulkan 的 Scene Pass 没有 MSAA 替身，所以身份核对可以是严格的引用相等。
+        // Vulkan's Scene Pass has no MSAA variant, so the identity check can be strict reference equality.
         if (!ReferenceEquals(Device.ActiveColorTarget, color)
             || color.ColorViewVersion != _colorViewVersion) return false;
-        // null == 使用该目标自带的深度，这同样要求准备期看到的是 null，否则深度语义已经变了。
+        // null == use the depth the target ships with, which likewise requires that Prepare saw null, otherwise the depth semantics have already changed.
         if (!ReferenceEquals(Device.ActiveDepthTarget, depth)) return false;
 
-        // 附件形状只能从实际绑定反推：速度槽存在即三目标（法线也在则四目标）；否则有显式深度就是双目标；
-        // 两者都没有时用的是目标自带的 RP，它是否带深度由 NoImplicitDepth 决定。
+        // The attachment shape can only be inferred from the actual bindings: a velocity slot means three targets (four if the normal slot is also present); otherwise an explicit depth target means two;
+        // when neither is present the target's own RP is used, and whether it carries depth is decided by NoImplicitDepth.
         var velocity = Device.ActiveVelocityTarget;
         var normalTarget = Device.ActiveNormalTarget;
         Attachments shape;
@@ -267,11 +267,11 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
         if (pipeline.Handle == 0) return false;
 
         var vk = Device.Vk;
-        // 主管线每次 SetPipeline 都会重绑 PSO、描述符和索引缓冲，所以这里的覆写不会泄漏到后续绘制。
+        // The main pipeline rebinds the PSO, descriptors, and index buffer on every SetPipeline, so the overrides here do not leak into subsequent draws.
         vk.CmdBindPipeline(_command, PipelineBindPoint.Graphics, pipeline);
         vk.CmdBindDescriptorSets(_command, PipelineBindPoint.Graphics, _layout, 0, 1, &set, 0, null);
         vk.CmdBindIndexBuffer(_command, Pipeline.UnitQuadIndexBuffer.Buffer, 0, IndexType.Uint16);
-        // 实例数来自参数缓冲的第二个字段，CPU 这一侧从未知道过它的值。
+        // The instance count comes from the second field of the argument buffer; the CPU side never knows its value.
         vk.CmdDrawIndexedIndirect(_command, args.Buffer.Buffer, 0, 1,
             Season.Rendering.IndirectDrawIndexedArgs.SizeInBytes);
         return true;

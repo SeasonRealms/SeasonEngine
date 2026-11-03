@@ -112,7 +112,7 @@ public struct CloudLayerArray
 
 /// <summary>
 /// 1-2 lighting system: C#-side mirror of the main-pipeline lighting UBO, with contract layout defined by the 1-2, 1-5, and 1-7 sections in the RenderQuality header.
-/// 布局仅使用 vec4/mat4；原 1376 字节前缀不变，区域天气追加 1056 字节，末尾追加雷电 16 字节，2-8 再追加虚拟地面 16 字节，共 2464 字节。
+/// The layout uses only vec4/mat4; the original 1376-byte prefix is unchanged, regional weather appends 1056 bytes, lightning appends 16 bytes at the tail, and 2-8 appends the virtual ground 16 bytes, for 2464 bytes total.
 /// The SceneLights UBO declared in shaders on all four backends must match it byte for byte.
 /// Byte offsets are:
 /// CameraPos=0, Ambient=16, Params0=32, Lights[i]=48+64i,
@@ -305,31 +305,31 @@ public struct SceneLightParams
     /// Non-procedural sky, disabled AerialPerspective, and a missing 3D texture all force this field to zero, see <c>SkyLighting.ApplyAerial</c>.</summary>
     public System.Numerics.Vector4 ApParams0;
 
-    /// <summary>偏移 1376：区域数、云可用性、区域层数、雨幕采样预算。</summary>
+    /// <summary>Offset 1376: region count, cloud availability, region layer count, rain-curtain sampling budget.</summary>
     public Vector4 WeatherParams0;
-    /// <summary>偏移 1392：雨幕近端渐入起止（米）、最大距离、是否存在降雨。</summary>
+    /// <summary>Offset 1392: rain-curtain near-end fade-in start and end (meters), maximum distance, and whether rain is present.</summary>
     public Vector4 WeatherParams1;
-    /// <summary>偏移 1408：8 个区域，每区域 8 行；详见 WeatherVisualState。</summary>
+    /// <summary>Offset 1408: 8 regions, 8 rows each; see WeatherVisualState for details.</summary>
     public WeatherVisualArray WeatherRegions;
 
     /// <summary>
-    /// 偏移 2432，2-7 雷电：xyz = 当前主导雷击在云内的世界坐标，w = 回击包络亮度，0~1。
-    /// **w &gt; 0 是消费侧唯一的总开关**；没有雷暴、区域质量档位为 Off、或处于 Showcase 模式时整个字段为零。
-    /// 只存一次而不是每区域一次，是因为同一帧可见的雷击几乎总发生在同一片云下，
-    /// 而按区域存会把 8 行预算再扩一倍却换不到可分辨的第二处闪光。
-    /// 记位置而不是方向：云内发光按到雷击点的距离衰减，不看视线方向。
+    /// Offset 2432, 2-7 lightning: xyz = world-space position of the dominant strike inside the cloud this frame, w = return-stroke envelope brightness in 0~1.
+    /// **w &gt; 0 is the only whole-feature gate on the consumer side**; without a thunderstorm, with the regional quality level set to Off, or in Showcase mode, the entire field is zero.
+    /// It is stored once rather than once per region because strikes visible in the same frame almost always happen under the same cloud,
+    /// and storing it per region would double the 8-row budget without buying a distinguishable second flash.
+    /// It records a position rather than a direction: in-cloud glow attenuates by distance to the strike point and ignores the view direction.
     /// </summary>
     public Vector4 WeatherFlash;
 
     /// <summary>
-    /// 偏移 2448，2-8 环境镜面的虚拟地面：xyz = 地面辐亮度（线性 HDR，已含 albedo、
-    /// 太阳与月亮的直射透射和余弦、天空 SH9，以及 1/π），w = 地面所在的世界 Y（米）。
-    /// 只由 <see cref="SkyLighting.Apply"/> 注入，与 hdrExposure 同一约定，App 侧写入无效。
-    /// 消费侧只在程序化天空分支（skyParams0.w &gt; 0）里使用：反射方向掉到地平线以下时，
-    /// Sky-View LUT 那一侧几乎没有能量（朝下的射线只穿过视点到地面那几百米空气），
-    /// 直接采样会得到纯黑的下半球，而这个字段给出那块地面本该有的亮度。
-    /// xyz 全零表示地面是黑的，也就是退回 2-7 之前的行为。
-    /// 追加在尾部而不是插在中间：前面所有字段的偏移被雾、雨幕与四端着色器硬编码，挪动它们等于整体重排。
+    /// Offset 2448, 2-8 environment-specular virtual ground: xyz = ground radiance (linear HDR, already including albedo,
+    /// the direct transmittance and cosine of the sun and moon, sky SH9, and 1/π), w = world Y of the ground (meters).
+    /// Injected only by <see cref="SkyLighting.Apply"/>, following the same convention as hdrExposure; App-side writes are ineffective.
+    /// The consumer side uses it only in the procedural-sky branch (skyParams0.w &gt; 0): when the reflection direction falls below the horizon,
+    /// the Sky-View LUT side carries almost no energy (a downward ray only passes through the few hundred meters of air from the viewpoint to the ground),
+    /// so sampling it directly yields a pure-black lower hemisphere, whereas this field supplies the brightness that patch of ground should have.
+    /// An all-zero xyz means the ground is black, i.e. a fallback to the behavior before 2-7.
+    /// Appended at the tail rather than inserted in the middle: the offsets of all preceding fields are hardcoded by fog, the rain curtain, and the shaders of all four backends, so moving them amounts to a full reorder.
     /// </summary>
     public Vector4 ReflectionParams0;
 

@@ -5,174 +5,174 @@
 namespace Season.Rendering;
 
 /// <summary>
-/// A7：一个 instanced 组交给 GPU 剔除时暴露的资源面。实现方是各端的 instanced primitive group，
-/// 因为只有它同时知道实例世界矩阵、各 surface 的索引区间和当前帧的实例数。
+/// A7: the resource surface an instanced group exposes when handed to GPU culling. The implementation is
+/// each backend's instanced primitive group, since only it knows the instance world matrices, each surface's index range and the current frame's instance count.
 ///
-/// 契约的核心是"原始序号间接寻址"：剔除内核读实例世界矩阵，通过的实例把**原始下标**写进
-/// <see cref="CullVisible"/>，绘制端把压缩后的 <c>SV_InstanceID</c> 经这张表还原成原始下标再去取
-/// 变换。因此实例数据本身从不重建、从不重排，每帧只多写一张 4 字节的序号表和几条间接参数。
-/// 这正是 1-5 在 <see cref="Season.Controls.InstancedMesh3DBase"/> 里标为延期的做法：那里的注释写明
-/// "逐实例剔除需要为每个级联重建实例缓冲并上传，违反 1-3 条款 2"，而序号表绕开了重建。
+/// The heart of the contract is "original-index indirection": the cull kernel reads the instance world matrices, and each passing instance writes its **original index** into
+/// <see cref="CullVisible"/>; the draw side uses the compressed <c>SV_InstanceID</c> to restore the original index through this table and then fetch
+/// the transform. So the instance data itself is never rebuilt and never reordered; each frame only adds a 4-byte index table and a few indirect args.
+/// This is exactly the approach 1-5 deferred in <see cref="Season.Controls.InstancedMesh3DBase"/>: the comment there states
+/// "per-instance culling would require rebuilding and uploading the instance buffer for every cascade, violating clause 2 of 1-3", while the index table sidesteps the rebuild.
 ///
-/// 所有缓冲都按 <see cref="InstanceCull.MaxSlots"/> 个槽位平铺，槽位布局与
-/// <see cref="CascadedShadow"/> 一致：0..2 是太阳级联，3 是聚光。未激活的槽位由 slotMask 直接跳过，
-/// 而不是靠填一个"什么都剔掉的矩阵"—— 那需要构造退化投影，一旦提取平面的代码改动就会静默失效。
+/// All buffers are tiled across <see cref="InstanceCull.MaxSlots"/> slots, with the slot layout matching
+/// <see cref="CascadedShadow"/>: 0..2 are the sun cascades and 3 is the spot light. Inactive slots are skipped directly by slotMask,
+/// rather than by filling in a "matrix that culls everything" -- that would require constructing a degenerate projection that silently breaks the moment the plane-extraction code changes.
 /// </summary>
 public interface IInstanceCullTarget
 {
-    /// <summary>本帧参与剔除的实例数。0 表示这组本帧不画，内核也不会被派发。</summary>
+    /// <summary>Number of instances participating in culling this frame. 0 means this group is not drawn this frame and the kernel is not dispatched.</summary>
     int CullInstanceCount { get; }
 
     /// <summary>
-    /// 序号表与重排流按实例计的容量，必须不小于 <see cref="CullInstanceCount"/>。
-    /// 它和实例数分开是有原因的：各端缓冲沿用"只增不减"的容量策略（与实例缓冲一致），
-    /// 而剔除内核按 capacity 定位、gather 也按 capacity 寻址；若这里回落到本帧实例数，
-    /// 容量一旦留过余量，序号表就会读错位置，表现为画出一批本不该出现的实例。
+    /// Per-instance capacity of the index table and the reordered stream; must be no less than <see cref="CullInstanceCount"/>.
+    /// It is kept separate from the instance count for a reason: backend buffers follow a "grow-only" capacity policy (consistent with the instance buffer),
+    /// and the cull kernel indexes by capacity while gather also addresses by capacity. If this fell back to the current frame's instance count, then once capacity holds
+    /// any extra room the index table would read the wrong locations, showing up as drawing a batch of instances that should not appear.
     /// </summary>
     int CullCapacity { get; }
 
-    /// <summary>本组的 primitive 数，即每个槽位要写多少条间接参数。超过 <see cref="InstanceCull.MaxPrimitives"/> 时该组退回 CPU 剔除。</summary>
+    /// <summary>Primitive count of this group, i.e. how many indirect arg entries to write per slot. If it exceeds <see cref="InstanceCull.MaxPrimitives"/>, this group falls back to CPU culling.</summary>
     int CullPrimitiveCount { get; }
 
-    /// <summary>每实例 80 字节的原始世界矩阵流，布局与 IA 的实例缓冲逐位相同（四行矩阵 + 四元组形变权重）。这是剔除的输入，本身永远不被改写。</summary>
+    /// <summary>The raw world-matrix stream of 80 bytes per instance, bit-identical to the IA instance buffer layout (four-row matrix + quaternion blend weights). This is the cull input and is never rewritten itself.</summary>
     StorageBuffer? CullSourceWorlds { get; }
 
     /// <summary>
-    /// 每实例 80 字节的重排世界矩阵流，<see cref="InstanceCull.MaxSlots"/> 个槽位按容量分段平铺。
-    /// gather 内核按序号表把可见实例物化到这里，绘制端把它绑成实例流并把实例数交给间接参数。
-    /// 之所以要物化而不是让顶点阶段自己查表：D3D12 的根签名已用掉 61/64 DWORD，再挂两个 SRV 表
-    /// 会把后续所有 Phase 的绑定余量吃尽，而 IA 的实例步进无法按序号索引。
+    /// The reordered world-matrix stream of 80 bytes per instance, tiled across <see cref="InstanceCull.MaxSlots"/> slots in capacity-sized segments.
+    /// The gather kernel materializes visible instances here according to the index table; the draw side binds it as the instance stream and feeds the instance count via indirect args.
+    /// The reason to materialize rather than have the vertex stage index the table itself: the D3D12 root signature has already used 61/64 DWORDs, and attaching two more SRV tables
+    /// would exhaust the binding budget for every subsequent Phase, while IA's instance stepping cannot be indexed by original index.
     /// </summary>
     StorageBuffer? CullSortedWorlds { get; }
 
-    /// <summary>每 primitive 16 字节：索引数、起始索引、基准顶点、保留。只在 primitive 集合变化时更新。</summary>
+    /// <summary>16 bytes per primitive: index count, start index, base vertex, reserved. Updated only when the primitive set changes.</summary>
     StorageBuffer? CullPrimitiveInfo { get; }
 
-    /// <summary><see cref="InstanceCull.MaxSlots"/> × <see cref="InstanceCull.MaxPrimitives"/> 条间接绘制参数，由 GPU 写。</summary>
+    /// <summary><see cref="InstanceCull.MaxSlots"/> × <see cref="InstanceCull.MaxPrimitives"/> indirect draw args, written by the GPU.</summary>
     StorageBuffer? CullArgs { get; }
 
-    /// <summary><see cref="InstanceCull.MaxSlots"/> × 容量个 uint，每槽位一段原始序号表，由 GPU 写。</summary>
+    /// <summary><see cref="InstanceCull.MaxSlots"/> × capacity uints; one segment of the original index table per slot, written by the GPU.</summary>
     StorageBuffer? CullVisible { get; }
 
-    /// <summary>组局部包围盒中心。多 surface 的组必须传合并盒，否则某个 surface 的实例会被误剔。</summary>
+    /// <summary>Group-local bounding box center. A multi-surface group must pass the merged box, otherwise instances of one surface would be culled incorrectly.</summary>
     Vector3 CullLocalCenter { get; }
 
-    /// <summary>组局部包围盒半长。</summary>
+    /// <summary>Group-local bounding box half-extents.</summary>
     Vector3 CullLocalExtents { get; }
 
     /// <summary>
-    /// 每次派发之前回调，让实现方把剔除的 CPU 侧输入（每实例矩阵流与 primitive 参数表）传到 GPU。
+    /// Called before each dispatch so the implementer can upload the CPU-side cull inputs (per-instance matrix stream and primitive arg table) to the GPU.
     ///
-    /// 这个回调存在的唯一理由是"相位"：GPU 上传要求命令列表已打开且不在 Pass 内，
-    /// 而控制件的 Update 两个条件都不满足。Windows 主循环先跑 App.Update 再调 Device.BeforeRender，
-    /// 于是 Update 阶段命令列表还停在上一帧关闭后的状态 —— DX12 在那里录 barrier 直接抛 SEH，
-    /// Vulkan 则被 IsRecording 判定静默丢弃（缓冲保持全零，整组实例被误剔，画面只是"少了一批东西"）。
-    /// 两端连失败方式都不一样，正说明上传时机不该由控制件自己决定，而该由"命令列表此刻能不能录"决定。
-    /// 本回调由 <see cref="InstanceCullEffect"/> 在 Record 里调用，刚好落在 BeforeRender 之后、
-    /// 阴影 Pass 之前，是四端唯一共同满足条件的相位。
+    /// The only reason this callback exists is "phase": a GPU upload requires the command list to be open and not inside a Pass,
+    /// and the control's Update satisfies neither condition. The Windows main loop runs App.Update before Device.BeforeRender,
+    /// so during Update the command list is still in the state left after the previous frame closed -- DX12 throws SEH when recording a barrier there,
+    /// while Vulkan silently drops it via the IsRecording check (the buffer stays all zero, the whole instance group is culled incorrectly, and the image merely "loses a batch of things").
+    /// The two backends do not even fail the same way, which shows the upload timing should not be decided by the control itself but by "whether the command list can record right now".
+    /// This callback is invoked by <see cref="InstanceCullEffect"/> inside Record, landing right after BeforeRender and
+    /// before the shadow Pass, the one phase all four backends commonly satisfy.
     ///
-    /// 返回 false 表示本帧输入不可用，调用方必须跳过该目标；绘制端会自行退回 CPU 整批剔除。
+    /// Returning false means this frame's inputs are unavailable and the caller must skip this target; the draw side falls back to whole-batch CPU culling on its own.
     /// </summary>
     bool PrepareCullInputs();
 
     /// <summary>
-    /// 三次派发之后回调，让实现方把重排流与间接参数从 compute 写入状态交接到绘制可读状态，
-    /// 返回本帧是否可以直接走间接路径。
+    /// Called after the dispatches so the implementer can transition the reordered stream and indirect args from compute-write state to draw-readable state,
+    /// returning whether the indirect path can be taken directly this frame.
     ///
-    /// 必须在 Record 里完成而不能推迟到 DrawShadow 里：那时候已经在阴影 Pass 内部，
-    /// 而 PassDesc 禁止在 Pass 体内切资源状态（Vulkan 的 render pass 实例内插不了 barrier）。
-    /// 这与 <see cref="IGraphics.TryPrepareIndirectArgs"/> 是同一条约束的两个落点。
+    /// It must be done inside Record and cannot be deferred into DrawShadow: by then we are already inside the shadow Pass,
+    /// and PassDesc forbids switching resource states inside a Pass (a Vulkan render pass instance cannot have a barrier inserted into it).
+    /// This and <see cref="IGraphics.TryPrepareIndirectArgs"/> are two landing points of the same constraint.
     /// </summary>
     bool PrepareCullDraw();
 }
 
 /// <summary>
-/// A7：逐实例 GPU 剔除的跨端常量与注册表。这里的每个数字都是四端着色器与 C# 分配共同依赖的契约，
-/// 改动任何一项都必须同步四份 kernel 源，否则表现为"剔除结果错位"而不是编译错误。
+/// A7: cross-backend constants and registry for per-instance GPU culling. Every number here is a contract that the four backends' shaders and the C# allocations both depend on;
+/// changing any one of them requires updating all four kernel sources in sync, otherwise it shows up as "culled results out of place" rather than a compile error.
 /// </summary>
 public static class InstanceCull
 {
-    /// <summary>槽位数，直接取自阴影系统的图集分区数：三个级联 + 一个聚光。</summary>
+    /// <summary>Slot count, taken directly from the shadow system's atlas partition count: three cascades + one spot light.</summary>
     public const int MaxSlots = CascadedShadow.SlotCount;
 
     /// <summary>
-    /// 每组 primitive 上限。间接参数表按 <c>slot * MaxPrimitives + primitive</c> 定长寻址，
-    /// 定长而非紧凑排布是刻意的：内核与绘制端都不必读一个"每帧可能变"的 stride，
-    /// 少一个漂移点。16 覆盖现有模型的所有 surface 组合，超出的组直接不参与 A7。
+    /// Per-group primitive limit. The indirect arg table is addressed at a fixed stride via <c>slot * MaxPrimitives + primitive</c>;
+    /// the fixed rather than packed layout is deliberate: neither the kernel nor the draw side has to read a stride that "may change per frame",
+    /// one fewer drift point. 16 covers every surface combination of the current models; groups exceeding it simply do not participate in A7.
     /// </summary>
     public const int MaxPrimitives = 16;
 
-    /// <summary>每实例世界矩阵步长，与 DX 的 InstanceTransformData、各端 IA 实例流逐位一致。</summary>
+    /// <summary>Per-instance world-matrix stride, bit-consistent with DX's InstanceTransformData and each backend's IA instance stream.</summary>
     public const uint WorldStride = 80;
 
-    /// <summary>每 primitive 描述步长：indexCount / startIndex / baseVertex / 保留。</summary>
+    /// <summary>Per-primitive descriptor stride: indexCount / startIndex / baseVertex / reserved.</summary>
     public const uint PrimitiveInfoStride = 16;
 
-    /// <summary>一条间接索引绘制参数的字节数，与 <see cref="IndirectDrawIndexedArgs"/> 同源。</summary>
+    /// <summary>Byte size of one indirect indexed draw arg, same source as <see cref="IndirectDrawIndexedArgs"/>.</summary>
     public const uint ArgsStride = IndirectDrawIndexedArgs.SizeInBytes;
 
-    /// <summary>剔除内核与扇出内核的统一工作组长。四端都以它作为 <c>numthreads</c> / <c>local_size</c>。</summary>
+    /// <summary>Shared workgroup size for the cull and fan-out kernels. All four backends use it as <c>numthreads</c> / <c>local_size</c>.</summary>
     public const uint CullGroupSize = 64;
 
-    /// <summary>每个槽位矩阵的字节数。四行 float4，与 System.Numerics 的行序一致。</summary>
+    /// <summary>Byte size of each slot matrix. Four float4 rows, matching System.Numerics' row order.</summary>
     public const uint SlotMatrixStride = 64;
 
-    /// <summary>间接参数表的总字节数：槽位 × primitive × 20。</summary>
+    /// <summary>Total byte size of the indirect arg table: slots × primitives × 20.</summary>
     public const uint ArgsBytes = (uint)(MaxSlots * MaxPrimitives) * ArgsStride;
 
-    /// <summary>重排实例流的总字节数：槽位 × 容量 × 80。容量只增不减，与实例缓冲同样的策略。</summary>
+    /// <summary>Total byte size of the reordered instance stream: slots × capacity × 80. Capacity is grow-only, same policy as the instance buffer.</summary>
     public static uint SortedBytes(int capacity) => (uint)(MaxSlots * capacity) * WorldStride;
 
     /// <summary>
-    /// gather 内核沿 X 的组数上限，X 维是一个槽位内的候选序号。按容量算而不是按实例数算：
-    /// 序号表是压缩过的，CPU 无从得知可见多少个，只有 GPU 知道。
-    /// 走间接派发时这一维改由 finalize 内核写成"最大槽位可见数对应的组数"，容量在这里只是上界。
+    /// Upper bound on the gather kernel's group count along X; the X dimension is the candidate index within a slot. Computed from capacity rather than instance count:
+    /// the index table is compressed, so the CPU has no way to know how many are visible, only the GPU does.
+    /// On the indirect dispatch path this dimension is instead written by the finalize kernel as "the group count corresponding to the largest per-slot visible count"; capacity is only an upper bound here.
     /// </summary>
     public static uint GatherGroupsX(int capacity) => (uint)((long)capacity + CullGroupSize - 1) / CullGroupSize;
 
-    /// <summary>gather 内核沿 Y 的组数，一个槽位一行。两条派发路径都用这个值：A/B 对比只允许 X 维变化。</summary>
+    /// <summary>Gather kernel's group count along Y, one row per slot. Both dispatch paths use this value: the A/B comparison is only allowed to vary the X dimension.</summary>
     public const uint GatherGroupsY = MaxSlots;
 
-    /// <summary>reset 内核的线程数：一次覆盖全部槽位与 primitive。</summary>
+    /// <summary>Thread count of the reset kernel: covers all slots and primitives in one go.</summary>
     public const uint ResetThreads = (uint)(MaxSlots * MaxPrimitives);
 
-    /// <summary>槽位矩阵缓冲的字节数。</summary>
+    /// <summary>Byte size of the slot matrix buffer.</summary>
     public const uint SlotMatrixBytes = (uint)MaxSlots * SlotMatrixStride;
 
     /// <summary>
-    /// 后端能力是否已就位。由 <see cref="InstanceCullEffect"/> 初始化成功置位，卸载或失败清回 false；
-    /// 各端 group 只在此时才分配剔除资源，于是"某端没写 kernel"表现为退回 CPU 剔除而不是空缓冲绘制。
+    /// Whether the backend capabilities are in place. Set by a successful <see cref="InstanceCullEffect"/> initialization, cleared back to false on unload or failure;
+    /// each backend's group only allocates cull resources at that point, so "a backend without kernels" shows up as falling back to CPU culling rather than drawing from empty buffers.
     /// </summary>
     public static bool Enabled { get; internal set; }
 
-    /// <summary>本帧登记的剔除目标。由各端 group 在创建时加入、销毁时按引用移除。</summary>
+    /// <summary>Cull targets registered for this frame. Added by each backend's group on creation and removed by reference on disposal.</summary>
     public static readonly List<IInstanceCullTarget> Targets = new();
 
     /// <summary>
-    /// 进程内走间接派发的 gather 次数。诊断用，两个数字合起来是"这一轮 A/B 到底走了哪条路"的唯一证据：
-    /// 只比较两张截图是不够的——两条路都正确时它们必然相同，但"gather 压根没被派发"同样会让它们相同，
-    /// 而那种情况下这组对比什么也没证明。
+    /// Number of indirect-dispatch gathers within the process. For diagnostics; the two numbers together are the only evidence of "which path this A/B run actually took":
+    /// comparing two screenshots is not enough -- when both paths are correct they must be identical, but "gather was never dispatched at all" would also make them identical,
+    /// and in that case the comparison proves nothing.
     ///
-    /// 累加发生在 <see cref="InstanceCullEffect"/> 的 DispatchTarget 里，每目标每帧最多加一，
-    /// 所以它与帧数的比值就是实际参与剔除的目标数。
+    /// The increment happens in <see cref="InstanceCullEffect"/>'s DispatchTarget, at most once per target per frame,
+    /// so its ratio to the frame count is the number of targets actually participating in culling.
     /// </summary>
     public static long IndirectGatherDispatches;
 
-    /// <summary>进程内走固定组数派发的 gather 次数，与 <see cref="IndirectGatherDispatches"/> 互斥且穷尽。</summary>
+    /// <summary>Number of fixed-group-count gathers within the process; mutually exclusive and exhaustive with <see cref="IndirectGatherDispatches"/>.</summary>
     public static long FixedGatherDispatches;
 
-    /// <summary>间接参数表中 (slot, primitive) 条目的字节偏移。</summary>
+    /// <summary>Byte offset of the (slot, primitive) entry in the indirect arg table.</summary>
     public static uint ArgsOffset(int slot, int primitive)
         => (uint)(slot * MaxPrimitives + primitive) * ArgsStride;
 
-    /// <summary>原始序号表中 (slot, 第 k 个可见实例) 的 uint 下标。</summary>
+    /// <summary>uint index of (slot, k-th visible instance) in the original index table.</summary>
     public static uint VisibleIndex(int slot, uint k, int capacity)
         => (uint)(slot * capacity) + k;
 
     /// <summary>
-    /// 写入一条 primitive 描述的四个字段。放在共享层是因为这四个字段的偏移是
-    /// reset 内核与四端绘制端共同依赖的契约，各写一遍就会有一端漂移。
-    /// 布局固定为 indexCount / startIndex / baseVertex / 保留，与 <see cref="PrimitiveInfoStride"/> 一致。
+    /// Writes the four fields of one primitive descriptor. It lives in the shared layer because the offsets of these four fields are
+    /// a contract the reset kernel and all four draw backends depend on; writing it once per backend would let one of them drift.
+    /// The layout is fixed as indexCount / startIndex / baseVertex / reserved, consistent with <see cref="PrimitiveInfoStride"/>.
     /// </summary>
     public static void WritePrimitiveInfo(Span<byte> dst, int offset, uint indexCount, uint startIndex, int baseVertex)
     {
@@ -183,14 +183,14 @@ public static class InstanceCull
         span[3] = 0u;
     }
 
-    /// <summary>登记一组剔除目标。重复登记无副作用，避免同一组在多条路径上被加入两次。</summary>
+    /// <summary>Registers a cull target. Re-registration has no side effect, avoiding the same group being added twice along multiple paths.</summary>
     public static void Register(IInstanceCullTarget target)
     {
         if (target == null || Targets.Contains(target)) return;
         Targets.Add(target);
     }
 
-    /// <summary>按引用移除；未登记时静默返回，因为失败的初始化可能根本没走到登记。</summary>
+    /// <summary>Removes by reference; silently returns if not registered, since a failed initialization may never have reached registration.</summary>
     public static void Unregister(IInstanceCullTarget target)
     {
         if (target != null) Targets.Remove(target);
@@ -198,17 +198,17 @@ public static class InstanceCull
 }
 
 /// <summary>
-/// A7：阴影剔除的调度者。<see cref="ComputePhase.FrameStart"/> 且 App 作用域，因为派发必须在任何 Pass 之外
-/// （Vulkan 在 Pass 内禁止 dispatch，Metal 的 compute 与 render encoder 互斥），而阴影图集整帧只有一张，
-/// 不该随视图重复剔除。
+/// A7: the shadow culling scheduler. <see cref="ComputePhase.FrameStart"/> and App scope, because dispatch must be outside any Pass
+/// (Vulkan forbids dispatch inside a Pass, and Metal's compute and render encoders are mutually exclusive), and the shadow atlas is a single one per frame,
+/// so it should not be culled repeatedly per view.
 ///
-/// 每组每帧固定四次派发：reset 填参数表、cull 分槽位压缩、finalize 把可见数归约成 gather 的派发尺寸、
-/// gather 按序号物化重排流并把实例数扇到其余 primitive。四次都必须在 Pass 之外，这一点与粒子系统的
-/// A0.1 链路完全相同，区别只在于这里产出的是"每槽位一份间接参数 + 一份原始序号表"，而不是一条唯一的
-/// apply 命令。
+/// Each group does four dispatches per frame: reset fills the arg table, cull compresses per slot, finalize reduces the visible counts into gather's dispatch size,
+/// and gather materializes the reordered stream by index and fans the instance count out to the remaining primitives. All four must be outside a Pass, exactly like the
+/// particle system's A0.1 chain; the only difference is that what is produced here is "one indirect arg set per slot + one original index table" rather than a single
+/// apply command.
 ///
-/// finalize 只在 gather 走间接派发时才录制（<see cref="IndirectGather"/>）。固定派发不需要它：
-/// CPU 手里的容量就是个足够用的上界，多派出去的空线程各自读一个 uint 就早退。
+/// finalize is only recorded when gather takes the indirect dispatch path (<see cref="IndirectGather"/>). Fixed dispatch does not need it:
+/// the capacity in the CPU's hands is a sufficient upper bound, and any extra threads dispatched just read one uint each and exit early.
 /// </summary>
 public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
 {
@@ -217,19 +217,19 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
     public override ComputePhase Phase => ComputePhase.FrameStart;
 
     /// <summary>
-    /// A7 gather 的派发方式开关，也是 A0.2 的第一处真实消费者。
+    /// Dispatch-mode switch for A7 gather, and the first real consumer of A0.2.
     ///
-    /// 打开时 gather 的组数由 GPU 决定：finalize 内核把"每槽位可见数的最大值"折成组数写进一个
-    /// 12 字节的 <see cref="IndirectDispatchArgs"/> 块，gather 用 ExecuteIndirect / CmdDispatchIndirect
-    /// 一类原语消费它。关闭时 CPU 按容量上界固定派发。
+    /// When on, gather's group count is determined by the GPU: the finalize kernel folds "the maximum per-slot visible count" into a group count written to a
+    /// 12-byte <see cref="IndirectDispatchArgs"/> block, and gather consumes it via a primitive such as ExecuteIndirect / CmdDispatchIndirect.
+    /// When off, the CPU dispatches a fixed count based on the capacity upper bound.
     ///
-    /// 两条路径的**线程映射完全相同**（X = 槽位内序号，Y = 槽位），唯一变量是 X 维的组数，
-    /// 所以两次运行的画面必须逐像素一致 —— 这就是 A/B 验证的判据。任何差异都是派发契约的 bug，
-    /// 不是"性能优化的副作用"。
+    /// The **thread mapping of both paths is exactly identical** (X = index within a slot, Y = slot); the only variable is the group count of the X dimension,
+    /// so the two runs' images must match pixel for pixel -- that is the criterion for the A/B verification. Any difference is a bug in the dispatch contract,
+    /// not a "side effect of a performance optimization".
     ///
-    /// 默认关闭，用环境变量开启，因为它存在的理由是验证而不是提速。实测收益取决于容量与可见数的
-    /// 差距：容量按 64 对齐，而可见数常常只是容量的一个零头，省下的就是那批"读一个 uint 就退出"的
-    /// 空转线程 —— 它们各自很便宜，但数量按槽位数倍乘。
+    /// Off by default, enabled via an environment variable, because the reason it exists is verification rather than speedup. The measured benefit depends on the
+    /// gap between capacity and visible count: capacity is aligned to 64, while the visible count is often just a fraction of capacity, and what is saved is that batch of
+    /// idle threads that "read one uint and exit" -- each is cheap, but their number is multiplied by the slot count.
     /// </summary>
     public static bool IndirectGather { get; set; } =
         Environment.GetEnvironmentVariable("SEASON_CULL_INDIRECT") == "1";
@@ -249,11 +249,11 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
     StorageBuffer? _slotBuffer;
 
     /// <summary>
-    /// 12 字节的派发参数块，由 finalize 内核写、gather 读。
+    /// The 12-byte dispatch arg block, written by the finalize kernel and read by gather.
     ///
-    /// 全部剔除目标共用一份，因为同一帧里每一组的四次派发都是背靠背录制的：GPU 读完这个块跑完
-    /// gather 之后，下一组的 finalize 才会覆盖它。共享省掉的是"每组建一个 12 字节缓冲"，
-    /// 代价是将来若改成并行录制多组就必须拆开 —— 到那时这个字段要变成 per-target。
+    /// Shared by all cull targets, because within a frame each group's four dispatches are recorded back to back: only after the GPU has read this block and finished
+    /// gather does the next group's finalize overwrite it. Sharing saves "creating a 12-byte buffer per group",
+    /// at the cost that if this is ever changed to record multiple groups in parallel it must be split up -- at that point this field has to become per-target.
     /// </summary>
     StorageBuffer? _dispatchArgs;
 
@@ -261,7 +261,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
 
     public override bool Initialize(IGraphics g)
     {
-        if (_graphics != null) throw new InvalidOperationException("实例剔除已经初始化。");
+        if (_graphics != null) throw new InvalidOperationException("Instance culling is already initialized.");
         if (!g.ComputeSupported || !g.IndirectDrawSupported) return false;
         _graphics = g;
         try
@@ -274,9 +274,9 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             _slotBuffer = g.CreateStorageBuffer(InstanceCull.SlotMatrixBytes);
             if (_slotBuffer == null || _slotBuffer.SizeInBytes < InstanceCull.SlotMatrixBytes) { Dispose(); return false; }
 
-            // 派发参数块只要后端支持就建，不跟着开关走：开关是"这一帧想走哪条路"，缓冲是"能不能走"。
-            // 让两者解耦，A/B 就能在同一进程内逐帧切换而不必重启 —— 逐像素比对需要的正是这一点。
-            // 拿不到就退回固定派发，而不是让整个 A7 失效：剔除本身与"gather 怎么被派发"是两件事。
+            // The dispatch arg block is created whenever the backend supports it, independent of the switch: the switch is "which path this frame wants to take", the buffer is "which path can be taken".
+            // Decoupling the two lets the A/B switch frame by frame within the same process without a restart -- exactly what pixel-for-pixel comparison needs.
+            // If it cannot be created, fall back to fixed dispatch rather than disabling all of A7: culling itself and "how gather is dispatched" are two different things.
             if (g.DispatchIndirectSupported)
             {
                 _dispatchArgs = g.CreateStorageBuffer(Season.Rendering.IndirectDispatchArgs.SizeInBytes,
@@ -286,7 +286,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
                 {
                     _dispatchArgs = null;
                     DeviceServices.BaseApp.AddLog(LogType.Backend,
-                        "[InstanceCull] 间接派发参数块创建失败，gather 退回固定组数派发。");
+                        "[InstanceCull] Failed to create the indirect dispatch arg block; gather falls back to fixed-group dispatch.");
                 }
             }
 
@@ -297,7 +297,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         catch (Exception ex)
         {
             Dispose();
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[InstanceCull] 初始化失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[InstanceCull] Initialization failed: {ex.Message}");
             return false;
         }
     }
@@ -307,14 +307,14 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         if (!ReferenceEquals(g, _graphics) || _reset == null || _cull == null || _finalize == null
             || _gather == null || _slotBuffer == null) return;
         if (!CascadedShadow.SunActive && !CascadedShadow.SpotActive) return;
-        // 阴影图复用命中时整个阴影 Pass 会被跳过，剔除与收集的产物没有任何消费者：
-        // 这一帧的四次派发（reset/cull/finalize/gather）连同每槽位的绘制参数都是纯浪费，直接早退。
-        // 早退安全的前提是本帧没有人读这些缓冲——绘制端只由阴影 Pass 驱动，而它这一帧不存在。
+        // On a shadow-map reuse hit the entire shadow Pass is skipped, and the culling and collection outputs have no consumers:
+        // this frame's four dispatches (reset/cull/finalize/gather) plus the per-slot draw args are pure waste, so exit early.
+        // The early exit is safe provided nobody reads these buffers this frame -- the draw side is driven only by the shadow Pass, which does not exist this frame.
         if (CascadedShadow.ReuseActive) return;
         if (InstanceCull.Targets.Count == 0) return;
 
-        // 槽位掩码在这里确定，而不是让内核拿一个"无效矩阵"去猜：未激活槽位直接不参与，
-        // 它们的参数表保持 reset 写下的 InstanceCount=0，绘制端也就自然不会画。
+        // The slot mask is determined here rather than letting the kernel guess from an "invalid matrix": inactive slots simply do not participate,
+        // their arg table keeps the InstanceCount=0 written by reset, and the draw side then naturally draws nothing.
         int slotMask = 0;
         int cascades = CascadedShadow.SunActive ? CascadedShadow.ActiveCascadeCount : 0;
         for (int slot = 0; slot < cascades && slot < CascadedShadow.MaxCascades; slot++)
@@ -329,7 +329,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         }
         if (slotMask == 0) return;
 
-        // 未激活槽位清零：矩阵缓冲跨帧复用，残留的上一帧矩阵若被读到会让某个槽位画出幽灵实例。
+        // Clear inactive slots: the matrix buffer is reused across frames; a leftover matrix from the previous frame, if read, would make some slot draw ghost instances.
         for (int slot = 0; slot < InstanceCull.MaxSlots; slot++)
             if ((slotMask & (1 << slot)) == 0) Array.Clear(_slotMatrices, slot * 4, 4);
 
@@ -353,9 +353,9 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         int count = target.CullInstanceCount;
         if (count <= 0) return;
 
-        // 上传排在 CullPrimitiveCount 的读取之前，而不是排在容量校验之后：
-        // Web 端那个属性发布的是"参数表已上传"的条数，若先读它再上传，首次运行时它还是 -1，
-        // 校验当场早退，上传于是永远没有机会发生 —— 一个自己锁死自己的顺序。
+        // The upload is placed before reading CullPrimitiveCount, not after the capacity check:
+        // on the Web backend that property publishes the count of "arg table uploaded"; if it is read before the upload, on the first run it is still -1,
+        // the check exits early on the spot, and the upload therefore never has a chance to happen -- an ordering that deadlocks itself.
         if (!target.PrepareCullInputs()) return;
 
         int capacity = target.CullCapacity;
@@ -369,15 +369,15 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         var visible = target.CullVisible;
         if (source == null || sorted == null || info == null || args == null || visible == null) return;
 
-        // 容量校验放在共享层，四端就不必各写一遍：args 是定长的，visible 与重排流必须容得下整份容量。
-        // source 只需装下本帧实例——它按实例数上传，不保留余量。
+        // The capacity checks live in the shared layer so the four backends do not each repeat them: args is fixed-size, and visible and the reordered stream must hold the full capacity.
+        // source only needs to hold this frame's instances -- it is uploaded by instance count, with no spare room reserved.
         if (args.SizeInBytes < InstanceCull.ArgsBytes) return;
         if (visible.SizeInBytes < (uint)(InstanceCull.MaxSlots * capacity) * 4u) return;
         if (source.SizeInBytes < (uint)count * InstanceCull.WorldStride) return;
         if (sorted.SizeInBytes < InstanceCull.SortedBytes(capacity)) return;
         if (info.SizeInBytes < (uint)primitives * InstanceCull.PrimitiveInfoStride) return;
 
-        // 1) reset：把每条的索引数与起始偏移写进去，InstanceCount 归零。
+        // 1) reset: writes the index count and start offset for each entry, and zeroes InstanceCount.
         _resetParams[0] = (uint)primitives;
         _resetParams[1] = (uint)InstanceCull.MaxSlots;
         _resetParams[2] = 0;
@@ -394,7 +394,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             GroupsZ = 1,
         });
 
-        // 2) cull：一个线程一个实例，逐槽位做球与六个裁剪平面的测试。
+        // 2) cull: one thread per instance, testing the sphere against the six clipping planes for each slot.
         _cullParams[0] = target.CullLocalCenter.X;
         _cullParams[1] = target.CullLocalCenter.Y;
         _cullParams[2] = target.CullLocalCenter.Z;
@@ -403,10 +403,10 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         _cullParams[5] = MathF.Abs(target.CullLocalExtents.Y);
         _cullParams[6] = MathF.Abs(target.CullLocalExtents.Z);
         _cullParams[7] = 0f;
-        // [8..12] 在四端着色器里全部声明为 uint，而 Params 是 16 字节对齐的裸字节块，
-        // 所以这五项必须原样送位模式：直接赋 int 会先转成 float，着色器读到的就是
-        // 8f / 4f 的浮点位模式（1090519040 / 1082130432），slotCount 被读成十亿，
-        // 循环与越界寻址会把整帧拖到永不完成。
+        // [8..12] are all declared as uint in the four backends' shaders, while Params is a 16-byte-aligned raw byte block,
+        // so these five entries must be sent as the raw bit patterns: assigning an int directly would convert it to float first, and the shader would read the
+        // float bit pattern of 8f / 4f (1090519040 / 1082130432), slotCount would be read as a billion,
+        // and the loop with out-of-bounds addressing would drag the whole frame into never finishing.
         _cullParams[8] = BitConverter.UInt32BitsToSingle((uint)count);
         _cullParams[9] = BitConverter.UInt32BitsToSingle((uint)InstanceCull.MaxSlots);
         _cullParams[10] = BitConverter.UInt32BitsToSingle((uint)primitives);
@@ -430,19 +430,19 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             GroupsZ = 1,
         });
 
-        // 3) finalize（仅间接路径）：把每槽位的可见数归约成"X 维要派发几组"。
-        //    尺寸只能由 GPU 给出 —— 序号表是压缩过的，CPU 手里只有容量这个上界。
-        //    它是四端里唯一一个 [numthreads(1,1,1)] 的内核：槽位数上限是 4，串行读四个 uint
-        //    比开一个工作组做归约再同步便宜得多，也不必为此在四端各写一遍 threadsync 的方言。
+        // 3) finalize (indirect path only): reduces the per-slot visible counts into "how many groups to dispatch along X".
+        //    The size can only come from the GPU -- the index table is compressed, and the CPU only has capacity as an upper bound.
+        //    It is the only [numthreads(1,1,1)] kernel among the four backends: the slot count is at most 4, and reading four uints serially
+        //    is far cheaper than opening a workgroup to do a reduction and then synchronize, and it avoids writing a threadsync dialect per backend.
         bool indirect = IndirectGather && _dispatchArgs != null;
         if (indirect)
         {
-            // 扫的槽位数就是 gather 的 Y 维组数，直接取 MaxSlots 而不是 GatherGroupsY：
-            // 两者眼下相等，但语义不同 —— 后者是"派发多少行"，前者是"参数表里有几行"。
+            // The slot count scanned is exactly gather's Y-dimension group count; it takes MaxSlots directly rather than GatherGroupsY:
+            // the two are currently equal but semantically different -- the latter is "how many rows to dispatch", the former is "how many rows are in the arg table".
             _finalizeParams[0] = (uint)InstanceCull.MaxSlots;
-            // 槽位跨度 = 一个槽位占多少字节的参数表。写成参数而不是让内核自带常量：
-            // 那条 MAX_PRIMITIVES × 20 的乘法是 reset 与 gather 共同依赖的契约，
-            // 多写一份就多一个漂移点。
+            // Slot stride = how many bytes of arg table one slot occupies. Written as a parameter rather than giving the kernel its own constant:
+            // that MAX_PRIMITIVES × 20 multiplication is a contract both reset and gather depend on,
+            // and writing it an extra time adds one more drift point.
             _finalizeParams[1] = (uint)InstanceCull.MaxPrimitives * InstanceCull.ArgsStride;
             _finalizeParams[2] = InstanceCull.CullGroupSize;
             _finalizeParams[3] = 0;
@@ -459,9 +459,9 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             });
         }
 
-        // 4) gather：按序号表把可见实例物化到槽位分段里，顺便把实例数扇到其余 primitive。
-        // X 维是槽位内序号，Y 维是槽位。这个二维映射两条派发路径完全共用 —— 否则 A/B 对比的
-        // 就不是"派发方式"，而是两套寻址，任何差异都无从归因。
+        // 4) gather: materializes visible instances into the slot segments by the index table, and fans the instance count out to the remaining primitives along the way.
+        // The X dimension is the index within a slot, the Y dimension is the slot. This two-dimensional mapping is fully shared by both dispatch paths -- otherwise the A/B comparison would
+        // not be about "the dispatch mode" but about two different addressing schemes, and any difference could not be attributed.
         _gatherParams[0] = (uint)capacity;
         _gatherParams[1] = (uint)primitives;
         _gatherParams[2] = (uint)InstanceCull.MaxSlots;
@@ -470,8 +470,8 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         _gatherRefs[1] = source;
         _gatherRefs[2] = sorted;
         _gatherRefs[3] = args;
-        // 计数器放在派发点而不是分支判定处：将来若 finalize 被合并进别的内核，分支还在、gather 却可能
-        // 不再被派发，那时候数字要与真实派发一一对应才有诊断价值。
+        // The counters sit at the dispatch point rather than at the branch test: if finalize is ever merged into another kernel in the future, the branch would still be there while gather might
+        // no longer be dispatched, and only when the numbers correspond one-to-one with the real dispatches do they have diagnostic value.
         if (indirect) InstanceCull.IndirectGatherDispatches++;
         else InstanceCull.FixedGatherDispatches++;
         g.DispatchCompute(new ComputeDispatchArgs
@@ -479,15 +479,15 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             Kernel = _gather!,
             Params = MemoryMarshal.AsBytes(_gatherParams.AsSpan()),
             Resources = _gatherRefs,
-            // 间接路径下这一维被参数块取代，写 0 而不是写一个永远用不上的容量：
-            // 抓帧时"0 组"是"去看参数块"的最短提示。
+            // On the indirect path this dimension is superseded by the arg block; write 0 rather than a capacity that will never be used:
+            // during a frame capture "0 groups" is the shortest hint to "go look at the arg block".
             GroupsX = indirect ? 0u : InstanceCull.GatherGroupsX(capacity),
             GroupsY = InstanceCull.GatherGroupsY,
             GroupsZ = 1,
             Arguments = indirect ? _dispatchArgs : null,
         });
 
-        // 交接放到这里而不是绘制时：draw 在阴影 Pass 内部，Pass 内不允许切资源状态。
+        // The handoff goes here rather than at draw time: draw happens inside the shadow Pass, and resource states cannot be switched inside a Pass.
         target.PrepareCullDraw();
     }
 
@@ -517,7 +517,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
     // finalize: [0] Params 16B / [1] StorageBufferRead args -> t0 / [2] StorageBufferReadWrite dispatch -> u0
     // gather:   [0] Params 16B / [1] StorageBufferRead visible -> t0 / [2] StorageBufferRead source -> t1
     //           [3] StorageBufferReadWrite sorted -> u0 / [4] StorageBufferReadWrite args -> u1
-    // 64B 远低于 Vulkan push constant 与 WebGPU uniform 的 128B 跨端上限。
+    // 64B is far below the 128B cross-backend limit of Vulkan push constants and WebGPU uniforms.
 
     static ComputeKernelDesc CreateResetKernel() => new()
     {
@@ -570,9 +570,9 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferRead },
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferReadWrite },
         },
-        // 一个线程。归约的上限是 MaxSlots(4) 个 uint，开一整个工作组只为了同步四个读远比它本身贵，
-        // 更不用说四端各写一遍 threadsync 的方言（GroupMemoryBarrierWithGroupSync / barrier /
-        // threadgroup_barrier / workgroupBarrier）就意味着四份可能漂移的实现。
+        // One thread. The reduction is over at most MaxSlots(4) uints; opening a whole workgroup just to synchronize four reads costs far more than the reads themselves,
+        // to say nothing of writing a threadsync dialect per backend (GroupMemoryBarrierWithGroupSync / barrier /
+        // threadgroup_barrier / workgroupBarrier), which would mean four implementations that can drift.
         WorkgroupX = 1,
         WorkgroupY = 1,
         WorkgroupZ = 1,

@@ -71,9 +71,9 @@ internal abstract class MTLPrimitiveGroup : IDisposable
     internal static MTLTexture3D? AerialLutActive;
 
     // 2-7 P0:
-    // 当前帧的程序化天空 Sky-View LUT，compute 算出的 rgba16float 2D 纹理。
-    // 与上三者同一套模式：SetLighting 每帧解一次，Device.BeginPass 绑到 texture(13)；
-    // 为 null 时回落到 Device.White，但消费侧由 skyParams0.w 在 uniform 分支里互斥 gate 住，白衣永远不会被采到。
+    // The current frame's procedural sky Sky-View LUT, an rgba16float 2D texture computed by the compute pass.
+    // Same pattern as the previous three: SetLighting resolves it once per frame, Device.BeginPass binds it to texture(13);
+    // when null it falls back to Device.White, but the consumer side is mutually gated by skyParams0.w in the uniform branch, so the white texture is never sampled.
     internal static MTLTexture? SkyViewActive;
 
     // === Shared instance state ===
@@ -321,9 +321,9 @@ internal abstract class MTLPrimitiveGroup : IDisposable
             : null;
         AerialLutActive = MTLTexture3D.Find(Season.Rendering.FrameSchedule.AerialLutTexture);
 
-        // 2-7 P0：每帧解一次当前帧的 Sky-View LUT，理由与云噪声相同：
-        // 释放或质量降档后 FrameSchedule.SkyViewTexture 会回到 null，
-        // Active 必须同步清空，否则已经释放的纹理句柄会继续被绑。
+        // 2-7 P0: resolve the current frame's Sky-View LUT once per frame, for the same reason as cloud noise:
+        // after a release or a quality downgrade FrameSchedule.SkyViewTexture returns to null,
+        // so Active must be cleared in sync, otherwise the already-released texture handle would keep being bound.
         SkyViewActive = Season.Rendering.FrameSchedule.SkyViewTexture is string skyViewName
             ? Season.Platforms.Shared.Apple.Graphics.FindDdgiAtlas(skyViewName)
             : null;
@@ -1667,10 +1667,10 @@ internal abstract class MTLPrimitiveGroup : IDisposable
     }
 
     /// <summary>
-    /// 图元绘制的统一出口，工作包 D 之后直接转交 <see cref="Pipeline.DrawPrimitive"/>。
-    /// 参数与旧的逐行绑定逐项等价：slot 2/9 用恒等实例流、slot 10 用上一帧骨骼环（PrevFrameIndex）、
-    /// 索引类型与偏移不变。
-    /// 这样收集期只需在 Pipeline.DrawPrimitive 一处拦截，非实例模型的全部 3D 绘制（含高亮壳体与壳盒）就都进了分段队列。
+    /// The unified exit for primitive drawing; after work package D it delegates directly to <see cref="Pipeline.DrawPrimitive"/>.
+    /// The parameters are item-by-item equivalent to the old per-line bindings: slot 2/9 use the identity instance stream, slot 10 uses the previous frame's bone ring (PrevFrameIndex),
+    /// and the index type and offset are unchanged.
+    /// This way the collection phase only needs to intercept at one place, Pipeline.DrawPrimitive, and all 3D draws of non-instanced models (including the highlight shell and shell box) enter the segmented queue.
     /// </summary>
     void DrawPrimitive(IMTLRenderCommandEncoder enc, PrimitiveData p)
     {

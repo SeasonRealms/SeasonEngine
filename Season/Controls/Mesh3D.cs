@@ -237,51 +237,51 @@ public class Mesh3D : Mesh3DBase
     public bool ExcludeFromAo { get; set; }
 
     /// <summary>
-    /// 主涌浪分量的波数（2π/90m）。着色器里三道分量的波长是 90m/55m/34m，这里只复现第一道：
-    /// 相位是三道共用的一个标量，另外两道的角频率取它的 2 倍与 3 倍，
-    /// 所以 CPU 侧只需要知道主分量的波数就能把 <see cref="WaveSpeed"/> 换算成相位推进量。
-    /// 两侧各写一份常量是刻意的，这个值不是给外部调的，多一条序列化字段没有好处；
-    /// 改波长时要同时改这里和四个后端的 <c>SwellEvaluate</c>。
+    /// The wave number of the primary swell component (2pi/90m). The shader has three components with wavelengths 90m/55m/34m, and here only the first is reproduced:
+    /// the phase is a single scalar shared by the three components, and the angular frequencies of the other two are 2x and 3x of it,
+    /// so the CPU side only needs to know the primary component's wave number to convert <see cref="WaveSpeed"/> into a phase advance amount.
+    /// Writing one copy of the constant on each side is deliberate; this value is not meant to be tuned externally, and one more serialized field would bring no benefit;
+    /// when changing the wavelength, change both this and <c>SwellEvaluate</c> in the four backends.
     /// </summary>
     const float SwellWaveNumber0 = 0.06981317f;     // 2 * PI / 90
 
     const float TwoPi = 6.2831853f;
 
     /// <summary>
-    /// 顶点涌浪的峰谷高度（米），0 表示完全关闭。默认关闭，因此所有既有网格的行为一字不变。
+    /// The peak-to-trough height (meters) of the vertex swell; 0 means fully off. Off by default, so the behavior of all existing meshes is identical character for character.
     ///
-    /// 这是叠在网格自身烘焙起伏之上的一层行波，不是替代：起伏仍然决定海面的整体形状与近岸衰减，
-    /// 涌浪只让它在原地上下动起来。位移发生在顶点着色器里，法线也随解析梯度重建，
-    /// 所以太阳高光、CSM 阴影接收与 GI 都跟着一起动，不需要额外的通道。
+    /// This is a layer of traveling waves superimposed on the mesh's own baked relief, not a replacement: the relief still determines the overall shape of the sea surface and the near-shore falloff,
+    /// and the swell just makes it move up and down in place. The displacement happens in the vertex shader, and the normal is also rebuilt from the analytic gradient,
+    /// so the sun specular, CSM shadow receiving, and GI all move along with it, with no extra channel needed.
     /// </summary>
     public float WaveAmplitude { get; set; }
 
     /// <summary>
-    /// 主分量相速度（米/秒）。相位由它积分出来，所以改这个值只影响之后的推进速度，
-    /// 不会像"历经时间乘速率"那样让整个波形瞬移。
+    /// The primary component's phase velocity (meters/second). The phase is integrated from it, so changing this value only affects the advance speed afterward,
+    /// and will not make the whole waveform teleport the way "elapsed time times speed" would.
     ///
-    /// 浪向是固定的：相位在着色器里是加号，波峰半径 r 满足 k*r + 相位 = 常数，
-    /// 相位涨一点波峰半径就小一点，所以浪永远朝岛心收拢，这个速度也就是径向靠岸速度。
+    /// The wave direction is fixed: the phase is a plus sign in the shader, and the crest radius r satisfies k*r + phase = constant,
+    /// so as the phase grows a little the crest radius shrinks a little, meaning the wave always converges toward the island center, and this speed is therefore the radial onshore speed.
     /// </summary>
     public float WaveSpeed { get; set; } = 9f;
 
     /// <summary>
-    /// 涌浪半径（米）：离相机超过这个距离的顶点回到烘焙起伏。0 表示不做距离衰减。
+    /// The swell radius (meters): vertices farther from the camera than this return to the baked relief. 0 means no distance falloff.
     ///
-    /// 这是这个特性里最大的一笔性能账：1400m 的网格有 65025 个顶点，而真正需要位移的只有相机附近那一圈。
-    /// 远处的海面本来就看不出一米级别的起伏，但它的太阳反光带是看得见的，所以那里不能剔除、也不能变黑，
-    /// 只能退回静态姿态——正好就是烘焙好的那份几何与法线。
+    /// This is the largest performance cost in this feature: a 1400m mesh has 65025 vertices, while only the ring near the camera actually needs displacement.
+    /// The distant sea surface could not show meter-level relief anyway, but its sun reflection band is visible, so there it must not be culled or darkened,
+    /// and can only fall back to the static pose -- exactly the baked geometry and normals.
     ///
-    /// 750m 是配合观景塔定的：塔甲板 20m，眼高约 21.7m，海面 -3m，所以相机离水面约 24.7m。原来的 260m
-    /// （161m 就开始淡出）从甲板上一眼就能看出"浪到某条线为止"，而这条线以下的整片海静止。750m 的淡出带是
-    /// 465m..750m，正好压在网格 700m 的外沿附近，所以从塔上看整片可见的海都在动。
-    /// 代价是相机附近那一圈从约 7000 个顶点变成几乎整张网格：65025 个顶点各跑十二个三角函数（涌浪本体与上一帧
-    /// 相位各一遍，速度通道要用后者的高度差），顶点着色器这一档的算力对现代移动 GPU 仍是零头（约 8M ALU/帧），
-    /// 而那片海无论如何都要读一遍顶点缓冲，所以这笔账划算。
+    /// 750m was chosen together with the observation tower: the tower deck is 20m, eye height about 21.7m, sea surface -3m, so the camera is about 24.7m from the water. The original 260m
+    /// (fading out starting at 161m) made it obvious at a glance from the deck that "the waves stop at some line", and the entire sea below that line was static. The 750m fade band is
+    /// 465m..750m, which sits right near the 700m outer edge of the mesh, so from the tower the whole visible sea is moving.
+    /// The cost is that the ring near the camera goes from about 7000 vertices to almost the entire mesh: all 65025 vertices each run twelve trigonometric functions (the swell body and the previous frame's
+    /// phase each once, since the velocity channel needs the latter's height difference), and this tier of vertex shader compute is still a trivial amount for modern mobile GPUs (about 8M ALU/frame),
+    /// and that sea has to read the vertex buffer once anyway, so the trade is worth it.
     ///
-    /// 门控量的是到相机的三维距离，不是水平距离，这一个判据同时覆盖三种处境：站在岛上或塔上时高度差只有几十米，
-    /// 与水平距离基本等价；坐船时相机贴着水面，同样等价；飞到高空时高度差就是离地高度，正下方的水面早已超出半径，
-    /// 整片海自动停止位移。所以这里不需要额外的"相机太高就归零"规则，也不该由面板去猜多高才算看不出。
+    /// The gate measures the 3D distance to the camera, not the horizontal distance, and this one criterion covers three situations at once: standing on the island or the tower, the height difference is only tens of meters,
+    /// essentially equivalent to the horizontal distance; on a boat, the camera hugs the water surface, likewise equivalent; flying high, the height difference is the altitude above ground, and the water directly below is already beyond the radius,
+    /// so the whole sea automatically stops displacing. Therefore no extra "zero out when the camera is too high" rule is needed here, nor should the panel guess how high counts as unnoticeable.
     /// </summary>
     public float WaveFadeRadius { get; set; } = 750f;
 
@@ -291,14 +291,14 @@ public class Mesh3D : Mesh3DBase
     bool _waveClockSeeded;
 
     /// <summary>
-    /// 交给后端的一个 float4：(半峰谷振幅, 当前相位, 上一帧相位, 衰减半径)。
-    /// 缓冲区里的相位不取模也能算对，取模只是为了长时间运行时不丢 float 的有效位。
+    /// A float4 handed to the backend: (half peak-to-trough amplitude, current phase, previous frame phase, fade radius).
+    /// The phase in the buffer would compute correctly without taking the modulo; taking it is only to avoid losing the significant bits of the float during long runs.
     /// </summary>
     internal Vector4 WaveParams => new(WaveAmplitude * 0.5f, _wavePhase, _wavePhasePrev, WaveFadeRadius);
 
     /// <summary>
-    /// 相位积分。用增量而不是 elapsedTime × speed：后者在改速度的那一刻会把整个波形瞬移一段，
-    /// 而增量只改变之后走多快。取模 2π 不产生接缝，因为三道分量的角频率是 1:2:3 的整数比。
+    /// Phase integration. Uses a delta rather than elapsedTime x speed: the latter would teleport the whole waveform at the moment the speed is changed,
+    /// whereas the delta only changes how fast it advances afterward. Taking the modulo 2pi produces no seam, because the three components' angular frequencies are in the integer ratio 1:2:3.
     /// </summary>
     void AdvanceWavePhase(float time)
     {
@@ -312,8 +312,8 @@ public class Mesh3D : Mesh3DBase
         float dt = time - _waveLastTime;
         _waveLastTime = time;
 
-        // 场景时间被重定基准（切场景）或这一帧卡了很久时，dt 会是负数或一大段空白；
-        // 按 0 处理让波形停在原地，而不是突然跳半圈。
+        // When the scene time is rebased (scene switch) or this frame stalled for a long time, dt will be negative or a large blank gap;
+        // treating it as 0 keeps the waveform in place rather than suddenly jumping half a cycle.
         if (dt <= 0f || dt > 0.25f)
             return;
 

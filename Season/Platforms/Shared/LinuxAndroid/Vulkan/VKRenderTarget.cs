@@ -141,11 +141,14 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
     }
 
     /// <summary>
-    /// 是否带私有深度图。Vulkan 把附件列表烘进 render pass，而所有能写后缓冲兼容表面的管线
-    /// （FinalBlit/Post 的 blit 家族、场景 PSO）都是对着 Display.RenderPass 烘的，
-    /// 即颜色 + 深度两附件；颜色格式为后缓冲格式却只有单个附件的 render pass 与它们不兼容，
-    /// 所以 <see cref="Season.Rendering.RenderTargetDesc.NoImplicitDepth"/> 的呈现目标仍然带深度，
-    /// 以保持与后缓冲 pass 同构。纯 MRT 槽位（速度/法线，非后缓冲格式）不受影响。
+    /// Whether this target carries a private depth image. Vulkan bakes the attachment list into the
+    /// render pass, and every pipeline that can write a backbuffer-compatible surface
+    /// (FinalBlit/Post's blit family, the scene PSOs) is baked against Display.RenderPass, i.e. color
+    /// + depth as two attachments; a render pass whose color format is the backbuffer format but that
+    /// has a single attachment is incompatible with them. So a present target with
+    /// <see cref="Season.Rendering.RenderTargetDesc.NoImplicitDepth"/> still carries depth to stay
+    /// isomorphic to the backbuffer pass. Pure MRT slots (velocity/normal, non-backbuffer formats)
+    /// are unaffected.
     /// </summary>
     bool OwnsDepth => !Desc.NoImplicitDepth || (HasColor && _colorFormat == Device.BackBufferFormat);
 
@@ -237,7 +240,7 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
             PDependencies = dependencies
         };
 
-        // 雾合成全屏覆盖新颜色目标，不读取或写入深度附件。
+        // The fog composite fully overwrites the new color target and neither reads nor writes the depth attachment.
         if (colorOnly)
         {
             subpass.PDepthStencilAttachment = null;
@@ -352,7 +355,7 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
             }
         };
 
-        // Clear/Load 与 PSO 锚点必须使用相同依赖，同时覆盖后续附件 Load 和 Compute 读取。
+        // Clear/Load and the PSO anchor must use the same dependencies, covering both the following attachment Load and the compute reads.
         Display.FillColorDependencies(dependencies);
         var rpInfo = new RenderPassCreateInfo
         {
@@ -573,20 +576,23 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
     }
 
     /// <summary>
-    /// D1 屏幕空间贴花的颜色-only render pass。
+    /// D1 screen-space decal color-only render pass.
     ///
-    /// <para>两个与场景 Pass 不同的关键点：</para>
+    /// <para>Two key points differ from the scene pass:</para>
     /// <list type="number">
-    /// <item>没有任何 Clear：贴花是把颜色乘/加到已经画完的不透明结果上，Load 是唯一的正确选择。
-    /// 因此 <c>InitialLayout</c> 必须是 <c>ShaderReadOnlyOptimal</c>（上一段场景 Pass 的 finalLayout），
-    /// 不能用 <c>Undefined</c>，否则 Load 的内容未定义；</item>
-    /// <item>没有深度附件：本 Pass 的深度是采样源，同一个资源不能同时是附件。贴花的可见性完全来自
-    /// 深度重建与盒内裁剪，不做深度测试。</item>
+    /// <item>There is no Clear: a decal multiplies/adds color onto the already-drawn opaque result, so
+    /// Load is the only correct choice. Therefore <c>InitialLayout</c> must be
+    /// <c>ShaderReadOnlyOptimal</c> (the previous scene pass's finalLayout) and cannot be
+    /// <c>Undefined</c>, otherwise the loaded contents would be undefined;</item>
+    /// <item>There is no depth attachment: this pass's depth is a sampling source, and the same
+    /// resource cannot be an attachment at the same time. Decal visibility comes entirely from depth
+    /// reconstruction and in-box clipping, with no depth test.</item>
     /// </list>
     ///
-    /// <para><paramref name="withNormal"/> 为真时挂第二个颜色附件（SceneNormal），供 s9 写粗糙度；
-    /// 两个形态的附件格式、采样数一致，但附件数量不同，是两个互不兼容的 render pass，
-    /// 后端必须按本帧的选择烘对应的 PSO。</para>
+    /// <para>When <paramref name="withNormal"/> is true a second color attachment (SceneNormal) is
+    /// attached for s9 to write roughness; the two shapes share the same attachment formats and sample
+    /// counts but differ in attachment count, so they are two mutually incompatible render passes and
+    /// the backend must bake the matching PSO according to this frame's choice.</para>
     /// </summary>
     internal static RenderPass CreateDecalRenderPassForFormat(Format colorFormat, bool withNormal)
     {
@@ -618,8 +624,12 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
 
         var dependencies = stackalloc SubpassDependency[2]
         {
-            // EXTERNAL -> 0: 上一段场景 Pass 的颜色与法线写入必须先可见，本段的 Load 才能读到它们；
-            // 贴花着色器还要采样深度，所以源阶段同时覆盖片元与计算采样。
+            // EXTERNAL -> 0: the previous scene pass's color and normal writes must become visible first
+            // so this pass's Load can read them; the decal shader also samples depth, so the source
+            // stage covers both fragment and compute sampling.
+            // The LoadOp=Load read is itself a color attachment read (COLOR_ATTACHMENT_READ) and must be
+            // listed explicitly in DstAccessMask, otherwise synchronization validation reports
+            // READ_AFTER_WRITE at vkCmdBeginRenderPass.
             new SubpassDependency
             {
                 SrcSubpass = Vk.SubpassExternal,
@@ -628,9 +638,9 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
                     | PipelineStageFlags.ComputeShaderBit | PipelineStageFlags.EarlyFragmentTestsBit | PipelineStageFlags.LateFragmentTestsBit,
                 SrcAccessMask = AccessFlags.ColorAttachmentWriteBit | AccessFlags.ShaderReadBit,
                 DstStageMask = PipelineStageFlags.ColorAttachmentOutputBit | PipelineStageFlags.FragmentShaderBit,
-                DstAccessMask = AccessFlags.ColorAttachmentWriteBit | AccessFlags.ShaderReadBit
+                DstAccessMask = AccessFlags.ColorAttachmentWriteBit | AccessFlags.ColorAttachmentReadBit | AccessFlags.ShaderReadBit
             },
-            // 0 -> EXTERNAL: 贴花写颜色完成 -> 本帧后续的雾/雨幕合成与透明阶段读该颜色（RAW）。
+            // 0 -> EXTERNAL: decal color writes complete -> this frame's later fog/rain-curtain composite and transparent phase read that color (RAW).
             new SubpassDependency
             {
                 SrcSubpass = 0,
@@ -659,19 +669,23 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
     }
 
     /// <summary>
-    /// P2 水面 Pass 的 render pass。附件形态与「不写法线」的贴花完全一致：单颜色附件、Load、没有深度附件、
-    /// initial/finalLayout 都是 <c>ShaderReadOnlyOptimal</c>。水面同样靠着色器里的软件深度测试遮挡，
-    /// 并且要采样 SceneDepth 与折射快照，所以两者对附件的要求本就相同，直接复用贴花的烘焙路径，
-    /// 不另写一份只差名字的 80 行。
+    /// P2 water pass render pass. The attachment shape is exactly the same as the "no normal" decal:
+    /// a single color attachment, Load, no depth attachment, and initial/finalLayout both
+    /// <c>ShaderReadOnlyOptimal</c>. The water surface likewise occludes via software depth testing in
+    /// the shader and needs to sample SceneDepth and the refraction snapshot, so the two have
+    /// identical attachment requirements anyway; we reuse the decal bake path directly rather than
+    /// writing another 80 lines that differ only in name.
     /// </summary>
     internal static RenderPass CreateWaterRenderPassForFormat(Format colorFormat)
         => CreateDecalRenderPassForFormat(colorFormat, false);
 
     /// <summary>
-    /// P0 SSR 加法合成的 render pass。附件形态与「不写法线」的贴花完全一致：单颜色附件、Load、
-    /// 没有深度附件、initial/finalLayout 都是 <c>ShaderReadOnlyOptimal</c>。
-    /// 理由也相同 —— 反射增量在 Pass 外由核写成采样布局，合成只把它按加法并进 SceneColor，
-    /// 而后续的雾/雨幕合成又要按采样布局读这张颜色，所以借同一条烘焙路径而不是另写一份。
+    /// P0 SSR additive composite render pass. The attachment shape is exactly the same as the "no
+    /// normal" decal: a single color attachment, Load, no depth attachment, and initial/finalLayout
+    /// both <c>ShaderReadOnlyOptimal</c>. The rationale is the same too -- the reflection delta is
+    /// written into a sampled layout by a kernel outside the pass, the composite merely adds it into
+    /// SceneColor, and the later fog/rain-curtain composite reads that color in a sampled layout
+    /// again. So we borrow the same bake path instead of writing a separate copy.
     /// </summary>
     internal static RenderPass CreateSsrCompositeRenderPassForFormat(Format colorFormat)
         => CreateDecalRenderPassForFormat(colorFormat, false);
@@ -751,7 +765,7 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
     {
         attachment.LoadOp = clear ? AttachmentLoadOp.Clear : AttachmentLoadOp.Load;
         attachment.StoreOp = store ? AttachmentStoreOp.Store : AttachmentStoreOp.DontCare;
-        // 上一场景阶段或雾合成已经发布为采样布局；Load 不得使用 Undefined。
+        // The previous scene stage or fog composite has already published a sampled layout; Load must not use Undefined.
         attachment.InitialLayout = clear ? ImageLayout.Undefined : ImageLayout.ShaderReadOnlyOptimal;
     }
 
@@ -891,7 +905,7 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
     /// <c>Graphics.EnqueueDeferredRelease(DirectX.Device.GetCurrentRetireFenceValue(), ...)</c>.</summary>
     public override void Dispose()
     {
-        // 先退休引用这些 view 的组合 framebuffer，再退休纹理本身。
+        // Retire the framebuffers that combine these views first, then retire the textures themselves.
         Device.ReleaseSceneTargetPasses(this);
         Device.OffscreenTargets.Remove(this);
 

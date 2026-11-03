@@ -824,7 +824,7 @@ float4 PSMainOutlineComposite(PSInput input) : SV_TARGET
     }
 }
 
-/// <summary>独立 RGBA16F 雾合成；每次准备均保留独立描述符与原生资源引用。</summary>
+/// <summary>Standalone RGBA16F fog composite; each Prepare keeps its own descriptors and native resource references alive.</summary>
 internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
 {
     readonly bool _weather;
@@ -848,7 +848,7 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
     uint _frameIndex;
     bool _disposed;
 
-    // 引用保活使 Resize 前后的原生地址不会被复用；描述符不可从共享可见堆原地借用。
+    // Keeping references alive prevents native addresses from being reused across Resize; descriptors cannot be borrowed in place from the shared visible heap.
     sealed class BindingSlot
     {
         internal readonly int[] Ids = [-1, -1, -1, -1, -1, -1];
@@ -974,7 +974,7 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
         ViewDimension = volume ? SrvDimension.Texture3D : SrvDimension.Texture2D,
         Texture2D = new() { MipLevels = 1 } };
 
-    // Resolve 不改变 GPU 状态，Draw 也可用它核对资源身份；转换仅在 Pass 外执行。
+    // Resolve does not change GPU state, and Draw can use it to verify resource identity; transitions are only performed outside a pass.
     bool Resolve(in FogCompositeInputs input, DXRenderTarget destination, Span<nint> resources,
         Span<ShaderResourceViewDesc> views, bool transition)
     {
@@ -1021,7 +1021,7 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
                 or Format.FormatR16G16Float or Format.FormatR16G16B16A16Float or Format.FormatR8G8B8A8Unorm)) return false;
         }
         resources[0] = (nint)frame.Resource;
-        // 雨幕 shader 不引用 t1/t2；使用输入颜色的合法视图保留描述符快照布局。
+        // The rain curtain shader does not reference t1/t2; a valid view of the input color is used to keep the descriptor snapshot layout.
         resources[1] = (nint)(_weather ? color.Color : integrated!.NativeResource);
         resources[2] = (nint)(_weather ? color.Color : local!.NativeResource); resources[3] = (nint)color.Color;
         resources[4] = (nint)depth.Depth; resources[5] = (nint)aoResource; resources[6] = (nint)destination.Color;
@@ -1127,9 +1127,9 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
         _transparentOwner = null;
     }
 
-    // 仅消费成功合成的同帧快照；绑定不转换深度状态，也不改写共享光照参数。
-    // S5: 不再检查 ActivePassId==SceneTransparent —— 门控已上提到 BindSceneFog 用 ViewHasFog 表达，
-    // 这里只保留"合成所有者有效 + 帧/资源匹配"的硬安全校验。
+    // Consumes only the same-frame snapshot from a successful composite; binding does not transition depth state or rewrite shared lighting parameters.
+    // S5: ActivePassId==SceneTransparent is no longer checked -- the gating has been lifted up into BindSceneFog, expressed via ViewHasFog,
+    // so only the hard safety check of "composite owner valid + frame/resource match" remains here.
     internal static bool BindTransparent()
     {
         var owner = _transparentOwner;
@@ -1179,9 +1179,9 @@ internal sealed unsafe class DXFogCompositePipeline : FogCompositePipeline
 }
 
 /// <summary>
-/// P0 SSR 加法合成：一条全屏绘制，把反射增量按 One/One 叠进 SceneColor。
-/// 与雾合成不同，它没有自己的目标：颜色附件就是场景色，所以既不清屏也不发布颜色源，
-/// 增量纹理也只读一次 —— 权重在 SSR 核里已经乘完，这里再乘一遍就会和主着色器分叉。
+/// P0 SSR additive composite: a single fullscreen draw that adds the reflection delta into SceneColor with One/One blending.
+/// Unlike the fog composite, it has no target of its own: the color attachment is the scene color, so it neither clears nor publishes a color source,
+/// and the delta texture is sampled only once -- the weight is already applied in the SSR kernel, so applying it again here would diverge from the main shader.
 /// </summary>
 internal sealed unsafe class DXSsrCompositePipeline : SsrCompositePipeline
 {
@@ -1189,7 +1189,7 @@ internal sealed unsafe class DXSsrCompositePipeline : SsrCompositePipeline
 Texture2D<float4> reflectionDelta : register(t0);
 float4 PSMain(float4 pos : SV_Position) : SV_Target
 {
-    // Load 而不是采样：增量是逐像素的确定值，线性过滤会在轮廓处把正负差分互相抵消。
+    // Load instead of Sample: the delta is a per-pixel exact value, and linear filtering would cancel positive and negative differences against each other at outlines.
     return float4(reflectionDelta.Load(int3(pos.xy, 0)).rgb, 0.0);
 }
 """;
@@ -1242,7 +1242,7 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target
                 DepthStencilState = new() { DepthFunc = ComparisonFunc.Always, FrontFace = stencil, BackFace = stencil },
                 SampleMask = uint.MaxValue, PrimitiveTopologyType = PrimitiveTopologyType.Triangle,
                 NumRenderTargets = 1, SampleDesc = new(1, 0) };
-            // One/One 而不是雾的 One/Zero：这里画的是一份**增量**，负值要能减回场景色。
+            // One/One instead of the fog's One/Zero: what is drawn here is a **delta**, and negative values must be able to subtract from the scene color.
             desc.BlendState.RenderTarget[0] = new() { BlendEnable = 1, SrcBlend = Blend.One, DestBlend = Blend.One,
                 BlendOp = BlendOp.Add, SrcBlendAlpha = Blend.One, DestBlendAlpha = Blend.One, BlendOpAlpha = BlendOp.Add,
                 LogicOp = LogicOp.Noop, RenderTargetWriteMask = (byte)ColorWriteEnable.All };
@@ -1262,7 +1262,7 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target
     public override bool Prepare(in SsrCompositeInputs inputs)
     {
         _destination = null; _reflection = null; _command = null;
-        // 只能在 Pass 之外调用：转换屏障要落在 BeginPass 之前，和雾合成的时序一致。
+        // Must only be called outside a pass: the transition barrier must land before BeginPass, matching the fog composite's timing.
         if (_disposed || Device.ActiveTarget != null || Device.GraphicsCommandList == null
             || inputs.Color is not DXRenderTarget destination) return false;
         if (destination.Color == null || destination.Desc.ColorFormat != RtFormat.Rgba16Float
@@ -1288,7 +1288,7 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target
     {
         var destination = _destination; var reflection = _reflection; var command = _command;
         _destination = null; _reflection = null; _command = null;
-        // 身份与状态都要核对：Prepare 与 Draw 之间可能插入了别的 Pass，此时加法叠错目标就毁掉了整帧。
+        // Both identity and state must be verified: another pass may be inserted between Prepare and Draw, in which case adding into the wrong target would ruin the whole frame.
         if (_disposed || destination == null || reflection == null || command == null
             || Device.ActivePassId != RenderPassId.SsrComposite
             || !ReferenceEquals(Device.ActiveTarget, destination) || Device.GraphicsCommandList != command

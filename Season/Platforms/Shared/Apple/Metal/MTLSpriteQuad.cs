@@ -50,7 +50,7 @@ internal abstract class MTLSpriteQuad : ITextureHolder, IDisposable
     // === First-frame guard: skip Draw until the first Update has finished ===
     protected bool _transformInitialized;
 
-    /// <summary>屏幕空间精灵（Sprite2D）绑定单位视图；3D 公告板重写为 false，改用当前活动视图。</summary>
+    /// <summary>Screen-space sprites (Sprite2D) bind the identity view; 3D billboards override this to false and use the current active view.</summary>
     protected virtual bool ScreenSpaceView => true;
 
     IMTLBuffer ViewBuffer => ScreenSpaceView ? Pipeline.ScreenViewBuffer : Pipeline.ActiveViewBuffer;
@@ -222,8 +222,8 @@ internal abstract class MTLSpriteQuad : ITextureHolder, IDisposable
 
     protected void DrawQuad(IMTLBuffer vb)
     {
-        // 工作包 D：收集期一个 encoder 都没有，SetVertexBuffer 无处可落，必须在这里先分流。
-        // 精灵固定走透明混合，与直绘路径的 SetPipeline(Transparent, doubleSided: false) 对齐。
+        // Work package D: during collection there is no encoder at all, so SetVertexBuffer has nowhere to land and must be split off here first.
+        // Sprites always use alpha blending, aligned with the direct-draw path's SetPipeline(Transparent, doubleSided: false).
         if (MTLSceneDrawCollection.Active is { } collecting)
         {
             int cf = Device.FrameIndex;

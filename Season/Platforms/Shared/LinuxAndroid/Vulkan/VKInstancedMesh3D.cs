@@ -265,7 +265,7 @@ internal unsafe class VKInstancedMesh3D : VKInstancedPrimitiveGroup
 
         Device.ResourceManager.UpdateBuffer(_instanceBuffer, _instanceData);
 
-        // A7：剔除的输入与 IA 实例流逐位相同，所以直接复用这份数组，不多存一份副本。
+        // A7: the culling input is bit-for-bit identical to the IA instance stream, so this array is reused directly rather than storing a second copy.
         UpdateCullUpload();
 
         var matrices = new MatrixBuffer

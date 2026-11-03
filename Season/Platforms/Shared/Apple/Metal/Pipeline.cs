@@ -173,85 +173,85 @@ internal static class Pipeline
     /// It is bound once whenever a frame encoder is created.</summary>
     public static IMTLBuffer DefaultTextDrawParamsBuffer = null!;
 
-    // -- 工作包 D 透明阶段体积雾采样。
-    //    Metal 没有描述符集也没有根签名，一切都落在 encoder 上，换 Pass 后全部归零；
-    //    因此这三件套必须是每条命令自带、重放时整份重绑的静态推送状态，
-    //    与 VK 的 set 1 binding 0/1/2 + push constant、DX 的 FogFrameRoot/FogIntegratedRoot/FogLocalRoot 一一对应。 --
+    // -- Work package D: transparent-stage volumetric fog sampling.
+    //    Metal has no descriptor sets and no root signature; everything lands on the encoder and resets to zero after a Pass switch;
+    //    therefore this trio must be static pushed state carried by every command and fully rebound on replay,
+    //    corresponding one-to-one with VK's set 1 binding 0/1/2 + push constant and DX's FogFrameRoot/FogIntegratedRoot/FogLocalRoot. --
 
-    /// <summary>本帧雾常量数组（<see cref="Season.Rendering.Effects.VolumetricFogEffect.FrameVectorCount"/> 个 float4）在 FS buffer(4)。</summary>
+    /// <summary>The current frame's fog constant array (<see cref="Season.Rendering.Effects.VolumetricFogEffect.FrameVectorCount"/> float4s) is in FS buffer(4).</summary>
     internal const int SceneFogFrameSlot = 4;
 
-    /// <summary>运行时门控 float4 在 FS buffer(5)，用 SetFragmentBytes 逐条命令推送；x &gt; 0.5 才真正采样。</summary>
+    /// <summary>The runtime gating float4 is in FS buffer(5), pushed per command with SetFragmentBytes; sampling actually happens only when x &gt; 0.5.</summary>
     internal const int SceneFogParamsSlot = 5;
 
-    /// <summary>积分列体积（read-only 3D）在 texture(11)，紧接 texture(10) 的 AP LUT。</summary>
+    /// <summary>The integrated column volume (read-only 3D) is in texture(11), right after the AP LUT in texture(10).</summary>
     internal const int SceneFogIntegratedSlot = 11;
 
-    /// <summary>局部列体积（read-only 3D）在 texture(12)。</summary>
+    /// <summary>The local column volume (read-only 3D) is in texture(12).</summary>
     internal const int SceneFogLocalSlot = 12;
 
-    /// <summary>只有透明阶段会把它置为 (1,0,0,0)；其余时刻保持零值，于是 MSL 的门控始终关闭。</summary>
+    /// <summary>Only the transparent stage sets it to (1,0,0,0); it stays zero at all other times, so the MSL gate is always closed.</summary>
     internal static Vector4 SceneFogParams;
 
-    /// <summary>本帧雾帧常量缓冲；为空时退回 <see cref="DefaultFogFrameBuffer"/> 全零页。</summary>
+    /// <summary>The current frame's fog frame constant buffer; when empty, falls back to the all-zero page of <see cref="DefaultFogFrameBuffer"/>.</summary>
     internal static IMTLBuffer? SceneFogFrame;
 
     internal static IMTLTexture? SceneFogIntegrated;
 
     internal static IMTLTexture? SceneFogLocal;
 
-    /// <summary>与 VK SceneFogSamplingBaked / DX _fogSamplingEnabled 同源：
-    /// 档位在初始化前已经锁定，此后不会翻转，因此这是一次性求值的能力开关。</summary>
+    /// <summary>Same origin as VK SceneFogSamplingBaked / DX _fogSamplingEnabled:
+    /// the tier is already locked before initialization and never flips afterwards, so this is a capability switch evaluated once.</summary>
     internal static bool SceneFogSamplingBaked;
 
-    /// <summary>雾采样关闭时的占位帧常量页：全零，<c>F(8).w</c> 与 <c>F(10).xyz</c> 都是 0，
-    /// 即使误采样也只会得到退化的零累积，而门控保证根本不会进入采样分支。</summary>
+    /// <summary>The placeholder frame constant page when fog sampling is off: all zero, with both <c>F(8).w</c> and <c>F(10).xyz</c> equal to 0,
+    /// so even an accidental sample only yields a degenerate zero accumulation, and the gate guarantees the sampling branch is never entered.</summary>
     public static IMTLBuffer DefaultFogFrameBuffer = null!;
 
-    // -- 每视图常量（ViewConstants，256 字节）在 VS buffer(11)，与 DX b8、VK set 2 一一对应。
-    //    MatrixBuffer 只剩物体级 World/PrevWorld；View/Projection/PrevViewProjection 由视图提供。
-    //    主视图按帧槽 N 缓冲，每帧由 MTLPrimitiveGroup.Update 写一次；屏幕空间视图（单位阵）常驻只读，
-    //    供 Sprite2D 与文字使用，于是它们不再需要在各自的 MatrixBuffer 里写单位 View/Projection。 --
+    // -- Per-view constants (ViewConstants, 256 bytes) are in VS buffer(11), corresponding one-to-one with DX b8 and VK set 2.
+    //    MatrixBuffer retains only the per-object World/PrevWorld; View/Projection/PrevViewProjection are provided by the view.
+    //    The main view is buffered per frame slot N and written once per frame by MTLPrimitiveGroup.Update; the screen-space view (identity matrix) is resident read-only,
+    //    used by Sprite2D and text, so they no longer need to write the identity View/Projection into their respective MatrixBuffers. --
 
-    /// <summary>ViewConstants 所在的 VS buffer 槽。</summary>
+    /// <summary>The VS buffer slot where ViewConstants lives.</summary>
     internal const int ViewConstantsSlot = 11;
 
-    /// <summary>视图槽上限，与共享调度器的 <see cref="Season.Rendering.FrameSchedule.MaxViews"/> 同源。</summary>
+    /// <summary>The view slot limit, same origin as the shared scheduler's <see cref="Season.Rendering.FrameSchedule.MaxViews"/>.</summary>
     internal const int MaxViews = Season.Rendering.FrameSchedule.MaxViews;
 
     /// <summary>
-    /// 每视图常量（视图槽 × 帧槽，2D 数组）。槽 0 是主视图，由 MTLPrimitiveGroup.Update 每帧写一次；
-    /// 其余槽位由 FrameSchedule.PrepareView 钩子在该视图绘制收集之前写入。
-    /// 视图常量本来就是一条独立缓冲，同一条绘制命令只要带上不同缓冲就能在多个视图之间复用。
+    /// Per-view constants (view slot × frame slot, a 2D array). Slot 0 is the main view, written once per frame by MTLPrimitiveGroup.Update;
+    /// the remaining slots are written by the FrameSchedule.PrepareView hook before that view's draw collection.
+    /// View constants are inherently a single independent buffer; the same draw command just needs to carry a different buffer to be reused across multiple views.
     /// </summary>
     static IMTLBuffer[][] _viewBuffers = [];
 
-    /// <summary>屏幕空间视图：View/Projection 为单位阵，无历史。</summary>
+    /// <summary>Screen-space view: View/Projection are the identity matrix, with no history.</summary>
     public static IMTLBuffer ScreenViewBuffer = null!;
 
-    /// <summary>当前帧槽的主视图常量缓冲。</summary>
+    /// <summary>The main view constant buffer for the current frame slot.</summary>
     internal static IMTLBuffer MainViewBuffer => _viewBuffers[0][Device.FrameIndex];
 
     /// <summary>
-    /// 正在收集/重放的视图槽。由 <see cref="SetActiveView"/> 在该视图的绘制收集之前设定，
-    /// 视图循环结束后由 <see cref="ResetActiveView"/> 复原成主视图，
-    /// 于是 Overlay 与直绘路径仍然绑到主视图常量。
+    /// The view slot currently being collected/replayed. Set by <see cref="SetActiveView"/> before that view's draw collection,
+    /// and restored to the main view by <see cref="ResetActiveView"/> after the view loop ends,
+    /// so the Overlay and the direct-draw path still bind to the main view constants.
     /// </summary>
     internal static int ActiveViewIndex;
 
-    /// <summary>当前视图槽本帧槽的常量缓冲：绘制项在收集时记下的就是这个缓冲。</summary>
+    /// <summary>The constant buffer for the current view slot and current frame slot: this is the buffer recorded by draw items at collection time.</summary>
     internal static IMTLBuffer ActiveViewBuffer => _viewBuffers[ActiveViewIndex][Device.FrameIndex];
 
-    /// <summary>选定后续绘制的视图槽；越界回落到主视图。</summary>
+    /// <summary>Select the view slot for subsequent draws; out of range falls back to the main view.</summary>
     internal static void SetActiveView(int index)
         => ActiveViewIndex = (uint)index < MaxViews ? index : 0;
 
     internal static void ResetActiveView() => ActiveViewIndex = 0;
 
-    /// <summary>写入当前帧槽的主视图常量；转置约定与 MatrixBuffer 相同。</summary>
+    /// <summary>Write the main view constants for the current frame slot; the transpose convention is the same as MatrixBuffer.</summary>
     internal static void WriteMainView(in ViewConstants constants) => WriteViewConstants(0, constants);
 
-    /// <summary>写入某个视图槽本帧槽的常量；槽位越界即忽略，调用方不必预先校验。</summary>
+    /// <summary>Write the constants for a given view slot and current frame slot; an out-of-range slot is ignored, and the caller need not pre-validate.</summary>
     internal static unsafe void WriteViewConstants(int index, in ViewConstants constants)
     {
         if ((uint)index >= MaxViews) return;
@@ -259,9 +259,9 @@ internal static class Pipeline
     }
 
     /// <summary>
-    /// 把视图常量同时推上 VS 与 FS 的 buffer(11)。Metal 换 Pass 后绑定归零，所以每条绘制都要自带。
-    /// FS 侧的引用只在 S1 分支（<c>viewc.cameraPos.w</c> 作视图槽门控）出现；shadow 通道的 PSO 无 FS 函数，
-    /// Metal 允许在该 encoder 上缓存未消费的 fragment 状态，因此这里不做分支处理。
+    /// Push the view constants onto buffer(11) of both VS and FS. Binding resets to zero after a Metal Pass switch, so every draw must carry it itself.
+    /// The FS-side reference only appears in the S1 branch (<c>viewc.cameraPos.w</c> as the view slot gate); the shadow channel's PSO has no FS function,
+    /// and Metal allows unconsumed fragment state to be cached on that encoder, so no branching is done here.
     /// </summary>
     internal static void BindView(IMTLRenderCommandEncoder enc, IMTLBuffer view)
     {
@@ -272,7 +272,7 @@ internal static class Pipeline
     static unsafe IMTLBuffer CreateViewBuffer()
     {
         var buffer = Device.MtlDevice.CreateBuffer((nuint)Unsafe.SizeOf<ViewConstants>(), MTLResourceOptions.CpuCacheModeDefault);
-        // 未写过的帧槽（例如即时 2D 模式从不调用 Update）也必须是可用的单位视图，而不是全零投影。
+        // Even frame slots never written (e.g. immediate 2D mode never calls Update) must be a usable identity view rather than an all-zero projection.
         *(ViewConstants*)buffer.Contents = ViewConstants.ScreenSpace.Transposed();
         return buffer;
     }
@@ -346,9 +346,9 @@ internal static class Pipeline
             *(MTLTextDrawParams*)DefaultTextDrawParamsBuffer.Contents = defaultTdp;
         }
 
-        // 工作包 D：透明阶段体积雾采样的能力开关与占位帧常量页。
-        // 与 VK CreateDefaultFogFrameBuffers + SceneFogSamplingBaked 同源：
-        // 档位在图形初始化前已锁定，此后不会翻转，所以只求值一次。
+        // Work package D: the capability switch and placeholder frame constant page for transparent-stage volumetric fog sampling.
+        // Same origin as VK CreateDefaultFogFrameBuffers + SceneFogSamplingBaked:
+        // the tier is locked before graphics initialization and never flips afterwards, so it is evaluated only once.
         SceneFogSamplingBaked = RenderQuality.Current.RequiresAtmosphereSceneDepth(
             Device.HdrSceneColor, true, Season.Rendering.Immediate2DMode.Enabled);
         DefaultFogFrameBuffer = Device.MtlDevice.CreateBuffer(
@@ -363,7 +363,7 @@ internal static class Pipeline
         SceneFogIntegrated = null;
         SceneFogLocal = null;
 
-        // 视图槽整池一次建满：每个视图只有 256B 常量，而视图首次出现（小地图上线）不该在帧内触发分配。
+        // The view slot pool is created fully in one go: each view has only 256B of constants, and the first appearance of a view (minimap coming online) should not trigger an allocation mid-frame.
         _viewBuffers = new IMTLBuffer[MaxViews][];
         for (int v = 0; v < MaxViews; v++)
         {
@@ -535,8 +535,8 @@ internal static class Pipeline
     /// </summary>
     public static void SetPipeline(IMTLRenderCommandEncoder enc, PipelineMode mode, bool doubleSided = false, bool depthWrite = true)
     {
-        // 工作包 D：收集期一个 encoder 都不存在（Metal 只有 BeginPass 之后才有 encoder），
-        // 这里只记下状态；PSO 与 DSS 由重放所在的 Pass 决定（主场景 / 速度 MRT / Overlay / OutlineMask）。
+        // Work package D: during collection no encoder exists at all (Metal only has an encoder after BeginPass),
+        // so only the state is recorded here; the PSO and DSS are determined by the Pass where replay happens (main scene / velocity MRT / Overlay / OutlineMask).
         if (MTLSceneDrawCollection.Active is { } collecting)
         {
             collecting.RecordPipeline(mode, doubleSided, depthWrite);
@@ -616,9 +616,9 @@ internal static class Pipeline
     }
 
     /// <summary>
-    /// Metal 的面剔除是 encoder 动态状态，<see cref="SetPipeline"/> 只能表达 None 与 Back 两种，
-    /// 而双面两遍的正面那一遍要单独设 Front，所以必须有一个可被收集期拦截的包装。
-    /// 收集期只记录，重放时再落到 encoder 上。
+    /// Metal's face culling is encoder dynamic state, and <see cref="SetPipeline"/> can only express None and Back,
+    /// whereas the front-face pass of the two-pass double-sided rendering needs Front set separately, so there must be a wrapper that the collection phase can intercept.
+    /// The collection phase only records, and it is applied to the encoder at replay time.
     /// </summary>
     internal static void SetCullMode(IMTLRenderCommandEncoder enc, MTLCullMode cull)
     {
@@ -631,22 +631,22 @@ internal static class Pipeline
     }
 
     /// <summary>
-    /// 把本帧透明阶段的雾采样三件套推上 encoder：
-    /// 帧常量数组在 FS buffer(4)，门控 float4 在 FS buffer(5)，两张只读体积在 texture(11)/texture(12)。
+    /// Push the current frame's transparent-stage fog sampling trio onto the encoder:
+    /// the frame constant array is in FS buffer(4), the gating float4 is in FS buffer(5), and the two read-only volumes are in texture(11)/texture(12).
     ///
-    /// 关闭时写的是零门控加占位资源，于是 MSL 里的 <c>if (fogParams.x &gt; 0.5)</c> 永不进入，
-    /// 也就不会去读尚未合成的体积纹理（占位体虽然是 1x1x1 黑体，但代码路径根本不采样）。
+    /// When off, it writes a zero gate plus placeholder resources, so the <c>if (fogParams.x &gt; 0.5)</c> in MSL is never entered,
+    /// and it therefore never reads the not-yet-composited volume textures (although the placeholder volume is a 1x1x1 black body, the code path does not sample at all).
     ///
-    /// 每条命令都必须调一次：Metal 换 Pass 后所有绑定归零，
-    /// 没有可跨命令复用的描述符集，这也正是重放不需要“补写”纪律的原因。
+    /// It must be called once per command: all bindings reset to zero after a Metal Pass switch,
+    /// and there is no descriptor set reusable across commands, which is exactly why replay needs no "re-write" discipline.
     /// </summary>
     internal static unsafe void BindSceneFog(IMTLRenderCommandEncoder enc)
     {
         bool sampling = SceneFogParams.X > 0.5f && SceneFogFrame != null
             && SceneFogIntegrated != null && SceneFogLocal != null;
-        // 栈上落一份再推送：SetFragmentBytes 会立刻把字节拷进命令流，栈页生命周期足够。
-        // S5: weather 跟随 sampling（"本视图是否有雾"），不再独立检查 ActivePassId==SceneTransparent
-        // —— deferredScene 视图同样在该 pass 里，但并没有合成雾或天气。
+        // Stage one copy on the stack and then push it: SetFragmentBytes copies the bytes into the command stream immediately, so the stack page's lifetime is sufficient.
+        // S5: weather follows sampling ("whether this view has fog"), no longer independently checking ActivePassId==SceneTransparent
+        // — the deferredScene view is also in that pass, but does not composite fog or weather.
         Vector4* p = stackalloc Vector4[1];
         *p = new Vector4(sampling ? 1 : 0, sampling && FrameSchedule.WeatherComposited ? 1 : 0, 0, 0);
         enc.SetFragmentBytes((IntPtr)p, 16, SceneFogParamsSlot);
@@ -686,8 +686,8 @@ internal static class Pipeline
         nuint prevBoneBufferOffset = 0,
         IMTLBuffer? viewBuffer = null)
     {
-        // 工作包 D：这是全部 3D 路径（模型 / 实例模型 / 实例网格 / 高亮壳体 / 精灵壳盒）的唯一出口，
-        // 拦截一次就覆盖了所有 PrimitiveData 绘制。收集期不提交任何绘制，只把不可变句柄交给重放队列。
+        // Work package D: this is the single exit for all 3D paths (model / instanced model / instanced mesh / highlight shell / sprite shell box),
+        // so intercepting once covers all PrimitiveData draws. The collection phase submits no draw; it only hands immutable handles to the replay queue.
         if (MTLSceneDrawCollection.Active is { } collecting)
         {
             collecting.CapturePrimitive(primitiveData, primitiveVertexBuffer, primitiveIndexBuffer,
@@ -703,7 +703,7 @@ internal static class Pipeline
         enc.SetVertexBuffer(matrixBuffer, 0, 1);          // b1 Matrices
         BindView(enc, viewBuffer ?? ActiveViewBuffer);     // b11 ViewConstants
         enc.SetVertexBuffer(boneBuffer, 0, 3);            // b3 BoneMatrices
-        enc.SetVertexBuffer(materialBuffer, 0, 4);        // b2 MaterialParams（VS 读取）
+        enc.SetVertexBuffer(materialBuffer, 0, 4);        // b2 MaterialParams (read by VS)
         enc.SetVertexBuffer(morphBuffer, 0, 5);           // b4 MorphDeltas
         enc.SetVertexBuffer(instanceBoneBuffer, instanceBoneBufferOffset, 6); // b5 InstanceBoneMatrices
 
@@ -813,11 +813,11 @@ internal static class Pipeline
     {
         enc.SetVertexBuffer(primitiveVertexBuffer, 0, 0); // VB slot 0
         enc.SetVertexBuffer(matrixBuffer, 0, 1);          // b1 Matrices
-        BindView(enc, MainViewBuffer);                    // b11 ViewConstants（shadow 不读 view/proj，保留占位）
+        BindView(enc, MainViewBuffer);                    // b11 ViewConstants (shadow does not read view/proj, placeholder kept)
         enc.SetVertexBuffer(boneBuffer, 0, 3);            // b3 BoneMatrices
         if (bindMaterial)
         {
-            enc.SetVertexBuffer(materialBuffer, 0, 4);    // b2 MaterialParams（VS 读变形标志）
+            enc.SetVertexBuffer(materialBuffer, 0, 4);    // b2 MaterialParams (VS reads the deformation flag)
             enc.SetVertexBuffer(morphBuffer, 0, 5);       // b4 MorphDeltas
         }
         enc.SetVertexBuffer(instanceBoneBuffer, instanceBoneBufferOffset, 6); // b5 InstanceBoneMatrices
@@ -830,17 +830,17 @@ internal static class Pipeline
     }
 
     /// <summary>
-    /// A7：阴影间接绘制出口，与 <see cref="DrawShadowPrimitive"/> 逐项同构，差别只在“画多少”由 GPU 侧参数缓冲给出。
-    /// 索引数、实例数与 baseVertex 全都读同一条 20 字节记录（布局与 D3D12_DRAW_INDEXED_ARGUMENTS 一致），
-    /// 所以这里不再收 indexCount 与 instanceCount——传进来只会和参数缓冲里的值打架。
-    /// 重载是 drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset:，
-    /// 索引缓冲在前、参数缓冲在后。
+    /// A7: the shadow indirect draw exit, structurally identical item by item to <see cref="DrawShadowPrimitive"/>, differing only in that "how many to draw" is given by the GPU-side argument buffer.
+    /// The index count, instance count and baseVertex all read the same 20-byte record (whose layout matches D3D12_DRAW_INDEXED_ARGUMENTS),
+    /// so indexCount and instanceCount are no longer taken here — passing them in would only clash with the values in the argument buffer.
+    /// The overload is drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset:,
+    /// with the index buffer first and the argument buffer second.
     /// </summary>
     /// <param name="instanceBufferOffset">
-    /// 剔除后重排流的槽位段起点。这里放偏移而不是放参数缓冲里的 firstInstance，
-    /// 是因为 Metal 与 Vulkan 都把 baseInstance 算进 gl_InstanceIndex，那会让实例流下标整体平移错位。
+    /// The start of the slot segment in the reordered stream after culling. An offset is placed here rather than the firstInstance in the argument buffer,
+    /// because both Metal and Vulkan count baseInstance into gl_InstanceIndex, which would shift the instance stream indices as a whole and misalign them.
     /// </param>
-    /// <param name="indirectOffset">本 primitive 在参数表中的字节偏移。</param>
+    /// <param name="indirectOffset">The byte offset of this primitive in the argument table.</param>
     public static void DrawShadowPrimitiveIndirect(
         IMTLRenderCommandEncoder enc,
         PrimitiveData primitiveData,
@@ -860,11 +860,11 @@ internal static class Pipeline
     {
         enc.SetVertexBuffer(primitiveVertexBuffer, 0, 0); // VB slot 0
         enc.SetVertexBuffer(matrixBuffer, 0, 1);          // b1 Matrices
-        BindView(enc, MainViewBuffer);                    // b11 ViewConstants（shadow 不读 view/proj，保留占位）
+        BindView(enc, MainViewBuffer);                    // b11 ViewConstants (shadow does not read view/proj, placeholder kept)
         enc.SetVertexBuffer(boneBuffer, 0, 3);            // b3 BoneMatrices
         if (bindMaterial)
         {
-            enc.SetVertexBuffer(materialBuffer, 0, 4);    // b2 MaterialParams（VS 读变形标志）
+            enc.SetVertexBuffer(materialBuffer, 0, 4);    // b2 MaterialParams (VS reads the deformation flag)
             enc.SetVertexBuffer(morphBuffer, 0, 5);       // b4 MorphDeltas
         }
         enc.SetVertexBuffer(instanceBoneBuffer, 0, 6);    // b5 InstanceBoneMatrices
@@ -1102,10 +1102,10 @@ internal static class Pipeline
     // ============================================================
 
     /// <summary>
-    /// 主场景 MSL。工作包 D 把雾采样胶水拼在文件最前，
-    /// 于是 fragment_main 的四个出口（文字 / 天空 / Sprite2D / PBR）与 VK、DX 共用同一份 ApplySceneFog 形状，
-    /// 而 FogSampler 的结构与数学直接来自 <see cref="Season.Rendering.Effects.VolumetricFogEffect.SamplingMsl"/>，不存在第二份副本。
-    /// 因为要拼接，这里从 const 改成 static readonly；所有使用点都只是运行时字符串拼接，语义不变。
+    /// Main-scene MSL. Work package D prepends the fog sampling glue to the top of the file,
+    /// so the four exits of fragment_main (text / sky / Sprite2D / PBR) share the same ApplySceneFog shape with VK and DX,
+    /// and FogSampler's structure and math come directly from <see cref="Season.Rendering.Effects.VolumetricFogEffect.SamplingMsl"/>, with no second copy.
+    /// Because it must be concatenated, this was changed from const to static readonly; all use sites are just runtime string concatenation, so the semantics are unchanged.
     /// </summary>
     static readonly string MetalShaderSource = @"
 #include <metal_stdlib>
@@ -1145,15 +1145,15 @@ struct BoneMatrices {
 // unified light structure, 64 bytes, byte-aligned with C# GpuLight.
 // The all-float4 layout naturally avoids the float3-alignment slip in MSL constant space, the same root cause as the old padding0 issue.
 struct GpuLight {
-    float4 posRange;        // xyz=世界位置（directional 忽略）, w=衰减半径 range（<=0 退化纯 1/d²）
-    float4 colorIntensity;  // xyz=线性色, w=intensity
-    float4 dirType;         // xyz=照射方向（spot/directional 用）, w=类型（0=point, 1=spot, 2=directional）
-    float4 spotParams;      // x=cosInner, y=cosOuter（CPU 预算）, zw=保留
+    float4 posRange;        // xyz=world position (ignored for directional), w=attenuation radius range (<=0 degenerates to pure 1/d²)
+    float4 colorIntensity;  // xyz=linear color, w=intensity
+    float4 dirType;         // xyz=light direction (used for spot/directional), w=type (0=point, 1=spot, 2=directional)
+    float4 spotParams;      // x=cosInner, y=cosOuter (precomputed on CPU), zw=reserved
 };
 
 struct SceneLights {
     float4 cameraPos;
-    float4 ambientParams;   // xyz=环境光色, w=强度（替代旧硬编码 0.5）
+    float4 ambientParams;   // xyz=ambient color, w=intensity (replacing the old hardcoded 0.5)
     // x=lightCount, y=hdrExposure from C# SceneLightParams.Params0.Y, with Device.HdrExposure injected every frame by SetLighting,
     // z=directionalIndex, the index of the directional light that casts CSM in the lights array, or -1 when absent,
     // w=spotShadowIndex, the index of the spotlight that casts the 2D shadow map, or -1 when absent
@@ -1165,11 +1165,11 @@ struct SceneLights {
     // byte-aligned with the 1152-byte C# SceneLightParams layout.
     // The matrices are uploaded as raw row-major bytes and read by MSL as M transpose,
     // so sampling sites must adapt with pre-multiplication M * v to match CPU-side pos * M.
-    float4x4 cascadeViewProj[4];   // offset 560：CSM 级联光空间矩阵（slot 0..2 用）
-    float4x4 spotShadowViewProj;   // offset 816：聚光光空间矩阵（slot 3）
-    float4 cascadeSplits;          // offset 880：各级联视空间远界（x/y/z 用，w 保留）
-    float4 shadowParams0;          // offset 896：x=sunEnabled, y=cascadeCount, z=1/atlasSize, w=保留
-    float4 shadowParams1;          // offset 912：x=spotEnabled, y=shadowStrength, zw=保留
+    float4x4 cascadeViewProj[4];   // offset 560: CSM cascade light-space matrices (used by slot 0..2)
+    float4x4 spotShadowViewProj;   // offset 816: spot light-space matrix (slot 3)
+    float4 cascadeSplits;          // offset 880: per-cascade view-space far bounds (x/y/z used, w reserved)
+    float4 shadowParams0;          // offset 896: x=sunEnabled, y=cascadeCount, z=1/atlasSize, w=reserved
+    float4 shadowParams1;          // offset 912: x=spotEnabled, y=shadowStrength, zw=reserved
     // Contract clause 6 of 2-3:
     // xy=current-frame subpixel jitter in NDC units, z=1/screenWidth, w=1/screenHeight.
     // Injected once per frame by MTLPrimitiveGroup.SetLighting. All-zero means no jitter.
@@ -1187,14 +1187,14 @@ struct SceneLights {
     // It is only valid when envParams.z > 0.5.
     // The float4 array in MSL constant space has stride 16 and is byte-aligned with C# SceneLightParams.IrradianceSH9, the InlineArray of 9 float4 values.
     // Using all float4 also avoids the float3-alignment slip noted on GpuLight.
-    float4 irradianceSH9[9];       // offset 960，尾部 1104B
+    float4 irradianceSH9[9];       // offset 960, tail 1104B
     // DDGI clause 10 of 2-4, starting at offset 1104:
     // giParams0=probeGridMin.xyz and spacing,
     // giParams1=gridXYZ as float and GiIntensity (blend weight, never a scale on probeIrr),
     // giParams2=normalBias, chebyshev, atlasReady, and fadeBandCells.
     float4 giParams0;              // offset 1104
     float4 giParams1;              // offset 1120
-    float4 giParams2;              // offset 1136，尾部 1152B
+    float4 giParams2;              // offset 1136, tail 1152B
     // Step B of 2-5, starting at offset 1152:
     // analytic sun disk, moon disk, and star field.
     // skyParams0.xyz is the sun direction and w is the sun angular radius.
@@ -1212,23 +1212,23 @@ struct SceneLights {
     // cloudParams1 stores cloudShadowStrength in x, silverLining g, dark-region brightness, and forward-scattering strength.
     float4 cloudLayerA[3];         // offset 1232
     float4 cloudLayerB[3];         // offset 1280
-    float4 cloudParams0;           // offset 1328（w=层数=云消费唯一门控）
+    float4 cloudParams0;           // offset 1328 (w=layer count=the sole gate for cloud consumption)
     float4 cloudParams1;           // offset 1344
     // Step E of 2-5, starting at offset 1360:
     // aerial-perspective 3D LUT consumption parameters.
     // x=maxDistanceKm, where values greater than 0 enable AP and act as the only gate.
     // y=Intensity, where 0 means identity composition.
     float4 apParams0;                      // offset 1360
-    // 区域天气：头两行后每区域八行；前缀 1376B 保持，总长 2448B。
+    // Regional weather: two header rows followed by eight rows per region; the 1376B prefix is preserved, total length 2448B.
     float4 weatherParams0;                 // offset 1376
     float4 weatherParams1;                 // offset 1392
-    float4 weatherRegions[64];             // offset 1408，尾部 2432B
-    // 2-7 雷电 (offset 2432)：xyz = 当前主导雷击在云内的世界坐标 / w = 回击包络亮度 0~1。
-    // w 是唯一总开关；非雷暴天气、区域质量 Off、Showcase 模式下整个字段为零。
-    float4 weatherFlash;                   // offset 2432，尾部 2448B
-    // 2-8 环境镜面的虚拟地面 (offset 2448)：xyz = 地面辐亮度（线性 HDR，含 albedo/直射/天空 SH9/1π），
-    // w = 地面所在的世界 Y。只由 SkyLighting.Apply 注入，只在程序化天空分支里被读取。
-    float4 reflectionParams0;              // offset 2448，尾部 2464B
+    float4 weatherRegions[64];             // offset 1408, trailing 2432B
+    // 2-7 lightning (offset 2432): xyz = world coordinates of the current dominant strike inside the cloud / w = return-stroke envelope brightness 0..1.
+    // w is the sole master switch; under non-thunderstorm weather, RegionalQuality Off, or Showcase mode the whole field is zero.
+    float4 weatherFlash;                   // offset 2432, trailing 2448B
+    // 2-8 virtual ground for ambient specular (offset 2448): xyz = ground radiance (linear HDR, including albedo/direct light/sky SH9/1pi),
+    // w = world Y where the ground lies. Injected only by SkyLighting.Apply, read only in the procedural sky branch.
+    float4 reflectionParams0;              // offset 2448, trailing 2464B
 };
 
 struct MaterialParams {
@@ -1251,13 +1251,13 @@ struct MaterialParams {
     uint hasMorphTargets;
     uint morphTargetCount;
     uint morphVertexCount;
-    uint hasPrevBones;          // 2-3 条款 8(b)：prev bone palette 可用性哨兵
-    uint hasPrevInstanceWorld;  // 2-3 条款 8(c)：prev instance world 流可用性哨兵
-    uint hasPrevMorph;          // 2-3 条款 8(c)：prev morph 权重可用性哨兵
+    uint hasPrevBones;          // Clause 8(b) of 2-3: prev bone palette availability sentinel
+    uint hasPrevInstanceWorld;  // Clause 8(c) of 2-3: prev instance world stream availability sentinel
+    uint hasPrevMorph;          // Clause 8(c) of 2-3: prev morph weight availability sentinel
     float4 morphWeights;
-    float4 prevMorphWeights;    // 非 instanced 路径的上一帧权重（CB 内联，源自 CPU 影子副本）
-    // 顶点涌浪（目前只有海面写它）：x=半峰谷振幅（米，0=关闭），y=当前相位，z=上一帧相位，w=衰减半径（米）。
-    // 见下方 SwellEvaluate。
+    float4 prevMorphWeights;    // previous-frame weights for the non-instanced path (inlined in the CB, sourced from the CPU shadow copy)
+    // Vertex swell (currently only the water surface writes it): x=half peak-to-trough amplitude (meters, 0=off), y=current phase, z=previous-frame phase, w=falloff radius (meters).
+    // See SwellEvaluate below.
     float4 vertexWave;
 };
 
@@ -1331,9 +1331,9 @@ struct VertexOut {
     float3 vNormal;
     float4 vTangent;
     float4 vInstanceColor;
-    float vViewDepth;       // 1-5：视空间深度（级联选择用；shadow pass 恒 0）
+    float vViewDepth;       // 1-5: view-space depth (used for cascade selection; always 0 in the shadow pass)
 #if VELOCITY_OUTPUT
-    float4 vPrevClip;       // 2-3：上一帧未抖动 clip 空间位置（FS 侧算 velocity 用）
+    float4 vPrevClip;       // 2-3: previous-frame un-jittered clip-space position (used by the FS to compute velocity)
 #endif
 };
 
@@ -2359,13 +2359,14 @@ struct FragmentOut {
 #define SEASON_RETURN_COLOR(col_) return ApplySceneFog(ApplySceneWeather((col_), in.vWorldPos, lights, fogParams), in.vWorldPos, sceneFog, fogParams);
 #endif
 
-// 2-7 P0：采样 Sky-View LUT 取反射方向的辐射度。
-// 参数化与 renderMode == 3 的天空球、以及 skyView 计算内核的反解逐字节对齐：
-// u 接缝在 +Z，v 用 sqrt 折叠把分辨率往地平线集中。LUT 无 mip，只能采 level 0——
-// 接缝两侧的隐式导数会选出错误的 level。
+// 2-7 P0: sample the Sky-View LUT for radiance along the reflection direction.
+// The parameterization is byte-for-byte aligned with the renderMode == 3 sky sphere and with the inverse
+// solve in the skyView compute kernel:
+// the u seam is at +Z, and v folds with sqrt to concentrate resolution toward the horizon. The LUT has no mip, so
+// only level 0 can be sampled - the implicit derivatives across the seam would select the wrong level.
 inline float3 SampleSkyViewRadiance(texture2d<float> skyView, sampler s, float3 dir)
 {
-    // 1/(2*PI) 写成字面量，避开与共享常量块中宏名的重复定义。
+    // 1/(2*PI) is written as a literal to avoid a duplicate definition with the macro name in the shared constant block.
     float2 uv;
     uv.x = atan2(dir.x, -dir.z) * 0.15915494309 + 0.5;
     uv.y = 0.5 - 0.5 * sign(dir.y) * sqrt(abs(dir.y));
@@ -2383,9 +2384,10 @@ fragment SEASON_FS_OUT fragment_main(
     constant SceneLights& lights [[buffer(1)]],
     constant MaterialParams& mat [[buffer(2)]],
     constant TextDrawParams& textParams [[buffer(3)]],
-    // 工作包 D：透明阶段的雾采样三件套，与 VK 的 set 1 binding 0/1/2、DX 的 FogFrameRoot/FogIntegratedRoot/FogLocalRoot 一一对应。
-    // 三者恒被声明，不靠编译期宏变体，所以 PSO 家族数量不因此变化，
-    // 真正决定“是否采样”的是逐条命令推送的 fogParams.x。
+    // Work package D: the fog sampling trio for the transparent stage, one-to-one with VK's set 1 binding 0/1/2 and
+    // DX's FogFrameRoot/FogIntegratedRoot/FogLocalRoot.
+    // All three are always declared, not behind compile-time macro variants, so the number of PSO families does not change because of them;
+    // what actually decides whether to sample is fogParams.x, pushed per command.
     const device float4* fogFrameData      [[buffer(4)]],
     constant float4& fogParams             [[buffer(5)]],
     // S1: per-view constants mirrored from VS buffer(11) onto FS buffer(11).
@@ -2452,14 +2454,14 @@ fragment SEASON_FS_OUT fragment_main(
     // All three axes use Clamp, and trilinear sampling reuses texSampler at sampler(0).
     , texture3d<float> apLut               [[texture(10)]]
     , sampler wrapSampler                  [[sampler(2)]]
-    // 工作包 D：两张只读体积纹理紧接 texture(10) 的 AP LUT。
-    // 片元阶段的 texture3d 默认是 access::sample，正好能直接交给 FogSampler 的形参。
+    // Work package D: two read-only volume textures immediately after the AP LUT at texture(10).
+    // A texture3d in the fragment stage defaults to access::sample, so it can be handed straight to FogSampler's parameters.
     , texture3d<float> fogIntegratedVolume [[texture(11)]]
     , texture3d<float> fogLocalVolume      [[texture(12)]]
-    // 2-7 P0：程序化天空的 Sky-View LUT（texture(13)），PBR 的环境镜面源。
-    // 与 texture(6) 的 envCube 并行而不是替换：两者互斥，由 skyParams0.w 在 uniform 分支里二选一，
-    // 因此两张图都必须有合法绑定（未就绪时 Device.BeginPass 绑 1x1 白）。
-    // 白衣不会被采到：写入 skyParams0.w 的前提正是 FrameSchedule.SkyViewTexture 非空。
+    // 2-7 P0: the procedural sky's Sky-View LUT (texture(13)), the ambient specular source for PBR.
+    // It runs in parallel with the envCube at texture(6) rather than replacing it: the two are mutually exclusive, chosen
+    // by skyParams0.w in the uniform branch, so both images must have a valid binding (Device.BeginPass binds 1x1 white before they are ready).
+    // The white dummy will never be sampled: the precondition for writing skyParams0.w is precisely that FrameSchedule.SkyViewTexture is non-null.
     , texture2d<float> skyView             [[texture(13)]]
 #if SHADOW_ENABLED
     , depth2d<float> shadowAtlas          [[texture(5)]]
@@ -2467,8 +2469,8 @@ fragment SEASON_FS_OUT fragment_main(
 #endif
     )
 {
-    // 工作包 D：只组装只读句柄，不读任何数据。
-    // 门控在 ApplySceneFog 内部，关闭时 fogFrameData 与两张体积纹理会一次也不被访问。
+    // Work package D: assemble read-only handles only, reading no data.
+    // The gate lives inside ApplySceneFog; when it is off, fogFrameData and the two volume textures are never accessed even once.
     FogSampler sceneFog{fogFrameData, fogIntegratedVolume, fogLocalVolume};
 #if OUTLINE_MASK
     // Phase 4 mask path, mirroring DX PSOutlineMask:
@@ -2708,8 +2710,9 @@ fragment SEASON_FS_OUT fragment_main(
     }
 
 #if NORMAL_OUTPUT
-    // P0 起第 4 通道不再是 metallic：它是 SSR 差分要用的**反射权重**，必须等 F0 与 ao 都算出来才能写，
-    // 所以写入点挪到下面的反射项之后（见 ambient += reflectionRadiance 那一行）。
+    // As of P0 the 4th channel is no longer metallic: it is the **reflection weight** the SSR difference needs, which
+    // can only be written once both F0 and ao are computed,
+    // so the write point has moved below the reflection term (see the `ambient += reflectionRadiance` line).
 #endif
 
     float3 V = normalize(lights.cameraPos.xyz - in.vWorldPos);
@@ -2722,8 +2725,8 @@ fragment SEASON_FS_OUT fragment_main(
     float3 Lo = float3(0.0);
 
     int lightCount = min(int(lights.params0.x), 8);
-    int dirShadowIdx = int(lights.params0.z);      // 投 CSM 的方向光下标（-1=无）
-    int spotShadowIdx = int(lights.params0.w);     // 投 2D shadowmap 的聚光下标（-1=无）
+    int dirShadowIdx = int(lights.params0.z);      // index of the directional light casting CSM (-1=none)
+    int spotShadowIdx = int(lights.params0.w);     // index of the spot light casting a 2D shadowmap (-1=none)
     for (int i = 0; i < lightCount; ++i) {
         float type = lights.lights[i].dirType.w;
         float3 L;
@@ -2805,22 +2808,26 @@ fragment SEASON_FS_OUT fragment_main(
     // the specular term uses mirrored reflection from radiance cube LOD0.
     // There is no mip chain and no GGX prefiltering,
     // so it is masked by one-minus-roughness squared and rough-surface environment energy is carried by the SH9 diffuse term above.
-    // 2-8 的两处修正都只发生在程序化天空分支里，else 分支（envCube）保持 1-7 的原式不变，
-    // 这样只开贴图立方图的预设仍是零回归：
-    //   A. R.y < 0 时 Sky-View LUT 那一侧几乎是黑的（朝下的射线只穿过视点到地面那几百米空气，
-    //      而地面自身被照亮后的辐亮度根本没有被加进去），于是改用 CPU 预算好的地面辐亮度，
-    //      地平线两侧用 smoothstep 过渡。镜面球下半部分本来就该映出草地，而不是黑。
-    //   B. 粗糙端不再靠再叠一次 (1-roughness)^2 把镜面压成零：金属的漫反射项被 (1-metallic) 乘掉，
-    //      压成零就等于金属在粗糙之后完全失去环境能量。改为按 (1-roughness)^2 在镜面采样与
-    //      giDiffuse（半球平均，已是 E/pi 且含 DDGI 的地面反弹）之间插值。粗糙时 R 本来就贴近 N，
-    //      用 N 上的辐照度近似反射叶内的平均入射辐射，不必再采一次探针。
+    // The two corrections of 2-8 both happen only inside the procedural sky branch; the else branch (envCube) keeps
+    // the 1-7 formula unchanged,
+    // so presets that enable only a texture cube are still zero-regression:
+    //   A. When R.y < 0 the Sky-View LUT side is almost black (a downward ray only crosses those few hundred meters of
+    //      air from the view point to the ground, and the radiance of the ground itself after being lit is not added in
+    //      at all), so it switches to the ground radiance precomputed on the CPU,
+    //      blended with a smoothstep across the horizon. The lower half of a mirror ball should reflect grass, not black.
+    //   B. The rough end no longer crushes the specular to zero by stacking another (1-roughness)^2: a metal's diffuse
+    //      term is multiplied by (1-metallic), so crushing to zero means a metal completely loses ambient energy once rough.
+    //      Instead it interpolates by (1-roughness)^2 between the specular sample and
+    //      giDiffuse (hemisphere average, already E/pi and including the DDGI ground bounce). When rough, R is already
+    //      close to N, so using the irradiance on N to approximate the average incoming radiance within the reflection
+    //      lobe avoids another probe fetch.
     float3 R = reflect(-V, N);
     float mirrorW = (1.0 - roughness) * (1.0 - roughness);
     float3 reflectionRadiance; float specGate;
     if (lights.skyParams0.w > 0.0)
     {
         float3 skyRadiance = SampleSkyViewRadiance(skyView, texSampler, R);
-        // 观察点必须在地面之上，地面项才有意义；否则（贴地或穿地的相机）一律退回天空。
+        // The view point must be above the ground for the ground term to be meaningful; otherwise (a camera at or under the ground) it always falls back to the sky.
         float aboveGround = step(lights.reflectionParams0.w, in.vWorldPos.y);
         float horizonW = max(smoothstep(-0.09, 0.09, R.y), 1.0 - aboveGround);
         skyRadiance = mix(lights.reflectionParams0.xyz, skyRadiance, horizonW);
@@ -2829,27 +2836,29 @@ fragment SEASON_FS_OUT fragment_main(
     }
     else
     {
-        // 1-7 原式：LOD0 镜面 × envParams.x × (1-r)^4。
+        // Original 1-7 formula: LOD0 specular x envParams.x x (1-r)^4.
         reflectionRadiance = envCube.sample(texSampler, R, level(0.0)).rgb * lights.envParams.x * mirrorW * mirrorW;
         specGate = step(0.5, lights.envParams.w);
     }
     ambient += reflectionRadiance * F0 * ao * specGate;
 
 #if NORMAL_OUTPUT
-    // P0 SSR 的 F0 通道。合成端要做的是「把天空那一项换成屏幕空间命中」，
-    // 恒等式是 Δ = conf·(1-r)²·(F0·ao)·(ssr − reflSky)：giDiffuse 在差里抵消，
-    // 所以这里只需要一个标量权重，用 Rec.709 亮度把 F0 压成一维。
-    // 丢掉的只是色偏（金球 vs 银球），因为 Δ 是替换量、不是颜色本身；换来的是不必为 SSR 再开一个 MRT 目标。
-    // envCube 分支写 0：那条路径的基项是贴图立方图，SSR 核拿不到它，替换只会算错。
+    // The F0 channel for P0 SSR. What the compositing side must do is replace the sky term with the screen-space hit,
+    // and the identity is delta = conf*(1-r)^2*(F0*ao)*(ssr - reflSky): giDiffuse cancels in the difference,
+    // so all that is needed here is a scalar weight, squeezing F0 to one dimension with Rec.709 luminance.
+    // What is lost is only the color cast (gold ball vs silver ball), because delta is a replacement amount, not the
+    // color itself; in exchange there is no need to open another MRT target for SSR.
+    // The envCube branch writes 0: that path's base term is the texture cube, which the SSR kernel cannot access, so replacing it would only compute wrong.
     normal_ = float4(OctEncodeNormal(N), roughness,
         lights.skyParams0.w > 0.0 ? dot(F0, float3(0.2126, 0.7152, 0.0722)) * ao : 0.0);
 #endif
 
-    // 2-7：雷击的照明。v1 把它并进环境项，于是任何朝向都均匀变亮——山脊背面也亮，
-    // 与「闪电在那边」对不上。v2 给出方向，做法与 DX12 逐字一致：
-    //   光源取击穿点在地面投影处、高度夹进 [地面, 击穿点]；衰减用 1/(1+d²/R²)，R=400 m；
-    //   朗伯项保留 25% 的底，因为通道有多段分支，总有某一段能照到背光面；
-    //   系数 1.6 使 400 m 处恰好回到 v1 的 0.8，远景亮度不变。
+    // 2-7: lightning illumination. v1 folded it into the ambient term, so every orientation brightened uniformly - the
+    // back of a ridge lit up too,
+    // which does not match the lightning is over there. v2 gives it a direction, done byte-for-byte the same as DX12:
+    //   the light source is taken at the ground projection of the strike point, with the height clamped to [ground, strike point]; attenuation is 1/(1+d^2/R^2), R=400 m;
+    //   the Lambert term keeps a 25% floor, because the channel has multiple branches so some branch can always light the back face;
+    //   the factor 1.6 makes it land exactly back at v1's 0.8 at 400 m, leaving distant brightness unchanged.
     if (lights.weatherFlash.w > 0.0)
     {
         float flashGround = min(lights.reflectionParams0.w, lights.weatherFlash.y);

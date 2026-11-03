@@ -24,7 +24,7 @@ namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 ///   DepthTexture = CombinedImageSampler (immutable nearest sampler Pipeline.StaticPointSampler,
 ///   exposed as sampler2D + texelFetch in GLSL; per contract 2-2 clause 3, D32 linear filtering
 ///   is an optional Vulkan feature),
-///   StorageTextureWrite=StorageImage（rgba8 writeonly image2D）、StorageBuffer*=StorageBuffer。
+///   StorageTextureWrite=StorageImage (rgba8 writeonly image2D), StorageBuffer*=StorageBuffer.
 ///
 /// 1-8: SampledTexture3D = CombinedImageSampler (same immutable StaticSampler; its AddressModeW
 /// is also ClampToEdge + Linear, so GLSL sampler3D naturally gets trilinear filtering with clamped
@@ -276,13 +276,13 @@ internal sealed unsafe class VKStorageBuffer : Season.Rendering.StorageBuffer
         uint alignedSize = (sizeInBytes + 15u) & ~15u;
         SizeInBytes = sizeInBytes;
         Usage = usage;
-        // A0.1：IndirectBufferBit 必须在创建时就要，之后无法追加，这是 StorageBufferUsage
-        // 做成创建期参数而不是提交期参数的原因。
+        // A0.1: IndirectBufferBit must be requested at creation time and cannot be appended afterward; this is why StorageBufferUsage
+        // is a creation-time parameter rather than a submission-time parameter.
         var usageFlags = BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferDstBit;
         if (usage == Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs)
             usageFlags |= BufferUsageFlags.IndirectBufferBit;
-        // A7：gather 物化出的实例流要直接当顶点流绑定，而 VertexBufferBit 与 IndirectBufferBit 一样
-        // 只能在创建时声明。
+        // A7: the instance stream materialized by gather must be bound directly as a vertex stream, and VertexBufferBit, like IndirectBufferBit,
+        // can only be declared at creation time.
         if (usage == Season.Rendering.StorageBufferUsage.ComputeAndVertexInput)
             usageFlags |= BufferUsageFlags.VertexBufferBit;
         Buffer = Device.ResourceManager.CreateBuffer(
@@ -292,11 +292,11 @@ internal sealed unsafe class VKStorageBuffer : Season.Rendering.StorageBuffer
     }
 
     /// <summary>
-    /// A7：把 compute 写入的缓冲交给顶点输入阶段。
+    /// A7: hands the buffer written by compute over to the vertex input stage.
     ///
-    /// 不复用 TryPrepareIndirectArgs 的 barrier：那一道的 dstStage 是 DrawIndirect，
-    /// 而顶点属性读取发生在 VertexInput 阶段、访问位是 VertexAttributeRead，两者不能互代。
-    /// 必须由调用方在 Pass 之外录制，理由与其它 barrier 相同：Vulkan 的 render pass 实例内插不了 barrier。
+    /// It does not reuse TryPrepareIndirectArgs' barrier: that one's dstStage is DrawIndirect,
+    /// whereas vertex attribute reads occur in the VertexInput stage with the access bit VertexAttributeRead; the two cannot substitute for each other.
+    /// The caller must record it outside the pass, for the same reason as other barriers: a barrier cannot be inserted inside a Vulkan render pass instance.
     /// </summary>
     internal void BarrierToVertexInput(CommandBuffer cmd)
     {

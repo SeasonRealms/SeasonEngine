@@ -76,7 +76,7 @@ internal unsafe class PrimitiveData
     /// LocalBoundsCenter for primitive-level and instance-level culling.</summary>
     public Vector3 LocalBoundsExtents;
 
-    // 共享高亮壳体不拥有 VB/IB；收集时从模板取资源并保留引用（AddRef 到本帧 GPU 安全点），命令不保留模板。
+    // The shared highlight shell does not own the VB/IB; during collection resources are taken from the template and kept alive (AddRef up to this frame's GPU safe point), the command does not retain the template.
     internal PrimitiveData? SharedGeometrySource;
     public ID3D12Resource* VertexBuffer;
     public VertexBufferView VertexBufferView;

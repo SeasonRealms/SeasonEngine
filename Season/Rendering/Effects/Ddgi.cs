@@ -191,8 +191,8 @@ public sealed class DdgiEffect : ComputeEffect
     ComputeResourceRef[]? _sliceResP1;
     // Update reads the previous frame and writes the current frame: two ping-pong variants
     // ([proxies, sdf, sh, prevIrr(read), writeIrr, prevDep(read), writeDep]).
-    ComputeResourceRef[]? _updateResP0;   // _pingWrite=false：write=irr0/dep0 read=irr1/dep1
-    ComputeResourceRef[]? _updateResP1;   // _pingWrite=true ：write=irr1/dep1 read=irr0/dep0
+    ComputeResourceRef[]? _updateResP0;   // _pingWrite=false: write=irr0/dep0 read=irr1/dep1
+    ComputeResourceRef[]? _updateResP1;   // _pingWrite=true: write=irr1/dep1 read=irr0/dep0
 
     /// <summary>Resolved volume resolution for this run, rounded to a multiple of <see cref="GatherGroup"/>.</summary>
     uint _resolution;
@@ -630,7 +630,7 @@ public sealed class DdgiEffect : ComputeEffect
     //   +32 albedo.rgb, _        +48 emissive.rgb, _
     // Step 1 gather reads only the first two float4 values; the debug strip reads the third one (albedo).
 
-    // ── D3D12 HLSL cs_5_0（fxc）──
+    // ── D3D12 HLSL cs_5_0 (fxc) ──
 
     /// <summary>kernel1 sdfGather: writes the res^3 volume with a 4x4x4 workgroup. The typed UAV stores only the .x channel in R16_FLOAT.</summary>
     const string SourceGatherHlsl = @"
@@ -789,7 +789,7 @@ void main()
 }
 ";
 
-    /// <summary>kernel2 sdfSlice。</summary>
+    /// <summary>kernel2 sdfSlice.</summary>
     const string SourceSliceGlsl = @"#version 450
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -870,7 +870,7 @@ void main()
     // ── Metal MSL (textures map to texture(declaration index), buffers to buffer(declaration index + 1),
     //    and workgroup size is supplied at dispatch time through ComputeKernelDesc.WorkgroupX/Y/Z) ──
 
-    /// <summary>kernel1 sdfGather。</summary>
+    /// <summary>kernel1 sdfGather.</summary>
     const string SourceGatherMsl = @"
 #include <metal_stdlib>
 using namespace metal;
@@ -993,7 +993,7 @@ kernel void CSMain(
     // ── WebGPU WGSL (submitted through interop; seasonWebGPU.js does not embed source; @binding(i)
     //    follows declaration order, the engine sampler stays at @binding(15), and the 3D volume uses rgba16float) ──
 
-    /// <summary>kernel1 sdfGather。</summary>
+    /// <summary>kernel1 sdfGather.</summary>
     const string SourceGatherWgsl = @"
 struct DdgiGatherParams
 {
@@ -1031,7 +1031,7 @@ fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
 }
 ";
 
-    /// <summary>kernel2 sdfSlice。</summary>
+    /// <summary>kernel2 sdfSlice.</summary>
     const string SourceSliceWgsl = @"
 struct DdgiSliceParams
 {
@@ -1128,7 +1128,7 @@ fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
     //    hysteresis, and keeps barriers in unconditional uniform control flow. Step 5 also classifies
     //    probe validity, writes it into irradiance alpha, and filters invalid probes out of bounce feedback. ──
 
-    // ── D3D12 HLSL cs_5_0（fxc）──
+    // ── D3D12 HLSL cs_5_0 (fxc) ──
     const string SourceUpdateHlsl = @"
 cbuffer DdgiUpdateParams : register(b0)
 {

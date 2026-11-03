@@ -316,7 +316,7 @@ public static class LinuxApp
         // 3) Create the SwapChain and upper-layer resource manager.
         VkDevice.CreateSwapChain(width, height);
 
-        // 4) Display（Depth + RenderPass + Framebuffers）
+        // 4) Display (Depth + RenderPass + Framebuffers)
         VkDevice.CreateDescriptorHeapsAndViews();
 
         // 5) Initialize the three Pipeline variants, which depend on the RenderPass.

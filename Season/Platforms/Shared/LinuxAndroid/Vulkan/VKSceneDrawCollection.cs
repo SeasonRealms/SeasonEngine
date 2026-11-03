@@ -9,7 +9,7 @@ using VkBuffer = Silk.NET.Vulkan.Buffer;
 
 namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 
-/// <summary>三种绘制命令形态：3D 图元、精灵四边形、文字批次。三者都走描述符集 + 顶点缓冲。</summary>
+/// <summary>Three draw command forms: 3D primitive, sprite quad, text batch. All three go through a descriptor set + vertex buffer.</summary>
 internal enum VKSceneDrawKind : byte
 {
     Primitive,
@@ -18,13 +18,13 @@ internal enum VKSceneDrawKind : byte
 }
 
 /// <summary>
-/// 单个已捕获的绘制项。只保存不可变句柄（描述符集、顶点/索引/实例缓冲、计数），
-/// 不保存控件、也不保存延迟调用 <c>Control.Draw</c> 的委托。
+/// A single captured draw item. It only stores immutable handles (descriptor set, vertex/index/instance buffers, counts),
+/// and does not store the control, nor the delegate for the deferred <c>Control.Draw</c> call.
 ///
-/// 与 DX 版本的差别只有一处：VK 的旋转环本来就是“所有者 + 帧槽”独占的
-/// （<c>PrimitiveData.MatrixBuffers[fi]</c>、<c>VKSpriteQuad._matrixBuffers[fi]</c>、
-/// 文字各自按帧槽的实例/参数缓冲），直绘路径只把句柄交给命令缓冲，
-/// 帧内没有谁会覆写别人的槽位，因此这里不需要 DX 那种上传页字节深拷贝。
+/// The only difference from the DX version: VK's rotating ring is inherently exclusive to an "owner + frame slot"
+/// (<c>PrimitiveData.MatrixBuffers[fi]</c>, <c>VKSpriteQuad._matrixBuffers[fi]</c>,
+/// text each has its own per-frame-slot instance/parameter buffer), and the direct draw path only hands the handles to the command buffer,
+/// no one within the frame overwrites another's slot, so here we do not need the DX-style deep copy of upload page bytes.
 /// </summary>
 internal unsafe struct VKSceneDrawCommand : ISceneDrawCommand
 {
@@ -36,9 +36,9 @@ internal unsafe struct VKSceneDrawCommand : ISceneDrawCommand
     // Primitive
     internal PrimitiveData? Primitive;
 
-    // 三者共用：描述符集 + 顶点/索引/实例缓冲
+    // Shared by all three: descriptor set + vertex/index/instance buffer
     internal DescriptorSet Set;
-    // 视图 set 2（主视图帧槽集合或屏幕空间集合），收集时确定。
+    // View set 2 (main view frame slot set or screen space set), determined at collection time.
     internal DescriptorSet View;
     internal VkBuffer Vertex;
     internal VkBuffer Index;
@@ -56,8 +56,8 @@ internal unsafe struct VKSceneDrawCommand : ISceneDrawCommand
         switch (Kind)
         {
             case VKSceneDrawKind.Primitive:
-                // 纹理就绪与描述符刷新已在收集阶段完成：
-                // 那些操作包含布局转换，只能在渲染 Pass 之外调用。
+                // Texture readiness and descriptor refresh are already done in the collection phase:
+                // those operations include layout transitions and can only be called outside the render pass.
                 Pipeline.DrawPrimitiveCore(cmd, Primitive!, Vertex, Index, Set, IndexCount,
                     Instances, InstanceCount, FirstInstance, prepared: true, View);
                 break;
@@ -101,14 +101,14 @@ internal unsafe struct VKSceneDrawCommand : ISceneDrawCommand
         }
     }
 
-    // 资源引用由 <see cref="VKSceneDrawCollection"/> 的快照页持有，直到本帧 GPU 退休。
+    // The resource references are held by the snapshot page of <see cref="VKSceneDrawCollection"/> until the GPU retires this frame.
     public void Release() { }
 }
 
 /// <summary>
-/// Vulkan 主线程场景收集器。收集期不提交任何绘制：
-/// <c>Pipeline.SetPipeline</c> 只记录模式/剔除/深度写入，真正绑定 PSO 发生在重放时
-/// （重放的 Pass 才知道该用哪一族 PSO：主场景、速度 MRT、Overlay、OutlineMask）。
+/// Vulkan main-thread scene collector. No draws are submitted during collection:
+/// <c>Pipeline.SetPipeline</c> only records mode/cull/depth write, and the actual PSO binding happens at replay time
+/// (only the replaying pass knows which PSO family to use: main scene, velocity MRT, Overlay, OutlineMask).
 /// </summary>
 internal sealed unsafe class VKSceneDrawCollection
 {
@@ -118,38 +118,38 @@ internal sealed unsafe class VKSceneDrawCollection
     ulong _stamp;
     bool _live;
 
-    /// <summary>正在收集的实例；非收集期为空，重放不会再被自己捕获。</summary>
+    /// <summary>The collection being collected; null outside the collection period, and replay will not be captured by itself again.</summary>
     internal static VKSceneDrawCollection? Active { get; private set; }
 
-    // 本帧/上一帧实际绘制过的图元，按引用去重。
-    // binding 16-20 只有在命令缓冲 begin 之前改写才安全（否则校验层把整条命令缓冲判为 invalid），
-    // 而场景收集发生在 begin 之后，所以帧首预刷新只能依据上一帧的绘制集合。
-    // 见 Pipeline.RefreshSceneBindingsForFrameStart。
+    // Primitives actually drawn this frame/last frame, deduplicated by reference.
+    // binding 16-20 are only safe to rewrite before the command buffer begins (otherwise the validation layer judges the whole command buffer as invalid),
+    // but scene collection happens after begin, so the frame-start pre-refresh can only be based on the previous frame's draw collection.
+    // See Pipeline.RefreshSceneBindingsForFrameStart.
     static HashSet<PrimitiveData> _drawnThisFrame = new();
     static HashSet<PrimitiveData> _drawnLastFrame = new();
     static HashSet<VKSpriteQuad> _quadThisFrame = new();
     static HashSet<VKSpriteQuad> _quadLastFrame = new();
 
-    /// <summary>上一帧实际绘制过的图元集合，供帧首预刷新遍历。</summary>
+    /// <summary>The set of primitives actually drawn last frame, for the frame-start pre-refresh to iterate.</summary>
     internal static IReadOnlyCollection<PrimitiveData> PreviousFramePrimitives => _drawnLastFrame;
 
-    /// <summary>上一帧实际绘制过的精灵集合，同样供帧首预刷新遍历。</summary>
+    /// <summary>The set of sprites actually drawn last frame, also for the frame-start pre-refresh to iterate.</summary>
     internal static IReadOnlyCollection<VKSpriteQuad> PreviousFrameQuads => _quadLastFrame;
 
     /// <summary>
-    /// 登记一个本帧渲染过的图元，作为下一帧帧首预刷新的依据。
-    /// 主通道收集与阴影通道都会调：阴影的绘制集合是它自己的剔除结果，不一定被主通道完整覆盖，
-    /// 而两者刷新的又是同一批描述符集。非收集期调用也是安全的。
+    /// Records a primitive rendered this frame, as the basis for the next frame's frame-start pre-refresh.
+    /// Both the main pass collection and the shadow pass call it: the shadow's draw collection is its own culling result and may not be fully covered by the main pass,
+    /// while both refresh the same set of descriptor sets. Calling it outside the collection period is also safe.
     /// </summary>
     internal static void NotePrimitiveDrawn(PrimitiveData primitive) => _drawnThisFrame.Add(primitive);
 
-    /// <summary>登记一个本帧绘制过的精灵，用途同 <see cref="NotePrimitiveDrawn"/>。</summary>
+    /// <summary>Records a sprite drawn this frame, with the same purpose as <see cref="NotePrimitiveDrawn"/>.</summary>
     internal static void NoteQuadDrawn(VKSpriteQuad quad) => _quadThisFrame.Add(quad);
 
-    // 雾采样开关只在状态翻转时记一行日志，方便在真机上确认“透明阶段到底有没有采样雾”。
+    // The fog sampling switch only logs one line when the state flips, making it convenient to confirm on a real device "whether the transparent phase actually samples fog".
     static bool? _reportedFog;
 
-    /// <summary>当前状态：最近一次 SetPipeline 记录下来的管线状态。</summary>
+    /// <summary>Current state: the pipeline state recorded by the most recent SetPipeline.</summary>
     internal VKSceneDrawCommand State;
 
     internal int OpaqueCount => _queue.OpaqueCount;
@@ -159,7 +159,7 @@ internal sealed unsafe class VKSceneDrawCollection
     internal void Begin()
     {
         if (_live || Active != null || !FrameSchedule.SceneCollectionActive || !FrameSchedule.SceneDrawOrder.IsCollecting)
-            throw new InvalidOperationException("场景收集必须由帧调度器开启，且上一帧已经释放。");
+            throw new InvalidOperationException("Scene collection must be opened by the frame scheduler, and the previous frame must have been released.");
         _queue.BeginCollection();
         _stamp = Device.GetCurrentRetireFenceValue();
         _arena.BeginFrame(_stamp);
@@ -171,7 +171,7 @@ internal sealed unsafe class VKSceneDrawCollection
     internal void Seal()
     {
         Validate();
-        if (Active != this) throw new InvalidOperationException("场景收集已封存。");
+        if (Active != this) throw new InvalidOperationException("Scene collection has been sealed.");
         _queue.Seal();
         Active = null;
     }
@@ -179,15 +179,15 @@ internal sealed unsafe class VKSceneDrawCollection
     void Validate()
     {
         if (!_live || _stamp != Device.GetCurrentRetireFenceValue())
-            throw new InvalidOperationException("场景绘制项只能在收集的同一帧消费。");
+            throw new InvalidOperationException("Scene draw items can only be consumed in the same frame as the collection.");
     }
 
     internal void DrawOpaque()
     {
         Validate();
         if (Device.ActivePassId != RenderPassId.SceneOpaque)
-            throw new InvalidOperationException("不透明队列的 Pass 无效。");
-        // 不透明变体没有雾采样代码，但 SceneFogParams 是跨帧的静态状态，必须显式归零。
+            throw new InvalidOperationException("The opaque queue's pass is invalid.");
+        // The opaque variant has no fog sampling code, but SceneFogParams is cross-frame static state, so it must be explicitly zeroed.
         Pipeline.SceneFogParams = default;
         _queue.DrawOpaque();
     }
@@ -196,40 +196,40 @@ internal sealed unsafe class VKSceneDrawCollection
     {
         Validate();
         if (Device.ActivePassId != RenderPassId.SceneTransparent)
-            throw new InvalidOperationException("透明队列的 Pass 无效。");
+            throw new InvalidOperationException("The transparent queue's pass is invalid.");
 
         bool fog = false;
         if (sampleFog && Pipeline.SceneFogSamplingBaked
             && VKFogCompositePipeline.TryGetTransparentBinding(out var frame, out var frameRange,
                 out var integrated, out var local))
         {
-            // 雾的体积纹理是本帧合成阶段才产出的资源，收集期拿不到句柄，
-            // 所以三段绑定只能在透明 Pass 内补齐。
-            // 写入的是独立的 set 1（每帧槽一个），不是绘制项自己的 set 0：
-            // set 0 在本帧更早的阴影 pass 里已经被绑定使用过，
-            // 未声明 UPDATE_AFTER_BIND 的集合被正在录制的命令缓冲引用后再改写，整条缓冲会失效。
-            // 顺序仍然是“先写完，再开始绘制”。
+            // The fog volumetric texture is a resource produced only in this frame's composite phase, its handle is not available during collection,
+            // so the three-segment binding can only be completed inside the transparent pass.
+            // What is written is an independent set 1 (one per frame slot), not the draw item's own set 0:
+            // set 0 has already been bound and used in this frame's earlier shadow pass,
+            // and a set that does not declare UPDATE_AFTER_BIND will invalidate the whole buffer if rewritten after being referenced by the command buffer currently being recorded.
+            // The order is still "finish writing first, then start drawing".
             Pipeline.PrepareTransparentFog(frame, frameRange, integrated, local);
             fog = true;
         }
 
-        // S5: 雾透明旁路 —— 本视图没有雾时 fogParams 全零，weather 也跟随关闭，
-        // 不再检查 FrameSchedule.WeatherComposited 独立位（避免二级视图误采主视图的天气残留）。
-        // 光束亮度由 S1（emissiveFactor × alpha）在 shader 端独立供给，不依赖 fogParams。
+        // S5: fog transparent bypass -- when this view has no fog, fogParams is all zeros and weather is turned off accordingly,
+        // no longer checking the independent FrameSchedule.WeatherComposited bit (to avoid a secondary view mistakenly sampling the main view's weather residue).
+        // The beam brightness is supplied independently on the shader side by S1 (emissiveFactor × alpha), independent of fogParams.
         Pipeline.SceneFogParams = new Vector4(fog ? 1 : 0, fog && FrameSchedule.WeatherComposited ? 1 : 0, 0, 0);
         var app = DeviceServices.BaseApp;
         if (app != null && _reportedFog != fog)
         {
             _reportedFog = fog;
             app.AddLog(Season.Basic.LogType.Backend,
-                $"{DateTime.UtcNow} [VK Scene] 透明阶段雾采样={(fog ? "开" : "关")} " +
+                $"{DateTime.UtcNow} [VK Scene] transparent-phase fog sampling={(fog ? "on" : "off")} " +
                 $"transparent={_queue.TransparentCount} baked={Pipeline.SceneFogSamplingBaked} requested={sampleFog}");
         }
         try { _queue.DrawTransparent(); }
         finally
         {
             Pipeline.SceneFogParams = default;
-            // set 1 回到默认集：直绘路径不能继续绑本帧的雾资源，它下一帧就会被改写。
+            // set 1 returns to the default set: the direct draw path cannot keep binding this frame's fog resources, they will be rewritten next frame.
             Pipeline.CurrentFogSet = default;
         }
     }
@@ -241,7 +241,7 @@ internal sealed unsafe class VKSceneDrawCollection
         finally
         {
             _live = false; State = default;
-            // 交换而不是复制：本帧的绘制集合成为下一帧帧首预刷新的依据。
+            // Swap rather than copy: this frame's draw collection becomes the basis for the next frame's frame-start pre-refresh.
             (_drawnThisFrame, _drawnLastFrame) = (_drawnLastFrame, _drawnThisFrame);
             _drawnThisFrame.Clear();
             (_quadThisFrame, _quadLastFrame) = (_quadLastFrame, _quadThisFrame);
@@ -249,29 +249,29 @@ internal sealed unsafe class VKSceneDrawCollection
         }
     }
 
-    /// <summary>记录本次 SetPipeline 请求的状态，供重放时重新选择 PSO。</summary>
+    /// <summary>Records the state requested by this SetPipeline, for reselecting the PSO at replay time.</summary>
     internal void RecordPipeline(PipelineMode mode, CullModeFlags cull, bool depthWrite)
         => State = new VKSceneDrawCommand { Kind = VKSceneDrawKind.Primitive, Mode = mode, Cull = cull, DepthWrite = depthWrite };
 
     /// <summary>
-    /// 钉住一个在重放期仍被命令缓冲引用的所有者（图元分组 / 精灵 / 文字状态）。
-    /// 共享壳体模板与实例缓冲都挂在分组上，钉住分组即可覆盖它们。
-    /// 非收集期是空操作。
+    /// Pins an owner still referenced by the command buffer during replay (primitive group / sprite / text state).
+    /// The shared hull template and instance buffer are both attached to the group, so pinning the group covers them.
+    /// It is a no-op outside the collection period.
     /// </summary>
     internal static void RetainOwner(object owner) => Active?._arena.Retain(owner);
 
-    /// <summary>沿相机前向的投影距离，与 DX 的 <c>DXSceneDrawCollection.Depth</c> 同式。</summary>
+    /// <summary>The projection distance along the camera forward, with the same formula as DX's <c>DXSceneDrawCollection.Depth</c>.</summary>
     internal static float Depth(Vector3 center, Matrix4x4 world)
         => RenderView.SortDepth(Vector3.Transform(center, world));
 
-    /// <summary>把实例流的行主序四行还原成世界矩阵，供透明排序求深度。</summary>
+    /// <summary>Restores the four row-major rows of the instance stream into a world matrix, for transparent sorting to compute depth.</summary>
     internal static Matrix4x4 InstanceWorld(in InstanceTransformData instance) => new(
         instance.Row0.X, instance.Row0.Y, instance.Row0.Z, instance.Row0.W,
         instance.Row1.X, instance.Row1.Y, instance.Row1.Z, instance.Row1.W,
         instance.Row2.X, instance.Row2.Y, instance.Row2.Z, instance.Row2.W,
         instance.Row3.X, instance.Row3.Y, instance.Row3.Z, instance.Row3.W);
 
-    /// <summary>读取图元矩阵 UBO 中的世界矩阵（存储时已转置，这里转置回来）。</summary>
+    /// <summary>Reads the world matrix from the primitive matrix UBO (it was transposed when stored, so it is transposed back here).</summary>
     static Matrix4x4 PrimitiveWorld(PrimitiveData primitive, int frameIndex)
     {
         var mapped = primitive.MappedMatrixBuffers[frameIndex];
@@ -285,7 +285,7 @@ internal sealed unsafe class VKSceneDrawCollection
     {
         if (indexCount == 0 || instanceCount == 0) return;
 
-        // 纹理就绪与绑定 16-20 的刷新必须在 Pass 之外完成，见 PreparePrimitive 的说明。
+        // Texture readiness and the refresh of bindings 16-20 must be done outside the pass, see the notes on PreparePrimitive.
         Pipeline.PreparePrimitive(cmd, primitive, set);
         _arena.Retain(primitive);
         _drawnThisFrame.Add(primitive);
@@ -294,7 +294,7 @@ internal sealed unsafe class VKSceneDrawCollection
         draw.Kind = VKSceneDrawKind.Primitive;
         draw.Primitive = primitive;
         draw.Set = set;
-        // 视图槽在收集期已由 FrameSchedule.PrepareView 选好，所以这里记下的就是本视图的 set 2。
+        // The view slot was already chosen by FrameSchedule.PrepareView during collection, so what is recorded here is this view's set 2.
         draw.View = Pipeline.ActiveViewSet;
         draw.Vertex = vertex;
         draw.Index = index;
@@ -311,8 +311,8 @@ internal sealed unsafe class VKSceneDrawCollection
             return;
         }
 
-        // 实例拆分：透明阶段必须逐实例绘制，才能让前后两个实例正确混色；
-        // 不透明阶段的整批实例化绘制保持原样（重复绘制同一实例没有意义）。
+        // Instance split: the transparent phase must draw per instance so that the two instances in front and behind blend colors correctly;
+        // the opaque phase's whole-batch instanced draw stays as is (drawing the same instance repeatedly is meaningless).
         int frameIndex = (int)Device.FrameIndex;
         var world = PrimitiveWorld(primitive, frameIndex);
         bool split = instanceBuffer.Handle != 0 && draw.Mode != PipelineMode.Opaque;
@@ -321,9 +321,9 @@ internal sealed unsafe class VKSceneDrawCollection
         {
             draw.InstanceCount = split ? 1u : instanceCount;
             draw.FirstInstance = firstInstance + i;
-            // 拆分路径上的个体深度需要实例矩阵，而实例流是 GPU 侧资源，
-            // 调用方能给就给（sortDepth 参数），给不了就退化到图元级深度：
-            // 同深度项之间由队列按添加顺序稳定排序，而调用方的遍历顺序本身已经排好序。
+            // The per-instance depth on the split path needs the instance matrix, but the instance stream is a GPU-side resource,
+            // so it is given if the caller can give it (the sortDepth parameter), otherwise it falls back to primitive-level depth:
+            // items at the same depth are stably sorted by the queue in insertion order, and the caller's traversal order is itself already sorted.
             _queue.Add(draw, draw.Mode != PipelineMode.Opaque, FrameSchedule.SceneDrawOrder.Current,
                 Depth(primitive.LocalBoundsCenter, world));
         }
@@ -336,7 +336,7 @@ internal sealed unsafe class VKSceneDrawCollection
             Kind = VKSceneDrawKind.Quad,
             Mode = PipelineMode.Transparent,
             Cull = CullModeFlags.BackBit,
-            // Transparent 变体本身就不写深度，与 DX 捕获时保持零值一致。
+            // The Transparent variant does not write depth itself, consistent with DX keeping it zero at capture time.
             DepthWrite = false,
             Set = set,
             View = screenSpace ? Pipeline.ScreenViewSet : Pipeline.ActiveViewSet,

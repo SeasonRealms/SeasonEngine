@@ -130,9 +130,10 @@ internal sealed class MTLStorageBuffer : Season.Rendering.StorageBuffer
         SizeInBytes = sizeInBytes;
         Usage = usage;
         _alignedSize = (nuint)alignedSize;
-        // A0.1：Metal 没有缓冲用途位也没有状态机，StorageModePrivate 缓冲直接就能当
-        // indirectBuffer 传给 DrawIndexedPrimitives，写后读的依赖由驱动 hazard tracking 兑现。
-        // usage 在这一端只是记录，用于跟其他三端保持同一套准入判定。
+        // A0.1: Metal has no buffer usage bits and no state machine; a StorageModePrivate buffer
+        // can be passed directly as indirectBuffer to DrawIndexedPrimitives, and read-after-write
+        // dependencies are honored by the driver's hazard tracking.
+        // On this backend usage is only recorded, to keep the same admission check as the other three backends.
         Buffer = Device.ResourceManager.CreateBuffer(_alignedSize, MTLResourceOptions.StorageModePrivate);
     }
 

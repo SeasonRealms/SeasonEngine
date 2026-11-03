@@ -34,8 +34,8 @@ namespace Season.Rendering.Effects;
 /// Several instances coexist on screen. Each owns its own instance buffer, indirect argument block
 /// and backend pipeline, and registers itself into <see cref="FrameSchedule.ParticleSubmitters"/>,
 /// so rain, snow and smoke are separate systems rather than modes of one.
-/// 每套系统按构造时的 ParticleBudget 分配和派发，Capacity 仅为单系统预算上限；
-/// 降低 Density 只减少存活数，不减少候选线程数。
+/// Each system allocates and dispatches by the ParticleBudget given at construction; Capacity is only the per-system budget ceiling.
+/// Lowering Density only reduces the survivor count, not the candidate thread count.
 ///
 /// The shader single source of truth for all stages lives beside this file, one partial per backend
 /// language (Particles.Hlsl.cs and friends), including the draw-side vertex and pixel shaders consumed
@@ -48,7 +48,7 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
     /// <summary>Upper bound on simultaneously simulated particles. One compaction thread per slot, so this is also the dispatch width.</summary>
     public const uint Capacity = 32768;
 
-    /// <summary>实际分配和派发预算，构造后不可改变；默认保持旧容量。</summary>
+    /// <summary>Actual allocation and dispatch budget, immutable after construction; defaults to retaining the legacy capacity.</summary>
     public uint ParticleBudget { get; }
 
     public ParticleSystemEffect() : this(Capacity) { }
@@ -59,10 +59,10 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
         ParticleBudget = particleBudget;
     }
 
-    /// <summary>关闭时不派发也不提交旧间接参数；默认开启以保持旧调用行为。</summary>
+    /// <summary>When disabled, neither dispatches nor submits the legacy indirect arguments; enabled by default to preserve the legacy call behavior.</summary>
     public bool Enabled = true;
     Vector3? _worldOrigin;
-    /// <summary>非空时生成盒固定在世界位置；为空时保持旧的相机跟随行为。</summary>
+    /// <summary>When non-null, the spawn box is fixed at a world position; when null, keeps the legacy camera-following behavior.</summary>
     public Vector3? WorldOrigin
     {
         get => _worldOrigin;
@@ -72,10 +72,10 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
             _worldOrigin = value;
         }
     }
-    /// <summary>世界锚定的周期场在相机周围选取窗口；只搬运边缘粒子，不平移整个场。</summary>
+    /// <summary>The world-anchored periodic field selects a window around the camera; it only wraps edge particles rather than translating the whole field.</summary>
     public bool CameraWindow;
     float _viewDistance;
-    /// <summary>近景可见距离（米）；最后四分之一距离平滑淡出。0 保持原来的无限距离。</summary>
+    /// <summary>Near-view visible distance (meters); smoothly fades out over the final quarter of the distance. 0 keeps the original infinite distance.</summary>
     public float ViewDistance
     {
         get => _viewDistance;
@@ -85,10 +85,10 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
             _viewDistance = value;
         }
     }
-    /// <summary>密度门槛前的 0.02 区间渐显，避免天气过渡时整颗粒子突然出现；默认关闭。</summary>
+    /// <summary>Fades in over the 0.02 band ahead of the density threshold, preventing particles from popping in wholesale during weather transitions; disabled by default.</summary>
     public bool SoftDensity;
     Vector3 _windVelocity;
-    /// <summary>恒定漂移速度（米/秒），不同于随年龄积分的加速度。</summary>
+    /// <summary>Constant drift velocity (meters/second), distinct from the acceleration integrated against age.</summary>
     public Vector3 WindVelocity
     {
         get => _windVelocity;
@@ -98,15 +98,15 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
     static void ValidateVector(Vector3 value, string name)
     {
         if (!float.IsFinite(value.X) || !float.IsFinite(value.Y) || !float.IsFinite(value.Z))
-            throw new ArgumentOutOfRangeException(name, "粒子空间参数必须有限。");
+            throw new ArgumentOutOfRangeException(name, "Particle space parameters must be finite.");
     }
-    /// <summary>独立种子，仅低 24 位参与，保证四端 float 常量可精确传递。</summary>
+    /// <summary>Independent seed; only the low 24 bits participate, ensuring the float constant transfers exactly across all four backends.</summary>
     public uint Seed;
-    /// <summary>区域约束，null 表示无约束；空场表示无降水。</summary>
+    /// <summary>Regional constraint; null means unconstrained, an empty field means no precipitation.</summary>
     public WeatherField? Weather;
-    /// <summary>区域场的降水通道：1=雨，2=雪。</summary>
+    /// <summary>Precipitation channel of the regional field: 1 = rain, 2 = snow.</summary>
     public int WeatherChannel = 1;
-    /// <summary>启用外部帧时间，未 Advance 时冻结；不会重复消费上一帧的时间。</summary>
+    /// <summary>Enables external frame time; frozen until Advance is called, and never consumes the previous frame's time twice.</summary>
     public bool ExternalTime;
     float _pendingDelta;
 
@@ -117,19 +117,20 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
     }
 
     /// <summary>
-    /// 把累积相位归零。唯一的调用方是逐像素 A/B 的取证钩子。
+    /// Zeroes the accumulated phase. Its only caller is the per-pixel A/B forensics hook.
     ///
-    /// 相位回答的是"这个系统已经记录了多久"，而记录是从粒子系统被创建那一刻开始的 ——
-    /// 创建时机取决于异步加载，两次运行可以差出几十帧。这个偏移不会随帧数收敛：等到第几帧，
-    /// 两边的雨雪都错开同样的距离，画面里那一大片落区于是永远对不上。
-    /// 归零会让粒子瞬移一次，但取证要的是可复现，不是连续。正常运行路径不调用它。
+    /// The phase answers "how long has this system been recording", and recording starts the moment the particle system is created --
+    /// the creation timing depends on asynchronous loading, so two runs can differ by dozens of frames. This offset does not
+    /// converge with frame count: by any given frame, both sides' rain and snow are shifted by the same distance, so that large
+    /// precipitation region in the image never lines up.
+    /// Zeroing makes particles teleport once, but forensics wants reproducibility, not continuity. The normal running path does not call it.
     /// </summary>
     public void ResetPhase()
     {
         _phase = 0f;
         _pendingDelta = 0f;
-        // 外部喂时间时 _lastSeconds 不参与运算，但内部计时那条路径会用它算 delta；
-        // 不同步更新的话，归零后的第一帧会算进"从上次记录到现在的全部墙钟时间"。
+        // When time is fed externally, _lastSeconds is not used in the computation, but the internal-timing path uses it to compute delta;
+        // without synchronizing it, the first frame after zeroing would count in "the entire wall-clock time since the last recording".
         _lastSeconds = _clock.Elapsed.TotalSeconds;
     }
 
@@ -149,12 +150,12 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
     double _lastSeconds;
     float _phase;
     bool _ready;
-    // 上一帧提交是否失败。Draw 返回 false 有多种合法成因（Pass 身份不符、PSO 仍在异步烘焙），
-    // 单帧失败不值得记，但连续失败意味着这套系统整场一帧都没画出来——而每帧都报会把日志刷满。
-    // 所以只在翻转时各记一次。
+    // Whether the previous frame's submission failed. Draw returning false has several legitimate causes (pass identity mismatch, PSO still being asynchronously compiled),
+    // a single-frame failure is not worth logging, but consecutive failures mean this system has not drawn a single frame all session -- and reporting every frame would flood the log.
+    // So log once on each flip.
     bool _submitFailed;
-    // 是否已进入 FrameSchedule 的提交表。Initialize 可能在加表之前就失败回退，
-    // 那时 Dispose 不能去移除一个从未加入的条目。
+    // Whether the system has entered FrameSchedule's submitter table. Initialize may fail and bail out before registering,
+    // and in that case Dispose must not remove an entry that was never added.
     bool _routed;
 
     /// <summary>Fraction of the capacity allowed to survive the density gate, in [0,1]. The rejection happens on the GPU, so lowering it costs no draw calls.</summary>
@@ -207,48 +208,95 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
     public float Stretch;
 
     /// <summary>
-    /// 曲线模式：外观随归一化年龄变化，而不是整个系统共用一个常量。
-    /// 打开后压缩阶段把实例记录的 rgb 改写成两枚稳定随机数（顶点阶段据此选两段颜色梯度与初始转角），
-    /// 所以 <see cref="Color"/> 的 rgb 变成梯度起点，只有 alpha 仍是覆盖度。
-    /// 关掉时两端都走原来的路径，一帧的输出与扩容前逐位相同。
+    /// Curve mode: appearance varies with normalized age rather than sharing one constant across the whole system.
+    /// When enabled, the compaction stage rewrites the instance record's rgb into two stable random numbers (the vertex stage uses them to pick the two-segment color gradient and the initial spin angle),
+    /// so <see cref="Color"/>'s rgb becomes the gradient start, and only alpha remains the coverage.
+    /// When disabled, both ends take the original path and a frame's output is bit-identical to before the extension.
     /// </summary>
     public bool CurveMode;
 
-    /// <summary>出生点落在水平面上均匀分布的圆盘里，而不是方盒里。与曲线模式相互独立。</summary>
+    /// <summary>Spawn points land in a disk uniformly distributed on the horizontal plane rather than in a box. Independent of curve mode.</summary>
     public bool SpawnDisk;
 
-    /// <summary>圆盘半径（米），仅在 <see cref="SpawnDisk"/> 打开时参与压缩。</summary>
+    /// <summary>Disk radius (meters); only participates in compaction when <see cref="SpawnDisk"/> is enabled.</summary>
     public float SpawnRadius = 1f;
 
     /// <summary>
-    /// 径向速度（米/秒），沿出生点到圆心的连线方向持续外扩：烟柱因此越升越宽，
-    /// 火焰用负值让火舌向中轴收拢。与风速一样是恒定速度，不是加速度。
+    /// Radial velocity (meters/second), continuously expanding outward along the line from the spawn point to the disk center: smoke columns therefore widen as they rise,
+    /// and fire uses a negative value to pull the flame tongues toward the center axis. Like wind velocity, it is a constant velocity, not an acceleration.
     /// </summary>
     public float Spread;
 
     /// <summary>
-    /// 低频摆动的幅度（米/秒）；两轴各一条不同频率的正弦，位移随年龄线性增长。
-    /// 仍然是对年龄的闭式函数，不引入任何跨帧状态。
+    /// Amplitude of low-frequency sway (meters/second); one sine of different frequency per axis, with displacement growing linearly with age.
+    /// It is still a closed-form function of age and introduces no cross-frame state.
     /// </summary>
     public float Turbulence;
 
-    /// <summary>寿命结束时的公告板半尺寸（米）；起点仍是 <see cref="ParticleSize"/>。</summary>
+    /// <summary>Billboard half-extent at the end of the lifetime (meters); the start is still <see cref="ParticleSize"/>.</summary>
     public float SizeEnd;
 
-    /// <summary>寿命中点的颜色，与 <see cref="Color"/>（起点）和 <see cref="ColorEnd"/> 组成两段线性梯度。</summary>
+    /// <summary>Color at the lifetime midpoint; together with <see cref="Color"/> (start) and <see cref="ColorEnd"/> it forms a two-segment linear gradient.</summary>
     public Vector3 ColorMid = Vector3.One;
 
-    /// <summary>寿命终点的颜色。</summary>
+    /// <summary>Color at the end of the lifetime.</summary>
     public Vector3 ColorEnd = Vector3.One;
 
     /// <summary>
-    /// 加法混合：保留 rgb 而把 alpha 压到 0，在既有的 One/InvSrcAlpha PSO 下就是纯加法。
-    /// 火焰与火星用它在亮部堆出饱和的白心，不需要第二套 PSO。
+    /// Additive blend: keeps rgb and drives alpha to 0, which under the existing One/InvSrcAlpha PSO is pure additive.
+    /// Fire and sparks use it to build a saturated white core in the highlights without needing a second PSO.
     /// </summary>
     public bool Additive;
 
-    /// <summary>亚像素噪声强度，0 表示平滑的径向衰减；仅在曲线模式下参与着色。</summary>
+    /// <summary>Sub-pixel noise strength; 0 means a smooth radial falloff; only participates in shading under curve mode.</summary>
     public float NoiseAmount;
+
+    /// <summary>
+    /// Rectangular spawn: spawn points land on a band centered on the spawn point and extending along <see cref="SpawnAxis">,
+    /// rather than in a box or disk. Used for the kind of emitting surface -- such as a waterfall lip -- where "one edge hangs down as a whole".
+    /// When opened together with <see cref="SpawnDisk">, the disk takes priority; the two do not stack.
+    /// </summary>
+    public bool SpawnRect;
+
+    /// <summary>Direction of the spawn axis within the horizontal plane (x/z), not required to be normalized; falls back to (0,1), i.e. extending along +Z, when too short.</summary>
+    public Vector2 SpawnAxis = new(0, 1);
+
+    /// <summary>Half-length of the rectangular spawn along the axis (meters); only participates in compaction when <see cref="SpawnRect"> is enabled.</summary>
+    public float SpawnHalfLength = 1f;
+
+    /// <summary>Half-depth of the rectangular spawn perpendicular to the axis (meters); only participates in compaction when <see cref="SpawnRect"> is enabled.</summary>
+    public float SpawnHalfDepth = 0.25f;
+
+    /// <summary>
+    /// Initial velocity of the rectangular spawn (meters/second): the whole band shares one direction, so a waterfall is a whole sheet of water flung downward.
+    /// The phase's closed-form velocity -- "deriving speed from the drop height" -- is no longer added on top, so this value is the actual initial velocity;
+    /// acceleration and wind velocity are still integrated as usual. The other spawn shapes do not read it.
+    /// </summary>
+    public Vector3 InitialVelocity;
+
+    /// <summary>
+    /// Cone jitter: randomly deflects the initial velocity direction in 3D, by an amount of |InitialVelocity| x this value.
+    /// 0 means the whole band is perfectly aligned (crisp edges); above 0 the water curtain gradually spreads out.
+    /// </summary>
+    public float ConeJitter;
+
+    /// <summary>Speed jitter: each particle's velocity magnitude is randomly scaled within 1 +/- this value/2; 0 means no jitter.</summary>
+    public float SpeedJitter;
+
+    /// <summary>Floor height (meters); only participates in compaction when <see cref="DieOnFloor"> is enabled.</summary>
+    public float FloorY;
+
+    /// <summary>
+    /// Die on floor: particles whose integrated position falls below <see cref="FloorY"> are not emitted that frame, so splashes vanish
+    /// as soon as they hit the ground rather than passing beneath it. Disabled by default; the legacy path's instance set is bit-identical.
+    /// </summary>
+    public bool DieOnFloor;
+
+    /// <summary>
+    /// Toon edge width (as a fraction of the billboard radius, 0..0.5): compresses the smooth radial falloff into a crisp circular edge.
+    /// 0 means disabled, the fragment stage takes no new branch, so the default render output is bit-identical to before the extension.
+    /// </summary>
+    public float ToonEdge;
 
     public override string Name => "particles";
 
@@ -256,7 +304,7 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
 
     public override bool Initialize(IGraphics g)
     {
-        if (_graphics != null) throw new InvalidOperationException("粒子系统已经初始化。");
+        if (_graphics != null) throw new InvalidOperationException("Particle system is already initialized.");
         if (!g.ComputeSupported || !g.IndirectDrawSupported) return false;
         _graphics = g;
         try
@@ -269,7 +317,7 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
             _frameBuffer = g.CreateStorageBuffer(ParticleDraw.FrameBytes);
             _instances = g.CreateStorageBuffer(ParticleBudget * ParticleInstance.SizeInBytes);
             _regionBuffer = g.CreateStorageBuffer((uint)_regionData.Length * 16);
-            // 这是全工程第一个间接参数缓冲；usage 必须在创建期声明，之后无法加宽。
+            // This is the project's first indirect argument buffer; usage must be declared at creation and cannot be widened afterwards.
             _args = g.CreateStorageBuffer(IndirectDrawIndexedArgs.SizeInBytes,
                 StorageBufferUsage.ComputeAndIndirectArgs);
             _resetResources[0] = _args;
@@ -284,7 +332,7 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
         catch (Exception ex)
         {
             Dispose();
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Particles] 初始化失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Particles] Initialization failed: {ex.Message}");
             return false;
         }
     }
@@ -297,14 +345,14 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
             || _frameBuffer == null) return;
 
         double now = _clock.Elapsed.TotalSeconds;
-        // 首帧与长卡顿都会给出异常 dt；钳位后相位推进最多等于一个落差周期，不会出现整场跳帧。
+        // The first frame and long hitches both produce anomalous dt; after clamping, phase advance is at most one fall cycle, so the whole field never skips.
         float delta = ExternalTime ? _pendingDelta : (float)Math.Clamp(now - _lastSeconds, 0, 0.1);
         _pendingDelta = 0;
         _lastSeconds = now;
         if (!Enabled || _regionBuffer == null) return;
         if (Weather != null)
         {
-            if (WeatherChannel is not (1 or 2)) throw new InvalidOperationException("天气通道必须为雨或雪。");
+            if (WeatherChannel is not (1 or 2)) throw new InvalidOperationException("Weather channel must be rain or snow.");
             bool active = false;
             foreach (var region in Weather.Regions)
                 active |= WeatherChannel == 1 ? region.State.Rain > 0 : region.State.Snow > 0;
@@ -313,11 +361,11 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
             if (!g.TryUpdateStorageBuffer(_regionBuffer, MemoryMarshal.AsBytes(_regionData.AsSpan(0, vectors)))) return;
         }
         float height = MathF.Max(BoxHeight, 0.01f);
-        // 寿命是相位的唯一时标：显式 Lifetime 优先，否则由落差与落速反推，两者都缺则相位冻结。
-        // 这样 shader 侧能把归一化年龄乘回秒数做闭式积分，而相位本身仍然只是 [0,1) 的纯量。
+        // Lifetime is the sole timebase for phase: an explicit Lifetime takes priority, otherwise it is derived from the drop height and fall speed, and if both are missing the phase freezes.
+        // This lets the shader side multiply normalized age back into seconds for the closed-form integral, while the phase itself remains a pure [0,1) scalar.
         float fallSpeed = MathF.Max(FallSpeed, 0);
         float life = Lifetime > 0 ? Lifetime : (fallSpeed > 0 ? height / fallSpeed : 0);
-        // 相位按归一化寿命累积并在 1 处回绕；shader 只在 frac() 与 2*pi 正弦内使用它，回绕因此精确连续。
+        // Phase accumulates in normalized lifetime and wraps at 1; the shader only uses it inside frac() and a 2*pi sine, so the wrap is exactly continuous.
         _phase += life > 0 ? delta / life : 0;
         if (_phase >= 1f) _phase -= MathF.Floor(_phase);
 
@@ -329,7 +377,7 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
         right = Vector3.Normalize(right);
         up = Vector3.Normalize(up);
 
-        // 用未抖动 VP 做剔除与投影：抖动只属于 TAA，粒子位置本身不应随抖动晃动。
+        // Use the unjittered VP for culling and projection: jitter belongs to TAA, and particle positions themselves should not wobble with it.
         var vp = FrameSchedule.UnjitteredRenderViewProjection;
         _frame[0] = new Vector4(vp.M11, vp.M12, vp.M13, vp.M14);
         _frame[1] = new Vector4(vp.M21, vp.M22, vp.M23, vp.M24);
@@ -338,19 +386,37 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
         _frame[4] = new Vector4(right, 0);
         _frame[5] = new Vector4(up, 0);
         _frame[6] = new Vector4(position, 0);
-        // row 7：寿命淡入/淡出、拉伸秒数、近景距离；后两项也参与 compaction。
+        // row 7: lifetime fade-in/fade-out, stretch in seconds, near-view distance; the latter two also participate in compaction.
         _frame[7] = new Vector4(Math.Clamp(FadeIn, 0, 1), Math.Clamp(FadeOut, 0, 1),
             MathF.Max(Stretch, 0), ViewDistance);
-        // rows 8..11：外观曲线与出生形状，见 ParticleDraw.FrameVectorCount 的行义表。
-        // 默认值下这四行里的标志位全为 0，顶点与片元两端都不会进入新分支。
+        // rows 8..11: appearance curve and spawn shape, see the row-meaning table in ParticleDraw.FrameVectorCount.
+        // Under default values the flag bits in these four rows are all 0, so neither the vertex nor the fragment end takes a new branch.
         _frame[8] = new Vector4(Color.X, Color.Y, Color.Z, Additive ? 1f : 0f);
         _frame[9] = new Vector4(ColorMid.X, ColorMid.Y, ColorMid.Z, Math.Clamp(NoiseAmount, 0f, 1f));
         _frame[10] = new Vector4(ColorEnd.X, ColorEnd.Y, ColorEnd.Z,
             float.IsFinite(SizeEnd) ? SizeEnd : 0f);
         _frame[11] = new Vector4(MathF.Max(SpawnRadius, 0f), MathF.Max(Spread, -100f),
             MathF.Max(Turbulence, 0f), CurveMode ? 1f : 0f);
-        // rows 12..15 保持零：那四行是 ribbon 带（闪电通道）的视口与雾参数，粒子路径从不填，
-        // 于是帧缓冲的 ribbon 标志为 0，顶点阶段不进新分支，粒子路径的每个字节与扩容前一致。
+        // rows 12..15 stay zero: those four rows are the viewport and fog parameters of the ribbon
+        // strip (lightning channel), which the particle path never fills, so the frame buffer's
+        // ribbon flag is 0, the vertex stage takes no new branch, and every byte of the particle
+        // path matches the pre-expansion layout.
+        // rows 16..18: spawn-shape extensions (rect spawn / initial velocity and jitter / die on floor
+        // / toon edge), see the row-meaning table.
+        // Under default values bits 32 and 64 of flags are 0 and the hard-edge width is 0, so none of
+        // the four backends read these rows.
+        Vector2 axis = SpawnAxis;
+        float axisLength = axis.Length();
+        // A non-finite or degenerate axis falls back to +Z: the shader assumes the axis is
+        // normalized, otherwise the rectangle collapses into an infinitely thin sliver.
+        if (!(axisLength > 1e-4f) || !float.IsFinite(axisLength)) axis = new Vector2(0, 1);
+        else axis /= axisLength;
+        _frame[16] = new Vector4(InitialVelocity, Math.Clamp(ConeJitter, 0f, 4f));
+        _frame[17] = new Vector4(axis.X, axis.Y, MathF.Max(SpawnHalfLength, 0f), MathF.Max(SpawnHalfDepth, 0f));
+        // The jitter amount is clamped to [0,1], so the speed-magnitude scale lands in [0.5, 1.5]
+        // and can never flip the velocity into the opposite direction.
+        _frame[18] = new Vector4(Math.Clamp(SpeedJitter, 0f, 1f),
+            float.IsFinite(FloorY) ? FloorY : 0f, Math.Clamp(ToonEdge, 0f, 0.5f), 0f);
         if (!g.TryUpdateStorageBuffer(_frameBuffer, MemoryMarshal.AsBytes(_frame.AsSpan()))) return;
 
         Span<float> reset = stackalloc float[4];
@@ -382,14 +448,17 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
         p[9] = Color.Y;
         p[10] = Color.Z;
         p[11] = Color.W;
-        // 密度同时决定 compact 的派发宽度：门控在 shader 侧按下标有序，所以第 ceil(密度×预算)
-        // 个之前的下标必然放行、之后必然被拒，派发后者只是让 GPU 空跑。
-        // p[12] 必须与下面算派发宽度用的是同一个值，否则 CPU 派发的宽度与 shader 判定的前缀对不上。
+        // Density also determines the dispatch width of compact: the gate is index-ordered on the
+        // shader side, so indices before the ceil(density x budget)-th are always admitted and those
+        // after are always rejected; dispatching the latter would only make the GPU spin idly.
+        // p[12] must be the same value used to compute the dispatch width below, otherwise the
+        // CPU's dispatch width and the shader's decided prefix would disagree.
         float density = Math.Clamp(Density, 0f, 1f);
         p[12] = density;
         p[13] = MathF.Max(Sway, 0);
-        // 寿命以秒送进 shader，让 kernel 把 [0,1) 的年龄换算回真实时间做闭式积分；
-        // 0 表示相位冻结，shader 会把时间项整条取零，于是位置与速度都退回不扩展前的结果。
+        // Lifetime is sent to the shader in seconds so the kernel can convert the [0,1) age back to
+        // real time for closed-form integration; 0 means the phase is frozen, and the shader zeroes
+        // out the entire time term, so position and velocity fall back to the pre-expansion result.
         p[14] = life;
         p[15] = Seed & 0x00FFFFFFu;
         p[16] = Acceleration.X;
@@ -397,27 +466,32 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
         p[18] = Acceleration.Z;
         p[19] = Weather?.Count ?? 0;
         p[20] = WindVelocity.X; p[21] = WindVelocity.Y; p[22] = WindVelocity.Z;
-        // 通道低两位：0=无约束，1=雨，2=雪；+4 世界锚定窗口，+8 密度渐显，+16 圆盘出生。
+        // Low two bits of the channel: 0 = unconstrained, 1 = rain, 2 = snow; +4 world-anchored
+        // window, +8 density fade-in, +16 disk spawn, +32 rect spawn, +64 die on floor. The last two
+        // are off by default, so the legacy path's decisions and instance set stay unchanged.
         p[23] = (Weather == null ? 0 : WeatherChannel) + (CameraWindow && WorldOrigin.HasValue ? 4 : 0)
-            + (SoftDensity ? 8 : 0) + (SpawnDisk ? 16 : 0);
+            + (SoftDensity ? 8 : 0) + (SpawnDisk ? 16 : 0) + (SpawnRect ? 32 : 0) + (DieOnFloor ? 64 : 0);
         g.DispatchCompute(new ComputeDispatchArgs
         {
             Kernel = _compact,
             Params = MemoryMarshal.AsBytes(p),
             Resources = _compactResources,
-            // 只派发会放行的那一段下标前缀：候选线程数随密度线性收窄，晴天过渡到小雨时
-            // 派发宽度也是连续变化的，不会出现"密度 0.02 仍按满预算跑"的空转。
-            // 向上取整到整组，组内多出来的下标由 shader 的下标门控自己拒掉。
+            // Dispatch only the index prefix that will be admitted: the candidate thread count
+            // narrows linearly with density, so the dispatch width also changes continuously as clear
+            // weather transitions to light rain, with no idle spinning where "density 0.02 still runs
+            // at full budget". Rounded up to whole groups; the surplus indices in the last group are
+            // rejected by the shader's own index gate.
             GroupsX = (uint)MathF.Ceiling(density * ParticleBudget / CompactGroupSize),
             GroupsY = 1,
             GroupsZ = 1,
         });
-        // 密度为 0 时 GroupsX 也是 0，后端跳过整条派发，args 停在 reset 写的 0：
-        // 本帧明确不画，而不是画一片上一帧已经淘汰的旧实例。
+        // When density is 0, GroupsX is 0 as well, so the backend skips the whole dispatch and args
+        // stays at the 0 written by reset: this frame draws nothing explicitly, rather than drawing a
+        // field of stale instances already culled last frame.
         _ready = true;
     }
 
-    /// <summary>Pass 之外的参数交接，由 FrameSchedule 在开启场景绘制目标前调用；每帧只接受一次。</summary>
+    /// <summary>Hands off parameters outside the pass; called by FrameSchedule before the scene draw target is opened; accepted only once per frame.</summary>
     bool IParticleSubmitter.Prepare(IGraphics g, RenderTarget color)
     {
         if (!_ready) return false;
@@ -435,10 +509,11 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
         if (drawn == _submitFailed)
         {
             _submitFailed = !drawn;
-            // 恢复记 Backend、进入失败记 Error：前者是本该如此，后者需要有人去看。
+            // Recovery logs Backend, entering failure logs Error: the former is expected, the latter
+            // needs someone to look into it.
             DeviceServices.BaseApp.AddLog(drawn ? LogType.Backend : LogType.Error, drawn
-                ? $"[Particles] 间接绘制恢复提交（预算 {ParticleBudget}）。"
-                : $"[Particles] 间接绘制连续未提交（预算 {ParticleBudget}）：本帧管线状态与 Prepare 不一致，这套粒子在整帧缺失。");
+                ? $"[Particles] Indirect draw resumed submission (budget {ParticleBudget})."
+                : $"[Particles] Indirect draw repeatedly failed to submit (budget {ParticleBudget}): this frame's pipeline state is inconsistent with Prepare, and this particle set is missing for the entire frame.");
         }
         return drawn;
     }
@@ -477,18 +552,23 @@ public sealed partial class ParticleSystemEffect : ComputeEffect, IParticleSubmi
     // compact: [0] Params 96B -> b0 / [1] StorageBufferRead regions -> t0
     //          [2] StorageBufferReadWrite instances -> u0 / [3] StorageBufferReadWrite args -> u1
     //          [4] StorageBufferRead frame -> t1
-    // 96B 低于 Vulkan push constant / WebGPU uniform 的跨端 128B 上限。
+    // 96B is below the cross-backend 128B limit of Vulkan push constants / WebGPU uniforms.
 
     /// <summary>
-    /// 单线程改写五个间接参数的 kernel。参数是四个 float：indexCount / instanceCount /
-    /// startIndex / baseVertex；第五个字段 startInstance 恒写 0。
+    /// Single-threaded kernel that rewrites five indirect arguments. The parameters are four floats:
+    /// indexCount / instanceCount / startIndex / baseVertex; the fifth field startInstance is always
+    /// written as 0.
     ///
-    /// 粒子每帧用它把实例计数归零（随后由压缩阶段用原子加抬高），闪电通道每帧用它写入固定的
-    /// 段数。闪电没有走 CPU 上传：间接参数缓冲的 compute-write → indirect-read 这条同步链
-    /// 已经被粒子路径在四端验证过，而 CPU 上传在 Vulkan 上要一道 copy→drawIndirect 的屏障，
-    /// 那条链路从未被验证，写成 CPU 上传会在 VK 上留下一个只在真机才现形的可见性缺口。
+    /// Each frame the particle path uses it to zero the instance count (later raised by the compaction
+    /// stage via atomic add), and the lightning channel uses it to write a fixed segment count.
+    /// Lightning does not go through CPU upload: the compute-write -> indirect-read synchronization
+    /// chain of the indirect argument buffer has already been verified by the particle path on all
+    /// four backends, whereas CPU upload would require a copy->drawIndirect barrier on Vulkan whose
+    /// chain has never been verified; writing it as a CPU upload would leave a visibility gap on VK
+    /// that only shows up on real hardware.
     ///
-    /// Name 只用于编译错误归因与调试标记，两端各传各的，日志里因此能区分是哪套系统在写参数。
+    /// Name is used only for compile-error attribution and debug markers; each backend passes its own,
+    /// so logs can tell which system is writing the arguments.
     /// </summary>
     internal static ComputeKernelDesc CreateArgsKernel(string name) => new()
     {

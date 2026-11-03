@@ -22,7 +22,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         try { return new(new DXFogCompositePipeline(DictionaryDXTexture, true)); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherComposite] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherComposite] creation failed: {ex.Message}");
             return null;
         }
     }
@@ -33,47 +33,58 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         try { return new DXFogCompositePipeline(DictionaryDXTexture); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[FogComposite] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[FogComposite] creation failed: {ex.Message}");
             return null;
         }
     }
 
-    /// <summary>P0 SSR 加法合成：一条全屏绘制把反射增量叠进 SceneColor，没有独立目标。</summary>
+    /// <summary>P0 SSR additive composite: a single fullscreen draw adds the reflection delta into SceneColor, with no independent target.</summary>
     public Season.Rendering.SsrCompositePipeline? CreateSsrCompositePipeline()
     {
         if (!ComputeSupported) return null;
         try { return new DXSsrCompositePipeline(DictionaryDXTexture); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[SsrComposite] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[SsrComposite] creation failed: {ex.Message}");
             return null;
         }
     }
 
-    /// <summary>D1 屏幕空间贴花：只依赖图形阶段的深度采样，不需要 compute，所以没有 ComputeSupported 门控。</summary>
+    /// <summary>D1 screen-space decal: depends only on depth sampling from the graphics stage; it does not need compute, so there is no ComputeSupported gating.</summary>
     public Season.Rendering.DecalPipeline? CreateDecalPipeline()
     {
         try { return new DXDecalPipeline(name => TryGetTexture(name, out var tex) ? tex : null); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] creation failed: {ex.Message}");
             return null;
         }
     }
 
-    /// <summary>P2 水面：与贴花同样只依赖图形阶段（深度采样 + 颜色快照），不需要 compute。</summary>
+    /// <summary>P2 water surface: like the decal, it depends only on the graphics stage (depth sampling + color snapshot) and does not need compute.</summary>
     public Season.Rendering.WaterPipeline? CreateWaterPipeline()
     {
         try { return new DXWaterPipeline(name => TryGetTexture(name, out var tex) ? tex : null); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] creation failed: {ex.Message}");
             return null;
         }
     }
 
-    /// <summary>P2: 场景色快照，供水面在「颜色已是附件」的帧里采样水底。
-    /// 状态收尾由 Device 负责（源回到 RenderTarget、目标转到 PixelShaderResource）。</summary>
+    /// <summary>P1 waterfall curtain: depends only on the graphics stage (depth sampling + color blending), has no refraction snapshot, and likewise does not need compute.</summary>
+    public Season.Rendering.WaterfallPipeline? CreateWaterfallPipeline()
+    {
+        try { return new DXWaterfallPipeline(name => TryGetTexture(name, out var tex) ? tex : null); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Waterfall] creation failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>P2: scene color snapshot, letting the water surface sample the riverbed in frames where "the color is already the attachment".
+    /// Device handles the state finalization (source back to RenderTarget, target to PixelShaderResource).</summary>
     public bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination)
         => DirectX.Device.CopyRenderTarget(source, destination);
 
@@ -565,23 +576,23 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         Season.Rendering.StorageBufferUsage usage = Season.Rendering.StorageBufferUsage.Compute)
         => new DXStorageBuffer(sizeInBytes, usage);
 
-    // ── A0.1 间接绘制（契约在 IGraphics / Indirect.cs）──
-    // D3D12 是四端里唯一需要显式状态转换的：compute 写完后缓冲停在 UnorderedAccess，
-    // 而 ExecuteIndirect 要求 INDIRECT_ARGUMENT。转换只能在 Pass 外做，所以它单独成为一个入口，
-    // 而不是藏在提交里。回程（IndirectArgument -> UnorderedAccess）由 TryDispatchCompute 里的
-    // 门控 TransitionTo 自动完成，状态机因此跨帧自洽。
+    // ── A0.1 indirect draw (contract in IGraphics / Indirect.cs) ──
+    // D3D12 is the only one of the four backends needing an explicit state transition: after compute
+    // writes the buffer stays in UnorderedAccess, while ExecuteIndirect requires INDIRECT_ARGUMENT.
+    // The transition can only be done outside a pass, so it is a separate entry point rather than
+    // hidden inside the submit. The return trip (IndirectArgument -> UnorderedAccess) is completed by the gated TransitionTo in TryDispatchCompute, keeping the state machine self-consistent across frames.
 
     public bool IndirectDrawSupported => ComputeSupported;
 
-    /// <summary>A0.2：间接计算派发。D3D12 的间接绘制与间接派发用的是两条不同的命令签名
-    /// （argument type 不同、字节步长也不同，绘制是 20 字节五段，派发是 12 字节三 uint），
-    /// 所以能力位各管各的；这里与 <see cref="IndirectDrawSupported"/> 同源是因为两者都只依赖 compute。</summary>
+    /// <summary>A0.2: indirect compute dispatch. D3D12 indirect draw and indirect dispatch use two different command signatures
+    /// (different argument types and different byte strides: draw is 20 bytes in five fields, dispatch is 12 bytes in three uints),
+    /// so the capability bits are managed separately; it shares a source with <see cref="IndirectDrawSupported"/> here because both depend only on compute.</summary>
     public bool DispatchIndirectSupported => ComputeSupported;
 
     public bool TryPrepareIndirectArgs(Season.Rendering.StorageBuffer buffer)
     {
         var cmd = DirectX.Device.GraphicsCommandList;
-        // ActiveTarget 非空即处于 Pass 内，此时录制 barrier 违反 PassDesc 契约，宁可放弃本帧间接提交。
+        // A non-null ActiveTarget means we are inside a pass; recording a barrier then would violate the PassDesc contract, so it is better to skip this frame's indirect submit.
         if (cmd == null || DirectX.Device.ActiveTarget != null
             || buffer is not DXStorageBuffer dxBuffer || dxBuffer.Resource == null
             || dxBuffer.Usage != Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs
@@ -591,14 +602,14 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         return true;
     }
 
-    /// <summary>间接实例化四边形绘制管线。创建失败即返回 null，粒子效果据此整体不注册，画面退回改动前。</summary>
+    /// <summary>Indirect instanced quad draw pipeline. Returns null on creation failure, which makes the particle effect skip registration entirely and the image fall back to its pre-change state.</summary>
     public Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline()
     {
         if (!IndirectDrawSupported || DirectX.Device.D3dDevice == null) return null;
         try { return new DXParticleDrawPipeline(); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Particles] D3D12 管线创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Particles] D3D12 pipeline creation failed: {ex.Message}");
             return null;
         }
     }
@@ -746,8 +757,8 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         var kernel = (DXComputeKernel)args.Kernel;
         var bindings = kernel.Desc.Bindings;
 
-        // A0.2 的准入放在最前面而不是派发点：校验放在绑定循环之后的话，失败时前面已经做了一堆
-        // 状态转换，虽然幂等无害，但会让"这一帧什么都没发生"这件事变得更难在抓帧里读懂。
+        // A0.2 admission is placed up front rather than at the dispatch point: if the validation came after the binding loop,
+        // a failure would already have performed a bunch of state transitions; though idempotent and harmless, it makes "nothing happened this frame" harder to read in a capture.
         DXStorageBuffer indirect = null;
         if (args.IsIndirect)
         {
@@ -888,15 +899,18 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
         if (indirect != null)
         {
-            // 组数由 GPU 写在参数块里。缓冲刚被上游内核写过、停在 UnorderedAccess，而 ExecuteIndirect
-            // 要求 INDIRECT_ARGUMENT；UNORDERED_ACCESS 转出的状态屏障本身就把之前的 UAV 写排到前面，
-            // 所以这里不需要再补一条 UAV barrier。
+            // The group count is written into the parameter block by the GPU. The buffer was just written by an upstream kernel
+            // and sits in UnorderedAccess, while ExecuteIndirect requires INDIRECT_ARGUMENT; the state barrier coming out of
+            // UNORDERED_ACCESS already orders the preceding UAV writes ahead, so no extra UAV barrier is needed here.
             indirect.TransitionTo(cmd, ResourceStates.IndirectArgument);
             cmd->ExecuteIndirect(DirectX.Device.EnsureDispatchCommandSignature(),
                 1, indirect.Resource, args.ArgumentsOffset, null, 0);
         }
-        else
+        else if (args.GroupsX != 0u && args.GroupsY != 0u && args.GroupsZ != 0u)
         {
+            // A group count of 0 means this dispatch is skipped entirely this frame (typically when particle density is 0):
+            // on Vulkan/Metal/WebGPU it is a no-op, but D3D12 treats 0 groups as a validation error (MessageIDEmptyDispatch).
+            // The state restoration below must still run, otherwise indirect draws in the same frame would read the wrong resource state.
             cmd->Dispatch(args.GroupsX, args.GroupsY, args.GroupsZ);
         }
 
@@ -2702,7 +2716,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     }
 
     // ============================================================
-    // InstancedModel（GLB GPU Instancing）
+    // InstancedModel (GLB GPU Instancing)
     // ============================================================
 
     public async Task<bool> LoadInstancedModel(InstancedModel model)
@@ -3134,6 +3148,11 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             ClearDepthEnable = false,
             StoreDepth = false,
         });
+
+        // The mask pass writes root constant b6 (index 20) inside DrawOutlineMask before the first
+        // Pipeline.SetPipeline call, so the main RootSignature must be bound here; otherwise the
+        // 2-parameter root signature left by the particle / 2D pipelines of the preceding pass leaks in.
+        Pipeline.BeginOutlineMaskPass();
 
         for (int i = 0; i < drawGroups.Count; i++)
         {

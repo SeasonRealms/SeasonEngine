@@ -741,7 +741,7 @@ fragment float4 blit_fs_outline_composite(BlitVSOut vsOut [[stage_in]],
     }
 }
 
-/// <summary>单颜色、无深度的 HDR 雾合成；每次 Draw 重绑资源并快照小参数。</summary>
+/// <summary>Single-color, depthless HDR fog composite; each Draw rebinds resources and snapshots the small parameters.</summary>
 internal sealed class MTLFogCompositePipeline : FogCompositePipeline
 {
     readonly bool _weather;
@@ -760,7 +760,7 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
     readonly record struct Resources(IMTLBuffer Frame, IMTLTexture Integrated, IMTLTexture Local,
         IMTLTexture Color, IMTLTexture Depth, IMTLTexture Ao, IMTLTexture Destination)
     {
-        // 同时比较托管身份与有效原生句柄，Resize 后不能误认复用的原生地址。
+        // Compare both managed identity and valid native handles; after Resize, a reused native address must not be mistaken for the same one.
         internal bool Same(in Resources other) => ReferenceEquals(Frame, other.Frame)
             && ReferenceEquals(Integrated, other.Integrated) && ReferenceEquals(Local, other.Local)
             && ReferenceEquals(Color, other.Color) && ReferenceEquals(Depth, other.Depth)
@@ -778,9 +778,9 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
             var vsLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, VolumetricFogEffect.CompositeVertexMsl);
             var fsLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, _weather ? WeatherShaders.CompositeMsl : VolumetricFogEffect.CompositeMsl);
             using var vs = vsLibrary.CreateFunction("VSMain")
-                ?? throw new InvalidOperationException("未找到雾合成顶点入口。");
+                ?? throw new InvalidOperationException("Fog composite vertex entry point not found.");
             using var fs = fsLibrary.CreateFunction("PSMain")
-                ?? throw new InvalidOperationException("未找到雾合成片元入口。");
+                ?? throw new InvalidOperationException("Fog composite fragment entry point not found.");
             using var desc = new MTLRenderPipelineDescriptor
             {
                 Label = _weather ? "Season-WeatherComposite" : "Season-FogComposite", VertexFunction = vs, FragmentFunction = fs,
@@ -790,32 +790,32 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
             desc.ColorAttachments[0].PixelFormat = MTLPixelFormat.RGBA16Float;
             desc.ColorAttachments[0].BlendingEnabled = false;
             _pipeline = Device.MtlDevice.CreateRenderPipelineState(desc, out Foundation.NSError? error)
-                ?? throw new InvalidOperationException($"雾合成 PSO 创建失败：{error?.LocalizedDescription}");
+                ?? throw new InvalidOperationException($"Fog composite PSO creation failed: {error?.LocalizedDescription}");
             using var depth = new MTLDepthStencilDescriptor
             {
                 DepthCompareFunction = MTLCompareFunction.Always, DepthWriteEnabled = false,
             };
             _depthState = Device.MtlDevice.CreateDepthStencilState(depth)
-                ?? throw new InvalidOperationException("雾合成深度状态创建失败。");
+                ?? throw new InvalidOperationException("Fog composite depth state creation failed.");
         }
         catch { Dispose(); throw; }
         if (!_weather) Current = this;
     }
 
-    /// <summary>本进程唯一的雾合成管线。透明阶段要靠它拿到本帧刚积分出的体积纹理，
-    /// 与 VK/DX “合成成功后才发布颜色源”的时序一致。
-    /// 帧调度层只会创建一个雾效果，因此这里不需要列表。</summary>
+    /// <summary>The only fog composite pipeline in this process. The transparent stage relies on it to obtain the volumetric texture just integrated this frame,
+    /// consistent with the VK/DX timing of "publishing the color source only after a successful composite".
+    /// The frame scheduler layer creates only one fog effect, so no list is needed here.</summary>
     internal static MTLFogCompositePipeline? Current { get; private set; }
 
-    // 本帧已成功合成的体积资源。它们只在 Draw 成功之后写入，并且在 Prepare 与 Draw 的入口处清空：
-    // 于是“合成没发生”或“合成失败”两种情况下它都是空的，透明阶段就不会去采样一张过期的体积。
+    // The volumetric resources successfully composited this frame. They are written only after a successful Draw, and cleared at the entry of Prepare and Draw:
+    // thus in both cases of "no composite happened" or "composite failed" they are empty, and the transparent stage will not sample a stale volume.
     IMTLBuffer? _transparentFrame;
     IMTLTexture? _transparentIntegrated;
     IMTLTexture? _transparentLocal;
 
-    /// <summary>取本帧已成功合成的雾采样三件套；返回 false 时透明阶段保持零门控。
-    /// 调用方（MTLSceneDrawCollection.DrawTransparent）只在帧调度器宣告合成成功时才会走到这里，
-    /// 两重条件必须同时成立才采样，避免把上一帧的体积当成这一帧的。</summary>
+    /// <summary>Fetch the three fog sampling resources successfully composited this frame; when it returns false the transparent stage stays zero-gated.
+    /// The caller (MTLSceneDrawCollection.DrawTransparent) only reaches here when the frame scheduler declares a successful composite,
+    /// and both conditions must hold for sampling, to avoid treating the previous frame's volume as this frame's.</summary>
     internal static bool TryGetTransparentBinding(out IMTLBuffer? frame, out IMTLTexture? integrated, out IMTLTexture? local)
     {
         var pipeline = Current;
@@ -899,7 +899,7 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
         _command = null;
         _inputs = default;
         _prepared = default;
-        // 透明阶段的采样资源跟 Prepare/Draw 走：入口清空，只有 Draw 成功才重新发布。
+        // The transparent stage's sampling resources follow Prepare/Draw: cleared at the entry, republished only on a successful Draw.
         _transparentFrame = null;
         _transparentIntegrated = null;
         _transparentLocal = null;
@@ -911,7 +911,7 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
         var command = Device.GraphicsCommandBuffer;
         if (_disposed || Device.GraphicsEncoder != null || command == null || command.Handle == IntPtr.Zero
             || destination is not MTLRenderTarget target || !Resolve(inputs, target, out var resources)) return false;
-        // Metal 默认 hazard tracking 处理前一个 Compute encoder 的写入依赖。
+        // Metal's default hazard tracking handles the write dependency of the preceding Compute encoder.
         _inputs = inputs;
         _destination = target;
         _prepared = resources;
@@ -948,9 +948,9 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
         encoder.SetFragmentTexture(resources.Ao, 4);
         encoder.DrawPrimitives(MTLPrimitiveType.Triangle, 0, 3);
 
-        // 本帧合成已成功：把体积资源交给紧随其后的透明阶段。
-        // 颜色源已经发布给 FrameSchedule，透明阶段的颜色附件就是这张合成目标，
-        // 而两张体积只读，不构成对附件的同时读写。
+        // The composite succeeded this frame: hand the volumetric resources to the immediately following transparent stage.
+        // The color source has already been published to FrameSchedule, and the transparent stage's color attachment is this composite target,
+        // while the two volumes are read-only, so there is no simultaneous read-write of the attachment.
         if (!_weather)
         {
             _transparentFrame = resources.Frame;
@@ -966,17 +966,17 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
         _disposed = true;
         ClearPrepared();
         if (ReferenceEquals(Current, this)) Current = null;
-        // 已编码资源由 command buffer 持有；未编码的准备结果已经失效。
+        // Encoded resources are held by the command buffer; unencoded preparation results are already invalid.
         _pipeline?.Dispose(); _pipeline = null;
         _depthState?.Dispose(); _depthState = null;
     }
 }
 
 /// <summary>
-/// P0 SSR 加法合成：把 <see cref="SsrEffect"/> 算出的反射增量叠进 SceneColor。
-/// 增量在核里已经是最终值（含 (1-r)²、反射权重与置信度），这里不做任何权重重算 ——
-/// 两处各算一遍 Fresnel 与粗糙度，口径迟早会分叉。
-/// 因此只剩一条全屏三角形 + One/One 混合：不新开目标、不清屏、无深度附件。
+/// P0 SSR additive composite: blends the reflection increment computed by <see cref="SsrEffect"/> into SceneColor.
+/// The increment is already the final value in the kernel (including (1-r)², reflection weight, and confidence), and no weight is recomputed here ——
+/// computing Fresnel and roughness once in each place would eventually diverge.
+/// So all that remains is a single full-screen triangle + One/One blending: no new target, no clear, no depth attachment.
 /// </summary>
 internal sealed class MTLSsrCompositePipeline : SsrCompositePipeline
 {
@@ -984,8 +984,8 @@ internal sealed class MTLSsrCompositePipeline : SsrCompositePipeline
 #include <metal_stdlib>
 using namespace metal;
 
-// 顶点着色器把全屏三角形铺满目标，position.xy 就是像素中心；
-// read 按整数像素取增量，不需要采样器，也不会因为半像素偏移取到邻位。
+// The vertex shader tiles the full-screen triangle across the target, and position.xy is the pixel center;
+// read fetches the increment by integer pixel, needing no sampler and never hitting a neighboring texel due to a half-pixel offset.
 fragment float4 PSMain(float4 position [[position]], texture2d<float> reflectionDelta [[texture(0)]]) {
     return float4(reflectionDelta.read(uint2(position.xy)).rgb, 0.0);
 }
@@ -1003,7 +1003,7 @@ fragment float4 PSMain(float4 position [[position]], texture2d<float> reflection
 
     readonly record struct Resources(IMTLTexture Delta, IMTLTexture Destination)
     {
-        // 同时比较托管身份与有效原生句柄，Resize 后不能误认复用的原生地址。
+        // Compare both managed identity and valid native handles; after Resize, a reused native address must not be mistaken for the same one.
         internal bool Same(in Resources other) => ReferenceEquals(Delta, other.Delta)
             && ReferenceEquals(Destination, other.Destination);
     }
@@ -1016,9 +1016,9 @@ fragment float4 PSMain(float4 position [[position]], texture2d<float> reflection
             var vsLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, VolumetricFogEffect.CompositeVertexMsl);
             var fsLibrary = MTLShaderCompiler.Compile(Device.MtlDevice, Msl);
             using var vs = vsLibrary.CreateFunction("VSMain")
-                ?? throw new InvalidOperationException("未找到 SSR 合成顶点入口。");
+                ?? throw new InvalidOperationException("SSR composite vertex entry point not found.");
             using var fs = fsLibrary.CreateFunction("PSMain")
-                ?? throw new InvalidOperationException("未找到 SSR 合成片元入口。");
+                ?? throw new InvalidOperationException("SSR composite fragment entry point not found.");
             using var desc = new MTLRenderPipelineDescriptor
             {
                 Label = "Season-SsrComposite", VertexFunction = vs, FragmentFunction = fs,
@@ -1027,8 +1027,8 @@ fragment float4 PSMain(float4 position [[position]], texture2d<float> reflection
             };
             var color = desc.ColorAttachments[0];
             color.PixelFormat = MTLPixelFormat.RGBA16Float;
-            // 加法：场景色是 rgba16float，负增量（反射比被反射的天空暗）也能正确压暗。
-            // alpha 恒写 0，所以 alpha 槽的 One/One 只是让目标 alpha 保持不变。
+            // Additive: the scene color is rgba16float, so a negative increment (reflection darker than the reflected sky) can also darken correctly.
+            // alpha always writes 0, so the One/One in the alpha slot merely keeps the target alpha unchanged.
             color.BlendingEnabled = true;
             color.RgbBlendOperation = MTLBlendOperation.Add;
             color.AlphaBlendOperation = MTLBlendOperation.Add;
@@ -1037,13 +1037,13 @@ fragment float4 PSMain(float4 position [[position]], texture2d<float> reflection
             color.SourceAlphaBlendFactor = MTLBlendFactor.One;
             color.DestinationAlphaBlendFactor = MTLBlendFactor.One;
             _pipeline = Device.MtlDevice.CreateRenderPipelineState(desc, out Foundation.NSError? error)
-                ?? throw new InvalidOperationException($"SSR 合成 PSO 创建失败：{error?.LocalizedDescription}");
+                ?? throw new InvalidOperationException($"SSR composite PSO creation failed: {error?.LocalizedDescription}");
             using var depth = new MTLDepthStencilDescriptor
             {
                 DepthCompareFunction = MTLCompareFunction.Always, DepthWriteEnabled = false,
             };
             _depthState = Device.MtlDevice.CreateDepthStencilState(depth)
-                ?? throw new InvalidOperationException("SSR 合成深度状态创建失败。");
+                ?? throw new InvalidOperationException("SSR composite depth state creation failed.");
         }
         catch { Dispose(); throw; }
     }
@@ -1052,7 +1052,7 @@ fragment float4 PSMain(float4 position [[position]], texture2d<float> reflection
         && texture.Handle != IntPtr.Zero && texture.TextureType == type && texture.SampleCount == 1
         && texture.Width > 0 && texture.Height > 0 && (texture.Usage & MTLTextureUsage.ShaderRead) != 0;
 
-    // 只接受生产者已经写好的增量纹理，不在 Pass 内补屏障 —— Metal 的 hazard tracking 负责这条依赖。
+    // Only accepts the increment texture the producer has already written, and does not add a barrier inside the Pass —— Metal's hazard tracking handles this dependency.
     bool Resolve(in SsrCompositeInputs inputs, MTLRenderTarget destination, out Resources resources)
     {
         resources = default;
@@ -1070,7 +1070,7 @@ fragment float4 PSMain(float4 position [[position]], texture2d<float> reflection
         lock (_textures) _textures.TryGetValue(inputs.ReflectionTexture, out texture);
         if (texture == null || !Volatile.Read(ref texture.Ready)) return false;
         var delta = texture.Image;
-        // 尺寸必须与场景色一致：增量是按像素写的，尺寸不符只能说明这一帧的核没按当前分辨率跑。
+        // The size must match the scene color: the increment is written per pixel, and a size mismatch can only mean this frame's kernel did not run at the current resolution.
         if (!Readable(delta, MTLTextureType.k2D) || delta!.PixelFormat != MTLPixelFormat.RGBA16Float
             || delta.Handle == dst.Handle || delta.Width != dst.Width || delta.Height != dst.Height)
             return false;

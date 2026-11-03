@@ -5,25 +5,33 @@
 namespace Season.Rendering.Effects;
 
 /// <summary>
-/// P3 Hi-Z 深度金字塔：把 SceneDepth 逐级 2×2 取最近深度，压成 <see cref="LevelCount"/> 级单通道链，
-/// 供屏幕空间反射的射线步进整块跳过空区域。
+/// P3 Hi-Z depth pyramid: reduces SceneDepth level by level with 2x2 nearest-depth, compressing it into
+/// a <see cref="LevelCount"/>-level single-channel chain that lets screen-space reflection's ray march
+/// skip empty regions in whole blocks.
 ///
-/// 为什么停在 1/16 而不是做到 1×1：金字塔的用途是"一个 texel 覆盖多少屏幕"，不是深度精度。
-/// 屏幕空间射线能走多远由它在屏幕上还剩多少距离决定，1/16 的一块已经是一个 1920 宽画面上的 120 像素，
-/// 再往下的级别在射线的有效长度里只剩一两步，省下的带宽抵不上多出来的绑定槽。
+/// Why stop at 1/16 instead of going all the way to 1x1: the pyramid is about "how much screen does one
+/// texel cover", not depth precision. How far a screen-space ray can travel is determined by how much
+/// screen distance it has left; a 1/16 block is already 120 pixels on a 1920-wide image, and deeper
+/// levels leave only one or two steps within the ray's effective length, so the bandwidth saved does not
+/// cover the extra binding slots.
 ///
-/// 存的值是 NDC 深度的**最小值**（最近表面）：步进时只要射线自身的深度还没越过整块的最小值，
-/// 就说明这一块里没有任何表面挡在射线前面，可以整块跳过；一旦越过，才降到更细的一级去逼近交点。
+/// The stored value is the **minimum** NDC depth (nearest surface): while marching, as long as the ray's
+/// own depth has not passed a block's minimum, no surface in that block blocks the ray and the whole
+/// block can be skipped; only once it passes does the march descend to a finer level to approach the
+/// intersection.
 ///
-/// 每帧重建而不是复用上一帧：金字塔的用途是"这次步进往哪走"，用旧深度会让快速运动的相机把反射
-/// 钉在上一帧的物体上。四级的成本加起来不到一次全屏拷贝。
+/// Rebuilt every frame rather than reusing the previous one: the pyramid is about "where this march
+/// should go", and stale depth would pin reflections onto last frame's objects for a fast-moving camera.
+/// The four levels together cost less than one full-screen copy.
 ///
-/// 注册顺序契约：消费方按名字采样这几张纹理，本效果必须先完成本帧的重建。
-/// 顺序反了不会读到脏数据 —— 消费方在入口检查 <see cref="Ready"/>，
-/// 表现为"本帧不画反射"，而不是采样上一帧残留的金字塔。
+/// Registration-order contract: consumers sample these textures by name, and this effect must complete
+/// this frame's rebuild first. Getting the order wrong does not read stale data -- consumers check
+/// <see cref="Ready"/> at their entry, showing up as "draw no reflection this frame" rather than
+/// sampling last frame's leftover pyramid.
 ///
-/// 只依赖 SceneDepth，不要求 SceneNormal：水面反射用的是自己扰动后的法线（水面根本不写法线目标），
-/// 从深度现场重建的法线在轮廓两侧会翻转，反而会在池沿、岸线糊成一片。
+/// Depends only on SceneDepth, not on SceneNormal: water reflection uses its own perturbed normal (the
+/// water does not write a normal target at all), and a normal reconstructed in place from depth flips on
+/// either side of silhouettes, which would smear along pool edges and shorelines.
 /// </summary>
 public sealed class HiZEffect : ComputeEffect
 {
@@ -33,7 +41,7 @@ public sealed class HiZEffect : ComputeEffect
 
     public static string LevelName(int level) => TextureNamePrefix + level;
 
-    /// <summary>本帧金字塔是否已按当前视图重建完成；水面反射用它做同帧依赖门控。</summary>
+    /// <summary>Whether this frame's pyramid has been rebuilt for the current view; water reflection uses it as a same-frame dependency gate.</summary>
     public static bool Ready { get; private set; }
 
     readonly uint[] _widths = new uint[LevelCount];
@@ -47,21 +55,21 @@ public sealed class HiZEffect : ComputeEffect
 
     public override string Name => "hiZ";
 
-    /// <summary>AfterOpaque：SceneDepth 在场景不透明段结束后才是一次干净的全帧深度。</summary>
+    /// <summary>AfterOpaque: SceneDepth is only a clean full-frame depth after the scene opaque stage ends.</summary>
     public override ComputePhase Phase => ComputePhase.AfterOpaque;
 
     public override ComputeScope Scope => ComputeScope.View;
 
     public override ViewFeature RequiredFeature => ViewFeature.Reflections;
 
-    /// <summary>第 0 级的尺寸（全分辨率的一半）；任一分量为零表示尚未分配。</summary>
+    /// <summary>Size of level 0 (half of full resolution); a zero component means not yet allocated.</summary>
     public uint Level0Width => _widths[0];
 
     public uint Level0Height => _heights[0];
 
     public override bool Initialize(IGraphics g)
     {
-        if (_graphics != null) throw new InvalidOperationException("Hi-Z 金字塔已经初始化。");
+        if (_graphics != null) throw new InvalidOperationException("Hi-Z pyramid is already initialized.");
         if (RenderQuality.Current.ScreenSpaceReflections != SsrMode.HiZ || FrameSchedule.SceneDepth == null) return false;
         var depth = FrameSchedule.SceneDepth;
         if (depth.Desc.DepthFormat != RtFormat.D32Float || depth.Desc.Width == 0 || depth.Desc.Height == 0) return false;
@@ -121,7 +129,8 @@ public sealed class HiZEffect : ComputeEffect
         uint w = width, h = height;
         for (int level = 0; level < LevelCount; level++)
         {
-            // 向上取整：源是奇数时最后一行/列也要被最后一块覆盖到，否则边缘会残留上一帧的深度。
+            // Round up: when the source is odd, the last row/column must still be covered by the last
+            // block, otherwise the edge would retain last frame's depth.
             w = Math.Max(1u, (w + 1u) / 2u);
             h = Math.Max(1u, (h + 1u) / 2u);
             _widths[level] = w;
@@ -209,7 +218,7 @@ public sealed class HiZEffect : ComputeEffect
     // Shader sources (single source of truth; slots follow the class-level binding
     // convention; workgroup is fixed at 8x8x1).
 
-    /// <summary>D3D12 cs_5_0 (fxc; single exit avoids X4000). 第 0 级直接读深度附件，四个角取最小值。</summary>
+    /// <summary>D3D12 cs_5_0 (fxc; single exit avoids X4000). Level 0 reads the depth attachment directly and takes the minimum of the four corners.</summary>
     const string SourceFromDepthHlsl = @"
 cbuffer HiZParams : register(b0)
 {
@@ -227,8 +236,9 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 {
     if (id.x < (uint)uDstWidth && id.y < (uint)uDstHeight)
     {
-        // 源是奇数尺寸时右下角会越界，钳到最后一行/列：重复采样边缘不会把最小值抬高，
-        // 而漏掉它就等于让金字塔的边缘比真实深度更远，射线会从缺口里穿过去。
+        // When the source has odd dimensions the bottom-right corner goes out of bounds; clamp to the
+        // last row/column: sampling the edge repeatedly will not raise the minimum, whereas dropping it
+        // would make the pyramid's edge farther than the true depth and the ray would slip through the gap.
         int2 first = int2(id.xy) * 2;
         int2 last = int2((uint)uSrcWidth - 1u, (uint)uSrcHeight - 1u);
         float d0 = uDepth.Load(int3(min(first, last), 0));
@@ -303,7 +313,7 @@ kernel void CSMain(
 }
 ";
 
-    /// <summary>WebGPU WGSL. 存储格式按引擎的窄格式回退链固定写 rgba16float，读取只取 .x。</summary>
+    /// <summary>WebGPU WGSL. The storage format is pinned to rgba16float by the engine's narrow-format fallback chain, and reads take only .x.</summary>
     const string SourceFromDepthWgsl = @"
 struct HiZParams
 {
@@ -333,7 +343,7 @@ fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
 }
 ";
 
-    /// <summary>D3D12 cs_5_0 (fxc; single exit avoids X4000). 上一级 2×2 取最小。</summary>
+    /// <summary>D3D12 cs_5_0 (fxc; single exit avoids X4000). Takes the minimum over the previous level's 2x2.</summary>
     const string SourceReduceHlsl = @"
 cbuffer HiZParams : register(b0)
 {
@@ -352,7 +362,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 {
     if (id.x < (uint)uDstWidth && id.y < (uint)uDstHeight)
     {
-        // 采样点落在源的两行两列 texel 中心上，线性过滤在中心处等于点采样。
+        // The sample points land on the centers of the source's two rows and two columns of texels, where
+        // linear filtering equals point sampling.
         float2 size = float2(uSrcWidth, uSrcHeight);
         float2 uv = (float2(id.xy) * 2.0 + 0.5) / size;
         float2 step = 1.0 / size;

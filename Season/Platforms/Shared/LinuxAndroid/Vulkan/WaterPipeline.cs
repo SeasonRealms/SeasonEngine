@@ -9,19 +9,19 @@ using Season.Rendering.Effects;
 namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 
 /// <summary>
-/// P2 水面材质的 Vulkan 实现。骨架与 <see cref="VKDecalPipeline"/> 同构（Pass 外 Prepare、
-/// Pass 内只消费一次），差别集中在三处：
+/// P2 water surface material's Vulkan implementation. The skeleton is structurally identical to <see cref="VKDecalPipeline"/> (Prepare outside the pass,
+/// consume once inside the pass), with the differences concentrated in three places:
 /// <list type="bullet">
-/// <item>几何由 <c>gl_VertexIndex</c> 展开（P3 是 6 顶点，P4 起是 tile 内的 subdiv² 网格），
-/// <c>gl_InstanceIndex</c> 就是 tile 索引，世界矩阵与分块参数都装在帧缓冲/推送常量里，没有顶点缓冲；</item>
-/// <item>本 Pass 不挂深度附件，SceneDepth 保持上一段场景 Pass 发布的 <c>ShaderReadOnlyOptimal</c>，
-/// 遮挡靠着色器里的软件深度测试；水面的 render pass 因此与「不写法线」的贴花完全同形；</item>
-/// <item>多一张折射快照（开画前的场景色拷贝）。它在 Pass 外由 <see cref="Vk"/> 侧的
-/// <c>CopyRenderTarget</c> 拷好并转入采样布局 —— 本 Pass 的颜色附件不能同时被采样。</item>
+/// <item>Geometry is expanded from <c>gl_VertexIndex</c> (6 vertices for P3; from P4 onward a subdiv² mesh within a tile),
+/// <c>gl_InstanceIndex</c> is the tile index, and the world matrix and tiling parameters are carried in the frame buffer/push constants, with no vertex buffer;</item>
+/// <item>This pass has no depth attachment; SceneDepth keeps the <c>ShaderReadOnlyOptimal</c> published by the previous scene pass,
+/// and occlusion relies on the software depth test in the shader; the water surface render pass is therefore completely identical in shape to a "no-normal" decal;</item>
+/// <item>One extra refraction snapshot (a copy of the scene color before drawing begins). Outside the pass it is copied by
+/// <c>CopyRenderTarget</c> on the <see cref="Vk"/> side and transitioned into the sampling layout — this pass's color attachment cannot be sampled at the same time.</item>
 /// </list>
 ///
-/// 混合走固定功能 <c>SRC_ALPHA / ONE_MINUS_SRC_ALPHA</c>，与原透明几何一致；
-/// 双面渲染（<c>CullMode = None</c>）让水面从水下也看得见，掠射角很大时也不会整块消失。
+/// Blending uses the fixed-function <c>SRC_ALPHA / ONE_MINUS_SRC_ALPHA</c>, consistent with the original transparent geometry;
+/// double-sided rendering (<c>CullMode = None</c>) lets the water surface be visible from underwater too, and it will not disappear entirely at very large grazing angles.
 /// </summary>
 internal sealed unsafe class VKWaterPipeline : Season.Rendering.WaterPipeline
 {
@@ -30,15 +30,15 @@ internal sealed unsafe class VKWaterPipeline : Season.Rendering.WaterPipeline
 
     readonly Dictionary<string, Texture> _textures;
 
-    // 描述符按帧槽轮转：每个槽各自一条 set 环，槽内游标在帧号盖戳变化时归零。
+    // Descriptors rotate by frame slot: each slot has its own set ring, and the cursor within a slot is reset to zero when the frame stamp changes.
     readonly List<DescriptorSet>[] _frameSets = new List<DescriptorSet>[(int)Device.frameCount];
     readonly int[] _frameCursors = new int[(int)Device.frameCount];
     readonly ulong[] _stamps = new ulong[(int)Device.frameCount];
 
-    // 逐 draw 的法线贴图解析结果与描述符集。Prepare 一次算好，Draw 只消费。
+    // Per-draw normal texture resolution result and descriptor set. Computed once in Prepare and only consumed in Draw.
     readonly Texture?[] _drawNormals = new Texture?[MaxWaters];
     readonly DescriptorSet[] _drawSets = new DescriptorSet[MaxWaters];
-    /// <summary>本帧的 Hi-Z 四级金字塔；<see cref="HiZEffect.Ready"/> 为假时整组为空，绑占位。</summary>
+    /// <summary>This frame's Hi-Z four-level pyramid; when <see cref="HiZEffect.Ready"/> is false the whole group is empty and a placeholder is bound.</summary>
     readonly Texture?[] _hz = new Texture?[HiZEffect.LevelCount];
 
     DescriptorSetLayout _frameLayout;
@@ -68,38 +68,38 @@ internal sealed unsafe class VKWaterPipeline : Season.Rendering.WaterPipeline
         var device = Device.LogicalDevice;
         var point = Pipeline.StaticPointSampler;
         var linear = Pipeline.StaticSampler;
-        if (point.Handle == 0 || linear.Handle == 0) throw new InvalidOperationException("水面采样器尚未初始化。");
+        if (point.Handle == 0 || linear.Handle == 0) throw new InvalidOperationException("The water surface samplers are not yet initialized.");
 
-        // 九槽挤在一个 set 里：深度、折射、法线、天空与 Hi-Z 四级都是「每帧最多换一次」的资源，
-        // 拆成独立 set 只会多一次绑定调用，而且贴花那种「一张贴图一个 set」的写法在这里不适用
-        // （一张图一个不可变采样器，几种图却要两种采样约束）。
+        // Nine slots are packed into one set: depth, refraction, normal, sky, and the four Hi-Z levels are all resources that are swapped at most once per frame.
+        // Splitting them into separate sets would only add one more binding call, and the decal style of "one set per texture" does not apply here
+        // (one image per immutable sampler, yet several kinds of image require two sampling constraints).
         var bindings = stackalloc DescriptorSetLayoutBinding[9];
         bindings[0] = new() { Binding = 0, DescriptorCount = 1,
             StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
             DescriptorType = DescriptorType.StorageBuffer };
         bindings[1] = new() { Binding = 1, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit,
             DescriptorType = DescriptorType.CombinedImageSampler, PImmutableSamplers = &point };
-        // binding 2 起全部是线性过滤的采样纹理：折射、法线、天空 LUT，以及 P3 的 Hi-Z 四级。
+        // From binding 2 onward everything is a linearly filtered sampled texture: refraction, normal, sky LUT, and the four Hi-Z levels of P3.
         for (int i = 2; i < 9; i++)
             bindings[i] = new() { Binding = (uint)i, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit,
                 DescriptorType = DescriptorType.CombinedImageSampler, PImmutableSamplers = &linear };
         var frameInfo = new DescriptorSetLayoutCreateInfo { SType = StructureType.DescriptorSetLayoutCreateInfo,
             BindingCount = 9, PBindings = bindings };
         if (vk.CreateDescriptorSetLayout(device, in frameInfo, null, out _frameLayout) != Result.Success)
-            throw new InvalidOperationException("创建水面描述符布局失败。");
+            throw new InvalidOperationException("Failed to create the water surface descriptor layout.");
 
-        // 顶点端要用槽号取世界矩阵，像素端要用槽号取材质与环境参数，所以两段都要看到 push constant。
+        // The vertex side needs the slot number to fetch the world matrix, and the pixel side needs it to fetch material and environment parameters, so both stages must see the push constant.
         var push = new PushConstantRange { StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit, Size = 16 };
         var setLayouts = stackalloc DescriptorSetLayout[1] { _frameLayout };
         var layoutInfo = new PipelineLayoutCreateInfo { SType = StructureType.PipelineLayoutCreateInfo,
             SetLayoutCount = 1, PSetLayouts = setLayouts, PushConstantRangeCount = 1, PPushConstantRanges = &push };
         if (vk.CreatePipelineLayout(device, in layoutInfo, null, out _layout) != Result.Success)
-            throw new InvalidOperationException("创建水面管线布局失败。");
+            throw new InvalidOperationException("Failed to create the water surface pipeline layout.");
 
         ShaderModule vertex = default, pixel = default;
         try
         {
-            // glslang 的简化 C 接口只认 main，所以顶点与片元是两份独立源码，各自拼同一段帧缓冲访问器。
+            // glslang's simplified C interface only recognizes main, so vertex and fragment are two independent sources, each assembling the same frame buffer accessor.
             vertex = ShaderCompiler.CreateShaderModule(vk, device, WaterShaders.VertexGlsl,
                 ShaderStageFlags.VertexBit, "main", "water.vert", false);
             pixel = ShaderCompiler.CreateShaderModule(vk, device, WaterShaders.PixelGlsl,
@@ -126,15 +126,15 @@ internal sealed unsafe class VKWaterPipeline : Season.Rendering.WaterPipeline
                 Topology = PrimitiveTopology.TriangleList };
             var viewport = new PipelineViewportStateCreateInfo { SType = StructureType.PipelineViewportStateCreateInfo,
                 ViewportCount = 1, ScissorCount = 1 };
-            // 双面：水面从水下也应该看得到，俯仰角很大时背面剔除会让水面整块消失。
-            // 深度不是附件（遮挡在片元里用软件比较），所以深度测试与写入都不参与管线状态。
+            // Double-sided: the water surface should be visible from underwater too; with a very large pitch angle, back-face culling would make the whole water surface disappear.
+            // Depth is not an attachment (occlusion uses a software comparison in the fragment stage), so neither depth test nor depth write is part of the pipeline state.
             var raster = new PipelineRasterizationStateCreateInfo { SType = StructureType.PipelineRasterizationStateCreateInfo,
                 PolygonMode = PolygonMode.Fill, CullMode = CullModeFlags.None, FrontFace = FrontFace.Clockwise,
                 LineWidth = 1, DepthClampEnable = false };
             var samples = new PipelineMultisampleStateCreateInfo { SType = StructureType.PipelineMultisampleStateCreateInfo,
                 RasterizationSamples = SampleCountFlags.Count1Bit };
             var blends = stackalloc PipelineColorBlendAttachmentState[1];
-            // 着色器输出非预乘色，所以用标准 alpha 混合；alpha 槽保留目标值。
+            // The shader outputs non-premultiplied color, so standard alpha blending is used; the alpha slot preserves the destination value.
             blends[0] = new PipelineColorBlendAttachmentState
             {
                 BlendEnable = true,
@@ -157,15 +157,15 @@ internal sealed unsafe class VKWaterPipeline : Season.Rendering.WaterPipeline
                 PColorBlendState = &blend, PDynamicState = &dynamic, Layout = _layout,
                 RenderPass = Device.GetWaterRenderPass() };
             if (vk.CreateGraphicsPipelines(device, default, 1, in info, null, out var pipeline) != Result.Success)
-                throw new InvalidOperationException("创建水面图形管线失败。");
+                throw new InvalidOperationException("Failed to create the water surface graphics pipeline.");
             return pipeline;
         }
     }
 
     /// <summary>
-    /// 校验资源形状。与贴花一样只接受生产者已经写入并转入采样布局的资源，不在 Pass 内补发 barrier：
-    /// 颜色附件的布局切换由 render pass 的 initial/finalLayout 完成，深度保持场景 Pass 发布的
-    /// <c>ShaderReadOnlyOptimal</c>，折射快照由拷贝那一侧转入采样布局。
+    /// Validates the resource shapes. Like the decal, it only accepts resources the producer has already written and transitioned into the sampling layout, and does not issue a barrier inside the pass:
+    /// the color attachment's layout transition is handled by the render pass's initial/finalLayout, depth keeps the <c>ShaderReadOnlyOptimal</c> published by the scene pass,
+    /// and the refraction snapshot is transitioned into the sampling layout on the copy side.
     /// </summary>
     bool Resolve(in WaterInputs inputs, VKRenderTarget destination, out VKRenderTarget color,
         out VKRenderTarget depth, out VKRenderTarget refraction, out BufferResource buffer)
@@ -184,7 +184,7 @@ internal sealed unsafe class VKWaterPipeline : Season.Rendering.WaterPipeline
             || ReferenceEquals(inputRefraction, inputColor)
             || inputColor.ColorView.Handle == 0 || inputDepth.DepthView.Handle == 0
             || inputRefraction.ColorView.Handle == 0 || destination.ColorView.Handle == 0
-            // 本 Pass 把颜色目标当作混合底图，共享层因此必须交出同一张目标。
+            // This pass treats the color target as the blending base, so the shared layer must hand over the same target.
             || !ReferenceEquals(inputColor, destination)
             || inputColor.Width == 0 || inputColor.Height == 0
             || inputColor.Width != inputDepth.Width || inputColor.Height != inputDepth.Height
@@ -207,7 +207,7 @@ internal sealed unsafe class VKWaterPipeline : Season.Rendering.WaterPipeline
 
         var command = Device.GraphicsCommandBuffer;
 
-        // 逐水面的法线贴图：只查字典，不加载。名字未注册或还没上传完的水面退回程序化波浪。
+        // Per-water-surface normal texture: dictionary lookup only, no loading. Water surfaces whose name is unregistered or not yet fully uploaded fall back to procedural waves.
         Array.Clear(_drawNormals);
         for (int i = 0; i < inputs.Count && i < MaxWaters; i++)
         {
@@ -216,7 +216,7 @@ internal sealed unsafe class VKWaterPipeline : Season.Rendering.WaterPipeline
             Texture? texture;
             lock (_textures) _textures.TryGetValue(name, out texture);
             if (texture == null || !texture.Ready || texture.View.Handle == 0) continue;
-            // 贴图首次被用到时把它推进采样布局；Prepare 在 Pass 外，所以这里不会走延迟转换那条路。
+            // Transition the texture into the sampling layout the first time it is used; Prepare runs outside the pass, so the deferred-transition path is not taken here.
             texture.EnsureReadyForRendering(command);
             if (texture.CurrentLayout == ImageLayout.ShaderReadOnlyOptimal) _drawNormals[i] = texture;
         }
@@ -225,20 +225,20 @@ internal sealed unsafe class VKWaterPipeline : Season.Rendering.WaterPipeline
         ulong stamp = Device.GetCurrentRetireFenceValue();
         if (_stamps[index] != stamp)
         {
-            // 本帧第一次 Prepare 会复用三帧前那一批 set，它们可能仍被 pending 命令缓冲引用。
+            // The first Prepare of this frame reuses the batch of sets from three frames ago, which may still be referenced by pending command buffers.
             Device.WaitForFrameSlot(index);
             _stamps[index] = stamp;
             _frameCursors[index] = 0;
         }
         var ring = _frameSets[index];
-        // 法线贴图是逐水面的资源，所以每个水面一份自己的 set（与贴花每贴花一份 set 同理），
-        // 换个写法就得把不能共存的贴图塞进同一个 set，到头来只能退化成同屏统一无贴图。
+        // The normal texture is a per-water-surface resource, so each water surface gets its own set (analogous to one set per decal for the decal),
+        // any other approach would have to cram mutually incompatible textures into the same set, ultimately degrading to a uniform "no texture" across the whole screen.
         while (ring.Count < _frameCursors[index] + inputs.Count)
             ring.Add(Device.DescriptorAllocator.AllocateSet(_frameLayout));
         int cursor = _frameCursors[index];
 
-        // 天空 LUT 是 P0 建的那张 compute 纹理：名字没注册（StaticCube 档）时退回 1×1 白，
-        // 着色器侧的 misc.w 门控保证它不会被真正采样。
+        // The sky LUT is the compute texture created by P0: when the name is unregistered (StaticCube tier) it falls back to a 1×1 white,
+        // and the misc.w gate on the shader side ensures it is never actually sampled.
         Texture? sky = null;
         if (inputs.SkyView != null)
         {
@@ -251,8 +251,8 @@ internal sealed unsafe class VKWaterPipeline : Season.Rendering.WaterPipeline
             if (sky.CurrentLayout != ImageLayout.ShaderReadOnlyOptimal) sky = null;
         }
 
-        // 占位图必须是合法视图且处在采样布局：白纹理优先，拿不到就用深度视图顶位 ——
-        // 后者本来就不是附件，而且着色器的两个门控保证它不会被真正采样。
+        // The placeholder image must be a valid view and in the sampling layout: the white texture is preferred, and if unavailable the depth view is used as a stand-in —
+        // the latter was never an attachment anyway, and the shader's two gates ensure it is never actually sampled.
         var white = Device.White;
         if (white != null && white.Ready && white.View.Handle != 0)
         {
@@ -261,8 +261,8 @@ internal sealed unsafe class VKWaterPipeline : Season.Rendering.WaterPipeline
         }
         var placeholder = white?.View ?? depth.DepthView;
 
-        // P3 Hi-Z：与天空 LUT 同一套拿法，只是四张而不是一张。任一级不成就整组退回，
-        // 与着色器侧的 frame[12].x 门控同源（两边都以 HiZEffect.Ready 为准）。
+        // P3 Hi-Z: fetched the same way as the sky LUT, just four images instead of one. If any level fails, the whole group falls back,
+        // sharing its origin with the frame[12].x gate on the shader side (both defer to HiZEffect.Ready).
         Array.Clear(_hz);
         if (HiZEffect.Ready)
         {
@@ -333,8 +333,8 @@ internal sealed unsafe class VKWaterPipeline : Season.Rendering.WaterPipeline
             || buffer.Buffer.Handle != _buffer.Handle) return false;
 
         vk.CmdBindPipeline(command, PipelineBindPoint.Graphics, _pipeline);
-        // 着色器侧是 uint4：槽位 + 分块网格参数（tilesX, tilesZ, subdiv），必须按整数位写。
-        // 不分块的水面三者是 (1,1,0)，顶点着色器据此退回单 quad。
+        // The shader side is a uint4: slot + tiled mesh parameters (tilesX, tilesZ, subdiv), which must be written as integer bits.
+        // For an untiled water surface the three are (1,1,0), and the vertex shader falls back to a single quad accordingly.
         var constants = stackalloc uint[4];
         int drawn = 0;
         for (int i = 0; i < _drawCount; i++)
@@ -347,8 +347,8 @@ internal sealed unsafe class VKWaterPipeline : Season.Rendering.WaterPipeline
             constants[2] = (uint)draw.TilesZ;
             constants[3] = (uint)draw.Subdiv;
             vk.CmdPushConstants(command, layout, ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit, 0, 16, constants);
-            // P4：分块实例化。tile 索引走 gl_InstanceIndex（firstInstance 保持 0），
-            // 槽位仍由推送常量携带 —— 只有 WebGPU 需要把两者挤进同一个实例号。
+            // P4: tiled instancing. The tile index goes through gl_InstanceIndex (firstInstance stays 0),
+            // and the slot is still carried by the push constant — only WebGPU needs to squeeze both into the same instance number.
             vk.CmdDraw(command, (uint)draw.VertexCount, (uint)draw.InstanceCount, 0, 0);
             drawn++;
         }

@@ -1640,9 +1640,11 @@ window.seasonWebGPU = (() => {
                 // _shadowBindGroupLayout is not expanded, same as binding 20 above.
                 { binding: 21, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'non-filtering' } },
                 // P2: per-view uniform (View / Projection / PrevViewProjection), one 256B slot per view.
-                // Referenced statically by vs_main, so _shadowBindGroupLayout must declare it as well
-                // (same reason as bindings 13/14).
-                { binding: 22, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 256 } },
+                // Referenced statically by vs_main AND by fs_main (the unlit emissive compensation reads
+                // uView.cameraPos.w to tell the primary view from secondary ones), so the visibility must
+                // cover both stages. The shadow layout below stays vertex-only: that pipeline has no
+                // fragment stage at all.
+                { binding: 22, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform', minBindingSize: 256 } },
                 // 2-7 P0: Sky-View LUT, the PBR ambient specular source.
                 // 2D float, referenced statically only by fs_main. Reuses the sampler at binding 1.
                 // Parallel to, not a replacement for, uEnvCube at binding 15: the two are mutually exclusive,
@@ -2634,7 +2636,7 @@ window.seasonWebGPU = (() => {
     // Offscreen targets are introduced in Step 2.
     // passId order matches the C# RenderPassId enum,
     // and the debug group is attached at the encoder level to wrap the whole pass (Step 0).
-    const _passLabels = ['Shadow', 'Scene', 'Post', 'OutlineMask', 'FinalBlit', 'Overlay', 'SceneOpaque', 'FogComposite', 'SceneTransparent', 'WeatherComposite', 'SceneDecal', 'SceneWater', 'SsrComposite'];
+    const _passLabels = ['Shadow', 'Scene', 'Post', 'OutlineMask', 'FinalBlit', 'Overlay', 'SceneOpaque', 'FogComposite', 'SceneTransparent', 'WeatherComposite', 'SceneDecal', 'SceneWater', 'SsrComposite', 'SceneWaterfall'];
 
     function beginPass(passId, targetName, clearColorEnable, clearR, clearG, clearB, clearA, clearDepthEnable, storeDepth, depthTargetName, velocityTargetName, normalTargetName) {
         if (!_frameStarted || !_commandEncoder) return;
@@ -2656,13 +2658,19 @@ window.seasonWebGPU = (() => {
         // P0 SSR 合成（RenderPassId.SsrComposite=12）与水面同形：颜色附件就是 SceneColor，
         // 反射增量按加法叠上去，所以既不能清屏也不能挂深度（深度此刻仍是透明阶段的附件）。
         const ssrPass = passId === 12;
-        const blendPass = decalPass || waterPass || ssrPass;
+        // P1 瀑布水幕（RenderPassId.SceneWaterfall=13）也与水面同形：唯一附件是 HDR 颜色，
+        // 遮挡在片元里拿深度采样值做软件比较，所以深度与法线都不能挂。
+        const waterfallPass = passId === 13;
+        const blendPass = decalPass || waterPass || ssrPass || waterfallPass;
         if (waterPass && (!fogTarget || fogTarget.depthOnly || fogTarget.colorFormat !== 'rgba16float'
             || depthTargetName || velocityTargetName || normalTargetName))
             throw new Error('水面必须使用 HDR 颜色目标，且不能挂载深度、速度或法线');
         if (ssrPass && (!fogTarget || fogTarget.depthOnly || fogTarget.colorFormat !== 'rgba16float'
             || depthTargetName || velocityTargetName || normalTargetName))
             throw new Error('SSR 合成必须使用 HDR 颜色目标，且不能挂载深度、速度或法线');
+        if (waterfallPass && (!fogTarget || fogTarget.depthOnly || fogTarget.colorFormat !== 'rgba16float'
+            || depthTargetName || velocityTargetName || normalTargetName))
+            throw new Error('瀑布水幕必须使用 HDR 颜色目标，且不能挂载深度、速度或法线');
         _clearActivePass();
 
         _commandEncoder.pushDebugGroup(_passLabels[passId] || `Pass${passId}`);
@@ -4308,8 +4316,9 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
     const _particleDraws = Object.create(null);
     // 必须与 ParticleDraw.FrameBytes 一致：绑定组声明的 size 若小于着色器读到的下标，
     // WebGPU 校验器会直接判非法，而报错点只出现在首次 draw 那一帧。
-    // 16 行 = 256B：第 12、13 行是 ribbon 带（闪电通道）的视口/最小屏宽/雾参数。
-    const _particleFrameBytes = 256;
+    // 20 行 = 320B：第 12、13 行是 ribbon 带（闪电通道）的视口/最小屏宽/雾参数，
+    // 第 16..18 行是粒子出生形状扩展（矩形出生/初速与抖动/落地消亡/卡通硬边）。
+    const _particleFrameBytes = 320;
     const _particleInstanceStride = 32;
     const _particleArgsBytes = 20;
     let _particleQuadIndex = null;
@@ -4946,6 +4955,214 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         state.placeholder = state.placeholderView = null;
     }
 
+    // P1 瀑布水幕（RenderPassId.SceneWaterfall=13）：与水面同构的独立 Pass —— 颜色目标既是混合底图
+    // 又是唯一附件，场景深度只是采样源（遮挡在片元里做软件深度比较）。WGSL 由 C# 下发，
+    // JS 只持有一条 PSO、两级绑定组与那串 draw。
+    const _waterfalls = Object.create(null);
+    // 必须与 WaterfallMath.ByteCount 一致（16 个帧头向量 + 8 条水幕 × 48 个 float4 = 400 个 float4）。
+    // 声明长度小于着色器实际读到的下标时，WebGPU 校验器只在首次 draw 报错。
+    const _waterfallFrameBytes = 6400;
+
+    function createWaterfallPipeline(name, code) {
+        if (!_device || _instancedDiag.deviceLost || !name) return false;
+        if (_waterfalls[name]) return !_waterfalls[name].failed;
+        const device = _device;
+        const state = { device, pipeline: null, prepared: null, failed: false, refs: null, group: null,
+            textureGroups: new Map(), placeholder: null, placeholderView: null };
+        let scopeOpen = false;
+        try {
+            device.pushErrorScope('validation'); scopeOpen = true;
+            // group 0 是整帧恒定的资源；group 1 只随三张贴图变化，于是逐水幕只换一组。
+            // 两个采样器分开：同一张 Mask 的 R/G 要钳制、B/A 要重复，WebGPU 的采样器是显式实参。
+            state.layout = device.createBindGroupLayout({ label: `${name}_layout`, entries: [
+                { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                    buffer: { type: 'read-only-storage', minBindingSize: _waterfallFrameBytes } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth', viewDimension: '2d' } },
+                { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+                { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+            ] });
+            state.textureLayout = device.createBindGroupLayout({ label: `${name}_texture_layout`, entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+                { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+            ] });
+            // clamp 给「从唇口到落点」的整段结构，wrap 给周期噪声：两者都是线性过滤。
+            state.clampSampler = device.createSampler({ label: `${name}_clamp`, minFilter: 'linear', magFilter: 'linear',
+                addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
+            state.wrapSampler = device.createSampler({ label: `${name}_wrap`, minFilter: 'linear', magFilter: 'linear',
+                addressModeU: 'repeat', addressModeV: 'repeat' });
+            const layout = device.createPipelineLayout({ bindGroupLayouts: [state.layout, state.textureLayout] });
+            const module = device.createShaderModule({ label: `${name}_wgsl`, code });
+            _logShaderErrors(`${name}_wgsl`, module);
+            // 1x1 占位：声明为 null 的贴图槽靠它顶位（着色器的标志位门控保证不会被采样）；
+            // 又不能拿本 Pass 的颜色附件顶替 —— 同个资源不能既当附件又当采样源。
+            state.placeholder = device.createTexture({ label: `${name}_placeholder`, size: [1, 1],
+                format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+            state.placeholderView = state.placeholder.createView();
+            const pending = device.createRenderPipelineAsync({
+                label: name, layout,
+                vertex: { module, entryPoint: 'VSMain' },
+                fragment: { module, entryPoint: 'PSMain', targets: [{
+                    format: 'rgba16float',
+                    // 着色器输出非预乘色：标准 alpha 混合，alpha 槽保留目标值，与另外三端逐项对应。
+                    blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                        alpha: { srcFactor: 'zero', dstFactor: 'one', operation: 'add' } },
+                }] },
+                // 双面：截面是闭合环，贴岩的背壁正是读成「厚度」的那一半。
+                // 深度不是附件（遮挡在片元里用软件比较），所以没有深度状态。
+                primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'cw' },
+                multisample: { count: 1 } });
+            const validation = device.popErrorScope(); scopeOpen = false;
+            _waterfalls[name] = state;
+            Promise.all([validation, pending]).then(([error, pipeline]) => {
+                if (error) throw new Error(error.message);
+                if (_waterfalls[name] !== state || _device !== device || _instancedDiag.deviceLost) return;
+                state.pipeline = pipeline;
+            }).catch(error => {
+                state.failed = true; state.prepared = null;
+                console.error(`瀑布水幕管线 '${name}' 编译失败：${error}`);
+            });
+            return true;
+        } catch (error) {
+            if (scopeOpen) device.popErrorScope().catch(() => {});
+            console.error(`瀑布水幕管线 '${name}' 创建失败：${error}`);
+            return false;
+        }
+    }
+
+    // 形状核对：水幕只在「颜色是独立 HDR、深度与颜色同尺寸」这一种形状下成立，
+    // 其余情况宁可不出图也不出错图（与另外三端同一取舍）。
+    function _resolveWaterfall(input) {
+        const color = _renderTargets[input.color], depth = _renderTargets[input.depth];
+        const destination = _renderTargets[input.destination];
+        const frame = _storageBuffers[input.frame];
+        if (!color || !depth || !destination || !frame) return null;
+        if (color.depthOnly || color.velocity || color.colorFormat !== 'rgba16float') return null;
+        if (!depth.depthOnly || !['depth24plus', 'depth32float'].includes(depth.depthFormat)) return null;
+        // 本 Pass 把颜色目标同时当作混合底图，共享层因此必须交出同一张目标。
+        if (destination !== color) return null;
+        if (!(frame.usage & GPUBufferUsage.STORAGE) || frame.size < _waterfallFrameBytes) return null;
+        // 过期尺寸代表本帧数据不完整，只能回退而不能在此重建：颜色与深度已经是本帧的采样源。
+        for (const rt of [color, depth])
+            if (rt.matchBackbuffer && (!_canvas || rt.width !== _canvas.width || rt.height !== _canvas.height)) return null;
+        const sampled = GPUTextureUsage.TEXTURE_BINDING;
+        const c = color.colorTex, d = depth.depthTex;
+        if (!c || !d) return null;
+        if ((d.usage & sampled) !== sampled) return null;
+        if (d.width !== c.width || d.height !== c.height) return null;
+        let draws;
+        try { draws = JSON.parse(input.drawsJson || '[]'); } catch { return null; }
+        if (!Array.isArray(draws) || draws.length === 0 || draws.length > 8) return null;
+        const list = [];
+        for (const entry of draws) {
+            // [槽位, Mask 名, 法线名, Flow 名, 顶点数, 实例号编码] —— 编码由 C# 侧拼好。
+            if (!Array.isArray(entry) || entry.length < 6) return null;
+            const slot = entry[0] | 0;
+            if (slot < 0 || slot >= 8) return null;
+            list.push({ slot, vertexCount: Math.max(entry[4] | 0, 0), encoded: entry[5] >>> 0,
+                mask: typeof entry[1] === 'string' ? entry[1] : null,
+                normal: typeof entry[2] === 'string' ? entry[2] : null,
+                flow: typeof entry[3] === 'string' ? entry[3] : null });
+        }
+        return { color, depth, frame, colorView: color.colorView, draws: list };
+    }
+
+    function _sameWaterfallRefs(a, b) {
+        if (!a || !b || a.color !== b.color || a.depth !== b.depth || a.frame !== b.frame
+            || a.colorView !== b.colorView) return false;
+        return true;
+    }
+
+    // 三张贴图逐水幕不同，绑定组只能按「三元组」缓存；用三层 Map 而不是拼字符串，
+    // 因为纹理视图没有稳定唯一的名字，而引用本身才是真正的身份。
+    function _waterfallTextureGroup(state, mask, normal, flow) {
+        let byMask = state.textureGroups.get(mask);
+        if (!byMask) { byMask = new Map(); state.textureGroups.set(mask, byMask); }
+        let byNormal = byMask.get(normal);
+        if (!byNormal) { byNormal = new Map(); byMask.set(normal, byNormal); }
+        let group = byNormal.get(flow);
+        if (!group) {
+            group = _device.createBindGroup({ layout: state.textureLayout, entries: [
+                { binding: 0, resource: mask }, { binding: 1, resource: normal }, { binding: 2, resource: flow } ] });
+            byNormal.set(flow, group);
+        }
+        return group;
+    }
+
+    function prepareWaterfall(name, color, depth, frame, drawsJson, destination) {
+        const state = _waterfalls[name];
+        if (!state) return false;
+        state.prepared = null;
+        if (!_frameStarted || !_commandEncoder || _passEncoder || _instancedDiag.deviceLost
+            || state.device !== _device || state.failed || !state.pipeline) return false;
+        try {
+            const refs = _resolveWaterfall({ color, depth, frame, drawsJson, destination });
+            if (!refs) return false;
+            const draws = [];
+            for (const draw of refs.draws) {
+                const mask = draw.mask ? _textureViews[draw.mask] : null;
+                const normal = draw.normal ? _textureViews[draw.normal] : null;
+                const flow = draw.flow ? _textureViews[draw.flow] : null;
+                // 声明了却解析不到 = 解析失败，整条跳过；不能拿占位图顶 —— 那会把泡沫画成一片白，
+                // 读起来像「贴图坏了」而不是「这条水幕本帧没画」（与另外三端同一取舍）。
+                if ((draw.mask && !mask) || (draw.normal && !normal) || (draw.flow && !flow)) continue;
+                if (draw.vertexCount <= 0) continue;
+                draws.push({ vertexCount: draw.vertexCount, encoded: draw.encoded,
+                    group: _waterfallTextureGroup(state, mask || state.placeholderView,
+                        normal || state.placeholderView, flow || state.placeholderView) });
+            }
+            if (draws.length === 0) return false;
+            if (!_sameWaterfallRefs(state.refs, refs)) {
+                state.group = _device.createBindGroup({ label: `${name}_frame`, layout: state.layout, entries: [
+                    { binding: 0, resource: { buffer: refs.frame, size: _waterfallFrameBytes } },
+                    { binding: 1, resource: refs.depth.depthView },
+                    { binding: 2, resource: state.clampSampler },
+                    { binding: 3, resource: state.wrapSampler },
+                ] });
+                state.refs = refs;
+            }
+            state.prepared = { refs, pipeline: state.pipeline, group: state.group, draws,
+                command: _commandEncoder, frameId: _computeFrameId };
+            return true;
+        } catch (error) {
+            console.error(`瀑布水幕 '${name}' 准备失败：${error}`);
+            return false;
+        }
+    }
+
+    function drawWaterfall(name) {
+        const state = _waterfalls[name], prepared = state?.prepared;
+        if (!prepared) return false;
+        // 一次 Prepare 只兑付一次提交，与其它三端同一约定。
+        state.prepared = null;
+        if (!_frameStarted || !_passEncoder || _instancedDiag.deviceLost || state.device !== _device
+            || prepared.command !== _commandEncoder || prepared.frameId !== _computeFrameId
+            || _activePassId !== 13 || _passDepthOnly || _passVelocity || _passOutlineMask || _passOverlay
+            // 附件集必须与烘好的 PSO 完全一致：本 Pass 只有颜色 0，深度与法线都必须是「不挂」的状态。
+            || _activeColorTarget !== prepared.refs.color || _activeColorView !== prepared.refs.colorView
+            || _activeDepthView !== null || _activeNormalView !== null) return false;
+        _passEncoder.setPipeline(prepared.pipeline);
+        _passEncoder.setBindGroup(0, prepared.group);
+        for (const draw of prepared.draws) {
+            _passEncoder.setBindGroup(1, draw.group);
+            // 实例号编码「槽位 | 列数 << 8 | 细分段数 << 16」：WebGPU 没有 push constant，
+            // first_instance 只能携带一个整数，所以三者必须拼在一起（WGSL 里逐位解回来）。
+            _passEncoder.draw(draw.vertexCount, 1, 0, draw.encoded);
+        }
+        return true;
+    }
+
+    function disposeWaterfallPipeline(name) {
+        const state = _waterfalls[name];
+        if (!state) return;
+        delete _waterfalls[name];
+        state.prepared = null; state.refs = null; state.group = null; state.pipeline = null;
+        state.textureGroups.clear();
+        if (state.placeholder) _queueComputeRetirement(state.placeholder);
+        state.placeholder = state.placeholderView = null;
+        state.clampSampler = state.wrapSampler = null;
+    }
+
     // P2: 整幅纹理拷贝，供水面在「颜色已是附件」的帧里拿到可采样的背景。
     // 必须在帧外、渲染 Pass 之外录制（copyTextureToTexture 不能穿插在 Pass 里），
     // 否则返回 false 让调用方整帧跳过水面，而不是拿旧快照当折射源。
@@ -5270,11 +5487,23 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
     // "r:" references add view-identity validation through slot.rtRefs:
     // MatchBackbuffer RTs lazily rebuild colorView/depthView in beginPass while their names stay unchanged,
     // so checking only the key would incorrectly hit old views.
-    function dispatchCompute(name, paramsBytes, resourcesJson, gx, gy, gz) {
+    function dispatchCompute(name, paramsBytes, resourcesJson, gx, gy, gz, indirectBufferId, indirectOffset) {
         const k = _computeKernels[name];
         if (!k) { console.error(`dispatchCompute: kernel '${name}' not found`); return false; }
         if (!_frameStarted || !_commandEncoder) { console.error(`dispatchCompute '${name}': outside frame`); return false; }
         if (_passEncoder) { console.error(`dispatchCompute '${name}': dispatch is forbidden inside a render pass (contract violation)`); return false; }
+
+        // A0.2 间接派发：组数来自 GPU 写的 12 字节参数块，此时 gx/gy/gz 被忽略。
+        // 解析放在开 compute pass 之前 —— 找不到缓冲就在派发前退出，不留一个半编码的 encoder。
+        // 这一端不需要 barrier：同一 encoder 内的编码顺序就是全部同步，参数块由前一个内核写出即可。
+        let indirectBuffer = null;
+        if (indirectBufferId) {
+            indirectBuffer = _storageBuffers[indirectBufferId];
+            if (!indirectBuffer) {
+                console.error(`dispatchCompute '${name}': indirect buffer '${indirectBufferId}' not found`);
+                return false;
+            }
+        }
 
         if (k.frameId !== _computeFrameId) { k.frameId = _computeFrameId; k.cursor = 0; }
         const slotIdx = k.cursor++;
@@ -5361,7 +5590,11 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         const pass = _commandEncoder.beginComputePass({ label: `compute_${name}` });
         pass.setPipeline(k.pipeline);
         pass.setBindGroup(0, slot.bindGroup);
-        pass.dispatchWorkgroups(gx, gy, gz);
+        if (indirectBuffer) {
+            pass.dispatchWorkgroupsIndirect(indirectBuffer, indirectOffset);
+        } else {
+            pass.dispatchWorkgroups(gx, gy, gz);
+        }
         pass.end();
         return true;
     }
@@ -5660,6 +5893,8 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         createDecalPipeline, prepareDecal, drawDecal, disposeDecalPipeline,
         // P2 池塘水
         createWaterPipeline, prepareWater, drawWater, disposeWaterPipeline, copyRenderTarget,
+        // P1 瀑布水幕
+        createWaterfallPipeline, prepareWaterfall, drawWaterfall, disposeWaterfallPipeline,
         // P0 SSR 加法合成
         createSsrCompositePipeline, prepareSsrComposite, drawSsrComposite, disposeSsrCompositePipeline,
         createComputeTexture,

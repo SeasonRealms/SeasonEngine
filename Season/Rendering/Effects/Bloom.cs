@@ -376,7 +376,7 @@ void main()
 }
 ";
 
-    /// <summary>Metal MSL kernel。</summary>
+    /// <summary>Metal MSL kernel.</summary>
     const string SourcePrefilterMsl = @"
 #include <metal_stdlib>
 using namespace metal;
@@ -511,7 +511,7 @@ void main()
 }
 ";
 
-    /// <summary>Metal MSL kernel。</summary>
+    /// <summary>Metal MSL kernel.</summary>
     const string SourceDownsampleMsl = @"
 #include <metal_stdlib>
 using namespace metal;
@@ -665,7 +665,7 @@ void main()
 }
 ";
 
-    /// <summary>Metal MSL kernel。</summary>
+    /// <summary>Metal MSL kernel.</summary>
     const string SourceUpsampleMsl = @"
 #include <metal_stdlib>
 using namespace metal;

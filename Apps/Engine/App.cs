@@ -44,6 +44,9 @@ internal class App : BaseApp
     /// </summary>
     internal float HourOfDay => Season.Rendering.DayNightCycle.HourFromPhase(celestial?.DayPhase ?? 0f);
 
+    /// <summary>当前昼夜相位（0..1）。WaterfallPool 的潭底焦散与 Pond 焦散同源，每帧按阳光高度重算亮度。</summary>
+    internal float DayPhase => celestial?.DayPhase ?? 0f;
+
     // Scene-medium driver: the three authored fog presets, the local volumes they use, and the colonnade the sun-shaft
     // preset needs as an occluder. Update runs right after celestial because the wind drift shares that clock's frame
     // delta and simulation scale rather than reading App.Time.
@@ -156,6 +159,9 @@ internal class App : BaseApp
 
     internal Campfire campfire;
 
+    // 瀑布潭：水面 + 潭底贴花 + 石块潭沿 + 水花/雾/白沫三组粒子，锚点每帧跟随瀑布落点。见 WaterfallPool.cs。
+    internal WaterfallPool waterfallPool;
+
     internal Robots robots;
 
     internal Birds birds;
@@ -173,6 +179,14 @@ internal class App : BaseApp
     Painting painting;
 
     internal List<Mesh3D> meshes = new List<Mesh3D>();
+
+    // P1 瀑布：控件只提供代理网格（选取/包围盒/描边）与摆放矩阵，真正的水幕仍由 SceneWaterfall Pass 画。
+    // 用列表而不是单个字段，是为了让“多条瀑布”只差一次 Add：同一份 Sheet 可以 Clone 到多个控件，
+    // 各自 Place 到不同坐标，注册表上限见 SceneWaterfalls.MaxActiveWaterfalls。
+    internal List<Waterfall> waterfalls = new List<Waterfall>();
+
+    // 已交给后端的贴图名（见 RegisterNamedTexture）。贴花与瀑布常常共用一张图，按名字记一份就够。
+    readonly HashSet<string> namedTextures = new();
 
     internal Views views;
 
@@ -704,6 +718,13 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // 水面本身由 SceneWater Pass 画：Fresnel、折射、Hi-Z 屏幕空间反射与深度吸收全在着色器里。
         Waters.Add(sea.Water);
 
+        CreateWaterfall();
+
+        // 瀑布潭必须在 CreateWaterfall 之后：面板要引用刚登记的那条瀑布（落点锚定的唯一数据源，
+        // 以及“瀑布是否已经 Load 完”这个门控 —— 首次摆放水汽盒要用到）。
+        waterfallPool = new WaterfallPool(waterfalls[^1]);
+        AddPanel(waterfallPool);
+
         // Square observation tower on the open lawn southeast of the spawn: a 3x3 deck at 20 player heights, with a
         // single 3m flight filling one whole flank. The flight runs east-west, perpendicular to the shoreline, so it
         // keeps a constant distance from the sea and the climber keeps the sea to the side. A slim mast on the deck
@@ -820,6 +841,18 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         picker.Targets.Add(room.bottle);
         picker.Targets.Add(room.busterDrone);
         picker.Targets.Add(sphere.sphereRow);
+        // 瀑布也走同一条路径：代理网格提供三角级拾取，Bounds/Wireframe/Outline 三种高亮与其它实体一致。
+        // 这里用列表而不是单个字段，多条瀑布时只需往 waterfalls 里再 Add 一个。
+        for (int i = 0; i < waterfalls.Count; i++)
+        {
+            picker.Targets.Add(waterfalls[i]);
+        }
+        // 水汽体积也是同一类目标：不可见的盒控件，拾取后可在属性面板里改 Pos/Width/Height/Depth/Rotation，
+        // 改完下一帧就作用到雾的出生矩形上（见 WaterfallPool.Update）。
+        if (waterfallPool != null)
+        {
+            picker.Targets.Add(waterfallPool.Mist);
+        }
         if (robots != null)
         {
             picker.InstancedTargets.Add(robots.robotField);
@@ -1291,6 +1324,17 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
 
         sphere?.Update(time);
 
+        // 瀑布控件每帧一同步：把 Pos/Rotation/Scale 算成摆放矩阵交给水幕，并更新高亮的三条通道。
+        // 水幕本身由 SceneWaterfall Pass 画，这里只管「对象」那一半。
+        for (int i = 0; i < waterfalls.Count; i++)
+        {
+            waterfalls[i].Update(time);
+        }
+
+        // 瀑布潭必须接在瀑布之后：它的锚点是 sheet.Transform × 末控制点，要读本帧刚同步好的摆放矩阵；
+        // Panel.Update 不会自动递归（见上方注释），漏掉这一行水面/贴花/石块/粒子就会停在默认值（原点、默认 8m 矩形）。
+        waterfallPool?.Update(time);
+
         meshes?.ForEach(me =>
         {
             me.Update(time);
@@ -1379,6 +1423,112 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     }
 
     /// <summary>
+    /// 瀑布的通用入口：拿一份形状（<paramref name="template"/>）生成一条独立的水幕控件，可选就地摆放。
+    ///
+    /// 一次调用做完五件事：拷作者数据（形状/材质/贴图名）、按需 <see cref="Waterfall.Place"/>、
+    /// AddControl 排队 Load（到那一刻才建代理网格）、登记进场景瀑布表（真正画水的那一侧）、
+    /// 登记进本 App 的 <see cref="waterfalls"/>（每帧 Update 与拾取目标）。
+    /// 于是「多条瀑布」只是多写几行：同一份 template 换一个 center 就能再长一条。
+    ///
+    /// <paramref name="center"/> 为空表示不摆放：控制点里的参考坐标同时就是世界坐标（P1 的旧行为）。
+    /// center 与属性面板的 PosX/PosY/PosZ 是同一个量（包围盒中心）；<paramref name="size"/> 是逐轴目标尺寸（米），
+    /// 与面板的 Width/Height/Depth 同一套数，null 则各轴沿用 <paramref name="scale"/>。
+    /// 视觉微调后把面板上的这几个数抄回来就是启动值。
+    ///
+    /// 三张 P0 资产也在这里登记：后端只按名字查字典，任一没注册就整条跳过（是「不显示」，
+    /// 而不是把白纹理当成满值白沫烧成一片白）。名字相同只加载一次，见 <see cref="RegisterNamedTexture"/>。
+    /// </summary>
+    internal Waterfall SpawnWaterfall(string name, Season.Rendering.WaterfallSheet template,
+        Vector3? center = null, float yawDegrees = 0f, float scale = 1f, Vector3? size = null)
+    {
+        var waterfall = new Waterfall(name);
+
+        // 拷贝而不是共享：DeepColor/Opacity/SortOrder 这类参数要能逐条调，改一条不会波及整群。
+        waterfall.Sheet.CopyFrom(template);
+
+        if (center.HasValue) waterfall.Place(center.Value, yawDegrees, scale, size);
+
+        AddControl(waterfall);
+        Waterfalls.Add(waterfall.Sheet);
+        waterfalls.Add(waterfall);
+        RegisterNamedTexture(waterfall.Sheet.MaskTexture);
+        RegisterNamedTexture(waterfall.Sheet.NormalTexture);
+        RegisterNamedTexture(waterfall.Sheet.FlowTexture);
+
+        return waterfall;
+    }
+
+    /// <summary>
+    /// P1 瀑布演示：P0 选址探针定下的 12 行控制点（candidate #5，海岛山脉相对房子/鬼屋那一侧的内侧凹角，
+    /// 与东岸 Rocks 保持距离，四条观察视线全部可见）。数据逐行照抄
+    /// <c>.dbg/_waterfall_site/out/site_report.txt</c> 的 paste-ready 段。
+    ///
+    /// outward 恒为 (0.511, 0, 0.860)（背离岩面的水平方向），半宽从 1.30 涨到 2.50 —— 水流在下落中摊开；
+    /// 弧长 17.97 m、落差 12.5 m。改形状只改这里：控制点进帧缓冲，着色器不需要重编译。
+    ///
+    /// 下面这 12 个点是探针给出的<b>原始世界坐标</b>，现在只当「形状模板」用：真正的启动位置与尺寸
+    /// 由 tunedCenter / tunedSize 给出（视觉微调的实测读数），见那一块的注释。
+    /// 要再挑位置：选中瀑布拖动或改数，把面板上的 PosX/PosY/PosZ 与 Width/Height/Depth 覆盖这两个变量即可。
+    /// </summary>
+    void CreateWaterfall()
+    {
+        var sheet = new Season.Rendering.WaterfallSheet
+        {
+            // 海水蓝绿的水体本色 + 近白泡沫。卡通风靠明度差把两条白边和水体分开，不靠高光。
+            DeepColor = new(0.09f, 0.31f, 0.36f),
+            FoamColor = new(0.93f, 0.98f, 1.00f),
+            Opacity = 0.85f,
+            ScrollSpeed = 0.55f,
+            NormalStrength = 0.55f,
+            NormalTiling = 2.5f,
+            FoamAmount = 0.85f,
+            // 落差 12.5 m 的长带：唇口/落点白边按比例收窄，否则中段会被两条白带啃没。
+            LipFoam = 0.08f,
+            FootFoam = 0.10f,
+            EdgeFoam = 0.22f,
+            EdgeSoftness = 0.14f,
+            Erosion = 0.30f,
+            Bow = 0.14f,
+            // 截面是绕控制点连线的闭合环：Thickness 是总厚度，前后各分一半。
+            // 崖面就在控制点连线上，所以后半个截面埋进岩体（被软件深度测试剔除），
+            // 前半个截面鼓出来才是能看见的“水体”。1.0 m 对 5 m 宽、12.5 m 高的瀑布大约是一人高的水墙。
+            // 想让瀑布更“实”就加这个数，代价是前壁也离崖面更远（远处看会显得往外飘）。
+            Thickness = 1.0f,
+            // 环向列数（含首尾重合的那一列）：12 段肉眼已看不出棱，两侧的切线过渡也不会太硬。
+            Columns = 12,
+            Subdiv = 2,
+        };
+        // 顺序必须从出水口到落点；v=0 是唇口、v=1 是落点，泡沫带按这个方向分配。
+        sheet.Points.Add(new(new Vector3( -75.32f,  13.44f,  -74.70f), 1.30f, new Vector3( 0.511f, 0f,  0.860f)));
+        sheet.Points.Add(new(new Vector3( -74.92f,  12.10f,  -74.03f), 1.66f, new Vector3( 0.511f, 0f,  0.860f)));
+        sheet.Points.Add(new(new Vector3( -74.52f,  10.67f,  -73.36f), 1.81f, new Vector3( 0.511f, 0f,  0.860f)));
+        sheet.Points.Add(new(new Vector3( -74.10f,   9.28f,  -72.65f), 1.93f, new Vector3( 0.511f, 0f,  0.860f)));
+        sheet.Points.Add(new(new Vector3( -73.65f,   7.93f,  -71.88f), 2.02f, new Vector3( 0.511f, 0f,  0.860f)));
+        sheet.Points.Add(new(new Vector3( -73.07f,   6.77f,  -70.92f), 2.11f, new Vector3( 0.511f, 0f,  0.860f)));
+        sheet.Points.Add(new(new Vector3( -72.54f,   5.52f,  -70.02f), 2.19f, new Vector3( 0.511f, 0f,  0.860f)));
+        sheet.Points.Add(new(new Vector3( -71.94f,   4.42f,  -69.00f), 2.26f, new Vector3( 0.511f, 0f,  0.860f)));
+        sheet.Points.Add(new(new Vector3( -71.28f,   3.42f,  -67.90f), 2.32f, new Vector3( 0.511f, 0f,  0.860f)));
+        sheet.Points.Add(new(new Vector3( -70.61f,   2.51f,  -66.77f), 2.39f, new Vector3( 0.511f, 0f,  0.860f)));
+        sheet.Points.Add(new(new Vector3( -69.90f,   1.71f,  -65.58f), 2.44f, new Vector3( 0.511f, 0f,  0.860f)));
+        sheet.Points.Add(new(new Vector3( -69.19f,   0.92f,  -64.38f), 2.50f, new Vector3( 0.511f, 0f,  0.860f)));
+
+        // 视觉微调的实测读数（属性面板原样）：位置是包围盒中心，尺寸是包围盒的边长（米），绕 Y 无旋转。
+        //
+        // 这些值不能像上一版那样烘进控制点：尺寸是逐轴的（15 × 13 × 13），而控制点只描述位置，
+        // 截面的半宽与厚度又是各向同性的标量，吸不掉 X 与 Y/Z 不同的缩放；而且这条水幕斜着横跨 XZ，
+        // 只拉宽 X 会连带改变水流的走向 —— 这类各向异性只能由摆放矩阵做，也就是 Width/Height/Depth。
+        // 于是控制点保持探针原值，摆放交给 Place：矩阵是 p → (p - 锚点)·缩放 + Pos，
+        // 锚点（包围盒中心）正好落在 Pos 上，包围盒边长正好等于 tunedSize，面板读回来的还是这两组数。
+        var tunedCenter = new Vector3(-75f, 6.8f, -73f);
+        var tunedSize = new Vector3(15f, 14f, 13f);
+
+        // 一条瀑布就是一调。同形状、换坐标再调一次就多一条（不同模板也可以），
+        // 上限见 SceneWaterfalls.MaxActiveWaterfalls：
+        //     SpawnWaterfall("Waterfall P2", sheet, new Vector3(x, y, z), yaw, scale, new Vector3(w, h, d));
+        SpawnWaterfall("Waterfall P1", sheet, tunedCenter, yawDegrees: 0f, size: tunedSize);
+    }
+
+    /// <summary>
     /// D1 贴花演示：三块贴花各带一张 SeasonImage 生成的 RGBA 贴图（见 .dbg/_decal_assets）。
     /// 贴图是「乘数」而不是反照率：Modulate 走 dst*src 混合，把一张照片直接当 albedo 会把地面
     /// 压暗好几倍，所以两张地表图的亮度在生成器里已被压进 [0.5,1.0] / [0.62,1.0]，颜色仍留在图里，
@@ -1408,7 +1558,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             SortOrder = 0,
         };
         Decals.Add(wetGrass);
-        RegisterDecalTexture(wetGrass.Texture);
+        RegisterNamedTexture(wetGrass.Texture);
 
         // 北侧池沿顶面的苔藓：只调制颜色。池沿顶面在 Pond.RimTop=0.5，盒子以它为中心；
         // 池沿内外侧壁有一截落进盒里，正好用来看掠射淡出。
@@ -1425,7 +1575,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             SortOrder = 1,
         };
         Decals.Add(moss);
-        RegisterDecalTexture(moss.Texture);
+        RegisterNamedTexture(moss.Texture);
 
         //池底的焦散：Additive，透明度 0.35 的池水会盖在它上面，同时验证“贴花在透明之前”。
         // 贴图本身已经是「黑底上的光网」，像素就是光，所以 Tint 只带到接近白，强度靠 Intensity 收。
@@ -1445,7 +1595,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             SortOrder = 2,
         };
         Decals.Add(pondCaustics);
-        RegisterDecalTexture(pondCaustics.Texture);
+        RegisterNamedTexture(pondCaustics.Texture);
     }
 
     /// <summary>正午直射时的焦散强度设计值。</summary>
@@ -1456,8 +1606,9 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     /// 太阳越高越强、接近地平线时几乎全部被水面按菲涅尔反射掉，所以用高次幂而不是线性，
     /// 并带一个起始阈值，避免日没前后在地平线附近拖出一条微亮的贴花。
     /// 月光焦散太弱，不参与。
+    /// internal：潭底焦散（WaterfallPool）与池底焦散共用这一条曲线，两处亮度永远同源。
     /// </summary>
-    static float SunlightFactor(float phase)
+    internal static float SunlightFactor(float phase)
     {
         DayNightCycle.Evaluate(phase, out _, out float sunElev01, out _, out _, out _, out _);
         float rise = Math.Clamp((sunElev01 - 0.04f) / 0.30f, 0f, 1f);
@@ -1465,13 +1616,17 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     }
 
     /// <summary>
-    /// 把贴图名字注册进后端纹理字典。贴花自己不会加载文件，名字没注册就会被整块跳过，
-    /// 所以这里复用既有的命名纹理路径：一张永远不画的 Sprite2D 用同一个名字加载。
-    /// 加载是异步的，贴图到位之前那几帧贴花不出现，这是设计而不是丢失。
+    /// 把贴图名字注册进后端纹理字典。贴花与水幕都只按名字查字典、不会自己加载文件，
+    /// 名字没注册就会被整块跳过，所以这里复用既有的命名纹理路径：一张永远不画的 Sprite2D 用同一个名字加载。
+    /// 加载是异步的，贴图到位之前那几帧效果不出现，这是设计而不是丢失。
+    ///
+    /// 按名字去重：多条瀑布共用同一套三张贴图，不去重就是几个空 Sprite2D 各自加载同一份文件。
+    /// internal：WaterfallPool 的潭底两张贴花走同一条命名纹理路径，不再另开加载链。
     /// </summary>
-    void RegisterDecalTexture(string? name)
+    internal void RegisterNamedTexture(string? name)
     {
         if (string.IsNullOrWhiteSpace(name)) return;
+        if (!namedTextures.Add(name)) return;
 
         AddControl(new Season.Controls.Sprite2D
         {

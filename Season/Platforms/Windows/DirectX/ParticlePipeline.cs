@@ -11,30 +11,30 @@ using Silk.NET.DXGI;
 namespace Season.Platforms.Windows.DirectX;
 
 /// <summary>
-/// A0.1 的 D3D12 提交端：一次 ExecuteIndirect 画出 compute 决定数量的公告板。
+/// D3D12 submission side of A0.1: one ExecuteIndirect draws a compute-determined number of billboards.
 ///
-/// 和 DXFogCompositePipeline 比，这里刻意少了一整套机制——没有描述符堆、没有按帧绑定环、
-/// 没有原生资源 AddRef 保活。原因是粒子只消费缓冲不消费纹理，而 root SRV 可以直接吃 GPU 虚拟地址，
-/// 所以根本不存在"描述符可能被在飞帧复用"这个问题。
+/// Compared with DXFogCompositePipeline, a whole set of mechanisms is deliberately omitted here - no descriptor heap, no per-frame binding ring,
+/// no native resource AddRef keep-alive. The reason is that particles only consume buffers and not textures, and a root SRV can directly take a GPU virtual address,
+/// so the problem "a descriptor may be reused by an in-flight frame" simply does not exist.
 ///
-/// PSO 不在构造期烘焙而是在 Draw 里按需烘焙：决定 OM 形状的三件事（采样数、是否绑定速度槽、
-/// 颜色格式）全部只在进入 Pass 之后才确定，而 Prepare 必须在 Pass 之外执行。创建 PSO 是设备调用
-/// 不是命令录制，在 Pass 内做是合法的，且按 key 缓存后每种形状只付一次代价。
+/// The PSO is not baked at construction time but baked on demand in Draw: the three things that determine the OM shape (sample count, whether a velocity slot is bound,
+/// color format) are all only determined after entering the Pass, while Prepare must execute outside the Pass. Creating a PSO is a device call
+/// rather than command recording, so doing it inside the Pass is legal, and after caching by key each shape pays the cost only once.
 ///
-/// 混合与深度状态照抄主管线的 Scene 透明分支，但 OM 的格式与采样数直接问绑定的资源要，
-/// 而不是读 Device 的全局档位。两者在正常运行时一致，可一旦不一致（MSAA 档位下绑的是
-/// MsaaSceneRT、离屏或无窗口路径下又可能是单采样目标），全局量就会烘出一个与附件不匹配的 PSO，
-/// 而这种错配只能在运行期由调试层报出来。资源描述本身就是 OM 的事实来源，所以以它为准。
+/// The blend and depth state are copied from the Scene transparent branch of the main pipeline, but the OM format and sample count are asked directly of the bound resource,
+/// rather than reading the global tier of Device. The two agree during normal operation, but once they disagree (the MSAA tier binds
+/// MsaaSceneRT, and the offscreen or windowless path may in turn be a single-sample target), the global value would bake out a PSO that does not match the attachment,
+/// and this mismatch can only be reported by the debug layer at runtime. The resource description itself is the source of truth for the OM, so it is taken as authoritative.
 /// </summary>
 internal sealed unsafe class DXParticleDrawPipeline : ParticleDrawPipeline
 {
-    /// <summary>根参数序号，与 ParticleSystemEffect.DrawHlsl 的 t0/t1 一一对应。</summary>
+    /// <summary>Root parameter indices, corresponding one-to-one with t0/t1 in ParticleSystemEffect.DrawHlsl.</summary>
     const uint InstancesRoot = 0;
     const uint FrameRoot = 1;
 
-    /// <summary>PSO 的 OM 签名。Velocity 为 Unknown 表示本 Pass 只绑了一个渲染目标，
-    /// 于是"是否有速度槽"与"速度槽格式"用同一个字段表达，不会出现两者矛盾的 key。
-    /// Normal 同理（A0.2 的 slot 2），且只会在 Velocity 非 Unknown 时出现。</summary>
+    /// <summary>The OM signature of the PSO. Velocity being Unknown means this Pass binds only one render target,
+    /// so "whether there is a velocity slot" and "the velocity slot format" are expressed by the same field, and no key with contradictory values can occur.
+    /// The same holds for Normal (slot 2 of A0.2), and it only appears when Velocity is not Unknown.</summary>
     readonly record struct PipelineKey(Format Color, Format Velocity, Format Normal, uint SampleCount, uint SampleQuality);
 
     readonly Dictionary<PipelineKey, nint> _pipelines = [];
@@ -44,7 +44,7 @@ internal sealed unsafe class DXParticleDrawPipeline : ParticleDrawPipeline
     ID3D10Blob* _pixel;
     ID3D10Blob* _pixelVelocity;
 
-    // Prepare 的产物，Draw 消费且只消费一次。
+    // The product of Prepare, consumed by Draw exactly once.
     ID3D12GraphicsCommandList* _command;
     DXRenderTarget? _color;
     RenderTarget? _depth;
@@ -64,8 +64,8 @@ internal sealed unsafe class DXParticleDrawPipeline : ParticleDrawPipeline
 
     void Initialize()
     {
-        // 两个 root SRV，仅顶点阶段可见。没有输入布局，所以不能声明
-        // AllowInputAssemblerInputLayout——该标志要求 PSO 真的带输入元素。
+        // Two root SRVs, visible only to the vertex stage. There is no input layout, so we cannot declare
+        // AllowInputAssemblerInputLayout - that flag requires the PSO to actually carry input elements.
         var parameters = stackalloc RootParameter[2];
         parameters[0] = new()
         {
@@ -90,8 +90,8 @@ internal sealed unsafe class DXParticleDrawPipeline : ParticleDrawPipeline
             blob.Get().GetBufferSize(), &iid, (void**)&signature));
         _signature = signature;
 
-        // 命令签名只描述一条 DrawIndexed 记录，不改任何根参数，所以 root signature 必须传 null；
-        // ByteStride 与共享层的 IndirectDrawIndexedArgs 同一个常量，布局漂移会在这里暴露。
+        // The command signature describes only a single DrawIndexed record and does not change any root parameter, so root signature must be passed as null;
+        // ByteStride is the same constant as IndirectDrawIndexedArgs in the shared layer, and a layout drift will be exposed here.
         var argument = new IndirectArgumentDesc { Type = IndirectArgumentType.DrawIndexed };
         var commandDesc = new CommandSignatureDesc
         {
@@ -123,7 +123,7 @@ internal sealed unsafe class DXParticleDrawPipeline : ParticleDrawPipeline
             StencilPassOp = StencilOp.Keep,
             StencilFunc = ComparisonFunc.Always,
         };
-        // 像素着色器输出预乘 alpha，所以源因子是 One 而不是 SrcAlpha。
+        // The pixel shader outputs premultiplied alpha, so the source factor is One rather than SrcAlpha.
         var blend = new RenderTargetBlendDesc
         {
             BlendEnable = 1,
@@ -136,8 +136,8 @@ internal sealed unsafe class DXParticleDrawPipeline : ParticleDrawPipeline
             LogicOp = LogicOp.Noop,
             RenderTargetWriteMask = (byte)ColorWriteEnable.All,
         };
-        // 速度槽写掩码置零，与主管线对透明几何的既有选择一致：保留下方不透明层的速度，
-        // 比写 0 更好，后者会让 TAA 把运动的粒子当成静止背景去累积。
+        // The velocity slot write mask is zeroed, consistent with the main pipeline's existing choice for transparent geometry: preserving the velocity of the opaque layer below
+        // is better than writing 0, which would make TAA accumulate moving particles as if they were a static background.
         var velocityBlend = blend;
         velocityBlend.BlendEnable = 0;
         velocityBlend.DestBlend = Blend.Zero;
@@ -154,13 +154,13 @@ internal sealed unsafe class DXParticleDrawPipeline : ParticleDrawPipeline
             RasterizerState = new()
             {
                 FillMode = FillMode.Solid,
-                // 公告板的绕序取决于相机基与索引顺序的组合，关掉剔除比在着色器里翻正负更可靠。
+                // The winding order of the billboard depends on the combination of the camera basis and the index order; disabling culling is more reliable than flipping the sign in the shader.
                 CullMode = CullMode.None,
                 FrontCounterClockwise = 0,
                 DepthClipEnable = 1,
                 MultisampleEnable = key.SampleCount > 1 ? 1u : 0u,
             },
-            // 深度测试开、深度写关：粒子互相之间不排序，写深度只会让后画的被先画的挡掉。
+            // Depth test on, depth write off: particles are not sorted against each other, writing depth would only let later-drawn ones be occluded by earlier-drawn ones.
             DepthStencilState = new()
             {
                 DepthEnable = 1,
@@ -183,8 +183,8 @@ internal sealed unsafe class DXParticleDrawPipeline : ParticleDrawPipeline
         desc.BlendState.RenderTarget[1] = velocity ? velocityBlend : blend;
         desc.RTVFormats[0] = key.Color;
         if (velocity) desc.RTVFormats[1] = key.Velocity;
-        // 法线槽与速度槽同一条规则：写掩码为零，保留下方不透明面的法线。着色器不必输出 SV_Target2，
-        // 写掩码为零的槽不要求有对应输出，所以沿用速度变体的像素着色器。
+        // The normal slot follows the same rule as the velocity slot: write mask zero, preserving the normal of the opaque surface below. The shader does not need to output SV_Target2,
+        // a slot with a zero write mask does not require a corresponding output, so the pixel shader of the velocity variant is reused.
         if (normal)
         {
             desc.BlendState.RenderTarget[2] = velocityBlend;
@@ -203,7 +203,7 @@ internal sealed unsafe class DXParticleDrawPipeline : ParticleDrawPipeline
         _prepared = false;
         _color = null; _depth = null; _instances = null; _args = null; _frame = null;
         var cmd = Device.GraphicsCommandList;
-        // ActiveTarget 非空即处于 Pass 内；此时录制 barrier 违反 PassDesc 契约，宁可放弃本帧提交。
+        // ActiveTarget being non-null means we are inside a Pass; recording a barrier here violates the PassDesc contract, so it is better to give up this frame's submission.
         if (_disposed || cmd == null || Device.ActiveTarget != null
             || Pipeline.UnitQuadIndexBuffer == null
             || inputs.Color is not DXRenderTarget color || color.Color == null
@@ -215,12 +215,12 @@ internal sealed unsafe class DXParticleDrawPipeline : ParticleDrawPipeline
             || args.SizeInBytes < IndirectDrawIndexedArgs.SizeInBytes
             || inputs.Frame is not DXStorageBuffer frame || frame.Resource == null
             || frame.SizeInBytes < ParticleDraw.FrameBytes) return false;
-        // 参数缓冲的转换由 IGraphics.TryPrepareIndirectArgs 负责，它必须已经先行；
-        // 这里只核对落点，避免把一个仍停在 UnorderedAccess 的缓冲喂给 ExecuteIndirect。
+        // The transition of the argument buffer is the responsibility of IGraphics.TryPrepareIndirectArgs, which must have already run first;
+        // here we only verify the landing state, to avoid feeding a buffer still sitting in UnorderedAccess to ExecuteIndirect.
         if (args.CurrentState != ResourceStates.IndirectArgument) return false;
 
-        // 实例缓冲刚被 compute 写完，停在 UnorderedAccess；顶点阶段要读它。
-        // 帧缓冲本就停在 AllShaderResource，门控转换因此是空操作。
+        // The instance buffer has just been written by compute and sits in UnorderedAccess; the vertex stage needs to read it.
+        // The frame buffer already sits in AllShaderResource, so the gated transition is a no-op.
         instances.TransitionTo(cmd, ResourceStates.AllShaderResource);
         frame.TransitionTo(cmd, ResourceStates.AllShaderResource);
 
@@ -247,20 +247,20 @@ internal sealed unsafe class DXParticleDrawPipeline : ParticleDrawPipeline
 
         var target = Device.ActiveTarget;
         if (target == null || target.Color == null || target.CurrentState != ResourceStates.RenderTarget) return false;
-        // MSAA 档位下 BeginPass 把 Scene 的颜色目标换成 MsaaSceneRT，共享层交出的那张退为解析目标。
-        // 不接受这一形式，粒子会在整个 MSAA 档位静默消失。
+        // In the MSAA tier BeginPass swaps the Scene color target for MsaaSceneRT, and the one handed out by the shared layer is demoted to a resolve target.
+        // Not accepting this form would make particles silently disappear for the entire MSAA tier.
         if (!ReferenceEquals(target, color)
             && !(ReferenceEquals(target, Device.MsaaSceneRT) && ReferenceEquals(target.ResolveDest, color)))
             return false;
-        // null == 使用后端默认深度，这同样要求准备期看到的是 null，否则深度语义已经变了。
+        // null == use the backend default depth, which likewise requires the prepare phase to have seen null, otherwise the depth semantics have already changed.
         if (!ReferenceEquals(Device.ActiveDepthTarget, depth)) return false;
         if (instances.Resource == null || (instances.CurrentState & ResourceStates.NonPixelShaderResource) == 0
             || frame.Resource == null || (frame.CurrentState & ResourceStates.NonPixelShaderResource) == 0
             || args.Resource == null || args.CurrentState != ResourceStates.IndirectArgument) return false;
 
-        // 向绑定的资源要 OM 签名。PSO 的 SampleDesc 必须与附件逐位相同，而附件的采样数和
-        // 采样质量只有资源自己知道得准；颜色格式同理，包装器上的 ColorNativeFormat 对
-        // 后备缓冲包装形式是留空的，反推资源则永远有值。
+        // Ask the bound resource for the OM signature. The PSO's SampleDesc must match the attachment bit-for-bit, and the attachment's sample count and
+        // sample quality are only known precisely by the resource itself; the same holds for the color format - the ColorNativeFormat on the wrapper is
+        // left empty for the back buffer wrapper form, whereas back-deriving from the resource always has a value.
         var colorDesc = target.Color->GetDesc();
         var velocityTarget = Device.ActiveVelocityTarget;
         var velocityFormat = velocityTarget != null && velocityTarget.Color != null
@@ -275,7 +275,7 @@ internal sealed unsafe class DXParticleDrawPipeline : ParticleDrawPipeline
         var pipeline = GetOrCreatePipeline(key);
         if (pipeline == null) return false;
 
-        // 主管线每次 SetPipeline 都会重设根签名、PSO 和拓扑，所以这里的覆写不会泄漏到后续绘制。
+        // The main pipeline resets the root signature, PSO and topology on every SetPipeline, so the override here will not leak into subsequent draws.
         cmd->SetGraphicsRootSignature(_signature);
         cmd->SetPipelineState(pipeline);
         cmd->IASetPrimitiveTopology(D3DPrimitiveTopology.D3DPrimitiveTopologyTrianglelist);
@@ -283,7 +283,7 @@ internal sealed unsafe class DXParticleDrawPipeline : ParticleDrawPipeline
         cmd->IASetIndexBuffer(&indexView);
         cmd->SetGraphicsRootShaderResourceView(InstancesRoot, instances.Resource->GetGPUVirtualAddress());
         cmd->SetGraphicsRootShaderResourceView(FrameRoot, frame.Resource->GetGPUVirtualAddress());
-        // 实例数来自参数缓冲的第二个字段，CPU 这一侧从未知道过它的值。
+        // The instance count comes from the second field of the argument buffer; the CPU side has never known its value.
         cmd->ExecuteIndirect(_commands, 1, args.Resource, 0, null, 0);
         return true;
     }
@@ -294,7 +294,7 @@ internal sealed unsafe class DXParticleDrawPipeline : ParticleDrawPipeline
         _disposed = true;
         _prepared = false;
         _color = null; _depth = null; _instances = null; _args = null; _frame = null;
-        // Blob 只是 CPU 侧字节，不被 GPU 引用，可以立即释放。
+        // A Blob is just CPU-side bytes, not referenced by the GPU, so it can be released immediately.
         if (_vertex != null) { _vertex->Release(); _vertex = null; }
         if (_pixel != null) { _pixel->Release(); _pixel = null; }
         if (_pixelVelocity != null) { _pixelVelocity->Release(); _pixelVelocity = null; }

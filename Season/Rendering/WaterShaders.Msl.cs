@@ -5,21 +5,24 @@
 namespace Season.Rendering;
 
 /// <summary>
-/// P2 水面材质的 MSL 变体。四端共用同一套语义与帧缓冲布局（见 <see cref="WaterMath"/>），
-/// 这里只负责「读布局 + 求值」，不定义布局。
+/// P2 MSL variant of the water surface material. All four backends share the same semantics
+/// and frame buffer layout (see <see cref="WaterMath"/>); this file only handles "read the layout
+/// + evaluate", it does not define the layout.
 ///
-/// 与另外三端的差异只有两处，都是 Metal 自己的形状：
+/// There are only two differences from the other three backends, both specific to Metal's shape:
 /// <list type="bullet">
-/// <item>帧缓冲直接以 <c>device const float4*</c> 传入，不需要 ByteAddressBuffer 那样的位重解释；</item>
-/// <item>采样器写在源码里（<c>constexpr sampler</c>），不占绑定槽 —— 与贴花和主管线对阴影图的做法一致。</item>
+/// <item>The frame buffer is passed directly as <c>device const float4*</c>, with no bit
+/// reinterpretation like ByteAddressBuffer requires;</item>
+/// <item>The sampler is written in the source (<c>constexpr sampler</c>) and does not occupy a
+/// binding slot -- the same approach as decals and the main pipeline for the shadow map.</item>
 /// </list>
 ///
-/// 深度必须是 <c>depth2d&lt;float&gt;</c> 才能 <c>read</c>：软件深度测试要的是点取样，
-/// 而 depth2d 本来就不支持过滤采样，与需求正好吻合。
+/// Depth must be <c>depth2d&lt;float&gt;</c> to be <c>read</c>: the software depth test wants point
+/// sampling, and depth2d does not support filtered sampling anyway, which matches the requirement exactly.
 /// </summary>
 public static partial class WaterShaders
 {
-    /// <summary>帧头与水面数组的访问器，两个入口共用。</summary>
+    /// <summary>Accessors for the frame header and the water array, shared by both entry points.</summary>
     const string CoreMsl = """
 #include <metal_stdlib>
 using namespace metal;
@@ -27,9 +30,9 @@ using namespace metal;
 struct WaterVertex {
     float4 position [[position]];
     float3 world;
-    // P4：顶点位移后的解析法线（世界空间）。Gerstner 关闭时恒为 (0,1,0)。
+    // P4: analytic normal after vertex displacement (world space). Constant (0,1,0) when Gerstner is off.
     float3 normal;
-    // 整数插值不经过线性滤波，显式标 flat 免得依赖编译器默认行为。
+    // Integer interpolation does not go through linear filtering; make flat explicit rather than rely on the compiler default.
     uint slot [[flat]];
 };
 
@@ -41,12 +44,13 @@ float4 WaterTransform(const device float4* data, float4 p, int i) {
 """;
 
     /// <summary>
-    /// P4 顶点端：分块网格展开 + Gerstner 位移。与 HLSL 版逐句同序；唯一的语法差异是
-    /// <c>[[instance_id]]</c> 而不是 <c>SV_InstanceID</c>，以及 <c>thread</c> 引用充当 out 参数。
+    /// P4 vertex stage: tile grid expansion + Gerstner displacement. Statement-for-statement in the
+    /// same order as the HLSL version; the only syntax differences are <c>[[instance_id]]</c> instead
+    /// of <c>SV_InstanceID</c>, and <c>thread</c> references acting as out parameters.
     /// </summary>
     const string VertexMsl = """
 
-// 六个二维角点，按 quad 的两个三角形排列。单一出口，与 HLSL 版同理。
+// Six 2D corner points, arranged as the quad's two triangles. Single exit, same rationale as the HLSL version.
 float2 WaterCorner(uint id) {
     float2 corner = float2(0.0f, 0.0f);
     if (id == 1u) corner = float2(1.0f, 0.0f);
@@ -57,7 +61,7 @@ float2 WaterCorner(uint id) {
     return corner;
 }
 
-// tile 内的 [0,1] 网格坐标 → 方形的 [-0.5,0.5] 平面坐标。除数钳到 1，与另外两端同理。
+// [0,1] grid coordinate within the tile -> square [-0.5,0.5] planar coordinate. The divisor is clamped to 1, same rationale as the other two backends.
 float2 WaterLocalUv(uint id, uint tile, uint tilesX, uint tilesZ, uint subdiv) {
     if (subdiv == 0u) return WaterCorner(id) - 0.5f;
     uint nx = max(tilesX, 1u);
@@ -70,9 +74,11 @@ float2 WaterLocalUv(uint id, uint tile, uint tilesX, uint tilesZ, uint subdiv) {
     return (tileXy + quadUv) / float2(float(nx), float(nz)) - 0.5f;
 }
 
-// Gerstner 位移与切向量，参数在 water + 8 .. + 11（振幅, 波数, 方向.x, 方向.z）。
-// 相速度由深水色散 ω = sqrt(g·k) 现算，帧缓冲里只存波数与 water + 13.x 的速度倍率。
-// 水平位移贡献 k·A·sin（横向压缩），高度贡献 k·A·cos（竖直倾斜）；混用会让波峰与波谷的法线反号。
+// Gerstner displacement and tangent vectors, parameters at water + 8 .. + 11 (amplitude, wavenumber, direction.x, direction.z).
+// The phase speed is computed on the fly from the deep-water dispersion ω = sqrt(g·k); the frame
+// buffer stores only the wavenumber and the speed multiplier at water + 13.x.
+// Horizontal displacement contributes k·A·sin (lateral compression), height contributes k·A·cos
+// (vertical tilt); mixing them up flips the sign of the normal at crests and troughs.
 float3 WaterGerstner(const device float4* data, float2 p, float t, int offset,
     thread float3& tangent, thread float3& binormal) {
     float3 displacement = float3(0.0f, 0.0f, 0.0f);
@@ -84,7 +90,7 @@ float3 WaterGerstner(const device float4* data, float2 p, float t, int offset,
         float4 wave = data[offset + 8 + int(i)];
         float amplitude = wave.x;
         float k = wave.y;
-        // 风浪关闭时四位全 0：k 为 0 跳过，顶点与法线保持恒等值。
+        // All four are 0 when wind waves are off: skip when k is 0, keeping the vertex and normal at identity values.
         if (k > 0.0f) {
             float2 dir = wave.zw;
             float omega = sqrt(9.81f * k) * speedScale;
@@ -104,7 +110,7 @@ float3 WaterGerstner(const device float4* data, float2 p, float t, int offset,
     return displacement;
 }
 
-// 实例号即 tile 索引；槽位仍走 buffer(1) 的常量（WebGPU 没有，那边只能挤进实例号）。
+// The instance index is the tile index; the slot still comes from the buffer(1) constant (WebGPU lacks this, so it must squeeze it into the instance index).
 vertex WaterVertex VSMain(uint id [[vertex_id]], uint tile [[instance_id]], const device float4* data [[buffer(0)]],
     constant uint4& params [[buffer(1)]]) {
     WaterVertex o;
@@ -113,13 +119,14 @@ vertex WaterVertex VSMain(uint id [[vertex_id]], uint tile [[instance_id]], cons
     float2 uv = WaterLocalUv(id, tile, params.y, params.z, params.w);
     float4 world = WaterTransform(data, float4(uv.x, 0.0f, uv.y, 1.0f), offset);
 
-    // 位移在模型→世界之后做：Gerstner 是世界 XZ 平面上的行波，放进模型空间会跟着矩形转。
+    // Displacement is applied after model->world: Gerstner is a traveling wave on the world XZ plane,
+    // so putting it in model space would make it rotate with the rectangle.
     float3 tangent, binormal;
     world.xyz += WaterGerstner(data, world.xz, data[10].z, offset, tangent, binormal);
 
     o.position = WaterTransform(data, world, 4);
     o.world = world.xyz;
-    // cross(binormal,tangent)：未扰动时 (0,0,1)×(1,0,0) = (0,1,0)，正好朝上。
+    // cross(binormal,tangent): (0,0,1)×(1,0,0) = (0,1,0) when undisturbed, pointing straight up.
     o.normal = normalize(cross(binormal, tangent));
     o.slot = slot;
     return o;
@@ -127,8 +134,9 @@ vertex WaterVertex VSMain(uint id [[vertex_id]], uint tile [[instance_id]], cons
 """;
 
     /// <summary>
-    /// 法线扰动、折射、吸收、Fresnel 与雨涟漪的求值。与 HLSL 版逐句同序；
-    /// <c>fmod</c> 之外的数学函数名两端一致，<c>frac</c> 对应 <c>fract</c>。
+    /// Normal perturbation, refraction, absorption, Fresnel and rain ripple evaluation. Statement-for-statement
+    /// in the same order as the HLSL version; all math function names match across the two backends except
+    /// <c>fmod</c>, and <c>frac</c> corresponds to <c>fract</c>.
     /// </summary>
     const string PixelMsl = """
 
@@ -139,9 +147,10 @@ float3 WaterSampleSky(texture2d<float> skyView, float3 direction) {
     return skyView.sample(linearClamp, uv, level(0.0)).rgb;
 }
 
-// 高度场梯度（米/米），系数 = 波数 × 振幅，叠加不到 0.07，法线只倾 3~4°。
-// 量纲不能省：直接返回 d·cos（幅值 ~1）会让法线倾到 15° 以上，俯视时一半像素的
-// 法线背对视线，facing 被 saturate 到 0、Fresnel 饱和到 1，水面退化成硬边镜面斑块。
+// Height field gradient (m/m), coefficient = wavenumber × amplitude, sums to under 0.07, so the normal only tilts 3~4°.
+// The units must not be dropped: returning d·cos directly (magnitude ~1) would tilt the normal past 15°, and
+// when looking down, half the pixels' normals face away from the view, so facing would be saturated to 0 and
+// Fresnel capped at 1, degenerating the water surface into hard-edged specular patches.
 float2 WaterWave(float2 p, float t, float speed) {
     float2 d1 = float2(0.86f, 0.51f);
     float2 d2 = float2(-0.42f, 0.91f);
@@ -150,7 +159,7 @@ float2 WaterWave(float2 p, float t, float speed) {
     return d1 * cos(k1) * (2.4f * 0.016f) + d2 * cos(k2) * (3.7f * 0.009f);
 }
 
-// 雨涟漪同样是梯度量纲：环频率 26/m、振幅 0.0025m，单环梯度约 0.065。
+// The rain ripples are likewise gradient units: ring frequency 26/m, amplitude 0.0025 m, single-ring gradient about 0.065.
 float2 WaterRipple(float2 p, float t) {
     float2 acc = float2(0.0f);
     for (uint i = 0u; i < 3u; i++) {
@@ -164,7 +173,7 @@ float2 WaterRipple(float2 p, float t) {
     return acc * (26.0f * 0.0025f);
 }
 
-// 视空间前向深度（LH + [0,1]），与主着色器 / GTAO / SsrEffect 的重建公式同源。
+// View-space forward depth (LH + [0,1]), same reconstruction formula as the main shader / GTAO / SsrEffect.
 float WaterLinear(const device float4* data, float d) {
     float nearV = data[12].z, farV = data[12].w;
     return nearV * farV / (farV - d * (farV - nearV));
@@ -178,9 +187,10 @@ float WaterHiZ(texture2d<float> hz0, texture2d<float> hz1, texture2d<float> hz2,
     return hz3.sample(sm, uv, level(0.0)).r;
 }
 
-// 屏幕空间反射：沿反射方向在屏幕空间步进，用 Hi-Z 金字塔整块跳过空区域，
-// 命中点取折射快照（开画前的不透明场景色）。rgb = 辐射，a = 置信度（0 = 没命中）。
-// MSL 没有着色器全局，七张纹理与采样器全部显式入参。
+// Screen-space reflection: march through screen space along the reflection direction, using the
+// Hi-Z pyramid to skip empty regions in whole blocks; on a hit, sample the refraction snapshot
+// (the opaque scene color from before this pass). rgb = radiance, a = confidence (0 = no hit).
+// MSL has no shader globals, so all seven textures and the sampler are explicit parameters.
 float4 WaterTraceReflection(const device float4* data, depth2d<float> depthTexture,
     texture2d<float> refraction, texture2d<float> hz0, texture2d<float> hz1,
     texture2d<float> hz2, texture2d<float> hz3, sampler sm,
@@ -193,7 +203,7 @@ float4 WaterTraceReflection(const device float4* data, depth2d<float> depthTextu
     float4 clip0 = WaterTransform(data, float4(origin, 1.0f), 4);
     float4 clip1 = WaterTransform(data, float4(origin + direction * maxDistance, 1.0f), 4);
 
-    // 射线走到相机背后时屏幕空间没有信息可用：沿原方向缩到相机近平面之前。
+    // When the ray goes behind the camera there is no screen-space information available: shrink along the original direction to just before the camera near plane.
     float endT = 1.0f;
     if (clip1.w <= 0.001f) {
         float denom = clip1.w - clip0.w;
@@ -208,7 +218,7 @@ float4 WaterTraceReflection(const device float4* data, depth2d<float> depthTextu
         float z1 = clip1.z / clip1.w;
         float2 delta = uv1 - uv0;
 
-        // 每步跨多少像素决定查哪一级金字塔：短射线用细级，否则粗块永远命中不了。
+        // How many pixels each step spans decides which pyramid level to query: short rays use fine levels, otherwise the coarse blocks would never hit.
         float pixels = length(delta * size) / float(coarseSteps);
         int level = 3;
         if (pixels < 12.0f) level = 2;
@@ -221,14 +231,14 @@ float4 WaterTraceReflection(const device float4* data, depth2d<float> depthTextu
             float t = float(i) / float(coarseSteps);
             float2 next = uv0 + delta * t;
             float nextZ = mix(z0, z1, t);
-            // 出屏即终止：屏幕外的信息不存在，继续走只会采到钳制后的边缘像素。
+            // Terminate as soon as it goes off-screen: out-of-screen information does not exist, and continuing only samples the clamped edge pixels.
             if (next.x < 0.0f || next.x > 1.0f || next.y < 0.0f || next.y > 1.0f) break;
             if (nextZ < WaterHiZ(hz0, hz1, hz2, hz3, sm, next, level)) {
                 coarse = next;
                 coarseZ = nextZ;
                 continue;
             }
-            // 越过了：在（上一节点, 当前节点）内逐点逼近真实交点。
+            // Overshot: converge point by point toward the true intersection within (previous node, current node).
             for (int j = 1; j <= refineSteps; j++) {
                 float tj = float(j) / float(refineSteps);
                 float2 suv = mix(coarse, next, tj);
@@ -236,12 +246,12 @@ float4 WaterTraceReflection(const device float4* data, depth2d<float> depthTextu
                 int2 coord = clamp(int2(suv * size), int2(0, 0), int2(int(size.x) - 1, int(size.y) - 1));
                 float sceneD = depthTexture.read(uint2(coord));
                 if (sceneD >= 1.0f) continue;
-                // 厚度判定放在线性深度上：NDC 深度越远越挤，同一阈值在近处和远处差出几个数量级。
+                // The thickness test is done in linear depth: NDC depth gets more compressed the farther away, so the same threshold differs by orders of magnitude near and far.
                 float rayView = WaterLinear(data, rayZ);
                 float sceneView = WaterLinear(data, sceneD);
                 if (rayView >= sceneView && rayView - sceneView <= thickness) {
                     float2 hitUv = saturate(suv);
-                    // 屏幕边缘淡出：那里的采样是外推出来的，硬切会在画面边缘拉出一条亮边。
+                    // Fade at the screen edge: the sampling there is extrapolated, and a hard cut would pull a bright edge along the frame border.
                     float edge = min(min(hitUv.x, 1.0f - hitUv.x), min(hitUv.y, 1.0f - hitUv.y));
                     float fade = saturate(edge / 0.06f) * saturate(1.0f - t);
                     result = float4(refraction.sample(sm, hitUv, level(0.0)).rgb, fade);
@@ -293,31 +303,34 @@ fragment float4 PSMain(WaterVertex in [[stage_in]], const device float4* data [[
     }
     if (misc.y > 0.5f) slope += WaterRipple(planar * 2.0f, time) * material2.y;
     slope *= material1.z;
-    // P4：细节斜率叠加到 Gerstner 的解析法线上。Gerstner 关闭时 in.normal 恒为 (0,1,0)，
-    // 这里退化成 P3 的 normalize(float3(slope.x,1,slope.y))。
+    // P4: the detail slope is added onto Gerstner's analytic normal. When Gerstner is off,
+    // in.normal is constant (0,1,0), and this degenerates into P3's normalize(float3(slope.x,1,slope.y)).
     float3 normal = normalize(in.normal + float3(slope.x, 0.0f, slope.y));
 
     float3 view = normalize(camera - in.world);
     float facing = saturate(dot(normal, view));
     float fresnel = material2.z + (1.0f - material2.z) * pow(1.0f - facing, 5.0f);
 
-    // 折射偏移的单位是像素（后面乘 1/宽高换成 UV），600 把梯度折成像素尺度。
+    // The refraction offset is in pixels (multiplied by 1/width and 1/height below to convert to UV); 600 folds the gradient into pixel scale.
     float2 offsetUv = slope * material1.y * 600.0f;
     float2 refractedUv = clamp(uv + offsetUv * screen.zw, float2(0.0f), float2(1.0f));
     float3 refracted = refractionSource.sample(linearClamp, refractedUv, level(0.0)).rgb;
 
     float3 transmittance = exp(-material1.x * thickness * float3(1.35f, 0.85f, 0.55f));
-    // 水体是被照亮的散射介质：水色是反照率，必须乘光照，否则夜里场景全暗之后水池会自己发光。
-    // 用池底快照的亮度当日光代理：夜里趋近 0，白天饱和到 1。
+    // The water body is a lit scattering medium: the water color is albedo and must be multiplied by
+    // lighting, otherwise the pool would glow on its own at night after the scene goes dark.
+    // Use the luminance of the pool bottom snapshot as a proxy for daylight: approaches 0 at night, saturates to 1 by day.
     float daylight = saturate(dot(refracted, float3(0.2126f, 0.7152f, 0.0722f)) * 3.0f);
     float3 body = refracted * transmittance + material0.rgb * (1.0f - transmittance) * daylight;
 
-    // 反射：先试屏幕空间反射（Hi-Z 加速），没命中再退回程序化天空。
-    // 射线用未钳制的方向：水面往下看时反射方向指向水底，天空 LUT 那里没有信息。
+    // Reflection: try screen-space reflection first (Hi-Z accelerated), fall back to the procedural sky on a miss.
+    // The ray uses the unclamped direction: when looking down at the water, the reflection direction points toward
+    // the bottom, where the sky LUT has no information.
     float3 reflectDirection = reflect(-view, normal);
-    // 天空采样前把地平线以下钳回地平线：LUT 下半球是近地雾霾（夜里几乎全黑），法线稍一倾斜就会打进去。
+    // Before sampling the sky, clamp below the horizon back to the horizon: the lower hemisphere of the
+    // LUT is near-ground haze (almost fully black at night), and a slight normal tilt would sample into it.
     float3 skyDirection = float3(reflectDirection.x, max(reflectDirection.y, 0.0f), reflectDirection.z);
-    // 兑底色同样乘 daylight：拿不到天空 LUT 时，这个常量不该在夜里继续发光。
+    // The mix-in base color is also multiplied by daylight: when the sky LUT is unavailable, this constant should not keep glowing at night.
     float3 reflection = misc.w > 0.5f ? WaterSampleSky(skyView, skyDirection) : float3(0.35f, 0.45f, 0.62f) * daylight;
     if (data[12].x > 0.5f) {
         float4 traced = WaterTraceReflection(data, depthTexture, refractionSource, hz0, hz1, hz2, hz3,
@@ -336,6 +349,6 @@ fragment float4 PSMain(WaterVertex in [[stage_in]], const device float4* data [[
 }
 """;
 
-    /// <summary>顶点与片元两个入口合成一份源码：后端按源码字符串缓存，整条管线只编译一次。</summary>
+    /// <summary>The vertex and fragment entry points are combined into a single source: the backend caches by source string, so the whole pipeline compiles only once.</summary>
     public const string Msl = CoreMsl + VertexMsl + PixelMsl;
 }

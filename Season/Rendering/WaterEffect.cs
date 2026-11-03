@@ -9,11 +9,11 @@ using Season.Rendering.Effects;
 namespace Season.Rendering;
 
 /// <summary>
-/// P2 水面的共享层驱动：每帧做视锥剔除、稳定排序、帧缓冲打包，然后交给后端 <see cref="WaterPipeline"/>。
+/// Shared-layer driver for P2 water surfaces: each frame it does frustum culling, stable sorting, and frame-buffer packing, then hands off to the backend <see cref="WaterPipeline"/>.
 ///
-/// 生命周期与 <see cref="DecalEffect"/> 一致：注册在初始化期完成（后端在此时建立 PSO 与根签名），
-/// 之后每帧 Prepare 在 Pass 外调用一次，Draw 在 <see cref="RenderPassId.SceneWater"/> 内消费一次。
-/// 本帧没有可见水面时 Prepare 返回 false，调用方连 BeginPass 与场景色快照都不需要发 —— 空表就是零开销。
+/// Its lifecycle matches <see cref="DecalEffect"/>: registration happens during initialization (the backend builds the PSO and root signature at that point),
+/// after which Prepare is called once per frame outside a pass and Draw is consumed once inside <see cref="RenderPassId.SceneWater"/>.
+/// When there is no visible water surface this frame, Prepare returns false and the caller need not even begin the pass or take the scene color snapshot -- an empty table means zero cost.
 /// </summary>
 public sealed class WaterEffect : IDisposable
 {
@@ -33,18 +33,18 @@ public sealed class WaterEffect : IDisposable
         _pipeline = pipeline;
     }
 
-    /// <summary>本帧是否已经有 Prepared 的水面表；Draw 只在为 true 时有意义。</summary>
+    /// <summary>Whether a prepared water table already exists for this frame; Draw is only meaningful while true.</summary>
     public bool Ready { get; private set; }
 
-    /// <summary>本帧通过剔除的水面数量，供日志与验收使用。</summary>
+    /// <summary>Number of water surfaces that passed culling this frame, for logging and acceptance checks.</summary>
     public int VisibleCount => _pipelineCount;
 
     /// <summary>
-    /// 收集并准备本帧的水面。任何一项前提缺失都返回 false 且不改动 Ready，
-    /// 调用方据此完全跳过快照与 Pass（不 BeginPass、不写测试计数）。
+    /// Collects and prepares this frame's water surfaces. If any precondition is missing it returns false without touching Ready,
+    /// and the caller then skips the snapshot and the pass entirely (no BeginPass, no test counters written).
     /// </summary>
-    /// <param name="refractionSource">开画前拷贝的场景色；由调用方在 Prepare 之前准备好。</param>
-    /// <param name="time">本帧时间（秒），驱动法线滚动与雨涟漪；来自 <c>BaseApp.Time</c>，暂停时自然冻结。</param>
+    /// <param name="refractionSource">The scene color copied before drawing begins; the caller prepares it before Prepare.</param>
+    /// <param name="time">This frame's time (seconds), driving normal scrolling and rain ripples; comes from <c>BaseApp.Time</c> and freezes naturally when paused.</param>
     public bool Prepare(IGraphics g, SceneWaters? source, RenderTarget? color, RenderTarget? refractionSource,
         RenderTarget? depth, float time)
     {
@@ -60,13 +60,13 @@ public sealed class WaterEffect : IDisposable
         var jitteredVp = view.View * view.RenderProjection;
         if (!Matrix4x4.Invert(jitteredVp, out var inverseJitteredVp)) return false;
 
-        // 天气与太阳都来自本帧已经冻结的光照快照，未就绪时按「晴天、无太阳」打包：
-        // 涟漪项被 0 乘掉，天空兜底色到暗灰，两条分支都不会读未初始化的数据。
+        // Weather and sun both come from this frame's already-frozen lighting snapshot, and when it is not ready it is packed as "clear sky, no sun":
+        // the ripple term is multiplied out by 0 and the sky fallback color goes to dark gray, so neither branch reads uninitialized data.
         var lights = FrameSchedule.LightingSnapshot;
         bool raining = FrameSchedule.LightingSnapshotValid && lights.WeatherParams1.W > 0;
         SunDirection(lights, FrameSchedule.LightingSnapshotValid, out var sunDirection, out float sunIntensity);
-        // 屏幕反射的开关跟 HiZEffect 走：金字塔本帧没重建（关档、没深度、刚 resize）时
-        // Enabled 为 0，着色器完全不去采那四张纹理，后端也就可以绑任意占位纹理。
+        // The screen reflection toggle follows HiZEffect: when the pyramid was not rebuilt this frame (disabled, no depth, just resized)
+        // Enabled is 0, the shader never samples those four textures at all, and the backend is free to bind any placeholder texture.
         var reflection = new WaterReflection(
             HiZEffect.Ready && RenderQuality.Current.ScreenSpaceReflections != SsrMode.Off,
             MathF.Max(0f, RenderQuality.Current.SsrIntensity),
@@ -81,8 +81,8 @@ public sealed class WaterEffect : IDisposable
             return false;
         for (int i = 0; i < _count; i++)
         {
-            // 分块参数与 Pack 用同一个 Tiling：帧数据里的 tilesX/tilesZ/subdiv 必须与后端 draw 投出的
-            // 顶点数、实例数逐位一致，否则顶点着色器会把 tile 索引解到网格外面去。
+            // The tiling parameters use the same Tiling as Pack: the tilesX/tilesZ/subdiv in the frame data must match the vertex and instance
+            // counts the backend draw emits, bit for bit, otherwise the vertex shader resolves tile indices outside the mesh.
             var tiling = WaterMath.Tiling(_sorted[i]);
             _draws[i] = new WaterDraw(i, _sorted[i].NormalTexture, tiling.X, tiling.Z, tiling.Subdiv);
         }
@@ -95,8 +95,8 @@ public sealed class WaterEffect : IDisposable
     }
 
     /// <summary>
-    /// 取太阳（最强的方向光）的方向与强度。方向已按惯例取「指向表面」的传播方向，
-    /// 与主着色器里 <c>dot(N, -sunDir)</c> 的用法一致；找不到方向光时返回零强度，水面只剩天空反射。
+    /// Gets the sun's (strongest directional light) direction and intensity. The direction is conventionally taken as the propagation direction "pointing toward the surface",
+    /// consistent with the <c>dot(N, -sunDir)</c> usage in the main shader; when no directional light is found it returns zero intensity and the water surface is left with sky reflection only.
     /// </summary>
     static void SunDirection(in SceneLightParams lights, bool valid, out Vector3 direction, out float intensity)
     {
@@ -117,7 +117,7 @@ public sealed class WaterEffect : IDisposable
         }
     }
 
-    /// <summary>在 <see cref="RenderPassId.SceneWater"/> 内调用一次；Prepare 未成功时什么都不做。</summary>
+    /// <summary>Called once inside <see cref="RenderPassId.SceneWater"/>; does nothing when Prepare did not succeed.</summary>
     public void Draw(IGraphics g)
     {
         if (!Ready || _disposed || !ReferenceEquals(g, _graphics)) return;
@@ -125,8 +125,8 @@ public sealed class WaterEffect : IDisposable
     }
 
     /// <summary>
-    /// 剔除并排序。排序必须稳定：同 <see cref="WaterPlane.SortOrder"/> 的水面按注册顺序绘制，
-    /// 否则每帧次序抖动会让两层水的叠加结果在 TAA 下发闪。
+    /// Culls and sorts. The sort must be stable: water surfaces with the same <see cref="WaterPlane.SortOrder"/> are drawn in registration order,
+    /// otherwise per-frame order jitter would make the blended result of two water layers flicker under TAA.
     /// </summary>
     int Collect(SceneWaters source, in Frustum frustum)
     {
@@ -136,7 +136,7 @@ public sealed class WaterEffect : IDisposable
         {
             var water = waters[i];
             if (!water.Enabled || water.Size.X <= 0f || water.Size.Y <= 0f) continue;
-            // 平面没有厚度：用一个极薄的包围盒做视锥测试，俯视与侧视都能正确剔除。
+            // A plane has no thickness: use a very thin bounding box for the frustum test, so both top-down and side views cull correctly.
             var center = water.Position;
             var extents = new Vector3(water.Size.X * 0.5f, 0.001f, water.Size.Y * 0.5f);
             if (!frustum.Intersects(in center, in extents)) continue;

@@ -5,24 +5,24 @@
 namespace Season.Rendering;
 
 /// <summary>
-/// D1 屏幕空间贴花的 GLSL 变体（Vulkan / Linux / Android），与 <see cref="DecalShaders"/> 的 HLSL 同语义。
+/// GLSL variant of the D1 screen-space decal (Vulkan / Linux / Android), semantically identical to the HLSL of <see cref="DecalShaders"/>.
 ///
-/// 与原版的差别只在语法层面，三处「看起来像笔误」的地方按 Vulkan 的规则保留：
+/// The differences from the original are only at the syntax level, and three places that "look like typos" are kept as-is per Vulkan's rules:
 /// <list type="bullet">
-/// <item>帧缓冲按 <c>vec4</c> 数组读，不再按字节偏移解包：<see cref="DecalMath"/> 的布局本来就是 float4 连续存放，
-/// 用 <c>std430</c> 的 <c>vec4[]</c> 直接索引与 HLSL 的 <c>Load4(i*16)</c> 是同一份内存；</item>
-/// <item>glslang 的简化 C 接口只认 <c>main</c>，所以「写粗糙度」与「不写粗糙度」必须是两份独立源码，
-/// 由 <see cref="PixelCoreGlsl"/> 拼同一份求值函数，避免两个入口对布局的解读分叉；</item>
-/// <item>深度用 <c>texelFetch</c> 而不是 <c>texture</c>：贴花是逐像素投影，任何滤波都会把贴花边缘的深度
-/// 混进邻像素，让盒边界出现一圈错误的遮挡。</item>
+/// <item>The frame buffer is read as a <c>vec4</c> array rather than unpacked by byte offset: the layout of <see cref="DecalMath"/> is inherently float4 values stored contiguously, and
+/// indexing <c>std430</c>'s <c>vec4[]</c> directly refers to the same memory as HLSL's <c>Load4(i*16)</c>;</item>
+/// <item>glslang's simplified C interface only recognizes <c>main</c>, so "writing roughness" and "not writing roughness" must be two separate sources,
+/// with <see cref="PixelCoreGlsl"/> concatenating the same evaluation function to avoid the two entry points diverging on how they read the layout;</item>
+/// <item>Depth uses <c>texelFetch</c> instead of <c>texture</c>: the decal is a per-pixel projection, and any filtering would mix the depth at the decal's edge
+/// into neighboring pixels, producing a ring of erroneous occlusion at the box boundary.</item>
 /// </list>
 /// </summary>
 public static partial class DecalShaders
 {
     /// <summary>
-    /// 帧缓冲与像素尺寸的访问器，顶点与像素共用。<c>DecalTransform</c> 保持 HLSL 的行向量写法
-    /// （<c>p.x*F(i)+...</c>），因为 <see cref="DecalMath"/> 把 <see cref="System.Numerics.Matrix4x4"/>
-    /// 按行抄进缓冲，GLSL 里按 <c>vec4</c> 索引取到的正是同一批行。
+    /// Accessors for the frame buffer and pixel size, shared by the vertex and pixel stages. <c>DecalTransform</c> keeps HLSL's row-vector form
+    /// (<c>p.x*F(i)+...</c>), because <see cref="DecalMath"/> copies <see cref="System.Numerics.Matrix4x4"/>
+    /// into the buffer row by row, and indexing by <c>vec4</c> in GLSL retrieves exactly the same rows.
     /// </summary>
     const string CoreGlsl = """
 layout(std430,set=0,binding=0) readonly buffer DecalFrame { vec4 decalF[]; };
@@ -37,8 +37,8 @@ vec2 DecalSize() { return DecalF(9).xy; }
 """;
 
     /// <summary>
-    /// 投影盒的 36 个顶点。面索引的位拆分与 HLSL 版逐字一致：六个面统一成「从盒外看逆时针」，
-    /// 后端再配 <c>CullMode.Front</c>（只留背面），每个像素恰好命中一次。
+    /// The 36 vertices of the projection box. The bit decomposition of the face index is word-for-word identical to the HLSL version: all six faces are unified as "counter-clockwise when viewed from outside the box",
+    /// and the backend then pairs this with <c>CullMode.Front</c> (keeping only back faces), hitting each pixel exactly once.
     /// </summary>
     public const string VertexGlsl = "#version 450\n" + CoreGlsl + """
 
@@ -58,11 +58,11 @@ void main() {
 """;
 
     /// <summary>
-    /// 深度重建 + 贴花求值。语义与 HLSL 的同名函数一一对应，输出约定也相同：
-    /// Modulate 输出「乘到目标上的因子」，Additive 输出自发光颜色，两者都靠固定功能混合落地。
+    /// Depth reconstruction + decal evaluation. The semantics correspond one-to-one to the same-named HLSL function, and the output convention is also the same:
+    /// Modulate outputs "the factor multiplied into the target", Additive outputs an emissive color, and both are applied via fixed-function blending.
     /// <para>
-    /// <c>gl_FragCoord</c> 在负高度视口下仍然是左上原点、Y 向下，与 DX 的 <c>SV_Position</c> 同一约定，
-    /// 所以屏幕坐标到 NDC 的换算保持 <c>vec2(2,-2)</c> 不变。
+    /// <c>gl_FragCoord</c> still uses a top-left origin with Y pointing down under a negative-height viewport, the same convention as DX's <c>SV_Position</c>,
+    /// so the conversion from screen coordinates to NDC keeps <c>vec2(2,-2)</c> unchanged.
     /// </para>
     /// </summary>
     const string PixelCoreGlsl = "#version 450\n" + CoreGlsl + """
@@ -82,7 +82,7 @@ void DecalEval(out vec4 color,out float coverage,out float roughness,out float r
     vec3 axis=normalize(DecalF(offset+5).xyz);
     float shade=0.0; vec3 albedo=tint.rgb;
     if(depth<1.0 && all(lessThanEqual(abs(local),vec3(1.0)))) {
-        // 羽化：盒边界向内 shape.y 的比例；掠射：法线与投影轴夹角的余弦低于 1-shape.z 就淡出。
+        // Feathering: the fraction of shape.y inward from the box edge; grazing: fade out when the cosine of the angle between the normal and the projection axis drops below 1-shape.z.
         float edge=shape.y>0? clamp((1.0-max(abs(local.x),abs(local.z)))/max(shape.y,1e-3),0.0,1.0) : 1.0;
         float grazing=shape.z>0? smoothstep(1.0-shape.z,1.0,abs(dot(n,axis))) : 1.0;
         float alpha=1.0;
@@ -90,15 +90,15 @@ void DecalEval(out vec4 color,out float coverage,out float roughness,out float r
             vec4 texel=textureGrad(decalTexture,uv,uvDx,uvDy);
             albedo=albedo*texel.rgb; alpha=texel.a;
         } else {
-            // 无纹理时的程序化图案：验证深度重建用，图案跟着地形起伏就说明重建对了。
+            // Procedural pattern when there is no texture: used to verify depth reconstruction; if the pattern follows the terrain relief, the reconstruction is correct.
             float checker=mod(floor(uv.x*4.0)+floor(uv.y*4.0),2.0)<0.5?1.0:0.45;
             albedo=albedo*checker*(0.55+0.45*sin(length(local.xz)*18.0));
         }
         shade=clamp(edge*edge*(3.0-2.0*edge),0.0,1.0)*grazing*alpha;
     }
     coverage=shade*tint.w;
-    // 不改粗糙度的贴花必须把 RT1 的源 alpha 置 0：RT1 混合是 mix(dst, src, src.a)，
-    // 源 alpha 不为 0 就会把“没要求改粗糙度”的区域白白拉向 src。
+    // A decal that does not modify roughness must set the source alpha of RT1 to 0: RT1 blending is mix(dst, src, src.a),
+    // so a non-zero source alpha would needlessly pull regions that "did not request a roughness change" toward src.
     roughWeight=wrap.y>0.5?coverage:0.0;
     roughness=wrap.y>0.5?wrap.x:0.0;
     color=shape.x<0.5 ? vec4(mix(vec3(1.0),albedo,coverage),1.0) : vec4(albedo*coverage*shape.w,0.0);
@@ -106,9 +106,9 @@ void DecalEval(out vec4 color,out float coverage,out float roughness,out float r
 """;
 
     /// <summary>
-    /// 只写 SceneColor 的像素入口。
-    /// Modulate 的固定功能混合是 <c>DST_COLOR / ZERO</c>，Additive 是 <c>ONE / ONE</c>；
-    /// 两者的 alpha 通道都保留目标值（<c>ONE / ZERO</c>），免得贴花把 SceneColor 的 alpha 抹成 1。
+    /// Pixel entry point that writes only SceneColor.
+    /// The fixed-function blend for Modulate is <c>DST_COLOR / ZERO</c>, and for Additive it is <c>ONE / ONE</c>;
+    /// both keep the destination value in the alpha channel (<c>ONE / ZERO</c>), so the decal does not smear SceneColor's alpha to 1.
     /// </summary>
     public const string PixelGlsl = PixelCoreGlsl + """
 
@@ -121,8 +121,8 @@ void main() {
 """;
 
     /// <summary>
-    /// s9：同时写粗糙度的像素入口。法线附件只开 B 通道写掩码，所以这里只需要把目标粗糙度送到 .z，
-    /// 八面体法线（.xy）与反射权重（.w）由附件里的原值保留，混合因子用 <c>roughWeight</c> 在 B 通道上插值。
+    /// s9: pixel entry point that also writes roughness. The normal attachment only enables the B channel in its write mask, so here we only need to send the target roughness to .z,
+    /// while the octahedral normal (.xy) and reflection weight (.w) keep their original values from the attachment, and the blend factor interpolates on the B channel using <c>roughWeight</c>.
     /// </summary>
     public const string PixelRoughnessGlsl = PixelCoreGlsl + """
 

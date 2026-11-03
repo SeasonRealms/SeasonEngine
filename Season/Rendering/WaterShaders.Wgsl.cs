@@ -5,48 +5,57 @@
 namespace Season.Rendering;
 
 /// <summary>
-/// P2 水面材质的 WGSL 变体。四端共用同一套语义与帧缓冲布局（见 <see cref="WaterMath"/>），
-/// 这里只负责「读布局 + 求值」，不定义布局。
+/// P2 WGSL variant of the water surface material. All four backends share the same semantics
+/// and frame buffer layout (see <see cref="WaterMath"/>); this file only handles "read the layout
+/// + evaluate", it does not define the layout.
 ///
-/// 与另外三端的差异来自 WebGPU 的两条硬限制，与 <see cref="DecalShaders.Wgsl"/> 同源：
+/// The differences from the other three backends come from two hard limits of WebGPU, the same
+/// source as <see cref="DecalShaders.Wgsl"/>:
 /// <list type="bullet">
-/// <item>没有 push constant：「本 draw 用哪个水面槽」由 <c>instance_index</c> 携带
-/// （JS 侧 <c>draw(6, 1, 0, slot)</c>），再用 flat 插值送进片元阶段；</item>
-/// <item>深度只能 <c>textureLoad</c>：<c>texture_depth_2d</c> 不支持过滤采样，而软件深度测试本来就要点取样。</item>
+/// <item>No push constant: "which water slot this draw uses" is carried by <c>instance_index</c>
+/// (the JS side calls <c>draw(6, 1, 0, slot)</c>), then sent to the fragment stage via flat interpolation;</item>
+/// <item>Depth can only be <c>textureLoad</c>: <c>texture_depth_2d</c> does not support filtered
+/// sampling, and the software depth test needs point sampling anyway.</item>
 /// </list>
 ///
-/// 折射采样用 <c>textureSampleLevel</c> 而不是隐式导数版本：同一个水面在掠射角下的像素足迹极大，
-/// 隐式 LOD 会在水面边缘取到模糊的邻域颜色，而这里只需要 LOD 0。
+/// Refraction sampling uses <c>textureSampleLevel</c> rather than the implicit-derivative version:
+/// the same water surface has an enormous pixel footprint at grazing angles, so the implicit LOD
+/// would fetch blurred neighboring color at the water surface edges, while only LOD 0 is needed here.
 /// </summary>
 public static partial class WaterShaders
 {
     /// <summary>
-    /// 顶点与片元两个入口合成一份源码，后端只建一个着色器模块。
+    /// The vertex and fragment entry points are combined into a single source; the backend only
+    /// builds one shader module.
     /// </summary>
     public const string Wgsl = """
 struct WaterVaryings {
     @builtin(position) position : vec4<f32>,
     @location(0) world : vec3<f32>,
-    // P4：顶点位移后的解析法线（世界空间）。Gerstner 关闭时恒为 (0,1,0)。
+    // P4: analytic normal after vertex displacement (world space). Constant (0,1,0) when Gerstner is off.
     @location(1) normal : vec3<f32>,
-    // 水面槽位随实例号进来：WebGPU 没有 push constant，只能靠这个把它送到片元阶段。
+    // The water slot arrives with the instance index: WebGPU has no push constant, so this is the
+    // only way to get it to the fragment stage.
     @location(2) @interpolate(flat) slot : u32,
 };
 
-// 帧缓冲布局见 WaterMath，下标与另外三端逐字相同。group 0 全是「整帧恒定」的资源。
+// Frame buffer layout is in WaterMath, the indices are textually identical to the other three
+// backends. group 0 is all "constant for the whole frame" resources.
 @group(0) @binding(0) var<storage, read> waterFrame : array<vec4<f32>>;
 @group(0) @binding(1) var sceneDepth : texture_depth_2d;
 @group(0) @binding(2) var refractionSource : texture_2d<f32>;
 @group(0) @binding(3) var waterSkyView : texture_2d<f32>;
 @group(0) @binding(4) var waterLinearClamp : sampler;
-// P3 Hi-Z 金字塔的四个级别（1/2 ~ 1/16）；frame[12].x 为 0 时一张都不会被采样。
+// The four levels of the P3 Hi-Z pyramid (1/2 ~ 1/16); none is sampled when frame[12].x is 0.
 @group(0) @binding(5) var waterHz0 : texture_2d<f32>;
 @group(0) @binding(6) var waterHz1 : texture_2d<f32>;
 @group(0) @binding(7) var waterHz2 : texture_2d<f32>;
 @group(0) @binding(8) var waterHz3 : texture_2d<f32>;
-// 法线贴图逐水面不同（也允许缺席走程序化波浪），所以单独成组：帧级绑定组每帧只建一次，
-// 逐 draw 只换这一组 —— 与贴花「纹理组」的取舍相同。另外三端把五个槽挤在一个 set 里，
-// 那边一张贴图一个不可变采样器，拆组只会多一次绑定调用。
+// The normal map differs per water surface (and may be absent, falling back to procedural waves),
+// so it is in its own group: the frame-level binding group is built only once per frame, and
+// only this group is swapped per draw -- the same tradeoff as the decal "texture group". The other
+// three backends squeeze five slots into one set, where each texture has an immutable sampler, so
+// splitting the group would only add an extra bind call.
 @group(1) @binding(0) var waterNormalTexture : texture_2d<f32>;
 
 fn waterF(index : u32) -> vec4<f32> { return waterFrame[index]; }
@@ -57,7 +66,7 @@ fn waterTransform(p : vec4<f32>, index : u32) -> vec4<f32> {
          + p.z * waterFrame[index + 2u] + p.w * waterFrame[index + 3u];
 }
 
-// 六个二维角点，按 quad 的两个三角形排列。单一出口，与另外三端同理。
+// Six 2D corner points, arranged as the quad's two triangles. Single exit, same rationale as the other three backends.
 fn waterCorner(id : u32) -> vec2<f32> {
     var corner = vec2<f32>(0.0, 0.0);
     if (id == 1u) { corner = vec2<f32>(1.0, 0.0); }
@@ -68,8 +77,9 @@ fn waterCorner(id : u32) -> vec2<f32> {
     return corner;
 }
 
-// tile 内的 [0,1] 网格坐标 → 方形的 [-0.5,0.5] 平面坐标。
-// 除数钳到 1：WGSL 里整数除零是未定义值，且着色器无法证明帧数据里的值非零。
+// [0,1] grid coordinate within the tile -> square [-0.5,0.5] planar coordinate.
+// The divisor is clamped to 1: integer division by zero is undefined in WGSL, and the shader
+// cannot prove the value from the frame data is non-zero.
 fn waterLocalUv(id : u32, tile : u32, tilesX : u32, tilesZ : u32, subdiv : u32) -> vec2<f32> {
     if (subdiv == 0u) { return waterCorner(id) - vec2<f32>(0.5, 0.5); }
     let nx = max(tilesX, 1u);
@@ -88,9 +98,11 @@ struct GerstnerResult {
     binormal : vec3<f32>,
 };
 
-// Gerstner 位移与切向量，参数在 water + 8 .. + 11（振幅, 波数, 方向.x, 方向.z）。
-// 相速度由深水色散 ω = sqrt(g·k) 现算，帧缓冲里只存波数与 water + 13.x 的速度倍率。
-// 水平位移贡献 k·A·sin（横向压缩），高度贡献 k·A·cos（竖直倾斜）；混用会让波峰与波谷的法线反号。
+// Gerstner displacement and tangent vectors, parameters at water + 8 .. + 11 (amplitude, wavenumber, direction.x, direction.z).
+// The phase speed is computed on the fly from the deep-water dispersion ω = sqrt(g·k); the frame
+// buffer stores only the wavenumber and the speed multiplier at water + 13.x.
+// Horizontal displacement contributes k·A·sin (lateral compression), height contributes k·A·cos
+// (vertical tilt); mixing them up flips the sign of the normal at crests and troughs.
 fn waterGerstner(p : vec2<f32>, t : f32, offset : u32) -> GerstnerResult {
     var result : GerstnerResult;
     result.displacement = vec3<f32>(0.0);
@@ -102,7 +114,7 @@ fn waterGerstner(p : vec2<f32>, t : f32, offset : u32) -> GerstnerResult {
         let wave = waterFrame[offset + 8u + i];
         let amplitude = wave.x;
         let k = wave.y;
-        // 风浪关闭时四位全 0：k 为 0 跳过，顶点与法线保持恒等值。
+        // All four are 0 when wind waves are off: skip when k is 0, keeping the vertex and normal at identity values.
         if (k > 0.0) {
             let dir = wave.zw;
             let omega = sqrt(9.81 * k) * speedScale;
@@ -122,41 +134,43 @@ fn waterGerstner(p : vec2<f32>, t : f32, offset : u32) -> GerstnerResult {
     return result;
 }
 
-// 单位平面或 tile 网格按 vertex_index 展开；实例号同时编码槽位与 tile。
-// 低 <see cref="WaterMath.TileBits"/> 位是 tile，高位是槽位 —— JS 侧的 firstInstance 是这个乘积。
+// The unit plane or tile grid is expanded from vertex_index; the instance index encodes both the slot and the tile.
+// The low <see cref="WaterMath.TileBits"/> bits are the tile, the high bits are the slot -- the JS side's firstInstance is this product.
 @vertex
 fn VSMain(@builtin(vertex_index) vertexIndex : u32, @builtin(instance_index) instanceIndex : u32) -> WaterVaryings {
     var out : WaterVaryings;
     let slot = instanceIndex >> 8u;
     let tile = instanceIndex & 255u;
     let offset = waterOffset(slot);
-    // 没有 push constant，tile 网格参数只能从帧数据读；另外三端走根常量。
+    // No push constant, so the tile grid parameters can only be read from the frame data; the other three backends use root constants.
     let tiling = waterFrame[offset + 12u];
     let uv = waterLocalUv(vertexIndex, tile, u32(tiling.x), u32(tiling.y), u32(tiling.z));
     var world = waterTransform(vec4<f32>(uv.x, 0.0, uv.y, 1.0), offset);
 
-    // 位移在模型→世界之后做：Gerstner 是世界 XZ 平面上的行波，放进模型空间会跟着矩形转。
+    // Displacement is applied after model->world: Gerstner is a traveling wave on the world XZ plane,
+    // so putting it in model space would make it rotate with the rectangle.
     let gerstner = waterGerstner(world.xz, waterFrame[10u].z, offset);
     world = world + vec4<f32>(gerstner.displacement, 0.0);
 
     out.position = waterTransform(world, 4u);
     out.world = world.xyz;
-    // cross(binormal,tangent)：未扰动时 (0,0,1)×(1,0,0) = (0,1,0)，正好朝上。
+    // cross(binormal,tangent): (0,0,1)×(1,0,0) = (0,1,0) when undisturbed, pointing straight up.
     out.normal = normalize(cross(gerstner.binormal, gerstner.tangent));
     out.slot = slot;
     return out;
 }
 
 fn waterSampleSky(direction : vec3<f32>) -> vec3<f32> {
-    // 与主着色器逐字同参：u = atan2(x,-z)/2pi+0.5，v = 0.5-0.5*sign(y)*sqrt(|y|)。
+    // Exact same parameters as the main shader: u = atan2(x,-z)/2pi+0.5, v = 0.5-0.5*sign(y)*sqrt(|y|).
     let uv = vec2<f32>(atan2(direction.x, -direction.z) * 0.15915494309 + 0.5,
         0.5 - 0.5 * sign(direction.y) * sqrt(abs(direction.y)));
     return textureSampleLevel(waterSkyView, waterLinearClamp, uv, 0.0).rgb;
 }
 
-// 高度场梯度（米/米），系数 = 波数 × 振幅，叠加不到 0.07，法线只倾 3~4°。
-// 量纲不能省：直接返回 d·cos（幅值 ~1）会让法线倾到 15° 以上，俯视时一半像素的
-// 法线背对视线，facing 被 saturate 到 0、Fresnel 饱和到 1，水面退化成硬边镜面斑块。
+// Height field gradient (m/m), coefficient = wavenumber × amplitude, sums to under 0.07, so the normal only tilts 3~4°.
+// The units must not be dropped: returning d·cos directly (magnitude ~1) would tilt the normal past 15°, and
+// when looking down, half the pixels' normals face away from the view, so facing would be saturated to 0 and
+// Fresnel capped at 1, degenerating the water surface into hard-edged specular patches.
 fn waterWave(p : vec2<f32>, t : f32, speed : f32) -> vec2<f32> {
     let d1 = vec2<f32>(0.86, 0.51);
     let d2 = vec2<f32>(-0.42, 0.91);
@@ -165,7 +179,7 @@ fn waterWave(p : vec2<f32>, t : f32, speed : f32) -> vec2<f32> {
     return d1 * cos(k1) * (2.4 * 0.016) + d2 * cos(k2) * (3.7 * 0.009);
 }
 
-// 雨涟漪同样是梯度量纲：环频率 26/m、振幅 0.0025m，单环梯度约 0.065。
+// The rain ripples are likewise gradient units: ring frequency 26/m, amplitude 0.0025 m, single-ring gradient about 0.065.
 fn waterRipple(p : vec2<f32>, t : f32) -> vec2<f32> {
     var acc = vec2<f32>(0.0);
     for (var i : u32 = 0u; i < 3u; i = i + 1u) {
@@ -179,7 +193,7 @@ fn waterRipple(p : vec2<f32>, t : f32) -> vec2<f32> {
     return acc * (26.0 * 0.0025);
 }
 
-// 视空间前向深度（LH + [0,1]），与主着色器 / GTAO / SsrEffect 的重建公式同源。
+// View-space forward depth (LH + [0,1]), same reconstruction formula as the main shader / GTAO / SsrEffect.
 fn waterLinear(d : f32) -> f32 {
     let nearV = waterF(12u).z;
     let farV = waterF(12u).w;
@@ -193,8 +207,9 @@ fn waterHiZ(uv : vec2<f32>, level : i32) -> f32 {
     return textureSampleLevel(waterHz3, waterLinearClamp, uv, 0.0).r;
 }
 
-// 屏幕空间反射：沿反射方向在屏幕空间步进，用 Hi-Z 金字塔整块跳过空区域，
-// 命中点取折射快照（开画前的不透明场景色）。rgb = 辐射，a = 置信度（0 = 没命中）。
+// Screen-space reflection: march through screen space along the reflection direction, using the
+// Hi-Z pyramid to skip empty regions in whole blocks; on a hit, sample the refraction snapshot
+// (the opaque scene color from before this pass). rgb = radiance, a = confidence (0 = no hit).
 fn waterTraceReflection(origin : vec3<f32>, direction : vec3<f32>, size : vec2<f32>) -> vec4<f32> {
     let coarseSteps : i32 = 24;
     let refineSteps : i32 = 6;
@@ -204,7 +219,7 @@ fn waterTraceReflection(origin : vec3<f32>, direction : vec3<f32>, size : vec2<f
     let clip0 = waterTransform(vec4<f32>(origin, 1.0), 4u);
     var clip1 = waterTransform(vec4<f32>(origin + direction * maxDistance, 1.0), 4u);
 
-    // 射线走到相机背后时屏幕空间没有信息可用：沿原方向缩到相机近平面之前。
+    // When the ray goes behind the camera there is no screen-space information available: shrink along the original direction to just before the camera near plane.
     var endT = 1.0;
     if (clip1.w <= 0.001) {
         let denom = clip1.w - clip0.w;
@@ -219,7 +234,7 @@ fn waterTraceReflection(origin : vec3<f32>, direction : vec3<f32>, size : vec2<f
         let z1 = clip1.z / clip1.w;
         let delta = uv1 - uv0;
 
-        // 每步跨多少像素决定查哪一级金字塔：短射线用细级，否则粗块永远命中不了。
+        // How many pixels each step spans decides which pyramid level to query: short rays use fine levels, otherwise the coarse blocks would never hit.
         let pixels = length(delta * size) / f32(coarseSteps);
         var level : i32 = 3;
         if (pixels < 12.0) { level = 2; }
@@ -232,14 +247,14 @@ fn waterTraceReflection(origin : vec3<f32>, direction : vec3<f32>, size : vec2<f
             let t = f32(i) / f32(coarseSteps);
             let next = uv0 + delta * t;
             let nextZ = mix(z0, z1, t);
-            // 出屏即终止：屏幕外的信息不存在，继续走只会采到钳制后的边缘像素。
+            // Terminate as soon as it goes off-screen: out-of-screen information does not exist, and continuing only samples the clamped edge pixels.
             if (next.x < 0.0 || next.x > 1.0 || next.y < 0.0 || next.y > 1.0) { break; }
             if (nextZ < waterHiZ(next, level)) {
                 coarse = next;
                 coarseZ = nextZ;
                 continue;
             }
-            // 越过了：在（上一节点, 当前节点）内逐点逼近真实交点。
+            // Overshot: converge point by point toward the true intersection within (previous node, current node).
             for (var j : i32 = 1; j <= refineSteps; j = j + 1) {
                 let tj = f32(j) / f32(refineSteps);
                 let suv = mix(coarse, next, tj);
@@ -248,12 +263,12 @@ fn waterTraceReflection(origin : vec3<f32>, direction : vec3<f32>, size : vec2<f
                     vec2<i32>(i32(size.x) - 1, i32(size.y) - 1));
                 let sceneD = textureLoad(sceneDepth, rc, 0);
                 if (sceneD >= 1.0) { continue; }
-                // 厚度判定放在线性深度上：NDC 深度越远越挤，同一阈值在近处和远处差出几个数量级。
+                // The thickness test is done in linear depth: NDC depth gets more compressed the farther away, so the same threshold differs by orders of magnitude near and far.
                 let rayView = waterLinear(rayZ);
                 let sceneView = waterLinear(sceneD);
                 if (rayView >= sceneView && rayView - sceneView <= thickness) {
                     let hitUv = clamp(suv, vec2<f32>(0.0), vec2<f32>(1.0));
-                    // 屏幕边缘淡出：那里的采样是外推出来的，硬切会在画面边缘拉出一条亮边。
+                    // Fade at the screen edge: the sampling there is extrapolated, and a hard cut would pull a bright edge along the frame border.
                     let edge = min(min(hitUv.x, 1.0 - hitUv.x), min(hitUv.y, 1.0 - hitUv.y));
                     let fade = saturate(edge / 0.06) * saturate(1.0 - t);
                     result = vec4<f32>(textureSampleLevel(refractionSource, waterLinearClamp, hitUv, 0.0).rgb, fade);
@@ -284,7 +299,7 @@ fn PSMain(input : WaterVaryings) -> @location(0) vec4<f32> {
     let uv = input.position.xy * screen.zw;
     let sceneDepthValue = textureLoad(sceneDepth, pixel, 0);
 
-    // 软件深度测试：本 Pass 没有深度附件，遮挡完全靠这一句。
+    // Software depth test: this pass has no depth attachment, occlusion relies entirely on this line.
     if (input.position.z > sceneDepthValue + 1e-6) { discard; }
 
     let ndc = vec4<f32>(uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), sceneDepthValue, 1.0);
@@ -301,31 +316,34 @@ fn PSMain(input : WaterVaryings) -> @location(0) vec4<f32> {
     }
     if (misc.y > 0.5) { slope = slope + waterRipple(planar * 2.0, time) * material2.y; }
     slope = slope * material1.z;
-    // P4：细节斜率叠加到 Gerstner 的解析法线上。Gerstner 关闭时 input.normal 恒为 (0,1,0)，
-    // 这里退化成 P3 的 normalize(vec3(slope.x,1,slope.y))。
+    // P4: the detail slope is added onto Gerstner's analytic normal. When Gerstner is off,
+    // input.normal is constant (0,1,0), and this degenerates into P3's normalize(vec3(slope.x,1,slope.y)).
     let normal = normalize(input.normal + vec3<f32>(slope.x, 0.0, slope.y));
 
     let view = normalize(camera - input.world);
     let facing = saturate(dot(normal, view));
     let fresnel = material2.z + (1.0 - material2.z) * pow(1.0 - facing, 5.0);
 
-    // 折射偏移的单位是像素（后面乘 1/宽高换成 UV），600 把梯度折成像素尺度。
+    // The refraction offset is in pixels (multiplied by 1/width and 1/height below to convert to UV); 600 folds the gradient into pixel scale.
     let offsetUv = slope * material1.y * 600.0;
     let refractedUv = clamp(uv + offsetUv * screen.zw, vec2<f32>(0.0), vec2<f32>(1.0));
     let refracted = textureSampleLevel(refractionSource, waterLinearClamp, refractedUv, 0.0).rgb;
 
     let transmittance = exp(-material1.x * thickness * vec3<f32>(1.35, 0.85, 0.55));
-    // 水体是被照亮的散射介质：水色是反照率，必须乘光照，否则夜里场景全暗之后水池会自己发光。
-    // 用池底快照的亮度当日光代理：夜里趋近 0，白天饱和到 1。
+    // The water body is a lit scattering medium: the water color is albedo and must be multiplied by
+    // lighting, otherwise the pool would glow on its own at night after the scene goes dark.
+    // Use the luminance of the pool bottom snapshot as a proxy for daylight: approaches 0 at night, saturates to 1 by day.
     let daylight = saturate(dot(refracted, vec3<f32>(0.2126, 0.7152, 0.0722)) * 3.0);
     let body = refracted * transmittance + material0.rgb * (1.0 - transmittance) * daylight;
 
-    // 反射：先试屏幕空间反射（Hi-Z 加速），没命中再退回程序化天空。
-    // 射线用未钳制的方向：水面往下看时反射方向指向水底，天空 LUT 那里没有信息。
+    // Reflection: try screen-space reflection first (Hi-Z accelerated), fall back to the procedural sky on a miss.
+    // The ray uses the unclamped direction: when looking down at the water, the reflection direction points toward
+    // the bottom, where the sky LUT has no information.
     let reflectDirection = reflect(-view, normal);
-    // 天空采样前把地平线以下钳回地平线：LUT 下半球是近地雾霾（夜里几乎全黑），法线稍一倾斜就会打进去。
+    // Before sampling the sky, clamp below the horizon back to the horizon: the lower hemisphere of the
+    // LUT is near-ground haze (almost fully black at night), and a slight normal tilt would sample into it.
     let skyDirection = vec3<f32>(reflectDirection.x, max(reflectDirection.y, 0.0), reflectDirection.z);
-    // 兑底色同样乘 daylight：拿不到天空 LUT 时，这个常量不该在夜里继续发光。
+    // The mix-in base color is also multiplied by daylight: when the sky LUT is unavailable, this constant should not keep glowing at night.
     var reflection = select(vec3<f32>(0.35, 0.45, 0.62) * daylight, waterSampleSky(skyDirection), misc.w > 0.5);
     if (waterF(12u).x > 0.5) {
         let traced = waterTraceReflection(input.world, reflectDirection, screen.xy);

@@ -429,11 +429,12 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         // with the 3D path, so it must supply the same pair (12 uses the comparison sampler).
         writes[21] = MakeImageWrite(set, 21, &shadowInfo);
 
-        // 雾采样三段（22/23/24）：
-        // 22 是帧常量 UBO，先写零填充占位；真正的内容按帧槽轮转，透明阶段只补推常量。
-        // 23/24 是两张体积纹理，收集期拿不到本帧产物，先用 AP 体积
-        // （DummyBlack 降落，已在 ShaderReadOnlyOptimal）占位，
-        // 由透明阶段在绑定前重写。
+        // The three fog sampling stages (22/23/24):
+        // 22 is a frame constant UBO, so first write a zero-filled placeholder; the real contents
+        // rotate per frame slot and the transparent phase only re-pushes the constants.
+        // 23/24 are two volume textures, and collection cannot obtain this frame's output, so use the
+        // AP volume as a placeholder first (DummyBlack landed, already in ShaderReadOnlyOptimal),
+        // to be rewritten by the transparent phase before binding.
         var fogFrameInfo = new DescriptorBufferInfo
         { Buffer = Pipeline.DefaultFogFrameBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize };
         writes[22] = MakeBufferWrite(set, Pipeline.SceneFogFrameBinding, DescriptorType.StorageBuffer, &fogFrameInfo);
@@ -446,10 +447,11 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
     }
 
     /// <summary>
-    /// 刷新本帧槽位的绑定 16-20（环境立方图、DDGI 图集与深度、云噪声、AP 体积）。
-    /// 这些是逐帧变化的帧级输入，而描述符集一旦被正在录制的命令缓冲绑定过就不能再改写，
-    /// 所以本方法除了绘制前调用，也会被帧首预刷新在命令缓冲 begin 之前调用；
-    /// 版本相同时各 Refresh*Binding 会自行跳过，重复调用无副作用。
+    /// Refresh this frame slot's bindings 16-20 (environment cube, DDGI atlas and depth, cloud noise, AP volume).
+    /// These are per-frame frame-level inputs, and a descriptor set cannot be rewritten once it has
+    /// been bound by a command buffer that is being recorded, so this method is called before drawing
+    /// and also by the frame-start pre-refresh before the command buffer begins; when the version is
+    /// unchanged each Refresh*Binding skips itself, so repeated calls have no side effects.
     /// </summary>
     internal void RefreshSceneBindings(int fi)
     {
@@ -606,7 +608,7 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
 
         int fi = (int)Device.FrameIndex;
 
-        // 记录本帧画过的精灵，供下一帧帧首预刷新使用（见 Pipeline.RefreshSceneBindingsForFrameStart）。
+        // Record the sprites drawn this frame for the next frame's frame-start pre-refresh (see Pipeline.RefreshSceneBindingsForFrameStart).
         VKSceneDrawCollection.NoteQuadDrawn(this);
 
         // 1-7: refresh binding 16 of the current frame slot to the environment radiance cube
@@ -617,7 +619,7 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
 
         var set = _descriptorSets[fi];
 
-        // 收集期：描述符集已就绪，只记下句柄与世界矩阵；真正绘制发生在透明 Pass。
+        // Collection phase: the descriptor set is ready, so just record the handle and the world matrix; the actual draw happens in the transparent pass.
         if (VKSceneDrawCollection.Active is { } collection)
         {
             VKSceneDrawCollection.RetainOwner(this);
@@ -635,13 +637,13 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
             Pipeline.PipelineLayout, 0, 1, in set, 0, null);
         Pipeline.BindViewSet(cmd, ScreenSpaceView ? Pipeline.ScreenViewSet : Pipeline.ActiveViewSet);
-        // 雾采样三件套在独立的 set 1，理由同 DrawPrimitiveCore：透明变体静态引用它。
+        // The fog sampling trio lives in its own set 1, for the same reason as DrawPrimitiveCore: the transparent variant statically references it.
         Pipeline.BindFogSet(cmd);
 
         vk.CmdDraw(cmd, 6, 1, 0, 0);
     }
 
-    /// <summary>读取当前帧槽矩阵 UBO 中的世界矩阵（存储时已转置）。</summary>
+    /// <summary>Read the world matrix from the current frame slot's matrix UBO (stored already transposed).</summary>
     Matrix4x4 QuadWorld(int fi)
     {
         var mapped = _mappedMatrixBuffers[fi];

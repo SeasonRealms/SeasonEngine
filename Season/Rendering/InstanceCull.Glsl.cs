@@ -6,8 +6,9 @@ namespace Season.Rendering;
 
 public sealed partial class InstanceCullEffect
 {
-    // A7 的 Vulkan 侧四份内核。Params 走 push constant，其余资源按"声明索引即 binding 编号"落位，
-    // 于是 binding 0 留给 Params 占位而不会被任何 buffer 占用，与 ComputeBindingType 的契约一致。
+    // A7's four kernels on the Vulkan side. Params go through push constants, and the remaining resources
+    // are placed by "declared index is the binding number", so binding 0 is reserved as a placeholder for
+    // Params and is never taken by any buffer, consistent with the ComputeBindingType contract.
 
     const string ResetGlsl = """
 #version 450
@@ -74,8 +75,8 @@ layout(std430, binding = 2) readonly buffer Worlds { float worlds[]; };
 layout(std430, binding = 3) buffer DrawArgs { uint drawArgs[]; };
 layout(std430, binding = 4) buffer VisibleIds { uint visibleIds[]; };
 
-// clip = pos * VP（行向量约定）：clip.x 是位置与第 0 列的点积，第 3 列就是 w，
-// 六个裁剪平面因此直接由行列组合得出。
+// clip = pos * VP (row-vector convention): clip.x is the dot product of the position with column 0, and
+// column 3 is w, so the six clip planes follow directly from row/column combinations.
 bool visibleInSlot(uint slot, vec3 center, float radius)
 {
     uint m = slot * 16u;
@@ -182,8 +183,8 @@ layout(std430, binding = 4) buffer DrawArgs { uint drawArgs[]; };
 
 void main()
 {
-    // 二维映射：X = 槽位内序号，Y = 槽位。固定派发与间接派发共用它，
-    // 于是 A/B 的唯一变量是 X 维的组数。
+    // Two-dimensional mapping: X = index within the slot, Y = slot. Fixed dispatch and indirect dispatch
+    // share it, so the only variable in the A/B is the group count along the X dimension.
     uint slot = gl_GlobalInvocationID.y;
     uint k = gl_GlobalInvocationID.x;
     if (slot >= gatherParams.slotCount)

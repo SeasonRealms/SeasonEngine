@@ -34,9 +34,9 @@ public static class WebGPUUniformLayout
     // Material parameters (each item is a vec4f).
     /// <summary>vec4f baseColor</summary>
     public const int BaseColor = 36;
-    /// <summary>vec4f emissive（xyz=color, w=ao）</summary>
+    /// <summary>vec4f emissive (xyz=color, w=ao)</summary>
     public const int Emissive = 40;
-    /// <summary>vec4f material（x=metallic, y=roughness, z=alpha, w=alphaCutoff）</summary>
+    /// <summary>vec4f material (x=metallic, y=roughness, z=alpha, w=alphaCutoff)</summary>
     public const int Material = 44;
 
     // Flags (vec4&lt;i32&gt;, written into float slots using int bit patterns).

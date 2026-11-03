@@ -8,10 +8,10 @@ using System.Numerics;
 namespace Season.Rendering;
 
 /// <summary>
-/// D1 场景贴花注册表，与 <see cref="SceneFog"/> 同构：作者层只管增删，渲染层每帧按需收集。
+/// D1 scene decal registry, isomorphic to <see cref="SceneFog"/>: the authoring layer only adds and removes, and the render layer collects on demand each frame.
 ///
-/// 上限是「同屏逐个体绘制」的上限，不是显存上限：每个贴花一次 36 顶点的小 draw，索引通过每 draw 常量传入。
-/// 想摆脱这个数字需要纹理图集 + 实例化，那是 D1 之后的优化，不属于第一版。
+/// The cap is the limit for "drawing each one individually on screen", not a memory limit: each decal is a small draw of 36 vertices, with the index passed via a per-draw constant.
+/// Escaping this number would require a texture atlas + instancing, which is an optimization after D1 and not part of the first version.
 /// </summary>
 public sealed class SceneDecals
 {
@@ -37,7 +37,7 @@ public sealed class SceneDecals
     internal void EnsureActiveCapacity()
     {
         if (ActiveCount >= MaxActiveDecals)
-            throw new InvalidOperationException($"每个场景最多支持 {MaxActiveDecals} 个活动贴花。");
+            throw new InvalidOperationException($"Each scene supports at most {MaxActiveDecals} active decals.");
     }
 
     public void Add(DecalVolume decal)
@@ -45,7 +45,7 @@ public sealed class SceneDecals
         ArgumentNullException.ThrowIfNull(decal);
         if (ReferenceEquals(decal.Owner, this)) return;
         if (decal.Owner != null)
-            throw new InvalidOperationException("同一贴花不能同时注册到多个场景。");
+            throw new InvalidOperationException("The same decal cannot be registered to multiple scenes at once.");
         if (decal.Enabled) EnsureActiveCapacity();
         _decals.Add(decal);
         decal.Owner = this;
@@ -64,7 +64,7 @@ public sealed class SceneDecals
         _decals.Clear();
     }
 
-    /// <summary>CPU 侧投影盒包含测试，与着色器的归一化局部坐标定义一致；用于放置期的自检与测试。</summary>
+    /// <summary>CPU-side projection-box containment test, consistent with the shader's normalized local coordinate definition; used for self-checks during placement and for tests.</summary>
     public static bool Contains(in DecalVolume decal, Vector3 worldPosition)
     {
         var local = Vector3.Transform(worldPosition, decal.WorldToLocalMatrix);

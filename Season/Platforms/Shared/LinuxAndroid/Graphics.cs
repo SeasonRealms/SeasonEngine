@@ -51,7 +51,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         try { return new(new VKFogCompositePipeline(DictionaryVKTexture, true)); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherComposite] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherComposite] creation failed: {ex.Message}");
             return null;
         }
     }
@@ -62,19 +62,19 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         try { return new VKFogCompositePipeline(DictionaryVKTexture); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[FogComposite] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[FogComposite] creation failed: {ex.Message}");
             return null;
         }
     }
 
-    /// <summary>P0 SSR 加法合成：一条全屏绘制把反射增量叠进 SceneColor，没有独立目标。</summary>
+    /// <summary>P0 SSR additive composite: a single full-screen draw adds the reflection delta into SceneColor, with no standalone target.</summary>
     public Season.Rendering.SsrCompositePipeline? CreateSsrCompositePipeline()
     {
         if (!ComputeSupported) return null;
         try { return new VKSsrCompositePipeline(DictionaryVKTexture); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[SsrComposite] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[SsrComposite] creation failed: {ex.Message}");
             return null;
         }
     }
@@ -84,25 +84,36 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         try { return new VKDecalPipeline(DictionaryVKTexture); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] creation failed: {ex.Message}");
             return null;
         }
     }
 
-    /// <summary>P2 水面：构造失败时返回 null，调度器据此保持零残留（有水面但不画，而不是画错）。</summary>
+    /// <summary>P2 water surface: returns null on construction failure, so the scheduler keeps zero residue (water present but not drawn, rather than drawn incorrectly).</summary>
     public Season.Rendering.WaterPipeline? CreateWaterPipeline()
     {
         try { return new VKWaterPipeline(DictionaryVKTexture); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] creation failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>P1 waterfall curtain: only needs the graphics stage (depth sampling + color blending), no refraction snapshot, and no compute either.</summary>
+    public Season.Rendering.WaterfallPipeline? CreateWaterfallPipeline()
+    {
+        try { return new VKWaterfallPipeline(DictionaryVKTexture); }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Waterfall] creation failed: {ex.Message}");
             return null;
         }
     }
 
     /// <summary>
-    /// P2 水面折射用的场景色快照。转调后端：同格式同尺寸的 vkCmdCopyImage，附带的两次 barrier
-    /// 把源送回采样布局、把目标转入采样布局 —— 水面 Pass 里 SceneColor 是颜色附件，不能同时被采样。
+    /// Scene-color snapshot used for P2 water surface refraction. Delegates to the backend: a vkCmdCopyImage of the same format and size, with two accompanying barriers
+    /// that return the source to a sample layout and transition the target into a sample layout — in the water Pass, SceneColor is a color attachment and cannot be sampled at the same time.
     /// </summary>
     public bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination)
         => Vulkan.Device.CopyRenderTarget(source, destination);
@@ -1063,11 +1074,11 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             // such as text recoloring or masking artifacts.
             var set = state.DescriptorSets[fi];
 
-            // 收集期：字形图集的布局转换已完成，参数 UBO 也已写入本帧槽，
-            // 剩下只需要记下不可变句柄。
-            // 排序深度用单位阵的投影距离：文字实例流是设备局部内存，
-            // GPU 侧矩阵不可回读（不同于 DX 的上传堆），
-            // 因此同帧文字共用同一个深度，彼此之间按添加顺序稳定排序。
+            // Collection phase: the glyph atlas layout transition is already done and the parameter UBO is already written to this frame's slot,
+            // so all that remains is to record the immutable handles.
+            // The sort depth uses the projection distance of the identity matrix: the text instance stream is device-local memory,
+            // and the GPU-side matrix cannot be read back (unlike the DX upload heap),
+            // so texts in the same frame share the same depth and are stably sorted among themselves by insertion order.
             if (VKSceneDrawCollection.Active is { } collection)
             {
                 VKSceneDrawCollection.RetainOwner(texts);
@@ -1099,10 +1110,10 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             var pipelineLayout = Pipeline.PipelineLayout;
 
             Vulkan.Device.Vk.CmdBindDescriptorSets(cmd, VkPipelineBindPoint.Graphics, pipelineLayout, 0, 1, &set, 0, null);
-            // 文字走屏幕空间视图 set 2（单位 View/Projection）。
+            // Text uses the screen-space view set 2 (identity View/Projection).
             Pipeline.BindViewSet(cmd, Pipeline.ScreenViewSet);
-            // 雾采样三件套在独立的 set 1：文字变体与 Sprite2D 共用同一个 FS，静态引用了它，
-            // 而布局里 set 1 参与兼容性检查，缺绑会被校验层报未绑定。
+            // The fog sampling trio is in a separate set 1: the text variant shares the same FS with Sprite2D and statically references it,
+            // and set 1 participates in layout compatibility checks, so a missing binding is reported as unbound by the validation layer.
             Pipeline.BindFogSet(cmd);
 
             // Single instanced draw
@@ -1454,9 +1465,9 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
                 imgInfos[i] = new VkDescriptorImageInfo
                 { ImageView = whiteView, ImageLayout = VkImageLayout.ShaderReadOnlyOptimal };
 
-            // Write 25 bindings（前缀提交，中间不能留洞）
+            // Write 25 bindings (prefix submission, no holes allowed in between)
             // (2-3 Step C adds default zero placeholders for previous-frame SSBO data at bindings 13/14/15;
-            //  工作包 C 追加了 21 的原始阴影深度与 22/23/24 的雾采样占位)
+            //  work package C added the raw shadow depth at 21 and the fog sampling placeholders at 22/23/24)
             var writes = stackalloc VkWriteDescriptorSet[25];
             writes[0] = MakeTextWrite(set, 0, VkDescriptorType.UniformBuffer, &matrixInfo);
             writes[1] = MakeTextWrite(set, 1, VkDescriptorType.UniformBuffer, &lightInfo);
@@ -1500,14 +1511,14 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             writes[14] = MakeTextWrite(set, 14, VkDescriptorType.StorageBuffer, &prevInstanceWorldInfo);
             writes[15] = MakeTextWrite(set, 15, VkDescriptorType.StorageBuffer, &prevMorphWeightsInfo);
 
-            // 1-5 clause 15: binding 21 是同一份阴影深度，
-            // 但走点采样器给蒙面搜索读原始深度（与 12 的比较采样器成对）。
+            // 1-5 clause 15: binding 21 is the same shadow depth,
+            // but goes through a point sampler to read raw depth for masked search (paired with the comparison sampler at 12).
             //
-            // 16-20 必须写：文字的 drawIndexed 绑的就是这套 set，而文字变体与
-            // Sprite2D / 天空共用同一个 FS，SPIR-V 静态声明了 envCube/ddgiAtlas/
-            // ddgiDepth/cloudNoise/aerialLut 五个采样器，未写的绑定是空描述符，
-            // 校验层会按 VUID-vkCmdDrawIndexed-None-08114 报 imageView=0。
-            // 占位一律用各绑定在帧内的 Bound 回退值（白图 / DummyBlack），保证可采样。
+            // 16-20 must be written: the text drawIndexed binds exactly this set, and the text variant
+            // shares the same FS with Sprite2D / sky; SPIR-V statically declares the five samplers envCube/ddgiAtlas/
+            // ddgiDepth/cloudNoise/aerialLut, and an unwritten binding is a null descriptor,
+            // which the validation layer reports as imageView=0 under VUID-vkCmdDrawIndexed-None-08114.
+            // Placeholders always use each binding's in-frame Bound fallback value (white / DummyBlack), guaranteeing samplability.
             var envCube = VKTextureCube.Bound;
             var envCubeInfo = new VkDescriptorImageInfo
             { ImageView = envCube.View, ImageLayout = VkImageLayout.ShaderReadOnlyOptimal };
@@ -1530,10 +1541,10 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             writes[20] = MakeTextImageWrite(set, VKPrimitiveGroup.AerialLutBinding, &aerialInfo);
             writes[21] = MakeTextImageWrite(set, 21, &shadowInfo);
 
-            // 雾采样三段（22/23/24）：文字入口在透明变体里静态引用，
-            // 未写的描述符是野值，必须先写占位。
-            // 22 为帧常量存储缓冲，真正内容由雾合成那边提供；
-            // 23/24 先用 AP 体积占位，由透明 Pass 在绑定前重写成本帧体积产物。
+            // The three fog sampling slots (22/23/24): the text entry point statically references them in the transparent variant,
+            // so an unwritten descriptor is garbage and placeholders must be written first.
+            // 22 is the frame constant storage buffer, whose real contents are provided by the fog composite;
+            // 23/24 first use the AP volume placeholder and are rewritten into this frame's volume products by the transparent Pass before binding.
             var fogFrameInfo = new VkDescriptorBufferInfo
             { Buffer = Pipeline.DefaultFogFrameBuffers[fi].Buffer, Offset = 0, Range = SVk.WholeSize };
             writes[22] = MakeTextWrite(set, Pipeline.SceneFogFrameBinding, VkDescriptorType.StorageBuffer, &fogFrameInfo);
@@ -2428,7 +2439,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         mesh.Ready = false;
     }
 
-    // ── InstancedModel（GLB GPU Instancing）──
+    // ── InstancedModel (GLB GPU Instancing) ──
 
     public async Task<bool> LoadInstancedModel(InstancedModel model)
     {
@@ -3330,15 +3341,15 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         Season.Rendering.StorageBufferUsage usage = Season.Rendering.StorageBufferUsage.Compute)
         => new VKStorageBuffer(sizeInBytes, usage);
 
-    // ── A0.1 间接绘制（契约在 IGraphics / Indirect.cs）──
-    // Vulkan 是四端里约束最严的：TryDispatchCompute 尾部的 buffer barrier 只把 dstStage 开到
-    // ComputeShader|VertexShader，并不覆盖 DrawIndirect 阶段，所以这里必须补一道独立 barrier。
-    // 它也解释了为何提交要拆成 Prepare/Draw：render pass instance 内部不得包含 barrier。
+    // ── A0.1 Indirect draw (the contract is in IGraphics / Indirect.cs) ──
+    // Vulkan has the strictest constraints among the four backends: the buffer barrier at the tail of TryDispatchCompute only opens dstStage to
+    // ComputeShader|VertexShader and does not cover the DrawIndirect stage, so an independent barrier must be added here.
+    // It also explains why submission is split into Prepare/Draw: a render pass instance must not contain a barrier internally.
 
     public bool IndirectDrawSupported => ComputeSupported;
 
-    /// <summary>A0.2：间接计算派发（vkCmdDispatchIndirect）。与间接绘制是两道独立能力位，
-    /// 但这里同源：两者都只需要 compute 队列与一个 ComputeAndIndirectArgs 缓冲。</summary>
+    /// <summary>A0.2: indirect compute dispatch (vkCmdDispatchIndirect). These are two independent capability bits alongside indirect draw,
+    /// but they share the same origin here: both only need the compute queue and one ComputeAndIndirectArgs buffer.</summary>
     public bool DispatchIndirectSupported => ComputeSupported;
 
     public unsafe bool TryPrepareIndirectArgs(Season.Rendering.StorageBuffer buffer)
@@ -3368,14 +3379,14 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         return true;
     }
 
-    /// <summary>间接实例化四边形绘制管线。创建失败即返回 null，粒子效果据此整体不注册，画面退回改动前。</summary>
+    /// <summary>Indirect instanced quad draw pipeline. Returns null on creation failure, so the particle effect is not registered as a whole and the image falls back to before the change.</summary>
     public Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline()
     {
         if (!IndirectDrawSupported || Vulkan.Device.LogicalDevice.Handle == 0) return null;
         try { return new VKParticleDrawPipeline(); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Particles] Vulkan 管线创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Particles] Vulkan pipeline creation failed: {ex.Message}");
             return null;
         }
     }
@@ -3427,7 +3438,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
         vk.UnmapMemory(Vulkan.Device.LogicalDevice, staging.Memory);
 
-        // 目标缓冲跨帧复用，写入前等待上一帧的计算、顶点和片元消费者。
+        // The destination buffer is reused across frames, so before writing we wait for the previous frame's compute, vertex, and fragment consumers.
         var beforeCopy = new VkBufferMemoryBarrier {
             SType = VkStructureType.BufferMemoryBarrier,
             SrcAccessMask = VkAccessFlags.ShaderReadBit | VkAccessFlags.ShaderWriteBit | VkAccessFlags.TransferWriteBit,
@@ -3506,7 +3517,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         var kernel = (VKComputeKernel)args.Kernel;
         var bindings = kernel.Desc.Bindings;
 
-        // A0.2 的准入与 D3D12 端同样放在绑定循环之前：失败时不该已经录进去一堆布局转换。
+        // A0.2 admission is placed before the binding loop, as on the D3D12 side: on failure we must not have already recorded a bunch of layout transitions.
         VKStorageBuffer indirect = null;
         if (args.IsIndirect)
         {
@@ -3745,10 +3756,10 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
         if (indirect != null)
         {
-            // 参数块刚被上游内核写过，停在 ShaderWrite。派发这里同样要一道独立的 barrier：
-            // vkCmdDispatchIndirect 在 DRAW_INDIRECT 阶段读参数（规范把它与 vkCmdDrawIndirect* 归在同一个阶段），
-            // 而上一段派发的收尾 barrier 的 dstStage 只开到 ComputeShader|VertexShader，覆盖不到它。
-            // 与绘制那条路径的唯一区别是不必拆成两步：派发本身就在 Pass 之外，录制与交接是同一次调用。
+            // The parameter block was just written by the upstream kernel and sits at ShaderWrite. The dispatch here likewise needs an independent barrier:
+            // vkCmdDispatchIndirect reads parameters in the DRAW_INDIRECT stage (the spec groups it with vkCmdDrawIndirect* in the same stage),
+            // while the dstStage of the previous dispatch's closing barrier only opens to ComputeShader|VertexShader and does not cover it.
+            // The only difference from the draw path is that it need not be split into two steps: the dispatch itself is outside the Pass, so recording and handoff are the same call.
             var indirectBarrier = new VkBufferMemoryBarrier
             {
                 SType = VkStructureType.BufferMemoryBarrier,

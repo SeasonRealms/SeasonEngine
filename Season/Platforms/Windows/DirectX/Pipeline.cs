@@ -125,8 +125,8 @@ internal static unsafe class Pipeline
     /// <summary>1-5 shadow PSO (depth-only, CullNone, bias baked in; created when ShadowsEnabled is on).</summary>
     internal static ID3D12PipelineState* ShadowPipelineState;
     /// <summary>
-    /// A7：阴影间接绘制的命令签名（一条 DrawIndexed 记录）。惰性创建且与进程同寿：
-    /// 它不引用任何根签名，也不随渲染目标或采样数变化，所以只需一份。
+    /// A7: command signature for shadow indirect draw (one DrawIndexed record). Lazily created and lives for the lifetime of the process:
+    /// it does not reference any root signature, nor does it change with the render target or sample count, so only one is needed.
     /// </summary>
     internal static ID3D12CommandSignature* ShadowIndirectCommandSignature;
 
@@ -506,9 +506,9 @@ internal static unsafe class Pipeline
         // Root parameters: 29 total (five CBVs b0-b4 + 16 SRV tables t0-t7 + t8/t9/t10
         // + 1-7 envCube t11 + 2-4 ddgiAtlas t12 + 2-4 ddgiDepth t13 + 2-5 cloudNoise t14
         // + 2-5 apLut t15 + 1-5 shadow root constants b5 + Outline2D mask color root constants b6)
-        // 新增独立雾绑定占 8 DWORD，总计 58，不改写已经提交的光照 CBV。
-        // 每视图常量 b8 再占 2 DWORD，总计 60（上限 64）。
-        // 2-7 P0 再追加一个 t19 描述符表，总计 61（上限 64），剩余 3 DWORD。
+        // The added standalone fog binding occupies 8 DWORDs, for a total of 58, without rewriting the already-submitted lighting CBV.
+        // The per-view constant b8 occupies another 2 DWORDs, for a total of 60 (limit 64).
+        // 2-7 P0 adds one more t19 descriptor table, for a total of 61 (limit 64), leaving 3 DWORDs.
         _fogSamplingEnabled = RenderQuality.Current.RequiresAtmosphereSceneDepth(
             Device.HdrSceneColor, true, Immediate2DMode.Enabled);
         var rootParameters = new RootParameter[29];
@@ -546,7 +546,7 @@ internal static unsafe class Pipeline
         // Create descriptor ranges for the 16 SRVs covering textures / morph / instance bone / shadow atlas /
         // prev bone / prev instance world / prev morph weights / env cube / DdgiAtlas / DdgiDepth /
         // CloudNoise / AerialLut (from t0 to t15)
-        // 放在栈上，保证后续序列化时各 table 指针仍然有效。
+        // Put on the stack to ensure each table pointer remains valid during later serialization.
         Span<DescriptorRange> descriptorRanges = stackalloc DescriptorRange[19];
         for (int i = 0; i < 5; i++)
         {
@@ -648,7 +648,7 @@ internal static unsafe class Pipeline
 
         descriptorRanges[16] = new() { RangeType = DescriptorRangeType.Srv, NumDescriptors = 1, BaseShaderRegister = 17 };
         descriptorRanges[17] = new() { RangeType = DescriptorRangeType.Srv, NumDescriptors = 1, BaseShaderRegister = 18 };
-        // 2-7 P0: t19 = 程序化天空的 Sky-View LUT，PBR 的环境镜面源
+        // 2-7 P0: t19 = procedural sky's Sky-View LUT, the PBR environment specular source
         descriptorRanges[18] = new() { RangeType = DescriptorRangeType.Srv, NumDescriptors = 1, BaseShaderRegister = 19 };
 
         // Pin the descriptorRanges array with a fixed block
@@ -824,9 +824,9 @@ internal static unsafe class Pipeline
                 ShaderVisibility = ShaderVisibility.Pixel
             };
 
-            // 2-7 P0: Sky-View LUT (t19)，程序化天空下的 PBR 环境镜面源。
-            // 与 t11 envCube 并列而不是替换它：两者互斥，由 skyParams0.w 在 uniform 分支里二选一，
-            // 所以两张图表都必须有合法描述符（未就绪时绑 1x1 白）。
+            // 2-7 P0: Sky-View LUT (t19), the PBR environment specular source under procedural sky.
+            // Parallel to t11 envCube rather than replacing it: the two are mutually exclusive, chosen between by skyParams0.w in the uniform branch,
+            // so both tables must have valid descriptors (binding 1x1 white when not ready).
             rootParameters[SkyViewRoot] = new RootParameter
             {
                 ParameterType = RootParameterType.TypeDescriptorTable,
@@ -1147,11 +1147,11 @@ cbuffer SceneLights : register(b1)
     float4 weatherParams0;
     float4 weatherParams1;
     float4 weatherRegions[64];
-    // 2-7 雷电 (offset 2432): xyz = 当前主导雷击在云内的世界坐标 / w = 回击包络亮度 0~1。
-    // w 是唯一总开关；非雷暴天气、区域质量 Off、Showcase 模式下整个字段为零。
+    // 2-7 lightning (offset 2432): xyz = world position within the cloud of the current dominant strike / w = return-stroke envelope brightness 0~1.
+    // w is the single master switch; under non-thunderstorm weather, region quality Off, or Showcase mode the whole field is zero.
     float4 weatherFlash;
-    // 2-8 环境镜面的虚拟地面 (offset 2448)：xyz = 地面辐亮度（线性 HDR，含 albedo/直射/天空 SH9/1π），
-    // w = 地面所在的世界 Y。只由 SkyLighting.Apply 注入，只在程序化天空分支里被读取。
+    // 2-8 virtual ground for environment specular (offset 2448): xyz = ground radiance (linear HDR, including albedo/direct/sky SH9/1π),
+    // w = world Y of the ground. Injected only by SkyLighting.Apply, read only in the procedural sky branch.
     float4 reflectionParams0;
 };
 
@@ -1561,7 +1561,7 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
         float4x4 prevWorldMatrix;
         if (isInstanced != 0 && hasPrevInstanceWorld != 0)
         {
-                        // CPU 历史实例流按原始行序上传，StructuredBuffer 矩阵须转置后再参与行向量乘法。
+                        // The CPU history instance stream is uploaded in original row order, so StructuredBuffer matrices must be transposed before row-vector multiplication.
                         prevWorldMatrix = transpose(g_PrevInstanceWorlds[(uint)outlineMaskBoneBase.x + instanceID]);
             if (prevWorldMatrix._m33 == 0.0)
                 prevWorldMatrix = worldMatrix;
@@ -1696,7 +1696,7 @@ float4 ApplySceneFog(float4 color, float3 worldPos) {
     }
     [branch] if(fogParams.x > 0.5) {
         float4 fog = FogAtWorld(worldPos);
-        // 当前材质 PSO 使用 straight alpha，混合阶段统一乘 alpha。
+        // The current material PSO uses straight alpha, so the blend stage multiplies by alpha uniformly.
         color.rgb = color.rgb * fog.w + fog.rgb;
     }
 #endif
@@ -2657,12 +2657,12 @@ float4 PSMain(PSInput input) : SV_TARGET
     [branch] if (renderMode == 0)
     {
 #if HDR_CHAIN
-        // S1: unlit 几何在二级视图的解析式自散射。viewCameraPos.w 是视图槽位（0 = 主视图），
-        // 主视图仍然完全交给 ApplySceneFog 里的体积雾 in-scatter 供光，观感与改动前逐像素一致。
-        // 二级视图的 BindSceneFog 走「雾透明旁路」（S5 门控 = ViewHasFog = false），fogParams 全零，
-        // 光束这类「靠散射活着」的几何会只剩 6% 裸 albedo 薄膜，与主画面完全脱节。
-        // emissiveFactor 是这条支路的 HDR 增益（.rgb = 增益色，.w = 门控），unlit 路径原先不读它，
-        // 所以只有真正需要该通道的图元（灯塔光束）会显式设置；其余图元保持零，不会有任何变化。
+        // S1: analytic self-scattering of unlit geometry in secondary views. viewCameraPos.w is the view slot (0 = main view),
+        // and the main view still delegates entirely to the volumetric fog in-scatter in ApplySceneFog, pixel-for-pixel identical to before the change.
+        // The secondary view's BindSceneFog takes the fog transparent bypass (S5 gate = ViewHasFog = false), with fogParams all zero,
+        // so geometry that lives on scattering such as light beams is left with only a 6% bare albedo film, completely disconnected from the main picture.
+        // emissiveFactor is the HDR gain for this branch (.rgb = gain color, .w = gate), which the unlit path did not previously read,
+        // so only primitives that genuinely need that channel (the lighthouse beam) set it explicitly; all other primitives stay zero with no change.
         [branch] if (viewCameraPos.w > 0.5 && emissiveFactor.w > 0.0)
             albedo = albedo + emissiveFactor.rgb * alpha;
         // Sprite2D: unlit, output linear color directly and let the FinalBlit exposure + ACES + gamma chain close it out
@@ -2782,8 +2782,8 @@ float4 PSMain(PSInput input) : SV_TARGET
 #if NORMAL_OUTPUT
     // A0.2 contract clause 2: world-space shading normal (after the normal map) and the roughness the lobe is actually
     // evaluated with (after Toksvig), so SSR and decals see the same surface the lighting below does.
-    // P0 起第 4 通道不再是 metallic：它是 SSR 差分要用的**反射权重**，必须等 F0 与 ao 都算出来才能写，
-    // 所以写入点挪到下面的反射项之后（见 ambient += reflectionRadiance 那一行）。
+    // From P0 the 4th channel is no longer metallic: it is the **reflection weight** used by the SSR difference, which can only be written once both F0 and ao are computed,
+    // so the write point was moved after the reflection term below (see the ambient += reflectionRadiance line).
 #endif
 
     // Compute the view direction
@@ -2887,15 +2887,15 @@ float4 PSMain(PSInput input) : SV_TARGET
     // 1-7 contract clause 6: the specular term uses the mirror-reflection sample from radiance cube LOD0.
     // There is no mip chain and no GGX prefiltering, so it is masked by (1-roughness)^2; the environment
     // energy for rough surfaces is carried by the SH9 diffuse term above.
-    // 2-8 的两处修正都只发生在程序化天空分支里，else 分支（envCube）保持 1-7 的原式不变，
-    // 这样只开贴图立方图的预设仍是零回归：
-    //   A. R.y < 0 时 Sky-View LUT 那一侧几乎是黑的（朝下的射线只穿过视点到地面那几百米空气，
-    //      而地面自身被照亮后的辐亮度根本没有被加进去），于是改用 CPU 预算好的地面辐亮度，
-    //      地平线两侧用 smoothstep 过渡。镜面球下半部分本来就该映出草地，而不是黑。
-    //   B. 粗糙端不再靠再叠一次 (1-roughness)^2 把镜面压成零：金属的漫反射项被 (1-metallic) 乘掉，
-    //      压成零就等于金属在粗糙之后完全失去环境能量。改为按 (1-roughness)^2 在镜面采样与
-    //      giDiffuse（半球平均，已是 E/pi 且含 DDGI 的地面反弹）之间插值。粗糙时 R 本来就贴近 N，
-    //      用 N 上的辐照度近似反射叶内的平均入射辐射，不必再采一次探针。
+    // The two 2-8 fixes both occur only in the procedural sky branch; the else branch (envCube) keeps the 1-7 original formula unchanged,
+    // so presets that enable only the cube-map remain zero-regression:
+    //   A. When R.y < 0 the Sky-View LUT side is almost black (a downward ray only crosses the few hundred meters of air from the viewpoint to the ground,
+    //      and the ground's own lit radiance was never added in), so it switches to the CPU-precomputed ground radiance,
+    //      with a smoothstep transition on both sides of the horizon. The lower half of a specular sphere should show grass, not black.
+    //   B. The rough end no longer crushes the specular to zero by stacking another (1-roughness)^2: the metal's diffuse term is multiplied by (1-metallic),
+    //      and crushing to zero means metal completely loses environment energy once rough. Instead it interpolates by (1-roughness)^2 between the specular sample and
+    //      giDiffuse (hemisphere average, already E/pi and including the DDGI ground bounce). At high roughness R is naturally close to N,
+    //      so the irradiance on N approximates the average incoming radiance within the reflection lobe, without sampling the probe again.
     float3 R = reflect(-V, N);
     float mirrorW = (1.0 - roughness) * (1.0 - roughness);
     float3 reflectionRadiance;
@@ -2903,7 +2903,7 @@ float4 PSMain(PSInput input) : SV_TARGET
     [branch] if (skyParams0.w > 0.0)
     {
         float3 skyRadiance = SampleSkyViewRadiance(R);
-        // 观察点必须在地面之上，地面项才有意义；否则（贴地或穿地的相机）一律退回天空。
+        // The viewpoint must be above the ground for the ground term to be meaningful; otherwise (a camera on or below the ground) it always falls back to the sky.
         float aboveGround = step(reflectionParams0.w, input.worldPos.y);
         float horizonW = max(smoothstep(-0.09, 0.09, R.y), 1.0 - aboveGround);
         skyRadiance = lerp(reflectionParams0.xyz, skyRadiance, horizonW);
@@ -2912,31 +2912,35 @@ float4 PSMain(PSInput input) : SV_TARGET
     }
     else
     {
-        // 1-7 原式：LOD0 镜面 × envParams.x × (1-r)^4。
+        // 1-7 original formula: LOD0 specular × envParams.x × (1-r)^4.
         reflectionRadiance = envCube.SampleLevel(linearSampler, R, 0).rgb * envParams.x * mirrorW * mirrorW;
         specGate = step(0.5, envParams.w);
     }
     ambient += reflectionRadiance * F0 * ao * specGate;
 
 #if NORMAL_OUTPUT
-    // P0 SSR 的 F0 通道。合成端要做的是「把天空那一项换成屏幕空间命中」，
-    // 恒等式是 Δ = conf·(1-r)²·(F0·ao)·(ssr − reflSky)：giDiffuse 在差里抵消，
-    // 所以这里只需要一个标量权重，用 Rec.709 亮度把 F0 压成一维。
-    // 丢掉的只是色偏（金球 vs 银球），因为 Δ 是替换量、不是颜色本身；换来的是不必为 SSR 再开一个 MRT 目标。
-    // envCube 分支写 0：那条路径的基项是贴图立方图，SSR 核拿不到它，替换只会算错。
+    // P0 SSR's F0 channel. What the composition side has to do is replace the sky term with the screen-space hit,
+    // the identity being Δ = conf·(1-r)²·(F0·ao)·(ssr − reflSky): giDiffuse cancels out in the difference,
+    // so only a scalar weight is needed here, collapsing F0 to one dimension via Rec.709 luminance.
+    // What is lost is only the color cast (gold sphere vs silver sphere), because Δ is a replacement quantity, not the color itself; what is gained is not needing another MRT target for SSR.
+    // The envCube branch writes 0: that path's base term is the cube-map, which the SSR kernel cannot access, so replacing it would only compute wrong.
     outNormal = float4(OctEncodeNormal(N), roughness,
         skyParams0.w > 0.0 ? dot(F0, float3(0.2126, 0.7152, 0.0722)) * ao : 0.0);
 #endif
 
-    // 2-7: 雷击的照明。v1 把它并进环境项，于是任何朝向都均匀变亮——山脊背面也亮，
-    // 与「闪电在那边」对不上。v2 给出方向：
-    //   光源取击穿点在地面投影处、高度夹进 [地面, 击穿点]：通道是竖直的，对站在地面的
-    //     观察者真正起作用的是它最低的那几段，用云点会让入射角几乎为零；
-    //   衰减用 1/(1+d²/R²) 而不是 1/d²：R=400 m 时 400 m 处仍有半亮，符合一次地闪照亮
-    //     方圆数公里的量级，也不会像 1/d² 那样在近处炸成白屏；系数 1.6 使 400 m 处
-    //     恰好回到 v1 的 0.8，远景亮度不变；
-    //   朗伯项保留 25% 的底：通道有多段分支，任何朝向都有某一段能照到，纯 dot 会把
-    //     背光面直接压黑，反而比 v1 更像错误。
+    // 2-7: Lightning illumination. v1 folded it into the ambient term, which lit every orientation
+    // uniformly -- the back side of a ridge was lit too, inconsistent with 'the lightning is over there'.
+    // v2 gives it direction:
+    //   The light is placed at the ground projection of the breakdown point, with its height clamped into
+    //     [ground, breakdown point]: the channel is vertical, and for an observer standing on the ground
+    //     only its lowest segments really matter; using the cloud point would make the incidence angle
+    //     nearly zero.
+    //   Attenuation uses 1/(1+d²/R²) instead of 1/d²: at R=400 m there is still half brightness at 400 m,
+    //     matching the scale of a single cloud-to-ground flash lighting up several kilometers around, and
+    //     unlike 1/d² it does not blow out to a white screen up close; the 1.6 coefficient brings 400 m
+    //     back to exactly v1's 0.8, so distant brightness is unchanged.
+    //   The Lambert term keeps a 25% floor: the channel has several branches, so some segment can reach
+    //     any orientation; a pure dot would crush back-lit faces to black, which looks more wrong than v1.
     [branch] if (weatherFlash.w > 0.0)
     {
         float flashGround = min(reflectionParams0.w, weatherFlash.y);
@@ -3309,16 +3313,18 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
 
     static void BindSceneFog()
     {
-        // S5: 门控从原来的 "Pass id 是否等于 SceneTransparent" 改成 "本视图是否有雾"（ViewHasFog）。
-        // deferredScene（非分段二级视图）也在 SceneTransparent pass 里重放，但它没有合成雾，
-        // 所以 ViewHasFog=false → 走下面的零门控旁路，保持 fogParams 全零。
-        // 光束在这条旁路里不会因丢失 in-scatter 而变成暗刀：S1 分支（emissiveFactor 增益）
-        // 已在 shader 端为二级视图提供了不依赖雾的解析式亮度。
+        // S5: the gate changed from "is the Pass id equal to SceneTransparent" to "does this view have fog"
+        // (ViewHasFog). deferredScene (a non-segmented secondary view) is also replayed in the SceneTransparent
+        // pass, but it has no composite fog, so ViewHasFog=false -> it takes the zero-gate bypass below and
+        // keeps fogParams all zero. In that bypass the light beam does not become a dark blade from missing
+        // in-scatter: the S1 branch (emissiveFactor gain) already gives secondary views a fog-independent
+        // analytic brightness on the shader side.
         if (DXSceneDrawCollection.ViewHasFog && DXFogCompositePipeline.BindTransparent()) return;
         var command = Device.GraphicsCommandList;
-        // 雾透明旁路：本视图没有体积雾合成，绑定合法哨兵并把 fogParams 保持全零。
-        // 复用既有骨骼缓冲和 AP 哨兵，不为雾关闭路径额外创建纹理。
-        // 光束亮度由 S1（emissiveFactor × alpha）在 shader 中独立供给，不依赖 fogParams。
+        // Fog transparent bypass: this view has no volumetric fog composite, so bind valid sentinels and keep
+        // fogParams all zero. Reuse the existing bone buffer and AP sentinel instead of creating extra textures
+        // for the fog-disabled path. Beam brightness is supplied independently by S1 (emissiveFactor x alpha)
+        // in the shader and does not depend on fogParams.
         var dummy = DXTexture3D.DummyBlack;
         dummy.EnsureReadyForRendering(command);
         command->SetGraphicsRootShaderResourceView(FogFrameRoot, DefaultInstanceBoneBuffer->GetGPUVirtualAddress());
@@ -3408,12 +3414,14 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
             prevMorphSrvHandle.Ptr != 0 ? prevMorphSrvHandle : DefaultPrevMorphWeightsSrvHandle);
 
         BindSceneTextures();
-        // SV_InstanceID 不包含 StartInstanceLocation；普通透明逐实例绘制也需要显式基址。
+        // SV_InstanceID does not include StartInstanceLocation; normal transparent per-instance drawing also
+        // needs an explicit base address.
         SetOutlineMaskBoneBase(instanceBufferView != null ? startInstanceLocation : 0);
         cmdList->DrawIndexedInstanced((uint)primitiveData.Indices.Length, instanceCount, 0, 0, startInstanceLocation);
     }
 
-    // 精灵与文字也使用完整场景 Shader；合成切换根签名后不能依赖上一次图元的残留绑定。
+    // Sprites and text also use the full scene shader; after composition switches the root signature, we must
+    // not rely on the residual bindings of the previous primitive.
     internal static void BindQuadSceneResources(ulong view)
     {
         var command = Device.GraphicsCommandList;
@@ -3463,7 +3471,7 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
     {
         var cmdList = Device.GraphicsCommandList;
         Device.White.EnsureReadyForRendering(cmdList);
-        // 阴影未注册时也绑定合法哨兵，阴影参数为零时不会采样。
+        // Bind a valid sentinel even when shadows are unregistered; with shadow parameters at zero it is never sampled.
         // P3 ShadowPolicy.Off: a view that opted out of shadows binds the 1x1 white fallback instead of the atlas.
         cmdList->SetGraphicsRootDescriptorTable(12,
             FrameSchedule.ActiveShadowPolicy != ViewShadowPolicy.Off
@@ -3514,9 +3522,10 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         apLut.EnsureReadyForRendering(cmdList);
         cmdList->SetGraphicsRootDescriptorTable(22, apLut.GpuDescriptorHandle);
 
-        // 2-7 P0: Sky-View LUT (t19)。着色器在 skyParams0.w > 0 的 uniform 分支里静态引用它，
-        // 而那个门控只在 FrameSchedule.SkyViewTexture 非空时成立，所以未就绪时绑的 1x1 白永远不会被采样。
-        // Active 每帧由 SetLighting 解析，不缓存挂掉的资源句柄。
+        // 2-7 P0: Sky-View LUT (t19). The shader statically references it in the uniform branch where
+        // skyParams0.w > 0, but that gate only holds when FrameSchedule.SkyViewTexture is non-null, so the 1x1
+        // white bound when it is not ready is never sampled. Active is resolved each frame by SetLighting and
+        // does not cache a dead resource handle.
         var skyView = SkyViewActive ?? Device.White;
         skyView.EnsureReadyForRendering(cmdList);
         cmdList->SetGraphicsRootDescriptorTable(SkyViewRoot, skyView.GpuDescriptorHandle);
@@ -3574,6 +3583,18 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
     {
         fixed (Matrix4x4* p = &lightViewProj)
             DirectX.Device.GraphicsCommandList->SetGraphicsRoot32BitConstants(13, 16, p, 0);
+    }
+
+    /// <summary>Begin the Outline2D mask pass by rebinding the main RootSignature.
+    /// The mask pass writes root constant b6 (index 20) via <see cref="SetOutlineMaskColor"/> before the first
+    /// <see cref="SetPipeline(PipelineMode, PipelineCullVariant, bool)"/> call, so it must not inherit the
+    /// 2-parameter root signature left behind by the particle / 2D pipelines of the preceding pass.
+    /// Mirrors the rebound performed by <see cref="SetShadowPipeline"/>.</summary>
+    internal static void BeginOutlineMaskPass()
+    {
+        var cmdList = DirectX.Device.GraphicsCommandList;
+        cmdList->SetGraphicsRootSignature(RootSignature);
+        ResetOutlineMaskBoneBase();
     }
 
     /// <summary>Write Outline2D mask outline parameters per group (root constants b6, 8 DWORDs):
@@ -3676,12 +3697,14 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
     }
 
     /// <summary>
-    /// A7 的阴影视图：与 <see cref="DrawShadowPrimitive"/> 只差最后一步——五个绘制参数不再来自 CPU 寄存器，
-    /// 而是从 argsResource 的指定偏移读一条记录。PSO、根签名、顶点布局、深度状态全部照旧，
-    /// 因为间接绘制只改变参数的来源，不改变任何管线形状。
+    /// A7's shadow view: it differs from <see cref="DrawShadowPrimitive"/> only in the last step -- the five
+    /// draw parameters no longer come from CPU registers but from one record read at a given offset in
+    /// argsResource. The PSO, root signature, vertex layout, and depth state are all unchanged, because
+    /// indirect draw only changes where the parameters come from, not any pipeline shape.
     /// <para>
-    /// 实例数由 gather 内核写出，CPU 这一侧从不回读。调用方必须已经通过 PrepareCullDraw 把参数缓冲
-    /// 交接到 INDIRECT_ARGUMENT，否则调试层会报状态不匹配。
+    /// The instance count is written by the gather kernel; the CPU side never reads it back. The caller must
+    /// already have transitioned the parameter buffer to INDIRECT_ARGUMENT via PrepareCullDraw, otherwise the
+    /// debug layer reports a state mismatch.
     /// </para>
     /// </summary>
     public static void DrawShadowPrimitiveIndirect(
@@ -3714,7 +3737,8 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
             int fi = (int)Device.FrameIndex;
             cmdList->SetGraphicsRootConstantBufferView(2, primitiveData.MaterialBuffers[fi]->GetGPUVirtualAddress());
 
-            // t5 morph：顶点阶段的形变分支需要它，与主通道共用同一个默认缓冲。
+            // t5 morph: the vertex-stage deformation branch needs it, and it shares the same default buffer
+            // with the main pass.
             cmdList->SetGraphicsRootDescriptorTable(9,
                 primitiveData.MorphDeltasSrvHandle.Ptr != 0
                     ? primitiveData.MorphDeltasSrvHandle
@@ -3725,8 +3749,9 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
     }
 
     /// <summary>
-    /// 阴影间接视图的命令签名：一条 DrawIndexed 记录，不引用任何根签名（间接只描述绘制参数，
-    /// 不改变已绑定的根参数）。ByteStride 直接用共享层常量，布局漂移会在这里立即暴露。
+    /// The command signature for the shadow indirect view: one DrawIndexed record that references no root
+    /// signature (indirect only describes the draw parameters, it does not change the root parameters already
+    /// bound). ByteStride uses the shared-layer constant directly, so any layout drift is exposed here immediately.
     /// </summary>
     static ID3D12CommandSignature* EnsureShadowIndirectSignature()
     {
@@ -3751,8 +3776,9 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         }
         catch (Exception ex)
         {
-            // 失败即保持 null：调用方据此退回直接绘制，而不是拿一个空签名去发间接提交。
-            DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] 命令签名创建失败：{ex.Message}");
+            // On failure stay null: the caller falls back to direct drawing based on that, rather than issuing
+            // an indirect submission with an empty signature.
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] Command signature creation failed: {ex.Message}");
             return null;
         }
         ShadowIndirectCommandSignature = signature;

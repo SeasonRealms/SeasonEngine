@@ -4,7 +4,7 @@
 
 namespace Season.Rendering.Effects;
 
-/// <summary>独立雨幕合成。复用后端全屏管线的资源快照机制，不持有或消费体积雾资源。</summary>
+/// <summary>Standalone rain curtain composite. Reuses the backend fullscreen pipeline's resource snapshot mechanism and neither holds nor consumes volumetric fog resources.</summary>
 public sealed class WeatherCompositePipeline(FogCompositePipeline backend) : IDisposable
 {
     public bool Prepare(RenderTarget color, RenderTarget depth, StorageBuffer frame,
@@ -14,15 +14,17 @@ public sealed class WeatherCompositePipeline(FogCompositePipeline backend) : IDi
     public void Dispose() => backend.Dispose();
 }
 
-/// <summary>不透明之后准备帧数据；独立 WeatherComposite Pass 合成，雾关闭仍可运行。</summary>
+/// <summary>Prepares frame data after opaque; composited by a standalone WeatherComposite pass and still runs when fog is disabled.</summary>
 public sealed class WeatherCurtainEffect : ComputeEffect, IDisposable
 {
     public const int LightingOffset = 8;
     /// <summary>
-    /// 帧缓冲向量数 = 前导 8 行（逆抖动 VP 与相机位置）+ <see cref="SceneLightParams"/> 的全部行。
-    /// 2432B/16 = 152 行，追加雷电后 153 行，2-8 追加虚拟地面后 154 行，所以是 162。
-    /// 这个常量被四端合成管线的绑定字节数共用，也是 js/seasonWebGPU.js 里 _weatherFrameBytes 的唯一依据；
-    /// 改 SceneLightParams 的尾部字段时必须同步，否则合成会因为绑定过小而静默丢帧。
+    /// Frame vector count = the leading 8 rows (inverse jittered VP and camera position) plus all rows of
+    /// <see cref="SceneLightParams"/>. 2432B/16 = 152 rows, 153 rows after lightning was added, 154 rows
+    /// after the 2-8 virtual ground was added, hence 162. This constant is shared by the four-backend
+    /// composite pipelines' binding byte counts and is also the sole basis for _weatherFrameBytes in
+    /// js/seasonWebGPU.js; it must be kept in sync when changing tail fields of SceneLightParams, otherwise
+    /// the composite will silently drop frames because the binding is too small.
     /// </summary>
     public const int FrameVectorCount = 162;
     readonly Vector4[] _frame = new Vector4[FrameVectorCount];
@@ -42,7 +44,7 @@ public sealed class WeatherCurtainEffect : ComputeEffect, IDisposable
 
     public override bool Initialize(IGraphics g)
     {
-        if (_graphics != null) throw new InvalidOperationException("雨幕已经初始化。");
+        if (_graphics != null) throw new InvalidOperationException("The rain curtain is already initialized.");
         if (g is not ISegmentedSceneGraphics || !g.ComputeSupported || Immediate2DMode.Enabled
             || RenderQuality.Current.RegionalWeather is not (RegionalWeatherQuality.Low or RegionalWeatherQuality.High)
             || FrameSchedule.SceneColor is not { Desc.ColorFormat: RtFormat.Rgba16Float, Desc.SampleCount: <= 1 }
@@ -63,7 +65,7 @@ public sealed class WeatherCurtainEffect : ComputeEffect, IDisposable
         }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherCurtain] 初始化失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherCurtain] Initialization failed: {ex.Message}");
             Dispose(); return false;
         }
     }
@@ -93,7 +95,7 @@ public sealed class WeatherCurtainEffect : ComputeEffect, IDisposable
         }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherCurtain] 尺寸重建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherCurtain] Resize rebuild failed: {ex.Message}");
         }
     }
 
@@ -117,13 +119,13 @@ public sealed class WeatherCurtainEffect : ComputeEffect, IDisposable
         }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherCurtain] 帧上传失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherCurtain] Frame upload failed: {ex.Message}");
         }
     }
 
     public static void PackFrame(Span<Vector4> frame, Matrix4x4 inverseJitteredVp, in SceneLightParams lights)
     {
-        if (frame.Length < FrameVectorCount) throw new ArgumentException("雨幕帧缓冲不足。", nameof(frame));
+        if (frame.Length < FrameVectorCount) throw new ArgumentException("Rain curtain frame buffer is too small.", nameof(frame));
         frame.Clear();
         MemoryMarshal.Cast<Matrix4x4, Vector4>(MemoryMarshal.CreateReadOnlySpan(ref inverseJitteredVp, 1)).CopyTo(frame);
         frame[4] = lights.CameraPos;
@@ -149,7 +151,7 @@ public sealed class WeatherCurtainEffect : ComputeEffect, IDisposable
         }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherCurtain] 合成准备失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherCurtain] Composite prepare failed: {ex.Message}");
             return false;
         }
     }
@@ -168,7 +170,7 @@ public sealed class WeatherCurtainEffect : ComputeEffect, IDisposable
         }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherCurtain] 合成绘制失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherCurtain] Composite draw failed: {ex.Message}");
             return default;
         }
     }

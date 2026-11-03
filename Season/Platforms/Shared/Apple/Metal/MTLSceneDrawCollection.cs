@@ -8,7 +8,7 @@ using MTLTexture = Season.Platforms.Shared.Apple.Metal.Texture;
 
 namespace Season.Platforms.Shared.Apple.Metal;
 
-/// <summary>三种绘制命令形态：3D 图元、精灵四边形、文字批次。三者绑定槽位不同，各自成组保存。</summary>
+/// <summary>Three forms of draw command: 3D primitives, sprite quads, and text batches. Their binding slots differ, so each is stored in its own group.</summary>
 internal enum MTLSceneDrawKind : byte
 {
     Primitive,
@@ -17,14 +17,14 @@ internal enum MTLSceneDrawKind : byte
 }
 
 /// <summary>
-/// 单个已捕获的绘制项。只保存不可变句柄（<c>IMTLBuffer</c>/<c>IMTLTexture</c> 引用与偏移、计数），
-/// 不保存控件、也不保存延迟调用 <c>Control.Draw</c> 的委托。
+/// A single captured draw item. Only immutable handles are stored (<c>IMTLBuffer</c>/<c>IMTLTexture</c> references with offsets and counts);
+/// neither the control nor a delegate for the deferred call to <c>Control.Draw</c> is stored.
 ///
-/// 与 DX/VK 的形态差异正是 Metal 的 encoder 语义：
-/// 一次 <c>BeginPass</c> 就是一个 <c>RenderCommandEncoder</c>，换 Pass 之后所有绑定归零，
-/// 没有类似描述符集或根签名的“持久绑定”可复用。
-/// 因此每条命令都必须自带**完整**的绑定清单，重放时从头绑一遍；
-/// 好处是重放完全没有跨命令状态依赖，也不需要 VK 那种“绑定后不可改写”的补写纪律。
+/// The difference in form from DX/VK is precisely Metal's encoder semantics:
+/// one <c>BeginPass</c> is one <c>RenderCommandEncoder</c>, and switching Passes resets all bindings,
+/// with no "persistent binding" like a descriptor set or root signature to reuse.
+/// Therefore every command must carry a **complete** binding list and rebind from the start during replay;
+/// the benefit is that replay has no cross-command state dependency at all, and it does not need VK's "no rewriting after binding" rewrite discipline.
 /// </summary>
 internal struct MTLSceneDrawCommand : ISceneDrawCommand
 {
@@ -32,10 +32,10 @@ internal struct MTLSceneDrawCommand : ISceneDrawCommand
     internal PipelineMode Mode;
     internal MTLCullMode Cull;
     internal bool DepthWrite;
-    // 每视图常量（VS buffer(11)）：收集时就定下是主视图帧槽还是屏幕空间视图。
+    // Per-view constant (VS buffer(11)): whether it is the main view's frame slot or the screen-space view is decided at collection time.
     internal IMTLBuffer? View;
 
-    // -- 3D 图元：九个顶点/片元缓冲 + 五张材质纹理 + 绘制参数
+    // -- 3D primitive: nine vertex/fragment buffers + five material textures + draw parameters
     internal PrimitiveData? Primitive;
     internal IMTLBuffer? Vertex;
     internal IMTLBuffer? IndexBuffer;
@@ -61,7 +61,7 @@ internal struct MTLSceneDrawCommand : ISceneDrawCommand
     internal nuint InstanceBoneOffset;
     internal nuint PrevBoneOffset;
 
-    // -- 精灵四边形：无 IB，六个非索引顶点
+    // -- Sprite quad: no IB, six non-indexed vertices
     internal IMTLBuffer? QuadVertex;
     internal IMTLBuffer? QuadMatrix;
     internal IMTLBuffer? QuadMaterial;
@@ -73,7 +73,7 @@ internal struct MTLSceneDrawCommand : ISceneDrawCommand
     internal MTLTexture? QuadOcclusion;
     internal MTLTexture? QuadEmissive;
 
-    // -- 文字批次：单位四边形 + 实例流 + 字形数据 + 本帧参数块
+    // -- Text batch: unit quad + instance stream + glyph data + this frame's parameter block
     internal IMTLBuffer? TextVertex;
     internal IMTLBuffer? TextMatrix;
     internal IMTLBuffer? TextInstances;
@@ -91,12 +91,12 @@ internal struct MTLSceneDrawCommand : ISceneDrawCommand
     {
         var enc = Device.GraphicsEncoder;
 
-        // 重放的 Pass 才知道该用哪一族 PSO（主场景 / 速度 MRT / Overlay / OutlineMask），
-        // 所以 PSO 与 DSS 都在这里才真正绑定，收集期只记录模式。
+        // Only the replay Pass knows which PSO family to use (main scene / velocity MRT / Overlay / OutlineMask),
+        // so both the PSO and DSS are actually bound here; the collection phase only records the mode.
         Pipeline.SetPipeline(enc, Mode, doubleSided: Cull == MTLCullMode.None, DepthWrite);
-        // 双面两遍的正面那一遍用的是 Front 剔除，SetPipeline 只表达 None/Back 两态，这里补上。
+        // In the two-pass double-sided scheme, the front-face pass uses Front culling, while SetPipeline only expresses the None/Back states, so it is filled in here.
         enc.SetCullMode(Cull);
-        // 透明阶段的门控与雾采样资源：整条命令自带，不依赖上一条命令留下的 encoder 状态。
+        // The transparent stage's gating and fog-sampling resources: carried by the whole command itself, not depending on encoder state left by the previous command.
         Pipeline.BindSceneFog(enc);
 
         switch (Kind)
@@ -137,8 +137,8 @@ internal struct MTLSceneDrawCommand : ISceneDrawCommand
                 enc.SetFragmentBuffer(TextLight!, 0, 1);
                 enc.SetFragmentBuffer(TextMaterial!, 0, 2);
                 enc.SetFragmentBuffer(TextParams!, 0, 3);
-                // 只有 atlas 有效，其余四张材质位恒用白体占位：文字分支在 FS 里只读 tex0，
-                // 但 Metal API Validation 要求参数里声明的每一个 texture 槽都有合法绑定。
+                // Only the atlas is valid; the other four material slots always use the white texture as a placeholder: the text branch reads only tex0 in the FS,
+                // but Metal API Validation requires every texture slot declared in the parameters to have a legal binding.
                 var fallback = TextFallback!;
                 enc.SetFragmentTexture((TextAtlas ?? fallback).Image, 0);
                 enc.SetFragmentTexture(fallback.Image, 1);
@@ -150,18 +150,18 @@ internal struct MTLSceneDrawCommand : ISceneDrawCommand
         }
     }
 
-    // 资源引用由 <see cref="MTLSceneDrawCollection"/> 的快照页持有，直到本帧 GPU 退休。
+    // Resource references are held by the <see cref="MTLSceneDrawCollection"/> snapshot page until this frame's GPU retires.
     public void Release() { }
 }
 
 /// <summary>
-/// Metal 主线程场景收集器。收集期不提交任何绘制：
-/// <c>Pipeline.SetPipeline</c> 只记录模式/剔除/深度写入，真正绑定 PSO 发生在重放时
-/// （重放的 Pass 才知道该用哪一族 PSO：主场景、速度 MRT、Overlay、OutlineMask）。
+/// Metal main-thread scene collector. During collection it submits no draws at all:
+/// <c>Pipeline.SetPipeline</c> only records mode/cull/depth-write, and the actual PSO binding happens during replay
+/// (only the replay Pass knows which PSO family to use: main scene, velocity MRT, Overlay, OutlineMask).
 ///
-/// 收集期 <c>Device.GraphicsEncoder</c> 为空（还没开 Pass），这是与 DX/VK 最大的形态差异：
-/// 那两端在收集期仍有一条活着的命令缓冲/命令列表可以“什么都不做地”接收绑定调用，
-/// Metal 没有任何 encoder 可接收，所以所有绘制入口都必须在碰到 encoder 之前分流到捕获路径。
+/// During collection <c>Device.GraphicsEncoder</c> is empty (no Pass has been opened yet), and this is the biggest difference in form from DX/VK:
+/// those two still have a live command buffer / command list during collection that can "do nothing while" accepting binding calls,
+/// whereas Metal has no encoder to accept them, so every draw entry point must be split off to the capture path before it touches an encoder.
 /// </summary>
 internal sealed class MTLSceneDrawCollection
 {
@@ -171,10 +171,10 @@ internal sealed class MTLSceneDrawCollection
     ulong _serial;
     int _sequence;
 
-    /// <summary>正在收集的实例；非收集期为空，重放不会再被自己捕获。</summary>
+    /// <summary>The instance currently collecting; empty outside collection, so replay will not be captured by itself again.</summary>
     internal static MTLSceneDrawCollection? Active { get; private set; }
 
-    /// <summary>当前状态：最近一次 SetPipeline/SetCullMode 记录下来的绘制状态。</summary>
+    /// <summary>Current state: the draw state last recorded by SetPipeline/SetCullMode.</summary>
     internal MTLSceneDrawCommand State;
 
     internal MTLDrawSnapshotArena Arena => _arena;
@@ -186,9 +186,9 @@ internal sealed class MTLSceneDrawCollection
     internal void Begin()
     {
         if (Active != null || !FrameSchedule.SceneCollectionActive || !FrameSchedule.SceneDrawOrder.IsCollecting)
-            throw new InvalidOperationException("场景收集必须由帧调度器开启，且上一帧已经释放。");
+            throw new InvalidOperationException("Scene collection must be started by the frame scheduler, and the previous frame must already have been released.");
         _queue.BeginCollection();
-        // Metal 的帧槽退休由 in-flight 信号量保证；这里只需要一个单调句柄来表达“同一帧”。
+        // Metal's frame-slot retirement is guaranteed by the in-flight semaphore; here only a monotonic handle is needed to express "the same frame".
         _arena.BeginFrame(++_serial);
         _sequence = 0;
         State = default;
@@ -197,7 +197,7 @@ internal sealed class MTLSceneDrawCollection
 
     internal void Seal()
     {
-        if (Active != this) throw new InvalidOperationException("场景收集已封存。");
+        if (Active != this) throw new InvalidOperationException("Scene collection has already been sealed.");
         _queue.Seal();
         Active = null;
     }
@@ -205,8 +205,8 @@ internal sealed class MTLSceneDrawCollection
     internal void DrawOpaque()
     {
         if (Device.ActivePassId != RenderPassId.SceneOpaque)
-            throw new InvalidOperationException("不透明队列的 Pass 无效。");
-        // 不透明变体没有雾采样门控，但它是跨 Pass 的静态状态，必须显式归零。
+            throw new InvalidOperationException("The opaque queue's Pass is invalid.");
+        // The opaque variant has no fog-sampling gating, but it is a cross-Pass static state, so it must be explicitly zeroed.
         Pipeline.SceneFogParams = default;
         _queue.DrawOpaque();
     }
@@ -214,9 +214,9 @@ internal sealed class MTLSceneDrawCollection
     internal void DrawTransparent(bool sampleFog)
     {
         if (Device.ActivePassId != RenderPassId.SceneTransparent)
-            throw new InvalidOperationException("透明队列的 Pass 无效。");
+            throw new InvalidOperationException("The transparent queue's Pass is invalid.");
 
-        // 先置空再短路：&& 右侧的不求值路径也要有确定的空绑定，否则会是“采上一帧体积”而不是“不采样”。
+        // Null out first, then short-circuit: the non-evaluated path on the right of && also needs a definite empty binding, otherwise it would be "sample the previous frame's volume" rather than "do not sample".
         IMTLBuffer? frame = null;
         IMTLTexture? integrated = null;
         IMTLTexture? local = null;
@@ -243,7 +243,7 @@ internal sealed class MTLSceneDrawCollection
         finally { _arena.Reset(); State = default; }
     }
 
-    /// <summary>记录本次 SetPipeline 请求的状态，供重放时重新选择 PSO。</summary>
+    /// <summary>Record the state requested by this SetPipeline, so replay can re-select the PSO.</summary>
     internal void RecordPipeline(PipelineMode mode, bool doubleSided, bool depthWrite)
     {
         State.Mode = mode;
@@ -251,14 +251,14 @@ internal sealed class MTLSceneDrawCollection
         State.Cull = doubleSided ? MTLCullMode.None : MTLCullMode.Back;
     }
 
-    /// <summary>记录双面两遍里单独设置的剔除面（正面那一遍为 Front）。</summary>
+    /// <summary>Record the cull face set separately in the two-pass double-sided scheme (Front for the front-face pass).</summary>
     internal void RecordCull(MTLCullMode cull) => State.Cull = cull;
 
     void Add(in MTLSceneDrawCommand command, bool transparent)
     {
-        // Metal 直绘路径本来就是按控件树顺序逐条编码，透明实例也已在调用方按深度排好并逐个拆分。
-        // 这里用递减序号充当“深度”，让共享队列的排序退化为稳定保持调用顺序，
-        // 从而保证分段重放与直绘逐像素一致；跨图元的全局透明排序在 Metal 上从未存在过。
+        // The Metal direct-draw path already encodes one by one in control-tree order, and transparent instances are already sorted by depth on the caller side and split one by one.
+        // Here a decreasing serial number acts as "depth", degrading the shared queue's sort into a stable preservation of call order,
+        // thereby guaranteeing that segmented replay matches direct draw pixel for pixel; global transparent ordering across primitives has never existed on Metal.
         _queue.Add(command, transparent, FrameSchedule.SceneDrawOrder.Current, -_sequence++);
     }
 
@@ -297,8 +297,8 @@ internal sealed class MTLSceneDrawCollection
         draw.Occlusion = primitive.OcclusionTexture;
         draw.Emissive = primitive.EmissiveTexture;
 
-        // Metal 的 buffer 由所有者按帧槽创建，纹理由字典集中管理；
-        // 只要所有人都活到本帧 GPU 退休，重放期就不会读到已释放的对象。
+        // Metal's buffers are created by their owners per frame slot, and textures are managed centrally by a dictionary;
+        // as long as everyone lives until this frame's GPU retires, replay will not read an already-released object.
         _arena.Retain(primitive);
         _arena.Retain(vertex); _arena.Retain(index); _arena.Retain(matrix); _arena.Retain(material);
         _arena.Retain(bones); _arena.Retain(morph); _arena.Retain(instanceBones);
@@ -324,9 +324,9 @@ internal sealed class MTLSceneDrawCollection
         draw.QuadMetallic = metallic;
         draw.QuadOcclusion = occlusion;
         draw.QuadEmissive = emissive;
-        // 精灵永远是透明混合，与 DX CaptureQuad / VK 的 Quad 形态一致。
-        // 剔除与深度写入显式写定，不继承上一条命令留下的状态：
-        // 直绘路径的 SetPipeline(Transparent) 就是 CullBack + TransparentDSS（DSS 不看 depthWrite）。
+        // Sprites are always alpha-blended, consistent with the DX CaptureQuad / VK Quad form.
+        // Cull and depth-write are set explicitly, not inheriting state left by the previous command:
+        // the direct-draw path's SetPipeline(Transparent) is CullBack + TransparentDSS (DSS ignores depthWrite).
         draw.Mode = PipelineMode.Transparent;
         draw.Cull = MTLCullMode.Back;
         draw.DepthWrite = true;
@@ -343,7 +343,7 @@ internal sealed class MTLSceneDrawCollection
     {
         var draw = State;
         draw.Kind = MTLSceneDrawKind.Text;
-        // 文字恒走屏幕空间视图（单位 View/Projection）。
+        // Text always uses the screen-space view (identity View/Projection).
         draw.View = Pipeline.ScreenViewBuffer;
         draw.TextVertex = vertex;
         draw.TextMatrix = matrix;
@@ -357,7 +357,7 @@ internal sealed class MTLSceneDrawCollection
         draw.TextAtlas = atlas;
         draw.TextFallback = fallback;
         draw.TextInstanceCount = instanceCount;
-        // 文字走双面透明，与直绘路径的 SetPipeline(Transparent, doubleSided: true) 对齐。
+        // Text uses double-sided transparent, aligned with the direct-draw path's SetPipeline(Transparent, doubleSided: true).
         draw.Mode = PipelineMode.Transparent;
         draw.Cull = MTLCullMode.None;
         draw.DepthWrite = true;

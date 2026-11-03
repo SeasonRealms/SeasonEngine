@@ -6,21 +6,21 @@ namespace Season.Rendering;
 
 public sealed partial class InstanceCullEffect
 {
-    // A7 的 D3D12 侧四份内核。reset 与 cull 的 [numthreads] 必须等于 C# 里的
-    // InstanceCull.ResetThreads(64) 与 InstanceCull.CullGroupSize(64)，MAX_PRIMITIVES 必须等于
-    // InstanceCull.MaxPrimitives(16)：这两组数字是"定长寻址"的全部依据，任何一处漂移都表现为
-    // 参数表错位而不是编译错误。gather 的 [numthreads] 同样是 64，但组数由 X/Y 两维给出，
-    // finalize 固定单线程 —— 它只读 4 个 uint 归约成派发尺寸，没有可并行的部分。
+    // A7's four D3D12 kernels. The [numthreads] of reset and cull must equal the C# values
+    // InstanceCull.ResetThreads(64) and InstanceCull.CullGroupSize(64), and MAX_PRIMITIVES must equal
+    // InstanceCull.MaxPrimitives(16): these two sets of numbers are the entire basis for "fixed-stride addressing", and any drift
+    // shows up as an arg-table misalignment rather than a compile error. gather's [numthreads] is likewise 64, but its group count is given in the X/Y dimensions,
+    // and finalize is fixed single-threaded -- it only reads 4 uints and reduces them into a dispatch size, with nothing to parallelize.
     //
-    // 参数一律走 cbuffer + 结构体实例，不用 SM5.1 的 ConstantBuffer<T> 模板：DX12 端用 fxc 编 cs_5_0，
-    // 模板形式在那里报 "unrecognized identifier 'ConstantBuffer'"，四份内核会一起注册失败，
-    // 表现为 A7 整体静默退回 CPU 剔除（InstanceCull.Enabled 一直是 false，画面完全正常所以很难察觉）。
-    // 两种写法落在 b0 上的字节布局相同，代码里的字段访问也不必改。
+    // Parameters always go through a cbuffer + struct instance rather than SM5.1's ConstantBuffer<T> template: the DX12 backend compiles cs_5_0 with fxc,
+    // where the template form reports "unrecognized identifier 'ConstantBuffer'", and all four kernels would fail registration together,
+    // showing up as all of A7 silently falling back to CPU culling (InstanceCull.Enabled stays false and the image looks completely normal, so it is hard to notice).
+    // The two forms have the same byte layout on b0, and the field accesses in the code need not change either.
 
     const string ResetHlsl = """
-// A7 reset：把每 (槽位, primitive) 条间接参数写成定值，实例数归零。
-// mode 0 填参数，mode 1 把槽位内 primitive 0 的实例数扇出到其余 primitive。
-// 分两次派发而不是一次做完，是因为扇出必须等剔除内核把计数累加完。
+// A7 reset: writes each (slot, primitive) indirect arg entry to fixed values and zeroes the instance count.
+// mode 0 fills the args, mode 1 fans the instance count of primitive 0 within a slot out to the remaining primitives.
+// It is split into two dispatches rather than done in one, because the fan-out must wait for the cull kernel to finish accumulating the counts.
 
 #define MAX_PRIMITIVES 16
 #define ARGS_STRIDE 20
@@ -61,13 +61,13 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 """;
 
     const string CullHlsl = """
-// A7 逐实例剔除：一个线程一个实例，算出世界包围球后逐槽位做六个裁剪平面的球测试。
-// 通过的实例用原始下标写进该槽位的序号表，并把该槽位的实例计数加一。
+// A7 per-instance culling: one thread per instance, computing the world bounding sphere and then testing it against the six clipping planes for each slot.
+// Passing instances write their original index into that slot's index table and increment the slot's instance count.
 //
-// 球与矩阵的约定跟着引擎走：世界矩阵是 System.Numerics 的行序（M11..M44 逐行存放），
-// 点变换是行向量右乘，所以"某点的世界位置 = 各行的加权和再加平移行"。
-// 半径用世界 AABB 的外接球上界，取 |Row0|*ex + |Row1|*ey + |Row2|*ez 的模长：
-// 它只会偏大不会偏小，偏大的后果是多画几个实例，偏小会把可见实例剔掉。
+// The sphere and matrix conventions follow the engine: the world matrix uses System.Numerics' row order (M11..M44 stored row by row),
+// point transform is a row vector on the right, so "a point's world position = the weighted sum of the rows plus the translation row".
+// The radius uses the world AABB's circumscribed-sphere upper bound, the length of |Row0|*ex + |Row1|*ey + |Row2|*ez:
+// it can only be too large, never too small; too large means drawing a few extra instances, too small would cull visible instances.
 
 #define MAX_PRIMITIVES 16
 #define WORLD_STRIDE 80
@@ -96,8 +96,8 @@ ByteAddressBuffer instanceWorlds : register(t1);
 RWByteAddressBuffer drawArgs : register(u0);
 RWByteAddressBuffer visibleIds : register(u1);
 
-// clip = pos * VP（行向量约定），所以 clip.x 是位置与"第 0 列"的点积，第 3 列就是 w。
-// 于是六个平面直接由行列组合得出，不必先转置。
+// clip = pos * VP (row-vector convention), so clip.x is the dot product of the position with "column 0", and column 3 is w.
+// The six planes thus fall out directly from row-column combinations, without needing to transpose first.
 bool VisibleInSlot(uint slot, float3 center, float radius)
 {
     uint m = slot * 64;
@@ -147,7 +147,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         if (!VisibleInSlot(slot, center, radius))
             continue;
 
-        // 每个槽位独立压缩：一个实例可以在多个级联里都可见，序号表按槽位各占一份。
+        // Each slot is compressed independently: an instance can be visible in several cascades, and the index table holds one segment per slot.
         uint k;
         drawArgs.InterlockedAdd(slot * MAX_PRIMITIVES * ARGS_STRIDE + 4, 1u, k);
         visibleIds.Store((slot * p.capacity + k) * 4, i);
@@ -156,19 +156,19 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 """;
 
     const string FinalizeHlsl = """
-// A7 finalize：把 cull 留在每条参数里的可见数折成一个派发尺寸，写进 IndirectDispatchArgs。
+// A7 finalize: folds the visible counts that cull left in each arg entry into a single dispatch size, written to IndirectDispatchArgs.
 //
-// 为什么需要它：序号表是压缩过的，CPU 无从得知可见多少个，于是 gather 只能按容量上界派发。
-// 这一步把"上界"换成"实际最大可见数"，让 gather 少跑那批注定早退的线程。
+// Why it is needed: the index table is compressed, so the CPU has no way to know how many are visible, and gather can only dispatch by the capacity upper bound.
+// This step replaces the "upper bound" with the "actual maximum visible count", letting gather skip that batch of threads that are bound to exit early.
 //
-// 单线程是刻意的。槽位上限是 4，串行读四个 uint 远低于开一个工作组再做归约同步的成本，
-// 也免去了四端各写一遍 threadsync 方言 —— 那种重复正是漂移的来源。
+// Single-threaded is deliberate. The slot count is at most 4; reading four uints serially is far below the cost of opening a workgroup and doing a reduction with synchronization,
+// and it avoids writing a threadsync dialect per backend -- exactly that kind of duplication is the source of drift.
 
 struct FinalizeParams
 {
-    uint slotCount;     // 扫几个槽位，同时就是 dispatch 的 Y 维组数
-    uint slotStride;    // 一个槽位占多少字节的参数表（MaxPrimitives * ARGS_STRIDE）
-    uint groupSize;     // gather 的工作组长，X 维组数 = ceil(maxCount / groupSize)
+    uint slotCount;     // how many slots to scan, which is also dispatch's Y-dimension group count
+    uint slotStride;    // how many bytes of arg table one slot occupies (MaxPrimitives * ARGS_STRIDE)
+    uint groupSize;     // gather's workgroup size, X-dimension group count = ceil(maxCount / groupSize)
     uint pad;
 };
 
@@ -187,20 +187,20 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     for (uint slot = 0; slot < p.slotCount; slot++)
         maxCount = max(maxCount, drawArgs.Load(slot * p.slotStride + 4));
 
-    // maxCount 为 0 时 groups 也是 0：四端都允许"0 组"的派发（它什么都不做），
-    // 所以整组被剔光的帧不需要在 CPU 侧再开一条分支。
+    // When maxCount is 0, groups is also 0: all four backends allow dispatching "0 groups" (it does nothing),
+    // so a frame whose whole group is culled away does not need another CPU-side branch.
     uint groups = (maxCount + p.groupSize - 1) / p.groupSize;
     dispatchArgs.Store3(0, uint3(groups, p.slotCount, 1));
 }
 """;
 
     const string GatherHlsl = """
-// A7 gather：第二阶段。剔除只产出"原始序号表 + 每槽位计数"，本内核按序号把实例数据物化到
-// 槽位分段里，绘制端就把这份流当实例缓冲用，实例数由间接参数给出。
+// A7 gather: the second stage. Culling only produces "the original index table + per-slot counts"; this kernel materializes the instance data into
+// the slot segments by index, and the draw side then uses this stream as the instance buffer, with the instance count given by the indirect args.
 //
-// 这一阶段是必要的，不是画蛇添足：IA 的实例步进是线性的，无法按序号索引，
-// 而顶点阶段自己查表需要两个新的 SRV —— D3D12 根签名只剩 3 DWORD，给不起。
-// 代价是每帧多写"可见数"份 80 字节，且全在 GPU 内完成，不产生任何 CPU 上传或回读。
+// This stage is necessary, not gratuitous: IA's instance stepping is linear and cannot be indexed by original index,
+// and having the vertex stage index the table itself would need two new SRVs -- the D3D12 root signature has only 3 DWORDs left, which cannot afford them.
+// The cost is writing "visible count" extra 80-byte records per frame, all done entirely on the GPU, producing no CPU upload or readback.
 
 #define MAX_PRIMITIVES 16
 #define WORLD_STRIDE 80
@@ -227,8 +227,8 @@ RWByteAddressBuffer drawArgs : register(u1);
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
     GatherParams p = gatherParams;
-    // 二维映射：X = 槽位内序号，Y = 槽位。固定派发与间接派发共用它 ——
-    // 唯一会变的是 X 维的组数，所以 A/B 两次运行必须逐像素一致。
+    // Two-dimensional mapping: X = index within a slot, Y = slot. Fixed dispatch and indirect dispatch share it --
+    // the only thing that varies is the group count of the X dimension, so the two A/B runs must match pixel for pixel.
     uint slot = id.y;
     uint k = id.x;
     if (slot >= p.slotCount)
@@ -237,8 +237,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     uint argsBase = slot * MAX_PRIMITIVES * ARGS_STRIDE;
     uint count = drawArgs.Load(argsBase + 4);
 
-    // 扇出：primitive 0 的实例数就是本槽位的可见总数，其余 primitive 逐字复制。
-    // 每个 primitive 的索引区间不同，所以参数表必须逐条存在，不能共用一份。
+    // Fan-out: primitive 0's instance count is the slot's total visible count; the remaining primitives copy it verbatim.
+    // Each primitive has a different index range, so the arg table must store one entry per primitive rather than sharing a single one.
     if (k == 0)
     {
         for (uint q = 1; q < p.primCount; q++)

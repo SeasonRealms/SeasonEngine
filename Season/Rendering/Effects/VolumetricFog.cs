@@ -4,15 +4,15 @@
 
 namespace Season.Rendering.Effects;
 
-/// <summary>近地体积雾：先过滤局部 Q/sigma_t，再积分；累计体 RGB=L、A=T。</summary>
+/// <summary>Near-ground volumetric fog: filter the local Q/sigma_t first, then integrate; accumulated volume RGB=L, A=T.</summary>
 public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
 {
-    // 帧缓冲只含 float4，矩阵按 System.Numerics 原始行序存放；不复用表面光照 UBO。
-    // 0..3 inverseVP，4..7 previousVP，8 camera/D，9 forward/g，10 grid/history，
-    // 11 density/height/falloff/noise，12 albedo/scale，13 wind/count，14 environment/PCF，
-    // 15 previousCamera/valid，16 previousForward/cloudReady，18..21 inverseJitteredVP，22..25 currentVP，
-    // 32..185 最终 SceneLightParams（含区域天气与 2-8 虚拟地面），192..447 为 32 个局部体。
-    // 186..191 是留给 SceneLightParams 继续追加的余量：追加字段只会往这里长，碰不到 192。
+    // The frame buffer holds only float4; matrices are stored in System.Numerics raw row order; the surface lighting UBO is not reused.
+    // 0..3 inverseVP, 4..7 previousVP, 8 camera/D, 9 forward/g, 10 grid/history,
+    // 11 density/height/falloff/noise, 12 albedo/scale, 13 wind/count, 14 environment/PCF,
+    // 15 previousCamera/valid, 16 previousForward/cloudReady, 18..21 inverseJitteredVP, 22..25 currentVP,
+    // 32..185 final SceneLightParams (including regional weather and the 2-8 virtual ground), 192..447 for 32 local volumes.
+    // 186..191 is headroom reserved for SceneLightParams to keep appending: appended fields only grow here and never reach 192.
     public const int FrameVectorCount = 448;
     public const int LightingOffset = 32;
     public const int VolumeOffset = 192;
@@ -23,7 +23,7 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
     static readonly string[] HistoryTextures = { "compute3d://fog/history0", "compute3d://fog/history1" };
     static readonly string[] OwnedTextures = { NoiseTexture, InjectionTexture, HistoryTextures[0], HistoryTextures[1], IntegratedTexture };
 
-    // FrameSchedule 和纹理名属于同一渲染设备域，只允许一个资源所有者。
+    // FrameSchedule and texture names belong to the same rendering device domain; only one resource owner is allowed.
     static VolumetricFogEffect? _active;
     readonly Vector4[] _frame = new Vector4[FrameVectorCount];
     readonly ComputeResourceRef[] _noiseResources = { NoiseTexture };
@@ -79,7 +79,7 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
 
     public override bool Initialize(IGraphics g)
     {
-        if (_graphics != null) throw new InvalidOperationException("雾效果已经初始化。");
+        if (_graphics != null) throw new InvalidOperationException("The fog effect is already initialized.");
         var color = FrameSchedule.SceneColor;
         _quality = RenderQuality.Current.VolumetricFog;
         if (_active != null || FrameSchedule.FogCompositeTarget != null || FrameSchedule.RenderFogComposite != null
@@ -121,7 +121,7 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
         catch (Exception ex)
         {
             Dispose();
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[VolumetricFog] 初始化失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[VolumetricFog] initialization failed: {ex.Message}");
             return false;
         }
     }
@@ -252,7 +252,7 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
         catch (Exception ex)
         {
             _allocated = false;
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[VolumetricFog] Resize 失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[VolumetricFog] Resize failed: {ex.Message}");
         }
     }
 
@@ -273,6 +273,9 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
         state.Ready = false;
         state.FilteredTexture = null;
         targets.FogLocalName = targets.FogHistory0Name;
+        // 对外暴露的 HistoryWeight 只在 Record 成功路径与 state 同步；失效路径如果不一并清零，
+        // 外部读到的是上一帧的历史权重，看不出本帧已经放弃历史。
+        if (targets.Index == 0) HistoryWeight = 0;
     }
 
     /// <summary>Legacy no-arg reset for Initialize-failure paths (targets may not have fog fields yet).</summary>
@@ -326,7 +329,7 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
         if (targets.Index == 0) HistoryWeight = historyWeight;
         PackFrame(_frame, fog, lights, Grid, inverse, inverseJittered, state.PreviousVp, position, forward,
             state.PreviousPosition, state.PreviousForward, historyWeight, !reset, RenderQuality.Current.FogShadowSamples);
-        // 无图集时用场景深度满足绑定形状，同时清掉所有几何阴影开关。
+        // With no atlas, use the scene depth to satisfy the binding shape and clear every geometric shadow flag.
         if (FrameSchedule.ShadowMap == null)
         {
             _frame[LightingOffset + 56].X = 0;
@@ -393,7 +396,7 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
         { ResetOutput(targets); return false; }
         if (targets.SceneColor == null || targets.SceneDepth == null || state.FilteredTexture == null)
         { ResetOutput(targets); return false; }
-        // 此时 GTAO 已完成，不受 AfterOpaque 注册先后次序影响。
+        // GTAO is already complete at this point, independent of AfterOpaque registration order.
         string? ao = FrameSchedule.PostAoTexture;
         var frameBuf = targets.FogFrameBuffer!;
         var inputs = new FogCompositeInputs(FrameSchedule.EffectiveSceneColor!, targets.SceneDepth, frameBuf,
@@ -405,7 +408,7 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
         }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[VolumetricFog] 合成准备失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[VolumetricFog] composite prepare failed: {ex.Message}");
         }
         ResetOutput(targets);
         return false;
@@ -426,7 +429,7 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
         catch (Exception ex)
         {
             ResetOutput(targets);
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[VolumetricFog] 合成绘制失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[VolumetricFog] composite draw failed: {ex.Message}");
             return default;
         }
     }
@@ -462,22 +465,22 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
         return false;
     }
 
-    /// <summary>四语言共用的字节布局；公开以便数学与平台绑定测试逐字段核对。</summary>
+    /// <summary>Byte layout shared by all four languages; public so math and platform binding tests can verify it field by field.</summary>
     public static void PackFrame(Span<Vector4> data, SceneFog fog, in SceneLightParams lights,
         (int Width, int Height, int Slices) grid, Matrix4x4 inverseVp, Matrix4x4 inverseJitteredVp,
         Matrix4x4 previousVp, Vector3 position, Vector3 forward, Vector3 previousPosition, Vector3 previousForward,
         float historyWeight, bool historyValid, int shadowSamples)
     {
-        if (data.Length < FrameVectorCount) throw new ArgumentException("雾帧缓冲不足。", nameof(data));
+        if (data.Length < FrameVectorCount) throw new ArgumentException("Fog frame buffer too small.", nameof(data));
         data.Clear();
         WriteMatrix(data, 0, inverseVp); WriteMatrix(data, 4, previousVp); WriteMatrix(data, 18, inverseJitteredVp);
-        if (!Matrix4x4.Invert(inverseVp, out var currentVp)) throw new ArgumentException("雾采样投影不可逆。", nameof(inverseVp));
+        if (!Matrix4x4.Invert(inverseVp, out var currentVp)) throw new ArgumentException("Fog sampling projection is not invertible.", nameof(inverseVp));
         WriteMatrix(data, 22, currentVp);
         data[8] = new(position, fog.MaxDistance); data[9] = new(forward, fog.Anisotropy);
         data[10] = new(grid.Width, grid.Height, grid.Slices, historyWeight);
         data[11] = new(fog.Extinction, fog.BaseHeight, fog.HeightFalloff, fog.NoiseAmount);
         data[12] = new(fog.Albedo, fog.NoiseScale); data[13] = new(fog.WindOffset, fog.ActiveVolumeCount);
-        // SH 的 l=0 辐照度除以 pi 还原平均辐亮度；不读取 DDGI，也不叠加直射光。
+        // Divide the SH l=0 irradiance by pi to recover the average radiance; DDGI is not read and direct light is not added.
         Vector3 ambient = lights.EnvParams.Z > 0.5f
             ? new Vector3(lights.IrradianceSH9[0].X, lights.IrradianceSH9[0].Y, lights.IrradianceSH9[0].Z) * (0.282095f / MathF.PI) * lights.EnvParams.Y
             : new Vector3(lights.Ambient.X, lights.Ambient.Y, lights.Ambient.Z) * lights.Ambient.W;

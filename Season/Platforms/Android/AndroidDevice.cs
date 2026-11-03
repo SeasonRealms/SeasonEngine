@@ -959,7 +959,7 @@ internal class AndroidFileService : IFileService
                 if (string.IsNullOrEmpty(ext) && !string.IsNullOrEmpty(mimeType))
                 {
                     // Minimum guarantee for display name without extension: take mime subtype (image/jpeg → ". jpeg",
-                    // application/octet-stream → ".octet-stream"）。
+                    // application/octet-stream → ".octet-stream").
                     var slash = mimeType.LastIndexOf('/');
 
                     ext = "." + (slash >= 0 ? mimeType[(slash + 1)..] : mimeType);
@@ -1682,9 +1682,10 @@ internal class AndroidRecordService : RecordService, IRecordService
 
             intent.AddFlags(ActivityFlags.GrantWriteUriPermission);
 
-            // RunContinuationsAsynchronously 与 Windows/Apple 端的 UI 桥接 TCS 一致：
-            // 结果经 UI 线程回填时续体改由线程池执行，渲染线程同步等待（GetResult）不会
-            // 与 UI 线程互相阻塞。
+            // RunContinuationsAsynchronously matches the UI-bridging TCS on Windows/Apple:
+            // when the result is filled in from the UI thread, continuations run on the thread pool
+            // instead, so the render thread's synchronous wait (GetResult) does not block against
+            // the UI thread.
             var tcs = new TaskCompletionSource<Uri?>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             tcsTakePhoto = tcs;

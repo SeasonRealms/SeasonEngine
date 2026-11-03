@@ -5,16 +5,16 @@
 namespace Season.Rendering;
 
 /// <summary>
-/// D1 屏幕空间贴花的 HLSL 变体。其余三端（GLSL / MSL / WGSL）按后端顺序各自实现同一套语义，
-/// 帧缓冲布局以 <see cref="DecalMath"/> 为准 —— 这里只做「读布局」的部分，不再定义布局。
+/// HLSL variant of the D1 screen-space decal. The other three backends (GLSL / MSL / WGSL) each implement the same semantics in backend order,
+/// and the frame buffer layout is governed by <see cref="DecalMath"/> -- here we only do the "reading the layout" part and no longer define the layout.
 /// </summary>
 public static partial class DecalShaders
 {
     /// <summary>
-    /// 帧头与贴花数组的访问器，顶点与像素着色器共用。
+    /// Accessors for the frame header and the decal array, shared by the vertex and pixel shaders.
     ///
-    /// 顶点端需要世界→局部以外的两套矩阵，像素端需要反投影矩阵与像素尺寸，所以这份前缀必须同时
-    /// 拼进 VS 与 PS 的源码；拆开拼会让两个入口对同一份布局的解读出现分歧。
+    /// The vertex stage needs the two matrices other than world->local, and the pixel stage needs the unprojection matrix and pixel size, so this prefix must be
+    /// concatenated into both the VS and PS sources; splitting it apart would make the two entry points disagree on how to read the same layout.
     /// </summary>
     public const string FrameHlsl = """
 ByteAddressBuffer decalFrame : register(t0);
@@ -30,19 +30,19 @@ float2 DecalSize() { return DecalF(9).xy; }
 """;
 
     /// <summary>
-    /// 把投影盒的 36 个顶点按 <c>SV_VertexID</c> 算出来，不依赖顶点缓冲。
+    /// Computes the 36 vertices of the projection box from <c>SV_VertexID</c>, without relying on a vertex buffer.
     ///
-    /// 六个面统一成「从盒外看逆时针」，因此 <c>CullMode.Front</c>（只留背面）在每个像素上恰好命中一次 ——
-    /// 这是整个方案不用模板、不用逐 draw 排序的前提。面索引的位拆分见下面的注释，改任何一处都要同步改绕序推导。
+    /// All six faces are unified as "counter-clockwise when viewed from outside the box", so <c>CullMode.Front</c> (keeping only back faces) hits each pixel exactly once --
+    /// this is the premise of the whole approach requiring neither the stencil nor per-draw sorting. The bit decomposition of the face index is described in the comment below; changing any one place requires updating the winding derivation accordingly.
     /// </summary>
     public const string VertexHlsl = """
 float4 VSMain(uint id:SV_VertexID):SV_Position {
-    // 每面 6 个顶点：两条三角形 (0,1,2)+(0,2,3)，再按 k 还原成四角编号。
+    // 6 vertices per face: two triangles (0,1,2)+(0,2,3), then k is mapped back to the corner index.
     uint face=id/6u, t=id-face*6u;
     uint tri=t/3u, c=t-tri*3u;
     uint k=c==0u?0u:(c==1u?(tri==0u?1u:2u):(tri==0u?2u:3u));
-    // face>>1 = 主轴（0=x,1=y,2=z），face&1 = 正负侧。副轴固定取 (a+1)%3 / (a+2)%3，
-    // 这组排列的叉积正好是 +e_a，所以负侧必须把 u 取反才能保持「盒外逆时针」。
+    // face>>1 = major axis (0=x,1=y,2=z), face&1 = positive/negative side. The minor axes are fixed to (a+1)%3 / (a+2)%3,
+    // and the cross product of this arrangement is exactly +e_a, so the negative side must flip u to preserve "counter-clockwise from outside the box".
     uint axis=face>>1u, side=face&1u;
     uint u=((k^(k>>1u))&1u)^(side^1u);
     uint v=(k>>1u)&1u;
@@ -54,20 +54,20 @@ float4 VSMain(uint id:SV_VertexID):SV_Position {
 """;
 
     /// <summary>
-    /// 深度重建 + 贴花求值。要点：
+    /// Depth reconstruction + decal evaluation. Key points:
     /// <list type="bullet">
-    /// <item>UV 来自盒内归一化坐标，所以贴花是「沿着盒的局部 Y 投影」的，与表面朝向无关；</item>
-    /// <item>导数一律在统一控制流里取（uv 与 world 都先算好），分支里的导数在 quad 边界是未定义行为；</item>
-    /// <item>采样用 <c>SampleGrad</c>：盒的背面代理三角形比像素足迹大得多，隐式导数会在盒轮廓上取到盒外的像素；</item>
-    /// <item>掠射淡出用深度导出的法线，不依赖 SceneNormal。贴花在写粗糙度时把 SceneNormal 挂在颜色附件上，
-    /// 同一个资源不能同时是可采样源，所以这条路径不能改成读 SceneNormal。</item>
+    /// <item>UV comes from the box's normalized coordinates, so the decal is "projected along the box's local Y" regardless of surface orientation;</item>
+    /// <item>Derivatives are always taken in uniform control flow (both uv and world are computed up front); derivatives inside branches are undefined behavior at quad boundaries;</item>
+    /// <item>Sampling uses <c>SampleGrad</c>: the box's back-face proxy triangle is far larger than the pixel footprint, so implicit derivatives would sample pixels outside the box along the box outline;</item>
+    /// <item>Grazing fade-out uses the normal derived from depth and does not rely on SceneNormal. When the decal writes roughness, SceneNormal is attached to the color attachment,
+    /// and the same resource cannot be a sampling source at the same time, so this path cannot be changed to read SceneNormal.</item>
     /// </list>
     ///
-    /// 输出约定：Modulate 输出「乘到目标上的因子」（1 处不改变），Additive 输出自发光颜色。
-    /// 两者都靠固定功能的混合完成，像素着色器不读 SceneColor，因此 SceneColor 不需要同时是可采样资源。
+    /// Output convention: Modulate outputs "the factor multiplied into the target" (unchanged at 1), and Additive outputs an emissive color.
+    /// Both rely on fixed-function blending to complete, and the pixel shader does not read SceneColor, so SceneColor does not need to be a samplable resource at the same time.
     ///
-    /// 帧缓冲字段：<c>wrap = (目标粗糙度, 是否改写粗糙度, 排序键, 是否有贴图)</c>，
-    /// <c>tint.w</c> 是不透明度，<c>shape.zw</c> 是羽化与掠射阈值。
+    /// Frame buffer fields: <c>wrap = (target roughness, whether to rewrite roughness, sort key, whether there is a texture)</c>,
+    /// <c>tint.w</c> is opacity, and <c>shape.zw</c> are the feather and grazing thresholds.
     /// </summary>
     public const string PixelHlsl = """
 void DecalEval(float4 position,out float4 color,out float coverage,out float roughness,out float roughWeight) {
@@ -85,7 +85,7 @@ void DecalEval(float4 position,out float4 color,out float coverage,out float rou
     float3 axis=normalize(DecalF(offset+5).xyz);
     float shade=0; float3 albedo=tint.rgb;
     if(depth<1.0 && all(abs(local)<=1.0)) {
-        // 羽化：盒边界向内 shape.y 的比例；掠射：法线与投影轴夹角的余弦低于 1-shape.z 就淡出。
+        // Feathering: the fraction of shape.y inward from the box edge; grazing: fade out when the cosine of the angle between the normal and the projection axis drops below 1-shape.z.
         float edge=shape.y>0? saturate((1.0-max(abs(local.x),abs(local.z)))/max(shape.y,1e-3)) : 1.0;
         float grazing=shape.z>0? smoothstep(1.0-shape.z,1.0,abs(dot(n,axis))) : 1.0;
         float alpha=1.0;
@@ -93,15 +93,15 @@ void DecalEval(float4 position,out float4 color,out float coverage,out float rou
             float4 texel=decalTexture.SampleGrad(decalLinearClamp,uv,uvDx,uvDy);
             albedo=albedo*texel.rgb; alpha=texel.a;
         } else {
-            // 无纹理时的程序化图案：验证深度重建用，图案跟着地形起伏就说明重建对了。
+            // Procedural pattern when there is no texture: used to verify depth reconstruction; if the pattern follows the terrain relief, the reconstruction is correct.
             float checker=fmod(floor(uv.x*4)+floor(uv.y*4),2.0)<0.5?1.0:0.45;
             albedo=albedo*checker*(0.55+0.45*sin(length(local.xz)*18.0));
         }
         shade=saturate(edge*edge*(3.0-2.0*edge))*grazing*alpha;
     }
     coverage=shade*tint.w;
-    // 不改粗糙度的贴花必须把 RT1 的源 alpha 置 0：RT1 混合是 lerp(dst, src, src.a)，
-    // 源 alpha 不为 0 就会把“没要求改粗糙度”的区域白白拉向 src。
+    // A decal that does not modify roughness must set the source alpha of RT1 to 0: RT1 blending is lerp(dst, src, src.a),
+    // so a non-zero source alpha would needlessly pull regions that "did not request a roughness change" toward src.
     roughWeight=wrap.y>0.5?coverage:0.0;
     roughness=wrap.y>0.5?wrap.x:0.0;
     color=shape.x<0.5
@@ -115,8 +115,8 @@ float4 PSMain(float4 position:SV_Position):SV_Target {
     return color;
 }
 
-// s9：法线目标只开 B 通道写掩码，所以这里只需要把目标粗糙度送到 .z，
-// 八面体法线（.xy）与反射权重（.w）由附件里的原值保留。混合用 roughWeight 在 B 通道上插值。
+// s9: the normal target only enables the B channel in its write mask, so here we only need to send the target roughness to .z,
+// while the octahedral normal (.xy) and reflection weight (.w) keep their original values from the attachment. Blending interpolates on the B channel using roughWeight.
 struct PSRoughnessOut { float4 color:SV_Target0; float4 normal:SV_Target1; };
 
 PSRoughnessOut PSMainRoughness(float4 position:SV_Position) {

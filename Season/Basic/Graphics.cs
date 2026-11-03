@@ -117,28 +117,31 @@ public interface IGraphics
     Season.Rendering.RenderTarget CreateRenderTarget(in Season.Rendering.RenderTargetDesc desc)
         => throw new NotImplementedException("CreateRenderTarget: implement when step 2 off-screen render targets are introduced");
 
-    /// <summary>在效果 Resize 前同步随窗口变化的 RT 资源与尺寸描述；已在平台 Resize 完成同步的后端无需额外操作。</summary>
+    /// <summary>Synchronizes window-dependent RT resources and size descriptors before an effect Resize; backends that already synchronized during the platform Resize need no extra action.</summary>
     void SynchronizeRenderTargetSizes() { }
 
-    /// <summary>缺少独立 HDR 雾合成能力时返回 null，不注册不完整的效果。</summary>
+    /// <summary>Returns null when the independent HDR fog composite capability is missing, so no incomplete effect is registered.</summary>
     Season.Rendering.FogCompositePipeline? CreateFogCompositePipeline() => null;
     Season.Rendering.Effects.WeatherCompositePipeline? CreateWeatherCompositePipeline() => null;
 
-    /// <summary>P0: 缺少「把反射增量加法并进场景色」的能力时返回 null，<see cref="Season.Rendering.Effects.SsrEffect"/>
-    /// 据此拒绝注册（零残留），画面退回天空反射。返回 null 而不是抛异常，是因为这条通路缺的只是额外信息，
-    /// 少了它画面依然正确 —— 只是镜面里看不到相邻物体。</summary>
+    /// <summary>P0: returns null when the capability to "add the reflection delta additively into the scene color" is missing, in which case <see cref="Season.Rendering.Effects.SsrEffect"/>
+    /// refuses to register accordingly (zero residue) and the image falls back to sky reflection. Returning null instead of throwing is because what this path lacks is only extra information,
+    /// and without it the image is still correct -- the only difference is that adjacent objects cannot be seen in the mirror.</summary>
     Season.Rendering.SsrCompositePipeline? CreateSsrCompositePipeline() => null;
 
-    /// <summary>D1: 缺少屏幕空间贴花能力时返回 null，<see cref="Season.Rendering.FrameSchedule.RegisterDecals"/> 据此保持零残留。</summary>
+    /// <summary>D1: returns null when the screen-space decal capability is missing, in which case <see cref="Season.Rendering.FrameSchedule.RegisterDecals"/> keeps zero residue.</summary>
     Season.Rendering.DecalPipeline? CreateDecalPipeline() => null;
 
-    /// <summary>P2: 缺少水面材质能力时返回 null，<see cref="Season.Rendering.FrameSchedule.RegisterWaters"/> 据此保持零残留。</summary>
+    /// <summary>P2: returns null when the water surface material capability is missing, in which case <see cref="Season.Rendering.FrameSchedule.RegisterWaters"/> keeps zero residue.</summary>
     Season.Rendering.WaterPipeline? CreateWaterPipeline() => null;
 
+    /// <summary>P1: returns null when the water curtain material capability is missing, in which case <see cref="Season.Rendering.FrameSchedule.RegisterWaterfalls"/> keeps zero residue.</summary>
+    Season.Rendering.WaterfallPipeline? CreateWaterfallPipeline() => null;
+
     /// <summary>
-    /// P2: 把 <paramref name="source"/> 的内容原样拷进 <paramref name="destination"/>（同尺寸、同格式）。
-    /// 水面折射要在「SceneColor 仍是颜色附件」的那一帧里采样场景色，而同一资源不能同时是附件与采样源，
-    /// 所以必须在开画前拿到一份独立副本。返回 false 表示本后端不支持或形状不符，调用方据此整帧跳水面。
+    /// P2: copies the contents of <paramref name="source"/> verbatim into <paramref name="destination"/> (same size, same format).
+    /// Water surface refraction needs to sample the scene color in the frame where "SceneColor is still a color attachment", and the same resource cannot be both an attachment and a sampling source,
+    /// so an independent copy must be obtained before drawing begins. Returning false means this backend does not support it or the shapes do not match, and the caller skips the water surface for the whole frame accordingly.
     /// </summary>
     bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination) => false;
 
@@ -231,17 +234,17 @@ public interface IGraphics
     void DispatchCompute(in Season.Rendering.ComputeDispatchArgs args)
         => throw new NotImplementedException("DispatchCompute: this platform has not integrated the 1-6 compute foundation yet");
 
-    /// <summary>返回本次调度是否已录制；缺少任一资源时为 false，不代表 GPU 已执行完成。</summary>
+    /// <summary>Returns whether this dispatch has been recorded; false when any resource is missing, and does not mean the GPU has finished executing.</summary>
     bool TryDispatchCompute(in Season.Rendering.ComputeDispatchArgs args) => false;
 
-    /// <summary>完整帧数据上传已录制才返回 true；失败时消费者不得发布旧缓冲对应的输出。</summary>
+    /// <summary>Returns true only when the full-frame data upload has been recorded; on failure the consumer must not publish the output corresponding to the old buffer.</summary>
     bool TryUpdateStorageBuffer(Season.Rendering.StorageBuffer buffer, ReadOnlySpan<byte> data) => false;
 
-    /// <summary>创建或在 GPU 安全点重建三维纹理，返回真实资源是否可用。</summary>
+    /// <summary>Creates or recreates a 3D texture at a GPU-safe point, returning whether the real resource is available.</summary>
     bool TryCreateComputeTexture3D(string name, uint width, uint height, uint depth,
         Season.Rendering.ComputeStorageFormat format = Season.Rendering.ComputeStorageFormat.Rgba8Unorm) => false;
 
-    /// <summary>注销效果独占的三维纹理，并按后端在飞资源契约延迟释放。</summary>
+    /// <summary>Unregisters a 3D texture exclusively owned by an effect, and defers the release according to the backend's in-flight resource contract.</summary>
     void ReleaseComputeTexture3D(string name) { }
 
     // Contract A0.1 indirect draw.
@@ -260,29 +263,29 @@ public interface IGraphics
     //   owns the matching PSO and index buffer, which can downcast the buffer handle itself, the same way
     //   FogCompositePipeline consumes a StorageBuffer through FogCompositeInputs.
 
-    /// <summary>后端是否已接通间接索引绘制；为 false 时消费者应改走固定实例数的退化路径或整体不注册。</summary>
+    /// <summary>Whether the backend has integrated indirect indexed draw; when false, consumers should switch to the degenerate path with a fixed instance count or not register at all.</summary>
     bool IndirectDrawSupported => false;
 
     /// <summary>
-    /// A0.2: 后端是否已接通间接计算派发（<see cref="Season.Rendering.ComputeDispatchArgs.Arguments"/> 非空的那条路径）。
-    /// 为 false 时消费者应改走固定组数派发，而不是跳过本次工作。
+    /// A0.2: whether the backend has integrated indirect compute dispatch (the path where <see cref="Season.Rendering.ComputeDispatchArgs.Arguments"/> is non-empty).
+    /// When false, consumers should switch to a dispatch with a fixed group count rather than skip this work.
     ///
-    /// 它和 <see cref="IndirectDrawSupported"/> 是两件事：D3D12 的间接绘制只需要一条命令签名，
-    /// 间接派发需要另一条（argument type 不同，字节步长也不同），所以两道能力位各管各的。
-    /// 现有四端全部接通，但能力位保留 —— 消费者据它决定是否值得为"组数由 GPU 决定"付出
-    /// 一次额外的内核，拿不到就直接按上界派发。
+    /// It and <see cref="IndirectDrawSupported"/> are two separate things: D3D12 indirect draw only needs one command signature,
+    /// while indirect dispatch needs another (the argument type differs, and so does the byte stride), so the two capability bits each handle their own.
+    /// All four existing backends are integrated, but the capability bit is kept -- consumers use it to decide whether it is worth paying
+    /// one extra kernel for "the group count determined by the GPU"; if not available, dispatch directly by the upper bound.
     ///
-    /// 和绘制不同，这里没有配对的 Prepare 入口，也不需要：DispatchCompute 本身受 ComputePhase 约束、
-    /// 天然在 Pass 之外录制，参数交接与派发是同一次调用。绘制那边之所以要拆成 Prepare + Draw，
-    /// 是因为 Draw 落在 Pass 内，而 PassDesc 禁止在 Pass 体内切资源状态。
+    /// Unlike draw, there is no paired Prepare entry point here, and none is needed: DispatchCompute is itself constrained by ComputePhase and
+    /// naturally recorded outside a Pass, and the parameter handoff and the dispatch are the same call. The reason the draw side must be split into Prepare + Draw
+    /// is that Draw falls inside a Pass, and PassDesc forbids switching resource state inside a Pass body.
     /// </summary>
     bool DispatchIndirectSupported => false;
 
-    /// <summary>把间接参数缓冲从 compute 写入状态交接到间接读取状态，返回是否已录制。必须在 Pass 之外调用；
-    /// 传入非 ComputeAndIndirectArgs 缓冲、或后端未接通时返回 false，调用方据此放弃本帧的间接提交。</summary>
+    /// <summary>Hands the indirect argument buffer over from the compute write state to the indirect read state and returns whether it has been recorded. Must be called outside a Pass;
+    /// returns false when a non-ComputeAndIndirectArgs buffer is passed or the backend is not integrated, and the caller abandons the frame's indirect submission accordingly.</summary>
     bool TryPrepareIndirectArgs(Season.Rendering.StorageBuffer buffer) => false;
 
-    /// <summary>缺少间接实例化四边形绘制能力时返回 null，粒子效果据此整体不注册；返回非 null 即表示 ExecuteIndirect 等效原语已接通。</summary>
+    /// <summary>Returns null when the indirect instanced quad draw capability is missing, in which case the particle effect is not registered at all; a non-null return means the ExecuteIndirect-equivalent primitive has been integrated.</summary>
     Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline() => null;
 
     // Contract 1-7 cubemap type + environment IBL.

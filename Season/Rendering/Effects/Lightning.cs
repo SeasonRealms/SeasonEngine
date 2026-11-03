@@ -5,52 +5,63 @@
 namespace Season.Rendering.Effects;
 
 /// <summary>
-/// 闪电通道 V2 的绘制端：把 <see cref="LightningChannel"/> 的折线喂给粒子 ribbon 管线，一条间接绘制画完整道雷。
+/// Draw side of lightning channel V2: feeds <see cref="LightningChannel"/>'s polyline into the
+/// particle ribbon pipeline, drawing a whole bolt with a single indirect draw.
 ///
-/// 为什么复用粒子管线而不是新建一条：ribbon 需要的全部能力——每实例数据来自 storage buffer、
-/// 实例数来自 GPU 侧的间接参数、预乘 alpha 的透明混合、深度测试开而写关——粒子管线已经具备。
-/// 顶点阶段的 ribbon 分支（见 <see cref="ParticleDraw"/> 第 12/13 行的契约）只在帧缓冲的 ribbon 标志
-/// 置位时执行，所以粒子路径的每个字节都与扩容前一致，两条路径共用一条 PSO 而不互相干扰。
+/// Why reuse the particle pipeline instead of building a new one: every capability a ribbon needs --
+/// per-instance data from a storage buffer, instance count from GPU-side indirect args, premultiplied
+/// alpha transparency, depth test on and depth write off -- the particle pipeline already has. The
+/// vertex stage's ribbon branch (see the contract at lines 12/13 of <see cref="ParticleDraw"/>) only
+/// runs when the frame buffer's ribbon flag is set, so every byte of the particle path is unchanged
+/// from before the expansion: the two paths share one PSO without interfering with each other.
 ///
-/// 每帧的链路，全部在 FrameStart 相位里、任何 Pass 之外：
-/// 1. 落雷边沿：把通道的每一段写成一条 <see cref="ParticleInstance"/> 并上传一次；
-/// 2. args kernel（单线程）写入 indexCount=6、instanceCount=段数、其余为 0；
-/// 3. Prepare（BeginPass 之前）：按本帧视口写帧缓冲，移交 args 到间接参数状态，解析资源；
-/// 4. 同一处（Prepare）：把通道投影成屏幕 AABB 写进 <see cref="ViewTargets.ReactiveRect"/>，
-///    TAA 在矩形内关掉历史复用——通道只活一两帧，0.97 的静态反馈会把它整条吃掉。
-/// 之后由 <see cref="FrameSchedule.SubmitParticles"/> 在场景透明阶段末尾提交一次。
+/// Per-frame chain, all inside the FrameStart phase and outside any pass:
+/// 1. Strike edge: write each segment of the channel as a <see cref="ParticleInstance"/> and upload once;
+/// 2. args kernel (single thread) writes indexCount=6, instanceCount=segment count, and 0 for the rest;
+/// 3. Prepare (before BeginPass): write the frame buffer for this frame's viewport, hand the args over
+///    to the indirect args state, and resolve resources;
+/// 4. Same place (Prepare): project the channel into a screen AABB and write it into
+///    <see cref="ViewTargets.ReactiveRect"/>; TAA disables history reuse inside the rect -- the channel
+///    only lives one or two frames, and the 0.97 static feedback would swallow the whole bolt.
+/// Afterwards <see cref="FrameSchedule.SubmitParticles"/> submits it once at the end of the scene
+/// transparent stage.
 ///
-/// args 走 GPU 而不是 CPU 上传：compute-write → indirect-read 这条同步链已被粒子路径在四端验证过，
-/// 而 CPU 上传在 Vulkan 上要一道 copy→drawIndirect 的屏障，那条链路从未被验证。
+/// Args go through the GPU rather than a CPU upload: the compute-write -> indirect-read sync chain has
+/// already been validated by the particle path on all four backends, whereas a CPU upload on Vulkan
+/// needs a copy->drawIndirect barrier, and that chain has never been validated.
 ///
-/// 亮度分两级：实例的 Color.a 是每段**静态**的权重（顶部在云里渐隐、支路比主通道暗），
-/// 帧缓冲 row 13 的强度是**逐帧**的包络（回击的四段衰减）。两者相乘才是最终覆盖度，
-/// 于是包络变化不需要重建实例。
+/// Brightness has two levels: the instance's Color.a is the per-segment **static** weight (the top
+/// fades out inside the cloud, branches are dimmer than the main channel), and the intensity in frame
+/// buffer row 13 is the **per-frame** envelope (the four-stage decay of a return stroke). The product
+/// is the final coverage, so a change in the envelope does not require rebuilding the instances.
 /// </summary>
 public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDisposable
 {
-    /// <summary>闪电的线性 RGB。冷白略偏蓝：真实通道的核心是白炽的，边缘才偏蓝紫。</summary>
+    /// <summary>Linear RGB of the lightning. Slightly blue-shifted cold white: a real channel's core is incandescent, only the edges lean blue-violet.</summary>
     public Vector3 Tint = new(0.78f, 0.85f, 1.0f);
 
-    /// <summary>包络满值时的覆盖度倍数。闪电是光源而不是表面，亮度必须远超 1 才会在 HDR 里烧成白色。</summary>
+    /// <summary>Coverage multiplier at full envelope. Lightning is an emitter rather than a surface, so its brightness must far exceed 1 to burn to white in HDR.</summary>
     public float Intensity = 3.2f;
 
     /// <summary>
-    /// 雾消光系数（每米）。刻意不用雨幕那条 0.006：那条描述的是"雨滴幕对背景的散射"，
-    /// 而闪电是自己的辐射源，它的光在暴雨里能穿透的距离远大于背景可见度。
-    /// 取 0.0012 时 500 m 处保留 55%、1500 m 处保留 16%，远处仍看得见一条亮线。
+    /// Fog extinction coefficient (per meter). Deliberately not the 0.006 of the rain curtain: that one
+    /// describes "scattering of the rain droplet curtain off the background", whereas lightning is its
+    /// own radiation source and its light penetrates far deeper in a downpour than background
+    /// visibility. At 0.0012 it retains 55% at 500 m and 16% at 1500 m, so a bright line is still
+    /// visible far away.
     /// </summary>
     public float FogExtinction = 0.0012f;
 
     /// <summary>
-    /// 最小半宽（像素）。远端通道的世界半宽会算到亚像素，光栅化在那种宽度上时有时无：
-    /// 有些帧产生片元、有些帧整段消失，表现为整条通道断续闪烁。
-    /// 反应矩形（<see cref="ViewTargets.ReactiveRect"/>）只保护已经画出来的像素不被历史拖住，
-    /// 补不上一个根本没产生的片元，所以这一档必须留着。
+    /// Minimum half-width (pixels). A distant channel's world half-width computes to sub-pixel, and
+    /// rasterization at that width flickers on and off: some frames produce fragments, others drop the
+    /// whole segment, showing up as the entire channel blinking intermittently. The reactive rect
+    /// (<see cref="ViewTargets.ReactiveRect"/>) only protects pixels that were already drawn from being
+    /// dragged by history; it cannot make up for a fragment that never existed, so this floor must stay.
     /// </summary>
     public float MinHalfWidthPixels = 1.4f;
 
-    /// <summary>关闭时不派发也不提交，用于面板或质量档。</summary>
+    /// <summary>When disabled, neither dispatched nor submitted; used by the panel or quality tiers.</summary>
     public bool Enabled = true;
 
     readonly ParticleInstance[] _instances = new ParticleInstance[LightningChannel.MaxSegments];
@@ -61,7 +72,8 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
     ComputeKernel? _argsKernel;
     StorageBuffer? _instancesBuffer, _args, _frameBuffer;
     ParticleDrawPipeline? _pipeline;
-    // 已经上传过实例的落雷序号。同一道雷的几何不会变，所以只在边沿上传一次。
+    // Strike serial for which instances have already been uploaded. The geometry of the same bolt does
+    // not change, so upload only once at the edge.
     int _builtSerial = int.MinValue;
     bool _ready;
     bool _routed;
@@ -73,7 +85,7 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
 
     public override bool Initialize(IGraphics g)
     {
-        if (_graphics != null) throw new InvalidOperationException("闪电效果已经初始化。");
+        if (_graphics != null) throw new InvalidOperationException("Lightning effect is already initialized.");
         if (!g.ComputeSupported || !g.IndirectDrawSupported) return false;
         _graphics = g;
         try
@@ -84,7 +96,8 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
             if (_argsKernel == null) { Dispose(); return false; }
             _frameBuffer = g.CreateStorageBuffer(ParticleDraw.FrameBytes);
             _instancesBuffer = g.CreateStorageBuffer(LightningChannel.MaxSegments * ParticleInstance.SizeInBytes);
-            // usage 必须在创建期声明：这条缓冲同时被 compute 写、被间接绘制读。
+            // usage must be declared at creation time: this buffer is both written by compute and read
+            // by an indirect draw.
             _args = g.CreateStorageBuffer(IndirectDrawIndexedArgs.SizeInBytes,
                 StorageBufferUsage.ComputeAndIndirectArgs);
             if (_frameBuffer == null || _instancesBuffer == null || _args == null) { Dispose(); return false; }
@@ -96,7 +109,7 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
         catch (Exception ex)
         {
             Dispose();
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Lightning] 初始化失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Lightning] initialization failed: {ex.Message}");
             return false;
         }
     }
@@ -115,8 +128,9 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
         var flash = visuals.Flash;
         if (!(flash.W > 0)) return;
 
-        // 本帧最亮的那一路未必属于这条通道：两块云各自落雷时 <see cref="WeatherVisualState.Flash"/>
-        // 取的是较亮的那一路。坐标对不上就明确不画，而不是把 A 云的通道点亮成 B 云的亮度。
+        // The brightest flash this frame may not belong to this channel: when two clouds each strike,
+        // <see cref="WeatherVisualState.Flash"/> takes the brighter one. If the coordinates do not
+        // match, explicitly draw nothing rather than lighting cloud A's channel at cloud B's brightness.
         Vector3 source = new(flash.X, flash.Y, flash.Z);
         if (Vector3.DistanceSquared(source, channel.CloudPoint) > 1e-4f) return;
 
@@ -131,7 +145,8 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
                 var segment = segments[i];
                 _instances[i] = new ParticleInstance
                 {
-                    // 段中点，配合 Velocity = 半段向量，就是 ribbon 顶点阶段认定的两个端点。
+                    // Segment midpoint; with Velocity = half the segment vector, these are the two
+                    // endpoints the ribbon vertex stage recognizes.
                     Position = (segment.A + segment.B) * 0.5f,
                     Size = segment.HalfWidth,
                     Color = new Vector4(Tint.X, Tint.Y, Tint.Z, segment.Brightness),
@@ -145,8 +160,9 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
             _builtSerial = visuals.StrikeSerial;
         }
 
-        // 段数是 CPU 已知的常量，但仍然让 GPU 写参数：这条 compute-write → indirect-read 的链
-        // 是粒子路径已经验证过的那一条，CPU 上传在 Vulkan 上还缺一道可见性保证。
+        // The segment count is a CPU-known constant, but we still let the GPU write the args: this
+        // compute-write -> indirect-read chain is the one the particle path has already validated, and a
+        // CPU upload on Vulkan still lacks a visibility guarantee.
         Span<float> args = stackalloc float[4];
         args[0] = ParticleDraw.QuadIndexCount;
         args[1] = count;
@@ -165,8 +181,9 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
     }
 
     /// <summary>
-    /// Pass 之外的参数交接。帧缓冲在这里写而不是在 Record 里写，因为最小屏宽需要一个**像素**尺寸，
-    /// 而 RenderTarget 只有在 Prepare 才到手；顺带整块帧缓冲只上传一次。
+    /// Parameter handoff outside the pass. The frame buffer is written here rather than in Record
+    /// because the minimum screen width needs a **pixel** size, and the RenderTarget only becomes
+    /// available in Prepare; it also means the whole frame buffer is uploaded only once.
     /// </summary>
     bool IParticleSubmitter.Prepare(IGraphics g, RenderTarget color)
     {
@@ -191,15 +208,16 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
         _frame[4] = new Vector4(right, 0);
         _frame[5] = new Vector4(up, 0);
         _frame[6] = new Vector4(position, 0);
-        // row 7 的寿命淡入淡出与拉伸由公告板路径消费；ribbon 不读，保持零以免有人以为它生效。
+        // row 7's lifetime fade and stretch are consumed by the billboard path; the ribbon does not read
+        // it, so keep it zero to avoid anyone assuming it takes effect.
         _frame[7] = default;
         _frame[8] = new Vector4(Tint.X, Tint.Y, Tint.Z, 1f);
         _frame[9] = default;
         _frame[10] = default;
         _frame[11] = default;
-        // row 12 = 视口宽 / 视口高 / 最小半宽像素 / ribbon 标志。
+        // row 12 = viewport width / viewport height / minimum half-width in pixels / ribbon flag.
         _frame[12] = new Vector4(color.Desc.Width, color.Desc.Height, MathF.Max(MinHalfWidthPixels, 0.05f), 1f);
-        // row 13 = 强度（包络 × 常量）/ 雾消光系数 / 保留 / 保留。
+        // row 13 = intensity (envelope x constant) / fog extinction coefficient / reserved / reserved.
         float envelope = FrameSchedule.WeatherVisuals?.Flash.W ?? 0f;
         _frame[13] = new Vector4(MathF.Max(Intensity, 0f) * envelope, MathF.Max(FogExtinction, 0f), 0f, 0f);
         _frame[14] = default;
@@ -210,25 +228,33 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
         if (!_pipeline.Prepare(new ParticleDrawInputs(color, FrameSchedule.SceneDepth,
             _instancesBuffer!, _args!, _frameBuffer!))) return false;
 
-        // 绘制真的会发生，才让 TAA 在这一帧的反应矩形里关掉历史复用。放在所有失败路径之后：
-        // 没有画出来的帧不该让任何像素失去时间累积。
+        // Only once the draw will really happen may TAA disable history reuse inside this frame's
+        // reactive rect. Placed after all failure paths: a frame that was not drawn should not cost any
+        // pixel its temporal accumulation.
         PublishReactiveRect(vp, color);
         return true;
     }
 
     /// <summary>
-    /// 把整条通道（主通道 + 全部分叉）投影到归一化屏幕空间，求一个 AABB 交给 TAA。
+    /// Projects the entire channel (main channel + all branches) into normalized screen space and
+    /// computes an AABB to hand to TAA.
     ///
-    /// 为什么需要：通道只存活 1～3 帧，而 TAA 的静态反馈是 0.97——新出现的亮线第一帧只拿到 3% 权重，
-    /// 等历史积到看得见的亮度事件已经结束；反过来它熄灭时又要三十多帧才褪干净。
-    /// 矩形内的像素直接不吃历史，通道因此帧帧都是「第一次出现」。
+    /// Why it is needed: the channel only survives 1-3 frames, whereas TAA's static feedback is
+    /// 0.97 -- a newly appeared bright line gets only 3% weight on its first frame, and by the time
+    /// history accumulates to a visible brightness the event is over; conversely, when it goes out it
+    /// takes thirty-some frames to fade. Pixels inside the rect skip history entirely, so the channel is
+    /// effectively "appearing for the first time" every frame.
     ///
-    /// 为什么是 AABB 而不是逐像素遮罩：CPU 手里只有折线的世界坐标，要精确覆盖得再加一道光栅化 Pass
-    /// 和一张全屏附件；而通道的屏幕足迹本来就是一条细折线，包围盒浪费的面积有限。
-    /// 代价写在明处：矩形内的背景像素在通道存活的这几帧失去时间累积，会短暂回到逐帧噪声。
+    /// Why an AABB rather than a per-pixel mask: the CPU only has the polyline's world coordinates, and
+    /// covering it exactly would need another rasterization pass and a full-screen attachment; the
+    /// channel's screen footprint is a thin polyline anyway, so the bounding box wastes limited area.
+    /// The cost is stated plainly: background pixels inside the rect lose temporal accumulation over the
+    /// few frames the channel is alive and briefly return to per-frame noise.
     ///
-    /// 每段按自己的米制半宽膨胀，而不是整个矩形加一个常数像素：近处的通道半宽可达十几像素，
-    /// 只按最小屏宽膨胀会切掉线的两侧，而被切掉的那部分恰好落在 TAA 邻域裁剪的视野里。
+    /// Each segment is dilated by its own metric half-width rather than dilating the whole rect by a
+    /// constant pixel count: a near channel's half-width can reach a dozen pixels, and dilating only by
+    /// the minimum screen width would cut off the sides of the line -- exactly the part that falls
+    /// inside TAA's neighborhood clipping view.
     /// </summary>
     void PublishReactiveRect(in Matrix4x4 viewProjection, RenderTarget color)
     {
@@ -241,12 +267,15 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
         float height = color.Desc.Height;
         if (width < 1f || height < 1f) return;
 
-        // 单位方向的世界偏移对 clip.x / clip.y 的影响分别由这两行的三个缩放项决定，取绝对值之和就是上界。
-        // 有了它，米制半宽换成 uv 偏移只是一次乘法，不必反解 fov 或 aspect，也不必假设投影是对称的。
+        // The effect of a unit-direction world offset on clip.x / clip.y is determined by the three
+        // scale terms of these two rows respectively; the sum of absolute values is an upper bound. With
+        // it, converting a metric half-width into a uv offset is a single multiply -- no need to invert
+        // fov or aspect, and no assumption that the projection is symmetric.
         float scaleX = MathF.Abs(viewProjection.M11) + MathF.Abs(viewProjection.M21) + MathF.Abs(viewProjection.M31);
         float scaleY = MathF.Abs(viewProjection.M12) + MathF.Abs(viewProjection.M22) + MathF.Abs(viewProjection.M32);
-        // 最小屏宽由顶点阶段兜底；再加 2 像素是 TAA 3x3 邻域半径——邻域里只要有一个像素看见通道，
-        // 裁剪就把整带一起拉过去，所以反应区必须比线本身更宽。
+        // The minimum screen width is handled by the vertex stage; the extra 2 pixels is TAA's 3x3
+        // neighborhood radius -- as long as one pixel in the neighborhood sees the channel, clipping
+        // pulls the whole band along, so the reactive region must be wider than the line itself.
         float minHalf = MathF.Max(MinHalfWidthPixels, 0.05f) + 2f;
         float minPadX = minHalf / width;
         float minPadY = minHalf / height;
@@ -260,20 +289,25 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
             var segment = segments[i];
             Vector4 a = Vector4.Transform(new Vector4(segment.A, 1f), viewProjection);
             Vector4 b = Vector4.Transform(new Vector4(segment.B, 1f), viewProjection);
-            // 任一端点落在相机平面之后，包围盒就失去意义（会把通道切掉一半）。此时退化成整屏：
-            // 这一帧的 TAA 实际上不再累积，但画面是对的；算一个错的矩形则会留下半条通道的残影。
+            // If either endpoint falls behind the camera plane, the bounding box becomes meaningless (it
+            // would cut the channel in half). In that case fall back to a full-screen rect: this frame's
+            // TAA effectively stops accumulating, but the image is correct; computing a wrong rect would
+            // leave an afterimage of half the channel.
             if (a.W <= 1e-4f || b.W <= 1e-4f)
             {
                 FrameSchedule.ActiveTargets.ReactiveRect = new Vector4(0f, 0f, 1f, 1f);
                 return;
             }
 
-            // uv.y 必须翻转：引擎的共享投影约定是 NDC 的 +1 在屏幕顶部（见 Picking.ProjectToScreen 的
-            // screenY = (1 - ndcY) * 0.5 * height），而 TAA 的纹理第一行 id.y = 0 也在顶部。
-            // 照着 +0.5 写会让反应区上下颠倒——闪电那一带不受保护，屏幕另一侧的天空反而失去历史。
+            // uv.y must be flipped: the engine's shared projection convention puts NDC +1 at the top of
+            // the screen (see Picking.ProjectToScreen's screenY = (1 - ndcY) * 0.5 * height), and TAA's
+            // texture row 0 (id.y = 0) is also at the top. Writing it with +0.5 would flip the reactive
+            // region upside down -- the lightning band would be unprotected while the sky on the other
+            // side of the screen would lose its history.
             Vector2 ua = new(a.X / a.W * 0.5f + 0.5f, 0.5f - a.Y / a.W * 0.5f);
             Vector2 ub = new(b.X / b.W * 0.5f + 0.5f, 0.5f - b.Y / b.W * 0.5f);
-            // 段中点的视深度。两端取平均已经足够：带子的宽度远小于它到相机的距离。
+            // View depth of the segment midpoint. Averaging the two endpoints is good enough: the ribbon's
+            // width is far smaller than its distance to the camera.
             float depth = (a.W + b.W) * 0.5f;
             float padX = MathF.Max(segment.HalfWidth * scaleX / depth * 0.5f, minPadX);
             float padY = MathF.Max(segment.HalfWidth * scaleY / depth * 0.5f, minPadY);
@@ -290,7 +324,8 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
         minY = Math.Clamp(minY, 0f, 1f);
         maxX = Math.Clamp(maxX, 0f, 1f);
         maxY = Math.Clamp(maxY, 0f, 1f);
-        // 整条通道都在视口外时两个分量会被夹到相等；此时留空矩形，让 TAA 走原路径。
+        // When the entire channel is off-viewport both components get clamped equal; leave the rect empty
+        // then and let TAA take its normal path.
         if (minX >= maxX || minY >= maxY) return;
 
         FrameSchedule.ActiveTargets.ReactiveRect = new Vector4(minX, minY, maxX, maxY);
@@ -304,8 +339,8 @@ public sealed class LightningEffect : ComputeEffect, IParticleSubmitter, IDispos
         {
             _submitFailed = !drawn;
             DeviceServices.BaseApp.AddLog(drawn ? LogType.Backend : LogType.Error, drawn
-                ? "[Lightning] 间接绘制恢复提交。"
-                : "[Lightning] 间接绘制连续未提交：本帧管线状态与 Prepare 不一致，通道在整帧缺失。");
+                ? "[Lightning] Indirect draw resumed submitting."
+                : "[Lightning] Indirect draw missing submissions in a row: this frame's pipeline state does not match Prepare, and the channel is absent for the entire frame.");
         }
         return drawn;
     }

@@ -4,7 +4,7 @@
 
 namespace Season.Rendering;
 
-/// <summary>体积雾资源档位，在图形初始化时固定；Off 不分配任何雾资源。</summary>
+/// <summary>Volumetric-fog resource tier, fixed at graphics initialization; Off allocates no fog resources.</summary>
 public enum FogQuality { Off, Low, Medium, High }
 
 /// <summary>
@@ -61,15 +61,16 @@ public enum AoMode
 }
 
 /// <summary>
-/// P3 屏幕空间反射档位：互斥且初始化时固定，与 <see cref="AoMode"/> / <see cref="GiMode"/> 同一套约定。
-/// 只有一档算法，质量伸缩改的是射线长度、厚度容差与采样步数，不切换实现。
+/// P3 screen-space reflection tier: mutually exclusive and fixed at initialization, following the same convention as
+/// <see cref="AoMode"/> / <see cref="GiMode"/>. There is only one algorithm tier; quality scaling changes the ray
+/// length, thickness tolerance and sample count rather than switching implementations.
 /// </summary>
 public enum SsrMode
 {
-    /// <summary>关闭。不建 Hi-Z 金字塔，也不建反射目标，整条链零残留。</summary>
+    /// <summary>Off. Builds no Hi-Z pyramid and no reflection target, leaving the whole chain with zero residue.</summary>
     Off,
 
-    /// <summary>P3：Hi-Z 加速的屏幕空间步进（深度金字塔整块跳过 + 命中后细化 + 天空/离屏回退）。</summary>
+    /// <summary>P3: Hi-Z accelerated screen-space stepping (whole-block depth-pyramid skipping + on-hit refinement + sky/off-screen fallback).</summary>
     HiZ,
 }
 
@@ -328,7 +329,8 @@ public class RenderQuality
     public static bool DefaultSceneNormals = false;
 
     /// <summary>Default value for Decals (overrideable in the app constructor and captured by Init()).
-    /// Off, because D1 要为一个只在不透明阶段生效的额外 Pass 打散场景：默认开会让每个不带贴花的项目都付这笔钱。</summary>
+    /// Off, because D1 has to split the scene for an extra Pass that only takes effect in the opaque stage: defaulting
+    /// it on would make every project without decals pay that cost.</summary>
     public static bool DefaultDecals = false;
 
     /// <summary>Default value for JitterScale (overrideable in the app constructor and captured by Init()).</summary>
@@ -727,7 +729,7 @@ public class RenderQuality
     public AaMode AntiAliasing { get; set; } = DefaultAntiAliasing;
 
     AaMode? _effectiveAntiAliasing;
-    /// <summary>本次图形初始化解析出的 AA；不序列化，也不覆盖用户保存的选择。</summary>
+    /// <summary>The AA resolved by this graphics initialization; not serialized, and does not overwrite the user's saved choice.</summary>
     [System.Text.Json.Serialization.JsonIgnore]
     public AaMode EffectiveAntiAliasing
     {
@@ -764,8 +766,10 @@ public class RenderQuality
     /// Settings.json (JsonUtils sets IgnoreReadOnlyProperties).</summary>
     public bool EffectiveSceneNormals => SceneNormals && MotionVectors;
 
-    /// <summary>D1 契约第 1 条：屏幕空间贴花开关。初始化期固定，且只有它能在初始化时把 SceneDepth 补出来 ——
-    /// 贴花完全依赖深度重建世界坐标，没有显式深度就没有贴花。运行时关闭贴花只影响绘制，不拆任何资源。</summary>
+    /// <summary>D1 contract clause 1: screen-space decal switch. Fixed during initialization, and it alone can
+    /// materialize SceneDepth at initialization -- decals rely entirely on rebuilding world positions from depth, so
+    /// without an explicit depth there are no decals. Turning decals off at runtime only affects drawing and tears
+    /// down no resources.</summary>
     public bool Decals { get; set; } = DefaultDecals;
 
     /// <summary>2-3 contract clauses 4/14: TAA jitter amplitude in NDC subpixel units. Effective only when TAA is active.</summary>
@@ -903,10 +907,10 @@ public class RenderQuality
     /// <summary>2-5 clause 12: aerial-perspective intensity scale. Runtime knob; values above 1 are allowed for artistic amplification on small-scale scenes.</summary>
     public float AerialIntensity { get; set; } = DefaultAerialIntensity;
 
-    /// <summary>资源画质，仅启动时生效；场景启停由 BaseApp.Fog.Enabled 控制。</summary>
+    /// <summary>Resource quality, taking effect only at startup; whether the scene runs is controlled by BaseApp.Fog.Enabled.</summary>
     public FogQuality VolumetricFog { get; set; } = DefaultVolumetricFog;
 
-    /// <summary>区域云与远景雨幕的启动档位；不改变近景粒子预算。</summary>
+    /// <summary>Startup tier for regional clouds and the distant rain curtain; does not change the near-field particle budget.</summary>
     public static RegionalWeatherQuality DefaultRegionalWeather = RegionalWeatherQuality.Off;
     public RegionalWeatherQuality RegionalWeather { get; set; } = DefaultRegionalWeather;
     public bool RequiresAtmosphereSceneDepth(bool hdrSceneColor, bool computeSupported, bool immediate2D)
@@ -914,47 +918,50 @@ public class RenderQuality
             || RegionalWeather is RegionalWeatherQuality.Low or RegionalWeatherQuality.High)
             && hdrSceneColor && computeSupported && !immediate2D;
 
-    /// <summary>局部散射源项的历史权重，0 关闭历史；不对累计透射率做时域混合。</summary>
+    /// <summary>History weight for the local scattering source term; 0 disables history and no temporal blending is applied to accumulated transmittance.</summary>
     public float FogHistoryWeight { get; set; } = DefaultFogHistoryWeight;
 
     /// <summary>
-    /// P3 屏幕空间反射档位。初始化时固定：Hi-Z 金字塔的级数与反射目标的形状都按它分配，
-    /// 运行期再改只会影响下一次 Initialize，不会重建已有资源。
-    /// 依赖 <see cref="EffectiveSceneNormals"/>：反射方向必须取自场景法线目标，
-    /// 从深度现场重建的法线在轮廓两侧会翻转，反射会顺着轮廓糊成一片。
+    /// P3 screen-space reflection tier. Fixed at initialization: both the Hi-Z pyramid level count and the shape of
+    /// the reflection target are allocated from it, and changing it at runtime only affects the next Initialize and
+    /// does not rebuild existing resources. It depends on <see cref="EffectiveSceneNormals"/>: the reflection
+    /// direction must come from the scene-normal target, since normals rebuilt from depth on the spot flip on either
+    /// side of silhouettes and the reflection smears along the silhouette.
     /// </summary>
     public SsrMode ScreenSpaceReflections { get; set; } = DefaultScreenSpaceReflections;
 
-    /// <summary>反射射线的世界空间最大长度。太长会把远处本不该出现在反射里的几何拉进来，太短则掠射角只剩天空。</summary>
+    /// <summary>Maximum world-space length of a reflection ray. Too long pulls in distant geometry that should not appear in the reflection; too short leaves only sky at grazing angles.</summary>
     public float SsrMaxDistance { get; set; } = DefaultSsrMaxDistance;
 
-    /// <summary>射线落到表面之后多少个视空间单位仍算命中。薄表面比它窄时会被穿透，表现为反射"漏"到背后的物体上。</summary>
+    /// <summary>How many view-space units past a surface a ray still counts as a hit. A thin surface narrower than this is pierced, showing up as reflection "leaking" onto objects behind it.</summary>
     public float SsrThickness { get; set; } = DefaultSsrThickness;
 
-    /// <summary>合成时的线性强度倍率；0 相当于只保留 Hi-Z 的构建成本而不显示反射。</summary>
+    /// <summary>Linear intensity multiplier at composite time; 0 keeps the Hi-Z build cost but shows no reflection.</summary>
     public float SsrIntensity { get; set; } = DefaultSsrIntensity;
 
     /// <summary>
-    /// P3：屏幕空间反射对显式 SceneDepth 与法线目标的需求。与雾、贴花同一形态 —— 三者共享同一张显式深度，
-    /// 任一需求成立后端就必须把 SceneDepth 建出来；法线目标另由 <see cref="EffectiveSceneNormals"/> 决定，
-    /// 这里只声明依赖，不负责开关它。
+    /// P3: the screen-space reflection requirement for an explicit SceneDepth and normal target. Same shape as fog and
+    /// decals -- all three share the same explicit depth, and if any of their requirements holds the backend must
+    /// materialize SceneDepth; the normal target is decided separately by <see cref="EffectiveSceneNormals"/>, and this
+    /// only declares the dependency rather than controlling it.
     /// </summary>
     public bool RequiresReflectionSceneDepth(bool hdrSceneColor, bool computeSupported, bool immediate2D)
         => ScreenSpaceReflections != SsrMode.Off && hdrSceneColor && computeSupported && !immediate2D;
 
     public int FogShadowSamples => VolumetricFog == FogQuality.Low ? 1 : 4;
 
-    /// <summary>图形初始化的雾深度需求；与场景运行期开关、AO 和 TAA 无关。</summary>
+    /// <summary>The fog depth requirement of graphics initialization; unrelated to the scene runtime switch, AO and TAA.</summary>
     public bool RequiresFogSceneDepth(bool hdrSceneColor, bool computeSupported, bool immediate2D)
         => VolumetricFog is FogQuality.Low or FogQuality.Medium or FogQuality.High
             && hdrSceneColor && computeSupported && !immediate2D;
 
-    /// <summary>D1 契约第 2 条：贴花对显式 SceneDepth 的需求。要求 HDR 场景颜色是因为贴花只写线性 HDR 目标，
-    /// LDR 直出路径没有可混合的单采样 SceneColor。</summary>
+    /// <summary>D1 contract clause 2: the decal requirement for an explicit SceneDepth. HDR scene color is required
+    /// because decals only write the linear HDR target, and the LDR direct-output path has no single-sample
+    /// SceneColor to blend into.</summary>
     public bool RequiresDecalSceneDepth(bool hdrSceneColor, bool immediate2D)
         => Decals && hdrSceneColor && !immediate2D;
 
-    /// <summary>资源创建前解析雾的单采样约束，不改写持久化的雾档位。</summary>
+    /// <summary>Resolves the fog single-sample constraint before resource creation, without rewriting the persisted fog tier.</summary>
     public AaMode ResolveFogAntiAliasing(bool hdrSceneColor, bool immediate2D)
         => AntiAliasing == AaMode.Msaa4x && RequiresAtmosphereSceneDepth(hdrSceneColor, true, immediate2D)
             ? AaMode.Fxaa : AntiAliasing;

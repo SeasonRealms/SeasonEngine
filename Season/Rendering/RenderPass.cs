@@ -17,24 +17,29 @@ public enum RenderPassId
     FinalBlit,  // Off-screen -> backbuffer (enabled in Step 2; HDR sources use the tonemap(+bloom) variant, and degrade to an LDR resolve when Post is active - see PostResolve and the RenderQuality 1-4 contract revision 1)
     Overlay,    // UI/debug overlay after final presentation; does not participate in global post-processing
 
-    // 追加编号，保持 Web 互操作及已有 Pass 的数值稳定；执行顺序由调度器决定。
+    // Appended numbers: keep Web interop and existing pass values stable; execution order is decided by the scheduler.
     SceneOpaque = 6,
     FogComposite = 7,
     SceneTransparent = 8,
     WeatherComposite = 9,
 
-    /// <summary>D1 屏幕空间贴花：不透明绘制结束后、雾/雨幕合成与透明绘制之前，只写 SceneColor。
-    /// 这个 Pass 没有颜色清屏、也没有深度附件（SceneDepth 此时是采样源），后端 BeginPass 必须按此特判。</summary>
+    /// <summary>D1 screen-space decals: after the opaque draws finish, before the fog/rain-curtain composites and the transparent draws; writes SceneColor only.
+    /// This pass has no color clear and no depth attachment (SceneDepth is a sampling source at this point), so the backend BeginPass must special-case it accordingly.</summary>
     SceneDecal = 10,
 
-    /// <summary>P2 水面：贴花之后、透明几何之前。同样没有深度附件（遮挡靠着色器里的软件深度测试），
-    /// 但多一张开画前的场景色快照作为折射源 —— 本 Pass 的颜色附件不能同时被采样。</summary>
+    /// <summary>P2 water surface: after decals, before transparent geometry. It likewise has no depth attachment (occlusion relies on a software depth test in the shader),
+    /// but adds a pre-draw scene-color snapshot as the refraction source - this pass's color attachment cannot be sampled at the same time.</summary>
     SceneWater = 11,
 
-    /// <summary>P0 屏幕空间反射合成：不透明段与贴花之后、雾/雨幕合成之前。
-    /// 与雾合成不同，它不另开目标：增量直接按加法并进 SceneColor，因此没有清屏、没有深度附件，
-    /// 也不需要 PublishSceneComposite —— 后面的雾/雨幕读到的是已经含反射的那张场景色。</summary>
+    /// <summary>P0 screen-space reflection composite: after the opaque segment and decals, before the fog/rain-curtain composites.
+    /// Unlike the fog composite, it opens no separate target: the delta is added directly into SceneColor, so there is no clear, no depth attachment,
+    /// and no PublishSceneComposite - the later fog/rain-curtain stages read the scene color that already contains reflections.</summary>
     SsrComposite = 12,
+
+    /// <summary>P1 waterfall curtain: after the water surface, before transparent geometry. Like the water surface it has no depth attachment (occlusion relies on a software depth test),
+    /// but it needs no refraction snapshot - the curtain does not sample scene color, and its color attachment is itself the blend base.
+    /// It is ordered after the water surface so the curtain at the impact point covers the pool edge; transparent primitives are still overlaid last.</summary>
+    SceneWaterfall = 13,
 }
 
 /// <summary>RenderTarget pixel format (cross-platform abstraction mapped to native formats per backend).</summary>
@@ -56,7 +61,7 @@ public struct RenderTargetDesc
 
     public RtFormat DepthFormat;
 
-    /// <summary>颜色目标不创建平台兼容用的隐式深度；默认 false 保留旧附件形状，显式 DepthFormat 不受影响。</summary>
+    /// <summary>The color target does not create the platform-compatible implicit depth; default false keeps the old attachment shape, and an explicit DepthFormat is unaffected.</summary>
     public bool NoImplicitDepth;
 
     /// <summary>When true, rebuild automatically with backbuffer resize; when false, use fixed Width/Height (shadowmap-style).</summary>
@@ -192,12 +197,13 @@ public static class FrameSchedule
     public static ulong FrameIndex { get; private set; }
 
     /// <summary>
-    /// 把帧序号归零。唯一的调用方是逐像素 A/B 的取证钩子。
+    /// Resets the frame index to zero. The only caller is the pixel-by-pixel A/B forensics hook.
     ///
-    /// 需要它的原因是这个序号从进程启动就在递增，而两次运行的加载耗时不同：
-    /// 即使仿真时间已经对齐，截图帧的序号仍会差出几十。凡是拿序号当噪声种子的地方
-    /// （SSR 的蓝噪声偏移就是典型）都会因此画出一模一样的场景配不同的噪声图案，
-    /// 逐像素比对就被这种"无意义的差异"淹没。正常运行路径不调用它。
+    /// It is needed because this counter has been incrementing since process start, and the two runs take different
+    /// times to load: even when the simulation time is aligned, the screenshot frame indices still differ by dozens.
+    /// Anywhere the index is used as a noise seed (the SSR blue-noise offset is the typical case) the same scene is
+    /// then drawn with a different noise pattern, and the pixel-by-pixel comparison is drowned in this "meaningless
+    /// difference". The normal path never calls it.
     /// </summary>
     public static void ResetFrameIndex() => FrameIndex = 0;
 
@@ -295,15 +301,15 @@ public static class FrameSchedule
         set => ActiveTargets.WeatherOutputReady = value;
     }
 
-    /// <summary>只有本帧成功完成雨幕合成后，透明材质才采样天气传输。</summary>
+    /// <summary>Transparent materials sample weather transmission only after this frame's rain-curtain composite has succeeded.</summary>
     public static bool WeatherComposited => ActiveTargets.WeatherComposited;
 
-    /// <summary>本帧完整场景颜色（包括透明与雾）；未发布时回退原始 SceneColor。</summary>
+    /// <summary>Complete scene color for this frame (including transparency and fog); falls back to the original SceneColor when not published.</summary>
     public static RenderTarget? CompleteSceneColor => ActiveTargets.CompleteSceneColor;
 
     public static RenderTarget? EffectiveSceneColor => ActiveTargets.EffectiveSceneColor;
 
-    /// <summary>雾效果注册的独立 HDR 合成目标和后端绘制入口；任一缺失时保持单 Scene 路由。</summary>
+    /// <summary>The independent HDR composite target and backend draw entry registered by the fog effect; when either is missing the single Scene route is kept.</summary>
     public static RenderTarget? FogCompositeTarget
     {
         get => ActiveTargets.FogCompositeTarget;
@@ -311,26 +317,27 @@ public static class FrameSchedule
     }
 
     public static Func<IGraphics, RenderTarget, FogCompositeResult>? RenderFogComposite;
-    /// <summary>所有 AfterOpaque 效果结束后、开启合成 Pass 前准备只读资源；false 跳过合成。</summary>
+    /// <summary>Prepares read-only resources after all AfterOpaque effects have finished and before the composite pass opens; false skips the composite.</summary>
     public static Func<IGraphics, bool>? PrepareFogComposite;
 
     /// <summary>
-    /// P0 屏幕空间反射的合成入口，由 <see cref="Effects.SsrEffect"/> 在注册成功后挂上、退休时摘掉。
-    /// 两个委托同时非 null 才打散场景 Pass —— 与雾合成不同，SSR 只能改写不透明段，
-    /// 透明图元必须画在反射之后（它们的颜色不该被当成反射源，也不该被加法叠一次）。
-    /// null 表示本后端没有加法合成能力，此时 SSR 根本不注册，画面退回天空反射。
+    /// The composite entry for P0 screen-space reflections, attached by <see cref="Effects.SsrEffect"/> after a successful
+    /// registration and detached on retirement. The scene pass is split only when both delegates are non-null - unlike the
+    /// fog composite, SSR can only rewrite the opaque segment, and transparent primitives must be drawn after the
+    /// reflections (their color should neither be treated as a reflection source nor be added in a second time).
+    /// null means this backend has no additive composite capability; SSR then does not register at all and the image falls back to sky reflections.
     /// </summary>
     public static Func<IGraphics, bool>? PrepareSsrComposite;
     public static Func<IGraphics, bool>? RenderSsrComposite;
 
-    /// <summary>仅在本帧反射增量已出版时置为 true，每帧开始自动清除。</summary>
+    /// <summary>Set to true only when this frame's reflection delta has been published; cleared automatically at the start of each frame.</summary>
     public static bool SsrOutputReady
     {
         get => ActiveTargets.SsrOutputReady;
         set => ActiveTargets.SsrOutputReady = value;
     }
 
-    /// <summary>仅在本帧注入、滤波和积分都完成后置为 true，每帧开始自动清除。</summary>
+    /// <summary>Set to true only after this frame's injection, filtering and integration have all completed; cleared automatically at the start of each frame.</summary>
     public static bool FogOutputReady
     {
         get => ActiveTargets.FogOutputReady;
@@ -338,39 +345,53 @@ public static class FrameSchedule
     }
 
     /// <summary>
-    /// D1 屏幕空间贴花入口。注册在初始化期完成（后端此时建立 PSO 与根签名），之后每帧由调度器在
-    /// <see cref="RenderPassId.SceneDecal"/> 前后各调用一次 Prepare/Draw。null 表示本后端没有实现，
-    /// 此时即使场景里注册了贴花也不会打散场景 Pass —— 有贴花却没有渲染器是「不显示」，不是「贴错位置」。
+    /// The D1 screen-space decal entry. Registration happens during initialization (the backend creates the PSO and root
+    /// signature at that point); thereafter the scheduler calls Prepare/Draw once each, before and after
+    /// <see cref="RenderPassId.SceneDecal"/>, every frame. null means this backend does not implement it, in which case the
+    /// scene pass is not split even when decals are registered - decals with no renderer mean "not displayed", not "drawn in the wrong place".
     /// </summary>
     public static DecalEffect? DecalRenderer { get; private set; }
 
     /// <summary>
-    /// P2 水面材质的后端入口。契约与 <see cref="DecalRenderer"/> 一致：null 表示本后端没有实现，
-    /// 此时即使场景里注册了水面也不会打散场景 Pass —— 有水面却没有渲染器是「不显示」，不是「画错位置」。
+    /// The backend entry for the P2 water-surface material. The contract matches <see cref="DecalRenderer"/>: null means this
+    /// backend does not implement it, in which case the scene pass is not split even when water surfaces are registered -
+    /// water with no renderer means "not displayed", not "drawn in the wrong place".
     /// </summary>
     public static WaterEffect? WaterRenderer { get; private set; }
 
     /// <summary>
-    /// 水面折射用的场景色快照。生命周期跟随 <see cref="RegisterWaters"/> / <see cref="UnregisterWaters"/>，
-    /// 尺寸在 <see cref="ResizeCompute"/> 里随 SceneColor 同步重建。与 SceneColor 严格是两张资源：
-    /// 水面 Pass 里 SceneColor 是颜色附件，同一资源不能同时被采样。
+    /// The scene-color snapshot used for water refraction. Its lifetime follows <see cref="RegisterWaters"/> /
+    /// <see cref="UnregisterWaters"/>, and it is rebuilt in sync with SceneColor inside <see cref="ResizeCompute"/>.
+    /// It is strictly a separate resource from SceneColor: in the water pass SceneColor is the color attachment, and
+    /// the same resource cannot be sampled at the same time.
     /// </summary>
     public static RenderTarget? WaterRefractionTarget => _waterRefractionTarget;
 
-    /// <summary>A0.1 粒子间接绘制入口。Prepare 在场景 Pass 之外完成参数交接并解析资源，返回 false 表示本帧放弃提交；
-    /// Submit 在场景透明阶段末尾（未分段时紧随完整 Scene 绘制）内提交一次，不新增 Pass 也不新增附件。
-    /// 粒子因此永远落在所有透明图元之后，这是接受的排序妥协：与 SceneDrawQueue 混排需要把 GPU 决定的实例数提前回读。
+    /// <summary>
+    /// The backend entry for the P1 waterfall curtain. The contract matches <see cref="WaterRenderer"/>: null means this
+    /// backend does not implement it, in which case the scene pass is not split even when curtains are registered. Unlike
+    /// the water surface it has no refraction snapshot, so there is no extra "snapshot not built" failure path.
+    /// </summary>
+    public static WaterfallEffect? WaterfallRenderer { get; private set; }
+
+    /// <summary>A0.1 particle indirect-draw entry. Prepare hands over the parameters and resolves resources outside the scene
+    /// pass, and returning false means this frame gives up submission; Submit submits once at the end of the scene's transparent
+    /// stage (right after the full Scene draw when not segmented), adding neither a pass nor an attachment.
+    /// Particles therefore always land after all transparent primitives, an accepted sorting compromise: interleaving with
+    /// SceneDrawQueue would require reading back the GPU-determined instance count in advance.
     ///
-    /// 这是一张表而不是单个槽位：雨、雪、烟各是一套独立的粒子系统，各自持有缓冲与间接参数块，
-    /// 同屏共存时按注册顺序提交——它们彼此之间的先后因此是确定的，只是整组仍在透明图元之后。</summary>
+    /// This is a table rather than a single slot: rain, snow and smoke are each an independent particle system holding its
+    /// own buffers and indirect parameter block, submitted in registration order when they coexist on screen - their relative
+    /// order is therefore deterministic, though the whole group still follows the transparent primitives.</summary>
     public static readonly List<IParticleSubmitter> ParticleSubmitters = new();
 
-    // 本帧 Prepare 成功的子集。Prepare 在 Pass 外、Submit 在 Pass 内，中间隔着 BeginPass，
-    // 所以必须把“谁交接成功了”记下来：在 Pass 内重新问一遍会让 Prepare 的一次性语义失效。
+    // The subset that prepared successfully this frame. Prepare is outside the pass and Submit is inside it, with
+    // BeginPass in between, so "who handed over successfully" has to be recorded: asking again inside the pass would
+    // break Prepare's one-shot semantics.
     static readonly List<IParticleSubmitter> _preparedParticles = new();
 
-    /// <summary>逐个交接已注册的粒子系统，返回是否至少有一个要在本 Pass 内提交。
-    /// 由帧循环在 BeginPass 之前调用；验收工程用它驱动单帧。</summary>
+    /// <summary>Hands over the registered particle systems one by one, returning whether at least one must submit inside this
+    /// pass. Called by the frame loop before BeginPass; the acceptance project uses it to drive a single frame.</summary>
     public static bool PrepareParticles(IGraphics g, RenderTarget? color)
     {
         _preparedParticles.Clear();
@@ -380,9 +401,10 @@ public static class FrameSchedule
         return _preparedParticles.Count > 0;
     }
 
-    /// <summary>提交本帧交接成功的粒子系统，并立刻清表，使每次 Prepare 最多兑付一次提交。
-    /// 返回真的画出来的系统数。失败不是异常：Prepare 与 Draw 之间夹着 BeginPass，
-    /// 后端可能在 Pass 内重新核对身份；失败本身由各系统按状态翻转自己记日志，这里只汇总。</summary>
+    /// <summary>Submits the particle systems handed over successfully this frame and clears the table immediately, so each
+    /// Prepare honors at most one submission. Returns the number of systems actually drawn. Failure is not an exception:
+    /// BeginPass sits between Prepare and Draw, and the backend may re-verify identity inside the pass; each system logs
+    /// its own state transitions on failure, and this only aggregates.</summary>
     public static int SubmitParticles(IGraphics g)
     {
         int drawn = 0;
@@ -393,37 +415,37 @@ public static class FrameSchedule
     }
 
     public static bool SceneCollectionActive { get; private set; }
-    /// <summary>分段收集的层级排序上下文；图元命令捕获 Current，不能保存控件引用。</summary>
+    /// <summary>Hierarchical sort context for segmented collection; primitive commands capture Current and must not keep control references.</summary>
     public static SceneDrawOrderContext SceneDrawOrder { get; } = new();
 
-    /// <summary>本帧已经选择不透明/透明分段；雾 Compute 仅在此路由发布输出。</summary>
+    /// <summary>This frame has chosen the opaque/transparent split; the fog compute publishes its output only on this route.</summary>
     public static bool SceneSegmented => ActiveTargets.SceneSegmented;
 
-    /// <summary>TAA 之后的消费者使用此入口；TAA 自身只读取 EffectiveSceneColor。</summary>
+    /// <summary>Consumers after TAA use this entry; TAA itself only reads EffectiveSceneColor.</summary>
     public static ComputeResourceRef EffectiveSceneSource => ActiveTargets.EffectiveSceneSource;
 
-    /// <summary>AO 仅在本帧生成且尚未在 HDR 合成中消费时进入最终后处理。</summary>
+    /// <summary>AO enters final post-processing only when it was generated this frame and has not yet been consumed in the HDR composite.</summary>
     public static bool AoReady { get; internal set; }
     public static bool AoComposited { get; private set; }
     public static string? PostAoTexture => AoReady && !AoComposited ? AoTexture : null;
 
-    /// <summary>必须在独立 HDR 目标完成写入后发布，不能把输入目标用作合成输出。</summary>
+    /// <summary>Must be published after the independent HDR target has finished writing; the input target must not be used as the composite output.</summary>
     public static void PublishSceneComposite(RenderTarget target, bool consumedAo)
     {
         ArgumentNullException.ThrowIfNull(target);
-        var source = SceneColor ?? throw new InvalidOperationException("场景合成缺少 SceneColor。");
+        var source = SceneColor ?? throw new InvalidOperationException("Scene composite is missing SceneColor.");
         if (ReferenceEquals(source, target) || ReferenceEquals(CompleteSceneColor, target)
             || target.Desc.ColorFormat != RtFormat.Rgba16Float
             || target.Desc.SampleCount > 1 || target.Desc.Width != source.Desc.Width
             || target.Desc.Height != source.Desc.Height)
-            throw new ArgumentException("场景合成必须使用尺寸匹配的独立单采样 HDR 目标。", nameof(target));
+            throw new ArgumentException("The scene composite must use an independent single-sampled HDR target with matching dimensions.", nameof(target));
         if (consumedAo && !AoReady)
-            throw new InvalidOperationException("不能消费本帧尚未生成的 AO。");
+            throw new InvalidOperationException("Cannot consume AO that has not been generated yet this frame.");
         ActiveTargets.CompleteSceneColor = target;
         AoComposited |= consumedAo;
     }
 
-    /// <summary>效果退休或重建其目标时，立即撤销指向旧目标的有效颜色源（所有视图都要清）。</summary>
+    /// <summary>When an effect retires or rebuilds its target, immediately revoke the effective color source pointing at the old target (every view must be cleared).</summary>
     internal static void ForgetSceneComposite(RenderTarget target)
     {
         bool live = Retire(PrimaryTargets);
@@ -443,14 +465,14 @@ public static class FrameSchedule
     static BaseApp? _pendingLightingApp;
     static bool _lightingPending;
 
-    /// <summary>后端最终上传的光照副本，包含同一帧的灯序、CSM、聚光、环境与云参数。</summary>
+    /// <summary>The lighting copy finally uploaded by the backend, containing this frame's light order, CSM, spot, ambient and cloud parameters.</summary>
     public static ref readonly SceneLightParams LightingSnapshot => ref _frameLights;
     public static bool LightingSnapshotValid { get; private set; }
     public static Matrix4x4 RenderView { get; private set; }
     public static Matrix4x4 RenderProjection { get; private set; }
     public static Matrix4x4 UnjitteredRenderViewProjection { get; private set; }
 
-    /// <summary>仅由后端在最终光照上传点调用；不修改共享灯光 UBO。</summary>
+    /// <summary>Called by the backend only at the final lighting upload point; does not modify the shared light UBO.</summary>
     public static void CaptureLighting(in SceneLightParams lights, in Matrix4x4 view,
         in Matrix4x4 projection, in Matrix4x4 unjitteredViewProjection)
     {
@@ -464,7 +486,7 @@ public static class FrameSchedule
 
     static void BeginSceneFrame(BaseApp app)
     {
-        // 逐视图状态在 ExecuteView 里由 ViewTargets.BeginFrame 复位；这里只复位帧级的（与视图无关的）状态。
+        // Per-view state is reset by ViewTargets.BeginFrame inside ExecuteView; here only the frame-level (view-independent) state is reset.
         AoReady = false;
         AoComposited = false;
         SceneCollectionActive = false;
@@ -641,9 +663,10 @@ public static class FrameSchedule
     }
 
     /// <summary>
-    /// D1: 建立贴花渲染入口。前提是 <see cref="RenderQuality"/> 声明了贴花、场景颜色是单采样 HDR、
-    /// 且显式 SceneDepth 存在 —— 后一条同时保证了深度在 AfterOpaque 阶段可被当采样源读取。
-    /// 任一前提缺失就返回 false 并留下零残留，与 <see cref="RegisterCompute"/> 的契约一致。
+    /// D1: establishes the decal render entry. The preconditions are that <see cref="RenderQuality"/> declares decals, the
+    /// scene color is single-sampled HDR, and an explicit SceneDepth exists - the last one also guarantees the depth can be
+    /// read as a sampling source during the AfterOpaque phase. If any precondition is missing, returns false leaving zero
+    /// leftovers, consistent with the <see cref="RegisterCompute"/> contract.
     /// </summary>
     public static bool RegisterDecals(IGraphics g)
     {
@@ -668,8 +691,9 @@ public static class FrameSchedule
     static RenderTarget? _waterRefractionTarget;
 
     /// <summary>
-    /// P2: 建立水面渲染入口与折射快照。前提与贴花一致：场景颜色是单采样 HDR、显式 SceneDepth 存在，
-    /// 另外还要求能建出与 SceneColor 同形的快照目标。任一前提缺失就返回 false 并留下零残留。
+    /// P2: establishes the water-surface render entry and the refraction snapshot. The preconditions match decals: the scene
+    /// color is single-sampled HDR and an explicit SceneDepth exists; it additionally requires that a snapshot target with
+    /// the same shape as SceneColor can be created. If any precondition is missing, returns false leaving zero leftovers.
     /// </summary>
     public static bool RegisterWaters(IGraphics g)
     {
@@ -684,7 +708,7 @@ public static class FrameSchedule
         try { ready = EnsureWaterRefractionTarget(g, color); }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] 快照目标创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] Failed to create snapshot target: {ex.Message}");
             ready = false;
         }
         if (!ready) { effect.Dispose(); ReleaseWaterRefractionTarget(); return false; }
@@ -701,7 +725,7 @@ public static class FrameSchedule
         ReleaseWaterRefractionTarget();
     }
 
-    /// <summary>尺寸与 SceneColor 不一致时整体重建；同形则直接复用，避免每帧比较分配。</summary>
+    /// <summary>Rebuilds entirely when the dimensions differ from SceneColor; reuses it directly when the shape matches, avoiding per-frame comparison allocations.</summary>
     static bool EnsureWaterRefractionTarget(IGraphics g, RenderTarget color)
     {
         var current = _waterRefractionTarget;
@@ -724,6 +748,32 @@ public static class FrameSchedule
     }
 
     /// <summary>
+    /// P1: establishes the waterfall-curtain render entry. The preconditions match decals (single-sampled HDR scene color +
+    /// explicit SceneDepth), but there is no refraction snapshot, so it has one fewer failure path than the water surface.
+    /// If any precondition is missing, returns false leaving zero leftovers.
+    /// </summary>
+    public static bool RegisterWaterfalls(IGraphics g)
+    {
+        if (WaterfallRenderer != null) return true;
+        if (Immediate2DMode.Enabled) return false;
+        if (SceneColor is not { Desc.ColorFormat: RtFormat.Rgba16Float } color
+            || color.Desc.SampleCount > 1 || SceneDepth == null) return false;
+        var pipeline = g.CreateWaterfallPipeline();
+        if (pipeline == null) return false;
+        WaterfallRenderer = new WaterfallEffect(g, pipeline);
+        return true;
+    }
+
+    /// <summary>Detaches the curtain entry and releases the backend pipeline; a no-op when it was never registered.</summary>
+    public static void UnregisterWaterfalls()
+    {
+        var effect = WaterfallRenderer;
+        if (effect == null) return;
+        WaterfallRenderer = null;
+        effect.Dispose();
+    }
+
+    /// <summary>
     /// Notify all registered compute effects to rebuild size-dependent storage textures after a window resize.
     /// Called by BaseApp.Resize after backend HandleResize (GPU idle) so the old native resources can be safely destroyed and rebuilt in place
     /// while keeping the C# object identity unchanged, which preserves Sprite2D references.
@@ -740,14 +790,14 @@ public static class FrameSchedule
         ResizeList(_computeAfterOpaque);
         ResizeList(_computeAfterScene);
 
-        // P2: 水面快照必须跟着 SceneColor 重建，且要在任何一帧开始前完成 ——
-        // 拓扑变更期不允许在渲染中途创建资源。
+        // P2: the water snapshot must be rebuilt along with SceneColor, and before any frame starts -
+        // creating resources mid-render is not allowed during topology changes.
         if (WaterRenderer != null && SceneColor is { } waterColor)
         {
             try { EnsureWaterRefractionTarget(g, waterColor); }
             catch (Exception ex)
             {
-                DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] 快照重建失败：{ex.Message}");
+                DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] Failed to rebuild snapshot: {ex.Message}");
                 UnregisterWaters();
             }
         }
@@ -956,37 +1006,49 @@ public static class FrameSchedule
             && SceneDepth != null && WeatherCompositeTarget is { Desc.ColorFormat: RtFormat.Rgba16Float, Desc.SampleCount: <= 1 }
             && SceneColor.Desc.Width == WeatherCompositeTarget.Desc.Width && SceneColor.Desc.Height == WeatherCompositeTarget.Desc.Height
             && !ReferenceEquals(SceneColor, WeatherCompositeTarget) && RenderWeatherComposite != null;
-        // D1: 贴花必须走分段路由。不分段时完整 Scene Pass 已经把透明图元一起画进去了，贴花会直接盖在水面与粒子上；
-        // 贴花没有雾那种「本帧输出未就绪」的退路，所以只要视图开着不透明、场景里有活动贴花，就无条件打散。
+        // D1: decals must use the segmented route. Without segmentation the full Scene pass already drew the transparent
+        // primitives, and decals would land right on top of water and particles; decals have no "this frame's output not
+        // ready" fallback like fog, so whenever the view has opacity on and the scene has active decals, split unconditionally.
         bool decalSplit = DecalRenderer != null && opaque && (features & ViewFeature.Decals) != 0
             && SceneColor != null && SceneDepth != null && app.Decals.ActiveCount > 0;
-        // P2: 水面同样必须分段 —— 不分段时完整 Scene Pass 已经把透明图元一起画进去了，
-        // 水面会盖在本来应该在它之上的透明物体上。折射快照必须与场景色同形，否则宁可不画。
+        // P2: the water surface must likewise be segmented - without segmentation the full Scene pass already drew the
+        // transparent primitives, and the water would cover transparent objects that should be above it. The refraction
+        // snapshot must have the same shape as the scene color, otherwise it is better not to draw at all.
         bool waterSplit = WaterRenderer != null && opaque && (features & ViewFeature.Water) != 0
             && SceneColor is { } waterColorTarget && SceneDepth != null && app.Waters.ActiveCount > 0
             && WaterRefractionTarget is { } waterSnapshot
             && !ReferenceEquals(waterSnapshot, waterColorTarget)
             && waterSnapshot.Desc.Width == waterColorTarget.Desc.Width
             && waterSnapshot.Desc.Height == waterColorTarget.Desc.Height;
-        // P0 SSR：反射要读「已经画完的不透明场景色」，而那段渲染正把它当颜色附件，同一资源不能既当附件又当采样源；
-        // 合成又必须落在透明图元之前，所以只要这一帧可能出版反射就打散。判据只看能力（委托已挂），
-        // 不看本帧是否 Ready —— 打散是 Pass 结构，不能由一帧的输出倒推，否则同一后端会逐帧换路由。
+        // P1 curtain: like the water surface it must be segmented (otherwise the full Scene draw has already drawn the
+        // transparent primitives and the curtain would cover them). It does not sample a scene-color snapshot, so there are
+        // only two gates, shape and data: single-sampled HDR color + active curtains in the scene.
+        bool waterfallSplit = WaterfallRenderer != null && opaque && (features & ViewFeature.Waterfalls) != 0
+            && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float, Desc.SampleCount: 1 }
+            && SceneDepth != null && app.Waterfalls.ActiveCount > 0;
+        // P0 SSR: reflections need to read the "already-drawn opaque scene color", but that rendering passes it as the color
+        // attachment, and the same resource cannot be both attachment and sampling source; the composite must also land
+        // before the transparent primitives, so we split whenever this frame might publish reflections. The criterion only
+        // looks at capability (delegates attached), not whether this frame is Ready - the split is pass structure and must not
+        // be inferred from a single frame's output, otherwise the same backend would switch routes frame by frame.
         bool ssrSplit = PrepareSsrComposite != null && RenderSsrComposite != null
             && opaque && (features & ViewFeature.Reflections) != 0
             && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float } && SceneDepth != null;
-        bool split = fogSplit || weatherSplit || decalSplit || waterSplit || ssrSplit;
-        // S4: 非分段视图同样要走「收集 → 不透明 → 透明」两段。不分段时完整 Scene Pass 会把透明图元
-        // 按场景顺序混进不透明里，于是 ViewFeature.Transparent 形同无效（只请求 Opaque 的小地图照样画出
-        // 光束），透明几何也没有「深度已写完」这个前提。后端把队列硬绑在 SceneOpaque / SceneTransparent
-        // 两个 Pass id 上，所以这里不能沿用 Scene Pass，只能把结构对齐分段路由。
+        bool split = fogSplit || weatherSplit || decalSplit || waterSplit || waterfallSplit || ssrSplit;
+        // S4: a non-segmented view must also run the two stages "collect -> opaque -> transparent". Without segmentation the
+        // full Scene pass mixes the transparent primitives into the opaque ones in scene order, so ViewFeature.Transparent is
+        // effectively a no-op (a minimap that requests only Opaque still draws light beams) and transparent geometry loses the
+        // "depth already finished" precondition. The backend hard-binds its queue to the two pass ids SceneOpaque /
+        // SceneTransparent, so we cannot keep using the Scene pass here and can only align the structure with the segmented route.
         bool deferredScene = !split && segmented != null && opaque;
-        // SceneSegmented 的语义保持原样（是否做了雾/天气那类全屏合成分段）：VolumetricFog 与 WeatherCurtain
-        // 都以它为发布输出的前提，而 deferredScene 只是把几何绘制拆成两段，并没有引入这两个合成阶段。
+        // SceneSegmented keeps its original meaning (whether the fog/weather-style full-screen composite segmentation was done):
+        // both VolumetricFog and WeatherCurtain require it to publish output, whereas deferredScene merely splits the geometry
+        // draws into two stages without introducing those two composite stages.
         targets.SceneSegmented = split;
 
         try
         {
-            // 未分段时粒子随完整 Scene 绘制提交，交接必须赶在 BeginPass 之前；分段时推迟到透明阶段开启前。
+            // Without segmentation particles submit along with the full Scene draw, and the handover must happen before BeginPass; with segmentation it is deferred until just before the transparent stage opens.
             bool particles = false;
             if (split || deferredScene)
             {
@@ -1024,10 +1086,11 @@ public static class FrameSchedule
             }
             finally { g.EndPass(); }
 
-            // D1: 贴花只写 SceneColor，深度在这里是采样源而不是附件。必须排在雾/雨幕合成之前，
-            // 否则 EffectiveSceneColor 已经指向合成后的拷贝，贴花会被随后发布的合成结果覆盖。
-            // Prepare 在 Pass 外完成剔除、排序与状态转换；返回 false 时连 BeginPass 都不发。
-            // s9: 只有确实要改写粗糙度时才把 SceneNormal 挂成第二个颜色附件（它因此不能同时是采样源）。
+            // D1: decals write SceneColor only, and the depth here is a sampling source rather than an attachment. They must be
+            // ordered before the fog/rain-curtain composites, otherwise EffectiveSceneColor already points at the post-composite
+            // copy and the decals would be overwritten by the composite result published afterwards.
+            // Prepare performs culling, sorting and state transitions outside the pass; when it returns false not even BeginPass is issued.
+            // s9: SceneNormal is attached as the second color attachment only when roughness actually has to be rewritten (it therefore cannot be a sampling source at the same time).
             if (decalSplit && DecalRenderer!.Prepare(g, app.Decals, SceneColor, SceneDepth, SceneNormal))
             {
                 g.BeginPass(new PassDesc
@@ -1048,9 +1111,10 @@ public static class FrameSchedule
             RecordPhase(g, ComputePhase.AfterOpaque, ComputeScope.View);
             RecordPhase(g, ComputePhase.AfterOpaque, ComputeScope.App, lastView);
 
-            // P0 SSR：贴花已经把粗糙度改完，反射该看到的是最终表面；增量按加法并进 SceneColor，
-            // 因此这一步必须排在雾/雨幕之前 —— 那两个合成会把结果拷进自己的目标并发布颜色源，
-            // 晚于它们就再也写不回最终画面了。透明图元在下面，天然不会被当成反射源。
+            // P0 SSR: decals have already finished rewriting roughness and reflections should see the final surface; the delta
+            // is added into SceneColor, so this step must be ordered before the fog/rain-curtain stages - those two composites copy
+            // the result into their own targets and publish the color source, and once past them it can never be written back to
+            // the final image. Transparent primitives come later and are naturally never treated as a reflection source.
             if (ssrSplit && SsrOutputReady && PrepareSsrComposite!(g))
             {
                 g.BeginPass(new PassDesc
@@ -1100,9 +1164,10 @@ public static class FrameSchedule
                         composited = true;
                     }
                 }
-                // P2 水面：贴花与雾/雨幕之后、透明几何之前。
-                // 快照必须在 BeginPass 之前拷好 —— 水面 Pass 里 SceneColor 是颜色附件，同一资源不能同时被采样。
-                // 拷贝失败时整帧跳水面：拿未初始化的快照当折射源会直接花屏，而不是少一个特效。
+                // P2 water surface: after decals and the fog/rain-curtain stages, before transparent geometry.
+                // The snapshot must be copied before BeginPass - in the water pass SceneColor is the color attachment, and the same
+                // resource cannot be sampled at the same time. When the copy fails, the whole frame skips water: using an uninitialized
+                // snapshot as the refraction source corrupts the image outright rather than just missing one effect.
                 if (waterSplit && EffectiveSceneColor is { } waterColor && WaterRefractionTarget is { } snapshot
                     && g.CopyRenderTarget(waterColor, snapshot)
                     && WaterRenderer!.Prepare(g, app.Waters, waterColor, snapshot, SceneDepth, app.Time))
@@ -1116,6 +1181,24 @@ public static class FrameSchedule
                         StoreDepth = false,
                     });
                     try { WaterRenderer!.Draw(g); }
+                    finally { g.EndPass(); }
+                }
+
+                // P1 waterfall curtain: after the water surface, before transparent geometry. There is no snapshot to make, and
+                // Prepare takes the final scene color directly; being ordered after the water surface lets the curtain at the impact
+                // point cover the pool edge (water writes no depth, so the order is decided entirely by pass order).
+                if (waterfallSplit && EffectiveSceneColor is { } waterfallColor
+                    && WaterfallRenderer!.Prepare(g, app.Waterfalls, waterfallColor, SceneDepth, app.Time))
+                {
+                    g.BeginPass(new PassDesc
+                    {
+                        Id = RenderPassId.SceneWaterfall,
+                        ColorTarget = waterfallColor,
+                        ClearColorEnable = false,
+                        ClearDepthEnable = false,
+                        StoreDepth = false,
+                    });
+                    try { WaterfallRenderer!.Draw(g); }
                     finally { g.EndPass(); }
                 }
 
@@ -1146,8 +1229,9 @@ public static class FrameSchedule
             }
             else if (deferredScene && transparent)
             {
-                // S4: 非分段视图的透明阶段。这里没有雾/天气合成，所以 EffectiveSceneColor 仍是 SceneColor；
-                // sampleFog 传 false —— 视图没请求 Fog，后端据此把体积三件套保持成零门控而不是上一帧的残留。
+                // S4: the transparent stage of a non-segmented view. There is no fog/weather composite here, so EffectiveSceneColor
+                // is still SceneColor; sampleFog is passed false - the view did not request Fog, and the backend uses this to keep the
+                // volumetric trio at zero gating rather than the previous frame's leftovers.
                 particles = particleSubmit && PrepareParticles(g, EffectiveSceneColor);
                 g.BeginPass(new PassDesc
                 {
@@ -1171,8 +1255,8 @@ public static class FrameSchedule
         finally
         {
             SceneCollectionActive = false;
-            // Pass 体内抛出会跳过 SubmitParticles，交接记录必须在这里丢掉：
-            // 带着它进下一帧虽不会误绘（Prepare 开头就清表），但会让残留跨帧存在。
+            // An exception thrown inside the pass body skips SubmitParticles, so the handover record must be dropped here:
+            // carrying it into the next frame would not misdraw (Prepare clears the table at the start) but would let residue persist across frames.
             _preparedParticles.Clear();
             if (split || deferredScene)
             {

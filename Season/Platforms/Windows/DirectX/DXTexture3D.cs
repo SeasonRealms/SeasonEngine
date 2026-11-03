@@ -123,7 +123,7 @@ internal unsafe sealed class DXTexture3D : IDisposable
         }
     }
 
-    /// <summary>立即注销；在最后使用此资源的 fence 完成后释放资源与描述符。</summary>
+    /// <summary>Unregister immediately; release the resource and descriptor after the fence that last used this resource completes.</summary>
     internal static void ReleaseByName(string name)
     {
         DXTexture3D? texture;

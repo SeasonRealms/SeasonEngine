@@ -9,7 +9,7 @@ namespace Season.Rendering;
 public enum FogVolumeShape { Box, Sphere }
 public enum FogVolumeMode { Add, Exclude }
 
-/// <summary>持久局部介质，尺寸为完整边长或各轴直径（米），旋转为单位四元数。</summary>
+/// <summary>A persistent local medium; the size is the full edge length or per-axis diameter (meters), and the rotation is a unit quaternion.</summary>
 public sealed class FogVolume
 {
     internal SceneFog? Owner;
@@ -67,19 +67,19 @@ public sealed class FogVolume
             FogMath.Finite(value.W);
             float length = value.Length();
             if (!float.IsFinite(length) || length < 1e-6f)
-                throw new ArgumentOutOfRangeException(nameof(value), "雾体旋转必须是有限的非零四元数。");
+                throw new ArgumentOutOfRangeException(nameof(value), "Fog volume rotation must be a finite, non-zero quaternion.");
             _rotation = Quaternion.Normalize(value);
         }
     }
     public float Extinction { get => _extinction; set => _extinction = Math.Max(0f, FogMath.Finite(value)); }
     public Vector3 Albedo { get => _albedo; set => _albedo = Vector3.Clamp(FogMath.Finite(value), Vector3.Zero, Vector3.One); }
 
-    /// <summary>由外边界向内部羽化的比例，0 为硬边，1 为全范围羽化。</summary>
+    /// <summary>Falloff ratio from the outer boundary inward; 0 is a hard edge, 1 is feathering over the full range.</summary>
     public float EdgeFeather { get => _edgeFeather; set => _edgeFeather = Math.Clamp(FogMath.Finite(value), 0f, 1f); }
     public float NoiseAmount { get => _noiseAmount; set => _noiseAmount = Math.Clamp(FogMath.Finite(value), 0f, 1f); }
     public float NoiseScale { get => _noiseScale; set => _noiseScale = Math.Max(0.0001f, FogMath.Finite(value)); }
 
-    /// <summary>CPU 参考软遮罩，与注入着色器使用相同的归一化形状定义。</summary>
+    /// <summary>CPU reference soft mask, using the same normalized shape definition as the injection shader.</summary>
     public float WeightAt(Vector3 worldPosition)
     {
         var local = Vector3.Transform(worldPosition - Position, Quaternion.Conjugate(Rotation)) * 2f / Size;

@@ -6,7 +6,7 @@ namespace Season.Rendering.Effects;
 
 public sealed partial class VolumetricFogEffect
 {
-    /// <summary>场景入口实例化 FogSampler，传入独立帧缓冲与两个只读体积；不改变表面光照参数。</summary>
+    /// <summary>The scene entry point instantiates FogSampler, passing an independent frame buffer and two read-only volumes; surface lighting parameters are left unchanged.</summary>
     public const string SamplingMsl = """
 struct FogSampler {
     const device float4* data;
@@ -60,12 +60,12 @@ float4 FogOpaque(float4 color,float4 fog,float ao) { return float4(color.xyz*ao*
 """;
 
     /// <summary>
-    /// 主着色器入口的雾合成胶水，四个出口（文字 / 天空 / Sprite2D / PBR）共用同一份形状，
-    /// 与 VK ApplySceneFog、DX ApplySceneFog 逐行对应。
-    /// 它直接拼接 <see cref="SamplingMsl"/>，所以主场景着色器里的体积采样数学与合成 Pass 是同一个来源，不存在第二份副本。
-    /// 门控是运行期参数而不是编译期宏：
-    /// 天空与不透明几何在同一 Pass 里绘制却不能吃透射采样，只有逐条命令推送的 fogParams 才能表达这一点，
-    /// 共享 UBO 会让整帧统一读取。
+    /// Fog composite glue for the main shader entry point; the four exits (text / sky / Sprite2D / PBR) share one shape
+    /// and correspond line by line to VK ApplySceneFog and DX ApplySceneFog.
+    /// It directly concatenates <see cref="SamplingMsl"/>, so the volumetric sampling math in the main scene shader and the composite Pass share one source with no second copy.
+    /// Gating is a runtime parameter rather than a compile-time macro:
+    /// the sky and opaque geometry are drawn in the same Pass but must not consume transmittance sampling, which only per-command pushed fogParams can express;
+    /// a shared UBO would force a uniform read for the whole frame.
     /// </summary>
     public const string SceneSamplingMsl = SamplingMsl + """
 
@@ -107,7 +107,7 @@ fragment float4 PSMain(float4 position [[position]],const device float4* data [[
 }
 """;
 
-    // 每个入口各自实例化只读帧上下文；纹理参数不存入共享 UBO。
+    // Each entry point instantiates its own read-only frame context; texture parameters are not stored in a shared UBO.
     const string CommonMsl = """
 #include <metal_stdlib>
 using namespace metal;

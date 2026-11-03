@@ -891,13 +891,15 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         if (p.SkyViewViewVersions != null)
             p.SkyViewViewVersions[fi] = skyView.ViewVersion;
 
-        // 雾采样三段（22/23/24）：
-        // 22 是帧常量存储缓冲，先写零填充占位（帧内容由雾合成那边的帧缓冲提供，
-        // 透明阶段只负责把真正句柄补写进本槽描述符）；
-        // 23/24 是两张体积纹理，收集期拿不到本帧产物，先拿 AP 体积
-        // （DummyBlack 降落且已处于 ShaderReadOnlyOptimal）占位，
-        // 由透明阶段在绑定前重写。三者都必须在收集期先写，
-        // 否则着色器静态引用的描述符会是野值（WSL 驱动会直接中止）。
+        // The three fog sampling stages (22/23/24):
+        // 22 is a frame constant storage buffer, so first write a zero-filled placeholder (the frame
+        // contents come from the frame buffer on the fog composite side; the transparent phase only
+        // patches the real handle into this slot's descriptor);
+        // 23/24 are two volume textures, and collection cannot obtain this frame's output, so use the
+        // AP volume as a placeholder first (DummyBlack landed and is already in ShaderReadOnlyOptimal),
+        // to be rewritten by the transparent phase before binding. All three must be written during
+        // collection first, otherwise the descriptors statically referenced by the shader would be
+        // wild values (the WSL driver aborts outright).
         var fogFrameInfo = new DescriptorBufferInfo
         { Buffer = Pipeline.DefaultFogFrameBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize };
         writes[22] = MakeBufferWrite(set, Pipeline.SceneFogFrameBinding, DescriptorType.StorageBuffer, &fogFrameInfo);
@@ -2041,8 +2043,8 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         if (!_transformInitialized)
             return;
 
-        // 收集期把本分组钉在快照页上：重放时命令缓冲还会引用图元、共享壳体模板与实例缓冲，
-        // 三者都挂在本分组上。非收集期是空操作。
+        // Pin this group on the snapshot page during collection: during replay the command buffer still references the primitives, the shared shell template, and the instance buffer, all three
+        // of which hang off this group. It is a no-op outside collection.
         VKSceneDrawCollection.RetainOwner(this);
 
         OnBeforeDraw();
@@ -2187,12 +2189,17 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
         if (_shadowDrawList.Count == 0)
             return;
 
-        // 描述符集一旦被绑定到正在录制的命令缓冲，未声明 UPDATE_AFTER_BIND 的绑定就不允许再改写
-        // （否则整条命令缓冲进入 invalid 状态，收尾时报 VUID-vkEndCommandBuffer-commandBuffer-00059）。
-        // 常驻图元的 binding 16-20 已经在帧首、命令缓冲 begin 之前刷新过
-        // （Pipeline.RefreshSceneBindingsForFrameStart），这里会因为 ViewVersion 相同而全部跳过；
-        // 它现在的职责是本帧首次出现的图元的兜底，每个槽位首次绘制时刷新一次。
-        // 阴影的剔选结果与主通道不一定重合，所以这里还得把自己画过的图元登记给下一帧的帧首预刷新。
+        // Once a descriptor set has been bound to a command buffer that is being recorded, bindings
+        // that do not declare UPDATE_AFTER_BIND must not be rewritten again
+        // (otherwise the entire command buffer becomes invalid and reports
+        // VUID-vkEndCommandBuffer-commandBuffer-00059 at teardown).
+        // The resident primitives' bindings 16-20 have already been refreshed at frame start, before
+        // the command buffer begins
+        // (Pipeline.RefreshSceneBindingsForFrameStart), and here they are all skipped because the
+        // ViewVersion is unchanged; its current job is the fallback for primitives first appearing this
+        // frame, refreshing once per slot on the first draw.
+        // The shadow cull selection does not always coincide with the main pass, so here we must also
+        // register the primitives we drew for the next frame's frame-start pre-refresh.
         int fi = (int)Device.FrameIndex;
         for (int i = 0; i < _shadowDrawList.Count; i++)
         {

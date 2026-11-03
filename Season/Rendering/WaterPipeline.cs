@@ -7,53 +7,53 @@ using System.Runtime.InteropServices;
 
 namespace Season.Rendering;
 
-/// <summary>单个水面的绘制请求：后端据此取帧缓冲里对应的槽位，并按 <see cref="Texture"/> 解析法线贴图。</summary>
-/// <param name="Index">水面数据在本帧缓冲中的槽位，后端作为每 draw 常量传给着色器。</param>
-/// <param name="Texture">法线贴图名；null 表示走程序化双正弦波。</param>
-/// <param name="TilesX">P4 分块实例化的列数；不启用 Gerstner 或不分块时是 1。</param>
-/// <param name="TilesZ">P4 分块实例化的行数；不分块时是 1。</param>
-/// <param name="Subdiv">每块 tile 的细分段数；0 表示不分块，退回 6 顶点的整块矩形。</param>
+/// <summary>Draw request for a single water surface: the backend uses it to fetch the corresponding slot in the frame buffer and resolve the normal texture via <see cref="Texture"/>.</summary>
+/// <param name="Index">Slot of the water data in this frame buffer, passed to the shader by the backend as per-draw constants.</param>
+/// <param name="Texture">Normal texture name; null means use the procedural dual sine wave.</param>
+/// <param name="TilesX">Column count for the P4 tiled instancing; 1 when Gerstner is disabled or tiling is off.</param>
+/// <param name="TilesZ">Row count for the P4 tiled instancing; 1 when tiling is off.</param>
+/// <param name="Subdiv">Number of subdivision segments per tile; 0 means no tiling, falling back to a single rectangle with 6 vertices.</param>
 public readonly record struct WaterDraw(int Index, string? Texture, int TilesX, int TilesZ, int Subdiv)
 {
-    /// <summary>本 draw 的顶点数：不分块是两个三角形，分块是每个 tile 的 subdiv² 个四边形。</summary>
+    /// <summary>Vertex count for this draw: two triangles when not tiled, or subdiv² quads per tile when tiled.</summary>
     public int VertexCount => Subdiv > 0 ? Subdiv * Subdiv * 6 : 6;
 
-    /// <summary>本 draw 的实例数：不分块是一次，分块是 tile 总数。</summary>
+    /// <summary>Instance count for this draw: one when not tiled, or the total tile count when tiled.</summary>
     public int InstanceCount => Subdiv > 0 ? TilesX * TilesZ : 1;
 }
 
 /// <summary>
-/// 每帧交给后端的水面输入。与 <see cref="DecalInputs"/> 的关键差异是它有两份场景颜色：
-/// <see cref="Color"/> 是颜色目标（写），<see cref="RefractionSource"/> 是开画前的不透明场景色快照（读）。
-/// 同一资源不能既是附件又是采样源，所以折射必须靠这份快照，而不是直接读 <see cref="Color"/>。
+/// Water input handed to the backend each frame. The key difference from <see cref="DecalInputs"/> is that it has two scene colors:
+/// <see cref="Color"/> is the color target (write), while <see cref="RefractionSource"/> is the opaque scene color snapshot taken before the pass (read).
+/// The same resource cannot be both an attachment and a sampling source, so refraction must rely on this snapshot rather than reading <see cref="Color"/> directly.
 /// </summary>
-/// <param name="Color">本帧 SceneColor，只作为颜色目标；本 Pass 不挂深度附件。</param>
-/// <param name="RefractionSource">开画前拷贝的场景色，与 <paramref name="Color"/> 同尺寸同格式。</param>
-/// <param name="Depth">本帧 SceneDepth，只作为采样源，用于软件深度测试与厚度吸收。</param>
-/// <param name="SkyView">P0 的程序化天空 Sky-View LUT 名；null 时反射退回常量天空色。</param>
-/// <param name="FrameBuffer">帧头 + 水面数组的连续缓冲，布局见 <see cref="WaterMath"/>。</param>
-/// <param name="Draws">按绘制次序排好的槽位表，前 <paramref name="Count"/> 项有效。</param>
+/// <param name="Color">This frame's SceneColor, used only as the color target; this pass attaches no depth attachment.</param>
+/// <param name="RefractionSource">The scene color copied before the pass, with the same size and format as <paramref name="Color"/>.</param>
+/// <param name="Depth">This frame's SceneDepth, used only as a sampling source for the software depth test and thickness absorption.</param>
+/// <param name="SkyView">Name of the P0 procedural sky Sky-View LUT; when null, reflection falls back to a constant sky color.</param>
+/// <param name="FrameBuffer">Contiguous buffer of the frame header plus the water array; see <see cref="WaterMath"/> for the layout.</param>
+/// <param name="Draws">Slot table ordered by draw order; the first <paramref name="Count"/> entries are valid.</param>
 public readonly record struct WaterInputs(RenderTarget Color, RenderTarget RefractionSource, RenderTarget Depth,
     string? SkyView, StorageBuffer FrameBuffer, WaterDraw[] Draws, int Count);
 
 /// <summary>
-/// P3 水面的屏幕空间反射参数：一张 water 表的全部水面共用，由共享层按本帧 Hi-Z 就绪状态填。
-/// <see cref="Enabled"/> 为 false 时着色器完全不碰那四张全字塔纹理，退回纯天空反射
-/// —— 后端的 Hi-Z 纹理名字可能压根析不出对象。
+/// Screen-space reflection parameters for P3 water: shared by all water surfaces in a water table, filled by the shared layer based on this frame's Hi-Z readiness.
+/// When <see cref="Enabled"/> is false the shader never touches those four pyramid textures and falls back to pure sky reflection
+/// -- the backend's Hi-Z texture name may not resolve to any object at all.
 /// </summary>
-/// <param name="Intensity">命中置信度的倍率；0 等价于关反射，1 是完全相信屏幕内命中。</param>
-/// <param name="MaxDistance">射线在水面上能走多远（米）。超出这个距离的反射直接退回天空。</param>
-/// <param name="Thickness">屏幕表面厚度容差（视空间米）。射线穿过薄物体时是否算命中就靠它。</param>
+/// <param name="Intensity">Scale for the hit confidence; 0 is equivalent to turning reflection off, and 1 fully trusts on-screen hits.</param>
+/// <param name="MaxDistance">How far a ray can travel along the water surface (meters). Reflections beyond this distance fall back to sky directly.</param>
+/// <param name="Thickness">Thickness tolerance of the on-screen surface (view-space meters). This decides whether a ray passing through thin objects counts as a hit.</param>
 public readonly record struct WaterReflection(bool Enabled, float Intensity, float Near, float Far,
     float MaxDistance, float Thickness);
 
 /// <summary>
-/// P2 水面材质的后端入口。四个后端各自实现，共享层只负责剔除、排序与打包。
-/// 返回 false 表示本帧放弃绘制（资源形状不符、能力缺失），调用方必须当成「没有水面」处理而不是部分绘制。
+/// Backend entry point for the P2 water material. Implemented by each of the four backends; the shared layer only handles culling, sorting, and packing.
+/// Returning false means drawing is skipped this frame (mismatched resource shape, missing capability); the caller must treat it as "no water" rather than partial drawing.
 ///
-/// 为什么是独立管线而不是主着色器的一个材质分支：水面要采样 SceneColor 与 SceneDepth，
-/// 而主着色器在透明段里拿到的这两张都是附件，同一资源不能同时是附件与采样源。独立 Pass 才能同时
-/// 读（快照 + 深度）与写（场景色），并且顺带省掉深度附件 —— 遮挡改用着色器里的软件深度测试。
+/// Why a separate pipeline instead of a material branch of the main shader: water needs to sample SceneColor and SceneDepth,
+/// but in the transparent stage the main shader receives both as attachments, and the same resource cannot be both an attachment and a sampling source. Only a separate pass can
+/// simultaneously read (snapshot + depth) and write (scene color), and it also saves the depth attachment -- occlusion instead uses the software depth test in the shader.
 /// </summary>
 public abstract class WaterPipeline : IDisposable
 {
@@ -65,26 +65,26 @@ public abstract class WaterPipeline : IDisposable
 }
 
 /// <summary>
-/// 水面帧缓冲的字节布局，四端与 C# 共享同一份定义；公开以便数学测试逐字段核对
-/// （与 <see cref="DecalMath"/> 的约定一致）。
+/// Byte layout of the water frame buffer, shared by the four backends and C#; made public so math tests can verify it field by field
+/// (consistent with the convention of <see cref="DecalMath"/>).
 ///
-/// 全部按 <see cref="System.Numerics"/> 原始行序存放 float4：
+/// Everything is stored as float4 in raw <see cref="System.Numerics"/> row order:
 /// <list type="bullet">
-/// <item>0..3 反抖动的 VP（含后端 NDC 变换）的逆矩阵，用于从深度重建世界坐标与厚度；</item>
-/// <item>4..7 反抖动的 VP（含后端 NDC 变换），顶点着色器用它把单位平面放进裁剪空间；</item>
-/// <item>8 (相机世界坐标.xyz, 1/宽)；9 (宽, 高, 1/宽, 1/高)；</item>
-/// <item>10 (水面数, 是否有降雨, 时间秒, 天空 LUT 是否可用)；
-/// 11 (太阳方向.xyz, 太阳强度)，水面高光与天空反射的兜底色；</item>
-/// <item>12 (屏幕反射是否启用, 反射强度倍率, 近平面, 远平面)，13 (最大射线距离, 厚度容差, 0, 0)；</item>
-/// <item>16 起每个水面 <see cref="WaterStride"/> 个 float4：
-/// 0..3 模型→世界，4 (tint.rgb, opacity)，
-/// 5 (吸收, 折射强度, 法线强度, 法线平铺)，
-/// 6 (滚动速度, 涟漪强度, fresnelF0, 粗糙度)，
-/// 7 (是否有法线贴图, 排序键, UV 原点.x, UV 原点.z)，
-/// 8..11 P4 的四个 Gerstner 波，每个一个 float4 (振幅, 波数, 方向.x, 方向.z)，
-/// k &lt;= 0 的空槽在着色器里被跳过，所以风速为 0 时顶点完全不动；
-/// 12 (分块列数, 分块行数, 细分段数, 水平位移系数)，细分段数为 0 表示不分块；
-/// 13 (相速度倍率, 实际波数, 0, 0)。</item>
+/// <item>0..3 the inverse of the un-jittered VP (including the backend NDC transform), used to reconstruct world position and thickness from depth;</item>
+/// <item>4..7 the un-jittered VP (including the backend NDC transform), used by the vertex shader to place the unit plane into clip space;</item>
+/// <item>8 (camera world position.xyz, 1/width); 9 (width, height, 1/width, 1/height);</item>
+/// <item>10 (water count, whether it is raining, time in seconds, whether the sky LUT is available);
+/// 11 (sun direction.xyz, sun intensity), the fallback color for water specular and sky reflection;</item>
+/// <item>12 (whether screen-space reflection is enabled, reflection intensity scale, near plane, far plane), 13 (max ray distance, thickness tolerance, 0, 0);</item>
+/// <item>From 16 on, <see cref="WaterStride"/> float4 per water surface:
+/// 0..3 model-to-world, 4 (tint.rgb, opacity),
+/// 5 (absorption, refraction strength, normal strength, normal tiling),
+/// 6 (scroll speed, ripple strength, fresnelF0, roughness),
+/// 7 (whether there is a normal map, sort key, UV origin.x, UV origin.z),
+/// 8..11 the four P4 Gerstner waves, one float4 each (amplitude, wave number, direction.x, direction.z),
+/// empty slots with k &lt;= 0 are skipped in the shader, so vertices do not move at all when wind speed is 0;
+/// 12 (tile columns, tile rows, subdivision segments, horizontal displacement factor), a subdivision segment count of 0 means no tiling;
+/// 13 (phase velocity scale, actual wave number, 0, 0).</item>
 /// </list>
 /// </summary>
 public static class WaterMath
@@ -93,46 +93,46 @@ public static class WaterMath
     public const int WaterOffset = HeaderVectorCount;
 
     /// <summary>
-    /// 每个水面占的 float4 数。P2/P3 是 8；P4 把四个 Gerstner 波（±8..+11）与分块参数（±12..+13）
-    /// 插进同一段，剩下的 +14/+15 留空。扩到 16 而不是 14，是为了让槽位地址始终是 2 的幂 ——
-    /// 着色器里 <c>WaterOffset</c> 的乘法因此和旧版一样便宜，也方便以后继续往后加字段。
+    /// Number of float4 occupied by each water surface. P2/P3 use 8; P4 inserts the four Gerstner waves (+8..+11) and the tiling parameters (+12..+13)
+    /// into the same segment, leaving the remaining +14/+15 empty. It was expanded to 16 instead of 14 so that the slot address stays a power of two --
+    /// the multiplication of <c>WaterOffset</c> in the shader is therefore as cheap as before, and it is easier to keep adding fields later.
     /// </summary>
     public const int WaterStride = 16;
     public const int MaxWaters = SceneWaters.MaxActiveWaters;
     public const int VectorCount = WaterOffset + MaxWaters * WaterStride;
     public const int ByteCount = VectorCount * 16;
 
-    /// <summary>Gerstner 波分量数，与帧布局里的 +8..+11 一一对应。</summary>
+    /// <summary>Number of Gerstner wave components, corresponding one-to-one with +8..+11 in the frame layout.</summary>
     public const int WaveCount = 4;
 
     /// <summary>
-    /// 单个水面最多切成多少块 tile。它同时是 WebGPU 的编码基数：WGSL 没有 push constant，
-    /// 槽位与 tile 只能挤在 <c>instance_index</c> 里（低 <see cref="TileBits"/> 位是 tile，高位是槽位），
-    /// 所以这个数必须是 2 的幂。
+    /// Maximum number of tiles a single water surface can be split into. It is also the encoding base for WebGPU: WGSL has no push constant,
+    /// so the slot and tile must be packed into <c>instance_index</c> (the low <see cref="TileBits"/> bits are the tile, the high bits are the slot),
+    /// which is why this number must be a power of two.
     /// </summary>
     public const int MaxTilesPerWater = 256;
 
-    /// <summary>由 <see cref="MaxTilesPerWater"/> 推出的低位数：WGSL 用实例号的低位取 tile，高位取槽位。</summary>
+    /// <summary>Low-bit count derived from <see cref="MaxTilesPerWater"/>: WGSL takes the tile from the low bits of the instance index and the slot from the high bits.</summary>
     public const int TileBits = 8;
 
-    /// <summary>单轴 tile 数上限：16×16 正好是 <see cref="MaxTilesPerWater"/>，再密就要换方案了。</summary>
+    /// <summary>Maximum tile count per axis: 16×16 is exactly <see cref="MaxTilesPerWater"/>; going denser would require a different scheme.</summary>
     public const int MaxTilesPerAxis = 16;
 
     /// <summary>
-    /// 单 tile 的细分段数上限。与 <see cref="MaxTilesPerAxis"/> 合起来把单水面的顶点数封在
-    /// 256×32²×6 ≈ 1.57M；实践中海面用 20，池塘不分块。
+    /// Upper bound on subdivision segments per tile. Together with <see cref="MaxTilesPerAxis"/> it caps a single water surface at
+    /// 256×32²×6 ≈ 1.57M vertices; in practice ocean surfaces use 20, and ponds are not tiled at all.
     /// </summary>
     public const int MaxSubdiv = 32;
 
-    /// <summary>深水重力加速度（m/s²）。四端着色器里写死同一个值，只用于把波数换成角频率。</summary>
+    /// <summary>Deep-water gravitational acceleration (m/s²). All four backends hard-code the same value; it is used only to convert wave number into angular frequency.</summary>
     public const float Gravity = 9.81f;
 
-    /// <summary>把本帧的帧头与水面数组写进缓冲。调用方负责先按排序结果把水面表排好。</summary>
+    /// <summary>Writes this frame's header and water array into the buffer. The caller is responsible for sorting the water table beforehand.</summary>
     public static void Pack(Span<Vector4> data, in Matrix4x4 jitteredVp, in Matrix4x4 inverseJitteredVp,
         Vector3 position, float width, float height, bool raining, float time, bool skyView,
         in WaterReflection reflection, Vector3 sunDirection, float sunIntensity, ReadOnlySpan<WaterPlane> waters)
     {
-        if (data.Length < VectorCount) throw new ArgumentException("水面帧缓冲不足。", nameof(data));
+        if (data.Length < VectorCount) throw new ArgumentException("Water frame buffer is too small.", nameof(data));
         data.Clear();
         WriteMatrix(data, 0, inverseJitteredVp);
         WriteMatrix(data, 4, jitteredVp);
@@ -152,8 +152,8 @@ public static class WaterMath
             data[offset + 5] = new(water.Absorption, water.RefractionStrength, water.NormalStrength, water.NormalTiling);
             data[offset + 6] = new(water.ScrollSpeed, water.RippleStrength, water.FresnelF0, water.Roughness);
             data[offset + 7] = new(water.NormalTexture != null ? 1 : 0, water.SortOrder, uv.X, uv.Y);
-            // P4：四个 Gerstner 波 + 分块参数。风浪关闭时 BuildWaves 把四位全写 0（着色器按 k<=0 跳过），
-            // Tiling 同时把细分段数归零，后端因此会退回 6 顶点的单矩形 —— 与 P3 的平整水面逐像素一致。
+            // P4: four Gerstner waves + tiling parameters. With wind waves disabled BuildWaves writes all four to 0 (the shader skips when k <= 0),
+            // and Tiling zeroes the subdivision segment count at the same time, so the backend falls back to a single 6-vertex rectangle -- pixel-identical to the flat P3 water surface.
             int waves = BuildWaves(data, offset + 8, water.WindSpeed, water.WindDirection,
                 water.SwellHeight, WaveCount);
             var tiling = Tiling(water);
@@ -164,10 +164,10 @@ public static class WaterMath
     }
 
     /// <summary>
-    /// 本水面的 tile 网格与细分度。返回的 <c>Subdiv</c> 为 0 表示不分块，后端据此画 6 顶点的整块矩形。
+    /// Tile grid and subdivision level for this water surface. A returned <c>Subdiv</c> of 0 means no tiling, and the backend then draws a single 6-vertex rectangle.
     ///
-    /// 风浪关闭时直接不分块：Gerstner 是唯一需要顶点密度的东西，没有它就没有理由为一个平面付
-    /// 上百倍的顶点。tile 数量超限时也整块退回，不做「一半分块」—— 那样接缝会出现在画面中间。
+    /// With wind waves disabled there is no tiling at all: Gerstner is the only thing that needs vertex density, and without it there is no reason to pay
+    /// a hundred times the vertices for a flat plane. When the tile count exceeds the limit it also falls back to a single rectangle rather than doing "half tiling" -- that would put a seam in the middle of the screen.
     /// </summary>
     public static (int X, int Z, int Subdiv) Tiling(in WaterPlane water)
     {
@@ -178,21 +178,21 @@ public static class WaterMath
         x = Math.Clamp(x, 1, MaxTilesPerAxis);
         z = Math.Clamp(z, 1, MaxTilesPerAxis);
         if (x * z > MaxTilesPerWater) return (1, 1, 0);
-        // 细分也钳一下：顶点数是 subdiv²×6×tiles，作者写错一个零就是几百万顶点，
-        // 而着色器的顶点预算里没有任何其它东西会拦住它。
+        // Clamp the subdivision too: the vertex count is subdiv²×6×tiles, and one misplaced zero by an author means millions of vertices,
+        // with nothing else in the shader's vertex budget to stop it.
         return (x, z, Math.Clamp(water.TileSubdiv, 1, MaxSubdiv));
     }
 
     /// <summary>
-    /// 按风速生成四个 Gerstner 分量的参数，写进 <c>water + 8 .. + 11</c>，返回实际写入的波数。
+    /// Generates the parameters of four Gerstner components from the wind speed, writes them into <c>water + 8 .. + 11</c>, and returns the number of waves actually written.
     ///
-    /// 波长谱：完全发展海的主波长是 λ_peak = 2πU²/g（PM 谱峰），这里再乘 2 往长波侧推一档，
-    /// 因为顶点端的几何只能承载长波 —— 短波交给像素端的高频细节，那里的密度不受网格限制。
-    /// 四个分量按 1/1.55 的等比递减，权重按 1/1.45 递减，最后归一化到 <paramref name="swellHeight"/>/2：
-    /// sin 的峰值是 1，所以峰谷差是振幅的两倍。
+    /// Wavelength spectrum: the dominant wavelength of a fully developed sea is λ_peak = 2πU²/g (the PM spectrum peak); here it is multiplied by 2 to push once toward the long-wave side,
+    /// because geometry on the vertex side can only carry long waves -- short waves are left to the high-frequency detail on the pixel side, where density is not limited by the mesh.
+    /// The four components decrease geometrically by 1/1.55, the weights decrease by 1/1.45, and it is finally normalized to <paramref name="swellHeight"/>/2:
+    /// the peak of sin is 1, so the crest-to-trough difference is twice the amplitude.
     ///
-    /// 相速度不进帧缓冲：它由深水色散 ω = sqrt(g·k) 唯一确定，着色器里用同一常量现算，
-    /// 两边不会因为各自插值出不同的频率。作者层的「速度」只是 <see cref="WaterPlane.WaveSpeed"/> 这个倍率。
+    /// Phase velocity is not stored in the frame buffer: it is uniquely determined by deep-water dispersion ω = sqrt(g·k), and the shader computes it on the fly with the same constant,
+    /// so the two sides never end up with different frequencies from interpolating separately. The author-facing "speed" is just the <see cref="WaterPlane.WaveSpeed"/> multiplier.
     /// </summary>
     public static int BuildWaves(Span<Vector4> data, int offset, float windSpeed, float windDirection,
         float swellHeight, int count)
@@ -204,10 +204,10 @@ public static class WaterMath
             return 0;
         }
 
-        // 主波长：PM 谱峰乘 2。下限 24m 是为了让顶点端至少有几何意义（tile 内格距通常 8~12m）。
+        // Dominant wavelength: the PM spectrum peak times 2. The 24m lower bound keeps it at least geometrically meaningful on the vertex side (the in-tile grid spacing is usually 8~12m).
         float longest = Math.Clamp(6.2831853f * windSpeed * windSpeed / Gravity * 2f, 24f, 320f);
 
-        // 权重先求和再归一化：只取前 count 个分量，总振幅仍等于 swellHeight/2，不会因减波而变矮。
+        // Sum the weights first, then normalize: only the first count components are taken, and the total amplitude still equals swellHeight/2, so it does not get shorter when waves are removed.
         Span<float> weight = stackalloc float[WaveCount];
         float weightSum = 0f;
         for (int i = 0; i < count; i++)
@@ -222,7 +222,7 @@ public static class WaterMath
         {
             float k = 6.2831853f / wavelength;
             float amplitude = peak * weight[i] / weightSum;
-            // 方向绕主风向展开约 ±45°：完全平行的一组波峰在掠射角会读成一组规则条纹。
+            // The directions fan out around the dominant wind by about ±45°: a set of perfectly parallel crests would read as regular stripes at grazing angles.
             float angle = windDirection + (i - (count - 1) * 0.5f) * 0.52f;
             data[offset + i] = new(amplitude, k, MathF.Cos(angle), MathF.Sin(angle));
             wavelength /= 1.55f;

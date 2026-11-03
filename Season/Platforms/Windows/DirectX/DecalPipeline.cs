@@ -10,20 +10,20 @@ using Silk.NET.DXGI;
 namespace Season.Platforms.Windows.DirectX;
 
 /// <summary>
-/// D1 屏幕空间贴花的 D3D12 实现。
+/// D3D12 implementation of the D1 screen-space decal.
 ///
-/// 每个贴花一次 36 顶点的 DrawInstanced：顶点由 SV_VertexID 算出投影盒的六个面，光栅器只留背面
-/// （<see cref="CullMode.Front"/>），因此每个像素最多命中一次 —— 混合不会被叠加两遍，也就不需要模板。
-/// 像素着色器用本帧深度重建世界坐标，折进盒的局部空间后取 UV；颜色通过固定功能混合写回 SceneColor，
-/// 所以 SceneColor 不需要同时是可采样资源，Pass 里它只是颜色附件。
+/// One 36-vertex DrawInstanced per decal: the vertex shader computes the six faces of the projection box from SV_VertexID, and the rasterizer keeps only the back faces
+/// (<see cref="CullMode.Front"/>), so each pixel is hit at most once - blending is not applied twice, and no stencil is needed.
+/// The pixel shader reconstructs the world position from this frame's depth, folds it into the box's local space and takes the UV; the color is written back to SceneColor through fixed-function blending,
+/// so SceneColor does not need to be a samplable resource at the same time - inside the Pass it is only a color attachment.
 ///
-/// 时序与 <see cref="DXFogCompositePipeline"/> 相同：Prepare 在 Pass 外完成深度/法线的状态转换与
-/// 描述符快照，Draw 只能在 <see cref="RenderPassId.SceneDecal"/> 内消费一次；任何一项与准备期不符
-/// 都放弃绘制而不是部分绘制。
+/// The timing is the same as <see cref="DXFogCompositePipeline"/>: Prepare performs the depth/normal state transitions and
+/// descriptor snapshot outside the Pass, and Draw may consume it only once inside <see cref="RenderPassId.SceneDecal"/>; if anything differs from the prepare phase
+/// it gives up the draw rather than drawing partially.
 /// </summary>
 internal sealed unsafe class DXDecalPipeline : DecalPipeline
 {
-    // 根参数序号，与 DecalShaders.Hlsl 的 t0/t1/t2、b0 一一对应。
+    // Root parameter indices, corresponding one-to-one with t0/t1/t2 and b0 in DecalShaders.Hlsl.
     const uint FrameRoot = 0;
     const uint DepthRoot = 1;
     const uint TextureRoot = 2;
@@ -33,10 +33,10 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
     readonly int[] _cursors = new int[(int)Device.frameCount];
     readonly ulong[] _stamps = new ulong[(int)Device.frameCount];
     ID3D12RootSignature* _signature;
-    // [模式 0=Modulate/1=Additive, 是否带法线附件]。s9 的粗糙度写入要第二个颜色附件，
-    // 而附件数量必须与 PSO 的 RT 数量一致，所以这里按两种附件形状各留一份。
+    // [mode 0=Modulate/1=Additive, whether it has a normal attachment]. The roughness write of s9 needs a second color attachment,
+    // and the number of attachments must match the RT count of the PSO, so one copy is kept here for each of the two attachment shapes.
     readonly ID3D12PipelineState*[,] _pipelines = new ID3D12PipelineState*[2, 2];
-    /// <summary>逐贴花的纹理解析器：只查后端纹理字典，不加载。名字 → 纹理为空时该 draw 被跳过。</summary>
+    /// <summary>Per-decal texture resolver: it only looks up the backend texture dictionary, it does not load. name -> when the texture is null this draw is skipped.</summary>
     readonly Func<string, DXTexture?> _resolve;
     readonly DXTexture?[] _textures = new DXTexture?[DecalMath.MaxDecals];
     readonly bool[] _skip = new bool[DecalMath.MaxDecals];
@@ -51,8 +51,8 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
     bool _disposed;
 
     /// <summary>
-    /// 深度与法线的描述符快照。引用保活使窗口 Resize 前后的原生地址不会被复用，
-    /// 描述符也不能从共享可见堆里原地借用 —— 与雾合成完全相同的原因。
+    /// Descriptor snapshot for depth and normal. Keeping the references alive prevents the native address from being reused across a window Resize,
+    /// and the descriptor also cannot be borrowed in place from the shared visible heap - exactly the same reason as for fog composite.
     /// </summary>
     sealed class BindingSlot
     {
@@ -116,7 +116,7 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
     void Initialize()
     {
         var parameters = stackalloc RootParameter[4];
-        // 帧缓冲是根 SRV：每帧只有一个，且顶点与像素阶段都要读，没必要为它单独占描述符。
+        // The frame buffer is a root SRV: there is only one per frame, and both the vertex and pixel stages need to read it, so there is no need to occupy a descriptor for it separately.
         parameters[FrameRoot] = new() { ParameterType = RootParameterType.TypeSrv,
             Descriptor = new RootDescriptor { ShaderRegister = 0, RegisterSpace = 0 },
             ShaderVisibility = ShaderVisibility.All };
@@ -169,12 +169,12 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
     }
 
     /// <summary>
-    /// 两种混合语义共用一套着色器，只是源因子不同：
-    /// Modulate 用 <c>dst * src</c>（SrcBlend = DestColor, DestBlend = Zero）把像素输出当成调制量，
-    /// Additive 用 <c>dst + src</c>。alpha 一律保留目标值，贴花不参与后续的 alpha 判定。
+    /// The two blend semantics share one shader, only the source factors differ:
+    /// Modulate uses <c>dst * src</c> (SrcBlend = DestColor, DestBlend = Zero) treating the pixel output as a modulation amount,
+    /// Additive uses <c>dst + src</c>. The alpha always keeps the destination value, and the decal does not participate in the subsequent alpha test.
     ///
-    /// <paramref name="roughness"/> 为 true 时挂第二个颜色附件（SceneNormal）。它只开 B 通道写掩码，
-    /// 并用 coverage 在原值上插值，所以八面体法线与金属度不被碰。
+    /// When <paramref name="roughness"/> is true a second color attachment (SceneNormal) is attached. It only enables the B channel write mask,
+    /// and interpolates on the original value with coverage, so the octahedral normal and the metalness are not touched.
     /// </summary>
     ID3D12PipelineState* CreatePipeline(ID3D10Blob* vertex, ID3D10Blob* fragment, Blend source, bool roughness)
     {
@@ -184,14 +184,14 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
             PRootSignature = _signature,
             VS = new(vertex->GetBufferPointer(), vertex->GetBufferSize()),
             PS = new(fragment->GetBufferPointer(), fragment->GetBufferSize()),
-            // 只留背面：投影盒是凸体，背面在每个像素上恰好命中一次。
+            // Keep only the back faces: the projection box is a convex body, and the back face is hit exactly once per pixel.
             RasterizerState = new() { FillMode = FillMode.Solid, CullMode = CullMode.Front, DepthClipEnable = 1 },
             DepthStencilState = new() { DepthFunc = ComparisonFunc.Always, FrontFace = stencil, BackFace = stencil },
             SampleMask = uint.MaxValue, PrimitiveTopologyType = PrimitiveTopologyType.Triangle,
             NumRenderTargets = roughness ? 2u : 1u, SampleDesc = new(1, 0) };
-        // BlendEnable 必须显式打开：默认 0 时混合因子全被忽略，PS 输出直接覆写 SceneColor ——
-        // Modulate 在盒内 coverage=0 处写出 1.0（白块，连盒后面的人物也被盖掉），Additive 写出 0（黑块）。
-        // 两个附件的混合方式不同，所以还要 IndependentBlendEnable，否则 RT1 会套用 RT0 的设置把法线整块覆写。
+        // BlendEnable must be explicitly enabled: when it is 0 the blend factors are all ignored and the PS output directly overwrites SceneColor -
+        // Modulate writes 1.0 where coverage=0 inside the box (a white block, even the characters behind the box are covered), Additive writes 0 (a black block).
+        // The two attachments blend differently, so IndependentBlendEnable is also needed, otherwise RT1 would apply RT0's settings and overwrite the normal entirely.
         desc.BlendState.IndependentBlendEnable = roughness ? 1u : 0u;
         desc.BlendState.RenderTarget[0] = new() { BlendEnable = 1, SrcBlend = source,
             DestBlend = source == Blend.One ? Blend.One : Blend.Zero, BlendOp = BlendOp.Add,
@@ -200,8 +200,8 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
         desc.RTVFormats[0] = Format.FormatR16G16B16A16Float;
         if (roughness)
         {
-            // 只写 .z（Blue）：法线的八面体编码在 .xy，反射权重在 .w，两者必须保留。
-            // 混合用 coverage 做 lerp，coverage 为 0 时结果恰好等于原值，所以“不碰粗糙度”的贴花不会改变目标。
+            // Write only .z (Blue): the octahedral encoding of the normal is in .xy and the reflection weight is in .w, both must be preserved.
+            // The blend lerps with coverage; when coverage is 0 the result is exactly the original value, so a decal that "does not touch roughness" does not change the destination.
             desc.BlendState.RenderTarget[1] = new() { BlendEnable = 1, SrcBlend = Blend.SrcAlpha,
                 DestBlend = Blend.InvSrcAlpha, BlendOp = BlendOp.Add,
                 SrcBlendAlpha = Blend.One, DestBlendAlpha = Blend.Zero, BlendOpAlpha = BlendOp.Add,
@@ -219,11 +219,11 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
         Texture2D = new() { MipLevels = 1 } };
 
     /// <summary>
-    /// 核对形状并把资源折成描述符快照。返回 false 表示本帧放弃：贴花只在「颜色是单采样 HDR、
-    /// 深度与颜色同尺寸」这一种形状下成立，其余情况宁可不出图也不出错图。
+    /// Verify the shape and fold the resources into a descriptor snapshot. Returning false means giving up this frame: the decal only
+    /// holds for the shape "color is single-sample HDR, depth and color are the same size"; in other cases it will produce no image rather than a wrong image.
     ///
-    /// 法线目标在 s9 之后是<b>附件</b>而不是采样源：同一个资源不能同时挂 RTV 与 SRV。
-    /// 所以两个描述符槽都指向深度，第二个槽留给 s3 的逐贴花纹理。
+    /// After s9 the normal target is an <b>attachment</b> rather than a sampling source: the same resource cannot be bound as both RTV and SRV.
+    /// So both descriptor slots point at the depth, and the second slot is left for the per-decal texture of s3.
     /// </summary>
     bool Resolve(in DecalInputs inputs, DXRenderTarget destination, Span<nint> resources,
         Span<ShaderResourceViewDesc> views, bool transition, out DXStorageBuffer? frame, out bool roughness)
@@ -239,11 +239,11 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
             || color.ColorNativeFormat != Format.FormatR16G16B16A16Float
             || destination.ColorNativeFormat != Format.FormatR16G16B16A16Float
             || depth.Desc.DepthFormat != RtFormat.D32Float
-            // 本 Pass 把颜色目标同时当作混合底图，共享层因此必须交出同一张目标；换成别的 RT 就不是「贴到场景上」了。
+            // This Pass uses the color target also as the blend base image, so the shared layer must hand out the same target; with another RT it would no longer be "decaled onto the scene".
             || !ReferenceEquals(destination, color)
             || color.Width == 0 || color.Height == 0 || color.Width != depth.Width || color.Height != depth.Height
             || inputs.Count <= 0 || inputs.Count > DecalMath.MaxDecals) return false;
-        // 粗糙度写入要求法线目标与颜色同形；不满足时只是不写粗糙度，不应该让颜色贴花一起消失。
+        // The roughness write requires the normal target to have the same shape as the color; if not satisfied only the roughness write is skipped, and it should not make the color decal disappear as well.
         DXRenderTarget? normal = inputs.Normal as DXRenderTarget;
         if (normal != null && (normal.Color == null || normal.Desc.SampleCount != 1
             || normal.Desc.ColorFormat != RtFormat.Rgba16Float
@@ -264,7 +264,7 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
             const ResourceStates read = ResourceStates.PixelShaderResource;
             if ((buffer.CurrentState & read) == 0 || (depth.DepthCurrentState & read) == 0
                 || destination.CurrentState != ResourceStates.RenderTarget
-                // 附件由 BeginPass 挂好，这里只核对它确实还在渲染目标状态。
+                // The attachment was bound by BeginPass, here we only verify it is indeed still in the render target state.
                 || (roughness && !ReferenceEquals(Device.ActiveNormalTarget, normal))) return false;
         }
         frame = buffer;
@@ -294,7 +294,7 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
         _inputs = inputs; _destination = target; _frame = frame; _prepared = slot; _writeRoughness = roughness;
         _command = Device.GraphicsCommandList; _stamp = stamp; _frameIndex = Device.FrameIndex;
 
-        // s3 逐贴花纹理：只查字典，不在这里加载。名字未注册或还没上传完的贴花整个跳过。
+        // s3 per-decal texture: only look up the dictionary, do not load here. A decal whose name is unregistered or not yet fully uploaded is skipped entirely.
         Array.Clear(_textures); Array.Clear(_skip);
         for (int i = 0; i < inputs.Count; i++)
         {
@@ -337,15 +337,15 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
         command->SetGraphicsRootShaderResourceView(FrameRoot, frame.Resource->GetGPUVirtualAddress());
         command->SetGraphicsRootDescriptorTable(DepthRoot, Device.SrvHeapManager.GetGpuHandle(slot.Ids[0]));
         command->SetGraphicsRootDescriptorTable(TextureRoot, Device.SrvHeapManager.GetGpuHandle(slot.Ids[1]));
-        // 同一模式的连续贴花共用一次 PSO 切换；排序已由共享层按 SortOrder 稳定排好。
+        // Consecutive decals of the same mode share one PSO switch; the ordering has already been stably sorted by the shared layer according to SortOrder.
         int mode = -1;
         int shape = roughness ? 1 : 0;
-        // 着色器侧是 uint4 decalParams，根常量按位原样拷贝：必须写整数位。写成 float 时 1.0f 会被读成
-        // 0x3F800000，DecalOffset 越界到根 SRV 之外（根描述符没有边界检查），第二个贴花起 GPU 就挂死。
+        // On the shader side it is uint4 decalParams; the root constants are copied bit-for-bit: you must write the integer bits. If written as float, 1.0f would be read as
+        // 0x3F800000, and DecalOffset would go out of bounds beyond the root SRV (root descriptors have no bounds check), hanging the GPU from the second decal onward.
         var parameters = stackalloc uint[4];
         for (int i = 0; i < inputs.Count; i++)
         {
-            // 贴图没就绪的贴花整个跳过：采样一个占位纹理会把“还没加载完”画成一块错误颜色。
+            // A decal whose texture is not ready is skipped entirely: sampling a placeholder texture would render "not yet loaded" as a block of wrong color.
             if (skip[i]) continue;
             var draw = inputs.Draws[i];
             int next = draw.Mode == DecalMode.Additive ? 1 : 0;
@@ -354,7 +354,7 @@ internal sealed unsafe class DXDecalPipeline : DecalPipeline
                 command->SetPipelineState(_pipelines[next, shape]);
                 mode = next;
             }
-            // 逐贴花纹理：直接借字典里已经建好的 SRV 句柄，不再重新分配描述符。
+            // Per-decal texture: directly borrow the already-built SRV handle from the dictionary, no need to allocate a descriptor again.
             if (textures[i] != null) command->SetGraphicsRootDescriptorTable(TextureRoot, textures[i]!.GpuDescriptorHandle);
             parameters[0] = (uint)draw.Index;
             command->SetGraphicsRoot32BitConstants(ParamsRoot, 4, parameters, 0);

@@ -238,9 +238,10 @@ public sealed class TaaEffect : ComputeEffect
         // by reprojection length, so a still camera gets the longer accumulation window that
         // jitter convergence needs while moving pixels keep the original, ghost-free weight.
         p[7] = state.HistoryValid ? RenderQuality.Current.TaaStaticFeedback : 0f;
-        // 反应矩形：由本帧的亮事件生产者（闪电通道）写进视图状态，没有生产者时它保持空矩形
-        // (1,1,0,0)，着色器的区间判定恒假。四项原样送进着色器，CPU 不做任何裁剪——
-        // 生产者已经把矩形夹进 [0,1] 并按线宽膨胀过。
+        // Reactive rect: written into the view state by this frame's bright-event producer (the
+        // lightning channel); with no producer it stays an empty rect (1,1,0,0) and the shader's range
+        // test is always false. The four values go to the shader as-is; the CPU does no clipping -- the
+        // producer has already clamped the rect to [0,1] and dilated it by the line width.
         var reactive = targets.ReactiveRect;
         p[8] = reactive.X;
         p[9] = reactive.Y;
@@ -529,11 +530,14 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         bool inside = all(prevUv > 0.0) && all(prevUv < 1.0);
         float w = (uHistoryValid > 0.5 && inside) ? fb : 0.0;
 
-        // 反应矩形（见 ViewTargets.ReactiveRect）：只存在一两帧的亮事件不接受历史。
-        // 静态反馈 0.97 对刚出现的像素意味着 3% 的权重，等历史积到看得见的亮度事件已经结束；
-        // 熄灭之后又要三十多帧才褪干净。矩形由生产者在 Pass 之前按屏幕包围盒写入，空矩形恒不命中。
-        // 这里不跳过历史采样：矩形边界在 warp 内几乎总是混合的，分支省不下那五次取指，
-        // 反而让编译器无法把采样延迟藏进后面的裁剪算术里。
+        // Reactive rect (see ViewTargets.ReactiveRect): bright events that last only one or two frames
+        // do not accept history. The 0.97 static feedback means a 3% weight for a freshly appeared
+        // pixel, and by the time history accumulates to a visible brightness the event is over; after it
+        // goes out it again takes thirty-some frames to fade. The rect is written by the producer from a
+        // screen bounding box before the pass; an empty rect never hits.
+        // We do not skip the history sample here: the rect boundary is almost always mixed within a
+        // warp, so the branch does not save those five fetches and instead stops the compiler from
+        // hiding the sample latency in the clipping arithmetic that follows.
         bool reactive = uv.x > uReactiveMinX && uv.y > uReactiveMinY
             && uv.x < uReactiveMaxX && uv.y < uReactiveMaxY;
         if (reactive) w = 0.0;
@@ -695,7 +699,8 @@ void main()
         bool inside = all(greaterThan(prevUv, vec2(0.0))) && all(lessThan(prevUv, vec2(1.0)));
         float w = (uHistoryValid > 0.5 && inside) ? fb : 0.0;
 
-        // 反应矩形：与 HLSL 端逐字同义，理由与「不跳过采样」的取舍见那边的注释。
+        // Reactive rect: verbatim equivalent to the HLSL side; the rationale and the 'do not skip the
+        // sample' trade-off are in the comment there.
         bool reactive = uv.x > uReactiveMinX && uv.y > uReactiveMinY
             && uv.x < uReactiveMaxX && uv.y < uReactiveMaxY;
         if (reactive) w = 0.0;
@@ -866,7 +871,8 @@ kernel void CSMain(
         bool inside = all(prevUv > float2(0.0)) && all(prevUv < float2(1.0));
         float w = (params.uHistoryValid > 0.5 && inside) ? fb : 0.0;
 
-        // 反应矩形：与 HLSL 端逐字同义，理由与「不跳过采样」的取舍见那边的注释。
+        // Reactive rect: verbatim equivalent to the HLSL side; the rationale and the 'do not skip the
+        // sample' trade-off are in the comment there.
         bool reactive = uv.x > params.uReactiveMinX && uv.y > params.uReactiveMinY
             && uv.x < params.uReactiveMaxX && uv.y < params.uReactiveMaxY;
         if (reactive) w = 0.0;
@@ -1040,7 +1046,8 @@ fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
             w = fb;
         }
 
-        // 反应矩形：与 HLSL 端逐字同义，理由与「不跳过采样」的取舍见那边的注释。
+        // Reactive rect: verbatim equivalent to the HLSL side; the rationale and the 'do not skip the
+        // sample' trade-off are in the comment there.
         let reactive = uv.x > params.uReactiveMinX && uv.y > params.uReactiveMinY
             && uv.x < params.uReactiveMaxX && uv.y < params.uReactiveMaxY;
         if (reactive)

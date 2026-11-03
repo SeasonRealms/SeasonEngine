@@ -23,31 +23,36 @@ public enum FogPreset
 }
 
 /// <summary>
-/// 海面呈现方式。这是世界参数而不是渲染质量档位：三种方式都走既有的、四端都已实现的渲染通道，
-/// 差别只在用哪一份几何与材质、以及顶点阶段要不要多算几道正弦，所以它可以随时切换，
-/// 也不存在"某端不支持"的情形。
+/// How the sea surface is presented. This is a world parameter rather than a render-quality tier: all three modes go
+/// through the existing render passes that every backend already implements, and the difference is only which
+/// geometry and material are used and whether the vertex stage computes a few extra sines, so it can be switched
+/// at any time and there is no "a backend does not support it" case.
 ///
-/// <see cref="Static"/> 是 P3 之前的海面做法取回来：1400m 烘焙起伏网格本身就是可见表面，
-/// 靠低粗糙度与噪声法线让太阳和月亮在水面上拉出高光带。它没有折射，也没有屏幕空间反射，
-/// 但每帧的开销只有一次矩阵写入。
-/// <see cref="Swell"/> 在同一个网格上叠一层顶点涌浪：波形是三道绕岛的径向正弦，没有 Gerstner 的尖峰
-/// 也没有高频细纹，所以轮廓保持圆润的卡通感；太阳反光、CSM 阴影接收与 GI 全部沿用，
-/// 因为走的还是同一个 PBR 着色器。位移只在相机附近的一个圆内发生，圆外回到静态的烘焙起伏。
-/// <see cref="Dynamic"/> 是 P3/P4 的水面：同一张网格退到水下当海底提供水深，
-/// 可见表面由 SceneWater Pass 的 Gerstner 水面绘制，菲涅尔、折射、Hi-Z 屏幕空间反射与深度吸收都在着色器里。
-/// 池塘不受这个开关影响，始终走动态水面。
+/// <see cref="Static"/> brings back the pre-P3 sea approach: the 1400 m baked displacement grid is itself the
+/// visible surface, relying on low roughness and normal noise to let the sun and moon pull highlight bands across
+/// the water. It has no refraction and no screen-space reflection, but its per-frame cost is a single matrix write.
+/// <see cref="Swell"/> layers a vertex swell on the same grid: the waveform is three radial sines around the island
+/// with no Gerstner peaks and no high-frequency ripples, so the silhouette keeps its rounded cartoon feel; sun
+/// specular, CSM shadow reception and GI are all inherited, because it still runs the same PBR shader. The
+/// displacement only happens inside a circle near the camera, beyond which it returns to the static baked
+/// displacement.
+/// <see cref="Dynamic"/> is the P3/P4 water: the same grid sinks underwater as the seabed to provide water depth,
+/// and the visible surface is drawn by the SceneWater Pass Gerstner water, with Fresnel, refraction, Hi-Z
+/// screen-space reflection and depth absorption all in the shader. Ponds are unaffected by this switch and always
+/// use dynamic water.
 /// </summary>
 public enum SeaMode
 {
-    /// <summary>烘焙起伏网格直接作为可见海面，默认。</summary>
+    /// <summary>The baked displacement grid is itself the visible sea surface, the default.</summary>
     Static,
 
-    /// <summary>SceneWater Pass 的 Gerstner 水面。</summary>
+    /// <summary>The SceneWater Pass Gerstner water surface.</summary>
     Dynamic,
 
     /// <summary>
-    /// 烘焙网格 + 顶点涌浪。追加在枚举末尾而不是插在中间：Settings.json 把枚举存成数字，
-    /// 中间插入会把已保存的 Dynamic 读成新值。面板上的排列顺序不受这里影响。
+    /// Baked grid + vertex swell. Appended at the end of the enum rather than inserted in the middle: Settings.json
+    /// stores enums as numbers, and inserting in the middle would read a saved Dynamic as the new value. The panel's
+    /// ordering is unaffected by this.
     /// </summary>
     Swell,
 }
@@ -157,12 +162,13 @@ public class WorldSettings
     public static SeaMode DefaultSeaMode = SeaMode.Static;
 
     /// <summary>
-    /// 海面用哪一种呈现方式，默认 <see cref="SeaMode.Static"/>。
+    /// Which presentation the sea surface uses, default <see cref="SeaMode.Static"/>.
     ///
-    /// 切换是一次结构性替换而不是渐变：静态与涌浪共用同一张网格（涌浪只是多算一段顶点位移），
-    /// 动态方式则把网格压到水下当天底并换成 SceneWater 的可见表面，三条路径的可见表面没有共同的中间态可插值。
-    /// 每帧只读一次这个属性，所以改动在下一帧生效，不需要重建任何管线 —— 三种方式用的都是已经常驻的通道
-    /// （Mesh3D 的 PBR 与 SceneWater Pass）。
+    /// Switching is a structural replacement rather than a blend: Static and Swell share the same grid (Swell only
+    /// computes an extra vertex displacement), while Dynamic sinks the grid underwater as the seabed and swaps in the
+    /// SceneWater visible surface, and the three paths' visible surfaces share no common intermediate state to
+    /// interpolate. This property is read once per frame, so a change takes effect on the next frame and needs no
+    /// pipeline rebuild -- all three modes use passes that are already resident (Mesh3D PBR and the SceneWater Pass).
     /// </summary>
     public SeaMode SeaMode { get; set; } = DefaultSeaMode;
 
@@ -170,12 +176,14 @@ public class WorldSettings
     public static float DefaultSeaWaveHeight = 1f;
 
     /// <summary>
-    /// 涌浪的峰谷高度（米），只在 <see cref="SeaMode.Swell"/> 下有意义。
+    /// Peak-to-trough height of the swell (meters), meaningful only under <see cref="SeaMode.Swell"/>.
     ///
-    /// 这个量是峰到谷的距离，与 <see cref="WaterPlane.SwellHeight"/> 同口径，着色器里取一半当振幅。
-    /// 海面网格的烘焙起伏本身已有约 ±4.5m 的开阔海涌浪，这一层是叠在它之上的行波，
-    /// 所以 1m 已经足够让水面"活"起来。上限不是为了护住水线——近岸掩码在离岸 6m 处就把振幅压到 0，
-    /// 波峰爬不上沙滩——而是因为再大就压过了烘焙起伏本身，读起来像风暴而不是涌浪。
+    /// This quantity is the peak-to-trough distance and uses the same convention as
+    /// <see cref="WaterPlane.SwellHeight"/>; the shader takes half of it as the amplitude. The sea grid's baked
+    /// displacement already carries roughly ±4.5 m of open-sea swell, and this layer is a travelling wave on top of
+    /// it, so 1 m is already enough to bring the water "alive". The upper bound is not there to protect the waterline
+    /// -- the shore mask crushes the amplitude to 0 at 6 m offshore, so crests cannot climb the beach -- but because
+    /// any more would override the baked displacement itself and read as a storm rather than a swell.
     /// </summary>
     public float SeaWaveHeight { get; set; } = DefaultSeaWaveHeight;
 
@@ -183,18 +191,22 @@ public class WorldSettings
     public static float DefaultSeaWaveSpeed = 9f;
 
     /// <summary>
-    /// 涌浪主分量的相速度（米/秒），只在 <see cref="SeaMode.Swell"/> 下有意义。
+    /// Phase speed of the swell's primary component (meters per second), meaningful only under
+    /// <see cref="SeaMode.Swell"/>.
     ///
-    /// 这是"浪峰每秒走过多少米"，不是相位角速度：相位由它积分出来，所以改这个值只影响之后的推进速度，
-    /// 不会像"历经时间乘速率"那样让整个波形瞬移。另外两道分量的角频率是它的 2 倍与 3 倍，
-    /// 整数倍是为了让相位取模 2π 时完全无缝；它们的波长更短，相速度因此略快，正好符合深水色散的方向。
+    /// This is "how many meters a crest travels per second", not a phase angular velocity: the phase is integrated
+    /// from it, so changing this value only affects the advance speed from then on and does not teleport the whole
+    /// waveform the way "elapsed time times rate" would. The other two components' angular frequencies are 2x and 3x
+    /// this, integer multiples so that the phase is perfectly seamless when taken modulo 2π; their wavelengths are
+    /// shorter and their phase speeds therefore slightly faster, exactly matching the direction of deep-water
+    /// dispersion.
     /// </summary>
     public float SeaWaveSpeed { get; set; } = DefaultSeaWaveSpeed;
 
-    /// <summary>空间天气配置。旧设置缺失此项时为空，由应用补齐场景默认区域。</summary>
+    /// <summary>Spatial weather configuration. Null when an old settings file lacks this entry; the app fills in the scene's default regions.</summary>
     public WeatherRegionSettings[] WeatherRegions { get; set; } = [];
 
-    /// <summary>区域模式不再让背景天空自动进入全局风暴；展示模式保留原循环。</summary>
+    /// <summary>Regional mode no longer lets the background sky enter a global storm automatically; showcase mode keeps the original cycle.</summary>
     public WeatherMode WeatherMode { get; set; } = WeatherMode.Regional;
 
     static WorldSettings? _currentFallback;

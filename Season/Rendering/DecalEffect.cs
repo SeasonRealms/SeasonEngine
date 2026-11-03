@@ -8,11 +8,11 @@ using System.Runtime.InteropServices;
 namespace Season.Rendering;
 
 /// <summary>
-/// D1 贴花的共享层驱动：每帧做视锥剔除、稳定排序、帧缓冲打包，然后交给后端 <see cref="DecalPipeline"/>。
+/// D1 decal shared-layer driver: each frame it performs frustum culling, stable sorting, and frame buffer packing, then hands off to the backend <see cref="DecalPipeline"/>.
 ///
-/// 生命周期与 <see cref="FogCompositePipeline"/> 一致：注册在初始化期完成（后端在此时建立 PSO 与根签名），
-/// 之后每帧 Prepare 在 Pass 外调用一次，Draw 在 <see cref="RenderPassId.SceneDecal"/> 内消费一次。
-/// 本帧没有可见贴花时 Prepare 返回 false，调用方连 BeginPass 都不需要发 —— 空表就是零开销。
+/// The lifetime matches <see cref="FogCompositePipeline"/>: registration happens during initialization (the backend sets up the PSO and root signature at that time);
+/// afterwards Prepare is called once per frame outside the pass, and Draw is consumed once inside <see cref="RenderPassId.SceneDecal"/>.
+/// When there are no visible decals this frame Prepare returns false, and the caller does not even need to issue BeginPass -- an empty list means zero overhead.
 /// </summary>
 public sealed class DecalEffect : IDisposable
 {
@@ -32,22 +32,22 @@ public sealed class DecalEffect : IDisposable
         _pipeline = pipeline;
     }
 
-    /// <summary>本帧是否已经有 Prepared 的贴花表；Draw 只在为 true 时有意义。</summary>
+    /// <summary>Whether this frame already has a prepared decal list; Draw only has meaning when true.</summary>
     public bool Ready { get; private set; }
 
-    /// <summary>本帧通过剔除的贴花数量，供日志与验收使用。</summary>
+    /// <summary>The number of decals that passed culling this frame, for logging and acceptance checks.</summary>
     public int VisibleCount => _pipelineCount;
 
     /// <summary>
-    /// 本帧是否需要把 SceneNormal 当成第二个颜色附件。只有「可见贴花里至少一个声明了
-    /// <see cref="DecalVolume.AffectRoughness"/>」且存在法线目标时才为 true，
-    /// 否则不要为一个不改粗糙度的贴花多付一次附件 Load/Store。调用方据此决定 Pass 的法线附件。
+    /// Whether this frame needs to treat SceneNormal as a second color attachment. This is true only when "at least one of the visible decals declares
+    /// <see cref="DecalVolume.AffectRoughness"/>" and a normal target exists;
+    /// otherwise do not pay an extra attachment Load/Store for a decal that does not change roughness. The caller uses this to decide the pass's normal attachment.
     /// </summary>
     public bool WriteRoughness { get; private set; }
 
     /// <summary>
-    /// 收集并准备本帧的贴花。任何一项前提缺失都返回 false 且不改动 Ready，
-    /// 调用方据此完全跳过 Pass（不 BeginPass、不写测试计数）。
+    /// Collects and prepares this frame's decals. If any precondition is missing it returns false without touching Ready,
+    /// and the caller uses this to skip the pass entirely (no BeginPass, no test counter write).
     /// </summary>
     public bool Prepare(IGraphics g, SceneDecals? source, RenderTarget? color, RenderTarget? depth, RenderTarget? normal)
     {
@@ -84,7 +84,7 @@ public sealed class DecalEffect : IDisposable
         return false;
     }
 
-    /// <summary>在 <see cref="RenderPassId.SceneDecal"/> 内调用一次；Prepare 未成功时什么都不做。</summary>
+    /// <summary>Called once inside <see cref="RenderPassId.SceneDecal"/>; does nothing when Prepare did not succeed.</summary>
     public void Draw(IGraphics g)
     {
         if (!Ready || _disposed || !ReferenceEquals(g, _graphics)) return;
@@ -92,8 +92,8 @@ public sealed class DecalEffect : IDisposable
     }
 
     /// <summary>
-    /// 剔除并排序。排序必须稳定：同 <see cref="DecalVolume.SortOrder"/> 的贴花按注册顺序绘制，
-    /// 否则每帧次序抖动会让半透明叠加结果在 TAA 下发闪。
+    /// Culls and sorts. The sort must be stable: decals with the same <see cref="DecalVolume.SortOrder"/> are drawn in registration order,
+    /// otherwise per-frame order jitter makes semi-transparent compositing flicker under TAA.
     /// </summary>
     int Collect(SceneDecals source, in Frustum frustum)
     {
@@ -103,12 +103,12 @@ public sealed class DecalEffect : IDisposable
         {
             var decal = decals[i];
             if (!decal.Enabled) continue;
-            // 强度为 0 的加法贴花对场景没有任何贡献（输出 0，dst+0 = dst），直接剔除。
-            // 除了省一次 draw，这也排除了「混合没开时输出 0 直接把目标涂黑」这类后端配置错的可见后果。
+            // An additive decal with zero intensity contributes nothing to the scene (outputs 0, dst+0 = dst), so cull it outright.
+            // Besides saving a draw, this also rules out visible consequences of backend misconfiguration such as "outputting 0 and painting the target black when blending is off".
             if (decal.Mode == DecalMode.Additive && decal.Intensity <= 0f) continue;
             decal.GetBounds(out var center, out var extents);
             if (!frustum.Intersects(in center, in extents)) continue;
-            // 稳定插入排序：上限 64，插入排序比分配 key 数组更省也更不容易写错。
+            // Stable insertion sort: the cap is 64, and insertion sort is cheaper and less error-prone than allocating a key array.
             int slot = count;
             while (slot > 0 && _sorted[slot - 1].SortOrder > decal.SortOrder)
             {

@@ -354,8 +354,8 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.disposeFogCompositePipeline")]
     internal static partial void DisposeFogCompositePipeline(string name);
 
-    // P0 SSR 加法合成：顶点复用雾合成那条全屏三角形，片元只做 textureLoad + One/One 叠加。
-    // 增量在核里已经是最终值，这里不重算权重 —— 两处各算一遍 Fresnel 与粗糙度，口径迟早会分叉。
+    // P0 SSR additive composite: the vertex reuses the full-screen triangle from the fog composite, and the fragment only does textureLoad + One/One accumulation.
+    // The delta is already the final value in the kernel; the weights are not recomputed here - computing Fresnel and roughness once in each place would eventually diverge.
     [JSImport("globalThis.seasonWebGPU.createSsrCompositePipeline")]
     internal static partial bool CreateSsrCompositePipeline(string name, string vertex, string fragment);
 
@@ -368,8 +368,8 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.disposeSsrCompositePipeline")]
     internal static partial void DisposeSsrCompositePipeline(string name);
 
-    // A0.1 粒子间接绘制。三段 WGSL 在创建期一次下发，JS 侧按本帧附件形状烘焙 PSO；
-    // depth 允许为空，代表场景 Pass 跑在默认深度缓冲上（见 ParticleDrawInputs）。
+    // A0.1 particle indirect draw. The three WGSL blocks are pushed down once at creation time, and the JS side bakes the PSO from this frame's attachment shape;
+    // depth may be null, meaning the Scene pass runs on the default depth buffer (see ParticleDrawInputs).
     [JSImport("globalThis.seasonWebGPU.createParticleDrawPipeline")]
     internal static partial bool CreateParticleDrawPipeline(string name, string vertex, string fragment,
         string fragmentVelocity);
@@ -384,9 +384,9 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.disposeParticleDrawPipeline")]
     internal static partial void DisposeParticleDrawPipeline(string name);
 
-    // D1 屏幕空间贴花。WGSL 一次性下发（三个入口同一份源码），JS 侧只烘四条 PSO
-    // （Modulate/Additive × 是否写粗糙度）；本 Pass 不挂深度附件，深度只是采样源。
-    // drawsJson 是 [[slot, mode, "textureName"], ...]，纹理名为 null 表示用程序化图案。
+    // D1 screen-space decal. WGSL is pushed down once (three entry points sharing one source), and the JS side bakes only four PSOs
+    // (Modulate/Additive x whether roughness is written); this Pass attaches no depth, depth is only a sampling source.
+    // drawsJson is [[slot, mode, "textureName"], ...], a null texture name means a procedural pattern is used.
     [JSImport("globalThis.seasonWebGPU.createDecalPipeline")]
     internal static partial bool CreateDecalPipeline(string name, string wgsl);
 
@@ -400,11 +400,11 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.disposeDecalPipeline")]
     internal static partial void DisposeDecalPipeline(string name);
 
-    // P2 池塘水。WGSL 一次性下发（顶点与片元同一份源码），JS 侧只建一条 PSO 与两级绑定组：
-    // group 0 是帧级资源（帧缓冲、场景深度、折射快照、天空 LUT、采样器），group 1 是逐水面的法线贴图。
-    // 与贴花一样，本 Pass 不挂深度附件 —— 本帧的深度只是采样源。
-    // drawsJson 是 [[slot, "textureName"], ...]；纹理名为 null 表示走程序化双正弦波。
-    // hzChain 是 P3 Hi-Z 四级的名字（逗号分隔），空串表示本帧不画屏幕空间反射。
+    // P2 pond water. WGSL is pushed down once (vertex and fragment sharing one source), and the JS side builds only one PSO and two binding groups:
+    // group 0 is frame-level resources (frame buffer, scene depth, refraction snapshot, sky LUT, sampler), group 1 is the per-water-surface normal texture.
+    // Like the decal Pass, this Pass attaches no depth - this frame's depth is only a sampling source.
+    // drawsJson is [[slot, "textureName"], ...]; a null texture name means procedural double sine waves are used.
+    // hzChain is the names of the P3 Hi-Z four levels (comma-separated); an empty string means no screen-space reflection is drawn this frame.
     [JSImport("globalThis.seasonWebGPU.createWaterPipeline")]
     internal static partial bool CreateWaterPipeline(string name, string wgsl);
 
@@ -418,8 +418,27 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.disposeWaterPipeline")]
     internal static partial void DisposeWaterPipeline(string name);
 
-    /// <summary>P2: 整幅纹理拷贝，用来在水面 Pass 开画前拷一份场景色当折射源。
-    /// <c>copyTextureToTexture</c> 必须在帧外、渲染 Pass 之外录制，否则整帧放弃。</summary>
+    // P1 waterfall water curtain. Two binding groups isomorphic to the water surface, but with one fewer refraction snapshot and Hi-Z:
+    // group 0 = frame buffer + scene depth + the two clamp/wrap samplers, group 1 = the per-curtain Mask / normal / Flow.
+    // Like the water surface and decal, this Pass attaches no depth - this frame's depth is only a sampling source.
+    // drawsJson is [[slot, mask, normal, flow, vertexCount, encoded], ...],
+    // a null name means that channel is absent (the shader's flag gating falls back to procedural defaults);
+    // encoded is already packed as slot | columns << 8 | subdiv << 16, and the JS side pushes it down as first_instance unchanged.
+    [JSImport("globalThis.seasonWebGPU.createWaterfallPipeline")]
+    internal static partial bool CreateWaterfallPipeline(string name, string wgsl);
+
+    [JSImport("globalThis.seasonWebGPU.prepareWaterfall")]
+    internal static partial bool PrepareWaterfall(string name, string color, string depth, string frame,
+        string drawsJson, string destination);
+
+    [JSImport("globalThis.seasonWebGPU.drawWaterfall")]
+    internal static partial bool DrawWaterfall(string name);
+
+    [JSImport("globalThis.seasonWebGPU.disposeWaterfallPipeline")]
+    internal static partial void DisposeWaterfallPipeline(string name);
+
+    /// <summary>P2: full-texture copy, used to copy the scene color as the refraction source before the water Pass starts drawing.
+    /// <c>copyTextureToTexture</c> must be recorded outside the frame and outside any render Pass, or the entire frame is abandoned.</summary>
     [JSImport("globalThis.seasonWebGPU.copyRenderTarget")]
     internal static partial bool CopyRenderTarget(string source, string destination);
 

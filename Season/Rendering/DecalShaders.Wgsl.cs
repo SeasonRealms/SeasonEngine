@@ -5,30 +5,30 @@
 namespace Season.Rendering;
 
 /// <summary>
-/// D1 屏幕空间贴花的 WGSL 变体。四端共用同一套语义与帧缓冲布局（见 <see cref="DecalMath"/>），
-/// 这里只负责「读布局 + 重建 + 求值」，不定义布局。
+/// WGSL variant of the D1 screen-space decal. All four backends share the same semantics and frame buffer layout (see <see cref="DecalMath"/>);
+/// this file is only responsible for "reading the layout + reconstructing + evaluating", and does not define the layout.
 ///
-/// 与另外三端的差异来自 WebGPU 的两条硬限制：
+/// The differences from the other three backends come from two hard limits of WebGPU:
 /// <list type="bullet">
-/// <item>没有 push constant：「本 draw 用哪个贴花槽」改由 <c>instance_index</c> 携带
-/// （JS 侧 <c>draw(36, 1, 0, slot)</c>），再用 flat 插值把它送进片元阶段 ——
-/// 否则每帧都要为 64 个贴花各写一次小 UBO，而写在命令流里的偏移在 WebGPU 里并不存在；</item>
-/// <item>深度只能 <c>textureLoad</c>：<c>texture_depth_2d</c> 不支持过滤采样，正好本 Pass 要的是点取样。</item>
+/// <item>There is no push constant: "which decal slot this draw uses" is instead carried by <c>instance_index</c>
+/// (on the JS side, <c>draw(36, 1, 0, slot)</c>), and then passed into the fragment stage via flat interpolation --
+/// otherwise every frame would have to write a small UBO once per decal for all 64 decals, and offsets written into the command stream do not exist in WebGPU;</item>
+/// <item>Depth can only use <c>textureLoad</c>: <c>texture_depth_2d</c> does not support filtered sampling, and point sampling is exactly what this pass needs.</item>
 /// </list>
 ///
-/// 采样器仍用显式梯度的 <c>textureSampleGrad</c>：盒的背面代理三角形比像素足迹大得多，
-/// 隐式导数会在轮廓上取到盒外；而且隐式导数只允许在统一控制流里调用，这里的贴花分支并不统一。
+/// The sampler still uses explicit gradients via <c>textureSampleGrad</c>: the box's back-face proxy triangle is far larger than the pixel footprint,
+/// so implicit derivatives would sample outside the box along the outline; moreover, implicit derivatives may only be called in uniform control flow, and the decal branch here is not uniform.
 /// </summary>
 public static partial class DecalShaders
 {
     /// <summary>
-    /// 三个入口（<c>VSMain</c> / <c>PSMain</c> / <c>PSMainRoughness</c>）合成一份源码，
-    /// 后端只建一个着色器模块，两种附件形状各烘一档 PSO。
+    /// The three entry points (<c>VSMain</c> / <c>PSMain</c> / <c>PSMainRoughness</c>) are combined into a single source;
+    /// the backend builds just one shader module and bakes one PSO for each of the two attachment shapes.
     /// </summary>
     public const string Wgsl = """
 struct DecalVaryings {
     @builtin(position) position : vec4<f32>,
-    // 贴花槽位随实例号进来：WebGPU 没有 push constant，只能靠这个把它送到片元阶段。
+    // The decal slot comes in with the instance index: WebGPU has no push constant, so this is the only way to pass it to the fragment stage.
     @location(0) @interpolate(flat) slot : u32,
 };
 
@@ -48,7 +48,7 @@ struct DecalEvalResult {
     roughWeight : f32,
 };
 
-// 帧缓冲布局见 DecalMath，下标与另外三端逐字相同。
+// Frame buffer layout is in DecalMath, with indices identical, word for word, to the other three backends.
 @group(0) @binding(0) var<storage, read> decalFrame : array<vec4<f32>>;
 @group(0) @binding(1) var sceneDepth : texture_depth_2d;
 @group(0) @binding(2) var decalSampler : sampler;
@@ -63,12 +63,12 @@ fn decalOffset(index : u32) -> u32 { return 16u + index * 12u; }
 
 fn decalSize() -> vec2<f32> { return decalFrame[9].xy; }
 
-// 把投影盒的 36 个顶点按 vertex_index 算出来，不依赖顶点缓冲。
-// 六个面统一成「从盒外看逆时针」，配合 cullMode:'front' + frontFace:'cw'（只留背面）
-// 让每个像素恰好命中一次 —— 这是整个方案不用模板、不用逐 draw 排序的前提。
+// Computes the 36 vertices of the projection box from vertex_index, without relying on a vertex buffer.
+// All six faces are unified as "counter-clockwise when viewed from outside the box", combined with cullMode:'front' + frontFace:'cw' (keeping only back faces)
+// so that each pixel is hit exactly once -- this is the premise of the whole approach requiring neither the stencil nor per-draw sorting.
 @vertex
 fn VSMain(@builtin(vertex_index) vid : u32, @builtin(instance_index) slot : u32) -> DecalVaryings {
-    // 每面 6 个顶点：两条三角形 (0,1,2)+(0,2,3)，再按 k 还原成四角编号。
+    // 6 vertices per face: two triangles (0,1,2)+(0,2,3), then k is mapped back to the corner index.
     let face = vid / 6u;
     let t = vid - face * 6u;
     let tri = t / 3u;
@@ -76,7 +76,7 @@ fn VSMain(@builtin(vertex_index) vid : u32, @builtin(instance_index) slot : u32)
     var k = 0u;
     if (c == 1u) { k = select(2u, 1u, tri == 0u); }
     else if (c == 2u) { k = select(3u, 2u, tri == 0u); }
-    // face>>1 = 主轴（0=x,1=y,2=z），face&1 = 正负侧；负侧把 u 取反才能保持「盒外逆时针」。
+    // face>>1 = major axis (0=x,1=y,2=z), face&1 = positive/negative side; the negative side must flip u to preserve "counter-clockwise from outside the box".
     let axis = face >> 1u;
     let side = face & 1u;
     let uu = ((k ^ (k >> 1u)) & 1u) ^ (side ^ 1u);
@@ -95,15 +95,15 @@ fn VSMain(@builtin(vertex_index) vid : u32, @builtin(instance_index) slot : u32)
     return result;
 }
 
-// 深度重建 + 贴花求值，要点与另外三端一一对应：
-// - UV 来自盒内归一化坐标，所以贴花是「沿着盒的局部 Y 投影」的，与表面朝向无关；
-// - 导数一律在统一控制流里取（uv 与 world 都先算好），分支里的导数在 quad 边界是未定义行为；
-// - 掠射淡出用深度导出的法线，不读 SceneNormal —— 写粗糙度时 SceneNormal 是颜色附件 1，不是采样源；
-// - 输出约定：Modulate 输出「乘到目标上的因子」，Additive 输出自发光颜色，两者都靠固定功能混合完成，
-//   片元着色器不读 SceneColor，因此 SceneColor 不需要同时是可采样资源。
+// Depth reconstruction + decal evaluation, with key points corresponding one-to-one to the other three backends:
+// - UV comes from the box's normalized coordinates, so the decal is "projected along the box's local Y" regardless of surface orientation;
+// - Derivatives are always taken in uniform control flow (both uv and world are computed up front); derivatives inside branches are undefined behavior at quad boundaries;
+// - Grazing fade-out uses the normal derived from depth and does not read SceneNormal -- when writing roughness, SceneNormal is color attachment 1, not a sampling source;
+// - Output convention: Modulate outputs "the factor multiplied into the target", Additive outputs an emissive color, and both rely on fixed-function blending to complete,
+//   the fragment shader does not read SceneColor, so SceneColor does not need to be a samplable resource at the same time.
 fn decalEval(pixel : vec2<f32>, slot : u32) -> DecalEvalResult {
     let offset = decalOffset(slot);
-    // 本 Pass 没有深度附件，深度只是采样源，所以按整数坐标点取样。
+    // This pass has no depth attachment; depth is only a sampling source, so it is point-sampled at integer coordinates.
     let depth = textureLoad(sceneDepth, vec2<i32>(pixel), 0);
     let clip = vec4<f32>(pixel / decalSize() * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), depth, 1.0);
     let w = decalTransform(clip, 0u);
@@ -120,7 +120,7 @@ fn decalEval(pixel : vec2<f32>, slot : u32) -> DecalEvalResult {
     var shade = 0.0;
     var albedo = tint.rgb;
     if (depth < 1.0 && all(abs(local) <= vec3<f32>(1.0, 1.0, 1.0))) {
-        // 羽化：盒边界向内 shape.y 的比例；掠射：法线与投影轴夹角的余弦低于 1-shape.z 就淡出。
+        // Feathering: the fraction of shape.y inward from the box edge; grazing: fade out when the cosine of the angle between the normal and the projection axis drops below 1-shape.z.
         var edge = 1.0;
         if (shape.y > 0.0) {
             edge = clamp((1.0 - max(abs(local.x), abs(local.z))) / max(shape.y, 1e-3), 0.0, 1.0);
@@ -135,9 +135,9 @@ fn decalEval(pixel : vec2<f32>, slot : u32) -> DecalEvalResult {
             albedo = albedo * texel.rgb;
             alpha = texel.a;
         } else {
-            // 无纹理时的程序化图案：验证深度重建用，图案跟着地形起伏就说明重建对了。
-            // WGSL 没有 fmod：浮点取余只有 `%`（e1 - e2*trunc(e1/e2)，与另外三端 fmod 同号），
-            // 写成 fmod(...) 会让整个模块编译失败，连顶点入口一起被判无效。
+            // Procedural pattern when there is no texture: used to verify depth reconstruction; if the pattern follows the terrain relief, the reconstruction is correct.
+            // WGSL has no fmod: the only floating-point remainder is `%` (e1 - e2*trunc(e1/e2), the same sign as fmod on the other three backends),
+            // and writing fmod(...) would make the whole module fail to compile, invalidating even the vertex entry point.
             let checker = select(0.45, 1.0, ((floor(uv.x * 4.0) + floor(uv.y * 4.0)) % 2.0) < 0.5);
             albedo = albedo * checker * (0.55 + 0.45 * sin(length(local.xz) * 18.0));
         }
@@ -145,8 +145,8 @@ fn decalEval(pixel : vec2<f32>, slot : u32) -> DecalEvalResult {
     }
     var result : DecalEvalResult;
     result.coverage = shade * tint.w;
-    // 不改粗糙度的贴花必须把附件 1 的源 alpha 置 0：那里的混合是 lerp(dst, src, src.a)，
-    // 源 alpha 不为 0 就会把「没要求改粗糙度」的区域白白拉向 src。
+    // A decal that does not modify roughness must set the source alpha of attachment 1 to 0: the blending there is lerp(dst, src, src.a),
+    // so a non-zero source alpha would needlessly pull regions that "did not request a roughness change" toward src.
     result.roughWeight = select(0.0, result.coverage, wrap.y > 0.5);
     result.roughness = select(0.0, wrap.x, wrap.y > 0.5);
     if (shape.x < 0.5) {
@@ -164,8 +164,8 @@ fn PSMain(varyings : DecalVaryings) -> DecalPixelOut {
     return o;
 }
 
-// s9：法线目标只开 B 通道写掩码，所以这里只需要把目标粗糙度送到 .z，
-// 八面体法线（.xy）与反射权重（.w）由附件里的原值保留。混合用 roughWeight 在 B 通道上插值。
+// s9: the normal target only enables the B channel in its write mask, so here we only need to send the target roughness to .z,
+// while the octahedral normal (.xy) and reflection weight (.w) keep their original values from the attachment. Blending interpolates on the B channel using roughWeight.
 @fragment
 fn PSMainRoughness(varyings : DecalVaryings) -> DecalRoughnessOut {
     var o : DecalRoughnessOut;

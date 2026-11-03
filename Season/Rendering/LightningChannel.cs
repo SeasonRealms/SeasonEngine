@@ -5,28 +5,36 @@
 namespace Season.Rendering;
 
 /// <summary>
-/// 一次落雷的可见通道几何：一条从云内击穿点向下到地面的折线，加上若干从主通道分叉出去的支路。
+/// Visible channel geometry for a single strike: a polyline from the in-cloud breakdown point down to the
+/// ground, plus several branches splitting off the main channel.
 ///
-/// 为什么是 CPU 几何而不是 GPU：通道的形状必须在落雷那一帧确定下来，之后整道雷只随包络变亮变暗，
-/// 不再改变形状。人眼对"闪电每帧重新长一遍"极其敏感——那样看起来是抖动的噪声而不是一道击穿。
-/// 一次落雷大约 150 段，生成成本在一次数组遍历的量级上，而落雷间隔是 2.6 秒起，完全不必放进 GPU。
+/// Why CPU geometry instead of GPU: the channel shape must be locked in on the frame of the strike, after
+/// which the whole bolt only brightens and dims with the envelope and never changes shape again. The eye is
+/// extremely sensitive to "a bolt regrowing every frame" -- that reads as jittering noise rather than a single
+/// breakdown. A strike is roughly 150 segments, the generation cost is on the order of one array pass, and
+/// strike intervals start at 2.6 seconds, so there is no reason to put this on the GPU.
 ///
-/// 为什么用中点位移而不是样条：中点位移的每一级只依赖上一级的端点，天然自相似，于是"主通道 / 分支 /
-/// 子分支"可以共用同一个函数，只是级数、振幅和方向约束不同。样条需要先解一组控制点，反而更贵。
+/// Why midpoint displacement instead of splines: each level of midpoint displacement depends only on the
+/// endpoints of the previous level, so it is naturally self-similar, letting "main channel / branch / twig"
+/// share the same function with only the level count, amplitude, and direction constraints differing. Splines
+/// require solving for a set of control points first, which is actually more expensive.
 ///
-/// 几何是 3D 的：位移方向取每段的垂直平面内随机方向，所以同一条通道从任何机位看都成立，
-/// 不需要为了镜头去调整通道平面。
+/// The geometry is 3D: the displacement direction is taken as a random direction in the plane perpendicular to
+/// each segment, so the same channel holds up from any camera position without adjusting the channel plane for
+/// the shot.
 ///
-/// 段记录的消费方是粒子 ribbon 顶点阶段（见 <see cref="ParticleDraw"/> 第 12/13 行的契约）：
-/// 每段一个 <see cref="ParticleInstance"/>，Position 是段中点、Velocity 是半段向量、Size 是米制半宽、
-/// Color.a 是该段的静态亮度权重。逐帧的包络亮度由帧缓冲 row 13 的强度统一乘上去，不写进实例。
+/// The consumer of the segment records is the particle ribbon vertex stage (see the contract in
+/// <see cref="ParticleDraw"/> on lines 12/13): one <see cref="ParticleInstance"/> per segment, with Position
+/// the segment midpoint, Velocity the half-segment vector, Size the metric half width, and Color.a the static
+/// brightness weight of that segment. The per-frame envelope brightness is applied uniformly by the intensity
+/// in frame buffer row 13 and is not written into the instance.
 /// </summary>
 public sealed class LightningChannel
 {
-    /// <summary>一段带：世界坐标的两个端点、米制半宽、[0,1] 的静态亮度权重。</summary>
+    /// <summary>A ribbon segment: the two world-space endpoints, the metric half width, and a [0,1] static brightness weight.</summary>
     public readonly record struct Segment(Vector3 A, Vector3 B, float HalfWidth, float Brightness);
 
-    /// <summary>实例缓冲的上限。主通道 64 + 四条支路各 16 + 四条子支路各 8 = 160，留出余量。</summary>
+    /// <summary>Upper bound on the instance buffer. Main channel 64 + four branches at 16 each + four twigs at 8 each = 160, with headroom.</summary>
     public const int MaxSegments = 192;
 
     const int MainLevels = 6;
@@ -36,26 +44,26 @@ public sealed class LightningChannel
     const int TwigLevels = 3;
     const int TwigPoints = (1 << TwigLevels) + 1;
 
-    /// <summary>云内闪的比例：约三成的落雷不出云，只留下云内发光，不生成任何可见通道。</summary>
+    /// <summary>Fraction of intra-cloud flashes: about a third of strikes stay in the cloud, leaving only an intra-cloud glow and no visible channel.</summary>
     const float IntraCloudChance = 0.30f;
 
     readonly Segment[] _segments = new Segment[MaxSegments];
 
-    /// <summary>已生成的段数。0 表示这一帧没有可见通道（云内闪、或通道还没生成）。</summary>
+    /// <summary>Number of segments generated. 0 means there is no visible channel this frame (an intra-cloud flash, or a channel not yet generated).</summary>
     public int Count { get; private set; }
 
-    /// <summary>地面落点。云内闪时为默认值，调用方必须先用 <see cref="Visible"/> 判断。</summary>
+    /// <summary>Ground strike point. Default for an intra-cloud flash, so callers must check <see cref="Visible"/> first.</summary>
     public Vector3 GroundPoint { get; private set; }
 
-    /// <summary>云内击穿点，与 <see cref="GroundPoint"/> 一起给出通道的跨度。</summary>
+    /// <summary>In-cloud breakdown point; together with <see cref="GroundPoint"/> it gives the span of the channel.</summary>
     public Vector3 CloudPoint { get; private set; }
 
-    /// <summary>是否有可见通道。云内闪、参数非法、或跨度太小时为假。</summary>
+    /// <summary>Whether there is a visible channel. False for an intra-cloud flash, invalid parameters, or too small a span.</summary>
     public bool Visible => Count > 0;
 
     public ReadOnlySpan<Segment> Segments => _segments.AsSpan(0, Count);
 
-    /// <summary>清空几何，但保留数组。天气切出雷暴或落雷被遣散时调用。</summary>
+    /// <summary>Clear the geometry but keep the array. Called when the weather leaves a thunderstorm or a strike is dismissed.</summary>
     public void Clear()
     {
         Count = 0;
@@ -64,15 +72,15 @@ public sealed class LightningChannel
     }
 
     /// <summary>
-    /// 由落雷种子与两个端点生成整条通道。同一个 <paramref name="code"/> 永远给出同一条几何，
-    /// 于是重放、录制和两端调试看到的是同一道闪电。
+    /// Build the whole channel from the strike seed and the two endpoints. The same <paramref name="code"/>
+    /// always yields the same geometry, so replay, recording, and debugging on both ends see the same bolt.
     /// </summary>
-    /// <param name="code">落雷的种子，与闪络包络同源（区域种子 × 落雷序号）。</param>
-    /// <param name="cloudPoint">云内击穿点，通常就是 <see cref="WeatherVisualState.StrikePoint"/>。</param>
-    /// <param name="cloudBase">云底高度：通道在这里以下完全可见，以上逐渐隐入云中。</param>
-    /// <param name="groundY">地面高度，地闪的端点落在这个平面上。</param>
-    /// <param name="baseHalfWidth">地面处的米制半宽，通道向上收窄到它的 45%。</param>
-    /// <returns>true 表示生成了可见通道；false 表示这次是云内闪，几何已清空。</returns>
+    /// <param name="code">Seed of the strike, from the same source as the flash envelope (region seed x strike serial).</param>
+    /// <param name="cloudPoint">In-cloud breakdown point, usually the <see cref="WeatherVisualState.StrikePoint"/>.</param>
+    /// <param name="cloudBase">Cloud base height: the channel is fully visible below this and gradually fades into the cloud above.</param>
+    /// <param name="groundY">Ground height; the ground-strike endpoint lands on this plane.</param>
+    /// <param name="baseHalfWidth">Metric half width at the ground; the channel narrows to 45% of this upward.</param>
+    /// <returns>true if a visible channel was generated; false if this was an intra-cloud flash and the geometry was cleared.</returns>
     public bool Build(uint code, Vector3 cloudPoint, float cloudBase, float groundY, float baseHalfWidth)
     {
         Clear();
@@ -83,13 +91,14 @@ public sealed class LightningChannel
         float height = cloudPoint.Y - groundY;
         if (!(height > 20f)) return false;
 
-        // 云内闪：不出云，也就不该有通道。判定放在这里而不是调用方，是因为"这道雷看起来是什么样"
-        // 本来就是几何的职责；调用方只需要看 Visible。
+        // Intra-cloud flash: it does not leave the cloud, so it should have no channel. The decision lives here
+        // rather than in the caller because "what this bolt looks like" is the geometry's job; the caller only
+        // needs to check Visible.
         if (Hash01(code ^ 0x1B873593u) < IntraCloudChance) return false;
 
         CloudPoint = cloudPoint;
-        // 落点带一点横向偏移：真实地闪几乎不会正好落在击穿点的正下方，
-        // 而完全垂直的一道闪电看起来像是被人拿尺子画的。
+        // Give the strike point some lateral offset: a real ground strike almost never lands exactly below the
+        // breakdown point, and a perfectly vertical bolt looks like it was drawn with a ruler.
         uint h = code ^ 0x27D4EB2Fu;
         float lateral = height * 0.16f;
         GroundPoint = new(cloudPoint.X + (Hash01(h) * 2f - 1f) * lateral, groundY,
@@ -98,8 +107,9 @@ public sealed class LightningChannel
         Span<Vector3> pts = stackalloc Vector3[MainPoints];
         Subdivide(pts, cloudPoint, GroundPoint, height * 0.12f, code * 0x9E3779B9u + 0x85EBCA6Bu);
 
-        // 顶部隐入云中的深度：云层薄时按通道高度的 6% 兜底，否则按击穿点高出云底的部分再放宽一半，
-        // 让通道在云缝里"长出来"而不是在云底被一刀切断。
+        // Depth to which the top fades into the cloud: when the cloud is thin, fall back to 6% of the channel
+        // height; otherwise take the part of the breakdown point above the cloud base and widen it by half again,
+        // so the channel "grows out" of the cloud gap instead of being cut off flat at the cloud base.
         float fadeSpan = MathF.Max((cloudPoint.Y - cloudBase) * 1.5f, height * 0.06f);
         float span = MathF.Max(cloudPoint.Y - groundY, 1e-3f);
 
@@ -108,7 +118,8 @@ public sealed class LightningChannel
             Emit(pts[i], pts[i + 1], cloudPoint.Y, span, fadeSpan, baseHalfWidth, 1f);
         }
 
-        // 支路从主通道的下半段分出去：越靠近地面越容易分叉，这也是真实地闪的形状。
+        // Branches split off the lower half of the main channel: the closer to the ground, the more likely a fork,
+        // which is also the shape of a real ground strike.
         uint branchSeed = code ^ 0x68E31DA4u;
         int branches = 3 + (int)(Hash01(branchSeed) * 2f);
         Span<Vector3> branch = stackalloc Vector3[BranchPoints];
@@ -121,7 +132,7 @@ public sealed class LightningChannel
             Vector3 origin = pts[index];
 
             float angle = Hash01(bh + 1u) * MathF.Tau;
-            // 相对竖直方向的水平分量：0.35 接近直落，0.80 明显斜出。
+            // Horizontal component relative to vertical: 0.35 is nearly straight down, 0.80 clearly slants out.
             float tilt = 0.35f + 0.45f * Hash01(bh + 2u);
             Vector3 direction = Vector3.Normalize(
                 new Vector3(MathF.Cos(angle) * tilt, -1f, MathF.Sin(angle) * tilt));
@@ -136,7 +147,7 @@ public sealed class LightningChannel
                 Emit(branch[i], branch[i + 1], cloudPoint.Y, span, fadeSpan, branchWidth, 0.45f);
             }
 
-            // 一条子支路，从父支路的中段再分出去；只分一层，再多就变成噪声了。
+            // A twig, splitting again from the middle of the parent branch; only one level down, any more turns into noise.
             if (Hash01(bh + 4u) > 0.45f) continue;
             Vector3 twigOrigin = branch[BranchPoints / 2];
             float twigAngle = angle + (Hash01(bh + 5u) * 2f - 1f) * 0.9f;
@@ -156,9 +167,10 @@ public sealed class LightningChannel
     }
 
     /// <summary>
-    /// 通道上离听者最近的距离。雷声按这个距离而不是云内击穿点算延迟与音量：
-    /// 听者听见的是最先到达的那一段，通常就是最低、最近的那一段。
-    /// 没有可见通道（云内闪）时返回正无穷，调用方回退到击穿点距离。
+    /// Distance from the channel to the nearest point to the listener. Thunder computes its delay and volume from
+    /// this distance rather than from the in-cloud breakdown point: what the listener hears is the segment that
+    /// arrives first, usually the lowest and nearest one. Returns positive infinity when there is no visible
+    /// channel (intra-cloud flash), and the caller falls back to the breakdown point distance.
     /// </summary>
     public float NearestDistance(Vector3 listener)
     {
@@ -182,9 +194,9 @@ public sealed class LightningChannel
     }
 
     /// <summary>
-    /// 中点位移：把 [第一个点, 最后一个点] 递归细分 <paramref name="levels"/> 级，
-    /// 每一级把新中点沿该段的垂直方向推开 <paramref name="amplitude"/>（逐级衰减到 55%）。
-    /// 端点保持不动，所以相邻段首尾必然相接。
+    /// Midpoint displacement: recursively subdivide [first point, last point] over <paramref name="levels"/> levels,
+    /// each level pushing the new midpoint out along the perpendicular of that segment by <paramref name="amplitude"/>
+    /// (attenuating to 55% per level). The endpoints stay fixed, so adjacent segments necessarily meet end to end.
     /// </summary>
     static void Subdivide(Span<Vector3> points, Vector3 start, Vector3 end, float amplitude, uint seed)
     {
@@ -215,7 +227,8 @@ public sealed class LightningChannel
                 float perpendicularLength = perpendicular.Length();
                 if (perpendicularLength < 1e-4f)
                 {
-                    // r 与段平行：换一条固定轴做叉积，此时除段方向外任何方向都等价。
+                    // r is parallel to the segment: use a different fixed axis for the cross product; here any
+                    // direction other than the segment direction is equivalent.
                     Vector3 axis = MathF.Abs(direction.Y) > 0.9f ? Vector3.UnitX : Vector3.UnitY;
                     perpendicular = Vector3.Cross(direction, axis);
                     perpendicularLength = perpendicular.Length();
@@ -240,10 +253,12 @@ public sealed class LightningChannel
         if (delta.LengthSquared() < 1e-6f) return;
 
         float midY = (a.Y + b.Y) * 0.5f;
-        // 越靠地面越粗：击穿点的电流路径在地面附近最亮最宽，向上逐渐收细。
+        // Thicker toward the ground: the current path at the breakdown point is brightest and widest near the
+        // ground and tapers upward.
         float groundT = Math.Clamp((topY - midY) / span, 0f, 1f);
         float halfWidth = baseHalfWidth * (0.45f + 0.55f * groundT);
-        // 顶部在云里渐隐：亮度按"高出云底多少"线性到零，云底以下恒为 1。
+        // Fade out into the cloud at the top: brightness ramps linearly to zero by "how far above the cloud base",
+        // and stays at 1 below the cloud base.
         float fade = Math.Clamp((topY - midY) / fadeSpan, 0f, 1f);
         _segments[Count++] = new Segment(a, b, halfWidth, brightness * fade);
     }
@@ -257,9 +272,10 @@ public sealed class LightningChannel
     }
 
     /// <summary>
-    /// 整数雪崩哈希取 [0,1)。调度（<see cref="WeatherVisualState"/>）与几何共用同一条公式：
-    /// 落雷位置、包络和通道形状都从同一枚 <c>code</c> 派生，任何一处改动都会让三者对不上。
-    /// 只用于生成形状，不参与渲染积分，不需要任何分布性质。
+    /// Integer avalanche hash to [0,1). The scheduler (<see cref="WeatherVisualState"/>) and the geometry share
+    /// the same formula: strike position, envelope, and channel shape are all derived from the same <c>code</c>,
+    /// so changing any one will make the three disagree. Used only for shape generation, not for the render
+    /// integral, so it needs no distribution properties.
     /// </summary>
     internal static float Hash01(uint value)
     {

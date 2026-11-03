@@ -1067,7 +1067,7 @@ void main()
 ";
 }
 
-/// <summary>独立 HDR 雾合成。描述符按帧槽与同帧调用轮转，所有销毁等待 GPU 退休。</summary>
+/// <summary>Standalone HDR fog composite. Descriptors rotate by frame slot and same-frame call, and all destruction waits for GPU retirement.</summary>
 internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompositePipeline
 {
     readonly bool _weather;
@@ -1093,13 +1093,13 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
     uint _frameIndex;
     bool _disposed;
 
-    // 透明阶段复用本次合成产出的雾资源：两张体积纹理只在 Resolve 校验通过后
-    // 才发布出去，且只允许在同一次提交、同一帧槽内被消费。
+    // The transparent stage reuses the fog resources produced by this composite: the two volume textures are only published
+    // after Resolve validation passes, and are only allowed to be consumed within the same submission and the same frame slot.
     VKTexture3D? _fogIntegrated;
     VKTexture3D? _fogLocal;
     bool _composed;
 
-    /// <summary>本帧正在使用的合成流水线；透明阶段通过它取回雾采样资源。</summary>
+    /// <summary>The composite pipeline in use this frame; the transparent stage retrieves the fog sampling resources through it.</summary>
     internal static VKFogCompositePipeline? Active { get; private set; }
 
     internal VKFogCompositePipeline(Dictionary<string, Texture> textures) : this(textures, false) { }
@@ -1117,7 +1117,7 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
     {
         var vk = Device.Vk; var device = Device.LogicalDevice;
         var point = Pipeline.StaticPointSampler; var linear = Pipeline.StaticSampler;
-        if (point.Handle == 0 || linear.Handle == 0) throw new InvalidOperationException("雾合成采样器尚未初始化。");
+        if (point.Handle == 0 || linear.Handle == 0) throw new InvalidOperationException("Fog composite sampler not yet initialized.");
         var bindings = stackalloc DescriptorSetLayoutBinding[6];
         for (int i = 0; i < 6; i++)
             bindings[i] = new() { Binding = (uint)i, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit,
@@ -1126,13 +1126,13 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
         var setInfo = new DescriptorSetLayoutCreateInfo { SType = StructureType.DescriptorSetLayoutCreateInfo,
             BindingCount = 6, PBindings = bindings };
         if (vk.CreateDescriptorSetLayout(device, in setInfo, null, out _setLayout) != Result.Success)
-            throw new InvalidOperationException("创建雾合成描述符布局失败。");
+            throw new InvalidOperationException("Failed to create fog composite descriptor layout.");
         var setLayout = _setLayout;
         var push = new PushConstantRange { StageFlags = ShaderStageFlags.FragmentBit, Size = 16 };
         var layoutInfo = new PipelineLayoutCreateInfo { SType = StructureType.PipelineLayoutCreateInfo,
             SetLayoutCount = 1, PSetLayouts = &setLayout, PushConstantRangeCount = 1, PPushConstantRanges = &push };
         if (vk.CreatePipelineLayout(device, in layoutInfo, null, out _layout) != Result.Success)
-            throw new InvalidOperationException("创建雾合成管线布局失败。");
+            throw new InvalidOperationException("Failed to create fog composite pipeline layout.");
         _renderPass = VKRenderTarget.CreateColorRenderPassForFormat(Format.R16G16B16A16Sfloat, colorOnly: true);
         ShaderModule vertex = default, fragment = default;
         try
@@ -1163,7 +1163,7 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
                     PViewportState = &viewport, PRasterizationState = &raster, PMultisampleState = &samples,
                     PColorBlendState = &blend, PDynamicState = &dynamic, Layout = _layout, RenderPass = _renderPass };
                 if (vk.CreateGraphicsPipelines(device, default, 1, in info, null, out _pipeline) != Result.Success)
-                    throw new InvalidOperationException("创建雾合成图形管线失败。");
+                    throw new InvalidOperationException("Failed to create fog composite graphics pipeline.");
             }
         }
         finally
@@ -1173,7 +1173,7 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
         }
     }
 
-    // 只接受生产者已经完成写入并转入采样布局的资源，不在 Pass 内补发 barrier。
+    // Only accepts resources whose producer has finished writing and transitioned into a sample layout; no barrier is re-issued inside the Pass.
     bool Resolve(in Season.Rendering.FogCompositeInputs input, VKRenderTarget destination,
         Span<Silk.NET.Vulkan.ImageView> views, Span<ulong> versions, out BufferResource buffer)
     {
@@ -1204,7 +1204,7 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
         versions[0] = _weather ? color.ColorViewVersion : integrated!.ViewVersion;
         versions[1] = _weather ? color.ColorViewVersion : local!.ViewVersion;
         versions[2] = color.ColorViewVersion; versions[3] = depth.DepthViewVersion;
-        // AO 关闭仍绑定有效颜色占位，片元分支保证不采样。
+        // With AO disabled, a valid color placeholder is still bound, and the fragment branch guarantees it is not sampled.
         views[4] = color.ColorView; versions[4] = color.ColorViewVersion;
         if (input.ApplyAo)
         {
@@ -1239,9 +1239,9 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
         ulong stamp = Device.GetCurrentRetireFenceValue();
         if (_stamps[index] != stamp)
         {
-            // 本帧第一次 Prepare 会复用 ring[0]，也就是同一槽三帧前用过的那个 set。
-            // 那批提交可能仍在 GPU 上，而未声明 UPDATE_AFTER_BIND 的 set 被 pending
-            // 命令缓冲引用时改写会让那条缓冲整体失效；见 Device.WaitForFrameSlot。
+            // The first Prepare of this frame reuses ring[0], i.e. the set used by the same slot three frames ago.
+            // That batch of submissions may still be on the GPU, and rewriting a set that does not declare UPDATE_AFTER_BIND
+            // while it is referenced by a pending command buffer invalidates that buffer as a whole; see Device.WaitForFrameSlot.
             Device.WaitForFrameSlot(index);
             _stamps[index] = stamp; _cursors[index] = 0;
         }
@@ -1270,8 +1270,8 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
     }
 
     /// <summary>
-    /// 透明阶段取回本次合成使用的雾采样资源。只有合成真正落地（<see cref="Draw"/> 成功）之后
-    /// 才可用，否则透明阶段应当回落到不采样雾的着色器变体。
+    /// The transparent stage retrieves the fog sampling resources used by this composite. They are only usable
+    /// after the composite has actually landed (<see cref="Draw"/> succeeded); otherwise the transparent stage should fall back to the shader variant that does not sample fog.
     /// </summary>
     internal static bool TryGetTransparentBinding(out Silk.NET.Vulkan.Buffer frame, out ulong frameRange,
         out Silk.NET.Vulkan.ImageView integrated, out Silk.NET.Vulkan.ImageView local)
@@ -1340,9 +1340,9 @@ internal sealed unsafe class VKFogCompositePipeline : Season.Rendering.FogCompos
 }
 
 /// <summary>
-/// P0 SSR 加法合成：把反射增量按 One/One 叠进 SceneColor，整个 Pass 只有一条全屏绘制。
-/// 与雾合成的差别都在「没有自己的目标」上：不清屏、不发布颜色源、不挂深度，
-/// 增量纹理以 <c>ShaderReadOnlyOptimal</c> 绑进来（核在 dispatch 尾部已经发布好这个布局）。
+/// P0 SSR additive composite: adds the reflection delta into SceneColor with One/One; the whole Pass is just one full-screen draw.
+/// All the differences from the fog composite come down to "having no target of its own": it does not clear, does not publish a color source, and does not attach depth;
+/// the delta texture is bound in as <c>ShaderReadOnlyOptimal</c> (the kernel has already published this layout at the tail of its dispatch).
 /// </summary>
 internal sealed unsafe class VKSsrCompositePipeline : Season.Rendering.SsrCompositePipeline
 {
@@ -1351,7 +1351,7 @@ internal sealed unsafe class VKSsrCompositePipeline : Season.Rendering.SsrCompos
 layout(binding = 0) uniform sampler2D reflectionDelta;
 layout(location = 0) out vec4 outColor;
 void main() {
-    // texelFetch 而不是采样：增量逐像素确定，线性过滤会在轮廓处把正负差分抵消掉。
+    // texelFetch instead of sampling: the delta is per-pixel determinate, and linear filtering would cancel the positive and negative differences at contours.
     outColor = vec4(texelFetch(reflectionDelta, ivec2(gl_FragCoord.xy), 0).rgb, 0.0);
 }
 """;
@@ -1385,20 +1385,20 @@ void main() {
     {
         var vk = Device.Vk; var device = Device.LogicalDevice;
         var point = Pipeline.StaticPointSampler;
-        if (point.Handle == 0) throw new InvalidOperationException("SSR 合成采样器尚未初始化。");
+        if (point.Handle == 0) throw new InvalidOperationException("SSR composite sampler not yet initialized.");
         var bindings = stackalloc DescriptorSetLayoutBinding[1];
         bindings[0] = new() { Binding = 0, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit,
             DescriptorType = DescriptorType.CombinedImageSampler, PImmutableSamplers = &point };
         var setInfo = new DescriptorSetLayoutCreateInfo { SType = StructureType.DescriptorSetLayoutCreateInfo,
             BindingCount = 1, PBindings = bindings };
         if (vk.CreateDescriptorSetLayout(device, in setInfo, null, out _setLayout) != Result.Success)
-            throw new InvalidOperationException("创建 SSR 合成描述符布局失败。");
+            throw new InvalidOperationException("Failed to create SSR composite descriptor layout.");
         var setLayout = _setLayout;
         var layoutInfo = new PipelineLayoutCreateInfo { SType = StructureType.PipelineLayoutCreateInfo,
             SetLayoutCount = 1, PSetLayouts = &setLayout };
         if (vk.CreatePipelineLayout(device, in layoutInfo, null, out _layout) != Result.Success)
-            throw new InvalidOperationException("创建 SSR 合成管线布局失败。");
-        // 锚点取自 BeginPass 实际会用的那个 render pass：单颜色附件、Load、无深度。
+            throw new InvalidOperationException("Failed to create SSR composite pipeline layout.");
+        // The anchor is taken from the render pass that BeginPass will actually use: single color attachment, Load, no depth.
         _renderPass = Device.GetSsrCompositeRenderPass();
         ShaderModule vertex = default, fragment = default;
         try
@@ -1419,7 +1419,7 @@ void main() {
                 var raster = new PipelineRasterizationStateCreateInfo { SType = StructureType.PipelineRasterizationStateCreateInfo,
                     PolygonMode = PolygonMode.Fill, CullMode = CullModeFlags.None, FrontFace = FrontFace.Clockwise, LineWidth = 1 };
                 var samples = new PipelineMultisampleStateCreateInfo { SType = StructureType.PipelineMultisampleStateCreateInfo, RasterizationSamples = SampleCountFlags.Count1Bit };
-                // One/One 而不是雾的 One/Zero：画的是增量，负值要能减回场景色。
+                // One/One instead of the fog's One/Zero: what is drawn is a delta, and negative values must be able to subtract back from the scene color.
                 var blendAttachment = new PipelineColorBlendAttachmentState {
                     BlendEnable = true, SrcColorBlendFactor = BlendFactor.One, DstColorBlendFactor = BlendFactor.One,
                     ColorBlendOp = BlendOp.Add, SrcAlphaBlendFactor = BlendFactor.One, DstAlphaBlendFactor = BlendFactor.One,
@@ -1433,7 +1433,7 @@ void main() {
                     PViewportState = &viewport, PRasterizationState = &raster, PMultisampleState = &samples,
                     PColorBlendState = &blend, PDynamicState = &dynamic, Layout = _layout, RenderPass = _renderPass };
                 if (vk.CreateGraphicsPipelines(device, default, 1, in info, null, out _pipeline) != Result.Success)
-                    throw new InvalidOperationException("创建 SSR 合成图形管线失败。");
+                    throw new InvalidOperationException("Failed to create SSR composite graphics pipeline.");
             }
         }
         finally
@@ -1443,7 +1443,7 @@ void main() {
         }
     }
 
-    // 只接受生产者已经完成写入并转入采样布局的资源，不在 Pass 内补发 barrier。
+    // Only accepts resources whose producer has finished writing and transitioned into a sample layout; no barrier is re-issued inside the Pass.
     bool Resolve(in Season.Rendering.SsrCompositeInputs inputs, VKRenderTarget destination, out Texture reflection)
     {
         reflection = null!;
@@ -1470,7 +1470,7 @@ void main() {
         ulong stamp = Device.GetCurrentRetireFenceValue();
         if (_stamps[index] != stamp)
         {
-            // 同一槽三帧前用过的 set 可能仍在 GPU 上；改写前必须先等该槽退休，见 Device.WaitForFrameSlot。
+            // A set used by the same slot three frames ago may still be on the GPU; before rewriting, we must wait for that slot to retire, see Device.WaitForFrameSlot.
             Device.WaitForFrameSlot(index);
             _stamps[index] = stamp; _cursors[index] = 0;
         }
@@ -1490,7 +1490,7 @@ void main() {
     {
         var destination = _destination; var reflection = _reflection; var set = _preparedSet;
         _destination = null; _reflection = null; _preparedSet = default;
-        // 身份与状态都要核对：Prepare 与 Draw 之间可能插入别的 Pass，此时加法叠错目标就毁掉了整帧。
+        // Both identity and state must be checked: another Pass may be inserted between Prepare and Draw, and in that case adding onto the wrong target would ruin the whole frame.
         if (_disposed || destination == null || reflection == null
             || !Device.InRenderPass || Device.ActivePassId != Season.Rendering.RenderPassId.SsrComposite
             || !ReferenceEquals(Device.ActiveColorTarget, destination)

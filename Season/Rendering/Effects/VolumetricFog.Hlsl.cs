@@ -6,7 +6,7 @@ namespace Season.Rendering.Effects;
 
 public sealed partial class VolumetricFogEffect
 {
-    /// <summary>由场景后端绑定 fogFrame（ByteAddressBuffer）、fogIntegrated/fogLocal（Texture3D）；调用方按 Pass 门控。</summary>
+    /// <summary>Bound by the scene backend to fogFrame (ByteAddressBuffer) and fogIntegrated/fogLocal (Texture3D); the caller gates by Pass.</summary>
     public const string SamplingHlsl = """
 float4 FogF(uint i) { return asfloat(fogFrame.Load4(i*16)); }
 float4 FogTransform(float4 p,uint i) { return p.x*FogF(i)+p.y*FogF(i+1)+p.z*FogF(i+2)+p.w*FogF(i+3); }
@@ -29,7 +29,7 @@ float4 FogColumn(int2 xy,int k,float depth) {
     return acc;
 }
 float4 FogAtWorld(float3 world) {
-    // 单出口保证被材质的动态分支调用时 fxc 不产生 X4000。
+    // A single exit ensures fxc does not emit X4000 when called from a material's dynamic branch.
     float4 result=float4(0,0,0,1);
     float depth=dot(world-FogF(8).xyz,FogF(9).xyz);
     float4 clip=FogTransform(float4(world,1),22);
@@ -141,8 +141,8 @@ float4 CloudSample(float2 uv) {
 }
 float4 WeatherH(int i) { float4 h=F(118+i); if(i==0 && F(16).w<0.5) h.y=0; return h; }
 float4 WeatherR(int i,int row) { return F(120+i*8+row); }
-// 2-7 雷电：雾帧里 SceneLightParams 从索引 32 起，WeatherFlash 是其中第 152 行，所以绝对位置是 184。
-// 图形管线读的是 cbuffer 同名成员，两边是同一份数据；缺了这一行 CloudHlsl 编不过，整条雾链在 Initialize 被拒。
+// 2-7 lightning: in the fog frame SceneLightParams starts at index 32, and WeatherFlash is row 152 within it, so the absolute position is 184.
+// The graphics pipeline reads the same-named cbuffer member; both sides are the same data. Without this line CloudHlsl fails to compile and the entire fog chain is rejected at Initialize.
 float4 WeatherFlash() { return F(184); }
 float4 WeatherNoise(float2 uv) { return CloudSample(uv); }
 """ + WeatherShaders.CommonHlsl + WeatherShaders.CloudHlsl + """

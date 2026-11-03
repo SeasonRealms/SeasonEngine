@@ -67,11 +67,18 @@ internal unsafe sealed class CommandQueue : IDisposable
         // overwritten by another thread, causing callers (for example
         // HandleResize -> WaitForGpu) to assume the GPU is done too early and touch
         // command allocators prematurely, which then triggers SEHException.
+        // The wait is sliced for the other direction: a removed device never
+        // completes the fence, and an unbounded wait here would turn the TDR into a
+        // hang on whichever thread is shutting the renderer down.
         while (_fence->GetCompletedValue() < fenceValue)
         {
+            if (Device.IsDeviceGone())
+                throw new DeviceRemovedException(
+                    "D3D12 device has been removed while waiting for a queue fence; the fence will never complete.");
+
             var hr = _fence->SetEventOnCompletion(fenceValue, _fenceEvent.ToPointer());
             if (hr != 0) Marshal.ThrowExceptionForHR(hr);
-            SilkMarshal.WaitWindowsObjects(_fenceEvent);
+            SilkMarshal.WaitWindowsObjects(_fenceEvent, 100, false);
         }
     }
 

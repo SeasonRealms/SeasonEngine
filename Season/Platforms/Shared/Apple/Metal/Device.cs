@@ -154,7 +154,7 @@ internal static class Device
     static MTLRenderPassDescriptor? _backbufferRpd;
 
     /// <summary>Pass debug labels used for encoder.Label and Xcode GPU capture markers in step 0. The index matches RenderPassId.</summary>
-    static readonly string[] _passLabels = { "Shadow", "Scene", "Post", "OutlineMask", "FinalBlit", "Overlay", "SceneOpaque", "FogComposite", "SceneTransparent", "WeatherComposite", "SceneDecal", "SceneWater", "SsrComposite" };
+    static readonly string[] _passLabels = { "Shadow", "Scene", "Post", "OutlineMask", "FinalBlit", "Overlay", "SceneOpaque", "FogComposite", "SceneTransparent", "WeatherComposite", "SceneDecal", "SceneWater", "SsrComposite", "SceneWaterfall" };
 
     /// <summary>Phase 4 current pass id, written by BeginPass and reset by EndPass.
     /// Pipeline.SetPipeline uses it to route OutlineMask passes to the mask PSO,
@@ -166,21 +166,21 @@ internal static class Device
     internal static MTLRenderTarget? ActiveColorTarget { get; private set; }
     internal static IMTLTexture? ActiveColorTexture { get; private set; }
 
-    /// <summary>A0.1：本 Pass 真正绑成深度附件的显式深度 RT，没有显式深度时为 null，与 VK/DX Device.ActiveDepthTarget 同语义。
-    /// 侧路管线据此确认准备期看到的深度语义没有变。</summary>
+    /// <summary>A0.1: the explicit depth RT actually bound as the depth attachment in this Pass, null when there is no explicit depth, with the same semantics as VK/DX Device.ActiveDepthTarget.
+    /// Side-path pipelines use this to confirm that the depth semantics seen during preparation have not changed.</summary>
     internal static MTLRenderTarget? ActiveDepthTarget { get; private set; }
 
-    /// <summary>A0.1：本 Pass 真正绑在 DepthAttachment 上的纹理，隐式深度也算。
-    /// Metal 把附件格式烘进 PSO，所以在 Pass 内自行录制绘制的侧路管线只能从这里取 DepthAttachmentPixelFormat：
-    /// 显式深度缺席不等于没有深度（RT 可能自带一张），而 NoImplicitDepth 的目标连深度测试都不能开。</summary>
+    /// <summary>A0.1: the texture actually bound to DepthAttachment in this Pass, implicit depth included.
+    /// Metal bakes the attachment formats into the PSO, so a side-path pipeline that records its own draws inside a Pass can only get DepthAttachmentPixelFormat from here:
+    /// the absence of explicit depth does not mean there is no depth (the RT may carry one of its own), and a NoImplicitDepth target cannot even enable depth testing.</summary>
     internal static IMTLTexture? ActiveDepthTexture { get; private set; }
 
-    /// <summary>A0.1：本 Pass 真正绑成颜色附件 1 的速度纹理，单目标形状时为 null。
-    /// 同样是给侧路管线烘 PSO 用：附件数与 slot 1 的格式都必须与实际 Pass 一致。</summary>
+    /// <summary>A0.1: the velocity texture actually bound as color attachment 1 in this Pass, null in the single-target shape.
+    /// Likewise for baking the PSO for side-path pipelines: both the attachment count and slot 1's format must match the actual Pass.</summary>
     internal static IMTLTexture? ActiveVelocityTexture { get; private set; }
 
-    /// <summary>A0.2：本 Pass 真正绑成颜色附件 2 的法线纹理，只在速度也成为附件时才可能非空。
-    /// 侧路管线据此把 slot 2 的格式烘进 PSO。</summary>
+    /// <summary>A0.2: the normal texture actually bound as color attachment 2 in this Pass, which can only be non-null when velocity is also an attachment.
+    /// Side-path pipelines use this to bake slot 2's format into the PSO.</summary>
     internal static IMTLTexture? ActiveNormalTexture { get; private set; }
 
     // ── GPU readback for CaptureApp ──
@@ -401,19 +401,19 @@ internal static class Device
     internal static void BeginPass(in Season.Rendering.PassDesc desc)
     {
         if (GraphicsEncoder != null)
-            throw new InvalidOperationException("不能嵌套 Metal 渲染 Pass。");
+            throw new InvalidOperationException("Cannot nest Metal render Passes.");
         if (desc.Id is (Season.Rendering.RenderPassId.FogComposite or Season.Rendering.RenderPassId.WeatherComposite)
             && (desc.ColorTarget is not MTLRenderTarget || desc.DepthTarget != null || desc.VelocityTarget != null))
-            throw new ArgumentException("雾合成必须使用独立颜色目标，不能挂载深度或速度。", nameof(desc));
-        // P0 SSR 合成与雾合成的区别只有一处：颜色目标就是 SceneColor 本身（增量叠加，不另开目标），
-        // 但它同样不能挂深度、速度或法线 —— 这些资源这会儿都还是采样源。
+            throw new ArgumentException("Fog composite must use a separate color target, and cannot attach depth or velocity.", nameof(desc));
+        // P0 SSR composite differs from fog composite in only one respect: the color target is SceneColor itself (additive increment, no separate target),
+        // but it likewise cannot attach depth, velocity, or normal —— these resources are all still sampling sources at this point.
         if (desc.Id == Season.Rendering.RenderPassId.SsrComposite
             && (desc.ColorTarget is not MTLRenderTarget || desc.DepthTarget != null
                 || desc.VelocityTarget != null || desc.NormalTarget != null))
-            throw new ArgumentException("SSR 合成必须只挂场景色，不能挂载深度、速度或法线。", nameof(desc));
+            throw new ArgumentException("SSR composite must attach only the scene color, and cannot attach depth, velocity, or normal.", nameof(desc));
         ActiveColorTarget = null;
         ActiveColorTexture = null;
-        // 这三个字段记录的是“真的成了附件”，而不是 PassDesc 请求了什么；下面逐条绑定时才落值。
+        // These fields record what "actually became an attachment", not what PassDesc requested; the values are only set as each binding is done below.
         ActiveDepthTarget = null;
         ActiveDepthTexture = null;
         ActiveVelocityTexture = null;
@@ -444,7 +444,7 @@ internal static class Device
         }
 
         // A0.2: SceneNormal normally rides on velocity (RenderQuality.EffectiveSceneNormals), at ColorAttachments[2].
-        // D1 例外：贴花 Pass 没有速度附件，SceneNormal 直接占颜色附件 1（见下面的绑定分支）。
+        // D1 exception: the decal Pass has no velocity attachment, so SceneNormal directly takes color attachment 1 (see the binding branch below).
         MTLRenderTarget? normalRT = null;
         if ((velocityRT != null || desc.Id == Season.Rendering.RenderPassId.SceneDecal)
             && desc.NormalTarget is MTLRenderTarget nrt)
@@ -457,11 +457,11 @@ internal static class Device
         MTLRenderPassDescriptor rpd;
         double vpWidth, vpHeight;
         bool depthOnly = false;
-        // D1：贴花只叠加不清屏，无论 PassDesc 怎么写都不允许 Clear —— 清掉的正是刚画完的不透明结果。
-        // P2 水面同理：它是叠在已合成的场景色上，清屏会把整幅背景抹成单色。
-        // P0 SSR 合成同理：反射增量按加法叠进 SceneColor，清一下就把整帧场景抹掉了。
+        // D1: decals only blend and do not clear, and no Clear is allowed regardless of how PassDesc is written —— what would be cleared is exactly the opaque result just drawn.
+        // P2 water surface is the same: it blends onto the already-composited scene color, and clearing would wipe the entire background to a single color.
+        // P0 SSR composite is the same: the reflection increment is added additively into SceneColor, and a single clear would wipe out the whole frame's scene.
         bool decalPass = desc.Id is Season.Rendering.RenderPassId.SceneDecal or Season.Rendering.RenderPassId.SceneWater
-            or Season.Rendering.RenderPassId.SsrComposite;
+            or Season.Rendering.RenderPassId.SsrComposite or Season.Rendering.RenderPassId.SceneWaterfall;
         var c = desc.ClearColor;
 
         if ((desc.ColorTarget ?? desc.DepthTarget) is MTLRenderTarget rt)
@@ -482,15 +482,16 @@ internal static class Device
             rpd = new MTLRenderPassDescriptor();
             if (!depthOnly)
                 rpd.ColorAttachments[0].Texture = rt.ColorTexture;
-            // 雾合成使用独立的无深度全屏管线；透明阶段再挂载原场景深度。
-            // D1 贴花与 P2 水面的深度是采样源而不是附件：同一资源不能既采样又当深度附件。
-            // P0 SSR 合成没有深度需求，且 SceneColor 自带的隐式深度此刻仍要留给透明阶段，不能在这里挂上。
+            // Fog composite uses a separate depthless full-screen pipeline; the transparent stage then attaches the original scene depth.
+            // For D1 decals and P2 water surface, depth is a sampling source rather than an attachment: the same resource cannot be both sampled and used as the depth attachment.
+            // P0 SSR composite has no depth requirement, and the implicit depth carried by SceneColor must still be left for the transparent stage at this point, so it cannot be attached here.
             rpd.DepthAttachment.Texture = desc.Id is Season.Rendering.RenderPassId.FogComposite
                 or Season.Rendering.RenderPassId.WeatherComposite or Season.Rendering.RenderPassId.SceneDecal
                 or Season.Rendering.RenderPassId.SceneWater or Season.Rendering.RenderPassId.SsrComposite
+                or Season.Rendering.RenderPassId.SceneWaterfall
                 ? null : explicitDepth?.DepthTexture ?? rt.DepthTexture;
-            // 颜色缺席时 rt 本身就是那张深度图（Shadow），它确实是本 Pass 的深度附件；
-            // 否则只有显式深度 RT 算数，用的是 RT 自带的隐式深度时没有 RT 可记。
+            // When color is absent, rt itself is that depth map (Shadow), and it is indeed this Pass's depth attachment;
+            // otherwise only an explicit depth RT counts, and when the RT's own implicit depth is used there is no RT to record.
             if (rpd.DepthAttachment.Texture != null)
                 ActiveDepthTarget = desc.ColorTarget == null ? rt : explicitDepth;
 
@@ -501,8 +502,8 @@ internal static class Device
                 if (normalRT != null && normalRT.ColorTexture != null)
                     rpd.ColorAttachments[2].Texture = normalRT.ColorTexture;
             }
-            // D1 贴花没有速度附件，SceneNormal 直接占颜色附件 1：附件下标必须从 0 起连续，
-            // 否则写 [[color(1)]] 的 PSO 与实际 Pass 不匹配。
+            // D1 decals have no velocity attachment, so SceneNormal directly takes color attachment 1: attachment indices must be contiguous starting from 0,
+            // otherwise a PSO writing [[color(1)]] would not match the actual Pass.
             else if (normalRT != null && normalRT.ColorTexture != null)
                 rpd.ColorAttachments[1].Texture = normalRT.ColorTexture;
 
@@ -536,7 +537,7 @@ internal static class Device
             }
             if (normalRT != null)
             {
-                // 法线附件在双目标形状里是 2，贴花这种单目标加附件的形状里是 1。
+                // The normal attachment is 2 in the dual-target shape, and 1 in the single-target-plus-attachment shape that decals use.
                 int normalSlot = velocityRT != null ? 2 : 1;
                 rpd.ColorAttachments[normalSlot].LoadAction = desc.ClearColorEnable && !decalPass ? MTLLoadAction.Clear : MTLLoadAction.Load;
                 rpd.ColorAttachments[normalSlot].StoreAction = MTLStoreAction.Store;
@@ -554,10 +555,10 @@ internal static class Device
         GraphicsEncoder = enc;
         ActiveColorTarget = desc.ColorTarget as MTLRenderTarget;
         ActiveColorTexture = rpd.ColorAttachments[0].Texture;
-        // 从 rpd 回读而不是从 PassDesc 推断：雾合成会把深度置空，后备缓冲路径的深度又不来自任何 RT。
+        // Read back from rpd rather than inferring from PassDesc: fog composite nulls out depth, and the backbuffer path's depth does not come from any RT.
         ActiveDepthTexture = rpd.DepthAttachment.Texture;
         ActiveVelocityTexture = velocityRT != null ? rpd.ColorAttachments[1].Texture : null;
-        // 速度缺席时法线改占附件 1（D1 贴花 Pass），所以槽位只能从实际绑定反推。
+        // When velocity is absent the normal takes attachment 1 instead (D1 decal Pass), so the slot can only be inferred from the actual bindings.
         ActiveNormalTexture = normalRT != null ? rpd.ColorAttachments[velocityRT != null ? 2 : 1].Texture : null;
 
         // Baseline binding replay:
@@ -569,7 +570,7 @@ internal static class Device
         enc.SetViewport(new MTLViewport { OriginX = 0, OriginY = 0, Width = vpWidth, Height = vpHeight, ZNear = 0.0, ZFar = 1.0 });
         enc.SetScissorRect(new MTLScissorRect { X = 0, Y = 0, Width = (nuint)vpWidth, Height = (nuint)vpHeight });
 
-        // 合成管线在 Draw 完整绑定自身资源，不访问主材质的环境和光照后备资源。
+        // Composite pipelines fully bind their own resources in Draw and do not access the main material's ambient and lighting fallback resources.
         if (desc.Id is Season.Rendering.RenderPassId.FogComposite or Season.Rendering.RenderPassId.WeatherComposite
             or Season.Rendering.RenderPassId.SsrComposite) return;
 
@@ -658,16 +659,16 @@ internal static class Device
         {
             enc.SetFragmentTexture((MTLPrimitiveGroup.CloudNoiseActive ?? White).Image, 9);
             enc.SetFragmentTexture((MTLPrimitiveGroup.AerialLutActive ?? MTLTexture3D.DummyBlack).Image, 10);
-            // 2-7 P0：程序化天空的 Sky-View LUT 基线绑定在 texture(13)，与 envCube texture(6) 并列。
-            // MSL 恒声明该纹理，所以每个带片元的 Pass 都必须有合法绑定（文本/精灵路径也共用同一个 PS）。
-            // 白衣是安全的回落：写入 skyParams0.w 的前提正是该 LUT 存在，StaticCube 档走 else 分支去采 envCube。
+            // 2-7 P0: the procedural sky's Sky-View LUT baseline is bound at texture(13), alongside envCube at texture(6).
+            // MSL always declares this texture, so every Pass with a fragment stage must have a valid binding (the text/sprite paths also share the same PS).
+            // White is a safe fallback: the write to skyParams0.w is predicated precisely on that LUT existing, while the StaticCube tier takes the else branch to sample envCube.
             enc.SetFragmentTexture((MTLPrimitiveGroup.SkyViewActive ?? White).Image, 13);
             enc.SetFragmentSamplerState(Pipeline.WrapSampler, 2);
 
-            // 工作包 D：雾采样三件套的基线绑定。
-            // MSL 的 fragment_main 不靠宏而恒声明 FS buffer(4)/(5) 与 texture(11)/(12)，
-            // 所以每一个带片元着色器的 Pass 都必须有合法绑定，否则 Metal API Validation 会报缺失。
-            // 这里写的是零门控加占位资源，真实体积只在透明阶段由 Pipeline.BindSceneFog 逐条命令重推。
+            // Work package D: baseline binding of the three fog sampling resources.
+            // MSL's fragment_main does not rely on macros and always declares FS buffer(4)/(5) and texture(11)/(12),
+            // so every Pass with a fragment shader must have valid bindings, or Metal API Validation will report them missing.
+            // What is written here is zero gating plus placeholder resources; the real volumes are only re-pushed per command by Pipeline.BindSceneFog in the transparent stage.
             Pipeline.BindSceneFog(enc);
         }
     }
@@ -705,12 +706,12 @@ internal static class Device
     }
 
     /// <summary>
-    /// P2: 把一张离屏颜色目标原样拷进另一张同形目标，供水面折射在「SceneColor 仍是颜色附件」
-    /// 的那一帧里拿到可采样的背景。
+    /// P2: copies one offscreen color target as-is into another target of the same shape, so water surface refraction can obtain a
+    /// samplable background in the frame where "SceneColor is still a color attachment".
     ///
-    /// Metal 靠 blit 编码器做纹理到纹理的整幅拷贝：没有滤波损失，也不需要额外管线。
-    /// 必须在一个渲染 Pass 之外调用 —— 同一个 command buffer 不能同时开着渲染与 blit 编码器，
-    /// 而调度器正是在水面 Pass 的 BeginPass 之前叫它。
+    /// Metal uses a blit encoder for a whole-texture-to-texture copy: no filtering loss, and no extra pipeline needed.
+    /// It must be called outside a render Pass —— the same command buffer cannot have the render and blit encoders open at the same time,
+    /// and the scheduler calls it right before the water surface Pass's BeginPass.
     /// </summary>
     internal static bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination)
     {

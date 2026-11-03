@@ -45,7 +45,8 @@ struct Args { values: array<u32,5> }
         // u32 indices 0..4 are the HLSL byte offsets 0/4/8/12/16 divided by the 4-byte stride.
         // startInstance stays 0 by contract -- WebGPU rejects a non-zero firstInstance without the
         // optional indirect-first-instance feature -- so instance_index equals the compacted slot.
-        // 粒子把后三项传 0，于是输出与参数化之前逐位相同；闪电通道传固定的段数。
+        // The particle path passes 0 for the last three, so the output is bit-identical to before the
+        // parameterization; the lightning channel passes a fixed segment count.
         args.values[0]=u32(params.resetParams.x);
         args.values[1]=u32(params.resetParams.y);
         args.values[2]=u32(params.resetParams.z);
@@ -57,9 +58,9 @@ struct Args { values: array<u32,5> }
 
     /// <summary>WebGPU compute: derives one particle per thread, culls it, and appends survivors while raising the indirect instance count.</summary>
     const string CompactWgsl = """
-// 与 HLSL 共用 96B 参数块，共六个 vec4f：
-// p[0]=相位/盒半径/盒高度/预算，p[1]=原点.xyz/粒径，p[2]=颜色。
-// p[3]=密度/摆幅/寿命/种子，p[4]=加速度.xyz/区域数，p[5]=风速.xyz/通道与窗口标志。
+// Shares the 96B parameter block with HLSL, six vec4f in total:
+// p[0]=phase/box radius/box height/budget, p[1]=origin.xyz/particle size, p[2]=color.
+// p[3]=density/sway/lifetime/seed, p[4]=acceleration.xyz/region count, p[5]=wind.xyz/channel and window flags.
 struct Params { p: array<vec4f,6> }
 struct Frame { values: array<vec4f> }
 struct Instances { values: array<vec4f> }
@@ -78,9 +79,11 @@ fn ParticleHash(seed: u32) -> f32 {
     let p0=params.p[0]; let p1=params.p[1]; let p2=params.p[2]; let p3=params.p[3]; let p4=params.p[4];
     let p5=params.p[5];
     if(id.x<u32(p0.w)) {
-        // 密度门控按下标有序，不按哈希：放行的是 [0, 密度×预算) 这一段前缀，
-        // 于是 CPU 只派发这一段的下标数即可，晴天与小雪不必按满预算空跑。
-        // 哈希仍然要算，因为下标会被种子平移——平移决定了这一批下标的空间分布。
+        // Density gating is index-ordered, not hash-based: what is admitted is the prefix
+        // [0, density x budget), so the CPU only needs to dispatch that many indices and clear
+        // weather or light snow need not spin at full budget.
+        // The hash is still computed because the index is shifted by the seed -- that shift decides
+        // the spatial distribution of this batch of indices.
         let ordinal=f32(id.x);
         let cutoff=p3.x*p0.w;
         let index=id.x+u32(p3.w);
@@ -89,40 +92,72 @@ fn ParticleHash(seed: u32) -> f32 {
         let h2=ParticleHash(index*11u+23u);
         let h3=ParticleHash(index*17u+41u);
         if(ordinal<cutoff) {
-            // 相位以寿命为时标，所以原来的 fall 同时就是 [0,1) 的归一化年龄；换算回秒即可闭式积分。
-            // 寿命为 0 时 t 与 invLife 一并取零，位置和速度都精确退回未扩展前的结果。
-            // WGSL 没有三元运算符，而 select() 会把两个分支都算出来，所以这里用语句形式写，
-            // 顺带避免对 0 取倒数这件事进入任何一条求值路径。
+            // The phase is timed by lifetime, so the former fall is at once the normalized age in
+            // [0,1); converting it back to seconds allows closed-form integration.
+            // When lifetime is 0, both t and invLife become zero, so position and velocity fall back
+            // exactly to the pre-expansion result.
+            // WGSL has no ternary operator, and select() evaluates both branches, so this is written
+            // as a statement, which also keeps taking the reciprocal of 0 out of every evaluation path.
             let age=fract(p0.x+h2);
             var invLife=0.0;
             if(p3.z>0.0) { invLife=1.0/p3.z; }
             let t=age*p3.z;
             let accel=p4.xyz;
-            // frameData[11] 是 HLSL Load4(176)：圆盘半径 / 径向速度 / 摆动幅度 / 曲线模式标志。
+            // frameData[11] is the HLSL Load4(176): disk radius / radial speed / sway amount / curve-mode flag.
             let uCurve=frameData.values[11];
+            // frameData[16..18] is the HLSL Load4(256/272/288): initial velocity and cone jitter / spawn
+            // axis and half length and half depth / speed jitter and floor and toon edge (the compaction
+            // stage uses only the first two).
+            let uLaunch=frameData.values[16];
+            let uRect=frameData.values[17];
+            let uExtra=frameData.values[18];
 
             var center=vec3f(0.0);
             var velocity=vec3f(0.0);
             if((u32(p5.w)&16u)!=0u) {
-                // 圆盘出生：半径取 sqrt(h0) 才让面积均匀，否则粒子会挤在圆心堆成一坨。
+                // Disk spawn: the radius takes sqrt(h0) to make the area uniform, otherwise particles
+                // bunch up into a clump at the center.
                 let ring=h1*6.283185;
                 let radial=vec2f(cos(ring),sin(ring));
                 let radius=sqrt(h0)*uCurve.x;
                 center=vec3f(p1.x+radial.x*radius,p1.y,p1.z+radial.y*radius);
-                // 圆盘出生没有落差：竖直运动全部来自加速度与风速，火舌的上升速度因此由 AccelY 单独决定。
+                // Disk spawn has no drop: vertical motion comes entirely from acceleration and wind,
+                // so the rise speed of a flame is decided by AccelY alone.
+            } else if((u32(p5.w)&32u)!=0u) {
+                // Rect spawn: take a uniform segment along the spawn axis and a uniform layer
+                // perpendicular, giving the whole strip equal density, unlike the disk which needs a
+                // square root to correct the area. h4..h6 are computed only here, so the default path
+                // does not spend three extra hashes on them.
+                let h4=ParticleHash(index*23u+59u);
+                let h5=ParticleHash(index*29u+71u);
+                let h6=ParticleHash(index*31u+83u);
+                let axis=uRect.xy;
+                let across=vec2f(-axis.y,axis.x);
+                let along=(h0*2.0-1.0)*uRect.z;
+                let depth=(h1*2.0-1.0)*uRect.w;
+                center=vec3f(p1.x+axis.x*along+across.x*depth,p1.y,p1.z+axis.y*along+across.y*depth);
+                // Initial velocity is shared by the whole strip; the cone jitter offsets the 3D
+                // direction in proportion to |initial velocity|, and the speed jitter then scales the
+                // magnitude as a whole.
+                velocity=(uLaunch.xyz+(vec3f(h4,h5,h6)*2.0-1.0)*uLaunch.w*length(uLaunch.xyz))
+                    *(1.0+(h6-0.5)*uExtra.x);
+                // Position integrates the initial velocity: each particle on the strip travels along
+                // its own initial velocity, and acceleration and wind are then added on top as usual.
+                center+=velocity*t;
             } else {
                 center=vec3f(
                     p1.x+(h0*2.0-1.0)*p0.y+sin((p0.x+h0)*6.283185)*p3.y,
                     p1.y+p0.z*(0.7-age),
                     p1.z+(h1*2.0-1.0)*p0.y+cos((p0.x+h1)*6.283185)*p3.y);
-                // 基础速度是上面三行对时间求导：相位速率就是 1/life，所以每项都带一个 invLife。
-                // p0.z*invLife 在默认档恰好等于 FallSpeed，因为 life 本就是 boxHeight / FallSpeed。
+                // The base velocity is the time derivative of the three lines above: the phase rate is
+                // 1/life, so each term carries an invLife. In the default case p0.z*invLife equals
+                // FallSpeed, since life is already boxHeight / FallSpeed.
                 velocity=vec3f(
                     cos((p0.x+h0)*6.283185)*6.283185*p3.y*invLife,
                     -p0.z*invLife,
                     -sin((p0.x+h1)*6.283185)*6.283185*p3.y*invLife);
             }
-            // 加速度位移必须在构造 clip 之前并入，否则剔除判据用的位置与最终光栅化的位置不是同一个点。
+            // The acceleration displacement must be folded in before building clip, otherwise the position used for the cull test and the final rasterized position are not the same point.
             center+=0.5*accel*t*t;
             velocity+=accel*t;
             center+=p5.xyz*t;
@@ -130,10 +165,10 @@ fn ParticleHash(seed: u32) -> f32 {
             if((u32(p5.w)&16u)!=0u) {
                 let ring=h1*6.283185;
                 let spread=vec2f(cos(ring),sin(ring))*uCurve.y;
-                // 径向扩散与年龄成正比：烟柱因此越往上越宽；火焰用负的 Spread 让火舌向中轴收拢。
+                // Radial spread is proportional to age: the column therefore widens as it rises; fire uses a negative Spread to draw the flame tongues toward the axis.
                 center=vec3f(center.x+spread.x*t,center.y,center.z+spread.y*t);
                 velocity=vec3f(velocity.x+spread.x,velocity.y,velocity.z+spread.y);
-                // 两条不同频率的正弦合成低频摆动，对年龄仍是闭式函数，不引入任何跨帧状态。
+                // Two sines at different frequencies compose a low-frequency sway that is still a closed-form function of age, introducing no cross-frame state.
                 let wobble=vec2f(sin(t*1.3+h2*6.283185),cos(t*1.1+h3*6.283185))*uCurve.z*t;
                 center=vec3f(center.x+wobble.x,center.y,center.z+wobble.y);
             }
@@ -161,30 +196,36 @@ fn ParticleHash(seed: u32) -> f32 {
                 }
             }
 
-            // 周期窗口的搬运发生在不可见边缘；强度变化只渐显新候选，不整场重置。
+            // The periodic-window relocation happens at the invisible edge; intensity changes only fade in new candidates rather than resetting the whole field.
             let viewDistance=frameData.values[7].w;
             if(viewDistance>0.0) {
                 let f=clamp((1.0-length(center-frameData.values[6].xyz)/viewDistance)*4.0,0.0,1.0);
                 weight*=f*f*(3.0-2.0*f);
             }
-            // 软边的宽度按放行前缀的 2% 算（至少一个下标）：密度渐变时新放行的粒子
-            // 从零覆盖度开始，不会整批突然出现。旧版按 h3 的 0.02 取边，宽度同阶。
+            // The soft-edge width is 2% of the admitted prefix (at least one slot): as the density ramps,
+            // newly admitted particles start at zero coverage instead of appearing all at once. The prior
+            // version took its edge from h3 * 0.02, which is the same order of width.
             if((u32(p5.w)&8u)!=0u) { weight*=clamp((cutoff-ordinal)/max(cutoff*0.02,1.0),0.0,1.0); }
+            // Die on floor: if the integrated position is already below the floor, this particle is not
+            // emitted, instead of letting it pass below the ground. It must come after the weight
+            // computation: region sampling resets weight, so placing it earlier would be overwritten.
+            if((u32(p5.w)&64u)!=0u && center.y<uExtra.y) { weight=0.0; }
 
             // frameData[0..3] are the HLSL Load4(0/16/32/48): the four rows of the view-projection.
             let viewProjection=mat4x4f(frameData.values[0],frameData.values[1],frameData.values[2],frameData.values[3]);
             let clip=viewProjection*vec4f(center,1.0);
-            // 用 w 加上公告板半径做横向余量，避免贴边粒子在扩张成四边形后被整体丢弃。
+            // Use w plus the billboard radius as a lateral margin, so edge-hugging particles are not discarded wholesale once expanded into a quad.
             let margin=clip.w+p1.w*4.0;
             let streak=abs(viewProjection*vec4f(velocity*frameData.values[7].z*0.5,0.0));
             if(weight>0.0 && clip.w+streak.w>1e-4 && clip.z+streak.z>-1e-4
                 && abs(clip.x)<margin+streak.x+streak.w && abs(clip.y)<margin+streak.y+streak.w) {
-                // 每个线程最多加一，线程数即容量，所以 slot 必然小于容量，无需再夹取。
+                // Each thread adds at most one and the thread count equals capacity, so slot is guaranteed to be less than capacity and needs no clamping.
                 let slot=atomicAdd(&args.values[1],1u);
                 // The 48-byte instance stride is three vec4f: HLSL offset+0, +16 and +32.
                 instanceData.values[slot*3u]=vec4f(center,p1.w);
-                // 曲线模式下 rgb 改存两枚稳定随机数（按下标哈希，不受实例槽位争夺影响），
-                // 顶点阶段据此选颜色梯度与初始转角；覆盖度仍然只走 alpha，与旧版完全一致。
+                // In curve mode rgb instead stores two stable random numbers (hashed by index, immune to
+                // instance-slot contention); the vertex stage uses them to pick the colour gradient and
+                // the initial rotation. Coverage still travels only through alpha, exactly as before.
                 let tint=select(p2.xyz,vec3f(h0,h1,0.0),uCurve.w>0.5);
                 instanceData.values[slot*3u+1u]=vec4f(tint,p2.w*weight);
                 instanceData.values[slot*3u+2u]=vec4f(velocity,age);
@@ -212,9 +253,12 @@ struct ParticleVertex {
     @builtin(position) position: vec4f,
     @location(0) offset: vec2f,
     @location(1) color: vec4f,
-    // (稳定随机数, 归一化年龄, 噪声强度, 加法混合标志)。片元阶段读不到 vertex 可见的绑定组，
-    // 所以曲线模式的外观参数跟着插值器过来，而不是再去读帧缓冲。
+    // (stable random, normalized age, noise strength, additive-blend flag). The fragment stage cannot
+    // read the bind groups visible to the vertex stage, so curve-mode appearance parameters arrive via
+    // the interpolator instead of reading the frame buffer again.
     @location(2) misc: vec4f,
+    // (toon edge width, reserved, reserved, reserved). Same as above: it can only reach the fragment via the interpolator.
+    @location(3) misc2: vec4f,
 }
 
 """;
@@ -241,75 +285,85 @@ struct Frame { values: array<vec4f> }
     let eye=frameData.values[6].xyz;
     // frameData[7] is the HLSL Load4(112): fadeIn / fadeOut (fractions of the lifetime) / stretch in seconds.
     let drawParams=frameData.values[7].xyz;
-    // frameData[8..11] 是外观曲线与出生形状：曲线模式关闭时标志位为 0，下面这个分支不成立，
-    // 于是 size、color、corner 三个量与扩容前逐位相同。
+    // frameData[8..11] are the appearance curve and spawn shape: when curve mode is off the flag is 0,
+    // so the branch below does not fire and size, color and corner are bit-identical to before the
+    // extension.
     let tintStart=frameData.values[8];
     let tintMid=frameData.values[9];
     let tintEnd=frameData.values[10];
     let curve=frameData.values[11];
+    // frameData[18] = speed jitter / floor height / toon edge / reserved: only the edge width travels to the fragment.
+    let uExtra=frameData.values[18];
     let viewProjection=mat4x4f(frameData.values[0],frameData.values[1],frameData.values[2],frameData.values[3]);
     var seed=0.0;
     var shape=corner;
     if(curve.w>0.5) {
-        // 实例 rgb 是压缩阶段写入的两枚稳定随机数：按粒子下标哈希，不受实例槽位争夺影响。
+        // The instance rgb holds the two stable random numbers written by the compaction stage: hashed by particle index, immune to instance-slot contention.
         seed=color.r;
-        // 两段线性梯度：前半程起点→中点，后半程中点→终点。WGSL 的 select 会两边都求值，
-        // 所以这里用 if/else 分开写。
+        // Two-segment linear gradient: first half start->mid, second half mid->end. WGSL's select
+        // evaluates both operands, so this is written out with if/else instead.
         var tint=vec3f(0.0);
         if(age<0.5) { tint=mix(tintStart.rgb,tintMid.rgb,age*2.0); }
         else { tint=mix(tintMid.rgb,tintEnd.rgb,age*2.0-1.0); }
         color=vec4f(tint,color.a);
         size=mix(size,tintEnd.w,age);
-        // 每颗粒子独立的初始转角并缓慢自旋：一排排同相的斑块是廉价粒子最明显的破绽。
+        // A per-particle initial rotation plus a slow spin: rows of in-phase blobs are the most obvious giveaway of cheap particles.
         let spin=seed*6.283185+age*(seed-0.5)*3.0;
         let spinCos=cos(spin);
         let spinSin=sin(spin);
         shape=vec2f(corner.x*spinCos-corner.y*spinSin,corner.x*spinSin+corner.y*spinCos);
     }
-    // 语句形式而非 select()：fadeIn 为 0 时 age 也常常是 0，select 会先把 0/0 算出来，
-    // 而 clamp(NaN) 的结果由实现决定；用 if 则那条除法根本不会被求值。
+    // Statement form rather than select(): when fadeIn is 0 age is often 0 too, and select would
+    // compute 0/0 first, leaving clamp(NaN) implementation-defined; with if that division is never
+    // evaluated at all.
     var fadeIn=1.0;
     if(drawParams.x>0.0) { fadeIn=clamp(age/drawParams.x,0.0,1.0); }
     var fadeOut=1.0;
     if(drawParams.y>0.0) { fadeOut=clamp((1.0-age)/drawParams.y,0.0,1.0); }
     color.a*=fadeIn*fadeOut;
-    // 沿速度方向把四边形切变成平行四边形，总长度为 |velocity| * stretch；
-    // 上下两角各偏移半个长度，所以 stretch 为 0 时精确退化回原来的正方形公告板。
+    // Shear the quad into a parallelogram along the velocity direction, with total length
+    // |velocity| * stretch; the top and bottom corners each offset by half that length, so at
+    // stretch = 0 it degenerates exactly back to the original square billboard.
     var world=center+(right*shape.x+up*shape.y)*size+velocity*(drawParams.z*shape.y*0.5);
     var uv=corner;
 
-    // ── ribbon 带：闪电通道这类"分段折线"不走公告板 ──
-    // frameData[12] = (视口宽, 视口高, 最小半宽像素, ribbon 标志)，
-    // frameData[13] = (强度, 雾消光系数, 保留, 保留)。标志为 0 时整段不执行。
+    // ── ribbon strip: "segmented polylines" like lightning channels do not use billboards ──
+    // frameData[12] = (viewport width, viewport height, minimum half-width in pixels, ribbon flag),
+    // frameData[13] = (intensity, fog extinction, reserved, reserved). When the flag is 0 this whole
+    // section is skipped.
     let ribbon=frameData.values[12];
     if(ribbon.w>0.5) {
-        // 这一档的实例记录换了语义：Position 是段中点，Velocity 是半段向量，
-        // 于是"中点 ± 半段"就是两个端点，不需要为每段多存一个实例。
+        // In this mode the instance record changes meaning: Position is the segment midpoint and
+        // Velocity is the half-segment vector, so "midpoint ± half segment" gives the two endpoints
+        // without storing an extra instance per segment.
         let segLen=length(velocity);
         var tangent=vec3f(0.0,1.0,0.0);
         if(segLen>1e-5) { tangent=velocity/segLen; }
-        // 面向相机的带：横向取切线与视线的叉积。正对镜头时叉积退化（带子本来就只是一个点），
-        // 退回相机右轴即可，方向此时无关紧要。
+        // Camera-facing strip: the lateral direction is the cross product of the tangent and the view
+        // ray. When facing the camera head-on that cross product degenerates (the strip is just a point
+        // anyway), so falling back to the camera right axis is fine; direction is irrelevant then.
         let lateral=cross(tangent,eye-center);
         let sideLen=length(lateral);
         var side=right;
         if(sideLen>1e-5) { side=lateral/sideLen; }
 
-        // 最小屏宽：把世界单位的 side 投影到像素空间，得到「一米横向等于几个像素」，
-        // 再反算保底像素宽所需的世界半宽。折线细到亚像素时光栅化会时有时无——那是片元
-        // 根本没产生的丢失，任何时间域补偿都救不回来。TAA 的反应矩形
-        //（ViewTargets.ReactiveRect）只保证已经画出来的像素不被历史拖住，补不上一个不存在的片元。
+        // Minimum screen width: project the world-unit side into pixel space to get "how many pixels one
+        // metre laterally spans", then invert it to find the world half-width needed for the minimum
+        // pixel width. When a polyline is thinner than a pixel, rasterization flickers on and off -- that
+        // is a loss where the fragment is simply never produced, and no temporal compensation can recover
+        // it. TAA's reactive rect (ViewTargets.ReactiveRect) only keeps already-drawn pixels from being
+        // dragged by history; it cannot fill in a fragment that never existed.
         let clipSide=viewProjection*vec4f(side,0.0);
         let clipW=max(abs(clipSide.w),1e-3);
         let pxPerWorld=max(length(abs(clipSide.xy)/clipW*ribbon.xy*0.5),1e-4);
         let halfWidth=max(size,ribbon.z/pxPerWorld);
 
-        // 沿切线各多伸半个带宽：相邻段在折点处因此重叠，而不是留下一道缝。
+        // Extend half a band width along the tangent at each end: adjacent segments then overlap at the bend instead of leaving a seam.
         world=center+tangent*(corner.y*(segLen+halfWidth))+side*(corner.x*halfWidth);
-        // 横向衰减复用片元里那条 1-dot(uv,uv)：纵向不参与，带子才是一条亮度均匀的线。
+        // The lateral falloff reuses the 1-dot(uv,uv) from the fragment: the longitudinal axis does not participate, so the strip stays a line of uniform brightness.
         uv=vec2f(corner.x,0.0);
 
-        // 强度与雾衰减都只压覆盖度：片元把 rgb 乘进 alpha，压在 rgb 上会变成平方。
+        // Both intensity and fog attenuation only scale coverage: the fragment multiplies rgb into alpha, so applying them to rgb would square the result.
         let trim=frameData.values[13];
         color.a*=trim.x*exp(-trim.y*length(center-eye));
     }
@@ -317,18 +371,19 @@ struct Frame { values: array<vec4f> }
     // No Y flip: WebGPU clip space matches D3D, so this is the HLSL line verbatim.
     var result: ParticleVertex;
     result.position=viewProjection*vec4f(world,1.0);
-    // offset 保持未旋转的角点：衰减只取它的平方和，旋转不改变结果，默认路径因此一字未改。
+    // offset keeps the unrotated corner: the falloff only takes its sum of squares, rotation does not change the result, so the default path is untouched.
     result.offset=uv;
     result.color=color;
-    // (稳定随机数, 归一化年龄, 噪声强度, 加法混合标志)
+    // (stable random, normalized age, noise strength, additive-blend flag)
     result.misc=vec4f(seed,age,select(0.0,tintMid.w,curve.w>0.5),tintStart.w);
+    result.misc2=vec4f(uExtra.z,0.0,0.0,0.0);
     return result;
 }
 
 """;
 
     const string ShadeWgsl = """
-// 无正弦的哈希：sin 在部分硬件上对大参数会丢精度，而这里的输入随年龄一路增大。
+// Sine-free hash: sin loses precision for large arguments on some hardware, and the input here grows monotonically with age.
 fn Hash2(p: vec2f) -> f32 {
     var p3=fract(p.xyx*0.1031);
     p3+=dot(p3,p3.yzx+33.33);
@@ -343,15 +398,26 @@ fn ValueNoise(p: vec2f) -> f32 {
 }
 fn Shade(input: ParticleVertex) -> vec4f {
     let falloff=clamp(1.0-dot(input.offset,input.offset),0.0,1.0);
-    // 默认路径保持原样：曲线模式关闭时 misc.z 为 0，这一行与旧版逐位相同。
+    // The default path is unchanged: with curve mode off misc.z is 0, so this line is bit-identical to before.
     var alpha=input.color.a*falloff*falloff;
     if(input.misc.z>0.0) {
-        // 噪声随年龄沿 -y 滚动，火舌与烟卷因此在原地往上走，而不是贴着一动不动。
+        // The noise scrolls along -y with age, so flame tongues and smoke curls travel upward in place rather than staying stuck.
         let q=input.offset*1.7+input.misc.x*31.0+vec2f(0.0,-input.misc.y*2.5);
         let n=0.65*ValueNoise(q)+0.35*ValueNoise(q*2.3);
         alpha=input.color.a*clamp(falloff*falloff*(1.0+input.misc.z*(n*2.0-1.0)),0.0,1.0);
     }
-    // 加法档把 alpha 压到 0：One/InvSrcAlpha 下就等于纯加法，不必多一个 PSO。
+    // Toon edge: compress the smooth radial falloff into a crisp boundary, with the width as a fraction
+    // of the billboard radius. 0 means off and the whole section is skipped, so every pixel of the
+    // default path is bit-identical to before the extension.
+    let edge=input.misc2.x;
+    if(edge>0.0) {
+        // coverage is "how much coverage this pixel originally had"; dividing by the peak coverage
+        // restores it to [0,1] before the hard cut. The denominator is clamped to 1e-5 only to guard
+        // against divide-by-zero: in the additive mode alpha is 0 anyway and stays 0 after the cut.
+        let coverage=clamp(alpha/max(input.color.a,1e-5),0.0,1.0);
+        alpha=input.color.a*smoothstep(0.5-edge,0.5+edge,coverage);
+    }
+    // The additive mode drives alpha to 0: under One/InvSrcAlpha this equals pure addition, so no extra PSO is needed.
     return vec4f(input.color.rgb*alpha,alpha*(1.0-input.misc.w));
 }
 """;

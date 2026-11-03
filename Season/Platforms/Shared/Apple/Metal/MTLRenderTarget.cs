@@ -115,7 +115,7 @@ internal sealed class MTLRenderTarget : Season.Rendering.RenderTarget
             throw;
         }
 
-        // 全部创建成功后才替换，失败时旧附件与尺寸保持一致。
+        // Replace only after all creations succeed; on failure the old attachments and size stay consistent.
         ColorTexture?.Dispose();
         DepthTexture?.Dispose();
         ColorTexture = color;

@@ -13,12 +13,13 @@ namespace Engine.Panels;
 /// into one Mesh3D preview per mesh through the shared GLTFInstance pipeline, and those previews are laid
 /// out in a horizontal row to the right of the select button.
 ///
-/// Two display rules matter here. First, previews are not occluded by the toolbar border because the border
-/// uses the Transparent path without writing depth, then the preview meshes render afterward through Opaque or Fade
-/// and overwrite the toolbar pixels by normal depth testing. Second, previews stay visually screen-anchored even
-/// though Mesh3D is world-space only: each frame their target pixel positions are projected back to camera rays,
-/// then the meshes are placed at a fixed distance and scaled from the world-space cell width. That keeps them stable
-/// on screen without adding a dedicated screen-space mesh mode.
+/// Two display rules matter here. First, previews are revealed by carving a window in the toolbar border: this
+/// overlay panel paints after the scene pass (and after the outline composite), so the border would otherwise cover
+/// the preview meshes and only their outline would stay visible. The preview-row viewport is therefore left
+/// unpainted through HoleBands while four abutting bands repaint the rest of the bar. Second, previews stay
+/// visually screen-anchored even though Mesh3D is world-space only: each frame their target pixel positions are
+/// projected back to camera rays, then the meshes are placed at a fixed distance and scaled from the world-space
+/// cell width. That keeps them stable on screen without adding a dedicated screen-space mesh mode.
 /// </summary>
 internal class Painting : Panel
 {
@@ -45,6 +46,10 @@ internal class Painting : Panel
     int _placedSerial;             // Running suffix for placed-instance names so logs and texture registration stay distinct.
 
     MovePanel movePanel;
+
+    // Carves the preview-row window out of the border. Registered in the constructor after the border so its
+    // bands paint in the same frame and cover the bar everywhere the previews do not show.
+    HoleBands holeBands;
 
     // -- Screen-anchoring parameters for the 3D preview row. --
     const float PreviewDistance = 3f;   // Fixed distance along the camera ray for preview placement.
@@ -73,6 +78,10 @@ internal class Painting : Panel
             Height = 100
         };
         AddControl(border);
+
+        // Registered after the border so the carved bands cover it in the same frame.
+        holeBands = new HoleBands();
+        holeBands.AddTo(this);
 
         select = new Sprite2D()
         {
@@ -203,6 +212,22 @@ internal class Painting : Panel
         {
             //return true;
         }
+
+        // Previews render in the scene pass while this overlay panel paints after it, so the border would cover
+        // them and leave only their outline visible. Leave the row viewport unpainted: switch the single border
+        // quad off by alpha and repaint the same rectangle with four abutting bands, so the models show through the
+        // window while the rest of the bar keeps its exact look. A degenerate rect stays a null hole on purpose,
+        // because an empty hole with the quad already switched off would erase the whole bar.
+        Season.Utils.Rect? hole = null;
+        int holeX = (int)MathF.Round(movePanel.PosX);
+        int holeY = (int)MathF.Round(movePanel.PosY);
+        int holeW = (int)MathF.Round(movePanel.Width ?? 0f);
+        int holeH = (int)MathF.Round(movePanel.Height ?? 0f);
+        if (holeW > 0 && holeH > 0 && mesh3Ds.Any(me => me != null && me.Ready))
+            hole = new Season.Utils.Rect(holeX, holeY, holeW, holeH);
+
+        border.Color = hole is null ? Season.Basic.Colors.White : new Season.Basic.Color(Season.Basic.Colors.White, 0);
+        holeBands.Update(time, border.PosX, border.PosY, border.Width ?? 0f, border.Height ?? 0f, hole, Season.Basic.Colors.White, border.Alpha);
 
         // -- Mesh3D preview row: laid out to the right of select and screen-anchored as described above. --
         float slotY = border.PosY + (border.Height ?? 0f) / 2f;
@@ -407,6 +432,11 @@ internal class Painting : Panel
                 mesh.Selected = !pre;
             };
 
+            // With an MR texture the factor multiplies the texture channels, so keep the glTF default of 1. Without one,
+            // such as the specGloss background_mountains.glb, the shader reads the factor directly as metallic/roughness;
+            // leaving it at 1 would make metallic 1, zeroing the ambient term and rendering the preview near black.
+            bool hasMetallicRoughness = extraction.MetallicRoughness[i].HasValue;
+
             mesh.Surfaces.Add(new Surface()
             {
                 Vertices = geometry.Vertices,
@@ -415,8 +445,8 @@ internal class Painting : Panel
                 MetallicRoughnessTextureOverride = extraction.MetallicRoughness[i],
                 NormalTextureOverride = extraction.Normal[i],
                 OcclusionTextureOverride = extraction.Occlusion[i],
-                MetallicFactor = 1f,      // With an MR texture, the factor multiplies the texture channels, so use the glTF default of 1.
-                RoughnessFactor = 1f,
+                MetallicFactor = hasMetallicRoughness ? 1f : 0f,        // Approximate a missing MR map as matte, matching Mountains.cs.
+                RoughnessFactor = hasMetallicRoughness ? 1f : 0.95f,
                 Unlit = false,            // Use PBR lighting so previews match the look of placed scene entities.
             });
 

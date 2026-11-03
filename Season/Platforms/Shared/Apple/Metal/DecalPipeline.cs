@@ -9,44 +9,44 @@ using Season.Rendering;
 namespace Season.Platforms.Shared.Apple.Metal;
 
 /// <summary>
-/// D1 屏幕空间贴花的 Metal 实现。
+/// D1 screen-space decal Metal implementation.
 ///
-/// 每个贴花一次 36 顶点的 <c>DrawPrimitives</c>：顶点由 <c>[[vertex_id]]</c> 算出投影盒的六个面，
-/// 光栅器只留背面（<see cref="MTLCullMode.Front"/>），因此每个像素最多命中一次 —— 混合不会被叠加两遍，
-/// 也就不需要模板。像素着色器用本帧深度重建世界坐标，折进盒的局部空间后取 UV；颜色通过固定功能混合写回
-/// SceneColor，所以 SceneColor 不需要同时是可采样资源，Pass 里它只是颜色附件。
+/// One 36-vertex <c>DrawPrimitives</c> per decal: vertices compute the six faces of the projection box from <c>[[vertex_id]]</c>,
+/// and the rasterizer keeps only back faces (<see cref="MTLCullMode.Front"/>), so each pixel is hit at most once —— blending is not applied twice,
+/// and no stencil is needed. The pixel shader reconstructs world coordinates from this frame's depth, folds them into the box's local space, and takes the UV; the color is written back to
+/// SceneColor via fixed-function blending, so SceneColor does not need to be a samplable resource at the same time, and in the Pass it is only a color attachment.
 ///
-/// 与另外三端的三处差异，都是 Metal 自己的形状：
+/// The three differences from the other three backends are all Metal's own shape:
 /// <list type="bullet">
-/// <item>没有 render pass 对象：附件由 <see cref="Device.BeginPass"/> 的 <c>MTLRenderPassDescriptor</c> 现建，
-/// 所以本类只需在 <see cref="Device"/> 侧确认「无深度附件 + 可选的颜色附件 1」；</item>
-/// <item>附件格式烘进 PSO，但贴花的附件形状只有一种（RGBA16Float + 可选第二张 RGBA16Float + 无深度），
-/// 因此四个 PSO 在构造期一次烘好，失败由 <c>CreateDecalPipeline</c> 接住并整体退回；</item>
-/// <item>没有描述符环也没有 fence：Metal 直接绑定资源，跨帧复用由帧内时序（每帧新建 command buffer）排除。</item>
+/// <item>No render pass object: attachments are created on the fly by <see cref="Device.BeginPass"/>'s <c>MTLRenderPassDescriptor</c>,
+/// so this class only needs to confirm on the <see cref="Device"/> side "no depth attachment + optional color attachment 1";</item>
+/// <item>The attachment formats are baked into the PSO, but the decal's attachment shape has only one form (RGBA16Float + optional second RGBA16Float + no depth),
+/// so the four PSOs are baked once at construction time, and failures are caught by <c>CreateDecalPipeline</c> and fall back entirely;</item>
+/// <item>There is neither a descriptor ring nor a fence: Metal binds resources directly, and cross-frame reuse is excluded by intra-frame timing (a new command buffer each frame).</item>
 /// </list>
 ///
-/// 时序与 <see cref="MTLFogCompositePipeline"/> 相同：Prepare 在 Pass 外解析资源，Draw 只能在
-/// <see cref="RenderPassId.SceneDecal"/> 内消费一次；任何一项与准备期不符都放弃绘制而不是部分绘制。
+/// The timing is the same as <see cref="MTLFogCompositePipeline"/>: Prepare resolves resources outside the Pass, and Draw can only
+/// consume once inside <see cref="RenderPassId.SceneDecal"/>; any mismatch with the preparation stage gives up the draw rather than partially drawing.
 /// </summary>
 internal sealed class MTLDecalPipeline : DecalPipeline
 {
-    /// <summary>逐贴花的纹理解析器：只查后端纹理字典，不加载。名字 → 纹理为空时该 draw 被跳过。</summary>
+    /// <summary>Per-decal texture resolver: only looks up the backend texture dictionary, does not load. When name → texture is empty, that draw is skipped.</summary>
     readonly Dictionary<string, Texture> _textures;
 
-    // 三个函数来自同一份源码、同一个库，整条管线只编译一次。
+    // The three functions come from the same source and the same library, and the whole pipeline is compiled only once.
     IMTLFunction? _vertexFunction, _fragmentFunction, _fragmentRoughnessFunction;
 
-    /// <summary>本 Pass 没有深度附件，比较函数必须是 Always —— 与雾合成、粒子的无深度档同一选择。</summary>
+    /// <summary>This Pass has no depth attachment, so the compare function must be Always —— the same choice as the depthless tiers of fog composite and particles.</summary>
     IMTLDepthStencilState? _noDepthState;
 
-    /// <summary>[模式 0=Modulate/1=Additive, 是否带法线附件]。附件数量必须与 PSO 的颜色附件数一致。</summary>
+    /// <summary>[mode 0=Modulate/1=Additive, whether a normal attachment is present]. The attachment count must match the PSO's color attachment count.</summary>
     readonly IMTLRenderPipelineState?[,] _pipelines = new IMTLRenderPipelineState?[2, 2];
 
     readonly Texture?[] _drawTextures = new Texture?[DecalMath.MaxDecals];
     readonly bool[] _drawSkip = new bool[DecalMath.MaxDecals];
 
-    // Prepare 的产物，Draw 消费且只消费一次。
-    // RT 包装对象也一并持有：纹理引用只是其中的字段，保住 RT 就保住了它不能在本帧中途被重建。
+    // Product of Prepare, consumed by Draw exactly once.
+    // The RT wrapper object is held as well: the texture reference is only a field within it, and holding the RT ensures it cannot be rebuilt midway through the frame.
     MTLRenderTarget? _destination;
     MTLRenderTarget? _color, _depth, _normal;
     IMTLTexture? _colorTexture, _depthTexture, _normalTexture;
@@ -76,7 +76,7 @@ internal sealed class MTLDecalPipeline : DecalPipeline
             DepthCompareFunction = MTLCompareFunction.Always, DepthWriteEnabled = false,
         };
         _noDepthState = Device.MtlDevice.CreateDepthStencilState(noDepth)
-            ?? throw new InvalidOperationException("贴花深度状态创建失败。");
+            ?? throw new InvalidOperationException("Decal depth state creation failed.");
 
         for (int roughness = 0; roughness < 2; roughness++)
         {
@@ -87,17 +87,17 @@ internal sealed class MTLDecalPipeline : DecalPipeline
     }
 
     static IMTLFunction CreateFunction(IMTLLibrary library, string entryPoint)
-        // MSL 保留真实入口名（不像 GLSL 恒为 main），找不到就是源码与这里的名字走样了。
+        // MSL keeps the real entry-point names (unlike GLSL, which is always main), so a failure to find one means the source and the name here have diverged.
         => library.CreateFunction(entryPoint)
-            ?? throw new InvalidOperationException($"贴花着色器未找到入口 {entryPoint}。");
+            ?? throw new InvalidOperationException($"Decal shader entry point {entryPoint} not found.");
 
     /// <summary>
-    /// 两种混合语义共用一套着色器，只是源因子不同：
-    /// Modulate 用 <c>dst * src</c>（SourceRgb = DestinationColor, DestinationRgb = Zero）把像素输出当成调制量，
-    /// Additive 用 <c>dst + src</c>。alpha 一律保留目标值，贴花不参与后续的 alpha 判定。
+    /// The two blend semantics share one shader, differing only in the source factors:
+    /// Modulate uses <c>dst * src</c> (SourceRgb = DestinationColor, DestinationRgb = Zero), treating the pixel output as the modulation amount,
+    /// and Additive uses <c>dst + src</c>. alpha always keeps the target value, and decals do not participate in subsequent alpha tests.
     ///
-    /// <paramref name="roughness"/> 为 true 时挂第二个颜色附件（SceneNormal）。它只开 B 通道写掩码，
-    /// 并用 coverage 在原值上插值，所以八面体法线与金属度不被碰。
+    /// When <paramref name="roughness"/> is true, a second color attachment (SceneNormal) is attached. It enables only the B channel write mask,
+    /// and interpolates onto the original value using coverage, so the octahedral normal and metallic are not touched.
     /// </summary>
     IMTLRenderPipelineState CreatePipeline(IMTLFunction fragment, bool additive, bool roughness)
     {
@@ -106,7 +106,7 @@ internal sealed class MTLDecalPipeline : DecalPipeline
             Label = (additive ? "Season-Decal-Add" : "Season-Decal-Mod") + (roughness ? "-Rough" : string.Empty),
             VertexFunction = _vertexFunction,
             FragmentFunction = fragment,
-            // 贴花 Pass 特意不挂深度：深度这一帧是采样源，同一资源不能既采样又当附件。
+            // The decal Pass deliberately does not attach depth: depth is a sampling source this frame, and the same resource cannot be both sampled and used as an attachment.
             DepthAttachmentPixelFormat = MTLPixelFormat.Invalid,
             StencilAttachmentPixelFormat = MTLPixelFormat.Invalid,
             RasterSampleCount = 1,
@@ -122,8 +122,8 @@ internal sealed class MTLDecalPipeline : DecalPipeline
         color.DestinationAlphaBlendFactor = MTLBlendFactor.One;
         if (roughness)
         {
-            // 只写 .z（Blue）：法线的八面体编码在 .xy，反射权重在 .w，两者必须保留。
-            // 混合用 coverage 做 lerp，coverage 为 0 时结果恰好等于原值，所以「不碰粗糙度」的贴花不会改变目标。
+            // Only .z (Blue) is written: the normal's octahedral encoding is in .xy and the reflection weight in .w, and both must be preserved.
+            // The blend lerps using coverage, and when coverage is 0 the result is exactly the original value, so a "does not touch roughness" decal does not change the target.
             var normal = desc.ColorAttachments[1];
             normal.PixelFormat = MTLPixelFormat.RGBA16Float;
             normal.BlendingEnabled = true;
@@ -137,25 +137,25 @@ internal sealed class MTLDecalPipeline : DecalPipeline
         }
         var pipeline = Device.MtlDevice.CreateRenderPipelineState(desc, out NSError? error);
         return pipeline ?? throw new InvalidOperationException(
-            $"贴花 PSO 创建失败：{error?.LocalizedDescription ?? "(no NSError)"}");
+            $"Decal PSO creation failed: {error?.LocalizedDescription ?? "(no NSError)"}");
     }
 
     static bool Readable(IMTLTexture? texture, MTLTextureType type) => texture != null
         && texture.Handle != IntPtr.Zero && texture.TextureType == type
         && texture.Width > 0 && texture.Height > 0 && (texture.Usage & MTLTextureUsage.ShaderRead) != 0;
 
-    /// <summary>后端纹理字典里的贴图：包装对象已就绪、底层纹理可采样。纹理尚未上传完的贴花整个跳过。</summary>
+    /// <summary>A texture in the backend texture dictionary: the wrapper object is ready and the underlying texture is samplable. Decals whose texture has not finished uploading are skipped entirely.</summary>
     static bool Samplable(Texture? texture) => texture != null && Volatile.Read(ref texture.Ready)
         && Readable(texture.Image, MTLTextureType.k2D);
 
     /// <summary>
-    /// 核对形状并把资源折成引用快照。返回 false 表示本帧放弃：贴花只在「颜色是单采样 HDR、深度与颜色同尺寸」
-    /// 这一种形状下成立，其余情况宁可不出图也不出错图。
+    /// Verifies the shape and folds the resources into a reference snapshot. Returning false means giving up this frame: a decal only holds
+    /// under the one shape of "color is single-sample HDR and depth has the same size as color"; in all other cases it is better to produce no image than a wrong one.
     ///
-    /// 法线目标在 s9 之后是<b>附件</b>而不是采样源：同一个资源不能同时是附件与采样源。
-    /// 与 DX 不同的是这一端不回退：<see cref="Device.BeginPass"/> 挂不挂颜色附件 1 只取决于
-    /// <see cref="DecalInputs.WriteRoughness"/>，而 Metal 把附件数量烘进了 PSO ——
-    /// 若这里降级成单附件 PSO，实际 Pass 却挂着两个附件。宁可整帧不出贴花也不赌一个未定义的附件数。
+    /// After s9 the normal target is an <b>attachment</b> rather than a sampling source: the same resource cannot be both an attachment and a sampling source.
+    /// Unlike DX, this backend does not fall back: whether <see cref="Device.BeginPass"/> attaches color attachment 1 depends only on
+    /// <see cref="DecalInputs.WriteRoughness"/>, while Metal bakes the attachment count into the PSO ——
+    /// if it degraded to a single-attachment PSO here, the actual Pass would still be attaching two attachments. Better to produce no decals for the whole frame than to gamble on an undefined attachment count.
     /// </summary>
     bool Resolve(in DecalInputs inputs, MTLRenderTarget destination, out bool roughness)
     {
@@ -167,7 +167,7 @@ internal sealed class MTLDecalPipeline : DecalPipeline
             || color.Desc.ColorFormat != RtFormat.Rgba16Float || destination.Desc.ColorFormat != RtFormat.Rgba16Float
             || color.Desc.SampleCount > 1 || depth.Desc.SampleCount > 1 || destination.Desc.SampleCount > 1
             || depth.Desc.ColorFormat != RtFormat.None || depth.Desc.DepthFormat != RtFormat.D32Float
-            // 本 Pass 把颜色目标同时当作混合底图，共享层因此必须交出同一张目标。
+            // This Pass uses the color target as the blend backdrop at the same time, so the sharing layer must hand over the same target.
             || !ReferenceEquals(destination, color)
             || color.Width <= 0 || color.Height <= 0 || color.Width != depth.Width || color.Height != depth.Height
             || inputs.Count <= 0 || inputs.Count > DecalMath.MaxDecals) return false;
@@ -179,8 +179,8 @@ internal sealed class MTLDecalPipeline : DecalPipeline
         if (depthTexture == null || depthTexture.PixelFormat != MTLPixelFormat.Depth32Float
             || !Readable(depthTexture, MTLTextureType.k2D)) return false;
 
-        // 粗糙度写入要求法线目标与颜色同形。Metal 的附件数烘在 PSO 里，所以形状不符时整帧放弃而不是降级，
-        // 否则就会出现「两个附件 + 单附件 PSO」的未定义组合。
+        // Roughness writing requires the normal target to have the same shape as the color. Metal bakes the attachment count into the PSO, so on a shape mismatch it gives up the whole frame rather than degrading,
+        // otherwise you would get the undefined combination of "two attachments + a single-attachment PSO".
         MTLRenderTarget? normal = null;
         IMTLTexture? normalTexture = null;
         if (inputs.WriteRoughness)
@@ -203,7 +203,7 @@ internal sealed class MTLDecalPipeline : DecalPipeline
     {
         ClearPrepared();
         var command = Device.GraphicsCommandBuffer;
-        // Metal 的 Pass 就是编码器，所以「在 Pass 之外」等价于当前没有渲染编码器。
+        // On Metal the Pass is the encoder, so "outside a Pass" is equivalent to there being no render encoder currently.
         if (_disposed || Device.GraphicsEncoder != null || command == null || command.Handle == IntPtr.Zero
             || destination is not MTLRenderTarget target || !Resolve(inputs, target, out bool roughness)) return false;
 
@@ -213,7 +213,7 @@ internal sealed class MTLDecalPipeline : DecalPipeline
         _command = command;
         _frameIndex = Device.FrameIndex;
 
-        // s3 逐贴花纹理：只查字典，不在这里加载。名字未注册或还没上传完的贴花整个跳过。
+        // s3 per-decal textures: only looks up the dictionary, does not load here. Decals whose name is unregistered or whose upload has not finished are skipped entirely.
         Array.Clear(_drawTextures);
         Array.Clear(_drawSkip);
         lock (_textures)
@@ -252,33 +252,33 @@ internal sealed class MTLDecalPipeline : DecalPipeline
             || frameIndex != Device.FrameIndex || Device.ActivePassId != RenderPassId.SceneDecal
             || !ReferenceEquals(destination, Device.ActiveColorTarget)
             || Device.ActiveColorTexture?.Handle != colorTexture.Handle
-            // 附件形状只能从实际绑定反推：法线有没有挂成附件决定用哪一档 PSO。
+            // The attachment shape can only be inferred from the actual bindings: whether the normal is attached decides which PSO tier to use.
             || roughness != (Device.ActiveNormalTexture != null)
             || (roughness && Device.ActiveNormalTexture!.Handle != normalTexture!.Handle)) return false;
 
         var pipeline = _pipelines[0, roughness ? 1 : 0];
         if (pipeline == null) return false;
 
-        // 主管线每条绘制都重绑 PSO、深度状态、剔除与顶点槽 0..4，所以这里的覆写不会泄漏到后续绘制。
+        // The main pipeline rebinds the PSO, depth state, culling, and vertex slots 0..4 on every draw, so the overrides here do not leak into subsequent draws.
         encoder.SetDepthStencilState(_noDepthState!);
-        // 绕序在 Metal 上是编码器动态状态，不是 PSO 状态：默认的 CounterClockwise 会让
-        // 「只留背面」剔错一侧（Metal 的绕序在 y 向下的帧缓冲坐标里判定，与 DX 的默认正好相反），
-        // 所以这里显式对齐主管线：顺时针为正面，Front 剔除 = 剔掉 DX 也会剔掉的那一侧。
+        // Winding is an encoder dynamic state on Metal, not a PSO state: the default CounterClockwise would make
+        // "keep only back faces" cull the wrong side (Metal's winding is determined in y-down frame-buffer coordinates, exactly the opposite of DX's default),
+        // so here it is explicitly aligned with the main pipeline: clockwise is front-facing, and Front culling = culling the side DX would cull too.
         encoder.SetFrontFacingWinding(MTLWinding.Clockwise);
-        // 只留背面：投影盒是凸体，背面在每个像素上恰好命中一次。
+        // Keep only back faces: the projection box is convex, so a back face is hit exactly once per pixel.
         encoder.SetCullMode(MTLCullMode.Front);
         encoder.SetVertexBuffer(frame.Buffer, 0, 0);
         encoder.SetFragmentBuffer(frame.Buffer, 0, 0);
-        // 无贴图时着色器不会采样，但绑定必须合法：与 DX/VK 一样拿深度图占位。
+        // With no texture the shader does not sample, but the binding must be valid: like DX/VK, use the depth map as a placeholder.
         encoder.SetFragmentTexture(depthTexture, 0);
         encoder.SetFragmentTexture(depthTexture, 1);
 
         int mode = -1;
-        // MSL 侧是 uint4，字节原样拷贝，必须写整数位；写 float 会让第二个贴花起的偏移越界。
+        // The MSL side is a uint4 and the bytes are copied as-is, so integer bits must be written; writing a float would make the offsets from the second decal onward go out of bounds.
         var parameters = stackalloc uint[4];
         for (int i = 0; i < inputs.Count; i++)
         {
-            // 贴图没就绪的贴花整个跳过：采样一个占位纹理会把「还没加载完」画成一块错误颜色。
+            // Decals whose texture is not ready are skipped entirely: sampling a placeholder texture would render "not yet finished loading" as a patch of wrong color.
             if (_drawSkip[i]) continue;
             var draw = inputs.Draws[i];
             int next = draw.Mode == DecalMode.Additive ? 1 : 0;
@@ -291,7 +291,7 @@ internal sealed class MTLDecalPipeline : DecalPipeline
             }
             var texture = _drawTextures[i];
             if (texture != null) encoder.SetFragmentTexture(texture.Image, 1);
-            // 贴花槽位只到 64，uint4 足够；顶点与像素读的是同一份，所以两个阶段都要推。
+            // Decal slots only go up to 64, so a uint4 is enough; the vertex and pixel stages read the same copy, so both stages must push it.
             parameters[0] = (uint)draw.Index;
             encoder.SetVertexBytes((IntPtr)parameters, 16, 1);
             encoder.SetFragmentBytes((IntPtr)parameters, 16, 1);
@@ -307,8 +307,8 @@ internal sealed class MTLDecalPipeline : DecalPipeline
         _colorTexture = null; _depthTexture = null; _normalTexture = null;
         _frame = null; _command = null; _inputs = default;
         _frameIndex = 0; _writeRoughness = false;
-        // 逐贴花的纹理与跳过表不在这里清：Draw 在 ClearPrepared 之后仍要消费它们，
-        // 而 Prepare 一定先于 Draw 发生，所以在 Prepare 入口清才是安全的。
+        // The per-decal textures and skip table are not cleared here: Draw still needs to consume them after ClearPrepared,
+        // and Prepare always happens before Draw, so clearing at the entry of Prepare is the safe choice.
     }
 
     public override void Dispose()
@@ -318,7 +318,7 @@ internal sealed class MTLDecalPipeline : DecalPipeline
         ClearPrepared();
         Array.Clear(_drawTextures);
         Array.Clear(_drawSkip);
-        // 已编码资源由 command buffer 持有（Device 规则 5），所以立即释放是安全的；未编码的准备结果已经失效。
+        // Encoded resources are held by the command buffer (Device rule 5), so immediate release is safe; unencoded preparation results are already invalid.
         for (int i = 0; i < 2; i++)
             for (int j = 0; j < 2; j++)
             {
@@ -326,7 +326,7 @@ internal sealed class MTLDecalPipeline : DecalPipeline
                 _pipelines[i, j] = null;
             }
         _noDepthState?.Dispose(); _noDepthState = null;
-        // 函数是本类持有的，要放掉；库不是 —— 它归 MTLShaderCompiler 的源码缓存所有。
+        // The functions are held by this class and must be released; the library is not —— it belongs to MTLShaderCompiler's source cache.
         _vertexFunction?.Dispose(); _vertexFunction = null;
         _fragmentFunction?.Dispose(); _fragmentFunction = null;
         _fragmentRoughnessFunction?.Dispose(); _fragmentRoughnessFunction = null;

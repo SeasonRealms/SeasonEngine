@@ -53,11 +53,11 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     Vector4 _outline2DInstanceColor;
     float _outline2DInstanceWidth;
 
-    // === A7 逐实例 GPU 剔除 ===
-    // Web 这一端没有"group"对象，剔除目标只能挂在网格实例宿主上；C# 侧只持有 StorageBuffer 的 JS 句柄，
-    // 真正的 GPUBuffer 在 JS 的 _storageBuffers[Id] 里。与另外三端的一处结构差异是本类的实例流
-    // 每帧由 C# 逐字节下发，但上传时机仍与另外三端一致：都延后到 Record 相位，
-    // 由 InstanceCullEffect 在 Pass 之外回调 PrepareCullInputs（WebGPU 的 writeBuffer 同样不允许在 Pass 内调用）。
+    // === A7 per-instance GPU culling ===
+    // The Web side has no "group" object, so the cull target can only hang off the mesh-instance host; the C# side only holds the JS handle of the StorageBuffer,
+    // while the real GPUBuffer lives in JS _storageBuffers[Id]. One structural difference from the other three backends is that this class's instance stream
+    // is pushed down byte by byte by C# every frame, but the upload timing still matches the other three: all are deferred to the Record phase,
+    // where InstanceCullEffect calls back PrepareCullInputs outside any Pass (WebGPU's writeBuffer is likewise not allowed inside a Pass).
 
     Season.Rendering.StorageBuffer? _cullSource;
     Season.Rendering.StorageBuffer? _cullSorted;
@@ -65,12 +65,12 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     Season.Rendering.StorageBuffer? _cullVisible;
     Season.Rendering.StorageBuffer? _cullPrimInfo;
     int _cullCapacity = -1;
-    /// <summary>已上传到 GPU 的参数表条数。与 <see cref="_cullPrimPendingCount"/> 不等时说明本帧要重传。</summary>
+    /// <summary>Number of parameter-table entries already uploaded to the GPU. A mismatch with <see cref="_cullPrimPendingCount"/> means this frame must re-upload.</summary>
     int _cullPrimitiveCount = -1;
-    /// <summary>CPU 侧已构造好的参数表字节：构造随时可做，上传要等 Pass 之外的相位
-    ///（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。</summary>
+    /// <summary>Parameter-table bytes already built on the CPU side: building can happen at any time, but uploading must wait for a phase outside the Pass
+    /// (see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>).</summary>
     byte[]? _cullPrimPendingBytes;
-    /// <summary>CPU 侧参数表的条数，-1 表示还没构造过。</summary>
+    /// <summary>Entry count of the CPU-side parameter table; -1 means it has not been built yet.</summary>
     int _cullPrimPendingCount = -1;
     bool _cullRegistered;
     Vector3 _cullLocalCenter;
@@ -78,13 +78,13 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     bool _cullDrawReady;
 
     /// <summary>
-    /// 参数表签名：一位一个 surface，取与 <c>DrawInstancedMesh3DShadow</c> 完全相同的谓词（非透明 + 有几何 + 已上传）。
-    /// 用位掩码而不是计数是因为只比个数会把"少一个 surface、多一个 surface"当成没变，
-    /// 而 indexCount 一旦错位画出来就是错的。
+    /// Parameter-table signature: one bit per surface, using exactly the same predicate as <c>DrawInstancedMesh3DShadow</c> (opaque + has geometry + uploaded).
+    /// A bit mask is used instead of a count because comparing only the count would treat "one fewer surface, one more surface" as unchanged,
+    /// and once indexCount is misaligned the draw is simply wrong.
     /// </summary>
     int _cullPrimMask = -1;
-    /// <summary>待上传的掩码。两者分开是因为 <see cref="_cullPrimMask"/> 是与绘制端对齐的已上传状态，
-    /// 而这张表可能已经因为几何变化被重建：先写好待传值，上传成功才让绘制端看见。</summary>
+    /// <summary>Mask pending upload. The two are kept separate because <see cref="_cullPrimMask"/> is the uploaded state aligned with the draw side,
+    /// while this table may already have been rebuilt due to geometry changes: write the pending value first, and only let the draw side see it after a successful upload.</summary>
     int _cullPrimPendingMask = -1;
     readonly int[] _cullPrimIndexCounts = new int[Season.Rendering.InstanceCull.MaxPrimitives];
 
@@ -238,8 +238,8 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
         TransformInitialized = true;
         MeshAlpha = mesh.Alpha;
 
-        // A7：剔除输入与 IA 实例流逐位相同（都是 20 floats = 80B，与 InstanceCull.WorldStride 一致），
-        // 所以直接复用 InstanceBytes，不多存一份副本。
+        // A7: the cull input is bit-for-bit identical to the IA instance stream (both are 20 floats = 80B, matching InstanceCull.WorldStride),
+        // so reuse InstanceBytes directly instead of keeping another copy.
         UpdateCullUpload(mesh);
     }
 
@@ -285,15 +285,15 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     }
 
     // ============================================================
-    // A7 逐实例 GPU 剔除
+    // A7 per-instance GPU culling
     // ============================================================
 
     int Season.Rendering.IInstanceCullTarget.CullInstanceCount => EnabledInstanceCount;
 
     int Season.Rendering.IInstanceCullTarget.CullCapacity => _cullCapacity;
 
-    /// <summary>参数表尚未与绘制端对齐时回落为 0，于是共享层早退、本网格退回 CPU 整批剔除，
-    /// 而不是拿错位的索引区间去画。</summary>
+    /// <summary>Falls back to 0 while the parameter table is not yet aligned with the draw side, so the shared layer early-returns and this mesh falls back to whole-batch CPU culling,
+    /// rather than drawing with a misaligned index range.</summary>
     int Season.Rendering.IInstanceCullTarget.CullPrimitiveCount => _cullPrimitiveCount;
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSourceWorlds => _cullSource;
@@ -310,7 +310,7 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
 
     Vector3 Season.Rendering.IInstanceCullTarget.CullLocalExtents => _cullLocalExtents;
 
-    /// <summary>本帧能否直接走间接阴影绘制：容量、句柄、参数表三项任一不就绪就为 false。</summary>
+    /// <summary>Whether this frame can go straight to indirect shadow drawing: false when any of capacity, handles, or the parameter table is not ready.</summary>
     internal bool TryGetCullDrawHandles(out string sortedId, out string argsId, out int capacity)
     {
         sortedId = string.Empty;
@@ -328,8 +328,8 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
         return true;
     }
 
-    /// <summary>每帧 Update 末尾调用一次：只备资源。矩阵流上传延后到 Record 相位，
-    /// 见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>。</summary>
+    /// <summary>Called once at the end of each frame's Update: only prepares resources. The matrix-stream upload is deferred to the Record phase,
+    /// see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>.</summary>
     void UpdateCullUpload(Season.Controls.InstancedMesh3D mesh)
     {
         _cullDrawReady = false;
@@ -340,8 +340,8 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     }
 
     /// <summary>
-    /// 按实例数准备剔除资源。容量按 64 对齐，于是实例数小幅抖动不会每帧重建五个缓冲；
-    /// 但接口上报的容量必须是真实容量，否则序号表会按本帧实例数寻址而与内核写入错位。
+    /// Prepares cull resources for the instance count. Capacity is aligned to 64, so small instance-count jitter does not rebuild the five buffers every frame;
+    /// but the capacity reported through the interface must be the real capacity, or the index table would address by this frame's instance count and misalign with the kernel writes.
     /// </summary>
     void EnsureCullResources(int count, Season.Controls.InstancedMesh3D mesh)
     {
@@ -350,7 +350,7 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
             ReleaseCullResources();
             return;
         }
-        // 实例数掉到 0 不等于要释放：隐藏再显示会因此每帧重建五个缓冲。
+        // An instance count dropping to 0 does not mean release: hiding and re-showing would otherwise rebuild the five buffers every frame.
         if (count <= 0)
             return;
 
@@ -372,7 +372,7 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
             }
             catch (Exception ex)
             {
-                DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] 缓冲创建失败：{ex.Message}");
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] Buffer creation failed: {ex.Message}");
             }
 
             if (_cullSource == null || _cullSorted == null || _cullVisible == null
@@ -398,10 +398,10 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     }
 
     /// <summary>
-    /// 只构造参数表字节，不碰 GPU —— 构造与上传的安全时机不同：构造随时可做，
-    /// 上传要等 Pass 之外（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。
-    /// 参数表的索引区间必须与 <c>DrawInstancedMesh3DShadow</c> 的迭代顺序逐位对齐，
-    /// 所以谓词取完全相同的一份：非透明 + 有几何 + 已上传。
+    /// Only builds the parameter-table bytes, without touching the GPU - building and uploading have different safe timings: building can happen at any time,
+    /// while uploading must wait for a phase outside the Pass (see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>).
+    /// The index ranges in the parameter table must be bit-for-bit aligned with the iteration order of <c>DrawInstancedMesh3DShadow</c>,
+    /// so the same predicate is used: opaque + has geometry + uploaded.
     /// </summary>
     void EnsureCullPrimitiveInfo(Season.Controls.InstancedMesh3D mesh)
     {
@@ -411,7 +411,7 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
         int surfaces = mesh.Surfaces.Count;
         if (surfaces > 31)
         {
-            // 一位一个 surface 才装得下；装不下就明确放弃本网格的 GPU 剔除，而不是取前 16 个就当完事。
+            // One bit per surface is the only way it fits; if it does not fit, explicitly abandon GPU culling for this mesh, rather than taking the first 16 and calling it done.
             AbandonCullPrimitiveInfo();
             return;
         }
@@ -458,8 +458,8 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     }
 
     /// <summary>
-    /// 参数表用不了：待传值与已上传值一起清掉。只清待传值是不够的 ——
-    /// 已上传值仍在发布给绘制端，它会让绘制端按一张过期的表去取索引区间。
+    /// The parameter table is unusable: clear the pending value together with the uploaded value. Clearing only the pending value is not enough -
+    /// the uploaded value is still published to the draw side, which would make it fetch index ranges from a stale table.
     /// </summary>
     void AbandonCullPrimitiveInfo()
     {
@@ -471,9 +471,9 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     }
 
     /// <summary>
-    /// A7：把剔除的 CPU 侧输入传到 GPU。由 InstanceCullEffect 在每次派发之前回调，
-    /// 那个相位在所有 Pass 之外 —— WebGPU 的 writeBuffer 不允许在 Pass 内调用。
-    /// 矩阵流与 IA 实例流逐位相同（都是 20 floats = 80B，与 WorldStride 一致），所以复用 InstanceBytes。
+    /// A7: uploads the cull CPU-side inputs to the GPU. Called back by InstanceCullEffect before each dispatch,
+    /// in a phase outside all Passes - WebGPU's writeBuffer is not allowed inside a Pass.
+    /// The matrix stream is bit-for-bit identical to the IA instance stream (both are 20 floats = 80B, matching WorldStride), so InstanceBytes is reused.
     /// </summary>
     bool Season.Rendering.IInstanceCullTarget.PrepareCullInputs()
     {
@@ -483,8 +483,8 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
 
         var g = Season.Basic.Graphics.Instance;
 
-        // 参数表跟着几何走而不跟帧走；掩码要和条数一起比，否则"少一个 surface、多一个 surface"
-        // 会因条数不变而被当成没事发生，indexCount 从此整体错位。
+        // The parameter table follows geometry, not frames; the mask must be compared together with the count, otherwise "one fewer surface, one more surface"
+        // would be treated as a no-op because the count is unchanged, and indexCount would be misaligned from then on.
         if (_cullPrimPendingCount != _cullPrimitiveCount || _cullPrimPendingMask != _cullPrimMask)
         {
             if (_cullPrimPendingCount <= 0 || _cullPrimPendingBytes == null || _cullPrimInfo == null)
@@ -497,7 +497,7 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
             _cullPrimMask = _cullPrimPendingMask;
         }
 
-        // 矩阵流每帧都变，只传有效段，不留余量。
+        // The matrix stream changes every frame; upload only the valid range, with no slack.
         if (_cullSource == null)
             return false;
         int sourceBytes = count * (int)Season.Rendering.InstanceCull.WorldStride;
@@ -507,8 +507,8 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     }
 
     /// <summary>
-    /// 组级合并盒：内核只收一个盒，所以把全部 surface 的顶点局部 AABB 并起来。
-    /// 几何在加载后不变，所以在拿到首个非退化盒之后就不再重算，不进每帧热路径。
+    /// Group-level merged box: the kernel takes only one box, so merge the vertex local AABBs of all surfaces.
+    /// Geometry does not change after loading, so once the first non-degenerate box is obtained it is never recomputed, staying off the per-frame hot path.
     /// </summary>
     void UpdateCullLocalBounds(Season.Controls.InstancedMesh3D mesh)
     {
@@ -542,9 +542,9 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     }
 
     /// <summary>
-    /// A7：在三次派发之后由 InstanceCullEffect 回调，核定本帧能否走间接绘制。
-    /// Web 没有显式屏障可发：compute pass 与 render pass 的命令次序加 queue 提交顺序就是同步点，
-    /// 与 Metal 同属“提交模型代管”的一侧，所以这里只做准入校验。
+    /// A7: called back by InstanceCullEffect after the three dispatches to determine whether this frame can go indirect.
+    /// The Web has no explicit barrier to issue: the command order of the compute pass and render pass plus the queue submission order is the synchronization point,
+    /// putting it on the same "submission-model-managed" side as Metal, so only an admission check is done here.
     /// </summary>
     public bool PrepareCullDraw()
     {
@@ -582,7 +582,7 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
         _cullDrawReady = false;
     }
 
-    /// <summary>卸载时把剔除目标从共享层撤掉，否则列表里会留下指向已死 JS 句柄的引用。</summary>
+    /// <summary>On unload, remove the cull target from the shared layer, otherwise the list would keep a reference to a dead JS handle.</summary>
     public void Dispose() => ReleaseCullResources();
 
     // Writes instance world matrices into a persistent byte buffer

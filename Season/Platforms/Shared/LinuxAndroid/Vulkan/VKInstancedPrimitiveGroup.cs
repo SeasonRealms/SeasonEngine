@@ -84,22 +84,24 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
     }
 
     // ============================================================
-    // A7 逐实例 GPU 剔除
+    // A7: per-instance GPU culling
     // ============================================================
-    // 由派生类在自己上传完实例后再调 UpdateCullUpload；没调的那些组保持全 null，
-    // 共享层直接早退，阴影自然退回 CPU 整批剔除。
+    // Derived classes call UpdateCullUpload after uploading their own instances; groups that never
+    // call it stay all-null, so the shared layer bails out early and shadows fall back to CPU
+    // whole-batch culling.
     Season.Rendering.StorageBuffer? _cullSource;
     Season.Rendering.StorageBuffer? _cullSorted;
     Season.Rendering.StorageBuffer? _cullArgs;
     Season.Rendering.StorageBuffer? _cullVisible;
     Season.Rendering.StorageBuffer? _cullPrimInfo;
     int _cullCapacity = -1;
-    /// <summary>已上传到 GPU 的参数表条数。与 <see cref="_cullPrimInfoPending"/> 不等时说明本帧要重传。</summary>
+    /// <summary>Number of primitive-info entries already uploaded to the GPU. When it differs from <see cref="_cullPrimInfoPending"/>, this frame must re-upload.</summary>
     int _cullPrimitiveCount = -1;
-    /// <summary>CPU 侧已构造好的参数表字节：构造随时可做，上传必须等命令列表进入录制态
-    ///（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。</summary>
+    /// <summary>CPU-side prebuilt primitive-info bytes: building can happen at any time, but the upload
+    /// must wait until the command list enters the recording state
+    /// (see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>).</summary>
     byte[]? _cullPrimInfoBytes;
-    /// <summary>CPU 侧参数表的条数，-1 表示还没构造过。</summary>
+    /// <summary>Number of CPU-side primitive-info entries; -1 means it has never been built.</summary>
     int _cullPrimInfoPending = -1;
     bool _cullRegistered;
     bool _cullDrawReady;
@@ -123,8 +125,9 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
     }
 
     /// <summary>
-    /// 把全部 primitive 的局部包围盒并成组级合并盒。剔除内核只收一个盒，传单个 surface 的盒
-    /// 会让其余 surface 的实例在盒外被成批误剔。
+    /// Merge the local bounding boxes of all primitives into a group-level combined box. The cull
+    /// kernel takes only one box, so passing a single surface's box would wrongly cull the
+    /// instances of the other surfaces in one batch when they fall outside it.
     /// </summary>
     void UpdateCullLocalBounds()
     {
@@ -173,7 +176,7 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
         if (!_transformInitialized || _instanceCount == 0)
             return;
 
-        // 收集期把本分组钉在快照页上：重放时实例缓冲与图元描述符集仍会被引用。
+        // Pin this group on the snapshot page during collection: during replay the instance buffer and the primitive descriptor sets are still referenced.
         VKSceneDrawCollection.RetainOwner(this);
 
         var cmd = Device.GraphicsCommandBuffer;
@@ -201,8 +204,9 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
             for (int orderIndex = 0; orderIndex < _transparentInstanceOrder.Count; orderIndex++)
             {
                 int instanceIndex = _transparentInstanceOrder[orderIndex];
-                // 实例矩阵只存在于 CPU 侧（_instanceWorlds），GPU 侧的实例流是不可回读的；
-                // 所以透明排序深度必须由这里给出，否则收集期只能退化到图元级深度。
+                // The instance matrices exist only on the CPU side (_instanceWorlds); the GPU-side
+                // instance stream cannot be read back. So the transparent sort depth must be supplied
+                // here, otherwise collection can only fall back to primitive-level depth.
                 float depth = ComputeTransparentDepth(_instanceWorlds[instanceIndex], primitive.LocalBoundsCenter);
                 if (primitive.DoubleSided)
                 {
@@ -245,10 +249,12 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
         var cmd = Device.GraphicsCommandBuffer;
         int fi = (int)Device.FrameIndex;
 
-        // 和 VKPrimitiveGroup / VKInstancedModel.DrawShadow 同一套契约：binding 16-20 必须在本帧
-        // 第一次绑定之前对齐，否则主通道的 PreparePrimitive 会在「已被本帧录制的 set」上补写，
-        // 未声明 UPDATE_AFTER_BIND 的集合因此让整条命令缓冲失效。
-        // 实例分组不走场景收集，主通道也不会替它登记，所以这里同时把画过的图元交给下一帧的帧首预刷新。
+        // Same contract as VKPrimitiveGroup / VKInstancedModel.DrawShadow: bindings 16-20 must be
+        // aligned before the first bind of this frame, otherwise the main pass's PreparePrimitive
+        // patches a set already recorded this frame, and sets without UPDATE_AFTER_BIND declared
+        // then invalidate the entire command buffer.
+        // Instanced groups bypass scene collection and the main pass will not register them either,
+        // so here we also hand the drawn primitives to the next frame's frame-start pre-refresh.
         for (int i = 0; i < _opaquePrimitives.Count; i++)
         {
             var primitive = _opaquePrimitives[i];
@@ -262,7 +268,7 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
                 ref primitive.SkyViewViewVersions[fi]);
         }
 
-        // A7：本帧剔除链路已就绪时，实例流改读本槽位的重排分段，索引数与实例数由间接参数给出。
+        // A7: when this frame's cull chain is ready, the instance stream instead reads this slot's reordered segment, with index count and instance count supplied by the indirect args.
         if (_cullDrawReady && _cullCapacity >= _instanceCount
             && _cullSorted is VKStorageBuffer sorted && sorted.Buffer.Buffer.Handle != 0
             && _cullArgs is VKStorageBuffer args && args.Buffer.Buffer.Handle != 0)
@@ -270,7 +276,7 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
             int slot = Season.Rendering.CascadedShadow.ActiveSlot;
             if (slot >= 0 && slot < Season.Rendering.InstanceCull.MaxSlots)
             {
-                // 偏移放在绑定上而不是参数里：firstInstance 会改变 gl_InstanceIndex 的起点。
+                // Put the offset on the binding rather than in the args: firstInstance shifts the starting point of gl_InstanceIndex.
                 ulong instanceOffset = (ulong)(slot * _cullCapacity) * Season.Rendering.InstanceCull.WorldStride;
                 for (int i = 0; i < _opaquePrimitives.Count; i++)
                 {
@@ -345,7 +351,7 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
     }
 
     // ============================================================
-    // A7 逐实例 GPU 剔除：资源面与交接
+    // A7: per-instance GPU culling -- resources and handoff
     // ============================================================
 
     int Season.Rendering.IInstanceCullTarget.CullInstanceCount => _instanceCount;
@@ -368,15 +374,16 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
 
     Vector3 Season.Rendering.IInstanceCullTarget.CullLocalExtents => _cullLocalExtents;
 
-    /// <summary>派生类在实例上传完成后调用：准备剔除资源。矩阵流上传延后到 Record 相位，
-    /// 见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>。</summary>
+    /// <summary>Derived classes call this after instance upload finishes: prepares the cull resources.
+    /// The matrix stream upload is deferred to the Record phase, see
+    /// <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>.</summary>
     protected void UpdateCullUpload()
     {
         _cullDrawReady = false;
         EnsureCullResources(_instanceCount);
     }
 
-    /// <summary>容量按 64 对齐，实例数小幅抖动因此不会每帧重建五个缓冲。</summary>
+    /// <summary>Capacity is aligned to 64 so small instance-count jitter does not recreate the five buffers every frame.</summary>
     void EnsureCullResources(int count)
     {
         if (!Season.Rendering.InstanceCull.Enabled)
@@ -384,7 +391,7 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
             ReleaseCullResources();
             return;
         }
-        // 实例数掉到 0 不等于要释放：隐藏再显示会因此每帧重建五个缓冲。
+        // An instance count of 0 does not mean we should release: hiding and re-showing would then recreate the five buffers every frame.
         if (count <= 0)
             return;
 
@@ -396,8 +403,9 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
             {
                 var g = Season.Basic.Graphics.Instance;
                 _cullSource = g.CreateStorageBuffer((uint)capacity * Season.Rendering.InstanceCull.WorldStride);
-                // 重排流会被直接绑成顶点流，所以必须声明为 ComputeAndVertexInput：
-                // VertexBufferBit 烘在创建期的 VkBufferUsageFlags 里，事后加不回来。
+                // The reordered stream is bound directly as a vertex stream, so it must be declared
+                // ComputeAndVertexInput: VertexBufferBit is baked into the creation-time
+                // VkBufferUsageFlags and cannot be added afterwards.
                 _cullSorted = g.CreateStorageBuffer(Season.Rendering.InstanceCull.SortedBytes(capacity),
                     Season.Rendering.StorageBufferUsage.ComputeAndVertexInput);
                 _cullVisible = g.CreateStorageBuffer((uint)(Season.Rendering.InstanceCull.MaxSlots * capacity) * 4u);
@@ -408,7 +416,7 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
             }
             catch (Exception ex)
             {
-                DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] 缓冲创建失败：{ex.Message}");
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] Buffer creation failed: {ex.Message}");
             }
 
             if (_cullSource == null || _cullSorted == null || _cullVisible == null
@@ -432,9 +440,11 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
     }
 
     /// <summary>
-    /// 只构造参数表字节，不碰 GPU —— 构造与上传的安全时机不同：构造随时可做，
-    /// 上传必须等命令缓冲进入录制态（见 <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>）。
-    /// primitive 集合不变就不重建。
+    /// Only builds the primitive-info bytes and never touches the GPU: building and uploading have
+    /// different safe timings -- building can happen at any time, while uploading must wait until
+    /// the command buffer enters the recording state
+    /// (see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>).
+    /// Nothing is rebuilt while the primitive set stays unchanged.
     /// </summary>
     void EnsureCullPrimitiveInfo()
     {
@@ -443,8 +453,9 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
         int n = _opaquePrimitives.Count;
         if (n <= 0 || n > Season.Rendering.InstanceCull.MaxPrimitives)
         {
-            // 明确记下"没有可传的参数表"：否则 PrepareCullInputs 会拿上一次的字节反复上传，
-            // 条数看起来对得上，内容却是过期的那一份。
+            // Explicitly record that there is no primitive-info table to upload: otherwise
+            // PrepareCullInputs would repeatedly upload the previous bytes, and the entry count
+            // would look right while the contents were the stale copy.
             _cullPrimInfoBytes = null;
             _cullPrimInfoPending = 0;
             _cullPrimitiveCount = 0;
@@ -467,9 +478,11 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
     }
 
     /// <summary>
-    /// A7：把剔除的 CPU 侧输入传到 GPU。由 InstanceCullEffect 在每次派发之前回调，
-    /// 那个相位在 BeforeRender 之后、所有 Pass 之外，也是 Vulkan 命令缓冲唯一处于录制态的时候 ——
-    /// 控制件的 Update 阶段 IsRecording 为假，上传会被静默丢弃，缓冲保持全零。
+    /// A7: upload the CPU-side cull inputs to the GPU. InstanceCullEffect calls this before every
+    /// dispatch; that phase runs after BeforeRender and outside all passes, and is the only time
+    /// the Vulkan command buffer is in the recording state -- during a control's Update phase
+    /// IsRecording is false, so uploads would be silently dropped and the buffer would stay all
+    /// zeros.
     /// </summary>
     bool Season.Rendering.IInstanceCullTarget.PrepareCullInputs()
     {
@@ -478,7 +491,7 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
 
         var g = Season.Basic.Graphics.Instance;
 
-        // 参数表跟着几何走而不跟帧走，所以只在条数变了时重传。
+        // The primitive-info table follows the geometry, not the frame, so it is re-uploaded only when the entry count changes.
         if (_cullPrimInfoPending != _cullPrimitiveCount)
         {
             if (_cullPrimInfoPending <= 0 || _cullPrimInfoBytes == null || _cullPrimInfo == null)
@@ -489,14 +502,15 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
             _cullPrimitiveCount = _cullPrimInfoPending;
         }
 
-        // 矩阵流每帧都变，只传有效段，不留余量。
+        // The matrix stream changes every frame, so upload only the valid range and no slack.
         return _cullSource != null && g.TryUpdateStorageBuffer(_cullSource,
             MemoryMarshal.AsBytes(_instanceData.AsSpan(0, _instanceCount)));
     }
 
     /// <summary>
-    /// A7：把 gather 写出的重排流与参数缓冲交接到绘制可读状态。必须在 Pass 之外执行，
-    /// 所以由 InstanceCullEffect 在三次派发之后回调。
+    /// A7: transition the reordered stream and args buffer written by gather into a
+    /// draw-readable state. This must run outside a pass, so InstanceCullEffect calls it after
+    /// the three dispatches.
     /// </summary>
     public bool PrepareCullDraw()
     {
@@ -512,7 +526,7 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
         if (cmd.Handle == 0 || Device.InRenderPass)
             return false;
 
-        // 顶点属性读取发生在 VertexInput 阶段，与 TryPrepareIndirectArgs 的 DrawIndirect 阶段不能互代。
+        // Vertex attribute reads happen in the VertexInput stage, which cannot substitute for the DrawIndirect stage of TryPrepareIndirectArgs.
         sorted.BarrierToVertexInput(cmd);
 
         if (!Season.Basic.Graphics.Instance.TryPrepareIndirectArgs(args))

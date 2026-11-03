@@ -6,7 +6,7 @@ using System.Numerics;
 
 namespace Season.Rendering;
 
-/// <summary>体积积分与 Froxel 坐标的 CPU 参考，实现用于数学测试和共享资源尺寸计算。</summary>
+/// <summary>CPU reference for volumetric integration and Froxel coordinates, used by math tests and shared resource size computation.</summary>
 public static class FogMath
 {
     public const float DepthOffset = 0.5f;
@@ -14,7 +14,7 @@ public static class FogMath
     public const int MaxFroxels = 1_500_000;
 
     internal static float Finite(float value)
-        => float.IsFinite(value) ? value : throw new ArgumentOutOfRangeException(nameof(value), "雾参数必须为有限数值。");
+        => float.IsFinite(value) ? value : throw new ArgumentOutOfRangeException(nameof(value), "Fog parameters must be finite values.");
 
     internal static Vector3 Finite(Vector3 value)
     {
@@ -40,7 +40,7 @@ public static class FogMath
         return (gx, gy, slices);
     }
 
-    /// <summary>前向深度切片边界；0 为相机原点，N 为最大前向距离。</summary>
+    /// <summary>Forward depth slice boundary; 0 is the camera origin, N is the maximum forward distance.</summary>
     public static float SliceDepth(float slice, int slices, float maxDistance)
     {
         if (slices <= 0 || maxDistance <= 0f) throw new ArgumentOutOfRangeException(nameof(slices));
@@ -55,14 +55,14 @@ public static class FogMath
             / Math.Log(1d + Finite(maxDistance) / DepthOffset));
     }
 
-    /// <summary>沿真实射线路程积分一个恒定系数段。累计值 RGB=L、A=T；恒等值为 (0,0,0,1)。</summary>
+    /// <summary>Integrate one constant-coefficient segment along the true ray path. Accumulated value RGB=L, A=T; identity is (0,0,0,1).</summary>
     public static Vector4 Integrate(Vector4 accumulated, Vector3 source, float extinction, float distance)
     {
         extinction = Math.Max(0f, Finite(extinction));
         distance = Math.Max(0f, Finite(distance));
         float opticalDepth = extinction * distance;
         float transmittance = MathF.Exp(-opticalDepth);
-        // 按光学厚度取极限，避免小消光、大距离时错误套用 Q*ds。
+        // Take the limit by optical depth to avoid wrongly applying Q*ds for small extinction and large distance.
         float integral = opticalDepth < 0.001f
             ? distance * (1f - opticalDepth * 0.5f + opticalDepth * opticalDepth / 6f)
             : (1f - transmittance) / extinction;
@@ -71,12 +71,12 @@ public static class FogMath
         return new Vector4(radiance, accumulated.W * transmittance);
     }
 
-    /// <summary>查询一列累计体，切片内部以局部 Q/sigma_t 补积分；范围外保持末端值。</summary>
+    /// <summary>Sample one accumulated column, completing integration inside the slice with the local Q/sigma_t; outside the range the end value is kept.</summary>
     public static Vector4 SampleColumn(ReadOnlySpan<Vector4> integrated, ReadOnlySpan<Vector4> local,
         float depth, float maxDistance, float rayLength)
     {
         if (local.Length == 0 || integrated.Length != local.Length + 1)
-            throw new ArgumentException("累计体必须包含 N+1 个边界，局部体必须包含 N 个系数。");
+            throw new ArgumentException("The accumulated volume must contain N+1 boundaries and the local volume must contain N coefficients.");
         Finite(depth);
         if (Finite(rayLength) < 1 || Finite(maxDistance) <= 0) throw new ArgumentOutOfRangeException(nameof(rayLength));
         if (depth <= 0) return new Vector4(0, 0, 0, 1);
@@ -87,7 +87,7 @@ public static class FogMath
             (depth - SliceDepth(slice, local.Length, maxDistance)) * rayLength);
     }
 
-    /// <summary>cosine 为观察射线与指向光源方向的夹角余弦，正 g 朝光源观察时增强。</summary>
+    /// <summary>cosine is the cosine of the angle between the view ray and the direction toward the light; a positive g strengthens when viewing toward the light.</summary>
     public static float Phase(float cosine, float anisotropy)
     {
         float g = Math.Clamp(Finite(anisotropy), -0.9f, 0.9f);
@@ -95,7 +95,7 @@ public static class FogMath
         return (1f - g * g) / (4f * MathF.PI * denominator * MathF.Sqrt(denominator));
     }
 
-    /// <summary>预乘透明颜色的雾合成；加法发光只衰减，不额外贡献背景雾光。</summary>
+    /// <summary>Fog composite of a premultiplied transparent color; additive emission only attenuates and contributes no extra background fog light.</summary>
     public static Vector4 CompositeTransparent(Vector4 premultiplied, Vector4 fog, bool additive = false)
     {
         var rgb = new Vector3(premultiplied.X, premultiplied.Y, premultiplied.Z) * fog.W;
@@ -103,25 +103,25 @@ public static class FogMath
         return new Vector4(rgb, premultiplied.W);
     }
 
-    /// <summary>深度使用本帧真实抖动投影的逆矩阵，UV 原点在左上角。</summary>
+    /// <summary>Depth uses the inverse of this frame's real jittered projection; the UV origin is the top-left corner.</summary>
     public static Vector3 ReconstructWorld(Vector2 uv, float depth, Matrix4x4 inverseViewProjection)
     {
         var homogeneous = Vector4.Transform(new Vector4(uv.X * 2f - 1f, 1f - uv.Y * 2f, depth, 1f), inverseViewProjection);
-        if (Math.Abs(homogeneous.W) < 1e-8f) throw new ArgumentException("深度反投影落在无穷远。");
+        if (Math.Abs(homogeneous.W) < 1e-8f) throw new ArgumentException("Depth unprojection lands at infinity.");
         return new Vector3(homogeneous.X, homogeneous.Y, homogeneous.Z) / homogeneous.W;
     }
 
-    /// <summary>返回每米前向深度的世界空间射线；长度通常大于 1，积分不能丢弃这个长度因子。</summary>
+    /// <summary>Return the world-space ray per meter of forward depth; the length is usually greater than 1, and integration must not drop this length factor.</summary>
     public static Vector3 RayPerForwardDepth(Vector2 uv, Matrix4x4 inverseUnjitteredViewProjection,
         Vector3 cameraPosition, Vector3 cameraForward)
     {
         var ray = ReconstructWorld(uv, 0.5f, inverseUnjitteredViewProjection) - cameraPosition;
         float forward = Vector3.Dot(ray, Vector3.Normalize(cameraForward));
-        if (forward <= 0f) throw new ArgumentException("Froxel 射线必须位于相机前方。");
+        if (forward <= 0f) throw new ArgumentException("Froxel rays must lie in front of the camera.");
         return ray / forward;
     }
 
-    /// <summary>固定整数哈希；与 RGBA8 噪声纹理的量化值一致。三个坐标均周期为 64。</summary>
+    /// <summary>Fixed integer hash; matches the quantized values of the RGBA8 noise texture. All three coordinates have period 64.</summary>
     public static float NoiseTexel(int x, int y, int z)
     {
         unchecked
@@ -133,7 +133,7 @@ public static class FogMath
         }
     }
 
-    /// <summary>手动周期三线性采样，八个 texel 均执行取模，避免 clamp 纹理的接缝。</summary>
+    /// <summary>Manual periodic trilinear sampling; all eight texels apply the modulo to avoid seams on a clamp texture.</summary>
     public static float PeriodicNoise(Vector3 uvw)
     {
         uvw = Finite(uvw);

@@ -24,11 +24,11 @@ internal unsafe static class Device
     internal static DescriptorAllocator DescriptorAllocator { get; } = new(2048);
 
     /// <summary>
-    /// A0.2：间接计算派发的命令签名。设备级单例 —— 签名只描述"一条 12 字节的 Dispatch 记录"，
-    /// 与调用方、与缓冲都无关，每帧新建它只会在驱动里多分配一次对象。
+    /// A0.2: command signature for indirect compute dispatch. A device-level singleton - the signature only describes "a 12-byte Dispatch record",
+    /// and is independent of the caller and of any buffer; recreating it every frame would only allocate one more object in the driver.
     ///
-    /// 记住创建它的设备指针而不是一个 bool：D3D12 设备一旦重建，旧签名就属于已销毁的设备，
-    /// 必须重新创建。Device 是静态类、没有"设备销毁"的钩子可挂，指针比较是唯一不依赖调用顺序的判据。
+    /// Remember the device pointer that created it rather than a bool: once the D3D12 device is recreated, the old signature belongs to a destroyed device and
+    /// must be recreated. Device is a static class with no "device destroyed" hook to attach to, so pointer comparison is the only criterion that does not depend on call order.
     /// </summary>
     static ID3D12CommandSignature* _dispatchCommandSignature;
 
@@ -44,8 +44,8 @@ internal unsafe static class Device
 
         ReleaseDispatchCommandSignature();
 
-        // 命令签名只描述记录格式，不改任何根参数，所以 root signature 必须传 null。
-        // ByteStride 取自共享层的 IndirectDispatchArgs：布局若漂移，会在这里而不是在画面里暴露。
+        // The command signature only describes the record format and does not change any root parameters, so the root signature must be passed as null.
+        // ByteStride comes from the shared layer's IndirectDispatchArgs: if the layout drifts it will surface here rather than in the picture.
         var argument = new IndirectArgumentDesc { Type = IndirectArgumentType.Dispatch };
         var desc = new CommandSignatureDesc
         {
@@ -66,8 +66,8 @@ internal unsafe static class Device
     {
         if (_dispatchCommandSignature == null)
             return;
-        // 签名在本次调用之前已经录制过的命令里不再被引用：ExecuteIndirect 在录制时就把签名内容解引用进
-        // 命令列表，之后 GPU 只读参数缓冲本身。所以这里可以直接释放，不必走延迟队列。
+        // The signature is no longer referenced by commands recorded before this call: ExecuteIndirect dereferences the signature contents into the
+        // command list at record time, after which the GPU only reads the argument buffer itself. So it can be released directly here, without going through the deferred queue.
         _dispatchCommandSignature->Release();
         _dispatchCommandSignature = null;
         _dispatchCommandSignatureOwner = 0;
@@ -971,6 +971,10 @@ internal unsafe static class Device
 
     internal static void WaitForGpu()
     {
+        // A removed device never completes a fence: Signal fails and the wait never returns, so a shutdown
+        // that runs after a TDR would hang instead of releasing anything.
+        if (IsDeviceGone()) return;
+
         ulong currentFenceValue = fenceValues[FrameIndex];
         DirectQueue.Signal(currentFenceValue);
         DirectQueue.WaitForFence(currentFenceValue);
@@ -982,7 +986,7 @@ internal unsafe static class Device
     /// an SEH exception instead of returning its HRESULT once the device is gone, so a throw counts as
     /// removed here rather than propagating out of a shutdown step that only wants to release resources.
     /// </summary>
-    static bool IsDeviceGone()
+    internal static bool IsDeviceGone()
     {
         if (D3dDevice == null) return true;
         try
@@ -1015,16 +1019,39 @@ internal unsafe static class Device
         catch (SEHException exception)
         {
             DumpDredReport(0);
-            throw new InvalidOperationException(
-                "D3D12 设备已被移除：GetDeviceRemovedReason 本身触发 SEH，本帧不再提交任何命令。", exception);
+            throw new DeviceRemovedException(
+                "D3D12 device has been removed: GetDeviceRemovedReason itself triggered an SEH, no commands will be submitted this frame.", exception);
         }
 
         if (reason == 0) return;
 
         DumpDredReport(reason);
-        throw new InvalidOperationException(
-            $"D3D12 设备已被移除（0x{reason:X8}：{Marshal.GetExceptionForHR(reason)?.Message}），本帧不再提交任何命令。");
+        throw new DeviceRemovedException(
+            $"D3D12 device has been removed (0x{(uint)reason:X8}: {DescribeRemovedReason(reason)}), no commands will be submitted this frame.");
     }
+
+    /// <summary>
+    /// Names the device removal behind a raw driver fault. Silk.NET surfaces a call on a removed device as a
+    /// bare SEHException raised from the vtable stub, and the call site that happens to be first is arbitrary
+    /// (command allocator Reset in practice), so it must not be reported as the cause. Callers filter on
+    /// <see cref="IsDeviceGone"/> before converting, so a genuine API misuse keeps its own exception.
+    /// </summary>
+    internal static DeviceRemovedException DeviceRemovedFromSeh(SEHException exception, string operation)
+    {
+        DumpDredReport(0);
+        return new DeviceRemovedException(
+            $"D3D12 device has been removed: {operation} faulted in the driver instead of returning an HRESULT.", exception);
+    }
+
+    /// <summary>Win32 WAIT_TIMEOUT: what a sliced wait returns when its object did not signal in time.</summary>
+    const uint WaitTimeout = 258;
+
+    /// <summary>
+    /// Upper bound for how long one submission may keep the CPU waiting on a fence before it is worth a log
+    /// line. The TDR watchdog allows 2 s of GPU work per submission by default, so anything near this bound
+    /// is the lead-up to a device removal and not a normal frame.
+    /// </summary>
+    const double SlowSubmissionWarnMs = 500;
 
     /// <summary>
     /// Shutdown only: reset all command allocators so they release the internal
@@ -1303,9 +1330,27 @@ internal unsafe static class Device
         // resources is still incomplete
         if (Fence->GetCompletedValue() < fenceValues[FrameIndex])
         {
-            var hr = Fence->SetEventOnCompletion(fenceValues[FrameIndex], FenceEvent.ToPointer());
-            CheckResult(hr);
-            SilkMarshal.WaitWindowsObjects(FenceEvent);
+            var waitStart = Stopwatch.GetTimestamp();
+            while (Fence->GetCompletedValue() < fenceValues[FrameIndex])
+            {
+                // Sliced: a removed device stops completing fences, and the second hazard is that the GPU
+                // was hung by the very submission being waited on - the TDR must surface as an exception
+                // here, not as a render thread that never returns.
+                ThrowIfDeviceRemoved();
+                var hr = Fence->SetEventOnCompletion(fenceValues[FrameIndex], FenceEvent.ToPointer());
+                CheckResult(hr);
+                SilkMarshal.WaitWindowsObjects(FenceEvent, 100, false);
+            }
+
+            // The only place that can name the danger before the device dies: a submission approaching the
+            // 2 s TDR budget stalls here first, and the DRED report that follows a removal names the pass.
+            var waitedMs = Stopwatch.GetElapsedTime(waitStart).TotalMilliseconds;
+            if (waitedMs >= SlowSubmissionWarnMs)
+            {
+                var message = $"[GPU] frame fence wait {waitedMs:F0} ms - one submission is approaching the TDR watchdog (2000 ms by default); a repeat will remove the device";
+                System.Diagnostics.Debug.WriteLine(message);
+                DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} {message}");
+            }
         }
 
         fenceValues[FrameIndex] = currentFenceValue + 1;
@@ -1977,7 +2022,7 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         if (!_offscreenRTs.Remove(rt))
             return;
 
-        // 雾可运行期注销；资源和描述符必须一起退休，不能覆盖在飞帧的 RTV/SRV。
+        // Fog can be unregistered at runtime; the resource and descriptor must be retired together, and must not be overwritten onto the RTV/SRV of an in-flight frame.
         nint color = (nint)rt.Color, depth = (nint)rt.Depth;
         int srv = rt.SrvIndex, dsv = rt.DsvIndex;
         uint rtv = rt.RtvIndex;
@@ -2017,6 +2062,7 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         "SceneDecal\0"u8.ToArray(),
         "SceneWater\0"u8.ToArray(),
         "SsrComposite\0"u8.ToArray(),
+        "SceneWaterfall\0"u8.ToArray(),
     ];
 
     internal static void PushDebugGroup(byte[] asciiLabelZ)
@@ -2050,7 +2096,14 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         // presenting the backbuffer.
         if (SwapChain != null && SwapChain.FrameLatencyWaitableObject != IntPtr.Zero)
         {
-            SilkMarshal.WaitWindowsObjects(SwapChain.FrameLatencyWaitableObject);
+            // Sliced instead of one unbounded wait: a device that dies between the check above and this
+            // point never signals the compositor's waitable object, so the render thread would park here
+            // forever with no exception and no log - a TDR turned into a silent hang.
+            var waitable = SwapChain.FrameLatencyWaitableObject;
+            while (SilkMarshal.WaitWindowsObjects(waitable, 100, false) == WaitTimeout)
+            {
+                ThrowIfDeviceRemoved();
+            }
         }
 
         // Reset the command list and allocator through the FrameContext
@@ -2169,8 +2222,8 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         }
 
         bool scenePass = desc.Id is RenderPassId.Scene or RenderPassId.SceneOpaque or RenderPassId.SceneTransparent;
-        // D1: 贴花 Pass 不带深度附件（深度是采样源），但 s9 的粗糙度写入要把 SceneNormal 挂成第二个颜色附件。
-        // 这是唯一一种「法线不跟速度同时出现」的挂法：贴花不写速度，也不会动到不透明阶段写下的值。
+        // D1: the decal Pass carries no depth attachment (depth is a sampling source), but the s9 roughness write must bind SceneNormal as a second color attachment.
+        // This is the only binding where "normal appears without velocity": decals do not write velocity and do not touch the values written by the opaque stage.
         bool decalPass = desc.Id == RenderPassId.SceneDecal;
         if (scenePass || decalPass || desc.Id == RenderPassId.OutlineMask)
         {
@@ -2210,7 +2263,7 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
                 decalNormal.TransitionTo(GraphicsCommandList, ResourceStates.RenderTarget);
                 ActiveNormalTarget = decalNormal;
 
-                // 不清除：贴花只在已有几何上混合，写掩码也只开 B 通道（粗糙度）。
+                // No clear: decals only blend over existing geometry, and the write mask enables only the B channel (roughness).
                 var decalNormalRtv = RtvHeapManager.GetCpuHandle(decalNormal.RtvIndex);
                 CpuDescriptorHandle* rtvs2 = stackalloc CpuDescriptorHandle[2] { rtvHandle, decalNormalRtv };
                 GraphicsCommandList->OMSetRenderTargets(2, rtvs2, 0, null);
@@ -2224,7 +2277,7 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
 
                 // Velocity always clears to zero, matching the optimized clear
                 // value: pixels not covered by geometry are static background.
-                // 透明阶段必须保留不透明阶段的速度，清除意图与颜色附件一致。
+                // The transparent stage must preserve the opaque stage's velocity, so the clear intent matches the color attachment.
                 if (desc.ClearColorEnable)
                 {
                     float* velocityClear = stackalloc float[4] { 0f, 0f, 0f, 0f };
@@ -2409,12 +2462,12 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     }
 
     /// <summary>
-    /// P2: 把一张离屏颜色目标原样拷进另一张同形目标，供水面折射在「SceneColor 仍是颜色附件」
-    /// 的那一帧里拿到可采样的背景。
+    /// P2: copies an offscreen color target verbatim into another same-shaped target, so that water surface refraction, in the frame where
+    /// "SceneColor is still a color attachment", can obtain a sampleable background.
     ///
-    /// 用 CopyResource 而不是 blit：两侧同格式同尺寸时逐 texel 复制没有滤波损失，也不需要 PSO。
-    /// 状态收尾按各自后续用途走 —— 源回到 RenderTarget（下一句就是水面的颜色附件），
-    /// 目标转到 PixelShaderResource（紧接着作为折射源被采样）。
+    /// Uses CopyResource rather than blit: when both sides share format and size, a per-texel copy has no filtering loss and needs no PSO.
+    /// State cleanup follows each side's subsequent use - the source returns to RenderTarget (the next statement is the water surface's color attachment),
+    /// and the destination moves to PixelShaderResource (immediately sampled as the refraction source).
     /// </summary>
     internal static bool CopyRenderTarget(RenderTarget source, RenderTarget destination)
     {
@@ -2611,21 +2664,21 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         {
             result0 = D3dDevice->GetDeviceRemovedReason();
         }
-        catch (SEHException)
+        catch (SEHException exception)
         {
             // Once the device is gone this raw vtable call can fault instead of returning a reason, which
             // is exactly the bare SEHException that reaches the app with no code attached. Report whatever
-            // DRED captured, then let the original exception keep its identity.
+            // DRED captured, then name the removal instead of leaving the fault unattributed.
             DumpDredReport(0);
-            throw;
+            throw new DeviceRemovedException(
+                "D3D12 device has been removed: GetDeviceRemovedReason faulted instead of returning a reason.", exception);
         }
 
-        var ex0 = Marshal.GetExceptionForHR(result0);
-        if (ex0 is not null)
-        {
-            DumpDredReport(result0);
-            throw ex0;
-        }
+        if (result0 == 0) return;
+
+        DumpDredReport(result0);
+        throw new DeviceRemovedException(
+            $"D3D12 device has been removed (0x{(uint)result0:X8}: {DescribeRemovedReason(result0)}).");
     }
 
 }

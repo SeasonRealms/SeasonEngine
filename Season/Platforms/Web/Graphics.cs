@@ -408,7 +408,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherComposite] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[WeatherComposite] creation failed: {ex.Message}");
         }
         pipeline.Dispose();
         return null;
@@ -424,13 +424,13 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[FogComposite] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[FogComposite] creation failed: {ex.Message}");
         }
         pipeline.Dispose();
         return null;
     }
 
-    /// <summary>间接实例化四边形绘制管线。创建失败即返回 null，粒子效果据此整体不注册，画面退回改动前。</summary>
+    /// <summary>Indirect instanced quad draw pipeline. Returns null if creation fails; on that basis the particle effect is not registered at all, and rendering falls back to before the change.</summary>
     public Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline()
     {
         if (!IndirectDrawSupported || !ComputeSupported) return null;
@@ -441,14 +441,14 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Particles] WebGPU 管线创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Particles] WebGPU pipeline creation failed: {ex.Message}");
         }
         pipeline.Dispose();
         return null;
     }
 
-    /// <summary>P0 SSR 加法合成：一条全屏绘制把反射增量叠进 SceneColor，没有独立目标。
-    /// 没有 compute 就没有增量纹理，合成无处可读，所以返回 null 让调度层保持零残留。</summary>
+    /// <summary>P0 SSR additive composite: a single full-screen draw blends the reflection delta into SceneColor, with no separate target.
+    /// Without compute there is no delta texture, so the composite has nothing to read; return null so the scheduler layer stays at zero residual.</summary>
     public Season.Rendering.SsrCompositePipeline? CreateSsrCompositePipeline()
     {
         if (!ComputeSupported) return null;
@@ -459,18 +459,18 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[SsrComposite] 创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[SsrComposite] creation failed: {ex.Message}");
         }
-        // 失败路径也要能安全收尾：JS 导出缺失时 Dispose 会再次抛绑定异常，
-        // 放任它冒泡就把「不合成」升级成「BaseApp.Create 失败」。
+        // The failure path must also wind down safely: when a JS export is missing, Dispose throws the binding exception again,
+        // and letting it bubble turns "no composite" into "BaseApp.Create failure".
         try { pipeline.Dispose(); }
-        catch (Exception ex) { DeviceServices.BaseApp.AddLog(LogType.Error, $"[SsrComposite] 失败句柄释放异常：{ex.Message}"); }
+        catch (Exception ex) { DeviceServices.BaseApp.AddLog(LogType.Error, $"[SsrComposite] failed handle release exception: {ex.Message}"); }
         return null;
     }
 
     /// <summary>
-    /// D1 屏幕空间贴花。只依赖图形阶段的深度采样（本 Pass 不挂深度附件），所以不像雾/粒子那样要求
-    /// compute/间接绘制能力；创建失败即返回 null，贴花效果整体不注册。
+    /// D1 screen-space decals. Depends only on depth sampling in the graphics stage (this Pass attaches no depth attachment), so unlike fog/particles it does not require
+    /// compute/indirect draw capability; returns null if creation fails, and the decal effect is not registered at all.
     /// </summary>
     public Season.Rendering.DecalPipeline? CreateDecalPipeline()
     {
@@ -481,18 +481,18 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] WebGPU 管线创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] WebGPU pipeline creation failed: {ex.Message}");
         }
-        // 失败路径也要能安全收尾：JS 导出缺失时 Dispose 会再次抛绑定异常，
-        // 放任它冒泡就把「贴花不画」升级成「BaseApp.Create 失败」。
+        // The failure path must also wind down safely: when a JS export is missing, Dispose throws the binding exception again,
+        // and letting it bubble turns "decals are not drawn" into "BaseApp.Create failure".
         try { pipeline.Dispose(); }
-        catch (Exception ex) { DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] 失败句柄释放异常：{ex.Message}"); }
+        catch (Exception ex) { DeviceServices.BaseApp.AddLog(LogType.Error, $"[Decal] failed handle release exception: {ex.Message}"); }
         return null;
     }
 
     /// <summary>
-    /// P2 池塘水。与贴花一样只依赖图形阶段的深度采样与一张颜色快照（本 Pass 不挂深度附件），
-    /// 所以不需要 compute/间接绘制能力；创建失败即返回 null，水面效果整体不注册。
+    /// P2 pond water. Like decals, it depends only on depth sampling in the graphics stage and one color snapshot (this Pass attaches no depth attachment),
+    /// so it does not require compute/indirect draw capability; returns null if creation fails, and the water surface effect is not registered at all.
     /// </summary>
     public Season.Rendering.WaterPipeline? CreateWaterPipeline()
     {
@@ -503,19 +503,41 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] WebGPU 管线创建失败：{ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] WebGPU pipeline creation failed: {ex.Message}");
         }
-        // 同上：创建失败只是在数据层面降级（有水面但不画），不能让 Dispose 的绑定异常
-        // 把整个 Create 打断 —— 旧日志里的「Create exception」就是这么来的。
+        // Same as above: a creation failure is only a data-level degradation (there is a water surface but it is not drawn); the binding exception from Dispose must not
+        // interrupt the whole Create -- that is exactly where "Create exception" in the old logs came from.
         try { pipeline.Dispose(); }
-        catch (Exception ex) { DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] 失败句柄释放异常：{ex.Message}"); }
+        catch (Exception ex) { DeviceServices.BaseApp.AddLog(LogType.Error, $"[Water] failed handle release exception: {ex.Message}"); }
         return null;
     }
 
     /// <summary>
-    /// P2: 场景色快照，供水面在「颜色已是附件」的帧里采水底。
-    /// 名字未注册、形状不一致或不在帧外调用都返回 false —— 调用方据此整帧跳过水面，
-    /// 而不是拿一张没初始化过的快照当折射源。
+    /// P1 waterfall curtain. Depends only on depth sampling in the graphics stage and color blending (this Pass attaches no depth attachment and has no refraction snapshot),
+    /// so it does not require compute/indirect draw capability; returns null if creation fails, and the waterfall effect is not registered at all.
+    /// </summary>
+    public Season.Rendering.WaterfallPipeline? CreateWaterfallPipeline()
+    {
+        var pipeline = new WGPUWaterfallPipeline();
+        try
+        {
+            if (pipeline.Initialize()) return pipeline;
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"[Waterfall] WebGPU pipeline creation failed: {ex.Message}");
+        }
+        // Same degradation path as the water surface: when a JS export is missing, Dispose throws the binding exception once more,
+        // and letting it bubble turns "the waterfall is not drawn" into "BaseApp.Create failure".
+        try { pipeline.Dispose(); }
+        catch (Exception ex) { DeviceServices.BaseApp.AddLog(LogType.Error, $"[Waterfall] failed handle release exception: {ex.Message}"); }
+        return null;
+    }
+
+    /// <summary>
+    /// P2: scene color snapshot, letting the water surface sample the water bottom on frames where "color is already an attachment".
+    /// Returns false if the name is unregistered, the shape does not match, or it is called outside the frame -- the caller then skips the water surface for the whole frame,
+    /// rather than using an uninitialized snapshot as the refraction source.
     /// </summary>
     public bool CopyRenderTarget(Season.Rendering.RenderTarget source, Season.Rendering.RenderTarget destination)
     {
@@ -703,9 +725,9 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public void BeginSceneCollection()
     {
         if (!_initialized || _sceneCollectionLive || _batchCount != 0 || _skinnedBatchCount != 0)
-            throw new InvalidOperationException("场景收集要求图形已初始化且上一阶段批次已消费。");
+            throw new InvalidOperationException("Scene collection requires graphics to be initialized and the previous stage's batches to be consumed.");
         if (!FrameSchedule.SceneCollectionActive || !FrameSchedule.SceneDrawOrder.IsCollecting)
-            throw new InvalidOperationException("场景收集必须由帧调度器开启。");
+            throw new InvalidOperationException("Scene collection must be started by the frame scheduler.");
         WebGPUInterop.BeginSceneCollection();
         _sceneCollecting = _sceneCollectionLive = true;
         _scenePrioritySet = false;
@@ -714,7 +736,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public void SealSceneCollection()
     {
         if (!_sceneCollecting || _batchCount != 0 || _skinnedBatchCount != 0)
-            throw new InvalidOperationException("场景收集未开始或仍有未捕获的批次。");
+            throw new InvalidOperationException("Scene collection has not started or still has uncaptured batches.");
         WebGPUInterop.SealSceneCollection();
         _sceneCollecting = false;
     }
@@ -735,7 +757,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
     }
 
-    // 只传值，不跨调用保留控件或优先级作用域；同一优先级的多个图元复用 JS 路径。
+    // Passes values only; no control or priority scope is retained across calls; multiple primitives of the same priority reuse the JS path.
     void PrepareSceneDraw()
     {
         if (!_sceneCollecting) return;
@@ -761,7 +783,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         _sceneMeshKey[0] = cacheKey;
         try
         {
-            // 同步进入 JS 固定纹理、材质和骨骼绑定，不能等控件更新后再 Flush。
+            // Synchronously enter the JS fixed texture, material, and bone bindings; it cannot wait for control updates before Flush.
             WebGPUInterop.DrawMesh3DBatch(_sceneMeshKey,
                 MemoryMarshal.AsBytes(uniform.AsSpan()), 1, skinKey);
         }
@@ -807,8 +829,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             depthTarget?.Name,
             (desc.VelocityTarget as WGPURenderTarget)?.Name,
             // A0.2: slot 2 only exists next to slot 1, matching the other three backends.
-            // D1: 贴花 Pass 是例外 —— 它没有速度槽，SceneNormal 作为颜色附件 1 用来写粗糙度，
-            // 所以这里必须把“没有速度”与“不要法线槽”分开判断。
+            // D1: the decal Pass is the exception -- it has no velocity slot; SceneNormal serves as color attachment 1 to write roughness,
+            // so here "no velocity" and "no normal slot" must be distinguished.
             desc.VelocityTarget is WGPURenderTarget || desc.Id == Season.Rendering.RenderPassId.SceneDecal
                 ? (desc.NormalTarget as WGPURenderTarget)?.Name : null);
     }
@@ -829,7 +851,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public Season.Rendering.RenderTarget CreateRenderTarget(in Season.Rendering.RenderTargetDesc desc)
     {
         if (!_initialized)
-            throw new InvalidOperationException("[CreateRenderTarget] 需在图形初始化完成后调用。");
+            throw new InvalidOperationException("[CreateRenderTarget] must be called after graphics initialization completes.");
         // Step 3 has two shapes (aligned with DX/VK): color-only
         // (BackbufferCompatible/Rgba16Float, with its paired depth) and depth-only
         // (D32Float shadow map, used both as attachment and sampled resource). formatKind is encoded for JS (0/1/2).
@@ -849,11 +871,11 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         else if (desc.ColorFormat == Season.Rendering.RtFormat.Rg16Float && desc.DepthFormat == Season.Rendering.RtFormat.None)
             formatKind = 4;
         else
-            throw new NotSupportedException("[CreateRenderTarget] 仅支持 color-only（BackbufferCompatible/Rgba16Float/Rg16Float）或 depth-only（D32Float）形态。");
+            throw new NotSupportedException("[CreateRenderTarget] only supports color-only (BackbufferCompatible/Rgba16Float/Rg16Float) or depth-only (D32Float) shapes.");
         if (desc.SampleCount > 1)
-            throw new NotSupportedException("[CreateRenderTarget] 离屏 MSAA 暂无消费者。");
+            throw new NotSupportedException("[CreateRenderTarget] offscreen MSAA has no consumer yet.");
         if (!desc.MatchBackbufferSize && (desc.Width == 0 || desc.Height == 0))
-            throw new ArgumentException("[CreateRenderTarget] 固定尺寸 RT 需指定非零 Width/Height。");
+            throw new ArgumentException("[CreateRenderTarget] fixed-size RTs require a nonzero Width/Height.");
 
         var rt = new WGPURenderTarget(desc, UnregisterRenderTarget);
         var resolved = WebGPUInterop.CreateRenderTarget(rt.Name, (int)desc.Width, (int)desc.Height, desc.MatchBackbufferSize, formatKind);
@@ -928,8 +950,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         if (!_initialized) return;
         var size = WebGPUInterop.SynchronizeRenderTargetSizes();
         if (size.Length != 2 || size[0] <= 0 || size[1] <= 0)
-            throw new InvalidOperationException("Web 渲染目标同步未返回有效画布尺寸。");
-        // JS 成功重建后才发布尺寸；效果 OnResize 从同一帧的实际资源描述分配纹理。
+            throw new InvalidOperationException("Web render target synchronization did not return a valid canvas size.");
+        // Sizes are published only after JS successfully recreates; the effect's OnResize allocates textures from the actual resource description of the same frame.
         foreach (var target in _renderTargets)
         {
             if (!target.Desc.MatchBackbufferSize) continue;
@@ -1059,10 +1081,10 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             if (bindings[i].Type == Season.Rendering.ComputeBindingType.Params)
             {
                 if (i != 0)
-                    throw new ArgumentException($"[CreateComputeKernel] '{desc.Name}': Params 必须位于 Bindings[0]。");
+                    throw new ArgumentException($"[CreateComputeKernel] '{desc.Name}': Params must be at Bindings[0].");
                 var size = bindings[i].SizeInBytes;
                 if (size == 0 || size % 16 != 0 || size > 128)
-                    throw new ArgumentException($"[CreateComputeKernel] '{desc.Name}': Params 需 16B 对齐且 ≤128B（得到 {size}）。");
+                    throw new ArgumentException($"[CreateComputeKernel] '{desc.Name}': Params must be 16B aligned and <=128B (got {size}).");
             }
             if (i > 0) sb.Append(',');
             // 2-1: pass StorageFormat per slot (JS only consumes it for storage-write bindings of type 3/7;
@@ -1112,16 +1134,16 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         return buffer;
     }
 
-    // ── A0.1 间接绘制（契约在 IGraphics / Indirect.cs）──
-    // WebGPU 没有显式 barrier，dispatch 与后续间接读取的先后关系由同一 encoder 的编码顺序保证，
-    // 所以 Prepare 此处只做准入校验。真正的约束在参数内容上：firstInstance 必须为 0，
-    // 否则需要可选 indirect-first-instance 特性；该约束由写入方（compute kernel）承担，见 IndirectDrawIndexedArgs。
+    // ── A0.1 indirect draw (contract in IGraphics / Indirect.cs) ──
+    // WebGPU has no explicit barrier; the ordering between dispatch and a later indirect read is guaranteed by the encoding order of the same encoder,
+    // so Prepare here only performs an admission check. The real constraint is on the argument contents: firstInstance must be 0,
+    // otherwise the optional indirect-first-instance feature is required; that constraint is borne by the writer (compute kernel), see IndirectDrawIndexedArgs.
 
     public bool IndirectDrawSupported => _initialized;
 
-    /// <summary>A0.2：间接计算派发（dispatchWorkgroupsIndirect）。与间接绘制是两道独立能力位，
-    /// 但这里同源：两者都只需要一个 ComputeAndIndirectArgs 缓冲，而 Web 没有显式状态机，
-    /// 编码顺序本身就是同步点。</summary>
+    /// <summary>A0.2: indirect compute dispatch (dispatchWorkgroupsIndirect). It is a separate capability bit from indirect draw,
+    /// but here it is the same source: both need only a ComputeAndIndirectArgs buffer, and Web has no explicit state machine,
+    /// so the encoding order itself is the synchronization point.</summary>
     public bool DispatchIndirectSupported => _initialized;
 
     public bool TryPrepareIndirectArgs(Season.Rendering.StorageBuffer buffer)
@@ -1147,7 +1169,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         if (!_initialized) return false;
         bool ready = WebGPUInterop.CreateComputeTexture3D(name, (int)width, (int)height, (int)depth, (int)format);
         if (!ready) DeviceServices.BaseApp.AddLog(LogType.Backend,
-            $"{DateTime.UtcNow} [CreateComputeTexture3D] '{name}' {width}×{height}×{depth} 创建失败");
+            $"{DateTime.UtcNow} [CreateComputeTexture3D] '{name}' {width}×{height}×{depth} creation failed");
         return ready;
     }
 
@@ -1193,8 +1215,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         if (!_initialized) return false;
         var kernel = (WGPUComputeKernel)args.Kernel;
 
-        // A0.2 的准入与另外三端一致：放在跨越 interop 边界之前，失败时 JS 侧什么都不知道。
-        // 这一端没有状态机也没有 barrier —— 同一 encoder 内的编码顺序就是全部同步。
+        // The A0.2 admission check matches the other three backends: it happens before crossing the interop boundary, so on failure the JS side knows nothing.
+        // This backend has no state machine and no barrier -- the encoding order within the same encoder is all the synchronization there is.
         string? indirectId = null;
         uint indirectOffset = 0;
         if (args.IsIndirect)
@@ -1236,9 +1258,9 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         try
         {
             if (format != Season.Rendering.TextureCubeFormat.Rgba8Unorm)
-                throw new NotSupportedException($"'{name}': 1-7 当前仅实装 Rgba8Unorm（得到 {format}）。");
+                throw new NotSupportedException($"'{name}': 1-7 currently implements only Rgba8Unorm (got {format}).");
             if (faces == null || faces.Length != 6)
-                throw new ArgumentException($"'{name}': 需恰好 6 张面贴图。", nameof(faces));
+                throw new ArgumentException($"'{name}': exactly 6 face textures are required.", nameof(faces));
 
             // The decoder contract is tightly packed RGBA8, but row-end padding is allowed
             // (Stride > size * 4), so repack row by row into a tight buffer.
@@ -1252,11 +1274,11 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
                 var decoder = faces[f];
                 if (decoder == null || decoder.Width != size || decoder.Height != size)
                     throw new ArgumentException(
-                        $"'{name}': 面 {(Season.Rendering.CubeFace)f} 尺寸不符（期望 {size}×{size}）。");
+                        $"'{name}': face {(Season.Rendering.CubeFace)f} size mismatch (expected {size}×{size}).");
                 if (decoder.Stride < dstStride)
                     throw new ArgumentException(
-                        $"'{name}': 面 {(Season.Rendering.CubeFace)f} 的解码器违反 INativeImageDecoder 的 " +
-                        $"RGBA8 契约（Stride={decoder.Stride} < {dstStride}，疑为未展开的 RGB 三通道数据）。");
+                        $"'{name}': the decoder for face {(Season.Rendering.CubeFace)f} violates INativeImageDecoder's " +
+                        $"RGBA8 contract (Stride={decoder.Stride} < {dstStride}, likely unexpanded three-channel RGB data).");
 
                 var src = decoder.PixelSpan;
                 int srcStride = decoder.Stride;
@@ -1278,7 +1300,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         }
         catch (Exception ex)
         {
-            DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [CreateTextureCube] '{name}' 创建失败: {ex.Message}");
+            DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [CreateTextureCube] '{name}' creation failed: {ex.Message}");
             return null;
         }
     }
@@ -3600,7 +3622,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             // (16 floats) is uploaded, which does not match the prev stream's per-instance 5×vec4 stride, so
             // prev is not fed there and behavior falls back to Step A (camera-motion velocity only).
             bool blendSurface = surface.Mode == SurfaceBlendMode.Blend;
-            // 分段收集保留完整流，Blend 也可携带前帧数据；旧单 Scene 路由保留原历史降级。
+            // Segmented collection keeps the full stream, so Blend can also carry previous-frame data; the old single Scene route keeps the original history degradation.
             byte[]? prevInstanceBytes = ((!blendSurface || _sceneCollecting)
                 && wgpuMesh.PrevInstanceBytes.Length > 0
                 && wgpuMesh.PrevInstanceBytes.Length == wgpuMesh.InstanceBytes.Length)
@@ -3653,7 +3675,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             if (DictionaryInstancedMesh3D.TryGetValue(key, out dropped))
                 DictionaryInstancedMesh3D.Remove(key);
         }
-        // A7：把剔除目标从共享层撤掉；不撤的话列表里会留下指向已死 JS 句柄的引用。
+        // A7: remove the cull target from the shared layer; otherwise the list would keep references pointing to a dead JS handle.
         dropped?.Dispose();
 
         // Remove synthesized procedural-texture metadata slot by slot (registered under mesh-private names).
@@ -3759,7 +3781,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             // Ensure GPU upload.
             EnsureModelPrimitiveUploaded(prim);
 
-            // 收集时按原图元顺序交给 JS 分类，避免提前分桶破坏等深度稳定顺序。
+            // During collection, hand primitives to JS in the original primitive order, to avoid early bucketing breaking the depth-equal stable order.
             if (prim.IsTransparent && !_sceneCollecting)
                 transparentPrimitives.Add(prim);
             else
@@ -4028,9 +4050,9 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         FlushDrawMesh3DBatch();
         FlushDrawSkinnedMeshBatch();
 
-        // A7：整组走间接路径时，索引数/实例数/baseVertex 全由 GPU 侧参数缓冲给出，
-        // 实例流换成 gather 产出的重排块——按槽位分段，所以偏移放在 setVertexBuffer 上。
-        // 参数表的迭代顺序与下面那段 CPU 循环必须完全一致，否则索引区间会与 primitive 错位。
+        // A7: when the whole group takes the indirect path, the index count / instance count / baseVertex all come from the GPU-side argument buffer,
+        // and the instance stream is replaced by the compacted block produced by gather -- segmented by slot, so the offset goes on setVertexBuffer.
+        // The iteration order of the argument table must exactly match the CPU loop below, otherwise the index range would be misaligned with the primitive.
         int cullSlot = Season.Rendering.CascadedShadow.ActiveSlot;
         if (cullSlot >= 0 && cullSlot < Season.Rendering.InstanceCull.MaxSlots
             && wgpuMesh.TryGetCullDrawHandles(out var cullSortedId, out var cullArgsId, out int cullCapacity))
@@ -4053,7 +4075,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
                     continue;
                 if (primitiveIndex >= Season.Rendering.InstanceCull.MaxPrimitives)
                 {
-                    // 参数表装不下就整组退回，不画半路：已经发出的间接绘制无法撤回。
+                    // If the argument table cannot fit, fall back for the whole group rather than drawing halfway: indirect draws already issued cannot be retracted.
                     indirectOk = false;
                     break;
                 }

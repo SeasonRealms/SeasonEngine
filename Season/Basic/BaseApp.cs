@@ -173,16 +173,20 @@ public abstract class BaseApp : Panel
     /// Add lights when scene objects appear and Remove them when they leave; no per-frame rebuild is needed.</summary>
     public readonly Season.Rendering.SceneLighting Lighting = new();
 
-    /// <summary>场景自己的近地雾介质及局部雾体注册表，类库默认关闭。</summary>
+    /// <summary>The scene's own near-ground fog medium and local fog volume registry; disabled by default in the class library.</summary>
     public Season.Rendering.SceneFog Fog { get; } = new();
 
-    /// <summary>D1 场景贴花注册表；实际绘制还需要 <see cref="Season.Rendering.RenderQuality"/>.Decals
-    /// 与后端实现同时到位，否则贴花只是数据，不会出现在画面上。</summary>
+    /// <summary>D1 scene decal registry; actual drawing also requires <see cref="Season.Rendering.RenderQuality"/>.Decals
+    /// and a backend implementation to be in place at the same time, otherwise decals are just data and will not appear on screen.</summary>
     public Season.Rendering.SceneDecals Decals { get; } = new();
 
-    /// <summary>P2 场景水面注册表。与贴花一样，实际绘制还需要后端实现了
-    /// <see cref="IGraphics.CreateWaterPipeline"/>，否则水面只是数据。</summary>
+    /// <summary>P2 scene water surface registry. Like decals, actual drawing also requires the backend to implement
+    /// <see cref="IGraphics.CreateWaterPipeline"/>, otherwise the water surface is just data.</summary>
     public Season.Rendering.SceneWaters Waters { get; } = new();
+
+    /// <summary>P1 scene waterfall water curtain registry. Actual drawing also requires the backend to implement
+    /// <see cref="IGraphics.CreateWaterfallPipeline"/>, otherwise the water curtain is just data.</summary>
+    public Season.Rendering.SceneWaterfalls Waterfalls { get; } = new();
 
     /// <summary>The effective scene lighting consumed by each platform frame loop (single convergence point;
     /// hdrExposure is still injected by each backend via SetLighting).</summary>
@@ -344,14 +348,18 @@ public abstract class BaseApp : Panel
         {
             Graphics.Instance.Init();
 
-            // D1: 贴花的 PSO 必须在第一帧之前建好。各平台在调用 Create 之前就已经按 RenderQuality 建完了
-            // SceneColor/SceneDepth，所以这里是唯一一个五端都经过、且目标已就位的时机；
-            // 后端没有实现的平台由 CreateDecalPipeline 返回 null，RegisterDecals 自己不注册、不留残留。
+            // D1: the decal PSO must be built before the first frame. Each platform already builds SceneColor/SceneDepth according to RenderQuality before calling Create,
+            // so this is the only timing that all five backends pass through and at which the targets are already in place;
+            // on platforms without a backend implementation, CreateDecalPipeline returns null, and RegisterDecals does not register itself and leaves no residue.
             Season.Rendering.FrameSchedule.RegisterDecals(Graphics.Instance);
 
-            // P2: 水面的 PSO 与折射快照同样必须在第一帧之前准备好。前提与贴花一致（单采样 HDR 场景色 + 显式深度），
-            // 另外还需要一张与 SceneColor 同形的快照目标；任一缺失时 RegisterWaters 自己退回、不留残留。
+            // P2: the water surface PSO and refraction snapshot must likewise be prepared before the first frame. The preconditions match decals (single-sample HDR scene color + explicit depth),
+            // and in addition a snapshot target of the same shape as SceneColor is required; if either is missing, RegisterWaters falls back itself and leaves no residue.
             Season.Rendering.FrameSchedule.RegisterWaters(Graphics.Instance);
+
+            // P1: the waterfall water curtain PSO must likewise be built before the first frame. The preconditions match decals (single-sample HDR scene color + explicit depth),
+            // with no refraction snapshot; if the backend has no implementation, RegisterWaterfalls falls back itself and leaves no residue.
+            Season.Rendering.FrameSchedule.RegisterWaterfalls(Graphics.Instance);
 
             // On Web, consume the channel from the main-thread render loop; on native platforms, start a background consumer.
             if (DeviceServices.Core.Platform is not Platform.Web)

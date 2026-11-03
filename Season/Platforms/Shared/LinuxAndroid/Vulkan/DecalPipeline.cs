@@ -9,22 +9,22 @@ using Season.Rendering;
 namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 
 /// <summary>
-/// D1 屏幕空间贴花的 Vulkan 实现，结构与 <see cref="VKFogCompositePipeline"/> 同构：
-/// Prepare 在 Pass 外解析资源并把深度留在采样布局，Draw 只能在
-/// <see cref="RenderPassId.SceneDecal"/> 内消费一次。
+/// Vulkan implementation of the D1 screen-space decal, structurally isomorphic to <see cref="VKFogCompositePipeline"/>:
+/// Prepare resolves resources outside the Pass and leaves depth in a sample layout, and Draw can only
+/// consume it once within <see cref="RenderPassId.SceneDecal"/>.
 ///
-/// <para>与 DX 版逐条对齐的三处：</para>
+/// <para>Three points aligned item-by-item with the DX version:</para>
 /// <list type="bullet">
-/// <item>每贴花一次 36 顶点 <c>vkCmdDraw</c>，顶点由 <c>gl_VertexIndex</c> 还原，没有任何顶点缓冲；</item>
-/// <item>光栅只留背面（<c>CullMode = Front</c>）。负高度视口与 DX 的屏幕 Y 翻转互相抵消，
-/// 所以两端对同一个盒面得到同一个「正面」判断；</item>
-/// <item>混合走固定功能：Modulate 是 <c>DST_COLOR / ZERO</c>，Additive 是 <c>ONE / ONE</c>，
-/// 两者的 alpha 都是 <c>ZERO / ONE</c>（保留目标 alpha）。</item>
+/// <item>one 36-vertex <c>vkCmdDraw</c> per decal, vertices reconstructed from <c>gl_VertexIndex</c>, with no vertex buffer at all;</item>
+/// <item>rasterization keeps only back faces (<c>CullMode = Front</c>). The negative-height viewport and DX's screen Y flip cancel each other out,
+/// so both backends reach the same "front face" decision for the same box face;</item>
+/// <item>blending uses fixed-function: Modulate is <c>DST_COLOR / ZERO</c>, Additive is <c>ONE / ONE</c>,
+/// and the alpha for both is <c>ZERO / ONE</c> (preserving the destination alpha).</item>
 /// </list>
 ///
-/// <para>粗糙度写入（s9）用第二个颜色附件，写掩码只开 B 通道，混合为 <c>SRC_ALPHA / ONE_MINUS_SRC_ALPHA</c>，
-/// 因此附件里的八面体法线（.xy）与反射权重（.w）保持原值。该形态的 render pass 与不写粗糙度的形态
-/// 附件数量不同、互不兼容，所以各烘一套 PSO。</para>
+/// <para>Roughness write (s9) uses a second color attachment, with the write mask enabling only the B channel, and blending is <c>SRC_ALPHA / ONE_MINUS_SRC_ALPHA</c>,
+/// so the octahedral normal (.xy) and reflection weight (.w) in the attachment keep their original values. This form's render pass and the form that does not write roughness
+/// have a different attachment count and are mutually incompatible, so a separate PSO is baked for each.</para>
 /// </summary>
 internal sealed unsafe class VKDecalPipeline : Season.Rendering.DecalPipeline
 {
@@ -33,14 +33,14 @@ internal sealed unsafe class VKDecalPipeline : Season.Rendering.DecalPipeline
 
     readonly Dictionary<string, Texture> _textures;
 
-    // 描述符按帧槽轮转：每个槽各自一条 set 环，槽内游标在帧号盖戳变化时归零。
+    // Descriptors rotate by frame slot: each slot has its own set ring, and the in-slot cursor resets to zero when the frame-number stamp changes.
     readonly List<DescriptorSet>[] _frameSets = new List<DescriptorSet>[(int)Device.frameCount];
     readonly int[] _frameCursors = new int[(int)Device.frameCount];
     readonly List<DescriptorSet>[] _textureSets = new List<DescriptorSet>[(int)Device.frameCount];
     readonly int[] _textureCursors = new int[(int)Device.frameCount];
     readonly ulong[] _stamps = new ulong[(int)Device.frameCount];
 
-    // 逐 draw 的贴图解析结果。Prepare 一次算好，Draw 只消费。
+    // Per-draw texture resolution results. Prepare computes them once, and Draw only consumes them.
     readonly Texture?[] _drawTextures = new Texture?[MaxDecals];
     readonly bool[] _drawSkip = new bool[MaxDecals];
     readonly DescriptorSet[] _drawSets = new DescriptorSet[MaxDecals];
@@ -79,7 +79,7 @@ internal sealed unsafe class VKDecalPipeline : Season.Rendering.DecalPipeline
         var device = Device.LogicalDevice;
         var point = Pipeline.StaticPointSampler;
         var linear = Pipeline.StaticSampler;
-        if (point.Handle == 0 || linear.Handle == 0) throw new InvalidOperationException("贴花采样器尚未初始化。");
+        if (point.Handle == 0 || linear.Handle == 0) throw new InvalidOperationException("Decal sampler not yet initialized.");
 
         var bindings = stackalloc DescriptorSetLayoutBinding[2];
         bindings[0] = new() { Binding = 0, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit,
@@ -89,7 +89,7 @@ internal sealed unsafe class VKDecalPipeline : Season.Rendering.DecalPipeline
         var frameInfo = new DescriptorSetLayoutCreateInfo { SType = StructureType.DescriptorSetLayoutCreateInfo,
             BindingCount = 2, PBindings = bindings };
         if (vk.CreateDescriptorSetLayout(device, in frameInfo, null, out _frameLayout) != Result.Success)
-            throw new InvalidOperationException("创建贴花描述符布局失败。");
+            throw new InvalidOperationException("Failed to create decal descriptor layout.");
 
         var textureBinding = new DescriptorSetLayoutBinding { Binding = 0, DescriptorCount = 1,
             StageFlags = ShaderStageFlags.FragmentBit, DescriptorType = DescriptorType.CombinedImageSampler,
@@ -97,15 +97,15 @@ internal sealed unsafe class VKDecalPipeline : Season.Rendering.DecalPipeline
         var textureInfo = new DescriptorSetLayoutCreateInfo { SType = StructureType.DescriptorSetLayoutCreateInfo,
             BindingCount = 1, PBindings = &textureBinding };
         if (vk.CreateDescriptorSetLayout(device, in textureInfo, null, out _textureLayout) != Result.Success)
-            throw new InvalidOperationException("创建贴花贴图描述符布局失败。");
+            throw new InvalidOperationException("Failed to create decal texture descriptor layout.");
 
         var setLayouts = stackalloc DescriptorSetLayout[2] { _frameLayout, _textureLayout };
-        // 顶点端要用贴花索引取矩阵，像素端要用索引取整块数据，所以两段都要可见。
+        // The vertex stage uses the decal index to fetch a matrix, and the pixel stage uses the index to fetch the whole block of data, so both stages must see it.
         var push = new PushConstantRange { StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit, Size = 16 };
         var layoutInfo = new PipelineLayoutCreateInfo { SType = StructureType.PipelineLayoutCreateInfo,
             SetLayoutCount = 2, PSetLayouts = setLayouts, PushConstantRangeCount = 1, PPushConstantRanges = &push };
         if (vk.CreatePipelineLayout(device, in layoutInfo, null, out _layout) != Result.Success)
-            throw new InvalidOperationException("创建贴花管线布局失败。");
+            throw new InvalidOperationException("Failed to create decal pipeline layout.");
 
         ShaderModule vertex = default, pixel = default, pixelRoughness = default;
         try
@@ -148,15 +148,15 @@ internal sealed unsafe class VKDecalPipeline : Season.Rendering.DecalPipeline
                 Topology = PrimitiveTopology.TriangleList };
             var viewport = new PipelineViewportStateCreateInfo { SType = StructureType.PipelineViewportStateCreateInfo,
                 ViewportCount = 1, ScissorCount = 1 };
-            // CullMode.Front 只留背面：盒的六个面从盒外看逆时针，背面恰好是「每个像素命中一次」的那一侧。
-            // 深度不是附件，所以深度测试与写入必须关掉。
+            // CullMode.Front keeps only back faces: the box's six faces are counter-clockwise when viewed from outside the box, and the back face is exactly the side that "hits each pixel once".
+            // Depth is not an attachment, so the depth test and write must be turned off.
             var raster = new PipelineRasterizationStateCreateInfo { SType = StructureType.PipelineRasterizationStateCreateInfo,
                 PolygonMode = PolygonMode.Fill, CullMode = CullModeFlags.FrontBit, FrontFace = FrontFace.Clockwise, LineWidth = 1 };
             var samples = new PipelineMultisampleStateCreateInfo { SType = StructureType.PipelineMultisampleStateCreateInfo,
                 RasterizationSamples = SampleCountFlags.Count1Bit };
 
             var blends = stackalloc PipelineColorBlendAttachmentState[2];
-            // RT0：Modulate = dst * src，Additive = dst + src；alpha 两个模式都保留目标值。
+            // RT0: Modulate = dst * src, Additive = dst + src; for alpha, both modes preserve the destination value.
             blends[0] = new PipelineColorBlendAttachmentState
             {
                 BlendEnable = true,
@@ -168,7 +168,7 @@ internal sealed unsafe class VKDecalPipeline : Season.Rendering.DecalPipeline
                 AlphaBlendOp = BlendOp.Add,
                 ColorWriteMask = ColorComponentFlags.RBit | ColorComponentFlags.GBit | ColorComponentFlags.BBit | ColorComponentFlags.ABit
             };
-            // RT1（仅写粗糙度形态）：只开 B 通道，用源 alpha 插值，源 alpha 为 0 时逐位保持原值。
+            // RT1 (roughness-write form only): enables only the B channel, interpolates with the source alpha, and preserves the original value bit-for-bit when the source alpha is 0.
             blends[1] = new PipelineColorBlendAttachmentState
             {
                 BlendEnable = true,
@@ -191,15 +191,15 @@ internal sealed unsafe class VKDecalPipeline : Season.Rendering.DecalPipeline
                 PColorBlendState = &blend, PDynamicState = &dynamic, Layout = _layout,
                 RenderPass = Device.GetDecalRenderPass(withNormal) };
             if (vk.CreateGraphicsPipelines(device, default, 1, in info, null, out var pipeline) != Result.Success)
-                throw new InvalidOperationException("创建贴花图形管线失败。");
+                throw new InvalidOperationException("Failed to create decal graphics pipeline.");
             return pipeline;
         }
     }
 
     /// <summary>
-    /// 校验资源形状并定下本帧的附件形态。与雾合成一样只接受生产者已经写入并转入采样布局的资源，
-    /// 不在 Pass 内补发 barrier：颜色与法线的布局切换由 render pass 的 initial/final layout 完成，
-    /// 深度保持上一段场景 Pass 发布的 ShaderReadOnlyOptimal。
+    /// Validates the resource shapes and fixes this frame's attachment form. Like the fog composite, it only accepts resources that the producer has written and transitioned into a sample layout,
+    /// and does not re-issue a barrier inside the Pass: the layout switching of color and normal is done by the render pass's initial/final layout,
+    /// and depth keeps the ShaderReadOnlyOptimal published by the previous scene Pass.
     /// </summary>
     bool Resolve(in DecalInputs inputs, VKRenderTarget destination, out VKRenderTarget color,
         out VKRenderTarget depth, out VKRenderTarget? normal, out BufferResource buffer)
@@ -250,7 +250,7 @@ internal sealed unsafe class VKDecalPipeline : Season.Rendering.DecalPipeline
             Texture? texture = null;
             lock (_textures) _textures.TryGetValue(draw.Texture, out texture);
             if (texture == null || !texture.Ready || texture.View.Handle == 0) { _drawSkip[i] = true; continue; }
-            // 贴图首次被用到时把它推进采样布局；Prepare 在 Pass 外，所以这里不会走延迟转换那条路。
+            // The first time a texture is used, push it into a sample layout; Prepare is outside the Pass, so this does not take the deferred-transition path.
             texture.EnsureReadyForRendering(command);
             if (texture.CurrentLayout != ImageLayout.ShaderReadOnlyOptimal) { _drawSkip[i] = true; continue; }
             _drawTextures[i] = texture;
@@ -261,7 +261,7 @@ internal sealed unsafe class VKDecalPipeline : Season.Rendering.DecalPipeline
         ulong stamp = Device.GetCurrentRetireFenceValue();
         if (_stamps[index] != stamp)
         {
-            // 本帧第一次 Prepare 会复用三帧前那一批 set，它们可能仍被 pending 命令缓冲引用。
+            // The first Prepare of this frame reuses the batch of sets from three frames ago, which may still be referenced by pending command buffers.
             Device.WaitForFrameSlot(index);
             _stamps[index] = stamp;
             _frameCursors[index] = 0;
@@ -272,7 +272,7 @@ internal sealed unsafe class VKDecalPipeline : Season.Rendering.DecalPipeline
         if (_frameCursors[index] == frameRing.Count) frameRing.Add(Device.DescriptorAllocator.AllocateSet(_frameLayout));
         var frameSet = frameRing[_frameCursors[index]++];
 
-        // 贴图环：本帧需要 drawn 个独立 set，外加一个给「无纹理贴花」的合法占位。
+        // Texture ring: this frame needs drawn independent sets, plus one valid placeholder for "textureless decals".
         var textureRing = _textureSets[index];
         while (textureRing.Count < _textureCursors[index] + drawn + 1)
             textureRing.Add(Device.DescriptorAllocator.AllocateSet(_textureLayout));
@@ -287,8 +287,8 @@ internal sealed unsafe class VKDecalPipeline : Season.Rendering.DecalPipeline
             DescriptorCount = 1, DescriptorType = DescriptorType.CombinedImageSampler, PImageInfo = &depthImage };
         Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 2, writes, 0, null);
 
-        // 无纹理贴花仍然会把贴图槽绑上一个合法视图：wrap.w 是逐 draw 常量，着色器不会真的采样，
-        // 但 Vulkan 要求静态使用的描述符必须有效。深度视图在这里是免费的合法占位（它本来就不是附件）。
+        // A textureless decal still binds a valid view to the texture slot: wrap.w is a per-draw constant, so the shader never actually samples it,
+        // but Vulkan requires statically used descriptors to be valid. The depth view is a free valid placeholder here (it was never an attachment anyway).
         _fallbackSet = textureRing[cursor++];
         var fallbackWrite = new WriteDescriptorSet { SType = StructureType.WriteDescriptorSet, DstSet = _fallbackSet,
             DstBinding = 0, DescriptorCount = 1, DescriptorType = DescriptorType.CombinedImageSampler, PImageInfo = &depthImage };
@@ -328,7 +328,7 @@ internal sealed unsafe class VKDecalPipeline : Season.Rendering.DecalPipeline
         var command = _command;
         var layout = _layout;
         var frameSet = _frameSet;
-        // 只接受匹配的附件形态：不写粗糙度时法线不能是附件，写粗糙度时必须是同一个 RT。
+        // Only accepts a matching attachment form: when roughness is not written, the normal must not be an attachment, and when it is written it must be the same RT.
         if (!Resolve(inputs, destination, out _, out _, out var normal, out var buffer)
             || buffer.Buffer.Handle != _buffer.Handle || (normal != null) != _withNormal) return false;
 

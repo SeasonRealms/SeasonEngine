@@ -961,7 +961,7 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         if (!_transformInitialized || _instanceCount == 0)
             return;
 
-        // 收集期把本模型钉在快照页上：重放时实例流与图元描述符集仍会被引用。
+        // During collection, pin this model on the snapshot page: the instance stream and the primitive descriptor sets will still be referenced during replay.
         VKSceneDrawCollection.RetainOwner(this);
 
         var cmd = Device.GraphicsCommandBuffer;
@@ -1002,8 +1002,8 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
             for (int orderIndex = 0; orderIndex < _transparentInstanceOrder.Count; orderIndex++)
             {
                 uint instanceIndex = (uint)_transparentInstanceOrder[orderIndex];
-                // 实例世界矩阵只在 CPU 侧（stream.Worlds），GPU 侧实例流不可回读，
-                // 所以透明排序深度必须由这里给出。
+                // The instance world matrix exists only on the CPU side (stream.Worlds); the GPU-side instance stream cannot be read back,
+                // so the transparent sort depth must be provided here.
                 float depth = ComputeTransparentDepth(stream.Worlds[instanceIndex], primitive.LocalBoundsCenter);
                 if (primitive.DoubleSided)
                 {
@@ -1057,11 +1057,11 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         var cmd = Device.GraphicsCommandBuffer;
         int fi = (int)Device.FrameIndex;
 
-        // 和 VKPrimitiveGroup.DrawShadow 保持同一套契约：未声明 UPDATE_AFTER_BIND 的描述符集一旦被
-        // 正在录制的命令缓冲引用就不能再改写，否则整条命令缓冲进入 invalid 状态。所以 binding 16-20
-        // 必须赶在本帧第一次绑定之前对齐——这里先把要投影的图元全部刷一遍，随后的 bind 才是安全的。
-        // 好处是主通道的 PreparePrimitive 会因为 ViewVersion 相同而跳过，不会再写回同一批集合。
-        // 实例模型的绘制不走场景收集，主通道也不会替它登记，所以这里同时把它画过的图元交给下一帧的帧首预刷新。
+        // Keeps the same contract as VKPrimitiveGroup.DrawShadow: a descriptor set that does not declare UPDATE_AFTER_BIND,
+        // once referenced by a command buffer being recorded, can no longer be rewritten, or the entire command buffer enters an invalid state. So bindings 16-20
+        // must be aligned before this frame's first bind — here all primitives to be projected are flushed first, and only then is the subsequent bind safe.
+        // The benefit is that the main pass's PreparePrimitive will be skipped because the ViewVersion is the same, and will not write back to the same batch of sets.
+        // The instanced model's drawing does not go through scene collection, and the main pass will not register it either, so here it also hands the primitives it has drawn to the next frame's frame-start pre-refresh.
         for (int i = 0; i < _opaquePrimitives.Count; i++)
         {
             var primitive = _opaquePrimitives[i];

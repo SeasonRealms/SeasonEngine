@@ -580,15 +580,18 @@ public static class CascadedShadow
     public static bool AccumulatingCasters => _fingerprintWalk;
 
     /// <summary>
-    /// 本帧阴影图是否复用上一帧的结果，由 <see cref="EvaluateReuse"/> 的调用方在 FrameStart 相位之前写入。
+    /// Whether this frame's shadow map reuses the previous frame's result; written by the caller of
+    /// <see cref="EvaluateReuse"/> before the FrameStart phase.
     ///
-    /// 存在的理由是顺序：A7 的实例剔除在 FrameStart 相位里跑，早于阴影 Pass，所以它只能在 Record 时
-    /// 读这个标志。复用命中时整个阴影 Pass 被跳过，剔除与收集的产物没有任何消费者，那一帧的三次派发
-    /// 纯属浪费。把判定提前到 RecordPhase 之前是可行的，因为 EvaluateReuse 只做一次树遍历而不提交任何
-    /// 绘制命令——见 <see cref="AccumulatingCasters"/>。
+    /// It exists because of ordering: A7 instance culling runs in the FrameStart phase, earlier than the shadow Pass,
+    /// so it can only read this flag during Record. When reuse hits, the entire shadow Pass is skipped, the culling
+    /// and gathering outputs have no consumer, and that frame's three dispatches are pure waste. Hoisting the
+    /// decision before RecordPhase is feasible because EvaluateReuse only walks the tree once and submits no draw
+    /// commands -- see <see cref="AccumulatingCasters"/>.
     ///
-    /// 没有调用 EvaluateReuse 的帧（复用档关闭、无阴影、无光源）由调用方明确写回 false，
-    /// 不依赖这个属性自己重置，否则一次命中之后标志会永久留着。
+    /// Frames that do not call EvaluateReuse (reuse tier off, no shadows, no lights) have the caller explicitly write
+    /// back false rather than relying on this property to reset itself, otherwise the flag would linger forever after
+    /// a single hit.
     /// </summary>
     public static bool ReuseActive { get; internal set; }
 

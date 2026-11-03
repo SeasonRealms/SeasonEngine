@@ -6,9 +6,9 @@ namespace Season.Rendering;
 
 public sealed partial class InstanceCullEffect
 {
-    // A7 的 Metal 侧四份内核。MSL 没有编译期的组大小声明，64 由 DispatchThreadgroups 的第二个参数给出，
-    // 所以这里的 C# 常量是唯一的来源；buffer 槽位按"Params 为 0，其余 buffer 从 1 起"排布。
-    // finalize 是唯一组大小为 1 的内核，C# 侧与之对应的 WorkgroupX/Y/Z 也是 1。
+    // A7's four Metal kernels. MSL has no compile-time group-size declaration; the 64 is given by the second argument of DispatchThreadgroups,
+    // so the C# constant here is the only source; buffer slots are laid out as "Params at 0, other buffers starting at 1".
+    // finalize is the only kernel with a group size of 1, and the matching C# WorkgroupX/Y/Z are also 1.
 
     const string ResetMsl = """
 #include <metal_stdlib>
@@ -68,7 +68,7 @@ struct CullParams
     uint pad2;
 };
 
-// clip = pos * VP（行向量约定）：clip.x 是位置与第 0 列的点积，第 3 列就是 w。
+// clip = pos * VP (row-vector convention): clip.x is the dot product of the position with column 0, and column 3 is w.
 static bool visible_in_slot(const device float* slotMatrices, uint slot, float3 center, float radius)
 {
     uint m = slot * 16u;
@@ -140,8 +140,8 @@ struct FinalizeParams
     uint pad;
 };
 
-// 单线程：槽位上限 4，串行读四个 uint 远低于开工作组再做归约同步的成本，
-// 也免去四端各写一遍 threadsync 方言。
+// Single-threaded: the slot count is at most 4, and reading four uints serially is far below the cost of opening a workgroup and doing a reduction with synchronization,
+// and it also avoids writing a threadsync dialect per backend.
 kernel void CSMain(uint3 id [[thread_position_in_grid]],
                    constant FinalizeParams& finalizeParams [[buffer(0)]],
                    const device uint* drawArgs [[buffer(1)]],
@@ -181,7 +181,7 @@ kernel void CSMain(uint3 id [[thread_position_in_grid]],
                    device float* sortedWorlds [[buffer(3)]],
                    device uint* drawArgs [[buffer(4)]])
 {
-    // 二维映射：X = 槽位内序号，Y = 槽位。两条派发路径共用它，A/B 的唯一变量是 X 维组数。
+    // Two-dimensional mapping: X = index within a slot, Y = slot. Both dispatch paths share it; the only A/B variable is the X-dimension group count.
     uint slot = id.y;
     uint k = id.x;
     if (slot >= gatherParams.slotCount)
@@ -190,7 +190,7 @@ kernel void CSMain(uint3 id [[thread_position_in_grid]],
     uint argsBase = slot * MAX_PRIMITIVES * ARGS_STRIDE_U;
     uint count = drawArgs[argsBase + 1u];
 
-    // 扇出：一个槽位的可见总数要写进该槽位每一条 primitive 的实例数。
+    // Fan-out: a slot's total visible count must be written into the instance count of every primitive entry for that slot.
     if (k == 0u)
     {
         for (uint q = 1u; q < gatherParams.primCount; ++q)

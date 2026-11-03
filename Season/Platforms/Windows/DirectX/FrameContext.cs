@@ -1,4 +1,4 @@
-﻿// Copyright (c) SeasonEngine and contributors.
+// Copyright (c) SeasonEngine and contributors.
 // Licensed under the MIT License.
 // https://github.com/SeasonRealms/SeasonEngine
 
@@ -64,13 +64,14 @@ internal unsafe class FrameContext
     private readonly ID3D12Device* _device;
     DXDrawSnapshotArena? _drawSnapshots;
 
-    // 仅按需分配；同帧追加，上一轮 fence 完成后才回收页和描述符。
+    // Allocated on demand only; appended within the same frame, and pages and descriptors are reclaimed
+    // only after the previous round's fence completes.
     internal DXDrawSnapshotArena DrawSnapshots
     {
         get
         {
             if (CommandList == null || CommandList != Device.GraphicsCommandList)
-                throw new InvalidOperationException("只能捕获当前帧的绘制资源。");
+                throw new InvalidOperationException("Only the current frame's draw resources can be captured.");
             var arena = _drawSnapshots ??= new DXDrawSnapshotArena();
             arena.BeginFrame(Device.GetCurrentRetireFenceValue(), Device.GetCompletedFenceValue());
             return arena;
@@ -119,13 +120,25 @@ internal unsafe class FrameContext
         // allocator Reset below, and that second error is louder than whatever went wrong first.
         if (!CloseIfRecording())
             throw new InvalidOperationException(
-                "FrameContext.Reset 无法继续：上一帧的命令列表仍在录制且关闭失败，不能重置其分配器。");
+                "FrameContext.Reset cannot continue: the previous frame's command list is still recording " +
+                "and failed to close, so its allocator cannot be reset.");
 
         // Snapshot the pointer value before Reset
         var cmdListBefore = (IntPtr)CommandList;
 
-        CommandAllocator->Reset();
-        CommandList->Reset(CommandAllocator, pso);
+        // A removed device faults here instead of returning its HRESULT: this Reset is only the first D3D12
+        // call of the frame, so it must not be reported as the cause. The filter keeps a genuine API misuse
+        // on its own exception path - only a device that is actually gone is relabelled.
+        try
+        {
+            CommandAllocator->Reset();
+            CommandList->Reset(CommandAllocator, pso);
+        }
+        catch (SEHException exception) when (Device.IsDeviceGone())
+        {
+            throw Device.DeviceRemovedFromSeh(exception, "resetting the frame's command allocator and list");
+        }
+
         IsRecording = true;
 
         // Snapshot and compare the pointer value after Reset
@@ -158,7 +171,7 @@ internal unsafe class FrameContext
     }
 }
 
-/// <summary>不可变绘制数据的帧内副本。上传页和独立 SRV 跨帧复用，不保留可变控件。</summary>
+/// <summary>Frame-local copy of immutable draw data. Upload pages and standalone SRVs are reused across frames, and no mutable control is retained.</summary>
 internal unsafe sealed class DXDrawSnapshotArena : IDisposable
 {
     internal readonly record struct Slice(nint Resource, ulong Offset, uint Size)
@@ -191,11 +204,12 @@ internal unsafe sealed class DXDrawSnapshotArena : IDisposable
     readonly List<Page> _pages = new();
     readonly List<int> _descriptors = new();
     readonly List<nint> _retained = new();
-    // 帧内保留的资源身份（几何缓冲按引用捕获时需要 AddRef 撑到 GPU 安全点）。
+    // Resource identities retained within the frame (a geometry buffer captured by reference needs an AddRef to last until the GPU safe point).
     readonly HashSet<nint> _retainedSet = new();
     readonly Dictionary<(nint Resource, ulong Offset, uint Size, uint Alignment), (Slice Slice, nint Mapped)> _bufferCopies = new();
-    // 视图缓存的键：直接对资源身份 + 视图描述符字节做等值比较。元组里放 ShaderResourceViewDesc
-    // 会走 ValueType 的反射式 Equals/GetHashCode，逐图元查询时实测占总耗时的四分之一。
+    // View cache key: compare resource identity + view descriptor bytes directly for equality. Putting a
+    // ShaderResourceViewDesc in a tuple would go through ValueType's reflective Equals/GetHashCode, which
+    // measured a quarter of the total time on per-primitive lookups.
     readonly struct ViewKey : IEquatable<ViewKey>
     {
         internal readonly nint Resource;
@@ -226,9 +240,9 @@ internal unsafe sealed class DXDrawSnapshotArena : IDisposable
     internal void BeginFrame(ulong stamp, ulong completed)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (stamp == 0 || stamp < _stamp) throw new InvalidOperationException("绘制快照帧标记无效。");
+        if (stamp == 0 || stamp < _stamp) throw new InvalidOperationException("Invalid draw snapshot frame stamp.");
         if (stamp == _stamp) return;
-        if (_stamp > completed) throw new InvalidOperationException("绘制快照仍在 GPU 使用中，不能复用。");
+        if (_stamp > completed) throw new InvalidOperationException("The draw snapshot is still in use by the GPU and cannot be reused.");
         ReleaseRetained();
         _bufferCopies.Clear(); _views.Clear();
         foreach (var page in _pages) page.Used = 0;
@@ -240,7 +254,7 @@ internal unsafe sealed class DXDrawSnapshotArena : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_stamp == 0 || _stamp != Device.GetCurrentRetireFenceValue())
-            throw new InvalidOperationException("绘制快照只能在所属帧捕获。");
+            throw new InvalidOperationException("A draw snapshot can only be captured in its owning frame.");
     }
 
     static ulong Align(ulong value, uint alignment)
@@ -250,7 +264,7 @@ internal unsafe sealed class DXDrawSnapshotArena : IDisposable
     {
         ValidateFrame();
         if (bytes.IsEmpty || alignment == 0 || alignment > 65536)
-            throw new ArgumentOutOfRangeException(nameof(alignment), "快照必须包含数据，且对齐量位于 1..65536。");
+            throw new ArgumentOutOfRangeException(nameof(alignment), "A snapshot must contain data, and the alignment must be within 1..65536.");
         while (true)
         {
             if (_pageCursor == _pages.Count)
@@ -267,8 +281,9 @@ internal unsafe sealed class DXDrawSnapshotArena : IDisposable
         }
     }
 
-    // 深复制 CPU 可写资源，而非仅 AddRef；后续 Update/Dispose 不得改写本帧已捕获的内容。
-    // 只用于仍可能是跨图元复用环的缓冲（2D 四边形/文本的矩阵与实例数据）。
+    // Deep-copy the CPU-writable resource rather than only AddRef; subsequent Update/Dispose must not
+    // rewrite what was already captured this frame. Used only for buffers that may still be a per-primitive
+    // reuse ring (the matrix and instance data of 2D quads/text).
     internal Slice CaptureBuffer(ID3D12Resource* source, ulong offset, uint size, uint alignment = 256)
     {
         ValidateFrame();
@@ -281,7 +296,7 @@ internal unsafe sealed class DXDrawSnapshotArena : IDisposable
         int hr = source->GetHeapProperties(&heap, &flags);
         if (hr < 0) Marshal.ThrowExceptionForHR(hr);
         if (heap.Type != HeapType.Upload)
-            throw new InvalidOperationException("可变绘制缓冲必须来自 CPU 可读的 Upload heap。");
+            throw new InvalidOperationException("A mutable draw buffer must come from a CPU-readable Upload heap.");
         void* mapped;
         hr = source->Map(0, null, &mapped);
         if (hr < 0) Marshal.ThrowExceptionForHR(hr);
@@ -289,8 +304,9 @@ internal unsafe sealed class DXDrawSnapshotArena : IDisposable
         {
             var key = ((nint)source, offset, size, alignment);
             var bytes = new ReadOnlySpan<byte>((byte*)mapped + offset, (int)size);
-            // 同帧共享 VB/IB/骨骼经常被多个图元使用。只有字节仍完全相同时才能复用，
-            // 不能仅按资源地址缓存，否则控件在两次 Draw 之间更新会污染快照。
+            // A VB/IB/skeleton shared within the frame is often used by multiple primitives. Reuse is only
+            // possible while the bytes are still exactly identical; caching by resource address alone is not
+            // enough, otherwise a control updated between two Draws would pollute the snapshot.
             if (_bufferCopies.TryGetValue(key, out var cached)
                 && bytes.SequenceEqual(new ReadOnlySpan<byte>((void*)cached.Mapped, (int)size))) return cached.Slice;
             var slice = CaptureBytes(bytes, alignment);
@@ -299,7 +315,7 @@ internal unsafe sealed class DXDrawSnapshotArena : IDisposable
         }
         finally
         {
-            // 捕获只读取原缓冲，不能宣布原缓冲被 CPU 改写。
+            // Capture only reads the source buffer, so it must not declare the source buffer as written by the CPU.
             Silk.NET.Direct3D12.Range written = default;
             source->Unmap(0, &written);
         }
@@ -309,8 +325,9 @@ internal unsafe sealed class DXDrawSnapshotArena : IDisposable
     {
         if (stride == 0 || stride > 2048 || stride % 4 != 0 || count == 0)
             throw new ArgumentOutOfRangeException(nameof(stride));
-        // 结构化缓冲（骨骼调色板、形变权重）与顶点缓冲一样在帧内不可变：直绘路径绑定的就是
-        // 同一资源的预建 SRV。因此直接在源资源上建视图，不再整块深拷贝上传数据。
+        // A structured buffer (skeleton palette, morph weights) is immutable within the frame just like a
+        // vertex buffer: the direct draw path binds the pre-built SRV of the very same resource. So the view
+        // is created on the source resource directly, without deep-copying the whole upload data again.
         var desc = new ShaderResourceViewDesc
         {
             ViewDimension = SrvDimension.Buffer, Shader4ComponentMapping = 0x1688,
@@ -319,8 +336,9 @@ internal unsafe sealed class DXDrawSnapshotArena : IDisposable
         return CaptureView(source, desc);
     }
 
-    // 从资源和原始视图描述重建 SRV；禁止从 shader-visible heap 复制描述符。
-    // 即使源对象撤销/改写自己的描述符，捕获的资源身份也保留到 GPU 安全点。
+    // Rebuild the SRV from the resource and the original view descriptor; copying a descriptor from the
+    // shader-visible heap is forbidden. Even if the source object revokes/rewrites its own descriptor, the
+    // captured resource identity is retained until the GPU safe point.
     internal GpuDescriptorHandle CaptureView(ID3D12Resource* resource, ShaderResourceViewDesc desc)
     {
         ValidateFrame();
@@ -338,8 +356,9 @@ internal unsafe sealed class DXDrawSnapshotArena : IDisposable
         return view;
     }
 
-    // 几何缓冲（VB/IB）在帧内不可变：直绘路径也直接把原始 GPU 地址交给命令列表，
-    // 寿命契约同样是“撑到本帧结束”。因此这里只需要保留引用，不再逐帧深复制。
+    // A geometry buffer (VB/IB) is immutable within the frame: the direct draw path also hands the raw GPU
+    // address to the command list, with the same lifetime contract of "last until the end of this frame".
+    // So only a reference needs to be retained here, and no per-frame deep copy is made.
     internal void Retain(ID3D12Resource* resource)
     {
         if (resource == null || !_retainedSet.Add((nint)resource)) return;

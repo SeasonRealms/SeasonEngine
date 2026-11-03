@@ -11,31 +11,31 @@ using Silk.NET.DXGI;
 namespace Season.Platforms.Windows.DirectX;
 
 /// <summary>
-/// P2 水面材质的 D3D12 实现。
+/// D3D12 implementation of the P2 water surface material.
 ///
-/// 与 <see cref="DXDecalPipeline"/> 的骨架相同（描述符快照 + Prepare/Draw 时序契约），差别集中在三处：
+/// The skeleton is the same as <see cref="DXDecalPipeline"/> (descriptor snapshot + Prepare/Draw timing contract); the differences are concentrated in three places:
 /// <list type="bullet">
-/// <item>几何由 VS 按 <c>SV_VertexID</c> 展开（P3 是 6 顶点的单位平面，P4 起是 tile 内的 subdiv² 网格），
-/// 世界矩阵与分块参数都装在帧缓冲/根常量里，所以没有顶点缓冲；<c>SV_InstanceID</c> 就是 tile 索引；</item>
-/// <item>本 Pass <b>不挂深度附件</b>：SceneDepth 是纯采样源（<c>AllShaderResource</c>），
-/// 遮挡靠着色器里的软件深度测试解决。这与贴花同理，但水面还需要深度来算厚度，所以两者共用同一次转换；</item>
-/// <item>多一张 <c>RefractionSource</c>（开画前的场景色快照）：颜色附件与采样源不能是同一资源，
-/// 快照由 <see cref="Device.CopyRenderTarget"/> 在 Pass 外拷好。</item>
+/// <item>The geometry is expanded by the VS from <c>SV_VertexID</c> (P3 is a 6-vertex unit plane, P4 onward is a subdiv² mesh inside a tile),
+/// the world matrix and tiling parameters are all packed in the frame buffer/root constants, so there is no vertex buffer; <c>SV_InstanceID</c> is the tile index;</item>
+/// <item>This Pass does <b>not attach a depth attachment</b>: SceneDepth is a pure sampling source (<c>AllShaderResource</c>),
+/// occlusion is solved by the software depth test in the shader. This is the same reasoning as for the decal, but the water surface also needs the depth to compute thickness, so the two share the same transition;</item>
+/// <item>There is an extra <c>RefractionSource</c> (a snapshot of the scene color before drawing): the color attachment and the sampling source cannot be the same resource,
+/// the snapshot is copied outside the Pass by <see cref="Device.CopyRenderTarget"/>.</item>
 /// </list>
 ///
-/// 混合是标准 alpha 混合（SrcAlpha / InvSrcAlpha）：着色器输出非预乘色，与原透明几何保持一致。
-/// 双面渲染（<c>CullMode.None</c>）：水面从水下也应该看得到，而且俯仰角很大时背面剔除会让水面整块消失。
+/// Blending is standard alpha blending (SrcAlpha / InvSrcAlpha): the shader outputs non-premultiplied color, consistent with the original transparent geometry.
+/// Double-sided rendering (<c>CullMode.None</c>): the water surface should be visible from underwater too, and at a very large pitch angle back-face culling would make the water surface disappear entirely.
 /// </summary>
 internal sealed unsafe class DXWaterPipeline : WaterPipeline
 {
-    // 根参数序号，与 WaterShaders.Hlsl 的 t0..t8、b0 一一对应。
-    // 八个采样槽连成一段：t1..t4 是深度/折射/法线/天空，t5..t8 是 P3 的 Hi-Z 四级金字塔。
+    // Root parameter indices, corresponding one-to-one with t0..t8 and b0 in WaterShaders.Hlsl.
+    // The eight sampling slots form one run: t1..t4 are depth/refraction/normal/sky, t5..t8 are the four-level Hi-Z pyramid of P3.
     const uint FrameRoot = 0;
     const uint DepthRoot = 1;
     const uint RefractionRoot = 2;
     const uint NormalRoot = 3;
     const uint SkyRoot = 4;
-    // P3：Hi-Z 金字塔的四个级别紧跟天空 LUT，t5..t8。
+    // P3: the four levels of the Hi-Z pyramid immediately follow the sky LUT, t5..t8.
     const uint HzRoot0 = 5;
     const uint ParamsRoot = 9;
 
@@ -44,10 +44,10 @@ internal sealed unsafe class DXWaterPipeline : WaterPipeline
     readonly ulong[] _stamps = new ulong[(int)Device.frameCount];
     ID3D12RootSignature* _signature;
     ID3D12PipelineState* _pipeline;
-    /// <summary>逐水面的法线纹理解析器：只查后端纹理字典，不加载。</summary>
+    /// <summary>Per-water-surface normal texture resolver: it only looks up the backend texture dictionary, it does not load.</summary>
     readonly Func<string, DXTexture?> _resolve;
     readonly DXTexture?[] _normals = new DXTexture?[WaterMath.MaxWaters];
-    /// <summary>本帧的 Hi-Z 四级金字塔；<see cref="HiZEffect.Ready"/> 为假时整组为空，绑白纹理。</summary>
+    /// <summary>This frame's four-level Hi-Z pyramid; when <see cref="HiZEffect.Ready"/> is false the whole set is null and a white texture is bound.</summary>
     readonly DXTexture?[] _hz = new DXTexture?[HiZEffect.LevelCount];
     ID3D12GraphicsCommandList* _command;
     WaterInputs _inputs;
@@ -60,8 +60,8 @@ internal sealed unsafe class DXWaterPipeline : WaterPipeline
     bool _disposed;
 
     /// <summary>
-    /// 深度与折射快照的描述符快照。引用保活使窗口 Resize 前后的原生地址不会被复用；
-    /// 法线贴图与天空 LUT 直接借后端字典里已经建好的 SRV 句柄，不占这里的槽。
+    /// Descriptor snapshot for depth and refraction. Keeping the references alive prevents the native address from being reused across a window Resize;
+    /// the normal map and the sky LUT directly borrow the already-built SRV handles from the backend dictionary and do not occupy a slot here.
     /// </summary>
     sealed class BindingSlot
     {
@@ -125,7 +125,7 @@ internal sealed unsafe class DXWaterPipeline : WaterPipeline
     void Initialize()
     {
         var parameters = stackalloc RootParameter[10];
-        // 帧缓冲是根 SRV：每帧只有一个，且顶点与像素阶段都要读，没必要为它单独占描述符。
+        // The frame buffer is a root SRV: there is only one per frame, and both the vertex and pixel stages need to read it, so there is no need to occupy a descriptor for it separately.
         parameters[FrameRoot] = new() { ParameterType = RootParameterType.TypeSrv,
             Descriptor = new RootDescriptor { ShaderRegister = 0, RegisterSpace = 0 },
             ShaderVisibility = ShaderVisibility.All };
@@ -154,7 +154,7 @@ internal sealed unsafe class DXWaterPipeline : WaterPipeline
             blob.Get().GetBufferSize(), &iid, (void**)&signature));
         _signature = signature;
 
-        // 编译产物由 ShaderCompiler 缓存持有一份引用，调用方拿到的这一份用完全必须自己释放。
+        // The compile result is kept as one reference by the ShaderCompiler cache; the copy the caller gets must be released by itself once done.
         string common = WaterShaders.FrameHlsl;
         ID3D10Blob* vertex = ShaderCompiler.CompileShaderFromSource(common + WaterShaders.VertexHlsl, "VSMain", "vs_5_0");
         try
@@ -174,14 +174,14 @@ internal sealed unsafe class DXWaterPipeline : WaterPipeline
             PRootSignature = _signature,
             VS = new(vertex->GetBufferPointer(), vertex->GetBufferSize()),
             PS = new(fragment->GetBufferPointer(), fragment->GetBufferSize()),
-            // 双面：水面从水下看得到，俯仰角很大时也不会因背面剔除整块消失。
+            // Double-sided: the water surface is visible from underwater, and at a very large pitch angle it will not disappear entirely due to back-face culling.
             RasterizerState = new() { FillMode = FillMode.Solid, CullMode = CullMode.None, DepthClipEnable = 1 },
-            // 没有深度附件，深度比较必须显式关闭；遮挡由着色器里的软件深度测试负责。
+            // There is no depth attachment, so the depth comparison must be explicitly disabled; occlusion is handled by the software depth test in the shader.
             DepthStencilState = new() { DepthEnable = 0, DepthWriteMask = DepthWriteMask.Zero,
                 DepthFunc = ComparisonFunc.Always, FrontFace = stencil, BackFace = stencil },
             SampleMask = uint.MaxValue, PrimitiveTopologyType = PrimitiveTopologyType.Triangle,
             NumRenderTargets = 1u, SampleDesc = new(1, 0) };
-        // 着色器输出非预乘色，所以用标准 alpha 混合；alpha 槽保留目标值，水面不参与后续的 alpha 判定。
+        // The shader outputs non-premultiplied color, so standard alpha blending is used; the alpha slot keeps the destination value, and the water surface does not participate in the subsequent alpha test.
         desc.BlendState.RenderTarget[0] = new() { BlendEnable = 1, SrcBlend = Blend.SrcAlpha,
             DestBlend = Blend.InvSrcAlpha, BlendOp = BlendOp.Add,
             SrcBlendAlpha = Blend.Zero, DestBlendAlpha = Blend.One, BlendOpAlpha = BlendOp.Add,
@@ -198,8 +198,8 @@ internal sealed unsafe class DXWaterPipeline : WaterPipeline
         Texture2D = new() { MipLevels = 1 } };
 
     /// <summary>
-    /// 核对形状并把资源折成描述符快照。返回 false 表示本帧放弃：水面只支持「颜色是单采样 HDR、
-    /// 深度与颜色同尺寸、快照与颜色不同形」这一种形状，其余情况宁可不出图也不出错图。
+    /// Verify the shape and fold the resources into a descriptor snapshot. Returning false means giving up this frame: the water surface only supports the one shape
+    /// "color is single-sample HDR, depth and color are the same size, snapshot and color are not the same shape"; in other cases it will produce no image rather than a wrong image.
     /// </summary>
     bool Resolve(in WaterInputs inputs, DXRenderTarget destination, Span<nint> resources,
         Span<ShaderResourceViewDesc> views, bool transition)
@@ -215,7 +215,7 @@ internal sealed unsafe class DXWaterPipeline : WaterPipeline
             || refraction.ColorNativeFormat != Format.FormatR16G16B16A16Float
             || depth.Desc.DepthFormat != RtFormat.D32Float
             || ReferenceEquals(refraction, color)
-            // 本 Pass 把颜色目标当作混合底图，共享层因此必须交出同一张目标。
+            // This Pass uses the color target as the blend base image, so the shared layer must hand out the same target.
             || !ReferenceEquals(destination, color)
             || color.Width == 0 || color.Height == 0 || color.Width != depth.Width || color.Height != depth.Height
             || color.Width != refraction.Width || color.Height != refraction.Height
@@ -262,12 +262,12 @@ internal sealed unsafe class DXWaterPipeline : WaterPipeline
         if (_cursors[index] == ring.Count) ring.Add(new BindingSlot());
         var slot = ring[_cursors[index]++];
         slot.Capture(resources, views);
-        // 天空 LUT 是 P0 建的那张 compute 纹理：名字没注册（StaticCube 档）时退回 1×1 白，
-        // 着色器侧的 misc.w 门控保证它不会被真正采样。
+        // The sky LUT is the compute texture created by P0: when the name is unregistered (the StaticCube tier) it falls back to 1x1 white,
+        // and the misc.w gate on the shader side guarantees it is never actually sampled.
         _skyView = inputs.SkyView != null && _resolve(inputs.SkyView) is { Ready: true } sky && sky._textureResource != null
             ? sky : null;
-        // P3 Hi-Z：逐级解析本帧的金字塔。任何一级缺席就整组退回，与着色器侧的
-        // frame[12].x 门控同源（两边都以 HiZEffect.Ready 为准），不会出现半套金字塔。
+        // P3 Hi-Z: resolve this frame's pyramid level by level. If any level is missing the whole set falls back, sharing the same source as the
+        // frame[12].x gate on the shader side (both are governed by HiZEffect.Ready), so a half set of the pyramid cannot occur.
         Array.Clear(_hz);
         if (HiZEffect.Ready)
         {
@@ -285,7 +285,7 @@ internal sealed unsafe class DXWaterPipeline : WaterPipeline
         _inputs = inputs; _destination = target; _frame = frame; _prepared = slot;
         _command = Device.GraphicsCommandList; _stamp = stamp; _frameIndex = Device.FrameIndex;
 
-        // 逐水面的法线贴图：只查字典，不加载。名字未注册或还没上传完的水面退回程序化波浪。
+        // Per-water-surface normal map: only look up the dictionary, do not load. A water surface whose name is unregistered or not yet fully uploaded falls back to procedural waves.
         Array.Clear(_normals);
         for (int i = 0; i < inputs.Count; i++)
         {
@@ -323,14 +323,14 @@ internal sealed unsafe class DXWaterPipeline : WaterPipeline
         command->SetGraphicsRootShaderResourceView(FrameRoot, frame.Resource->GetGPUVirtualAddress());
         command->SetGraphicsRootDescriptorTable(DepthRoot, Device.SrvHeapManager.GetGpuHandle(slot.Ids[0]));
         command->SetGraphicsRootDescriptorTable(RefractionRoot, Device.SrvHeapManager.GetGpuHandle(slot.Ids[1]));
-        // 法线贴图与天空 LUT 直接借字典里已经建好的 SRV 句柄，不再重新分配描述符。
+        // The normal map and the sky LUT directly borrow the already-built SRV handles from the dictionary, no need to allocate a descriptor again.
         var white = Device.White;
         command->SetGraphicsRootDescriptorTable(SkyRoot, (skyView ?? white).GpuDescriptorHandle);
-        // Hi-Z 是 compute 写入的纹理，dispatch 结束就停在 PixelShaderResource，这里不再补 barrier。
+        // Hi-Z is a texture written by compute; when the dispatch ends it stays in PixelShaderResource, so no barrier is added here.
         for (int i = 0; i < hz.Length; i++)
             command->SetGraphicsRootDescriptorTable(HzRoot0 + (uint)i, (hz[i] ?? white).GpuDescriptorHandle);
-        // 着色器侧是 uint4 waterParams，根常量按位原样拷贝：必须写整数位。
-        // P4 起后三个分量是 tile 网格参数，顶点着色器据此展开分块网格；不分块时全为 (1,1,0)。
+        // On the shader side it is uint4 waterParams; the root constants are copied bit-for-bit: you must write the integer bits.
+        // From P4 onward the last three components are the tile mesh parameters, and the vertex shader expands the tiled mesh from them; when not tiling they are all (1,1,0).
         var parameters = stackalloc uint[4];
         for (int i = 0; i < inputs.Count; i++)
         {
@@ -341,8 +341,8 @@ internal sealed unsafe class DXWaterPipeline : WaterPipeline
             parameters[3] = (uint)draw.Subdiv;
             command->SetGraphicsRootDescriptorTable(NormalRoot, (normals[i] ?? white).GpuDescriptorHandle);
             command->SetGraphicsRoot32BitConstants(ParamsRoot, 4, parameters, 0);
-            // P4：分块实例化。tile 索引走 SV_InstanceID（StartInstanceLocation 保持 0），
-            // 槽位仍由根常量携带 —— 只有 WebGPU 需要把两者挤进同一个实例号。
+            // P4: tiled instancing. The tile index goes through SV_InstanceID (StartInstanceLocation stays 0),
+            // and the slot is still carried by the root constants - only WebGPU needs to squeeze the two into the same instance number.
             command->DrawInstanced((uint)draw.VertexCount, (uint)draw.InstanceCount, 0, 0);
         }
         return true;

@@ -6,12 +6,12 @@ using Silk.NET.Direct3D12;
 
 namespace Season.Platforms.Windows.DirectX;
 
-/// <summary>只保存不可变的本帧地址/视图，不保存控件、图元或重放 Draw 的委托。</summary>
+/// <summary>Stores only this frame's immutable addresses/views, not controls, primitives, or a delegate to replay Draw.</summary>
 internal unsafe struct DXSceneDrawCommand : ISceneDrawCommand
 {
-    // 29 而不是 23：2-7 P0 的 Sky-View LUT 挂在根参数 28（见 Pipeline.SkyViewRoot）。
-    // 23~27 在根签名里不是描述符表（t16 是根 SRV，b6/b7 是根常量，b8 是 CBV），
-    // 所以重放循环只走到 22，索引 28 单独绑定。
+    // 29 rather than 23: the Sky-View LUT of 2-7 P0 is attached at root parameter 28 (see Pipeline.SkyViewRoot).
+    // 23..27 are not descriptor tables in the root signature (t16 is a root SRV, b6/b7 are root constants, b8 is a CBV),
+    // so the replay loop only goes up to 22, and index 28 is bound separately.
     [System.Runtime.CompilerServices.InlineArray(29)]
     internal struct Views { GpuDescriptorHandle _first; }
     internal Views Textures;
@@ -49,19 +49,19 @@ internal unsafe struct DXSceneDrawCommand : ISceneDrawCommand
         else cmd->DrawInstanced(Count, InstanceCount, 0, StartInstance);
     }
 
-    // 快照属于 FrameContext，必须等 fence 完成；队列清空不能提前回收。
+    // The snapshot belongs to the FrameContext and must wait for the fence to complete; clearing the queue cannot reclaim it early.
     public void Release() { }
 }
 
-/// <summary>主线程场景收集器。SetPipeline 仅记录状态，消费时才绑定真实 Pass 的 PSO。</summary>
+/// <summary>Main-thread scene collector. SetPipeline only records state; the real Pass PSO is bound at consumption time.</summary>
 internal unsafe sealed class DXSceneDrawCollection
 {
     readonly SceneDrawQueue<DXSceneDrawCommand> _queue = new();
     ulong _stamp;
     bool _live;
     internal static DXSceneDrawCollection? Active { get; private set; }
-    /// <summary>S5: "本视图是否有雾" 正向门控，取代原 SuppressFog 反向语义。
-    /// 由 DrawTransparent(sampleFog) 在重放期设定；BindSceneFog 据此决定走真实合成绑定还是零门控旁路。</summary>
+    /// <summary>S5: the positive gate "whether this view has fog", replacing the former SuppressFog negative semantics.
+    /// Set by DrawTransparent(sampleFog) during replay; BindSceneFog uses it to decide between the real composite binding and the zero-gate bypass.</summary>
     internal static bool ViewHasFog { get; private set; }
     internal DXSceneDrawCommand State;
     internal static DXDrawSnapshotArena Arena => Device.FrameContexts[Device.FrameIndex].DrawSnapshots;
@@ -71,7 +71,7 @@ internal unsafe sealed class DXSceneDrawCollection
     internal void Begin()
     {
         if (_live || Active != null || !FrameSchedule.SceneCollectionActive || !FrameSchedule.SceneDrawOrder.IsCollecting)
-            throw new InvalidOperationException("场景收集必须由帧调度器开启，且上一帧已经释放。");
+            throw new InvalidOperationException("Scene collection must be opened by the frame scheduler, and the previous frame must already be released.");
         _queue.BeginCollection();
         _stamp = Device.GetCurrentRetireFenceValue();
         _live = true;
@@ -80,8 +80,9 @@ internal unsafe sealed class DXSceneDrawCollection
         Active = this;
     }
 
-    // 场景级纹理（阴影图/环境立方图/DDGI/Aerial LUT）每帧只解析一次，其余图元只拷贝句柄：
-    // 每图元重建 5 次 SRV 视图并把描述符当作字典键，实测占收集耗时的百分之几。
+    // Scene-level textures (shadow map / environment cubemap / DDGI / Aerial LUT) are resolved only once per
+    // frame, and the remaining primitives only copy the handle: rebuilding 5 SRV views per primitive and using
+    // the descriptor as a dictionary key measured a few percent of the collection time.
     DXSceneDrawCommand _sceneTemplate;
     bool _sceneCaptured;
 
@@ -105,7 +106,7 @@ internal unsafe sealed class DXSceneDrawCollection
     internal void Seal()
     {
         Validate();
-        if (Active != this) throw new InvalidOperationException("场景收集已封存。");
+        if (Active != this) throw new InvalidOperationException("The scene collection is already sealed.");
         _queue.Seal();
         Active = null;
     }
@@ -113,20 +114,20 @@ internal unsafe sealed class DXSceneDrawCollection
     void Validate()
     {
         if (!_live || _stamp != Device.GetCurrentRetireFenceValue())
-            throw new InvalidOperationException("场景绘制项只能在收集的同一帧消费。");
+            throw new InvalidOperationException("Scene draw items can only be consumed in the same frame they were collected.");
     }
 
     internal void DrawOpaque()
     {
         Validate();
-        if (Device.ActivePassId != RenderPassId.SceneOpaque) throw new InvalidOperationException("不透明队列的 Pass 无效。");
+        if (Device.ActivePassId != RenderPassId.SceneOpaque) throw new InvalidOperationException("Invalid Pass for the opaque queue.");
         _queue.DrawOpaque();
     }
 
     internal void DrawTransparent(bool sampleFog)
     {
         Validate();
-        if (Device.ActivePassId != RenderPassId.SceneTransparent) throw new InvalidOperationException("透明队列的 Pass 无效。");
+        if (Device.ActivePassId != RenderPassId.SceneTransparent) throw new InvalidOperationException("Invalid Pass for the transparent queue.");
         ViewHasFog = sampleFog;
         try { _queue.DrawTransparent(); }
         finally { ViewHasFog = false; }
@@ -159,10 +160,11 @@ internal unsafe sealed class DXSceneDrawCollection
     internal static ulong Constant(ID3D12Resource* source, uint size)
         => Arena.CaptureBuffer(source, 0, size).GpuAddress;
 
-    // 3D 图元的 CB 全部是“每所有者 + 每帧槽位”（primitiveData.MatrixBuffers[fi]、
-    // MaterialBuffers[fi]、每组光照 CB、每模型的骨骼 CB），帧内写一次就不再变；
-    // 直绘路径本来就只把 GPU 地址交给命令列表，所以这里同样只保留引用，不逐帧深复制。
-    // 2D 四边形/文本仍走 Constant 深复制：那条链上的矩阵 CB 可能是跨图元复用的环。
+    // The CBs of 3D primitives are all "per-owner + per-frame slot" (primitiveData.MatrixBuffers[fi],
+    // MaterialBuffers[fi], each light group CB, each model's skeleton CB), written once within the frame
+    // and unchanged thereafter; the direct draw path already hands only the GPU address to the command
+    // list, so only a reference is retained here as well, with no per-frame deep copy.
+    // 2D quads/text still go through the Constant deep copy: the matrix CB on that path may be a per-primitive reuse ring.
     internal static ulong ConstantRef(ID3D12Resource* source)
     {
         Arena.Retain(source);
@@ -209,8 +211,9 @@ internal unsafe sealed class DXSceneDrawCollection
         draw.Light = ConstantRef(light);
         draw.Material = ConstantRef(primitive.MaterialBuffers[fi]);
         var geometry = primitive.SharedGeometrySource ?? primitive;
-        // 顶点/索引缓冲在帧内不变（直绘路径同样直接把原始地址交给命令列表），所以只保留引用。
-        // 逐帧深复制会让每帧二十多 MB 几何数据穿过 write-combined 上传页，实测占收集耗时的九成。
+        // The vertex/index buffers are unchanged within the frame (the direct draw path likewise hands the raw
+        // address to the command list), so only a reference is retained. A per-frame deep copy would push over
+        // twenty MB of geometry data per frame through the write-combined upload page, measured at ninety percent of the collection time.
         Arena.Retain(geometry.VertexBuffer);
         Arena.Retain(geometry.IndexBuffer);
         draw.Vertex = primitive.VertexBufferView;

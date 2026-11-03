@@ -274,7 +274,7 @@ public enum ComputePhase
     FrameStart,
     AfterScene,
 
-    /// <summary>不透明场景结束后、透明场景开始前；未分段时紧随完整 Scene 执行。</summary>
+    /// <summary>After the opaque scene ends and before the transparent scene begins; when there is no segmentation, it runs immediately after the full Scene pass.</summary>
     AfterOpaque,
 }
 
@@ -360,7 +360,7 @@ public abstract class ComputeEffect
     /// <summary>Drops every per-view state slot; call from Dispose so a re-registered effect starts from a clean history.</summary>
     protected void ClearViewStates() => _viewStates = null;
 
-    /// <summary>从注册表移除后通知效果撤销其附加帧路由；缺省保留原有手动释放契约。</summary>
+    /// <summary>Notifies the effect after it is removed from the registry so it can revoke the frame routing it attached; by default the original manual-disposal contract is retained.</summary>
     public virtual void OnUnregistered() { }
 
     /// <summary>Window resize notification, driven by FrameSchedule.ResizeCompute after the GPU becomes idle.

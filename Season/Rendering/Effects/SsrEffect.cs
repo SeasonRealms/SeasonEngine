@@ -5,40 +5,50 @@
 namespace Season.Rendering.Effects;
 
 /// <summary>
-/// P3 屏幕空间反射：从每个不透明像素的着色法线出发，沿反射方向在屏幕空间步进，
-/// 用 <see cref="HiZEffect"/> 的金字塔整块跳过空区域，命中后取该点的场景色作为反射辐射。
+/// P3 screen-space reflection: starting from each opaque pixel's shading normal, march along the
+/// reflection direction in screen space, using the <see cref="HiZEffect"/> pyramid to skip empty
+/// regions in whole blocks, and on a hit take that point's scene color as the reflected radiance.
 ///
-/// 为什么是独立 compute 而不是主着色器里的一个采样：反射要用到"这一帧已经画完的不透明场景"，
-/// 而主着色器正在写这张图，同一资源不能既当附件又当采样源。放到场景之后单独算，
-/// 输入是一张完整的、可采样的不透明色，也就不需要为反射再拷一份全屏快照。
+/// Why this is a separate compute pass rather than a single sample in the main shader: reflection
+/// needs the "opaque scene already drawn this frame", while the main shader is writing that same
+/// image, and one resource cannot be both an attachment and a sampling source. Computing it
+/// separately after the scene means the input is a complete, samplable opaque color, so there is no
+/// need to copy another full-screen snapshot for reflections.
 ///
-/// 输出是**增量**而不是辐射值：核里已经把「把天空那一项换成命中点」的差分算完，
-/// Δ = conf · (1-r)² · w · (ssr − reflSky)，其中 w 是主着色器写进 SceneNormal.w 的反射权重
-/// （F0 的 Rec.709 亮度 × ao）。所以 <see cref="SsrCompositePipeline"/> 只剩一条全屏加法绘制：
-/// 不重算权重、不清屏、不另开目标。差分里 giDiffuse 自动抵消（替换量减替换量），
-/// 这也正是核必须知道 reflSky 的原因 —— 命中点亮度本身不能直接加，那是一份重复的天空能量。
+/// The output is a **delta**, not a radiance value: the kernel has already computed the difference
+/// of "replacing the sky term with the hit point", Δ = conf · (1-r)² · w · (ssr − reflSky), where w
+/// is the reflection weight the main shader writes into SceneNormal.w (the F0 Rec.709 luminance
+/// × ao). So <see cref="SsrCompositePipeline"/> only needs a single full-screen additive draw: no
+/// recomputing weights, no clearing, no separate target. In the delta, giDiffuse cancels out
+/// automatically (replacement minus replacement), which is exactly why the kernel must know reflSky
+/// -- the hit point's luminance cannot simply be added, since that would double the sky energy.
 ///
-/// 没命中的像素写 0，什么都没变，画面自然退回主着色器已经算好的天空 + 地面反射。
+/// Pixels that miss write 0, nothing changes, and the image naturally falls back to the sky +
+/// ground reflection the main shader already computed.
 ///
-/// 步进分两段：粗段按屏幕像素步长自动挑一级金字塔（步长大就查更粗的级，一个 texel 覆盖一整片），
-/// 射线深度还没越过该块的最近深度就整块跳过；越过之后在该块内用全分辨率深度细化，找第一个交点。
-/// 粗段挑级而不是固定用最粗一级，是因为近处的短射线每步只有几个像素，查 1/16 的块等于什么都没跳过。
+/// Marching has two stages: the coarse stage picks a pyramid level automatically from the per-pixel
+/// step length (a larger step queries a coarser level, where one texel covers a whole region), and
+/// it skips the block entirely while the ray depth has not passed that block's nearest depth; once
+/// it passes, the block is refined using full-resolution depth to find the first intersection. The
+/// coarse stage picks a level rather than always using the coarsest one because a short near ray
+/// only moves a few pixels per step, and querying a 1/16 block would skip nothing at all.
 ///
-/// 依赖：<see cref="HiZEffect"/> 必须先注册且本帧已重建（<see cref="HiZEffect.Ready"/>），
-/// 同时 SceneNormal 必须存在 —— 从深度现场重建的法线在轮廓两侧会翻转，反射会顺着轮廓糊成一片。
+/// Dependencies: <see cref="HiZEffect"/> must be registered first and rebuilt for this frame
+/// (<see cref="HiZEffect.Ready"/>), and SceneNormal must exist -- normals reconstructed from depth
+/// flip on either side of silhouettes, and the reflection would smear along the silhouette.
 /// </summary>
 public sealed class SsrEffect : ComputeEffect
 {
-    /// <summary>反射增量输出：rgb = 已含权重的 HDR 差分（可为负），a 恒为 0（加法合成不叠加透明度）。</summary>
+    /// <summary>Reflection delta output: rgb = weighted HDR difference (may be negative), a is always 0 (additive compositing does not accumulate opacity).</summary>
     public const string TextureName = "compute://ssr/reflection";
 
-    /// <summary>帧缓冲只含 float4；矩阵按 System.Numerics 原始行序存放。</summary>
+    /// <summary>The frame buffer contains only float4; matrices are stored in System.Numerics' native row order.</summary>
     public const int FrameVectorCount = 16;
 
-    /// <summary>粗段的屏幕步数。步长由射线在屏幕上的总位移除以它得到，所以远处细长的射线同样是这么多步。</summary>
+    /// <summary>Screen step count for the coarse stage. The step size is the ray's total screen displacement divided by it, so a long, thin distant ray also uses this many steps.</summary>
     const int CoarseSteps = 40;
 
-    /// <summary>命中块内的细化步数。</summary>
+    /// <summary>Refinement step count inside a hit block.</summary>
     const int RefineSteps = 8;
 
     static SsrEffect? _active;
@@ -55,24 +65,24 @@ public sealed class SsrEffect : ComputeEffect
 
     public override string Name => "ssr";
 
-    /// <summary>AfterOpaque：只反射不透明场景，且必须在雾/水面之前把结果出版给后面的消费者。</summary>
+    /// <summary>AfterOpaque: reflects only the opaque scene, and must publish its result to later consumers before fog/water.</summary>
     public override ComputePhase Phase => ComputePhase.AfterOpaque;
 
     public override ComputeScope Scope => ComputeScope.View;
 
     public override ViewFeature RequiredFeature => ViewFeature.Reflections;
 
-    /// <summary>本帧是否出版了一份可用的反射纹理；合成与水面的采样都看它。</summary>
+    /// <summary>Whether a usable reflection texture was published this frame; both compositing and water sampling gate on it.</summary>
     public bool Ready => _ready;
 
     public static bool AnyReady => _active is { _ready: true };
 
-    /// <summary>当前出版的反射纹理名；未就绪时为 null，调用方据此退回天空反射。</summary>
+    /// <summary>Name of the currently published reflection texture; null when not ready, in which case callers fall back to sky reflection.</summary>
     public static string? PublishedTexture => _active is { _ready: true } ? TextureName : null;
 
     public override bool Initialize(IGraphics g)
     {
-        if (_graphics != null) throw new InvalidOperationException("SSR 已经初始化。");
+        if (_graphics != null) throw new InvalidOperationException("SSR is already initialized.");
         if (_active != null) return false;
         if (RenderQuality.Current.ScreenSpaceReflections != SsrMode.HiZ) return false;
         var color = FrameSchedule.SceneColor;
@@ -107,8 +117,10 @@ public sealed class SsrEffect : ComputeEffect
         });
         if (_kernel == null) return false;
         _frameBuffer = g.CreateStorageBuffer(FrameVectorCount * 16);
-        // 后端没有加法全屏合成能力时根本不该注册：反射算得出来却画不上去，
-        // 只会白白打散场景 Pass（split 判据看的是委托非 null），还多一次全屏 dispatch。
+        // Without additive full-screen compositing on the backend there is no point registering at
+        // all: the reflection would be computed but never drawn, needlessly splitting the scene pass
+        // (the split predicate just checks whether the delegate is non-null) and costing an extra
+        // full-screen dispatch.
         _composite = g.CreateSsrCompositePipeline();
         if (_frameBuffer == null || _composite == null)
         {
@@ -129,9 +141,11 @@ public sealed class SsrEffect : ComputeEffect
         _height = height;
         _params = new Vector4(width, height, 0f, 0f);
         g.CreateComputeTexture(TextureName, width, height, ComputeStorageFormat.Rgba16Float);
-        // 槽位表与绑定声明一一对应（Params 之后从 0 数）：0 帧缓冲、1 场景色、2 深度、
-        // 3 法线、4..7 金字塔、8 天空 LUT、9 输出。只建一次：纹理名是常量，尺寸变化时
-        // CreateComputeTexture 会就地重建，引用同一名字的绑定不需要跟着换。
+        // The slot table corresponds one-to-one with the binding declarations (numbered from 0 after
+        // Params): 0 frame buffer, 1 scene color, 2 depth, 3 normals, 4..7 pyramid, 8 sky LUT,
+        // 9 output. Built only once: the texture name is a constant, and on a size change
+        // CreateComputeTexture recreates in place, so bindings referring to the same name do not need
+        // to be swapped.
         _resources[0] = _frameBuffer!;
         _resources[1] = FrameSchedule.SceneColor!;
         _resources[2] = FrameSchedule.SceneDepth!;
@@ -152,13 +166,16 @@ public sealed class SsrEffect : ComputeEffect
     public override void Record(IGraphics g)
     {
         _ready = false;
-        // 每帧先撤销出版：合成 Pass 只有在核真的写成功之后才该发出。
+        // Retract the publication first each frame: the composite pass should only be emitted after
+        // the kernel has actually written successfully.
         FrameSchedule.SsrOutputReady = false;
         if (!ReferenceEquals(g, _graphics) || _kernel == null || _frameBuffer == null || _composite == null) return;
         if (!HiZEffect.Ready || RenderQuality.Current.ScreenSpaceReflections != SsrMode.HiZ) return;
-        // 没有 Sky-View LUT 就没有 reflSky 可减：核要算的是「换成命中点」的差分，
-        // 少了基项只能算成「净加一份反射」，那正是上一轮 A 要修的重影。这种情况下主着色器写的
-        // 反射权重也是 0 整屏，所以直接不跑，画面保持主着色器已经算好的天空 + 地面反射。
+        // Without the Sky-View LUT there is no reflSky to subtract: the kernel computes the delta of
+        // "replaced by the hit point", and without the base term it could only compute "add a net
+        // reflection", which is exactly the ghosting that round A was meant to fix. In that case the
+        // reflection weight the main shader writes is also a full screen of 0, so just skip it and let
+        // the image keep the sky + ground reflection the main shader already computed.
         if (FrameSchedule.SkyViewTexture is not string skyView || !FrameSchedule.LightingSnapshotValid) return;
         var color = FrameSchedule.SceneColor;
         var depth = FrameSchedule.SceneDepth;
@@ -172,7 +189,7 @@ public sealed class SsrEffect : ComputeEffect
         float aspect = camera.Aspect > 0f ? camera.Aspect : (float)_width / _height;
         if (!(tanHalf > 0f) || !(aspect > 0f) || !(camera.Far > camera.Near)) return;
 
-        // 行序写入：0..3 VP、4..7 逆 VP、8..11 相机与重建参数、12 步进参数。
+        // Row-order writes: 0..3 VP, 4..7 inverse VP, 8..11 camera and reconstruction params, 12 march params.
         MemoryMarshal.Cast<Matrix4x4, Vector4>(MemoryMarshal.CreateReadOnlySpan(ref vp, 1)).CopyTo(_frame);
         MemoryMarshal.Cast<Matrix4x4, Vector4>(MemoryMarshal.CreateReadOnlySpan(ref inverse, 1)).CopyTo(_frame.AsSpan(4));
         _frame[8] = new Vector4(camera.Position, 1f);
@@ -182,11 +199,13 @@ public sealed class SsrEffect : ComputeEffect
             MathF.Max(0.01f, RenderQuality.Current.SsrThickness), RenderQuality.Current.SsrIntensity,
             FrameSchedule.SkyViewTexture != null ? 1f : 0f);
         _frame[12] = new Vector4((float)(FrameSchedule.FrameIndex & 0xFFFFUL), CoarseSteps, RefineSteps, 0f);
-        // 13 = reflectionParams0（地面辐亮度 xyz + 地面高度 w），14 = 天空强度与出版位。
-        // 帧缓冲本来就留了三行空位，reflSky 需要的全部外部输入正好塞得下，不必扩容。
+        // 13 = reflectionParams0 (ground radiance xyz + ground height w), 14 = sky intensity and publish slot.
+        // The frame buffer already had three spare rows, so all the external inputs reflSky needs fit
+        // exactly, with no need to grow it.
         _frame[13] = FrameSchedule.LightingSnapshot.ReflectionParams0;
         _frame[14] = new Vector4(FrameSchedule.LightingSnapshot.EnvParams.X, 1f, 0f, 0f);
-        // 天空 LUT 只在注册期之后才存在（SkyAtmosphere 注册晚于本效果），所以这里每帧解析名字。
+        // The sky LUT only exists after registration (SkyAtmosphere registers later than this effect),
+        // so resolve the name each frame here.
         _resources[8] = skyView;
         if (!g.TryUpdateStorageBuffer(_frameBuffer, MemoryMarshal.AsBytes(_frame.AsSpan()))) return;
         if (!g.TryDispatchCompute(new ComputeDispatchArgs
@@ -202,11 +221,11 @@ public sealed class SsrEffect : ComputeEffect
         FrameSchedule.SsrOutputReady = true;
     }
 
-    /// <summary>调度层在 <see cref="RenderPassId.SsrComposite"/> 打开之前调用；false 表示这一帧不合成。</summary>
+    /// <summary>Called by the scheduler before <see cref="RenderPassId.SsrComposite"/> opens; false means no compositing this frame.</summary>
     bool PrepareComposite(IGraphics g) => _composite != null && FrameSchedule.SceneColor is { } color
         && _composite.Prepare(new SsrCompositeInputs(color, TextureName));
 
-    /// <summary>只在该 Pass 内调用一次；合成失败时场景保持原样（反射只是少一份增量）。</summary>
+    /// <summary>Called exactly once inside that pass; on composite failure the scene stays as-is (reflection just loses its delta).</summary>
     bool DrawComposite(IGraphics g) => _composite?.Draw() ?? false;
 
     Vector4 _params;
@@ -221,7 +240,8 @@ public sealed class SsrEffect : ComputeEffect
         _graphics = null;
         _ready = false;
         if (graphics != null) FrameSchedule.UnregisterCompute(this);
-        // 委托必须摘干净：split 判据只看委托是否非 null，留着就会让场景 Pass 白打散。
+        // The delegates must be fully unhooked: the split predicate only checks whether a delegate is
+        // non-null, so leaving them behind would needlessly split the scene pass.
         if (FrameSchedule.PrepareSsrComposite == PrepareComposite) FrameSchedule.PrepareSsrComposite = null;
         if (FrameSchedule.RenderSsrComposite == DrawComposite) FrameSchedule.RenderSsrComposite = null;
         FrameSchedule.SsrOutputReady = false;
@@ -241,7 +261,8 @@ public sealed class SsrEffect : ComputeEffect
 
     /// <summary>D3D12 cs_5_0 (fxc; single exit avoids X4000).</summary>
     /// <remarks>
-    /// 不能写成 const：源码里的步数是把 int 常量拼进字符串，而「字符串 + int」不是编译期常量。
+    /// Cannot be a const: the step counts in the source are int constants concatenated into the
+    /// string, and "string + int" is not a compile-time constant.
     /// </remarks>
     static readonly string SourceHlsl = @"
 cbuffer SsrParams : register(b0)
@@ -264,13 +285,15 @@ Texture2D<float> uHz3 : register(t7);
 Texture2D<float4> uSkyView : register(t8);
 RWTexture2D<float4> uOutput : register(u0);
 
-// 帧缓冲走 ByteAddressBuffer：Load4 的偏移是字节，i * 16 就是 float4 的下标 i。
+// The frame buffer goes through a ByteAddressBuffer: Load4 offsets are in bytes, so i * 16 is the
+// float4 index i.
 float4 FrameF(uint i)
 {
     return asfloat(uFrame.Load4(i * 16u));
 }
 
-// 行序矩阵：与其余三端同形，绝不能写成 mul(M, p)——System.Numerics 是按行存放的。
+// Row-order matrix: same shape as the other three backends; never write mul(M, p) -- System.Numerics
+// stores rows.
 float4 Transform(float4 p, uint offset)
 {
     return p.x * FrameF(offset) + p.y * FrameF(offset + 1) + p.z * FrameF(offset + 2) + p.w * FrameF(offset + 3);
@@ -283,15 +306,16 @@ float3 OctDecode(float2 e)
     return normalize(n);
 }
 
-// 视空间前向深度（LH + [0,1]），与 GTAO 的重建公式同源。
+// View-space forward depth (LH + [0,1]), same origin as the GTAO reconstruction formula.
 float Linearize(float d)
 {
     float near = FrameF(10u).x, far = FrameF(10u).y;
     return near * far / (far - d * (far - near));
 }
 
-// 与主 PS 的 SampleSkyViewRadiance 逐字同形：地平线落在 uv.y = 0.5，天顶 0，天底 1。
-// 这张 LUT 是唯一的天空辐亮度来源，核里必须用同一套 UV 映射，否则差分会对不上。
+// Verbatim same shape as the main PS's SampleSkyViewRadiance: the horizon lands at uv.y = 0.5,
+// zenith 0, nadir 1. This LUT is the sole source of sky radiance, and the kernel must use the same
+// UV mapping, otherwise the delta will not line up.
 float3 SkyRadiance(float3 dir)
 {
     float2 uv;
@@ -300,8 +324,9 @@ float3 SkyRadiance(float3 dir)
     return uSkyView.SampleLevel(uLinearClamp, uv, 0.0).rgb;
 }
 
-// 这一像素上主 PS 原本加进去的天空反射项（A+B 之后的值）。差分是「换成命中点」，
-// 所以必须知道被换掉的是什么 —— 直接加命中点亮度会把天空那份能量算两遍。
+// The sky reflection term the main PS originally added for this pixel (the value after A+B). The
+// delta is 'replaced by the hit point', so it must know what is being replaced -- adding the hit
+// point's radiance directly would count the sky energy twice.
 float3 ReflectedSky(float3 P, float3 R)
 {
     float3 lut = SkyRadiance(R) * FrameF(14u).x;
@@ -310,8 +335,9 @@ float3 ReflectedSky(float3 P, float3 R)
     return lerp(FrameF(13u).xyz, lut, horizonW);
 }
 
-// 单一出口 + 显式 .x：fxc 4.x 对「模板化 SampleLevel 返回值隐式转 float + 多 return」的
-// 流分析会错报 X4000（use of potentially uninitialized variable）。
+// Single exit + explicit .x: fxc 4.x misreports X4000 (use of potentially uninitialized variable)
+// for the flow analysis of 'templated SampleLevel return implicitly converted to float + multiple
+// returns'.
 float HiZ(float2 uv, int level)
 {
     float value;
@@ -332,37 +358,43 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         float4 result = float4(0.0, 0.0, 0.0, 0.0);
         float depth = uDepth.Load(int3(id.xy, 0));
 
-        // 天空与背景不产生反射：深度停在远平面，法线目标里也没有可用的面。
+        // Sky and background produce no reflection: the depth sits at the far plane, and the normal
+        // target has no usable surface either.
         if (depth < 1.0)
         {
             float4 packed = uNormal.SampleLevel(uLinearClamp, uv, 0.0);
             float roughness = saturate(packed.z);
-            // w 是主 PS 算好的反射权重（F0 的 Rec.709 亮度 × ao）。envCube 路径写 0，
-            // 那种像素点的基项不是天空、差分无从定义，这里也就不该出任何东西。
+            // w is the reflection weight the main PS computed (F0's Rec.709 luminance x ao). The
+            // envCube path writes 0; for such pixels the base term is not sky and the delta is
+            // undefined, so nothing should come out here either.
             float weight = saturate(packed.w);
             float3 N = OctDecode(packed.xy);
 
-            // 粗糙面上屏幕空间反射本来就会糊成一片，还容易被单像素的误命中放大成噪点；
-            // 粗糙面的环境能量由 SH9 漫反射项承担，这里直接不出反射。
+            // Screen-space reflection on a rough surface smears into a blur anyway, and is easily
+            // amplified into noise by single-pixel false hits; the ambient energy of rough surfaces is
+            // carried by the SH9 diffuse term, so emit no reflection here.
             if (roughness < 0.6 && weight > 0.0)
             {
-                // 世界坐标重建：UV 的 Y 向下，所以 NDC 的 Y 要翻回来。
+                // World position reconstruction: UV Y points down, so the NDC Y must be flipped back.
                 float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
                 float4 world = Transform(float4(ndc, depth, 1.0), 4u);
                 float3 P = world.xyz / world.w;
                 float3 V = normalize(FrameF(8u).xyz - P);
                 float3 R = reflect(-V, N);
-                // 与主 PS 的 B 项同一个粗糙度权重：命中点替换掉的正是这一份镜面能量。
+                // Same roughness weight as the main PS's B term: the hit point replaces exactly this
+                // share of specular energy.
                 float mirrorW = (1.0 - roughness) * (1.0 - roughness);
 
-                // 沿法线偏移：不偏就直接命中自己所在的平面，整屏会反射成同一个颜色。
+                // Offset along the normal: without it the ray immediately hits the plane it lies on
+                // and the whole screen reflects the same color.
                 float bias = max(0.02, length(FrameF(8u).xyz - P) * 0.002);
                 float3 origin = P + N * bias + R * bias;
                 float maxDistance = FrameF(11u).x;
                 float4 clip0 = Transform(float4(origin, 1.0), 0u);
                 float4 clip1 = Transform(float4(origin + R * maxDistance, 1.0), 0u);
 
-                // 射线走不到的地方（相机背后）没有屏幕信息可采，缩短到近平面之前。
+                // Where the ray cannot reach (behind the camera) there is no screen information to
+                // sample, so shorten it to just before the near plane.
                 float endT = 1.0;
                 if (clip1.w <= 0.001)
                 {
@@ -379,7 +411,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                     float z1 = clip1.z / clip1.w;
                     float2 delta = uv1 - uv0;
 
-                    // 每步跨多少像素决定查哪一级金字塔：短射线用细级，否则粗块永远命中不了。
+                    // How many pixels each step spans decides which pyramid level to query: short rays
+                    // use a finer level, otherwise a coarse block would never register a hit.
                     float pixels = length(delta * size) / (float)" + CoarseSteps + @";
                     int level = 3;
                     if (pixels < 12.0) level = 2;
@@ -394,7 +427,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                     {
                         float2 next = uv0 + delta * ((float)i / (float)" + CoarseSteps + @");
                         float nextZ = lerp(z0, z1, (float)i / (float)" + CoarseSteps + @");
-                        // 出屏即终止：屏幕外的信息不存在，继续走只会采到钳制后的边缘像素。
+                        // Off screen means stop: information outside the screen does not exist, and
+                        // continuing only samples the clamped edge pixels.
                         if (next.x < 0.0 || next.x > 1.0 || next.y < 0.0 || next.y > 1.0) break;
                         float tile = HiZ(next, level);
                         if (nextZ < tile)
@@ -403,7 +437,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                             coarseZ = nextZ;
                             continue;
                         }
-                        // 射线越过了这一块的最近表面：在 (上一节点, 当前节点) 内逐点逼近真实交点。
+                        // The ray passed this block's nearest surface: refine point by point within
+                        // (previous node, current node) to approach the true intersection.
                         float2 from = coarse;
                         float fromZ = coarseZ;
                         float2 to = next;
@@ -417,7 +452,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                             int2 coord = clamp(int2(suv * size), int2(0, 0), int2((int)uDstWidth - 1, (int)uDstHeight - 1));
                             float sceneD = uDepth.Load(int3(coord, 0));
                             if (sceneD >= 1.0) continue;
-                            // 厚度判定放在线性深度上：NDC 深度越远越挤，同一个阈值在近处和远处差出几个数量级。
+                            // Thickness testing happens in linear depth: NDC depth compresses with
+                            // distance, so a single threshold differs by orders of magnitude near and far.
                             float rayView = Linearize(rayZ);
                             float sceneView = Linearize(sceneD);
                             if (rayView >= sceneView && rayView - sceneView <= FrameF(11u).y)
@@ -426,8 +462,10 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                                 float edge = min(min(hitUv.x, 1.0 - hitUv.x), min(hitUv.y, 1.0 - hitUv.y));
                                 float fade = saturate(edge / 0.06);
                                 fade *= saturate(1.0 - (float)i / (float)" + CoarseSteps + @");
-                                // 差分写在这里而不是合成端：命中点的辐射减去这一像素原本的天空项，
-                                // 再乘 (1-r)²、反射权重与置信度 —— 合成端因此只剩一条加法绘制。
+                                // The delta is written here rather than at the composite side: the hit
+                                // point's radiance minus this pixel's original sky term, then scaled by
+                                // (1-r)^2, the reflection weight and the confidence -- so compositing is
+                                // left with just one additive draw.
                                 float3 hitRadiance = uScene.SampleLevel(uLinearClamp, hitUv, 0.0).rgb;
                                 result = float4((hitRadiance - ReflectedSky(P, R)) * (mirrorW * weight * fade), 0.0);
                                 break;
@@ -484,7 +522,8 @@ float Linearize(float d)
     return near * far / (far - d * (far - near));
 }
 
-// 与主 PS 的 SampleSkyViewRadiance 逐字同形：地平线落在 uv.y = 0.5，天顶 0，天底 1。
+// Verbatim same shape as the main PS's SampleSkyViewRadiance: the horizon lands at uv.y = 0.5,
+// zenith 0, nadir 1.
 vec3 SkyRadiance(vec3 dir)
 {
     vec2 uv;
@@ -493,7 +532,8 @@ vec3 SkyRadiance(vec3 dir)
     return textureLod(uSkyView, uv, 0.0).rgb;
 }
 
-// 这一像素上主 PS 原本加进去的天空反射项（A+B 之后的值），差分要把它减掉。
+// The sky reflection term the main PS originally added for this pixel (the value after A+B); the
+// delta must subtract it.
 vec3 ReflectedSky(vec3 P, vec3 R)
 {
     vec3 lut = SkyRadiance(R) * uFrame.data[14].x;
@@ -643,7 +683,8 @@ float Linearize(const device float4* frame, float d)
     return near * far / (far - d * (far - near));
 }
 
-// 与主 PS 的 SampleSkyViewRadiance 逐字同形：地平线落在 uv.y = 0.5，天顶 0，天底 1。
+// Verbatim same shape as the main PS's SampleSkyViewRadiance: the horizon lands at uv.y = 0.5,
+// zenith 0, nadir 1.
 float3 SkyRadiance(texture2d<float, access::sample> sky, sampler sm, float3 dir)
 {
     float2 uv;
@@ -652,7 +693,8 @@ float3 SkyRadiance(texture2d<float, access::sample> sky, sampler sm, float3 dir)
     return sky.sample(sm, uv, level(0.0)).rgb;
 }
 
-// 这一像素上主 PS 原本加进去的天空反射项（A+B 之后的值），差分要把它减掉。
+// The sky reflection term the main PS originally added for this pixel (the value after A+B); the
+// delta must subtract it.
 float3 ReflectedSky(texture2d<float, access::sample> sky, sampler sm, const device float4* frame, float3 P, float3 R)
 {
     float3 lut = SkyRadiance(sky, sm, R) * frame[14].x;
@@ -786,7 +828,7 @@ kernel void CSMain(
 }
 ";
 
-    /// <summary>WebGPU WGSL. 存储格式按引擎的窄格式回退链固定写 rgba16float。</summary>
+    /// <summary>WebGPU WGSL. The storage format is pinned to rgba16float by the engine's narrow-format fallback chain.</summary>
     static readonly string SourceWgsl = @"
 struct SsrParams
 {
@@ -830,7 +872,8 @@ fn Linearize(d : f32) -> f32
     return near * far / (far - d * (far - near));
 }
 
-// 与主 PS 的 SampleSkyViewRadiance 逐字同形：地平线落在 uv.y = 0.5，天顶 0，天底 1。
+// Verbatim same shape as the main PS's SampleSkyViewRadiance: the horizon lands at uv.y = 0.5,
+// zenith 0, nadir 1.
 fn SkyRadiance(dir : vec3<f32>) -> vec3<f32>
 {
     var uv : vec2<f32>;
@@ -839,7 +882,8 @@ fn SkyRadiance(dir : vec3<f32>) -> vec3<f32>
     return textureSampleLevel(uSkyView, uLinearClamp, uv, 0.0).rgb;
 }
 
-// 这一像素上主 PS 原本加进去的天空反射项（A+B 之后的值），差分要把它减掉。
+// The sky reflection term the main PS originally added for this pixel (the value after A+B); the
+// delta must subtract it.
 fn ReflectedSky(P : vec3<f32>, R : vec3<f32>) -> vec3<f32>
 {
     let lut = SkyRadiance(R) * uFrame[14].x;

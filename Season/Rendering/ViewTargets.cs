@@ -111,7 +111,7 @@ public sealed class ViewTargets
     /// <summary>Set once this frame's weather curtain produced its output.</summary>
     public bool WeatherOutputReady;
 
-    /// <summary>P0：本帧屏幕空间反射的增量纹理已出版，紧随其后的合成 Pass 才会发出。</summary>
+    /// <summary>P0: this frame's screen-space reflection delta texture has been published, so the composite pass immediately after it is issued.</summary>
     public bool SsrOutputReady;
 
     /// <summary>Only after this frame's rain composite succeeded do transparent materials sample weather transmission.</summary>
@@ -129,14 +129,15 @@ public sealed class ViewTargets
     public bool TaaActive;
 
     /// <summary>
-    /// 本帧 TAA 反应矩形，归一化 uv 空间的 (minX, minY, maxX, maxY)。矩形内的像素不复用历史。
+    /// This frame's TAA reactive rect, as (minX, minY, maxX, maxY) in normalized uv space. Pixels inside the rect do not reuse history.
     ///
-    /// 存在的理由：只存在一两帧的亮事件（闪电通道）在静态反馈 0.97 下第一帧只拿到 3% 权重，
-    /// 等历史积到看得见的亮度事件已经结束；熄灭之后又要三十多帧才褪干净。
+    /// Why it exists: a bright event that lasts only one or two frames (a lightning channel) receives only 3% weight on the first frame
+    /// under a static feedback of 0.97, so by the time the history accumulates to a visible brightness the event is already over; after it
+    /// dies down it takes another thirty-odd frames to fade out completely.
     ///
-    /// 默认值是**空矩形** (1,1,0,0)，它同时也是并集运算的单位元：合并时 x/y 取 min、z/w 取 max，
-    /// 而空矩形在这两个方向上恰好各自等于中性值，所以多个生产者可以无条件合并。
-    /// 没有生产者时任何 uv 都落不进矩形内，着色器那条分支因此恒假，普通帧零成本。
+    /// The default value is the **empty rect** (1,1,0,0), which is also the identity element of the union operation: when merging, x/y take
+    /// min and z/w take max, and the empty rect happens to equal the neutral value in both directions, so multiple producers can merge
+    /// unconditionally. With no producer, no uv falls inside the rect, so that shader branch is always false and ordinary frames cost nothing.
     /// </summary>
     public Vector4 ReactiveRect = new(1f, 1f, 0f, 0f);
 

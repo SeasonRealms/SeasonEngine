@@ -5,16 +5,16 @@
 namespace Season.Rendering;
 
 /// <summary>
-/// 天气名称只用于配置；具体强度和视觉配方由应用定义。
-/// Thunderstorm 与 ThunderRain 追加在枚举末尾：已保存配置按数值序列化，追加不改变既有值的语义。
-/// Thunderstorm 是「只打雷不下雨」，ThunderRain 是雷雨：降水与电活动由 WeatherSample 同时给出，
-/// 两者在同一个区域里共存，不需要用户叠两个区域。
+/// Weather names are for configuration only; the concrete intensity and visual recipe are defined by the app.
+/// Thunderstorm and ThunderRain are appended at the end of the enum: saved configuration is serialized by numeric value, so appending does not change the meaning of existing values.
+/// Thunderstorm is "thunder only, no rain", and ThunderRain is a thunderstorm with rain: precipitation and electrical activity are supplied together by WeatherSample,
+/// and the two coexist within the same region, so the user does not need to stack two regions.
 /// </summary>
 public enum WeatherKind { Clear, Cloudy, Overcast, LightRain, Rain, HeavyRain, LightSnow, HeavySnow, Thunderstorm, ThunderRain }
 
 /// <summary>
-/// 可持久化的世界区域。长度使用米、旋转使用弧度；标量属性避免 JSON 默认忽略 Vector 字段。
-/// 修改时使用 with 替换记录，不原地修改正在保存的配置。云的范围独立于降水范围。
+/// A persistable world region. Lengths are in meters and rotations in radians; scalar properties avoid JSON's default of ignoring Vector fields.
+/// Modify it by replacing the record with with, never by mutating a configuration that is being saved in place. The cloud extent is independent of the precipitation extent.
 /// </summary>
 public sealed record WeatherRegionSettings
 {
@@ -27,7 +27,7 @@ public sealed record WeatherRegionSettings
     public float RadiusX { get; init; } = 100;
     public float RadiusZ { get; init; } = 100;
     public float Rotation { get; init; }
-    /// <summary>短半轴上的软边宽度，沿椭圆同比缩放；最小软带为半轴的 0.0001，0 表示近似硬边。</summary>
+    /// <summary>Soft-edge width on the minor axis, scaled proportionally along the ellipse; the minimum soft band is 0.0001 of the semi-axis, and 0 means a near-hard edge.</summary>
     public float EdgeFeather { get; init; } = 20;
     public float Bottom { get; init; } = -5;
     public float Top { get; init; } = 80;
@@ -39,33 +39,33 @@ public sealed record WeatherRegionSettings
     public uint Seed { get; init; }
     public float TransitionSeconds { get; init; } = 4;
     /// <summary>
-    /// 室内遮挡区域。自身不产生任何雨雪，只按覆盖权重压掉排在它之后的区域，因此必须排在所有降水区之前。
-    /// 纵向范围取地板到天花板而不是整个天空高度，屋顶以上仍照常降水；云范围必须另行给到极小值，
-    /// 否则它会在云层里开一个洞。
+    /// Indoor shelter region. It produces no rain or snow itself and only suppresses the regions ranked after it by coverage weight, so it must rank before every precipitation region.
+    /// Its vertical range spans floor to ceiling rather than the full sky height, and rain still falls normally above the roof; the cloud extent must be given an extremely small value separately,
+    /// otherwise it would punch a hole in the cloud layer.
     /// </summary>
     public bool Shelter { get; init; }
 
     public void Validate()
     {
         if (string.IsNullOrWhiteSpace(Id) || !Enum.IsDefined(Weather))
-            throw new ArgumentException("天气区域必须具有稳定 ID 和有效天气类型。");
+            throw new ArgumentException("A weather region must have a stable ID and a valid weather kind.");
         if (!float.IsFinite(CenterX) || !float.IsFinite(CenterZ) || !float.IsFinite(Rotation)
             || !float.IsFinite(Bottom) || !float.IsFinite(Top) || Top <= Bottom
             || !Positive(RadiusX) || !Positive(RadiusZ) || !Positive(CloudRadiusX) || !Positive(CloudRadiusZ)
             || !float.IsFinite(CloudBase) || !float.IsFinite(WindX) || !float.IsFinite(WindZ)
             || !float.IsFinite(EdgeFeather) || EdgeFeather < 0
             || !float.IsFinite(TransitionSeconds) || TransitionSeconds < 0)
-            throw new ArgumentOutOfRangeException(nameof(WeatherRegionSettings), "天气区域参数必须有限，范围必须为正。");
+            throw new ArgumentOutOfRangeException(nameof(WeatherRegionSettings), "Weather region parameters must be finite and ranges must be positive.");
     }
 
-    // 半径倒数会直接上传 GPU；排除会在取倒数时溢出的极小值。
+    // The reciprocal radius is uploaded to the GPU directly; exclude tiny values that would overflow when inverted.
     static bool Positive(float value) => float.IsFinite(value) && value > 0 && float.IsFinite(1 / value);
 }
 
 /// <summary>
-/// 归一化的雨、雪、天气云强度与雷电活动度。与显示名称分离，允许过渡途中雨雪共存。
-/// <see cref="Lightning"/> 是「电气活跃度」而不是某一帧的闪光亮度：它决定落雷间隔，
-/// 具体亮度由 WeatherVisualState 的泊松调度与回击包络逐帧算出，因此过渡途中会自然衰减。
+/// Normalized rain, snow, weather-cloud intensity, and lightning activity. Separate from the display name, allowing rain and snow to coexist mid-transition.
+/// <see cref="Lightning"/> is "electrical activity" rather than the flash brightness of any single frame: it determines the strike interval,
+/// while the concrete brightness is computed frame by frame from WeatherVisualState's Poisson schedule and return-stroke envelope, so it decays naturally mid-transition.
 /// </summary>
 public readonly record struct WeatherSample(float Rain, float Snow, float Cloud, float Lightning = 0)
 {
@@ -80,7 +80,7 @@ public readonly record struct WeatherSample(float Rain, float Snow, float Cloud,
     }
 }
 
-/// <summary>从当前实际值重定向的平滑切换。调用者提供经过暂停和卡顿处理的帧时间。</summary>
+/// <summary>Smooth transition retargeted from the current actual value. The caller supplies frame times that have already handled pauses and hitches.</summary>
 public sealed class WeatherTransition
 {
     WeatherSample _from, _target;
@@ -111,24 +111,24 @@ public sealed class WeatherTransition
         _elapsed = MathF.Min(_duration, _elapsed + seconds);
         float t = Progress;
         float s = t * t * (3 - 2 * t);
-        // 雷电与雨雪共用同一条平滑曲线，否则切换雷暴时云会先变厚、电活动却瞬跳。
+        // Lightning shares the same smooth curve as rain and snow; otherwise, when switching to a thunderstorm, the clouds would thicken first while the electrical activity jumps instantly.
         Current = WeatherSample.From(Vector3.Lerp(_from.Vector, _target.Vector, s),
             _from.Lightning + (_target.Lightning - _from.Lightning) * s);
     }
 }
 
-/// <summary>本帧区域快照。记录不可变，运行中切换不会改写已发布帧的数据。</summary>
+/// <summary>Snapshot of the regions for this frame. The record is immutable, so switching at runtime never rewrites the data of an already-published frame.</summary>
 public readonly record struct WeatherRegion(WeatherRegionSettings Settings, WeatherSample State);
 
 /// <summary>
-/// 有界的空间天气场。按优先级降序、ID 序稳定合成；高优先级的晴天也会覆盖低优先级降水。
-/// 每层消耗剩余权重，避免重叠处强度翻倍；软边处允许平滑混合，区域外严格为晴。
-/// 更新、采样和粒子 Record 均由帧线程调用。空场是零降水，不是无约束粒子。
+/// A bounded spatial weather field. Composed stably by descending priority and then by ID order; a clear region with higher priority also overrides lower-priority precipitation.
+/// Each layer consumes the remaining weight to avoid doubling intensity at overlaps; smooth blending is allowed at soft edges, and outside the regions it is strictly clear.
+/// Update, sampling, and particle Record are all called from the frame thread. An empty field is zero precipitation, not unconstrained particle emission.
 /// </summary>
 public sealed class WeatherField
 {
     public const int MaxRegions = 8;
-    /// <summary>GPU 记录为三行 float4：位置/半径倒数，旋转/羽化，垂直范围/雨雪强度。</summary>
+    /// <summary>Each GPU record is three float4 rows: position/reciprocal radius, rotation/feather, vertical range/rain-snow intensity.</summary>
     public const int RegionVectorCount = 3;
     readonly WeatherRegion[] _regions = new WeatherRegion[MaxRegions];
     public int Count { get; private set; }
@@ -137,19 +137,19 @@ public sealed class WeatherField
     public void SetRegions(ReadOnlySpan<WeatherRegion> regions)
     {
         if (regions.Length > MaxRegions) throw new ArgumentOutOfRangeException(nameof(regions));
-        // 先完整验证，失败时保留上一帧；不允许半更新。
+        // Validate fully first and keep the previous frame on failure; a partial update is not allowed.
         for (int i = 0; i < regions.Length; i++)
         {
-            if (regions[i].Settings == null) throw new ArgumentException("天气区域配置不能为空。");
+            if (regions[i].Settings == null) throw new ArgumentException("A weather region configuration must not be null.");
             regions[i].Settings.Validate();
             regions[i].State.Validate();
             for (int j = 0; j < i; j++)
-                if (regions[i].Settings.Id == regions[j].Settings.Id) throw new ArgumentException("天气区域 ID 重复。");
+                if (regions[i].Settings.Id == regions[j].Settings.Id) throw new ArgumentException("Duplicate weather region ID.");
         }
         Count = 0;
         foreach (var region in regions)
             if (region.Settings.Enabled) _regions[Count++] = region;
-        // 区域上限很小，插入排序无需每帧委托或临时数组。
+        // The region limit is tiny, so insertion sort needs no per-frame delegate or temporary array.
         for (int i = 1; i < Count; i++)
         {
             var value = _regions[i];
@@ -163,7 +163,7 @@ public sealed class WeatherField
         }
     }
 
-    // 遮挡区永远排在最前：它只压制后出现的降水，自己不带强度，优先级由语义而非配置决定。
+    // A shelter region always ranks first: it only suppresses precipitation that appears later, carries no intensity of its own, and its priority is decided by semantics rather than configuration.
     static bool ComesBefore(WeatherRegionSettings a, WeatherRegionSettings b)
         => a.Shelter != b.Shelter ? a.Shelter
             : a.Priority > b.Priority || (a.Priority == b.Priority && string.CompareOrdinal(a.Id, b.Id) < 0);
@@ -184,7 +184,7 @@ public sealed class WeatherField
             remaining *= 1 - weight;
             float cloud = FootprintWeight(worldPosition, s, true);
             value.Z += cloudRemaining * cloud * region.State.Cloud;
-            // 闪电只发生在云里，所以它和云共用同一条覆盖权重，而不是降水的柱体权重。
+            // Lightning only happens inside clouds, so it shares the same coverage weight as the clouds rather than the precipitation column weight.
             lightning += cloudRemaining * cloud * region.State.Lightning;
             cloudRemaining *= 1 - cloud;
         }
@@ -202,10 +202,10 @@ public sealed class WeatherField
         return t * t * (3 - 2 * t);
     }
 
-    /// <summary>写入与 CPU 采样完全相同的优先级顺序；调用者上传有效前缀即可。</summary>
+    /// <summary>Writes the exact same priority order as CPU sampling; the caller only needs to upload the valid prefix.</summary>
     public int WriteParticleData(Span<Vector4> destination)
     {
-        if (destination.Length < Count * RegionVectorCount) throw new ArgumentException("天气上传缓冲过小。");
+        if (destination.Length < Count * RegionVectorCount) throw new ArgumentException("Weather upload buffer is too small.");
         for (int i = 0; i < Count; i++)
         {
             var s = _regions[i].Settings;

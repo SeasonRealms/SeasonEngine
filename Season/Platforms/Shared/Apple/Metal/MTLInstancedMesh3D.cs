@@ -240,9 +240,9 @@ internal sealed class MTLInstancedMesh3D : MTLInstancedPrimitiveGroup
 
         FlipAndUploadInstanceStream(_instanceData, _instanceCount);
 
-        // A7：剔除的输入与 IA 实例流逐位相同，所以直接复用这份数组，不多存副本。
-        // 只有本类接线：MTLInstancedModel 的实例流是按 surface 分开的，不走基类 _instanceBuffer，
-        // 于是那一组的 _cullSource 保持 null，共享层早退，安全退回 CPU 整批剔除。
+        // A7: the cull input is bit-for-bit identical to the IA instance stream, so this array is reused directly without storing an extra copy.
+        // Only this class wires it up: MTLInstancedModel's instance stream is split per surface and does not go through the base class _instanceBuffer,
+        // so that group's _cullSource stays null, the shared layer early-returns, and it safely falls back to a full-batch CPU cull.
         UpdateCullUpload();
 
         int fi = Device.FrameIndex;

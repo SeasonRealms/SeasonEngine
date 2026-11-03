@@ -37,7 +37,7 @@ public static class WebGPUPipeline
 
     // ── Unified WGSL shader source ──
 
-    /// <summary>场景透明雾的独立绑定；现有 Web 混合使用 straight alpha，等价于预乘公式除以 alpha。</summary>
+    /// <summary>Independent binding for the scene's transparent fog; the existing Web blend uses straight alpha, which is equivalent to the premultiplied formula divided by alpha.</summary>
     public const string SceneFogSamplingShader = """
 struct FogMaterialFrame { values:array<vec4f> }
 @group(1) @binding(0) var<storage,read> fogFrame:FogMaterialFrame;
@@ -206,8 +206,8 @@ struct SceneLights {
     // byte-aligned with C# SceneLightParams.IrradianceSH9 ([InlineArray(9)] Sh9Array).
     irradianceSH9: array<vec4f, 9>,      // offset 960
     // 2-4 DDGI Clause 10 (starting at offset 1104, expanding to 1152B): JS-side SCENE_LIGHT_BYTES must stay synchronized.
-    // giParams0=probeGridMin.xyz/spacing，giParams1=gridXYZ(as float)/GiIntensity（blend weight, never a scale on probeIrr），
-    // giParams2=normalBias/chebyshev/atlasReady/fadeBandCells。
+    // giParams0=probeGridMin.xyz/spacing, giParams1=gridXYZ(as float)/GiIntensity (blend weight, never a scale on probeIrr),
+    // giParams2=normalBias/chebyshev/atlasReady/fadeBandCells.
     giParams0: vec4f,                    // offset 1104
     giParams1: vec4f,                    // offset 1120
     giParams2: vec4f,                    // offset 1136, end of 1152B block
@@ -231,17 +231,17 @@ struct SceneLights {
     // x=max distance in km (>0 enables AP; the only gate), y=Intensity (0 = identity blend).
     // JS-side SCENE_LIGHT_BYTES must stay synchronized.
     apParams0: vec4f,               // offset 1360
-    // 区域天气：头两行后每区域八行；前缀 1376B 保持，总长 2448B。
+    // Regional weather: eight rows per region after the first two; the 1376B prefix is kept, total length 2448B.
     weatherParams0: vec4f,          // offset 1376
     weatherParams1: vec4f,          // offset 1392
     weatherRegions: array<vec4f, 64>, // offset 1408
-    // 2-7 雷电 (offset 2432)：xyz = 当前主导雷击在云内的世界坐标 / w = 回击包络亮度 0~1。
-    // w 是唯一总开关；非雷暴天气、区域质量 Off、Showcase 模式下整个字段为零。
-    weatherFlash: vec4f,            // offset 2432，尾部 2448B
-    // 2-8 环境镜面的虚拟地面 (offset 2448)：xyz = 地面辐亮度（线性 HDR，含 albedo/直射/天空 SH9/1π），
-    // w = 地面所在的世界 Y。只由 SkyLighting.Apply 注入，只在程序化天空分支里被读取。
-    // 追加后 SCENE_LIGHT_BYTES 同步为 2464，见 js/seasonWebGPU.js。
-    reflectionParams0: vec4f,       // offset 2448，尾部 2464B
+    // 2-7 lightning (offset 2432): xyz = world position within the cloud of the current dominant strike / w = return-stroke envelope brightness 0~1.
+    // w is the only master switch; in non-thunderstorm weather, regional quality Off, or Showcase mode the entire field is zero.
+    weatherFlash: vec4f,            // offset 2432, tail 2448B
+    // 2-8 virtual ground for the ambient specular (offset 2448): xyz = ground radiance (linear HDR, including albedo/direct/sky SH9/1pi),
+    // w = world Y where the ground lies. Injected only by SkyLighting.Apply, and read only in the procedural sky branch.
+    // After appending, SCENE_LIGHT_BYTES is synchronized to 2464, see js/seasonWebGPU.js.
+    reflectionParams0: vec4f,       // offset 2448, tail 2464B
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -316,19 +316,19 @@ fn WeatherNoise(uv: vec2f) -> vec4f { return textureSampleLevel(uCloudNoise,uWra
 // texture to be sampled non-comparatively only through a non-filtering sampler, which is also what the blocker search wants
 // - a filtered depth across a silhouette lies on no surface. This is a sampler slot only; the texture is unchanged.
 @group(0) @binding(21) var uShadowPointSampler: sampler;
-// 2-7 P0: 程序化天空的 Sky-View LUT（binding 23），PBR 的环境镜面源。
-// 与 binding 15 的 uEnvCube 并行而不是替换：两者互斥，由 skyParams0.w 在 uniform 分支里二选一，
-// 所以两张图都必须有合法绑定（未就绪时 JS 绑 1x1 白）。
-// 白衣不会被采到：写入 skyParams0.w 的前提正是 SkyViewTexture 非空。
-// 与 uAerialLut 一样复用 binding 1 的 uSampler（线性 Clamp），不另占采样器槽。
+// 2-7 P0: Sky-View LUT for the procedural sky (binding 23), the PBR ambient specular source.
+// Runs in parallel with uEnvCube at binding 15 rather than replacing it: the two are mutually exclusive, selected by skyParams0.w in the uniform branch,
+// so both textures must have a valid binding (JS binds 1x1 white when not ready).
+// The white texture is never sampled: the precondition for writing skyParams0.w is precisely that SkyViewTexture is non-null.
+// Like uAerialLut, it reuses uSampler at binding 1 (linear Clamp) and does not take an extra sampler slot.
 @group(0) @binding(23) var uSkyView: texture_2d<f32>;
 
-// 2-7 P0：采样 Sky-View LUT 取反射方向的辐射度。
-// 参数化与 renderMode == 3 的天空球、以及 skyView 计算内核的反解逐字节对齐：
-// u 接缝在 +Z，v 用 sqrt 折叠把分辨率往地平线集中。LUT 无 mip，只能采 level 0——
-// 接缝两侧的 fwidth 会选出错误的 level。
+// 2-7 P0: sample the Sky-View LUT to get radiance along the reflection direction.
+// The parameterization is byte-aligned with the renderMode == 3 sky sphere and the inverse solve of the skyView compute kernel:
+// the u seam is at +Z, and v uses a sqrt fold to concentrate resolution toward the horizon. The LUT has no mips, so only level 0 can be sampled --
+// fwidth across the seam would select the wrong level.
 fn SampleSkyViewRadiance(d: vec3f) -> vec3f {
-    // 1/(2*PI) 写成字面量，避开与常量重名。
+    // 1/(2*PI) written as a literal to avoid a name clash with the constant.
     var uv: vec2f;
     uv.x = atan2(d.x, -d.z) * 0.15915494309 + 0.5;
     uv.y = 0.5 - 0.5 * sign(d.y) * sqrt(abs(d.y));
@@ -998,8 +998,8 @@ fn SampleProbeIrradiance(worldPos: vec3f, N: vec3f, fallback: vec3f) -> vec3f {
     for (var i: i32 = 0; i < 8; i = i + 1) {
         let off = vec3f(f32(i & 1), f32((i >> 1) & 1), f32((i >> 2) & 1));
         let tri = mix(vec3f(1.0) - f, f, off);
-        // 方向项是在几何权之上一路累乘的，所以必须是 var：let 在 WGSL 里不可赋值，
-        // 而这条错误只在浏览器首次建管线时才报，四端的文本契约都抓不到它。
+        // The directional term is accumulated multiplicatively on top of the geometric weight, so it must be a var: let is not assignable in WGSL,
+        // and this error only surfaces when the browser first builds the pipeline; the text contracts of all four backends cannot catch it.
         var w = tri.x * tri.y * tri.z;
         let pi = clamp(base + off, vec3f(0.0), dims - vec3f(1.0));
         let probePos = gridMin + (pi + vec3f(0.5)) * spacing;
@@ -1321,7 +1321,9 @@ fn OctEncodeNormal(nIn: vec3f) -> vec2f {
 
 fn shade(input: ShadeInput) -> vec4f {
     let texColor = textureSampleBias(uTexture, uSampler, input.uv, TEXTURE_LOD_BIAS);
-    let albedo = texColor.rgb * u.baseColor.rgb;
+    // var rather than let: the emissive compensation for non-primary views adds a term to albedo in the unlit branch (see the
+    // uView.cameraPos.w / u.emissive gate below); assigning to a let variable in WGSL is a compile-time error.
+    var albedo = texColor.rgb * u.baseColor.rgb;
     let alpha = texColor.a * u.material.z;
 
     // renderMode == 2 (TextMsdf): multi-channel signed distance field rendering
@@ -1493,8 +1495,8 @@ fn shade(input: ShadeInput) -> vec4f {
     }
 
     // A0.2: the final shading normal and the Toksvig-adjusted roughness, i.e. what SSR / decals must see.
-    // P0 起第 4 通道不再是 metallic：它是 SSR 差分要用的**反射权重**，必须等 F0 与 ao 都算出来才能写，
-    // 所以写入点挪到下面的反射项之后（见 ambient += reflectionRadiance 那一行）。
+    // As of P0 the 4th channel is no longer metallic: it is the **reflection weight** needed for the SSR difference, which can only be written once both F0 and ao are computed,
+    // so the write site was moved below the reflection term (see the ambient += reflectionRadiance line).
 
     let V = normalize(uLights.cameraPos.xyz - input.worldPos);
     var F0 = vec3f(0.04);
@@ -1576,49 +1578,49 @@ fn shade(input: ShadeInput) -> vec4f {
     // 1-7 Contract Clause 6: use mirrored reflection from the radiance cube at LOD0 for the specular term.
     // There is no mip chain and no GGX prefiltering, so it is masked by (1-roughness)^2.
     // The ambient energy of rough surfaces is carried by the SH9 diffuse term above.
-    // 2-8 的两处修正都只发生在程序化天空分支里，else 分支（envCube）保持 1-7 的原式不变，
-    // 这样只开贴图立方图的预设仍是零回归：
-    //   A. R.y < 0 时 Sky-View LUT 那一侧几乎是黑的（朝下的射线只穿过视点到地面那几百米空气，
-    //      而地面自身被照亮后的辐亮度根本没有被加进去），于是改用 CPU 预算好的地面辐亮度，
-    //      地平线两侧用 smoothstep 过渡。镜面球下半部分本来就该映出草地，而不是黑。
-    //   B. 粗糙端不再靠再叠一次 (1-roughness)^2 把镜面压成零：金属的漫反射项被 (1-metallic) 乘掉，
-    //      压成零就等于金属在粗糙之后完全失去环境能量。改为按 (1-roughness)^2 在镜面采样与
-    //      giDiffuse（半球平均，已是 E/pi 且含 DDGI 的地面反弹）之间插值。粗糙时 R 本来就贴近 N，
-    //      用 N 上的辐照度近似反射叶内的平均入射辐射，不必再采一次探针。
+    // The two 2-8 corrections occur only in the procedural sky branch; the else branch (envCube) keeps the 1-7 formula unchanged,
+    // so presets that only enable the texture cube remain zero-regression:
+    //   A. When R.y < 0 the Sky-View LUT side is almost black (a downward ray only traverses the few hundred meters of air from the view point to the ground,
+    //      while the radiance of the illuminated ground itself is not added at all), so it switches to the CPU-precomputed ground radiance,
+    //      with a smoothstep transition on either side of the horizon. The lower half of the specular sphere should reflect grass anyway, not black.
+    //   B. The rough end no longer crushes the specular to zero by stacking another (1-roughness)^2: the metal's diffuse term is multiplied away by (1-metallic),
+    //      so crushing it to zero means the metal completely loses ambient energy once rough. Instead it interpolates by (1-roughness)^2 between the specular sample and
+    //      giDiffuse (hemisphere average, already E/pi and including the DDGI ground bounce). When rough, R is already close to N,
+    //      so the irradiance on N approximates the average incoming radiance within the reflection lobe, avoiding another probe sample.
     let R = reflect(-V, N);
     let mirrorW = (1.0 - roughness) * (1.0 - roughness);
     var reflectionRadiance: vec3f;
     var specGate: f32;
     if (uLights.skyParams0.w > 0.0) {
         var skyRadiance = SampleSkyViewRadiance(R);
-        // 观察点必须在地面之上，地面项才有意义；否则（贴地或穿地的相机）一律退回天空。
+        // The view point must be above the ground for the ground term to be meaningful; otherwise (a camera at or below ground) it always falls back to the sky.
         let aboveGround = step(uLights.reflectionParams0.w, input.worldPos.y);
         let horizonW = max(smoothstep(-0.09, 0.09, R.y), 1.0 - aboveGround);
         skyRadiance = mix(uLights.reflectionParams0.xyz, skyRadiance, horizonW);
         reflectionRadiance = mix(giDiffuse, skyRadiance * uLights.envParams.x, mirrorW);
         specGate = 1.0;
     } else {
-        // 1-7 原式：LOD0 镜面 × envParams.x × (1-r)^4。
+        // 1-7 original formula: LOD0 specular * envParams.x * (1-r)^4.
         reflectionRadiance = textureSampleLevel(uEnvCube, uSampler, R, 0.0).rgb * uLights.envParams.x * mirrorW * mirrorW;
         specGate = step(0.5, uLights.envParams.w);
     }
     ambient += reflectionRadiance * F0 * ao * specGate;
 
     if (NORMAL_OUTPUT) {
-        // P0 SSR 的 F0 通道。合成端要做的是「把天空那一项换成屏幕空间命中」，
-        // 恒等式是 Δ = conf·(1-r)²·(F0·ao)·(ssr − reflSky)：giDiffuse 在差里抵消，
-        // 所以这里只需要一个标量权重，用 Rec.709 亮度把 F0 压成一维。
-        // 丢掉的只是色偏（金球 vs 银球），因为 Δ 是替换量、不是颜色本身；换来的是不必为 SSR 再开一个 MRT 目标。
-        // envCube 分支写 0：那条路径的基项是贴图立方图，SSR 核拿不到它，替换只会算错。
+        // P0 SSR F0 channel. What the composite side must do is "replace the sky term with the screen-space hit",
+        // the identity is Δ = conf*(1-r)^2*(F0*ao)*(ssr - reflSky): giDiffuse cancels in the difference,
+        // so only a scalar weight is needed here, collapsing F0 to one dimension with Rec.709 luminance.
+        // The only thing lost is the color tint (gold sphere vs silver sphere), since Δ is a replacement quantity, not the color itself; in exchange there is no need to open another MRT target for SSR.
+        // The envCube branch writes 0: that path's base term is the texture cube, which the SSR kernel cannot access, so replacement would only be wrong.
         gSceneNormal = vec4f(OctEncodeNormal(N), roughness,
             select(0.0, dot(F0, vec3f(0.2126, 0.7152, 0.0722)) * ao, uLights.skyParams0.w > 0.0));
     }
 
-    // 2-7：雷击的照明。v1 把它并进环境项，于是任何朝向都均匀变亮——山脊背面也亮，
-    // 与「闪电在那边」对不上。v2 给出方向，做法与 DX12 逐字一致：
-    //   光源取击穿点在地面投影处、高度夹进 [地面, 击穿点]；衰减用 1/(1+d²/R²)，R=400 m；
-    //   朗伯项保留 25% 的底，因为通道有多段分支，总有某一段能照到背光面；
-    //   系数 1.6 使 400 m 处恰好回到 v1 的 0.8，远景亮度不变。
+    // 2-7: lightning illumination. v1 folded it into the ambient term, so every orientation brightened uniformly -- the back of a ridge brightened too,
+    // which does not match "the lightning is over there". v2 gives it a direction, byte-for-byte matching DX12:
+    //   The light source is taken at the ground projection of the breakdown point, with height clamped into [ground, breakdown point]; attenuation uses 1/(1+d^2/R^2), R=400 m;
+    //   the Lambert term keeps a 25% floor, because the channel has multiple branches and some branch can always reach the backlit face;
+    //   the coefficient 1.6 returns exactly to v1's 0.8 at 400 m, so distant brightness is unchanged.
     if (uLights.weatherFlash.w > 0.0) {
         let flashGround = min(uLights.reflectionParams0.w, uLights.weatherFlash.y);
         let flashTo = vec3f(uLights.weatherFlash.x,

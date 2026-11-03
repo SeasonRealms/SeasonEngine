@@ -416,7 +416,7 @@ internal static class GlyphPrewarm
             {
                 // Stable-page budget exhausted: stop pre-warming, remaining glyphs use the lazy path.
                 DeviceServices.BaseApp?.AddLog(LogType.Backend,
-                    $"Font preheating reaches capacity budget:{font.FileKey}，{cursor}/{codePoints.Length}, estimate {atlas.EstimatedStableBytes / 1024 / 1024} MiB; Reserve on-demand drawing capacity");
+                    $"Font preheating reaches capacity budget:{font.FileKey},{cursor}/{codePoints.Length}, estimate {atlas.EstimatedStableBytes / 1024 / 1024} MiB; Reserve on-demand drawing capacity");
                 cursor = codePoints.Length;
                 break;
             }
