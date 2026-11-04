@@ -149,14 +149,13 @@ internal sealed class RiverSegment : Mesh3D
     /// </summary>
     internal const float DikeFacing = 0f;
 
-    /// <summary>
-    /// Where the island's east edge runs, i.e. where the grass tile stops and the sea begins - the tile is 150 m across
+    /// <summary>Where the island's east edge runs, i.e. where the grass tile stops and the sea begins - the tile is 150 m across
     /// (see <c>Rocks.CoastHalf</c>), pulled in 15 cm so a piece's foot lands on the grass and not on its last blade. Only
     /// the stretch that reaches the sea tests against it: bank pieces are dropped one by one where their footprint would
     /// cross the line (<see cref="AddDikePair"/>), and the bed and the levee stop at the last row before it
-    /// (<see cref="RiverSegment.BuildSurface"/>).
-    /// </summary>
-    const float CoastEdge = 74.85f;
+    /// (<see cref="RiverSegment.BuildSurface"/>). The boat's waterway uses it as the coast line: everything past it is the
+    /// open sea, and the estuary corridor is what carries a hull across it.</summary>
+    internal const float CoastEdge = 74.85f;
 
     // -- Confluences, where the south branch crosses the main course. --
     //
@@ -1584,6 +1583,48 @@ internal sealed class River : Panel
     /// main channel's centerline. The main course reads it to cut its own bank there, see <see cref="CrossingHalf"/>.
     /// </summary>
     static readonly Vector3 BranchCrossing = new(0f, WaterY, (BranchCourse[6].Z + BranchCourse[7].Z) * 0.5f);
+
+    /// <summary>
+    /// Number of branch control points a hull can use: the pond outlet down to <c>BranchCourse[9]</c>, the last row
+    /// whose surface still stands above the shore lip (0.30 m at z = -63). The points that follow it sink under the
+    /// meadow at the foot of the range - the water surface is below the grass there and only the ribbon is left - so
+    /// the corridor ends on the last row that still has a bed and banks under it. Its end cap reaches about two metres
+    /// further, which is where the drawn water meets the grass.
+    /// </summary>
+    const int BranchNavigablePoints = 10;
+
+    static (Vector3 Center, float HalfWidth)[]? navigableMain, navigableBranch;
+
+    /// <summary>
+    /// The two courses as the boat's navigable centerline: world-space water-surface points together with the water half
+    /// width at each, in flow order. The main route runs from inside the waterfall pool (index 0) through the bridge to the
+    /// estuary (index 14); the branch runs from the pond, across the main channel, and on up to the foot of the range
+    /// (see <see cref="BranchNavigablePoints"/>).
+    ///
+    /// <para>These are read off the same tables the channel geometry is built from, so a course edit moves the corridor and
+    /// the water it describes together - there is no second copy of the route to keep in sync. The pond and the open sea are
+    /// not part of this table: they are rectangles, not ribbons, and <see cref="BoatWaterway"/> adds them by name.</para>
+    ///
+    /// <para>Cached once because both tables are static. Callers must not mutate the returned array.</para>
+    /// </summary>
+    internal static (Vector3 Center, float HalfWidth)[] NavigableCenterline(bool branch)
+    {
+        if (branch)
+            return navigableBranch ??= BuildNavigableCenterline(BranchCourse, BranchNavigablePoints);
+
+        return navigableMain ??= BuildNavigableCenterline(Course, Course.Length);
+    }
+
+    static (Vector3 Center, float HalfWidth)[] BuildNavigableCenterline(CoursePoint[] course, int count)
+    {
+        var result = new (Vector3 Center, float HalfWidth)[count];
+        for (int i = 0; i < count; i++)
+        {
+            result[i] = (new Vector3(course[i].X, course[i].Y, course[i].Z), course[i].HalfWidth);
+        }
+
+        return result;
+    }
 
     /// <summary>Selectable stretches in flow order. Add them all to the picker to edit the course in the property panel.</summary>
     internal RiverSegment[] Segments { get; }

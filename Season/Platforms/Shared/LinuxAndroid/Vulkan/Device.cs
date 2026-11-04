@@ -396,6 +396,20 @@ internal unsafe static class Device
 
     static readonly string[] DeviceExtensions = ["VK_KHR_swapchain"];
 
+    /// <summary>
+    /// Contract 1-9: VK_EXT_memory_budget, the only Vulkan mechanism that reports per-heap usage. It is an optional device
+    /// extension, so it is never requested unconditionally: enabling an extension the driver does not advertise makes
+    /// vkCreateDevice fail, which would trade a diagnostic readout for a hard startup failure.
+    /// </summary>
+    const string MemoryBudgetExtension = "VK_EXT_memory_budget";
+
+    /// <summary>
+    /// Contract 1-9: whether the picked physical device advertises <see cref="MemoryBudgetExtension"/>. Populated by
+    /// PickPhysicalDevice before CreateLogicalDevice reads it to decide whether to enable the extension, and read again by
+    /// the usage query so an unenabled extension is never called. False means the backend reports "unknown", not zero.
+    /// </summary>
+    internal static bool MemoryBudgetSupported;
+
     static readonly string[] ValidationLayers = ["VK_LAYER_KHRONOS_validation"];
 
     /// <summary>
@@ -597,6 +611,11 @@ internal unsafe static class Device
         SupportsSamplerAnisotropy = pickedFeatures.SamplerAnisotropy;
         MaxSamplerAnisotropy = SupportsSamplerAnisotropy ? pickedProps.Limits.MaxSamplerAnisotropy : 1f;
 
+        // Contract 1-9: probed once here, for the same reason as the features above - both the device creation that has
+        // to request the extension and the later usage query that has to decide whether calling it is legal read this
+        // field instead of re-enumerating extensions per frame.
+        MemoryBudgetSupported = HasDeviceExtension(picked, MemoryBudgetExtension);
+
         // Sync-path capability probe consumed by CreateLogicalDevice, CommandQueue, and ShaderCompiler:
         // only core 1.2 devices may enable the timeline-semaphore feature, everything else takes the
         // VkFence fallback. See the field doc for why the KHR extension is not probed.
@@ -673,6 +692,62 @@ internal unsafe static class Device
         return (int)(best / (1024 * 1024));
     }
 
+    /// <summary>
+    /// Contract 1-9: live device-local usage and budget summed over the picked device's memory heaps, from
+    /// <c>VK_EXT_memory_budget</c>. Unlike <see cref="GetGpuMemoryInfo"/>, which reports the ceiling once at startup for
+    /// model grading, this is what the driver is accounting against right now, including allocations made outside our
+    /// own resources.
+    ///
+    /// Only device-local heaps are summed, so a discrete GPU reports its VRAM rather than VRAM plus system RAM; on unified
+    /// memory devices, where the single device-local heap is system memory, that heap is the GPU's working budget and is
+    /// reported as-is. Never throws; returns false when the extension was not enabled or the query reports no budget.
+    /// </summary>
+    internal static bool TryQueryGpuMemoryUsage(out long usedBytes, out long totalBytes)
+    {
+        usedBytes = 0;
+        totalBytes = 0;
+
+        if (!MemoryBudgetSupported) return false;
+
+        try
+        {
+            var budget = new PhysicalDeviceMemoryBudgetPropertiesEXT
+            {
+                SType = StructureType.PhysicalDeviceMemoryBudgetPropertiesExt
+            };
+
+            var memoryProperties = new PhysicalDeviceMemoryProperties2
+            {
+                SType = StructureType.PhysicalDeviceMemoryProperties2,
+                PNext = &budget
+            };
+
+            Vk.GetPhysicalDeviceMemoryProperties2(PhysicalDevice, &memoryProperties);
+
+            long used = 0;
+            long total = 0;
+            uint heapCount = memoryProperties.MemoryProperties.MemoryHeapCount;
+            for (uint i = 0; i < heapCount; i++)
+            {
+                if ((memoryProperties.MemoryProperties.MemoryHeaps[(int)i].Flags & MemoryHeapFlags.DeviceLocalBit) == 0)
+                    continue;
+                used += (long)budget.HeapUsage[i];
+                total += (long)budget.HeapBudget[i];
+            }
+
+            if (total <= 0) return false;
+
+            usedBytes = used;
+            totalBytes = total;
+            return true;
+        }
+        catch
+        {
+            // A diagnostic readout must never break the frame that asked for it.
+            return false;
+        }
+    }
+
     static bool IsDeviceSuitable(PhysicalDevice device)
     {
         // The swapchain extension must be supported.
@@ -716,6 +791,31 @@ internal unsafe static class Device
             if (hasGraphics && hasPresent) break;
         }
         return hasGraphics && hasPresent;
+    }
+
+    /// <summary>
+    /// Contract 1-9: whether the device advertises one named device extension. Used for optional extensions such as
+    /// VK_EXT_memory_budget, which must be probed before vkCreateDevice because requesting an unsupported one fails
+    /// outright rather than degrading.
+    /// </summary>
+    static bool HasDeviceExtension(PhysicalDevice device, string name)
+    {
+        uint extCount = 0;
+        Vk.EnumerateDeviceExtensionProperties(device, (byte*)null, ref extCount, null);
+        if (extCount == 0) return false;
+
+        var props = new ExtensionProperties[extCount];
+        fixed (ExtensionProperties* p = props)
+            Vk.EnumerateDeviceExtensionProperties(device, (byte*)null, ref extCount, p);
+
+        for (int i = 0; i < extCount; i++)
+        {
+            fixed (ExtensionProperties* ep = &props[i])
+            {
+                if (Marshal.PtrToStringAnsi((IntPtr)ep->ExtensionName) == name) return true;
+            }
+        }
+        return false;
     }
 
     static void FindQueueFamilies(PhysicalDevice device)
@@ -792,7 +892,13 @@ internal unsafe static class Device
             TimelineSemaphore = true
         };
 
-        nint extPtr = SilkMarshal.StringArrayToPtr(DeviceExtensions);
+        // Contract 1-9: the memory-budget extension is optional and therefore part of the list only when the picked
+        // device advertises it. Everything else stays exactly the static set declared in DeviceExtensions.
+        string[] deviceExtensions = MemoryBudgetSupported
+            ? [.. DeviceExtensions, MemoryBudgetExtension]
+            : DeviceExtensions;
+
+        nint extPtr = SilkMarshal.StringArrayToPtr(deviceExtensions);
         nint layerPtr = validation ? SilkMarshal.StringArrayToPtr(ValidationLayers) : 0;
 
         Result result;
@@ -807,7 +913,7 @@ internal unsafe static class Device
                 QueueCreateInfoCount = (uint)queueCreateInfos.Length,
                 PQueueCreateInfos = qcip,
                 PEnabledFeatures = &features,
-                EnabledExtensionCount = (uint)DeviceExtensions.Length,
+                EnabledExtensionCount = (uint)deviceExtensions.Length,
                 PpEnabledExtensionNames = (byte**)extPtr,
                 EnabledLayerCount = validation ? (uint)ValidationLayers.Length : 0,
                 PpEnabledLayerNames = validation ? (byte**)layerPtr : null

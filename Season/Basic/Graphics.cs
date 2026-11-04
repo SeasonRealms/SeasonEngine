@@ -328,6 +328,52 @@ public interface IGraphics
     /// </summary>
     /// <returns>How many textures were rebuilt. Zero means the platform does not support it, or nothing was eligible.</returns>
     int RebuildNormalVarianceTextures() => 0;
+
+    // Contract 1-9 runtime statistics (frame rate / GPU memory / CPU memory).
+    // The work is split between the shared layer and the backends on purpose:
+    // - Frame rate and CPU memory are process facts, not device facts. <see cref="GraphicsStatistics"/> measures them once
+    //   for every backend, fed by the single per-frame entry point in FrameSchedule.Execute, so four backends do not end up
+    //   with four slightly different definitions of "a frame".
+    // - GPU memory can only be answered by whoever owns the device, so it is the one member here. It is queried at most once
+    //   per second by GraphicsStatistics, never per frame, which is what makes a driver query affordable.
+    // - Usage and ceiling are independent: a backend that knows what it holds but not what the budget is (WebGPU) still
+    //   reports a real usage, and unknown usage reports <see cref="GraphicsMemoryInfo.Unknown"/> rather than a fabricated 0.
+    //   The default implementation below is exactly that: platforms that never integrated a memory query degrade to "--"
+    //   in the HUD instead of lying.
+
+    /// <summary>
+    /// This backend's view of graphics memory: what the process currently holds on the GPU and the ceiling the same source
+    /// exposes. Never throws; an unavailable query returns <see cref="GraphicsMemoryInfo.Unknown"/>.
+    /// </summary>
+    GraphicsMemoryInfo QueryGraphicsMemory() => default;
+}
+
+/// <summary>
+/// One reading of graphics memory (contract 1-9).
+/// <para><see cref="UsedBytes"/> is the process's own GPU footprint where the platform can report one: the D3D12 local
+/// segment from DXGI, <c>currentAllocatedSize</c> on Metal, the memory-budget heaps on Vulkan, and the host-side texture
+/// sum on WebGPU. <see cref="TotalBytes"/> is the ceiling the same source exposes, or 0 when it has none.</para>
+/// </summary>
+public readonly struct GraphicsMemoryInfo
+{
+    /// <summary>Bytes of GPU memory attributed to this process; meaningful only when <see cref="UsedKnown"/> is true.</summary>
+    public long UsedBytes { get; init; }
+
+    /// <summary>Ceiling reported by the same source, or 0 when the platform has none to report.</summary>
+    public long TotalBytes { get; init; }
+
+    /// <summary>False when the backend could not measure usage; <see cref="UsedBytes"/> is then not a reading.</summary>
+    public bool UsedKnown { get; init; }
+
+    /// <summary>"This backend cannot measure it": the only value a platform without a memory query may return.</summary>
+    public static GraphicsMemoryInfo Unknown => default;
+
+    public GraphicsMemoryInfo(long usedBytes, long totalBytes = 0, bool usedKnown = true)
+    {
+        UsedBytes = usedBytes;
+        TotalBytes = totalBytes;
+        UsedKnown = usedKnown;
+    }
 }
 
 public interface INativeImageDecoder : IDisposable

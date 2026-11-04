@@ -3853,4 +3853,14 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         return true;
     }
 
+    /// <summary>
+    /// Contract 1-9: Vulkan has no always-available usage query, so this backend answers through VK_EXT_memory_budget and
+    /// reports "unknown" when the driver does not expose it. The budget is the driver's own headroom for this process,
+    /// which is the same thing DXGI calls a budget, so the two desktop backends stay comparable.
+    /// </summary>
+    public GraphicsMemoryInfo QueryGraphicsMemory()
+        => Vulkan.Device.TryQueryGpuMemoryUsage(out long used, out long total)
+            ? new GraphicsMemoryInfo(used, total)
+            : GraphicsMemoryInfo.Unknown;
+
     }

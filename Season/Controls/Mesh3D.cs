@@ -297,6 +297,14 @@ public class Mesh3D : Mesh3DBase
     internal Vector4 WaveParams => new(WaveAmplitude * 0.5f, _wavePhase, _wavePhasePrev, WaveFadeRadius);
 
     /// <summary>
+    /// The phase (radians) the vertex swell is displaced by right now - the scalar the backends receive as
+    /// <c>WaveParams.y</c>. Published because a CPU-side consumer that has to sit on the wave surface (a hull riding the
+    /// sea) must evaluate the very displacement being drawn; re-deriving it would mean keeping a second copy of this
+    /// clock, and the two would drift apart the first time the speed changed.
+    /// </summary>
+    public float WavePhase => _wavePhase;
+
+    /// <summary>
     /// Phase integration. Uses a delta rather than elapsedTime x speed: the latter would teleport the whole waveform at the moment the speed is changed,
     /// whereas the delta only changes how fast it advances afterward. Taking the modulo 2pi produces no seam, because the three components' angular frequencies are in the integer ratio 1:2:3.
     /// </summary>

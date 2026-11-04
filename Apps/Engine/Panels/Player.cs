@@ -13,8 +13,6 @@ internal class Player : Panel
 
     bool modelSettled;
 
-    bool torchSettled;
-
     internal Season.Controls.Model model;
 
     internal Season.Controls.Model torch;
@@ -39,6 +37,36 @@ internal class Player : Panel
 
     const float FlameSize = 0.16f;
 
+    /// <summary>
+    /// Scale applied to the whole character while it stands on the boat. The hull is 3.4 m long and the character
+    /// 1 m tall, so at full size it would fill the boat; half size reads as a person at the oars instead. Everything
+    /// that hangs off the body - the carried torch and its flame - is scaled by the same factor in
+    /// <see cref="PlaceTorch"/> and <see cref="Update"/>, so the rig stays proportional in both states.
+    /// </summary>
+    const float DeckScale = 0.5f;
+
+    // -- Body box at full scale, in meters. The constructor pins these values and Update rewrites the box every frame
+    //    at the pose scale below, so the deck pose is a size the body walks toward, not a second set of numbers. --
+    const float BodyWidth = 1f;
+    const float BodyHeight = 1f;
+    const float BodyDepth = 0.5f;
+
+    /// <summary>
+    /// Seconds the body takes to cross the whole full-size to <see cref="DeckScale"/> span, linearly. The jump aims
+    /// this at takeoff rather than at the touchdown (see <see cref="Skill"/>), so most of the crossing happens while
+    /// the body is still in the air; short enough that a leap meeting the hull early still arrives at deck size.
+    /// </summary>
+    const float PoseShiftSeconds = 0.6f;
+
+    /// <summary>Size change per second: the slope of that linear crossing.</summary>
+    const float PoseRate = (1f - DeckScale) / PoseShiftSeconds;
+
+    /// <summary>Size the body is heading for: 1 walking, <see cref="DeckScale"/> at the oars.</summary>
+    float poseTarget = 1f;
+
+    /// <summary>Size in force this frame, walked toward <see cref="poseTarget"/> at <see cref="PoseRate"/>.</summary>
+    float poseScale = 1f;
+
     // Warm flame colour. The torch is a carried light rather than a dusk-only lamp, so it keeps burning and keeps
     // warming the character at midday too, as asked, instead of switching itself off with the sun.
     static readonly Vector3 TorchLightColor = new Vector3(1f, 0.7f, 0.35f);
@@ -62,6 +90,13 @@ internal class Player : Panel
     // The local origin of 3DGodotRobot.glb is approximately at the center of the feet:
     // when the origin is at (0,0,0), the model stands on the origin, with the body in
     // y in [0,1] and the bottom resting on the y=0 plane, which matches grass level.
+    /// <summary>
+    /// Aims the body at the walking size or the deck pose. The size itself is walked there by <see cref="Update"/>,
+    /// so nothing pops: a boarding jump starts shrinking at takeoff and a jump off the deck starts growing there.
+    /// Called at takeoff with the landing the jump expects, and again on touchdown with the landing it got.
+    /// </summary>
+    internal void SetDeckPose(bool onDeck) => poseTarget = onDeck ? DeckScale : 1f;
+
     internal Player()
     {
         model = new Season.Controls.Model()
@@ -74,9 +109,9 @@ internal class Player : Panel
             PosX = 0,
             PosY = 0.5f,
             PosZ = 0,
-            Width = 1,
-            Height = 1,
-            Depth = 0.5f,
+            Width = BodyWidth,
+            Height = BodyHeight,
+            Depth = BodyDepth,
             Rotation = (float)Math.PI
         };
         AddControl(model);
@@ -128,6 +163,25 @@ internal class Player : Panel
     {
         var result = base.Update(time, alpha: alpha, posX: posX, posY: posY, posZ: posZ, width: width, height: height, depth: depth);
 
+        // The pose is walked, not switched, and written to the box every frame: the torch rig, its light and the
+        // collision box all read this one scale, so none of them can disagree half way through the change.
+        if (poseScale != poseTarget)
+        {
+            float limit = PoseRate * time;
+            poseScale = MathF.Abs(poseTarget - poseScale) <= limit
+                ? poseTarget
+                : poseScale + MathF.Sign(poseTarget - poseScale) * limit;
+        }
+
+        model.Width = BodyWidth * poseScale;
+        model.Height = BodyHeight * poseScale;
+        model.Depth = BodyDepth * poseScale;
+
+        // The flame marker is a fixed-size sphere, so it follows the body here rather than in SetDeckPose.
+        torchFlame.Width = FlameSize * poseScale;
+        torchFlame.Height = FlameSize * poseScale;
+        torchFlame.Depth = FlameSize * poseScale;
+
         // Model defaults set explicitly in the constructor take priority.
         // Size values are assigned only when still zero, using normalized 0.2x scaling
         // (world meters = local size * OriginalScale * 0.2).
@@ -150,15 +204,37 @@ internal class Player : Panel
 
         // Torch proportions come from the asset rather than from constants: Torch.glb is a thin shaft of unit
         // height, and a uniform scale derived from its bounds keeps that shape instead of squaring it off.
-        if (!torchSettled && torch.LocalSize.Y > 1e-6f)
+        // The deck pose halves the body, so the shaft is resized with it on every frame of the pose change.
+        if (torch.LocalSize.Y > 1e-6f)
         {
-            float scale = TorchHeight / torch.LocalSize.Y;
+            float shaftHeight = TorchHeight * poseScale;
+            float scale = shaftHeight / torch.LocalSize.Y;
 
             torch.Width = torch.LocalSize.X * scale;
-            torch.Height = TorchHeight;
+            torch.Height = shaftHeight;
             torch.Depth = torch.LocalSize.Z * scale;
+        }
 
-            torchSettled = true;
+        // While the player is on the boat the deck owns the pose: the seat position, the deck height and the boat's
+        // heading are copied in before the rig is placed, so the torch reads the deck on the same frame. The long jump
+        // is exempt because it is steering the body itself, and the landing test decides whether the player stayed
+        // aboard or stepped off.
+        var boat = App.Instance.boat;
+        if (boat != null && boat.Aboard && !jumping)
+        {
+            var seat = boat.SeatPosition;
+            model.PosX = seat.X;
+            model.PosZ = seat.Z;
+            model.PosY = seat.Y + (model.Height ?? 0f) * 0.5f;
+            model.Rotation = boat.Heading;
+        }
+        else if (!jumping && poseScale != poseTarget)
+        {
+            // The feet are the fixed end of a body still changing size, so the centre has to be re-read from the
+            // floor and the height it has right now. Without this a body growing back to full size sinks half of
+            // what it just gained into the grass until the next step settles it again.
+            var planted = model.GetWorldBoundsRaw();
+            model.PosY = App.Instance.collider.FloorHeightUnder(planted.Center, planted.Extents) + (model.Height ?? 0f) * 0.5f;
         }
 
         // Direction and Skill have already moved and turned the character by the time App.Update reaches this
@@ -206,6 +282,13 @@ internal class Player : Panel
     {
         float yaw = model.Rotation;
 
+        // The deck pose halves the body and the rig with it; everything below is authored for the 1 m character.
+        float k = poseScale;
+        float forward = TorchForward * k;
+        float shaftHeight = TorchHeight * k;
+        float lift = TorchLift * k;
+        float flameSize = FlameSize * k;
+
         // Character facing convention shared with Direction and Skill: forward = (-sin yaw, 0, -cos yaw).
         float forwardX = -MathF.Sin(yaw);
         float forwardZ = -MathF.Cos(yaw);
@@ -213,13 +296,13 @@ internal class Player : Panel
         // The anchor is the bounding-box center, so the feet plane sits half a height below PosY.
         float feetY = model.PosY - (model.Height ?? 0f) * 0.5f;
 
-        torch.PosX = model.PosX + forwardX * TorchForward;
-        torch.PosZ = model.PosZ + forwardZ * TorchForward;
-        torch.PosY = feetY + TorchLift + TorchHeight * 0.5f;   // Anchor is the torch box center.
+        torch.PosX = model.PosX + forwardX * forward;
+        torch.PosZ = model.PosZ + forwardZ * forward;
+        torch.PosY = feetY + lift + shaftHeight * 0.5f;   // Anchor is the torch box center.
         torch.Rotation = yaw;   // Same yaw as the character, so the shaft turns with it instead of staying put.
 
         // Flame sits just above the tip of the shaft; the light emits from that same point.
-        float flameY = feetY + TorchLift + TorchHeight + FlameSize * 0.15f;
+        float flameY = feetY + lift + shaftHeight + flameSize * 0.15f;
 
         torchFlame.PosX = torch.PosX;
         torchFlame.PosY = flameY;
@@ -227,5 +310,11 @@ internal class Player : Panel
 
         // Point lights are the ones that read Position; Direction is ignored by the shader for this kind.
         torchLight.Position = new Vector3(torch.PosX, flameY, torch.PosZ);
+
+        // The deck pose carries the flame half as high off the boards, so the same intensity lights the hull around
+        // it about twice as brightly. Tying the intensity to the body scale keeps the pool at the strength the body
+        // calls for at every distance, and it moves with the pose instead of stepping at the ends of it; the range
+        // stays fixed, because shortening it would cut the lit circle off instead of dimming it.
+        torchLight.Intensity = TorchLightIntensity * k;
     }
 }

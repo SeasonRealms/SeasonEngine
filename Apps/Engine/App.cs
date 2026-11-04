@@ -162,6 +162,10 @@ internal class App : BaseApp
 
     internal House house;
 
+    // 风车小屋：站在支线西侧、桥与南脉坡脚之间的草地上，模型自带的单段动画（风车叶片旋转）循环播放。
+    // 见 LittleHouse.cs。
+    internal LittleHouse littleHouse;
+
     Ball ball;
 
     Sphere sphere;
@@ -185,6 +189,18 @@ internal class App : BaseApp
     // 按“直线段 / 弯道段”切成六个可选取的 Mesh3D；水面由 SceneWaterfall Pass 按 WaterRibbon 数据现算；
     // 两岸的草土堤坝是 RiverBank.glb 的一个批次（River.Dikes），由河段每帧把自身矩阵折进去。
     internal River river;
+
+    // Stone arch bridge over the main river channel, at the spot the player first stood (halfway from the
+    // south-branch confluence to the waterfall pool). The visible span is an AI-generated GLB (SeasonImage ->
+    // SeasonThreeD, see .dbg/_bridge_assets); the walkable deck and its two grass-to-deck stone step flights
+    // are authored in code so the player can climb up and cross. High enough for a boat to pass beneath. See
+    // Bridge.cs.
+    internal Bridge bridge;
+
+    // 维京小船：泊在水池北岸的台阶边，也就是 Player 出生点正下方，模型自带的 morph 动画驱动划桨与风帆。
+    // 静止时由 Boat 自己算三个低频摇晃；跳上甲板后 Player 绑定在座位上、方向键驱动 Boat.Steer，
+    // 可行水域（水池 / 支流 / 主河道 / 桥下 / 海口 / 海面 / 瀑布潭）见 Boat.cs。
+    internal Boat boat;
 
     internal Robots robots;
 
@@ -726,6 +742,9 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         house = new House();
         AddPanel(house);
 
+        littleHouse = new LittleHouse();
+        AddPanel(littleHouse);
+
         sphere = new Sphere();
         AddPanel(sphere);
 
@@ -781,6 +800,20 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         {
             RegisterNamedTexture(texture);
         }
+
+        // Stone arch bridge over the main channel, just upstream of where the player spawns on the bank - the
+        // visible span is the AI-generated Bridge.glb, and the walkable deck plus the two grass-to-deck stone
+        // step flights (authored like Tower's stair) are built in code so the player can climb up and cross to
+        // the far bank. Placed right after the river because its crossing centre and orientation are read off
+        // the same course table. See Bridge.cs.
+        bridge = new Bridge();
+        AddPanel(bridge);
+
+        // 维京小船泊在池北岸的台阶边：构造时从 pond 取池塘矩形与位置，所以水池移动时航道和泊位都自动跟着走。
+        // 船头默认朝 +Z，正对 Player 走下来的那排台阶；跳上甲板即绑定位置，划出去后跳回岸上，船留在原地。
+        // 海面段还给 sea：船在海里跟着可见浪面起伏与倾斜，而不是浮在恒定海平面上。
+        boat = new Boat(pond, sea);
+        AddPanel(boat);
 
         // Square observation tower on the open lawn southeast of the spawn: a 3x3 deck at 20 player heights, with a
         // single 3m flight filling one whole flank. The flight runs east-west, perpendicular to the shoreline, so it
@@ -890,6 +923,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         picker.Targets.Add(ball.bee);
         picker.Targets.Add(streetLight.lightsPunctualLamp);
         picker.Targets.Add(house.model);
+        picker.Targets.Add(littleHouse.model);
         if (campfire != null)
         {
             picker.Targets.Add(campfire.logs);
@@ -928,6 +962,8 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             picker.InstancedTargets.Add(robots.robotField);
         }
         picker.InstancedTargets.Add(birds.seagullsModel);
+        // 船也是普通可选实体：点击选中后可在属性面板里查看它，与房子/瀑布同一条路径。
+        picker.Targets.Add(boat.Hull);
         AddPanel(picker);
 
         // Movement-collision registration: only register solid obstacles that block ground travel.
@@ -949,6 +985,10 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // The river's water blocks entry exactly like the pond's water, while its bank pieces are walkable floors the
         // player can jump onto and walk along - the same treatment the pond's rim gets, at the same height.
         collider.River = river;
+        // The bridge deck and step flights are walkable floors the player climbs onto from either bank, and while
+        // the feet stand on the deck the river's water below is ignored so the crossing is not blocked. See
+        // Bridge.cs.
+        collider.Bridge = bridge;
         foreach (var blocker in tower.Blockers)
         {
             collider.Obstacles.Add(blocker);
@@ -957,6 +997,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         collider.Obstacles.Add(ball.bee);
         collider.Obstacles.Add(streetLight.lightsPunctualLamp);
         collider.Obstacles.Add(house.model);
+        collider.Obstacles.Add(littleHouse.model);
         // Only the teepee blocks; the ash bed is flat enough to walk over, and a 0.9 m disc of
         // collision would feel like an invisible step around the fire.
         if (campfire != null)
@@ -989,6 +1030,9 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // between the camera and the player. The railings are already covered by the obstacle loop above.
         foreach (var part in tower.Occluders)
             fade.Register(part);
+        // Bridge span: walkable, so not an obstacle, but the arch and parapets can stand between the camera and a
+        // player crossing the deck, so it fades like the tower shaft.
+        fade.Register(bridge.model);
         foreach (var part in room.roomParts)
         {
             if (part.Name is "RoomRoof" or "RoomCeiling")
@@ -1378,6 +1422,8 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
 
         house?.Update(time);
 
+        littleHouse?.Update(time);
+
         ball?.Update(time);
 
         robots?.Update(time);
@@ -1392,6 +1438,9 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         room?.Update(time);
 
         pond?.Update(time);
+
+        // 船要排在 pond 之后：它的水面高度与航道都来自池塘，且每帧自己算摇晃与动画状态。
+        boat?.Update(time);
 
         tower?.Update(time);
 
@@ -1411,6 +1460,8 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // 河流同理：每个河段各自是独立 Mesh3D，Panel 不会递归 tick，漏了这行高亮脉动与 Changed 就停在初值。
         // 真正的水面由 SceneWaterfall Pass 按 River 构造时注册好的 WaterRibbon 数据现算，与这里无关。
         river?.Update(time);
+
+        bridge?.Update(time);
 
         meshes?.ForEach(me =>
         {

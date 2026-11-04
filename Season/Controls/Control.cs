@@ -351,7 +351,10 @@ public abstract class Control : BaseControl, IControl
     /// Skinned and morphed models override it, because their bounds cannot serve. Animated bounds are the conservative box,
     /// raw times AnimatedBoundsScale, computed once at load time, so a character can raise an arm through a whole clip while
     /// its box never moves - a digest built from bounds alone would happily conclude nothing changed and freeze the shadow
-    /// mid-stride. The animation clock is what actually distinguishes those poses, so that is what gets folded in.
+    /// mid-stride. Something that actually distinguishes those poses has to be folded in: a single host folds its animation
+    /// clock (see <see cref="Season.Models.GltfAsset.ShadowPoseKey"/>), while a per-instance throttled batch folds an
+    /// evaluation generation (see <see cref="InstancedModel.AnimationPoseGeneration"/>), because its shared player clock
+    /// belongs to whichever instance was evaluated last and no longer describes the batch.
     /// </summary>
     protected virtual int ShadowPoseKey => 0;
 

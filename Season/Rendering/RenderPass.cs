@@ -172,6 +172,25 @@ public static class FrameSchedule
     public const int MaxViews = 8;
 
     /// <summary>
+    /// P2: whether some registered secondary view draws opaque geometry this frame.
+    ///
+    /// The pose-evaluation cull in <see cref="Season.Controls.InstancedModel"/> tests the main camera's frustum, and during Update
+    /// <see cref="CurrentView"/> is still the main view: a secondary view's camera may be posed later in the frame. A secondary view
+    /// that draws opaque geometry would then show instances the main camera cannot see, frozen on their last pose, so while one
+    /// exists the evaluation cull stays off. This is a v1 conservative rule and it costs nothing in the single-view shape, where the
+    /// list is empty; the P1 sampling throttle is unaffected either way.
+    /// </summary>
+    public static bool AnySecondaryViewDrawsOpaque
+    {
+        get
+        {
+            for (int i = 0; i < Views.Count; i++)
+                if (Views[i].View.HasFeature(ViewFeature.Opaque)) return true;
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Lowest view index not used by <see cref="PrimaryTargets"/> or any registered view, or -1 when every slot is
     /// taken. Callers must hold the slot for the lifetime of their view: the slot indexes both the per-view constant
     /// buffers and the per-view texture scope suffix, so reusing one for two live views would alias them.
@@ -905,6 +924,11 @@ public static class FrameSchedule
     {
         BeginSceneFrame(app);
         FrameIndex++;
+
+        // Contract 1-9: every platform reaches a frame through this one method, so it is where the shared statistics are
+        // sampled. It must stay before any draw: a frame that throws still counts as a frame the engine tried to present.
+        GraphicsStatistics.OnFrameRendered();
+
         var canvas = app.Canvas2D;
         var backend = g.Immediate2D;
         try

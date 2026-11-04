@@ -218,6 +218,18 @@ public class Model : Mesh3DBase
         return Asset.GetCurrentAnimationName();
     }
 
+    /// <summary>Stops playback and parks the pose on the clip's first frame. A looping clip otherwise freezes wherever it
+    /// happened to be, which reads as mid-stride; this returns a model that is meant to idle to its authored resting
+    /// pose. Returns false when not loaded or when the asset carries no clip.</summary>
+    public bool StopAnimationAtRest()
+    {
+        if (Name.IsNullOrWhiteSpace() || !Ready || Asset == null)
+            return false;
+
+        Asset.StopAndRest();
+        return true;
+    }
+
     /// <summary>1-5 clause 12: reports the asset's animation clock so shadow-atlas reuse can tell one skinned pose from
     /// another; see <see cref="Control.ShadowPoseKey"/> for why bounds cannot answer this. Zero before the asset is injected,
     /// which is also when the control is not Ready and therefore casts nothing.</summary>

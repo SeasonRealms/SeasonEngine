@@ -59,6 +59,13 @@ internal sealed class PlayerCollider
     /// </summary>
     internal River River;
 
+    /// <summary>
+    /// Registered stone bridge over the river: its deck and two approach step flights add walkable heights through
+    /// <see cref="Bridge.FloorHeightUnder"/>, and while the feet stand on that deck the river's water below is
+    /// ignored, so the player can walk right across instead of the channel blocking the path. Null means no bridge.
+    /// </summary>
+    internal Bridge Bridge;
+
     /// <summary>Contact margin: stop 1 mm before intersection to avoid jitter from floating-point boundary ambiguity.</summary>
     const float ContactEpsilon = 1e-3f;
 
@@ -80,8 +87,14 @@ internal sealed class PlayerCollider
     /// after orientation has settled because the footprint changes with Rotation, via GetWorldBoundsRaw.
     /// Obstacles that are not loaded yet, have zero-size bounds, or are disabled are skipped automatically,
     /// so registration may happen before asset loading finishes.
+    ///
+    /// <para><paramref name="airborne"/> drops the ledge retraction for a long jump in flight. That retraction is what
+    /// keeps a walking footprint out of the water and off a step face; in the air it would also stop every jump aimed at
+    /// the boat's deck, because the deck sits over water. The caller that asks for it owns the landing decision: the jump
+    /// checks where the feet come down and either lands on the deck, lands on dry ground, or puts the player back at the
+    /// takeoff point.</para>
     /// </summary>
-    internal Vector2 TryMove(in Season.Rendering.Bounds3D player, float dx, float dz)
+    internal Vector2 TryMove(in Season.Rendering.Bounds3D player, float dx, float dz, bool airborne = false)
     {
         CollectObstacleBoxes(boxes);
 
@@ -91,15 +104,23 @@ internal sealed class PlayerCollider
         var center = player.Center;
 
         float moveX = Sweep(player.Extents, ref center, dx, alongX: true);
-        moveX = RetractLedge(player.Extents, ref center, moveX, alongX: true);
+        if (!airborne) moveX = RetractLedge(player.Extents, ref center, moveX, alongX: true);
         moveX = RetractTerrain(player.Extents, ref center, moveX, alongX: true);
 
         float moveZ = Sweep(player.Extents, ref center, dz, alongX: false);
-        moveZ = RetractLedge(player.Extents, ref center, moveZ, alongX: false);
+        if (!airborne) moveZ = RetractLedge(player.Extents, ref center, moveZ, alongX: false);
         moveZ = RetractTerrain(player.Extents, ref center, moveZ, alongX: false);
 
         return new Vector2(moveX, moveZ);
     }
+
+    /// <summary>
+    /// Whether the footprint stands over open water - the pond's interior or a river channel, with the bridge deck
+    /// counting as dry ground above it. The long-jump landing test uses it to tell a jump that came down on a bank or a
+    /// dike from one that fell in.
+    /// </summary>
+    internal bool InWater(in Season.Rendering.Bounds3D bounds)
+        => WaterOverlap(bounds.Center, bounds.Extents) > 0f;
 
     /// <summary>
     /// Clamps motion along a single axis. For each obstacle, first require overlap on the other
@@ -290,7 +311,16 @@ internal sealed class PlayerCollider
     {
         float overlap = Pond != null ? Pond.WaterOverlap(center, half) : 0f;
         if (River != null)
-            overlap += River.WaterOverlap(center, half);
+        {
+            float riverOverlap = River.WaterOverlap(center, half);
+            // Bridge-deck override: a footprint standing on the bridge deck is over the channel, not in it, so
+            // walking along the deck must not read as entering the water. The gate only fires when the deck under
+            // this footprint actually rises above the water surface, so the banks and the dike (where
+            // Bridge.FloorHeightUnder is zero) keep their normal water-blocking behaviour. See Bridge.cs.
+            if (Bridge != null && riverOverlap > 0f && Bridge.FloorHeightUnder(center, half) > River.WaterY)
+                riverOverlap = 0f;
+            overlap += riverOverlap;
+        }
         return overlap;
     }
 
@@ -303,7 +333,7 @@ internal sealed class PlayerCollider
     /// </summary>
     internal float FloorHeightUnder(in Vector3 center, in Vector3 half)
     {
-        if (Room == null && Pond == null && Tower == null && River == null)
+        if (Room == null && Pond == null && Tower == null && River == null && Bridge == null)
             return 0f;
 
         float h = FloorHeightAt(center.X, center.Z);
@@ -311,7 +341,11 @@ internal sealed class PlayerCollider
         h = MathF.Max(h, FloorHeightAt(center.X - half.X, center.Z + half.Z));
         h = MathF.Max(h, FloorHeightAt(center.X + half.X, center.Z - half.Z));
         h = MathF.Max(h, FloorHeightAt(center.X + half.X, center.Z + half.Z));
-        return River != null ? MathF.Max(h, River.FloorHeightUnder(center, half)) : h;
+        if (River != null)
+            h = MathF.Max(h, River.FloorHeightUnder(center, half));
+        if (Bridge != null)
+            h = MathF.Max(h, Bridge.FloorHeightUnder(center, half));
+        return h;
     }
 
     float FloorHeightAt(float x, float z)

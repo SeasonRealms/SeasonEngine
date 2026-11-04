@@ -218,6 +218,18 @@ public class RenderQuality
     /// <summary>Default value for AnimatedBoundsScale (overrideable in the app constructor and captured by Init()).</summary>
     public static float DefaultAnimatedBoundsScale = 1.5f;
 
+    /// <summary>Default value for InstanceAnimationLod (overrideable in the app constructor and captured by Init()).</summary>
+    public static bool DefaultInstanceAnimationLod = true;
+
+    /// <summary>Default value for InstanceAnimationLodFullRateSize (overrideable in the app constructor and captured by Init()).</summary>
+    public static float DefaultInstanceAnimationLodFullRateSize = 0.10f;
+
+    /// <summary>Default value for InstanceAnimationLodHalfRateSize (overrideable in the app constructor and captured by Init()).</summary>
+    public static float DefaultInstanceAnimationLodHalfRateSize = 0.04f;
+
+    /// <summary>Default value for InstanceAnimationCull (overrideable in the app constructor and captured by Init()).</summary>
+    public static bool DefaultInstanceAnimationCull = true;
+
     /// <summary>Default value for ShadowsEnabled (overrideable in the app constructor and captured by Init()).</summary>
     public static bool DefaultShadowsEnabled = true;
 
@@ -514,6 +526,42 @@ public class RenderQuality
     /// Runtime culling uses rest-pose AABB x this value to avoid false culling when animation extends outside the static box. Higher values trade culling efficiency for safety.
     /// </summary>
     public float AnimatedBoundsScale { get; set; } = DefaultAnimatedBoundsScale;
+
+    /// <summary>
+    /// P1: process-wide switch for per-instance animation sampling LOD on <see cref="Season.Controls.InstancedModel"/>. When on,
+    /// an instance's projected size s = R / (d x tan(fovY/2)) - the instance bounding sphere's radius as a fraction of the
+    /// view's half-height at its depth - decides how often its clip is sampled: at or above <see cref="InstanceAnimationLodFullRateSize"/>
+    /// every frame, at or above <see cref="InstanceAnimationLodHalfRateSize"/> every second frame, otherwise every fourth. An
+    /// instance the main camera cannot see at all (shadow-only) is pinned to the four-frame tier, because only the shadow atlas
+    /// can show it. Playback time still advances every frame, so a throttled instance is sampled at the correct time when its
+    /// turn comes; only the pose shown is up to period-1 frames old. Hero units that must never lag opt out per control through
+    /// <c>InstancedModel.AnimationLod</c>. This switch is a gate on top of that one: either off means full rate everywhere.
+    /// </summary>
+    public bool InstanceAnimationLod { get; set; } = DefaultInstanceAnimationLod;
+
+    /// <summary>
+    /// P1: projected-size threshold above which an instance samples its clip every frame. See <see cref="InstanceAnimationLod"/> for
+    /// the measure itself. The default (0.10) keeps a 1.8 m tall character at full rate out to roughly 20 m under a 45-degree vertical
+    /// FOV; raising it pulls that distance closer, and it also widens the band that stays at every frame.
+    /// </summary>
+    public float InstanceAnimationLodFullRateSize { get; set; } = DefaultInstanceAnimationLodFullRateSize;
+
+    /// <summary>
+    /// P1: projected-size threshold above which an instance samples its clip every second frame; below it the instance falls to the
+    /// four-frame tier. It must stay at or below <see cref="InstanceAnimationLodFullRateSize"/> to describe a usable pair of bands.
+    /// </summary>
+    public float InstanceAnimationLodHalfRateSize { get; set; } = DefaultInstanceAnimationLodHalfRateSize;
+
+    /// <summary>
+    /// P2: process-wide switch for the per-frame pose-evaluation cull on <see cref="Season.Controls.InstancedModel"/>. When on, an
+    /// instance whose root box the main camera's frustum cannot reach -- the test is <see cref="InstanceCull.CpuVisible"/>, the same
+    /// sphere formula the GPU cull kernel uses plus a guard band -- skips its clip evaluation for the frame, and the frame it re-enters
+    /// the frustum republishes its previous-frame transform so its motion vector reads zero instead of one frame of travel.
+    /// The instance itself keeps drawing from its cached pose, so a culled instance is still shadow-cast and still culled by the GPU on
+    /// the draw side; only the CPU replay is skipped. The switch is a gate on top of <see cref="Season.Controls.InstancedModel.AnimationCull"/>:
+    /// either off disables the evaluation cull, while the P1 sampling throttle keeps working unaffected.
+    /// </summary>
+    public bool InstanceAnimationCull { get; set; } = DefaultInstanceAnimationCull;
 
     /// <summary>1-5 tier: global shadow switch (CSM + spot shadowmap). Locked at initialization and ignored by unsupported backends.</summary>
     public bool ShadowsEnabled { get; set; } = DefaultShadowsEnabled;

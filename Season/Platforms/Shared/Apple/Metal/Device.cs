@@ -97,6 +97,46 @@ internal static class Device
 
     internal static CommandQueue GraphicsQueue = null!;
 
+    /// <summary>
+    /// Contract 1-9: Metal's own accounting of the bytes this process holds on the device, plus the ceiling when the
+    /// platform publishes one. <c>CurrentAllocatedSize</c> exists on both iOS and macOS and includes everything the driver
+    /// allocated on our behalf, which is the closest thing Metal has to a VRAM counter. The ceiling is macOS-only
+    /// (<c>RecommendedMaxWorkingSetSize</c>): iOS has no per-process GPU budget, so it stays 0 there and the caller reports
+    /// usage without a total rather than inventing one.
+    /// Never throws; returns false when the device is not up yet.
+    /// </summary>
+    internal static bool TryQueryGpuMemory(out long usedBytes, out long totalBytes)
+    {
+        usedBytes = 0;
+        totalBytes = 0;
+
+        var device = MtlDevice;
+        if (device == null) return false;
+
+        try
+        {
+            usedBytes = (long)device.CurrentAllocatedSize;
+        }
+        catch
+        {
+            // A diagnostic readout must never break the frame that asked for it.
+            return false;
+        }
+
+#if MACCATALYST
+        try
+        {
+            totalBytes = (long)device.RecommendedMaxWorkingSetSize;
+        }
+        catch
+        {
+            totalBytes = 0;
+        }
+#endif
+
+        return true;
+    }
+
     // ===== Shared rendering parameters, aligned with DX and VK =====
     internal static int frameCount = 3;
 

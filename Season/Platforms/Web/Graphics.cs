@@ -5092,4 +5092,23 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
 
         shape.Ready = false;
     }
+
+    /// <summary>
+    /// Contract 1-9: the browser exposes neither a device-wide usage counter nor a budget, so WebGPU answers with the
+    /// bytes its own texture registries account for and no ceiling. That is an estimate of our allocations, not a driver
+    /// number, and it is labelled as such wherever it is shown. A module that is not up yet, or an interop call that
+    /// fails because the page has no WebGPU, reports "unknown" rather than zero.
+    /// </summary>
+    public GraphicsMemoryInfo QueryGraphicsMemory()
+    {
+        try
+        {
+            double bytes = WebGPUInterop.QueryGpuMemoryBytes();
+            return bytes < 0 ? GraphicsMemoryInfo.Unknown : new GraphicsMemoryInfo((long)bytes);
+        }
+        catch
+        {
+            return GraphicsMemoryInfo.Unknown;
+        }
+    }
 }

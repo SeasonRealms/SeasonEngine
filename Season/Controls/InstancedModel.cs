@@ -10,7 +10,7 @@ namespace Season.Controls;
 /// For the shared framework (instance collection / template-box bounding-sphere broad-phase culling /
 /// shadow gating / Draw gating), see <see cref="InstancedMesh3DBase"/>.
 /// </summary>
-public class InstancedModel : InstancedMesh3DBase
+public partial class InstancedModel : InstancedMesh3DBase
 {
     /// <summary>GLB model path, relative to `Raw/`.</summary>
     public string ModelName { get; init; } = string.Empty;
@@ -26,14 +26,20 @@ public class InstancedModel : InstancedMesh3DBase
     /// The platform LoadInstancedModel path injects the instantiated GltfAsset, whose node tree,
     /// animations, and bone palettes share the same source as instance rendering.
     /// Per-instance picking snapshots (InstancePickNodeWorlds/InstancePickBones) are written by the
-    /// platform every frame. This is null before loading and after disposal.
+    /// platform on every frame where that instance's pose is sampled, and left in place on a throttled
+    /// frame, where they keep describing the pose still being rendered. This is null before loading and
+    /// after disposal.
     /// </summary>
     internal Season.Models.GltfAsset Asset { get; set; }
 
-    /// <summary>1-5 clause 12: reports the shared asset's animation clock for shadow-atlas reuse. One clock covers the whole
-    /// batch because every instance replays the same clip from the same player; the per-instance transforms are folded in
-    /// separately by <see cref="InstancedMesh3DBase.DrawShadow"/>.</summary>
-    protected override int ShadowPoseKey => Asset?.ShadowPoseKey ?? 0;
+    /// <summary>1-5 clause 12: reports the batch's pose generation for shadow-atlas reuse. This used to be the shared asset's
+    /// animation clock, which was one value for the whole batch because every instance replayed the same clip from the same
+    /// player; once P1 throttles sampling per instance, that clock only belongs to whichever instance was evaluated last, so it
+    /// no longer describes the batch. The backend increments <see cref="AnimationPoseGeneration"/> on exactly the frames where at
+    /// least one instance was evaluated -- the frames on which the set of rendered poses can change -- so throttled and held
+    /// frames keep the cached atlas and any real motion redraws it. Per-instance transforms are folded in separately by
+    /// <see cref="InstancedMesh3DBase.DrawShadow"/>.</summary>
+    protected override int ShadowPoseKey => AnimationPoseGeneration;
 
     protected override bool HasContent => !string.IsNullOrEmpty(ModelName);
 
@@ -75,6 +81,22 @@ public class InstancedModel : InstancedMesh3DBase
             // UpdateInstancedModel, after matrices have already converged in BuildInstanceMatrix.
             for (int i = 0; i < Instances.Count; i++)
                 SettleInstanceDimensions(Instances[i]);
+
+            // P1: start the throttling frame immediately before the backend replays the batch. The enabled count is what
+            // forces a full-rate frame after an enable/disable change, and the frame delta is what the static hold reads.
+            int enabledCount = 0;
+            for (int i = 0; i < Instances.Count; i++)
+            {
+                if (Instances[i].Enable)
+                    enabledCount++;
+            }
+
+            BeginAnimationLodFrame(enabledCount, time);
+
+            // P2: composes every instance's root world once and decides which ones skip their pose evaluation. It has to run
+            // after the throttle frame (it stamps itself with that frame) and before the backend replays the batch, which is
+            // what reads the verdicts back.
+            BeginInstanceCullFrame();
 
             Graphics.Instance.UpdateInstancedModel(this, time);
         }

@@ -166,6 +166,19 @@ internal class Direction : Panel
         dx *= app.playerSpeed;
         dz *= app.playerSpeed;
 
+        // At the oars the same input drives the boat instead of the character: Boat.Steer turns the bow into the
+        // requested direction and keeps the hull inside the waterway, so the pond, the river and the sea are the only
+        // places it can go. The body is re-bound to the seat by Player.Update later in the frame, and the camera
+        // follows the seat's displacement rather than the character's.
+        var boat = app.boat;
+        if (boat != null && boat.Aboard)
+        {
+            var beforeSteer = boat.SeatPosition;
+            boat.Steer(dx, dz);
+            app.FollowCamera(boat.SeatPosition - beforeSteer);
+            return;
+        }
+
         // Turn first, then move. Facing always takes effect, even when blocked,
         // so the player can rotate in place. Collision uses the AABB under the new facing direction.
         model.Rotation = yaw;

@@ -133,6 +133,16 @@ internal class Sea : Panel
     static readonly float[] Amplitudes = { 2.4f, 1.2f, 0.6f, 0.3f };
 
     /// <summary>
+    /// The baked relief grid, kept after the build so <see cref="SurfaceY"/> can read the very surface the mesh draws.
+    /// Filled once by <see cref="BuildSurfaces"/>, row-major at <see cref="GridSize"/> per side, in the mesh's local
+    /// space. Nothing else reads it, and it costs one 255x255 float array for the whole program.
+    /// </summary>
+    static float[]? reliefHeights;
+
+    /// <summary>Midpoint of the baked height bounds, the offset the vertices were shifted down by; see <see cref="BuildSurfaces"/>.</summary>
+    static float reliefMidY;
+
+    /// <summary>
     /// Static variant: the visible sea surface at <see cref="SeaLevel"/>. Disabled whenever the dynamic path is in
     /// force, which is what keeps it out of every draw list without unloading its geometry.
     /// </summary>
@@ -149,6 +159,13 @@ internal class Sea : Panel
     /// The constructor seeds it, so the first Update never has to guess.
     /// </summary>
     Season.Rendering.SeaMode _mode;
+
+    /// <summary>
+    /// Seconds of sea time seen by this panel, advanced by the same clamped frame delta the mesh uses. It is the clock
+    /// of the dynamic path's Gerstner phase, which the shader takes from <c>BaseApp.Time</c>; both count unpaused frame
+    /// time from zero, so <see cref="SurfaceY"/> lands on the phase the water pass draws.
+    /// </summary>
+    float waterClock;
 
     /// <summary>
     /// The dynamic path's visible sea surface: a 1400x1400m rectangle at <see cref="SeaLevel"/>. Registered by App
@@ -321,6 +338,11 @@ internal class Sea : Panel
         }
         float midY = (minY + maxY) * 0.5f;              // Midpoint of the bounds in Y, subtracted so the anchor sits on average sea level.
 
+        // Keep the grid: a floating body has to ride this height, and re-deriving it from Fbm(x,z) would miss the
+        // interpolation the 5.5 m grid does between samples, i.e. the boat would sink into crests the mesh smooths over.
+        reliefHeights = heights;
+        reliefMidY = midY;
+
         // 2. Vertices: filled the same way as the road, with any reasonable tangent because renderMode=0 ignores TBN.
         var verts = new Vertex[GridSize * GridSize];
         for (int j = 0; j < GridSize; j++)
@@ -478,6 +500,123 @@ internal class Sea : Panel
         return x * x * (3f - 2f * x);
     }
 
+    /// <summary>
+    /// World Y of the visible sea surface at a world XZ - whatever the active mode actually draws there: the baked
+    /// relief on Static, that plus the travelling swell on Swell, and the Gerstner plane on Dynamic.
+    ///
+    /// <para><b>Why a floating body needs this.</b> <see cref="SeaLevel"/> is the mean level only: the relief offshore
+    /// runs to about +/-4.5 m, so a hull pinned to the mean sits buried under every crest and hanging over every trough.
+    /// Reading the drawn surface instead makes it ride what the eye sees. Near the shore the mask flattens it back to
+    /// <see cref="SeaLevel"/>, so the estuary and the beach keep the level the rest of the scene was built against.</para>
+    ///
+    /// <para>On Swell the swell's camera-range fade (<see cref="Mesh3D.WaveFadeRadius"/>) is taken as fully open. The
+    /// only caller is the boat under the player's camera, which is always inside the first few dozen metres of the sheet
+    /// where that fade is 1; a distant consumer would want the fade term too.</para>
+    /// </summary>
+    internal float SurfaceY(float worldX, float worldZ)
+    {
+        if (_mode == Season.Rendering.SeaMode.Dynamic)
+            return Water.Position.Y + GerstnerY(worldX, worldZ);
+
+        float y = sea.PosY + ReliefAt(worldX - sea.PosX, worldZ - sea.PosZ);
+        if (_mode == Season.Rendering.SeaMode.Swell)
+            y += SwellY(worldX, worldZ);
+
+        return y;
+    }
+
+    /// <summary>
+    /// Bilinear read of the baked relief at a mesh-local XZ, relative to the sea plane's own position. This is the same
+    /// interpolation the vertex grid does (bilinear instead of the mesh's two triangles, a couple of centimetres apart on
+    /// 5.5 m cells). Outside the sheet it clamps to the last row, which is what the drawn edge does too.
+    /// </summary>
+    static float ReliefAt(float localX, float localZ)
+    {
+        if (reliefHeights == null)
+            return 0f;
+
+        const int cells = GridSize - 1;
+        float step = Size / cells;
+        float half = Size * 0.5f;
+
+        // Clamp inside the last cell rather than onto the last vertex: the read below needs i + 1 and j + 1.
+        float fx = Math.Clamp((localX + half) / step, 0f, cells - 1e-4f);
+        float fz = Math.Clamp((localZ + half) / step, 0f, cells - 1e-4f);
+
+        int i = (int)fx, j = (int)fz;
+        float tx = fx - i, tz = fz - j;
+        int row = j * GridSize;
+        int next = row + GridSize;
+
+        float top = reliefHeights[row + i] + (reliefHeights[row + i + 1] - reliefHeights[row + i]) * tx;
+        float bottom = reliefHeights[next + i] + (reliefHeights[next + i + 1] - reliefHeights[next + i]) * tx;
+
+        return top + (bottom - top) * tz - reliefMidY;
+    }
+
+    /// <summary>
+    /// The vertex swell's height at a world XZ, mirroring <c>SwellEvaluate</c> in the four backends: three radial
+    /// components advancing at 1x / 2x / 3x of the shared phase, weighted 0.55 / 0.30 / 0.15, scaled by the half
+    /// amplitude the mesh publishes and by the shoaling mask baked into the vertices. Zero whenever the mesh carries no
+    /// amplitude, which is every mode but Swell.
+    /// </summary>
+    float SwellY(float worldX, float worldZ)
+    {
+        // WaveAmplitude is peak-to-trough and the shader takes half of it; the phase is the mesh's own clock.
+        float amplitude = sea.WaveAmplitude * 0.5f;
+        if (amplitude <= 0f)
+            return 0f;
+
+        float mask = SwellMask(worldX, worldZ);
+        if (mask <= 0f)
+            return 0f;
+
+        float amp = amplitude * mask;
+        float phase = sea.WavePhase;
+
+        // The three centers are the shader's own offsets; the radii are guarded at 1 because the island center is a
+        // singular point for a radial wave (the mask already covers it).
+        var d0 = new Vector2(worldX, worldZ);
+        var d1 = d0 - new Vector2(37f, -24f);
+        var d2 = d0 - new Vector2(-61f, 43f);
+        float r0 = MathF.Max(d0.Length(), 1f);
+        float r1 = MathF.Max(d1.Length(), 1f);
+        float r2 = MathF.Max(d2.Length(), 1f);
+
+        return amp * (0.55f * MathF.Sin(0.06981317f * r0 + phase)
+                    + 0.30f * MathF.Sin(0.11423740f * r1 + phase * 2f)
+                    + 0.15f * MathF.Sin(0.18478989f * r2 + phase * 3f));
+    }
+
+    /// <summary>
+    /// The dynamic path's Gerstner height at a world XZ, from the same four components <see cref="WaterMath.BuildWaves"/>
+    /// hands the shader: <c>amplitude * sin(k * dot(dir, p) - sqrt(g * k) * WaveSpeed * t)</c>. Only the height is
+    /// summed - the horizontal orbit moves the surface sideways, not up.
+    /// </summary>
+    float GerstnerY(float worldX, float worldZ)
+    {
+        Span<Vector4> waves = stackalloc Vector4[Season.Rendering.WaterMath.WaveCount];
+        int count = Season.Rendering.WaterMath.BuildWaves(waves, 0, Water.WindSpeed, Water.WindDirection,
+            Water.SwellHeight, Season.Rendering.WaterMath.WaveCount);
+        if (count == 0)
+            return 0f;
+
+        float speed = Water.WaveSpeed;
+        float t = waterClock * speed;
+        float y = 0f;
+        for (int i = 0; i < count; i++)
+        {
+            float k = waves[i].Y;
+            if (k <= 0f)
+                continue;
+
+            float omega = MathF.Sqrt(Season.Rendering.WaterMath.Gravity * k) * speed;
+            y += waves[i].X * MathF.Sin(k * (waves[i].Z * worldX + waves[i].W * worldZ) - omega * t);
+        }
+
+        return y;
+    }
+
     public override bool Update(float time, float? alpha = null, float? posX = null, float? posY = null, float? posZ = null, float? width = null, float? height = null, float? depth = null)
     {
         var result = base.Update(time, alpha: alpha, posX: posX, posY: posY, posZ: posZ, width: width, height: height, depth: depth);
@@ -488,6 +627,10 @@ internal class Sea : Panel
         var seaMode = Season.Rendering.WorldSettings.Current.SeaMode;
         if (seaMode != _mode) ApplySeaMode(seaMode);
         ApplyWaveSettings(seaMode);
+
+        // The Gerstner phase on the dynamic path is a function of elapsed sea time, so the clock has to run whether or
+        // not that mode is showing: a switch mid-session must not restart the wave.
+        waterClock += float.IsFinite(time) ? Math.Clamp(time, 0f, 0.1f) : 0f;
 
         // The water rectangle is world-space data with no mesh and no child control, so it follows the panel directly.
         // On the dynamic path the floor sits SeaDepth below it; that gap is what the shader reads as water thickness.

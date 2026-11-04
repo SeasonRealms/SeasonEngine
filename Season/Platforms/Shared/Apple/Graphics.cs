@@ -3273,4 +3273,14 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         // Resource lifetime is guaranteed by command-buffer retained references under rule 5.
         return true;
     }
+
+    /// <summary>
+    /// Contract 1-9: Metal answers GPU memory from the device itself, so the number includes driver-side allocations that
+    /// are invisible to our resource dictionaries. iOS publishes no ceiling, so the total stays 0 there and the caller
+    /// prints usage alone instead of a fabricated limit.
+    /// </summary>
+    public GraphicsMemoryInfo QueryGraphicsMemory()
+        => Metal.Device.TryQueryGpuMemory(out long used, out long total)
+            ? new GraphicsMemoryInfo(used, total)
+            : GraphicsMemoryInfo.Unknown;
 }

@@ -10,9 +10,27 @@ internal class Logo : Panel
 
     internal bool IsRecording = false;
 
+    /// <summary>Contract 1-9 readout: one small line under the logo, e.g. "FPS 60 / GPU 200M / CPU 500M".</summary>
+    Texts statisticsText;
+
+    // Last numbers the line was built from. The statistics are sampled at most twice per second, so the string and the
+    // relayout it triggers only happen when a published number actually moved.
+    float statisticsFps;
+    long statisticsGpuUsed;
+    long statisticsCpu;
+    bool statisticsGpuKnown;
+
     internal Logo()
     {
         RenderDomain = Season.Controls.RenderDomain.Overlay;
+
+        statisticsText = new Texts()
+        {
+            Color = Season.Basic.Colors.DarkRed,
+            Scale = new Vector2(0.75f, 0.75f)
+        };
+
+        AddControl(statisticsText);
 
         sprite2D = new Sprite2D()
         {
@@ -114,6 +132,39 @@ internal class Logo : Panel
             result = true;
         }
 
+        result |= UpdateStatistics(time, size);
+
         return result;
+    }
+
+    /// <summary>
+    /// Contract 1-9: draws the frame-rate / GPU-memory / CPU-memory line under the logo. The numbers come from the shared
+    /// <see cref="GraphicsStatistics"/>, which every backend feeds through the single per-frame entry point, so this panel
+    /// needs no platform knowledge of its own. Unknown GPU usage prints as "--" rather than a fabricated zero.
+    ///
+    /// Right alignment uses the width measured by the previous layout: Texts lays out from a top-left origin and has no
+    /// alignment of its own, so the line's right edge is kept on the logo's right edge instead of its left edge being
+    /// pinned, which would make the line grow off-screen as the numbers widen.
+    /// </summary>
+    bool UpdateStatistics(float time, int size)
+    {
+        var statistics = GraphicsStatistics.Current;
+
+        if (statistics.Fps != statisticsFps
+            || statistics.GpuUsedBytes != statisticsGpuUsed
+            || statistics.GpuUsageKnown != statisticsGpuKnown
+            || statistics.CpuBytes != statisticsCpu)
+        {
+            statisticsFps = statistics.Fps;
+            statisticsGpuUsed = statistics.GpuUsedBytes;
+            statisticsGpuKnown = statistics.GpuUsageKnown;
+            statisticsCpu = statistics.CpuBytes;
+
+            statisticsText.Content = statistics.ToCompactString();
+        }
+
+        float width = statisticsText.Width ?? 0f;
+
+        return statisticsText.Update(time, alpha: 0.75f, posX: App.Instance.ExtendResolution.X - size - width, posY: (float)(size * 2.5));
     }
 }

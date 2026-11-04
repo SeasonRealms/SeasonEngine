@@ -5751,6 +5751,79 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
     function setDebugLog(enabled) { _debugLog = !!enabled; }
     function getInstancedDiagState() { return { ..._instancedDiag }; }
 
+    // Contract 1-9: WebGPU exposes no device-wide memory counter, so the only honest number is the one this module can
+    // account for itself: every texture in the four registries, sized from its own declared shape. It is an estimate of
+    // our own allocations (it cannot see driver overhead or the browser's internal copies), and the browser publishes no
+    // budget at all, so the caller reports usage without a ceiling instead of inventing one.
+
+    // Bytes one texel of a WebGPU format occupies. Compressed families are counted per 4x4 block, which is exact for
+    // every compressed format WebGPU allows; an unrecognised format falls back to 4 bytes so a new format shows up as a
+    // slightly wrong number rather than vanishing from the total.
+    function _bytesPerTexel(format) {
+        if (!format) return 4;
+        switch (format) {
+            case 'r8unorm': case 'r8snorm': case 'r8uint': case 'r8sint':
+                return 1;
+            case 'r16uint': case 'r16sint': case 'r16float':
+            case 'rg8unorm': case 'rg8snorm': case 'rg8uint': case 'rg8sint':
+            case 'depth16unorm':
+                return 2;
+            case 'rgba8unorm': case 'rgba8unorm-srgb': case 'rgba8snorm': case 'rgba8uint': case 'rgba8sint':
+            case 'bgra8unorm': case 'bgra8unorm-srgb':
+            case 'rgb10a2unorm': case 'rgb10a2uint': case 'rg11b10ufloat': case 'rgb9e5ufloat':
+            case 'rg16uint': case 'rg16sint': case 'rg16float':
+            case 'r32uint': case 'r32sint': case 'r32float':
+            case 'depth24plus': case 'depth24plus-stencil8': case 'depth32float':
+                return 4;
+            case 'rgba16uint': case 'rgba16sint': case 'rgba16float':
+            case 'rg32uint': case 'rg32sint': case 'rg32float':
+            case 'depth32float-stencil8':
+                return 8;
+            case 'rgba32uint': case 'rgba32sint': case 'rgba32float':
+                return 16;
+            default:
+                if (format.startsWith('bc1-')) return 8 / 16;
+                if (format.startsWith('bc') || format.startsWith('etc2-') || format.startsWith('eac-')
+                    || format.startsWith('astc-')) return 16 / 16;
+                return 4;
+        }
+    }
+
+    // One texture's footprint: every mip level at its own size, times the sample count for multisampled targets, times
+    // the per-texel cost. GPUTexture carries its full shape, so no bookkeeping is needed beside the registries.
+    function _textureByteSize(texture) {
+        if (!texture) return 0;
+        const bytesPerTexel = _bytesPerTexel(texture.format);
+        const samples = texture.sampleCount || 1;
+        let texels = 0;
+        for (let level = 0; level < texture.mipLevelCount; level++) {
+            const w = Math.max(1, texture.width >> level);
+            const h = Math.max(1, texture.height >> level);
+            const d = Math.max(1, texture.depthOrArrayLayers >> level);
+            texels += w * h * d;
+        }
+        return texels * bytesPerTexel * samples;
+    }
+
+    // Sum over the four registries. Render targets hold up to three planes (colour, implicit depth, presentation depth),
+    // all of which are real allocations and are therefore all counted. A module that has not initialised yet answers -1,
+    // which the caller reads as "unknown", so a backend that is not up is never mistaken for an idle one.
+    function queryGpuMemoryBytes() {
+        if (!_device) return -1;
+        let bytes = 0;
+        for (const name in _textures) bytes += _textureByteSize(_textures[name]);
+        for (const name in _textureCubes) bytes += _textureByteSize(_textureCubes[name] && _textureCubes[name].texture);
+        for (const name in _textures3d) bytes += _textureByteSize(_textures3d[name]);
+        for (const name in _renderTargets) {
+            const rt = _renderTargets[name];
+            if (!rt) continue;
+            bytes += _textureByteSize(rt.colorTex)
+                + _textureByteSize(rt.depthTex)
+                + _textureByteSize(rt.auxDepthTex);
+        }
+        return bytes;
+    }
+
     let _immediatePipeline, _immediateLayout, _immediateLinear, _immediatePoint;
     let _nextCapture;
     function captureNextFrame() {
@@ -5949,6 +6022,8 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         updateMeshTexture,
         updateMeshMaterialParams,
         getInstancedDiagState,
+        // Contract 1-9: our own GPU allocation estimate, in bytes; WebGPU publishes no budget to pair it with.
+        queryGpuMemoryBytes,
         createComputeKernel,
         disposeComputeKernel,
         createFogCompositePipeline, prepareFogComposite, drawFogComposite, disposeFogCompositePipeline,

@@ -67,6 +67,16 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
     private InstanceAnimationState[] _animationStates = Array.Empty<InstanceAnimationState>();
     private PrimitiveInstanceStream[] _primitiveInstanceStreams = Array.Empty<PrimitiveInstanceStream>();
 
+    // P1: last sampled pose per instance (owner-node worlds / morph weights / bone palette). A throttled frame never
+    // evaluates an instance's clip, and the shared node tree cannot hold every instance's pose at once, so the streams of
+    // a skipped instance are rebuilt from here instead. Rows are keyed by the Instances index, see the cache's contract.
+    private readonly InstancePoseCache _poseCache = new();
+
+    // P2: compacted slots that just re-entered the main camera's frustum. Their previous-frame world and morph weights are
+    // republished from this frame's values after the loop, so the motion-vector pass reads zero velocity across the frames the
+    // instance spent culled instead of one frame of the distance it travelled. Rebuilt every Update.
+    private readonly List<int> _historyResetSlots = new();
+
     struct InstanceAnimationState
     {
         public bool Initialized;
@@ -601,6 +611,67 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         }
     }
 
+    /// <summary>
+    /// P3a: a deduplicated instance does not replay its clip, so the backend's "rewrite the picking snapshot on every sampled
+    /// frame" rule would leave its snapshot describing the pose it had before the copy. The snapshot is part of the rendered
+    /// pose, so it follows the cache row.
+    /// </summary>
+    void CopyInstancePickPose(int source, int destination, bool hasSkin)
+    {
+        var nodeWorlds = _asset.InstancePickNodeWorlds;
+        if ((uint)source < (uint)nodeWorlds.Length && (uint)destination < (uint)nodeWorlds.Length)
+        {
+            var from = nodeWorlds[source];
+            var to = nodeWorlds[destination];
+            if (from != null && to != null)
+                Array.Copy(from, to, Math.Min(from.Length, to.Length));
+        }
+
+        if (!hasSkin)
+            return;
+
+        var bones = _asset.InstancePickBones;
+        if ((uint)source < (uint)bones.Length && (uint)destination < (uint)bones.Length)
+        {
+            var from = bones[source];
+            var to = bones[destination];
+            if (from != null && to != null)
+                Array.Copy(from, to, Math.Min(from.Length, to.Length));
+        }
+    }
+
+    /// <summary>
+    /// P2: republishes this frame's transform for every slot that just came back into view into the previous-frame ring, so the
+    /// motion vector computed against it is zero for exactly this frame.
+    ///
+    /// The slot written is <see cref="PrevFrameSlot"/> -- the side this frame's shaders read as "previous" -- and no in-flight
+    /// frame reads it: a frame reads the slot before its own, and this one is being filled for the commands about to be recorded.
+    /// Morph weights are taken from the CPU shadow that was just uploaded rather than zeroed, because their previous-frame buffer
+    /// has no sentinel: zero is a legitimate set of weights, not "no history".
+    /// </summary>
+    void WriteHistoryResets(Matrix4x4[]? frameWorlds)
+    {
+        if (_historyResetSlots.Count == 0 || frameWorlds == null)
+            return;
+
+        int prevSlot = PrevFrameSlot;
+        byte* worlds = (uint)prevSlot < (uint)_mappedInstanceWorldBuffers.Length
+            ? _mappedInstanceWorldBuffers[prevSlot] : null;
+        byte* morphs = (uint)prevSlot < (uint)_mappedMorphWeightsBuffers.Length
+            ? _mappedMorphWeightsBuffers[prevSlot] : null;
+
+        for (int k = 0; k < _historyResetSlots.Count; k++)
+        {
+            int slot = _historyResetSlots[k];
+
+            if (worlds != null && slot < _instanceWorldCapacity && slot < frameWorlds.Length)
+                *(Matrix4x4*)(worlds + slot * sizeof(Matrix4x4)) = frameWorlds[slot];
+
+            if (morphs != null && slot < _instanceMorphWeightsCapacity && slot < _currentMorphShadow.Length)
+                *(Vector4*)(morphs + slot * sizeof(Vector4)) = _currentMorphShadow[slot];
+        }
+    }
+
     /// <summary>2-3 Step C (tier C-b): publishes this frame's morph shadow into this frame's ring slot. The previous
     /// frame is the slot that frame wrote, so no copy between the two exists.</summary>
     void UploadMorphWeightsForFrame()
@@ -655,6 +726,7 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         bool wasInitialized = _transformInitialized;
         _wireframeActive = false;
         _instanceCount = 0;
+        _historyResetSlots.Clear();
         // Latched before the early return below, so a frame with no instances can never inherit last frame's indirect authorization.
         BeginCullFrame(model);
 
@@ -700,6 +772,12 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         bool hasAnimation = _asset._animations.Count > 0;
         bool hasSkin = _skins.Count > 0;
         float deltaTime = Math.Max(time, 0f);
+        bool anySampled = false;
+
+        // P1: one pose row per instance, sized by the primitive layout and the palette stride. Cheap after the first frame.
+        _poseCache.Ensure(model.Instances.Count, _primitives.Count, hasSkin ? _bonePaletteStride : 0);
+        if (hasAnimation || hasSkin)
+            EnsureInstancePickShadow(model.Instances.Count);
 
         // 2-3 Step C (tiers B/C-b): nothing is copied here any more. Each GPU ring above holds one frame in flight per
         // slot, so "the previous frame's palette / morph weights" is simply the slot the previous frame wrote, and the
@@ -719,8 +797,13 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
 
             // Unified transform convention: route everything through
             // BuildInstanceMatrix (anchor pivot, see InstancedMesh3DBase)
-            var instanceWorld = model.BuildInstanceMatrix(instance);
+            var instanceWorld = model.InstanceWorld(i);
             _instanceData[writeIndex] = InstanceTransformData.FromWorld(instanceWorld);
+
+            // P2: the CPU cull decision is made once per instance in the control's Update; this is where it reaches the replay.
+            bool instanceCulled = model.IsInstanceAnimationCulled(i);
+            if (model.ShouldResetInstanceHistory(i))
+                _historyResetSlots.Add(writeIndex);
             bool instWire = instance.Highlight.Wireframe;
             _wireframeActive |= instWire;
 
@@ -780,75 +863,117 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
                     _shellBoxDrawList.Add(writeIndex);
                 }
             }
-            RestoreNodesToRestPose();
-
+            int clip = 0;
+            float playbackTime = 0f;
             if (hasAnimation)
             {
-                int clip = instance.AnimationClip;
+                clip = instance.AnimationClip;
                 if (clip < 0 || clip >= _asset._animations.Count)
                     clip = 0;
 
                 ref var state = ref _animationStates[i];
-                float nextPlaybackTime;
                 if (!state.Initialized || state.AnimationClip != clip)
                 {
-                    nextPlaybackTime = instance.AnimationTimeOffset + deltaTime * instance.AnimationSpeed;
+                    playbackTime = instance.AnimationTimeOffset + deltaTime * instance.AnimationSpeed;
                     state.Initialized = true;
                     state.AnimationClip = clip;
                 }
                 else
                 {
-                    nextPlaybackTime = state.PlaybackTime + deltaTime * instance.AnimationSpeed;
+                    playbackTime = state.PlaybackTime + deltaTime * instance.AnimationSpeed;
                 }
 
-                state.PlaybackTime = nextPlaybackTime;
-                _asset._animationPlayer.Evaluate(clip, nextPlaybackTime, _workNodes);
+                // P1: the clock advances every frame regardless of the tier, so a throttled instance is always sampled at
+                // the true current time and only its refresh rate changes. A held instance (zero delta, zero speed) reads
+                // the same time it already cached, which is what makes the hold a pure reuse.
+                state.PlaybackTime = playbackTime;
             }
-            else
+
+            bool samplePose = !instanceCulled && model.ShouldSampleInstanceAnimation(i, instance, clip);
+            anySampled |= samplePose;
+
+            // P3a: a sampled instance at tier 2 or slower may share another instance's sample for the same (clip, quantized
+            // time) pair. Reflight the clip only on a miss; on a hit the cached rows are copied and the streams below are built
+            // from them exactly as on a throttled frame, so the instance transform still applies this frame.
+            float sampleTime = playbackTime;
+            int poseSource = -1;
+            if (samplePose && model.TryReuseInstancePose(i, clip, playbackTime, out poseSource, out sampleTime))
             {
-                _asset._animationPlayer.UpdateAllNodeTransforms(_workNodes);
+                _poseCache.CopyRow(poseSource, i);
+                CopyInstancePickPose(poseSource, i, hasSkin);
+                samplePose = false;
+            }
+
+            if (samplePose)
+            {
+                RestoreNodesToRestPose();
+
+                if (hasAnimation)
+                    _asset._animationPlayer.Evaluate(clip, sampleTime, _workNodes);
+                else
+                    _asset._animationPlayer.UpdateAllNodeTransforms(_workNodes);
             }
 
             if (hasSkin)
             {
-                _asset._animationPlayer.UpdateBoneMatrices(_skins);
-                UploadInstanceBoneMatrices(writeIndex, _asset._animationPlayer.GetBoneMatricesArray());
+                if (samplePose)
+                {
+                    _asset._animationPlayer.UpdateBoneMatrices(_skins);
+                    var palette = _asset._animationPlayer.GetBoneMatricesArray();
+                    Array.Copy(palette, _poseCache.Bones[i], Math.Min(palette.Length, _poseCache.Bones[i].Length));
+                }
+
+                // P1: a throttled frame re-uploads the palette it sampled last, which is the pose its instance is drawn with.
+                UploadInstanceBoneMatrices(writeIndex, _poseCache.Bones[i]);
             }
 
-            if (hasAnimation || hasSkin)
+            if (samplePose && (hasAnimation || hasSkin))
             {
-                // v2 picking: write a per-instance shadow copy
-                // (node worlds + bone palette). Instance playback time and bones
-                // are backend-private, so shared-layer picking cannot replay
-                // them. This backend writes the shadow each frame for
-                // InstancedModel.TryPickInstanceSurface to read. It matches the
-                // render source of truth: node world corresponds to the OwnerNode
-                // part of finalWorld below.
-                EnsureInstancePickShadow(model.Instances.Count);
+                // v2 picking: write a per-instance shadow copy (node worlds + bone palette) on every sampled frame, and
+                // leave it in place on a throttled one -- the previous snapshot then describes the pose still being
+                // rendered, so picking agrees with what the camera sees. Instance playback time and bones are
+                // backend-private, so shared-layer picking cannot replay them. The shadow matches the render source of
+                // truth: node world corresponds to the OwnerNode part of finalWorld below.
                 var pickNodeWorlds = _asset.InstancePickNodeWorlds[i];
                 for (int n = 0; n < _asset.gltfNodes.Count; n++)
                     pickNodeWorlds[n] = _asset.gltfNodes[n].WorldTransform;
 
                 if (hasSkin)
-                    _asset._animationPlayer.GetBoneMatricesArray().CopyTo(_asset.InstancePickBones[i], 0);
+                {
+                    var pickBones = _asset.InstancePickBones[i];
+                    Array.Copy(_poseCache.Bones[i], pickBones, Math.Min(_poseCache.Bones[i].Length, pickBones.Length));
+                }
             }
 
-            foreach (var primitive in _primitives)
+            for (int p = 0; p < _primitives.Count; p++)
             {
+                var primitive = _primitives[p];
                 var stream = GetPrimitiveInstanceStream(primitive);
                 if (stream == null)
                     continue;
 
-                var finalWorld = (primitive.OwnerNode?.WorldTransform ?? Matrix4x4.Identity) * instanceWorld;
+                // P1: on a sampled frame the pose comes from the freshly evaluated tree and is parked in the cache; on a
+                // throttled frame it comes back out of the cache. Either way the instance transform is applied this frame,
+                // so movement is never throttled.
+                var nodeWorld = samplePose
+                    ? (primitive.OwnerNode?.WorldTransform ?? Matrix4x4.Identity)
+                    : _poseCache.NodeWorlds[i][p];
+                if (samplePose)
+                    _poseCache.NodeWorlds[i][p] = nodeWorld;
+
+                var finalWorld = nodeWorld * instanceWorld;
                 var instanceData = InstanceTransformData.FromWorld(finalWorld);
                 if (primitive.MaterialParams.HasMorphTargets != 0)
                 {
-                    instanceData.MorphWeights = ExtractMorphWeights(primitive.OwnerNode);
-                    // 2-3 Step C (tier C-b): update the CPU shadow immediately after extraction, so it can be published as
-                    // this frame's history below. The destination is the compacted instance slot (the same slot the VS reads as
-                    // instanceSlot), never the primitive's stream index: a model with several morphing primitives would otherwise
-                    // scatter each instance's weights into a different slot, and the history stream would hold one primitive's
-                    // last instance in place of every instance's own weights.
+                    // 2-3 Step C (tier C-b): the destination is the compacted instance slot (the same slot the VS reads as
+                    // instanceSlot), never the primitive's stream index: a model with several morphing primitives would
+                    // otherwise scatter each instance's weights into a different slot, and the history stream would hold one
+                    // primitive's last instance in place of every instance's own weights.
+                    instanceData.MorphWeights = samplePose
+                        ? ExtractMorphWeights(primitive.OwnerNode)
+                        : _poseCache.MorphWeights[i][p];
+                    if (samplePose)
+                        _poseCache.MorphWeights[i][p] = instanceData.MorphWeights;
                     if ((uint)writeIndex < (uint)_currentMorphShadow.Length)
                         _currentMorphShadow[writeIndex] = instanceData.MorphWeights;
                 }
@@ -859,6 +984,12 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
 
             writeIndex++;
         }
+
+        // P1: publish the pose generation the shadow-atlas reuse digest keys on. It advances only on frames where at least
+        // one instance's pose was actually replayed -- exactly when the rendered pose set can differ -- so throttled and held
+        // frames keep the cached atlas and any real motion invalidates it. A static host never advances it.
+        if (hasAnimation && anySampled)
+            model.AnimationPoseGeneration++;
 
         int slotIndex = FrameSlot;
         Matrix4x4[]? frameWorlds = null;
@@ -876,6 +1007,9 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
 
         if (frameWorlds != null)
             UploadInstanceWorldsForFrame(frameWorlds, _instanceCount);
+
+        // P2: instances that just came back into view get one frame of zero velocity; see WriteHistoryResets.
+        WriteHistoryResets(frameWorlds);
 
         // A7: the box must be in the root instance's model space and cover every clip pose, because the kernel culls the whole
         // instance with it once and every primitive stream only replays that decision.

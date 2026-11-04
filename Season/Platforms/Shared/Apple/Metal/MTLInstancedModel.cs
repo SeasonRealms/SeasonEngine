@@ -32,6 +32,16 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
     InstanceAnimationState[] _animationStates = Array.Empty<InstanceAnimationState>();
     PrimitiveInstanceStream[] _primitiveInstanceStreams = Array.Empty<PrimitiveInstanceStream>();
 
+    // P1: last sampled pose per instance (owner-node worlds / morph weights / bone palette). A throttled frame never
+    // evaluates an instance's clip, and the shared node tree cannot hold every instance's pose at once, so the streams of
+    // a skipped instance are rebuilt from here instead. Rows are keyed by the Instances index, see the cache's contract.
+    readonly InstancePoseCache _poseCache = new();
+
+    // P2: compacted slots that just re-entered the main camera's frustum. Their previous-frame instance record is republished
+    // from this frame's data after the upload, so the motion-vector pass reads zero velocity across the frames the instance spent
+    // culled instead of one frame of the distance it travelled. Rebuilt every Update.
+    readonly List<int> _historyResetSlots = new();
+
     struct InstanceAnimationState
     {
         public bool Initialized;
@@ -540,10 +550,46 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
         return _asset.GetAnimationNames();
     }
 
+    /// <summary>
+    /// P2: republishes this frame's record for every slot that just came back into view into the previous-frame half of the
+    /// double buffer, so the motion vector computed against it is zero for exactly this frame.
+    ///
+    /// The record is copied whole (world and morph weights): this backend's shader reads both from the same 80-byte record and
+    /// gates them together on r3.w, so patching one without the other would make the pair disagree. Nothing is written while the
+    /// two halves are the same buffer, which only happens before the first swap -- and then there is no history to reset anyway.
+    /// </summary>
+    void WriteHistoryResets()
+    {
+        if (_historyResetSlots.Count == 0)
+            return;
+
+        foreach (var stream in _primitiveInstanceStreams)
+        {
+            if (stream == null)
+                continue;
+
+            var prev = stream.PrevBuffer;
+            if (prev == null || ReferenceEquals(prev, stream.Buffer))
+                continue;
+
+            for (int k = 0; k < _historyResetSlots.Count; k++)
+            {
+                int slot = _historyResetSlots[k];
+                if ((uint)slot >= (uint)_instanceCount)
+                    continue;
+
+                Device.ResourceManager.UpdateBuffer(prev,
+                    new ReadOnlySpan<InstanceTransformData>(stream.Data, slot, 1),
+                    (nuint)(slot * Unsafe.SizeOf<InstanceTransformData>()));
+            }
+        }
+    }
+
     public void Update(InstancedModel model, float time)
     {
         bool wasInitialized = _transformInitialized;
         _instanceCount = 0;
+        _historyResetSlots.Clear();
 
         // Unified highlighting:
         // clear this frame's per-instance Bounds and Wireframe draw lists.
@@ -583,6 +629,10 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
         bool hasAnimation = _asset._animations.Count > 0;
         bool hasSkin = _skins.Count > 0;
         float deltaTime = Math.Max(time, 0f);
+        bool anySampled = false;
+
+        // P1: one pose row per instance, sized by the primitive layout and the palette stride. Cheap after the first frame.
+        _poseCache.Ensure(model.Instances.Count, _primitives.Count, hasSkin ? _bonePaletteStride : 0);
 
         int writeIndex = 0;
         for (int i = 0; i < model.Instances.Count; i++)
@@ -593,54 +643,104 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
 
             // Unified positioning contract:
             // converge on BuildInstanceMatrix using the anchor pivot described by InstancedMesh3DBase.
-            var instanceWorld = model.BuildInstanceMatrix(instance);
+            var instanceWorld = model.InstanceWorld(i);
             _instanceData[writeIndex] = InstanceTransformData.FromWorld(instanceWorld);
-            RestoreNodesToRestPose();
 
+            // P2: the CPU cull decision is made once per instance in the control's Update; this is where it reaches the replay.
+            bool instanceCulled = model.IsInstanceAnimationCulled(i);
+            if (model.ShouldResetInstanceHistory(i))
+                _historyResetSlots.Add(writeIndex);
+
+            int clip = 0;
+            float playbackTime = 0f;
             if (hasAnimation)
             {
-                int clip = instance.AnimationClip;
+                clip = instance.AnimationClip;
                 if (clip < 0 || clip >= _asset._animations.Count)
                     clip = 0;
 
                 ref var state = ref _animationStates[i];
-                float nextPlaybackTime;
                 if (!state.Initialized || state.AnimationClip != clip)
                 {
-                    nextPlaybackTime = instance.AnimationTimeOffset + deltaTime * instance.AnimationSpeed;
+                    playbackTime = instance.AnimationTimeOffset + deltaTime * instance.AnimationSpeed;
                     state.Initialized = true;
                     state.AnimationClip = clip;
                 }
                 else
                 {
-                    nextPlaybackTime = state.PlaybackTime + deltaTime * instance.AnimationSpeed;
+                    playbackTime = state.PlaybackTime + deltaTime * instance.AnimationSpeed;
                 }
 
-                state.PlaybackTime = nextPlaybackTime;
-                _asset._animationPlayer.Evaluate(clip, nextPlaybackTime, _workNodes);
+                // P1: the clock advances every frame regardless of the tier, so a throttled instance is always sampled at
+                // the true current time and only its refresh rate changes. A held instance (zero delta, zero speed) reads
+                // the same time it already cached, which is what makes the hold a pure reuse.
+                state.PlaybackTime = playbackTime;
             }
-            else
+
+            bool samplePose = !instanceCulled && model.ShouldSampleInstanceAnimation(i, instance, clip);
+            anySampled |= samplePose;
+
+            // P3a: a sampled instance at tier 2 or slower may share another instance's sample for the same (clip, quantized
+            // time) pair. Replay the clip only on a miss; on a hit the cached rows are copied and the streams below are built
+            // from them exactly as on a throttled frame, so the instance transform still applies this frame.
+            float sampleTime = playbackTime;
+            int poseSource = -1;
+            if (samplePose && model.TryReuseInstancePose(i, clip, playbackTime, out poseSource, out sampleTime))
             {
-                _asset._animationPlayer.UpdateAllNodeTransforms(_workNodes);
+                _poseCache.CopyRow(poseSource, i);
+                samplePose = false;
+            }
+
+            if (samplePose)
+            {
+                RestoreNodesToRestPose();
+
+                if (hasAnimation)
+                    _asset._animationPlayer.Evaluate(clip, sampleTime, _workNodes);
+                else
+                    _asset._animationPlayer.UpdateAllNodeTransforms(_workNodes);
             }
 
             if (hasSkin)
             {
-                _asset._animationPlayer.UpdateBoneMatrices(_skins);
-                UploadInstanceBoneMatrices(writeIndex, _asset._animationPlayer.GetBoneMatricesArray());
+                if (samplePose)
+                {
+                    _asset._animationPlayer.UpdateBoneMatrices(_skins);
+                    var palette = _asset._animationPlayer.GetBoneMatricesArray();
+                    Array.Copy(palette, _poseCache.Bones[i], Math.Min(palette.Length, _poseCache.Bones[i].Length));
+                }
+
+                // P1: a throttled frame re-uploads the palette it sampled last, which is the pose its instance is drawn with.
+                UploadInstanceBoneMatrices(writeIndex, _poseCache.Bones[i]);
             }
 
-            foreach (var primitive in _primitives)
+            for (int p = 0; p < _primitives.Count; p++)
             {
+                var primitive = _primitives[p];
                 var stream = GetPrimitiveInstanceStream(primitive);
                 if (stream == null)
                     continue;
 
-                var finalWorld = (primitive.OwnerNode?.WorldTransform ?? Matrix4x4.Identity) * instanceWorld;
+                // P1: on a sampled frame the pose comes from the freshly evaluated tree and is parked in the cache; on a
+                // throttled frame it comes back out of the cache. Either way the instance transform is applied this frame,
+                // so movement is never throttled.
+                var nodeWorld = samplePose
+                    ? (primitive.OwnerNode?.WorldTransform ?? Matrix4x4.Identity)
+                    : _poseCache.NodeWorlds[i][p];
+                if (samplePose)
+                    _poseCache.NodeWorlds[i][p] = nodeWorld;
+
+                var finalWorld = nodeWorld * instanceWorld;
                 stream.Worlds[writeIndex] = finalWorld;
                 var instanceData = InstanceTransformData.FromWorld(finalWorld);
                 if (primitive.MaterialParams.HasMorphTargets != 0)
-                    instanceData.MorphWeights = ExtractMorphWeights(primitive.OwnerNode);
+                {
+                    instanceData.MorphWeights = samplePose
+                        ? ExtractMorphWeights(primitive.OwnerNode)
+                        : _poseCache.MorphWeights[i][p];
+                    if (samplePose)
+                        _poseCache.MorphWeights[i][p] = instanceData.MorphWeights;
+                }
                 stream.Data[writeIndex] = instanceData;
             }
 
@@ -705,6 +805,12 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
             writeIndex++;
         }
 
+        // P1: publish the pose generation the shadow-atlas reuse digest keys on. It advances only on frames where at least
+        // one instance's pose was actually replayed -- exactly when the rendered pose set can differ -- so throttled and held
+        // frames keep the cached atlas and any real motion invalidates it. A static host never advances it.
+        if (hasAnimation && anySampled)
+            model.AnimationPoseGeneration++;
+
         // Outline2D activation is the union of host-wide activation and any per-instance activation.
         // Host-wide activation uses the full mask and ignores the per-instance list.
         // For color and width, per-instance activation takes priority and uses the instance values,
@@ -722,6 +828,10 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
             // this frame's previous-instance stream.
             stream?.Upload(_instanceCount);
         }
+
+        // P2: instances that just came back into view get one frame of zero velocity. This has to run after Upload, because the
+        // prev side is the other half of the same double buffer and must not be written before the current side is.
+        WriteHistoryResets();
 
         // A7: the box must be in the root instance's model space and cover every clip pose, because the kernel culls the whole
         // instance with it once and every primitive stream only replays that decision. The cull-side uploads themselves wait for

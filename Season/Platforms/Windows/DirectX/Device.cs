@@ -128,6 +128,12 @@ internal unsafe static class Device
 
     static IDXGIFactory4* DxgiFactory;
 
+    /// <summary>
+    /// The adapter upgraded to DXGI 1.4, kept only for the memory query of contract 1-9. Null on systems whose DXGI predates
+    /// 1.4, which then reports "unknown" instead of a number.
+    /// </summary>
+    static IDXGIAdapter3* DxgiAdapter3;
+
     // Access through Display for compatibility
     internal static uint _msaaSampleCount => Display?.MsaaSampleCount ?? 4;
     internal static uint _msaaQualityLevels => Display?.MsaaQualityLevels ?? 0;
@@ -311,6 +317,13 @@ internal unsafe static class Device
         CheckResult(result);
         D3dDevice = d3dDevice;
 
+        // Contract 1-9: QueryVideoMemoryInfo lives on IDXGIAdapter3 (DXGI 1.4). Upgrading the adapter once here is what
+        // keeps the per-second memory refresh free of interface lookups; a failure only costs the HUD its GPU number.
+        var iidAdapter3 = IDXGIAdapter3.Guid;
+        IDXGIAdapter3* dxgiAdapter3 = null;
+        if (HResult.IndicatesSuccess(dxgiAdapter->QueryInterface(&iidAdapter3, (void**)&dxgiAdapter3)))
+            DxgiAdapter3 = dxgiAdapter3;
+
         ResourceManager = new ResourceManager(d3dDevice);
 
         // ID3D12InfoQueue exists only when the Debug Layer is enabled. If
@@ -430,6 +443,37 @@ internal unsafe static class Device
         }
 
         return adapter;
+    }
+
+    /// <summary>
+    /// Contract 1-9: the process's own VRAM footprint and the budget DXGI grants it, both from
+    /// <c>IDXGIAdapter3::QueryVideoMemoryInfo</c>.
+    ///
+    /// <para>The local segment group is queried rather than the sum of every segment: on a discrete GPU it is the VRAM that
+    /// holds the engine's textures and buffers, and on an integrated one it is the shared system-memory pool the driver hands
+    /// out, so one query covers both topologies without a per-architecture branch.</para>
+    ///
+    /// <para>The numbers are process-wide, not allocation-tracked: they include driver overhead and the swap chain, which is
+    /// exactly what a HUD should show. It never throws and reports false when DXGI 1.4 is missing or the query fails, so the
+    /// caller prints "--" instead of a misleading 0.</para>
+    /// </summary>
+    internal static bool TryQueryVideoMemory(out long usedBytes, out long totalBytes)
+    {
+        usedBytes = 0;
+        totalBytes = 0;
+
+        if (DxgiAdapter3 == null)
+            return false;
+
+        QueryVideoMemoryInfo info;
+
+        if (!HResult.IndicatesSuccess(DxgiAdapter3->QueryVideoMemoryInfo(0, MemorySegmentGroup.Local, &info)))
+            return false;
+
+        usedBytes = (long)info.CurrentUsage;
+        totalBytes = (long)info.Budget;
+
+        return true;
     }
 
     /// <summary>Adapters reporting at least this much dedicated video memory are

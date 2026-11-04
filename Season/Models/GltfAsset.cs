@@ -1004,6 +1004,26 @@ internal class GltfAsset
         _animationPlayer.IsAnimating = animating;
     }
 
+    /// <summary>
+    /// Stops playback and pins the pose to the clip's first sampled frame.
+    ///
+    /// <para><see cref="SetAnimating"/> alone would leave whichever pose the last frame produced on screen,
+    /// because every backend's per-frame update returns before sampling while the player is stopped. A boat
+    /// that has finished rowing has to rest with its oars shipped, not freeze mid-stroke, so the pose is
+    /// evaluated once here in the parsing domain; the backends then upload the same node state they would
+    /// have uploaded for any other frame. Sampling at time 0 clamps to the first keyframe (the viking boat's
+    /// clip starts at 1/24 s), which is the clip's authored start pose.</para>
+    ///
+    /// <para>Safe on an asset with no clips: the player resets the nodes to their rest state instead, which
+    /// is also the correct "stopped" pose for a rigid model.</para>
+    /// </summary>
+    public void StopAndRest()
+    {
+        _animationPlayer.IsAnimating = false;
+        _animationPlayer.AnimationTime = 0f;
+        _animationPlayer.Evaluate(_animationPlayer.CurrentAnimationIndex, 0f, gltfNodes);
+    }
+
     public void SetAnimationTime(float time)
     {
         _animationPlayer.AnimationTime = time;
@@ -1052,6 +1072,11 @@ internal class GltfAsset
     /// remain eligible for reuse, while a seek performed while paused still changes the pose and must be caught. Both fall out
     /// of digesting the time itself. The clip index joins it because switching clips can land on the same time value while
     /// producing an entirely different pose.
+    ///
+    /// P1: this key describes a single host, where the shared player's clock is the host's clock. The instanced batch
+    /// (<see cref="Season.Controls.InstancedModel"/>) no longer reads it: every instance replays into the same player, so after
+    /// per-instance throttling the clock belongs to whichever instance was evaluated last and no longer describes the batch.
+    /// That path publishes <see cref="Season.Controls.InstancedModel.AnimationPoseGeneration"/> instead.
     /// </summary>
     public int ShadowPoseKey
         => _animationPlayer.AnimationCount == 0

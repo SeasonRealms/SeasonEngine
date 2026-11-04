@@ -237,6 +237,17 @@ public static class InstanceCull
     public const uint SlotMatrixBytes = (uint)MaxSlots * SlotMatrixStride;
 
     /// <summary>
+    /// P2: safety band applied to the radius in <see cref="CpuVisible"/>. The GPU kernel already culls a sphere circumscribing the
+    /// world-space AABB; the CPU test is widened by this factor on top of that, so it can only ever be more permissive than the kernel.
+    ///
+    /// Direction matters: a CPU cull that skipped an instance's pose evaluation while the kernel still drew it would freeze a visible
+    /// pose in place, which is a defect; a CPU cull that keeps a pose the kernel drops only costs the evaluation it was meant to save.
+    /// The band also absorbs the frame between "this pose was skipped" and "the camera moved", where the two tests are not evaluated
+    /// against the same frustum.
+    /// </summary>
+    public const float CpuCullGuardScale = 1.25f;
+
+    /// <summary>
     /// Whether the backend capabilities are in place. Set by a successful <see cref="InstanceCullEffect"/> initialization, cleared back to false on unload or failure;
     /// each backend's group only allocates cull resources at that point, so "a backend without kernels" shows up as falling back to CPU culling rather than drawing from empty buffers.
     /// </summary>
@@ -283,6 +294,35 @@ public static class InstanceCull
     /// <summary>uint index of (slot, k-th visible instance) in the original index table.</summary>
     public static uint VisibleIndex(int slot, uint k, int capacity)
         => (uint)(slot * capacity) + k;
+
+    /// <summary>
+    /// P2: CPU mirror of the cull kernel's sphere test, for callers that decide something *before* the dispatch and have to reach the
+    /// same verdict the kernel will. <paramref name="localCenter"/> / <paramref name="localExtents"/> are the instance's model-space box
+    /// (the same pair a target hands the kernel as CullLocalCenter/CullLocalExtents), and <paramref name="instanceWorld"/> is the root
+    /// instance world the kernel reads back out of the 80-byte instance stream.
+    ///
+    /// The math is the kernel's line for line: rows 0..2 of the world matrix weight the box center, the per-axis absolute rows weighted
+    /// by the box extents give the world AABB's half-diagonal, and that length is the sphere radius. The plane test is the same six-plane
+    /// test, done through <see cref="Frustum.IntersectsSphere"/> because the frustum planes are the kernel's c3±c0 / c3±c1 / c3±c2 in
+    /// normalized form -- with one difference: the radius is widened by <see cref="CpuCullGuardScale"/>.
+    ///
+    /// The frustum must be the one built from the unjittered ViewProjection (<see cref="RenderView.Frustum"/>), the same matrix
+    /// <see cref="InstanceCullEffect"/> writes into the main-view slot. A default-constructed frustum answers true for every sphere, so
+    /// "no camera prepared yet" degrades to no culling rather than to culling everything.
+    /// </summary>
+    public static bool CpuVisible(in Vector3 localCenter, in Vector3 localExtents,
+                                  in Matrix4x4 instanceWorld, in Frustum frustum)
+    {
+        var r0 = new Vector3(instanceWorld.M11, instanceWorld.M12, instanceWorld.M13);
+        var r1 = new Vector3(instanceWorld.M21, instanceWorld.M22, instanceWorld.M23);
+        var r2 = new Vector3(instanceWorld.M31, instanceWorld.M32, instanceWorld.M33);
+        var r3 = new Vector3(instanceWorld.M41, instanceWorld.M42, instanceWorld.M43);
+
+        var ext = Vector3.Abs(localExtents);
+        var center = localCenter.X * r0 + localCenter.Y * r1 + localCenter.Z * r2 + r3;
+        var bound = Vector3.Abs(r0) * ext.X + Vector3.Abs(r1) * ext.Y + Vector3.Abs(r2) * ext.Z;
+        return frustum.IntersectsSphere(in center, bound.Length() * CpuCullGuardScale);
+    }
 
     /// <summary>
     /// Writes the four fields of one primitive descriptor. It lives in the shared layer because the offsets of these four fields are

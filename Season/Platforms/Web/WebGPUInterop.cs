@@ -485,4 +485,11 @@ internal static partial class WebGPUInterop
         string resourcesJson,
         int groupsX, int groupsY, int groupsZ,
         string? indirectBufferId, int indirectOffset);
+
+    /// <summary>Contract 1-9: bytes this module's own textures occupy, summed on the JS side over the four texture
+    /// registries (2D, cube, 3D and render targets). WebGPU publishes neither a device-wide usage counter nor a budget, so
+    /// this estimate is the only GPU figure the browser can honestly provide. Negative means the module is not up yet,
+    /// which the caller turns into "unknown" rather than zero.</summary>
+    [JSImport("globalThis.seasonWebGPU.queryGpuMemoryBytes")]
+    internal static partial double QueryGpuMemoryBytes();
 }

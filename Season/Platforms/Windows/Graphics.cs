@@ -3274,4 +3274,13 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             return scene;
         }
     }
+
+    /// <summary>
+    /// Contract 1-9: D3D12 answers GPU memory through DXGI, so this backend has the exact number the driver is accounting
+    /// against, including what it spends outside our allocations (swap chain, driver overhead).
+    /// </summary>
+    public GraphicsMemoryInfo QueryGraphicsMemory()
+        => DirectX.Device.TryQueryVideoMemory(out long used, out long total)
+            ? new GraphicsMemoryInfo(used, total)
+            : GraphicsMemoryInfo.Unknown;
 }
