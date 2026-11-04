@@ -2588,7 +2588,7 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             };
 
             var mtlInstancedModel = new MTLInstancedModel(model.ModelName);
-            mtlInstancedModel.Load(template, wrapperModel);
+            mtlInstancedModel.Load(template, wrapperModel, model.SkinningMode);
 
             // A7: replay the clips on the instance's own runtime asset before it is published through model.Asset (picking reads
             // its node tree), since sampling poses it; nothing else holds it yet. The shared template's player is never touched.
@@ -3013,6 +3013,19 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             && buffer is MTLStorageBuffer mtlBuffer && mtlBuffer.Buffer != null
             && mtlBuffer.Usage == Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs
             && mtlBuffer.SizeInBytes >= Season.Rendering.IndirectDrawIndexedArgs.SizeInBytes;
+
+    /// <summary>
+    /// P0: the instance palette can be compute-written and read by the vertex shader. Metal needs nothing recorded for it: an MTLBuffer has
+    /// no usage bits, and the driver's automatic hazard tracking orders a producer's dispatch before the draw that reads it, in the same
+    /// command buffer or across encoders. So this only performs the same admission check as the other three backends, and returning true
+    /// means "handoff satisfied" rather than "instructions recorded".
+    /// </summary>
+    public bool VertexShaderStorageReadSupported => ComputeSupported;
+
+    public bool TryPrepareVertexShaderRead(Season.Rendering.StorageBuffer buffer)
+        => Metal.Device.GraphicsEncoder == null
+            && buffer is MTLStorageBuffer mtlBuffer && mtlBuffer.Buffer != null
+            && mtlBuffer.Usage == Season.Rendering.StorageBufferUsage.ComputeAndVertexShaderRead;
 
     /// <summary>Indirect instanced quad draw pipeline. Returns null on creation failure, so the particle effect is not registered at all and the image falls back to before the change.</summary>
     public Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline()

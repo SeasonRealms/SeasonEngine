@@ -252,6 +252,9 @@ struct SceneLights {
 @group(0) @binding(4) var uMetallicRoughnessTexture: texture_2d<f32>;
 @group(0) @binding(5) var uAoTexture: texture_2d<f32>;
 @group(0) @binding(6) var uEmissiveTexture: texture_2d<f32>;
+// P2 L1: row instanceSlot of this palette doubles as that instance's pose-pool tag (see vs_main and computePrevLocalPosition),
+// so a pooled palette addresses joints from the row the tag names instead of from the hard-coded 100-matrix stride. Row count
+// is only ever capacity * stride, and instanceSlot < capacity, so the tag fetch stays in bounds whatever the pool does.
 @group(0) @binding(7) var<storage, read> uBones: array<mat4x4f>;
 @group(0) @binding(8) var<storage, read> uMorphMeta: array<u32>;
 @group(0) @binding(9) var<storage, read> uMorphValues: array<f32>;
@@ -351,7 +354,9 @@ fn getMorphWeight(weights: vec4f, index: u32) -> f32 {
 // so that branch contributes no velocity. Do not fall back to zero weights or an identity matrix,
 // because that would fabricate large false motion. With all three bits zero on the first frame, behavior matches pre-Step-C logic.
 // Position only: normal/tangent do not participate in velocity.
-fn computePrevLocalPosition(input: VertexInput, instanceIndex: u32, vertexIndex: u32) -> vec4f {
+// The second argument is the decoded instance slot (A7 originals, not the compacted instance_index): every per-instance side
+// table this function touches - bones, the previous bone palette, the previous instance stream - is laid out by that index.
+fn computePrevLocalPosition(input: VertexInput, instanceSlot: u32, vertexIndex: u32) -> vec4f {
     var localPosition = vec4f(input.position, 1.0);
     let prevFlags = u.flags.x;
     let instanced = (u.flags.w & 16) != 0;
@@ -364,7 +369,7 @@ fn computePrevLocalPosition(input: VertexInput, instanceIndex: u32, vertexIndex:
             var prevWeights = select(u.morphWeights, input.instanceMorphWeights, instanced);
             if ((prevFlags & 4) != 0) {
                 if (instanced) {
-                    prevWeights = uPrevInstanceData[instanceIndex * 5u + 4u];
+                    prevWeights = uPrevInstanceData[instanceSlot * 5u + 4u];
                 } else {
                     prevWeights = u.prevMorphWeights;
                 }
@@ -387,15 +392,47 @@ fn computePrevLocalPosition(input: VertexInput, instanceIndex: u32, vertexIndex:
         let totalWeight = input.weights.x + input.weights.y + input.weights.z + input.weights.w;
         if (totalWeight > 0.0) {
             var skinnedPosition = vec4f(0.0);
-            let boneBaseIndex: u32 = select(0u, instanceIndex * 100u, instanced);
+            // P2 L1 / P3 L2: pose-pool tag (mirrors the DX/VK/MTL VS). Every instance block ends with one row that holds nothing
+            // but the tag: the block is 100 rows wide here, the first (jointCount) of which are joints, so for a bake that fits
+            // at all (the shared latch rejects jointCount + 1 > 100) the last row is never a joint row. Bytes 48 and 52 of that
+            // row carry the current- and previous-frame block this instance draws its joints from.
+            //
+            // The tag row is not the row whose index equals the instance slot. uBones[i] resolves to row i of the flat palette,
+            // which belongs to instance i / 100 at joint i % 100 - a live joint of a neighbour. That address stayed harmless
+            // only while every one of those rows held zero in both lanes, which is why this lookup now goes through the stride
+            // product instead. 100 is spelled out because the vertex stage has always hardcoded it (see
+            // WGPUInstancedModel.MaxBonesPerInstance), and the kernel is handed the same number as its palette stride.
+            //
+            // The two lanes are M41 and M42, the last row of the matrix. An affine palette guarantees they are zero in a joint
+            // row - it holds transpose(IBM * world * inverseMesh), every factor is affine so the product's last column is
+            // (0, 0, 0, 1), and the transpose moves that column into the last row. Nothing multiplies by the tag row, so its two
+            // lanes are plain storage. WGSL indexes float32x4 by column, so that row's first two lanes are [3].x and [3].y of
+            // the same row-major upload the other three backends read.
+            //
+            // An unpooled palette decodes to 0 and keeps the historical instanceSlot * 100 address below. The decode only ever
+            // selects an address and never rewrites a matrix, so both branches are bit-exact. This function rebuilds the current
+            // sample before swapping history in, so it needs both rows.
+            var boneBaseIndex: u32 = select(0u, instanceSlot * 100u, instanced);
+            var prevBaseIndex: u32 = boneBaseIndex;
+            if (instanced) {
+                let poseTag = uBones[boneBaseIndex + 99u];
+                let pooledRow = bitcast<u32>(poseTag[3].x);      // PoseTagCurrentOffset = 48
+                let pooledPrevRow = bitcast<u32>(poseTag[3].y);  // PoseTagPreviousOffset = 52
+                if (pooledRow != 0u) {
+                    boneBaseIndex = pooledRow;
+                }
+                if (pooledPrevRow != 0u) {
+                    prevBaseIndex = pooledPrevRow;
+                }
+            }
             let usePrevBones = (prevFlags & 1) != 0;
             for (var i: i32 = 0; i < 4; i = i + 1) {
                 let weight = input.weights[i];
                 if (weight > 0.0) {
-                    let boneIndex = boneBaseIndex + u32(input.joints[i]);
-                    var boneMatrix = uBones[boneIndex];
+                    let jointIndex = u32(input.joints[i]);
+                    var boneMatrix = uBones[boneBaseIndex + jointIndex];
                     if (usePrevBones) {
-                        boneMatrix = uPrevBones[boneIndex];
+                        boneMatrix = uPrevBones[prevBaseIndex + jointIndex];
                     }
                     skinnedPosition += (localPosition * boneMatrix) * weight;
                 }
@@ -497,7 +534,17 @@ fn vs_main(input: VertexInput, @builtin(instance_index) instanceIndex: u32, @bui
             var skinnedPosition = vec4f(0.0);
             var skinnedNormal = vec3f(0.0);
             var skinnedTangent = vec3f(0.0);
-            let boneBaseIndex: u32 = select(0u, instanceSlot * 100u, (u.flags.w & 16) != 0);
+            // P2 L1 / P3 L2: pose-pool tag, the same decode as in computePrevLocalPosition. The whole block already sits under bit 5
+            // (skinned), so only the instancing bit remains to gate the fetch: a plain instanced draw binds no palette. The tag row
+            // is read once before the loop because every joint of the vertex shares it.
+            var boneBaseIndex: u32 = select(0u, instanceSlot * 100u, (u.flags.w & 16) != 0);
+            if ((u.flags.w & 16) != 0) {
+                let poseTag = uBones[boneBaseIndex + 99u];
+                let pooledRow = bitcast<u32>(poseTag[3].x);  // PoseTagCurrentOffset = 48
+                if (pooledRow != 0u) {
+                    boneBaseIndex = pooledRow;
+                }
+            }
             for (var i: i32 = 0; i < 4; i = i + 1) {
                 let weight = input.weights[i];
                 if (weight > 0.0) {

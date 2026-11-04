@@ -196,6 +196,19 @@ internal static partial class WebGPUInterop
         string skinKey,
         [JSMarshalAs<JSType.MemoryView>] Span<byte> boneBytes);
 
+    /// <summary>
+    /// P0: points a skin key at two storage buffers instead of at a CPU upload. The vertex stage of this backend reads the palette through
+    /// a bind group, not through an upload call, so swapping the source is a rebinding rather than a different draw path - and the current
+    /// and previous slots come from the ring directly, which also removes the JS-side previous-frame shadow copy.
+    /// Returns false when either id is unknown, in which case the caller keeps the CPU route.
+    /// </summary>
+    [JSImport("globalThis.seasonWebGPU.bindSkinnedBoneStorage")]
+    internal static partial bool BindSkinnedBoneStorage(string skinKey, string currentId, string previousId);
+
+    /// <summary>P0: drops the storage binding so the next upload rebuilds the CPU-side palette for this skin key.</summary>
+    [JSImport("globalThis.seasonWebGPU.unbindSkinnedBoneStorage")]
+    internal static partial void UnbindSkinnedBoneStorage(string skinKey);
+
     /// <summary>1-2 Contract 8: upload the full SceneLightParams block once per frame
     /// (expanded from 960B in 1-5 to 976B in 2-3) into the shared lighting UBO at JS binding(10),
     /// with the same semantics as SetLighting on the other three backends. JS consumes it immediately through writeBuffer.

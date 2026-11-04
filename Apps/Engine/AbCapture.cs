@@ -90,6 +90,24 @@ internal static class AbCapture
         string.Equals(Environment.GetEnvironmentVariable(ParticlesVariable), "off",
             StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// 隔离实验开关：设为 off 时关掉实例动画的采样节流（<see cref="Season.Rendering.RenderQuality.InstanceAnimationLod"/>）。
+    ///
+    /// 它解决的是"跨路径差异到底归谁"。节流按 (帧号 + 实例下标) % 周期 决定这一帧采不采样，而这个帧号从进程启动起算，
+    /// 各轮落地时刻不同，取证帧上的相位就不同：一条路径（CPU）可能正处在"保持"帧，显示的是最多三帧前的姿态，
+    /// 另一条（GPU）每帧都真实求值。两者的差值不是缺陷，是节流在正常工作的证据 —— 但它与"求值算错"在
+    /// 逐像素统计上长得一模一样，都表现为机器人身体的大片区域不同。
+    ///
+    /// 关掉之后每个实例每帧都求值，两条路径用的是同一个 playbackTime 序列，残差就只剩真正的求值差异
+    /// （以及 60Hz 重采样本身）。
+    /// </summary>
+    const string AnimationLodVariable = "SEASON_AB_LOD";
+
+    /// <summary>隔离实验是否关闭实例动画节流。</summary>
+    static readonly bool SterileAnimationLod =
+        string.Equals(Environment.GetEnvironmentVariable(AnimationLodVariable), "off",
+            StringComparison.OrdinalIgnoreCase);
+
     /// <summary>输出 PNG 的完整路径；空表示钩子关闭。</summary>
     static readonly string OutputPath = Environment.GetEnvironmentVariable(PathVariable);
 
@@ -166,6 +184,11 @@ internal static class AbCapture
     {
         if (SterileAntiAliasing)
             Season.Rendering.RenderQuality.Current.EffectiveAntiAliasing = Season.Rendering.AaMode.Off;
+
+        // Per frame like the other two: this one is a plain property read by the next Update, so setting it once would be enough,
+        // but keeping the three switches in one place is what makes the isolation experiment readable.
+        if (SterileAnimationLod)
+            Season.Rendering.RenderQuality.Current.InstanceAnimationLod = false;
 
         if (!SterileParticles) return;
         var submitters = Season.Rendering.FrameSchedule.ParticleSubmitters;
@@ -328,6 +351,16 @@ internal static class AbCapture
                 + $"mainViewDraws={InstanceCull.MainViewDraws} "
                 + $"a7=(enabled={InstanceCull.Enabled},targets={InstanceCull.Targets.Count},"
                 + $"sun={CascadedShadow.SunActive},spot={CascadedShadow.SpotActive},reuse={CascadedShadow.ReuseActive}) "
+                // P1: the same evidence for the skinning route. dispatches is what the FrameStart kernel actually served this frame, so a
+                // run that asked for SEASON_INSTANCE_SKINNING=gpu but served 0 is a fallback, not a comparison.
+                // P3 L2: pooled is how many shared (clip, tick) groups the frame actually collapsed. A frame that pools nothing is
+                // supposed to look exactly like the historical path, so without this number a matching capture proves nothing about
+                // the pool code having run.
+                + $"skinning=(enabled={Season.Rendering.InstanceSkinning.Enabled},"
+                + $"mode={(Season.Rendering.InstanceSkinning.Override?.ToString() ?? "auto")},"
+                + $"targets={Season.Rendering.InstanceSkinning.Targets.Count},"
+                + $"dispatches={Season.Rendering.InstanceSkinning.DispatchedTargets},"
+                + $"pooled={Season.Rendering.InstanceSkinning.PooledGroups}) "
                 + $"size={image.Width}x{image.Height}");
 
             // 直接退出而不是走窗口关闭：关闭路径会再跑若干帧清理，那些帧的 TAA 历史与统计会把

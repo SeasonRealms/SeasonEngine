@@ -144,6 +144,10 @@ window.seasonWebGPU = (() => {
     // Therefore a frame-serial gate ensures it rolls exactly once per frame per skinKey:
     // the first call is effective, later calls in the same frame only write current data.
     const _prevSkinnedBoneFrame = {};
+    // P0: skin keys whose palette comes from a storage ring instead of an upload. bindSkinnedBoneStorage fills this in and points both the
+    // current and previous maps straight at ring slots, which also replaces the shadow copy above: with a ring, "previous" is a different
+    // buffer rather than last frame's bytes, so there is nothing to roll forward.
+    const _skinnedBoneStorageKeys = {};
     let _frameSerial = 0;
     let _skinnedLogCount = 0;
     const _instancedDiag = {
@@ -399,6 +403,8 @@ window.seasonWebGPU = (() => {
     function uploadSkinnedBones(skinKey, boneBytes) {
         boneBytes = _interopToU8(boneBytes);
         if (!boneBytes || boneBytes.byteLength === 0) return;
+        // P0: a storage-bound skin key is produced on the GPU; overwriting it here would put a stale CPU palette behind the ring.
+        if (_skinnedBoneStorageKeys[skinKey]) return;
 
         if (boneBytes.byteLength < MIN_SKINNED_BONE_BUFFER_BYTES) {
             const paddedBytes = new Uint8Array(MIN_SKINNED_BONE_BUFFER_BYTES);
@@ -432,6 +438,30 @@ window.seasonWebGPU = (() => {
             _log(`[WebSkinningJS] uploadSkinnedBones skinKey=${skinKey} boneBytes=${boneBytes.byteLength}`);
             _skinnedLogCount++;
         }
+    }
+
+    // P0: pointer swap from "a CPU upload per frame" to "a slot of the GPU-resident palette ring". Both maps that the draw paths read are
+    // filled here, so the two routes are byte-identical from the shader's point of view and the draw code needs no branch of its own.
+    function bindSkinnedBoneStorage(skinKey, currentId, previousId) {
+        if (!_device || !skinKey) return false;
+        const current = _storageBuffers[currentId];
+        if (!current) return false;
+        const previous = _storageBuffers[previousId] || current;
+        _skinnedBoneBuffers[skinKey] = current;
+        _prevSkinnedBoneBuffers[skinKey] = previous;
+        _skinnedBoneStorageKeys[skinKey] = true;
+        // The shadow copy is dead weight for this key from now on; dropping it keeps a later unbind from reinstating a stale palette.
+        delete _prevSkinnedBoneBytes[skinKey];
+        delete _prevSkinnedBoneFrame[skinKey];
+        return true;
+    }
+
+    function unbindSkinnedBoneStorage(skinKey) {
+        if (!skinKey || !_skinnedBoneStorageKeys[skinKey]) return;
+        delete _skinnedBoneStorageKeys[skinKey];
+        // Only the references go: the buffers belong to the producer, these maps never owned them.
+        delete _skinnedBoneBuffers[skinKey];
+        delete _prevSkinnedBoneBuffers[skinKey];
     }
 
     function updateStaticMeshVertices(cacheKey, vertexBytes) {
@@ -5984,6 +6014,8 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         uploadStaticSkinnedMesh,
         uploadStaticMeshInterop,
         uploadSkinnedBones,
+        bindSkinnedBoneStorage,
+        unbindSkinnedBoneStorage,
         updateSceneLights,
         setViewConstants,
         setShadowViewport,

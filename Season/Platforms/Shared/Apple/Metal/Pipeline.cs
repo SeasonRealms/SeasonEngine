@@ -1364,6 +1364,11 @@ vertex VertexOut vertex_main(
     constant BoneMatrices& bones     [[buffer(3)]],
     constant MaterialParams& mparams [[buffer(4)]],
     const device float* morphDeltas  [[buffer(5)]],
+    // P2 L1: row instanceSlot doubles as that instance's pose-pool tag (see the decode below), so a pooled palette addresses
+    // joints from the row the tag names instead of from the stride product. Row count is only ever Capacity * Stride, and
+    // instanceSlot < Capacity, so the tag fetch stays in bounds whatever the pool does.
+    // Declared unconditionally, unlike prevBoneMatrices: the tag is not a velocity feature, it selects the address the
+    // current frame reads too.
     const device float4x4* instanceBoneMatrices [[buffer(6)]],
     constant TextDrawParams& textParams [[buffer(7)]]
 #if SHADOW_PASS
@@ -1420,6 +1425,37 @@ vertex VertexOut vertex_main(
         tangentXYZ = normalize(tangentXYZ);
     }
 
+    // P2 L1 / P3 L2: pose-pool tag (mirrors the DX and VK VS). Each instance's palette block ends with one row that holds nothing
+    // but the tag: the block is bonePaletteStride rows, the first (bonePaletteStride - 1) of which are joints. Bytes 48 and 52 of
+    // that last row carry the current- and previous-frame block this instance draws its joints from.
+    //
+    // The tag row is not the row whose index equals the instance slot. instanceBoneMatrices[i] resolves to row i of the flat
+    // palette, which belongs to instance i / bonePaletteStride at joint i % bonePaletteStride - a live joint of a neighbour. That
+    // address stayed harmless only while every one of those rows held zero in both lanes, which is why this lookup now goes
+    // through the stride product instead.
+    //
+    // The two lanes are M41 and M42, the last row of the matrix. An affine palette guarantees they are zero in a joint row - it
+    // holds transpose(IBM * world * inverseMesh), every factor is affine so the product's last column is (0, 0, 0, 1), and the
+    // transpose moves that column into the last row. Nothing multiplies by the tag row, so its two lanes are plain storage. MSL
+    // indexes float4x4 by column, so that row's first two lanes are [3].x and [3].y of the same row-major upload the other three
+    // backends read.
+    //
+    // An unpooled palette decodes to 0 and keeps the historical instanceSlot * stride address below. The decode only ever selects
+    // an address and never rewrites a matrix, so both branches are bit-exact. Gated on isSkinned as well: a plain instanced draw
+    // binds no palette, and its block would be an out-of-bounds fetch rather than a tag row.
+    uint stride = max(mparams.bonePaletteStride, 1u);
+    uint boneBase = mparams.isInstanced == 1u ? instanceSlot * stride : 0u;
+    uint prevBoneBase = boneBase;
+    if (mparams.isInstanced == 1u && mparams.isSkinned != 0u) {
+        uint tagRow = boneBase + stride - 1u;
+        uint pooledRow = as_type<uint>(instanceBoneMatrices[tagRow][3].x);      // PoseTagCurrentOffset = 48
+        uint pooledPrevRow = as_type<uint>(instanceBoneMatrices[tagRow][3].y);  // PoseTagPreviousOffset = 52
+        if (pooledRow != 0u)
+            boneBase = pooledRow;
+        if (pooledPrevRow != 0u)
+            prevBoneBase = pooledPrevRow;
+    }
+
     float totalWeight = vin.inWeights.x + vin.inWeights.y + vin.inWeights.z + vin.inWeights.w;
     if (mparams.isSkinned != 0u && totalWeight > 0.0) {
         float4 skinnedPos = float4(0.0);
@@ -1429,9 +1465,7 @@ vertex VertexOut vertex_main(
             float w = vin.inWeights[i];
             if (w > 0.0) {
                 int idx = int(vin.inJoints[i]);
-                uint boneIndex = mparams.isInstanced == 1u
-                    ? instanceSlot * max(mparams.bonePaletteStride, 1u) + uint(idx)
-                    : uint(idx);
+                uint boneIndex = mparams.isInstanced == 1u ? boneBase + uint(idx) : uint(idx);
                 float4x4 B;
                 if (mparams.isInstanced == 1u)
                     B = instanceBoneMatrices[boneIndex];
@@ -1558,9 +1592,7 @@ vertex VertexOut vertex_main(
                 float w = vin.inWeights[i];
                 if (w > 0.0) {
                     int idx = int(vin.inJoints[i]);
-                    uint boneIndex = mparams.isInstanced == 1u
-                        ? instanceSlot * max(mparams.bonePaletteStride, 1u) + uint(idx)
-                        : uint(idx);
+                    uint boneIndex = mparams.isInstanced == 1u ? prevBoneBase + uint(idx) : uint(idx);
                     float4x4 Bp;
                     if (mparams.isInstanced == 1u)
                         Bp = instanceBoneMatrices[boneIndex];

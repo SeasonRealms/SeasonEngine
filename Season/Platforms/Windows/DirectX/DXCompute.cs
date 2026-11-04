@@ -224,6 +224,14 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
 
     internal GpuDescriptorHandle UavGpuHandle;
 
+    /// <summary>P0: the structured view a compute-written, vertex-read block needs. The compute path binds the raw SRV/UAV pair below,
+    /// because a kernel addresses the block as bytes; the vertex shader declares the palette as <c>StructuredBuffer&lt;float4x4&gt;</c>,
+    /// and D3D12 types a buffer view by its element stride, so the raw view cannot be reused for it. Owned only by buffers created with
+    /// <see cref="Season.Rendering.StorageBufferUsage.ComputeAndVertexShaderRead"/>; -1 everywhere else.</summary>
+    internal int VertexSrvDescriptorID = -1;
+
+    internal GpuDescriptorHandle VertexSrvGpuHandle;
+
     internal ResourceStates CurrentState = ResourceStates.Common;
 
     /// <summary>
@@ -322,6 +330,11 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
 
         CreateSrv(numElements);
 
+        // P0: only the palette usage also gets a structured view (see VertexSrvDescriptorID). Every other usage stops at the raw pair,
+        // because no shader indexes them as typed elements.
+        if (usage == Season.Rendering.StorageBufferUsage.ComputeAndVertexShaderRead)
+            CreateVertexSrv(Math.Max(1u, alignedSize / (uint)Season.Rendering.StorageBuffer.VertexShaderReadElementBytes));
+
         UavDescriptorID = Device.DescriptorAllocator.Allocate();
         UavGpuHandle = Device.SrvHeapManager.GetGpuHandle(UavDescriptorID);
         var uavDesc = new UnorderedAccessViewDesc
@@ -361,6 +374,33 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
             },
         };
         Device.D3dDevice->CreateShaderResourceView(Resource, &srvDesc, Device.SrvHeapManager.GetCpuHandle(SrvDescriptorID));
+    }
+
+    /// <summary>
+    /// P0: typed view over the same resource, stride <see cref="Season.Rendering.StorageBuffer.VertexShaderReadElementBytes"/>.
+    /// Format must stay UNKNOWN and the stride non-zero: that pair is exactly what makes a buffer SRV a StructuredBuffer descriptor
+    /// rather than a ByteAddressBuffer one, and mismatching it against the shader declaration is a debug-layer error rather than a
+    /// silent reinterpreting.
+    /// </summary>
+    void CreateVertexSrv(uint numElements)
+    {
+        VertexSrvDescriptorID = Device.DescriptorAllocator.Allocate();
+        VertexSrvGpuHandle = Device.SrvHeapManager.GetGpuHandle(VertexSrvDescriptorID);
+        const uint DefaultShader4ComponentMapping = 0x00001688;
+        var srvDesc = new ShaderResourceViewDesc
+        {
+            Format = Format.FormatUnknown,
+            ViewDimension = SrvDimension.Buffer,
+            Shader4ComponentMapping = DefaultShader4ComponentMapping,
+            Buffer = new BufferSrv
+            {
+                FirstElement = 0,
+                NumElements = numElements,
+                StructureByteStride = (uint)Season.Rendering.StorageBuffer.VertexShaderReadElementBytes,
+                Flags = BufferSrvFlags.None,
+            },
+        };
+        Device.D3dDevice->CreateShaderResourceView(Resource, &srvDesc, Device.SrvHeapManager.GetCpuHandle(VertexSrvDescriptorID));
     }
 
     /// <summary>
@@ -459,15 +499,15 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
 
     public override void Dispose()
     {
-        if (Resource == null && SrvDescriptorID < 0 && UavDescriptorID < 0) return;
+        if (Resource == null && SrvDescriptorID < 0 && UavDescriptorID < 0 && VertexSrvDescriptorID < 0) return;
         // A7c: the alias does not own the resource (the instance buffer releases it), so only the descriptor it allocated is ours.
         nint resource = _borrowed ? 0 : (nint)Resource;
         var uploads = (IntPtr[])_uploadHeaps.Clone();
-        int srv = SrvDescriptorID, uav = UavDescriptorID;
+        int srv = SrvDescriptorID, uav = UavDescriptorID, vertexSrv = VertexSrvDescriptorID;
         var allocator = Device.DescriptorAllocator;
         Resource = null;
-        SrvDescriptorID = UavDescriptorID = -1;
-        SrvGpuHandle = UavGpuHandle = default;
+        SrvDescriptorID = UavDescriptorID = VertexSrvDescriptorID = -1;
+        SrvGpuHandle = UavGpuHandle = VertexSrvGpuHandle = default;
         Array.Clear(_uploadHeaps);
         Array.Clear(_uploadHeapCapacities);
         // The resource and the descriptors retire together, to prevent a later allocation from overwriting the SRV/UAV bound by an in-flight frame.
@@ -478,6 +518,7 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
                 if (upload != IntPtr.Zero) ((ID3D12Resource*)upload)->Release();
             if (srv >= 0) allocator.Free(srv);
             if (uav >= 0) allocator.Free(uav);
+            if (vertexSrv >= 0) allocator.Free(vertexSrv);
         });
     }
 }

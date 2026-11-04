@@ -17,10 +17,14 @@ internal class House : Panel
     {
         model = new Season.Controls.Model()
         {
-            Name = @"Assets/halloween_haunted_house.glb",
-            Highlight = 
-            { 
-                Style = HighlightStyle.Wireframe
+            Name = @"Assets/halloween_haunted_house_merged.glb",
+            // Bounds, not Wireframe: the wireframe shell is built per primitive, and the original
+            // export had 14 of them. The merged asset is a single primitive, so both styles are now
+            // cheap; Bounds stays because a 25 m box reads more clearly around a whole house than one
+            // outline around every roof, plank and pumpkin.
+            Highlight =
+            {
+                Style = HighlightStyle.Bounds
             },
             PosX = 40,
             PosY = 4,

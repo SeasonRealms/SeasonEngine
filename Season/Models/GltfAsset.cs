@@ -41,6 +41,14 @@ internal class GltfAsset
     // to avoid per-frame new List allocations and Contains scans.
     private List<GLTFSkin> _allSkinsCache;
 
+    /// <summary>
+    /// P1: the load-time clip bake, or null when this asset stays on the CPU route. Four conditions decide it, all of them
+    /// properties of the model rather than of the device: the backend cannot bind a storage buffer into the vertex stage, the model
+    /// has no clips or no skin, some animated node is not a joint, or the tables would exceed the size ceiling. See
+    /// <see cref="InstanceSkinBake"/> for the full rule set. Built once by the platform's LoadInstancedModel.
+    /// </summary>
+    internal InstanceSkinBake SkinBake;
+
     internal List<GLTFSkin> GetAllSkins()
     {
         if (_allSkinsCache != null)

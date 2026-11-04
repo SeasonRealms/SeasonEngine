@@ -127,6 +127,12 @@ internal class Direction : Panel
 
         var model = app.player.model;
 
+        // Key identity, taken before Character mode rewrites dx/dz into camera-relative displacement. The basket
+        // steers in the balloon's own frame, where all that matters is which key went down, not where the camera
+        // happened to be pointing when it did.
+        float keyX = MathF.Sign(dx);
+        float keyZ = MathF.Sign(dz);
+
         if (app.Movement == Movement.Character)
         {
             var dir = app.CameraTarget - app.CameraPos;
@@ -165,6 +171,32 @@ internal class Direction : Panel
         // the real displacement and a fast player stops at the same contact faces.
         dx *= app.playerSpeed;
         dz *= app.playerSpeed;
+
+        // In the basket the same keys drive the balloon, mapped onto the crew's own frame rather than onto the
+        // camera: up runs toward the face the crew turns, down toward its back, and left/right across the basket.
+        // Dragging the view around therefore turns only the body standing in the basket while the balloon keeps its
+        // course. The step keeps the length the camera-relative mapping gave it, so a diagonal still covers the
+        // same ground and the speed setting still scales it. Every refused step is the tower test in Steer.
+        var balloon = app.hotAirBalloon;
+        if (balloon != null && balloon.Aboard)
+        {
+            float fx = -MathF.Sin(balloon.SteerHeading);
+            float fz = -MathF.Cos(balloon.SteerHeading);
+
+            // Right is forward turned -90 degrees around +Y in the left-handed system, (x,z)->(z,-x), the same
+            // rule the camera-relative branch above applies to its own forward vector.
+            float mx = fx * keyZ + fz * keyX;
+            float mz = fz * keyZ - fx * keyX;
+            float len = MathF.Sqrt(mx * mx + mz * mz);
+            if (len < 1e-4f)
+                return;
+
+            float step = MathF.Sqrt(dx * dx + dz * dz);
+            var beforeSteer = balloon.SeatPosition;
+            balloon.Steer(mx / len * step, mz / len * step);
+            app.FollowCamera(balloon.SeatPosition - beforeSteer);
+            return;
+        }
 
         // At the oars the same input drives the boat instead of the character: Boat.Steer turns the bow into the
         // requested direction and keeps the hull inside the waterway, so the pond, the river and the sea are the only

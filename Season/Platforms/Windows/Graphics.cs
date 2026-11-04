@@ -616,6 +616,26 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         return true;
     }
 
+    /// <summary>
+    /// P0: the instance palette can be compute-written and read by the vertex shader. D3D12 needs no creation flag for it - the resource
+    /// already exists in a default heap with AllowUnorderedAccess - but the read state does have to be recorded: NON_PIXEL_SHADER_RESOURCE
+    /// is the state a structured SRV may be read in from any non-pixel stage, and the compute writer left the resource in UnorderedAccess.
+    /// Like <see cref="TryPrepareIndirectArgs"/>, the barrier cannot be recorded inside a pass.
+    /// </summary>
+    public bool VertexShaderStorageReadSupported => ComputeSupported;
+
+    public bool TryPrepareVertexShaderRead(Season.Rendering.StorageBuffer buffer)
+    {
+        var cmd = DirectX.Device.GraphicsCommandList;
+        if (cmd == null || DirectX.Device.ActiveTarget != null
+            || buffer is not DXStorageBuffer dxBuffer || dxBuffer.Resource == null
+            || dxBuffer.Usage != Season.Rendering.StorageBufferUsage.ComputeAndVertexShaderRead
+            || dxBuffer.VertexSrvDescriptorID < 0)
+            return false;
+        dxBuffer.TransitionTo(cmd, ResourceStates.NonPixelShaderResource);
+        return true;
+    }
+
     /// <summary>Indirect instanced quad draw pipeline. Returns null on creation failure, which makes the particle effect skip registration entirely and the image fall back to its pre-change state.</summary>
     public Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline()
     {
@@ -2756,7 +2776,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             };
 
             var dxInstancedModel = new DXInstancedModel(model.ModelName);
-            dxInstancedModel.Load(template, wrapperModel);
+            dxInstancedModel.Load(template, wrapperModel, model.SkinningMode);
 
             // A7: replay the clips on the instance's own runtime asset before it is published through model.Asset (picking reads
             // its node tree), since sampling poses it; nothing else holds it yet. The shared template's player is never touched.

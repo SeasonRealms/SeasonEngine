@@ -166,6 +166,9 @@ internal class App : BaseApp
     // 见 LittleHouse.cs。
     internal LittleHouse littleHouse;
 
+    // Hot air balloon moored just off the tower deck on the house side, 8 player heights tall. See HotAirBalloon.cs.
+    internal HotAirBalloon hotAirBalloon;
+
     Ball ball;
 
     Sphere sphere;
@@ -205,6 +208,10 @@ internal class App : BaseApp
     internal Robots robots;
 
     internal Birds birds;
+
+    // 飞机群：十架按 1/2/3/4 四列排成楔形，在岛外的海面上方、与高塔平台同高绕岛作圆周飞行，
+    // 每架的螺旋桨循环自转。见 Planes.cs。
+    internal Planes planes;
 
     CubeField cubeField;
 
@@ -390,12 +397,101 @@ internal class App : BaseApp
     {
         if (Movement == Movement.World)
         {
-            BindCamera();
+            // The basket camera is re-pinned to the eyes later in the frame (UpdateBalloonCamera), so the World-mode
+            // reset here would only throw away the view the player just dragged: the ride keeps its look instead.
+            if (hotAirBalloon == null || !hotAirBalloon.Aboard)
+                BindCamera();
             return;
         }
 
         CameraPos += delta;
         CameraTarget += delta;
+    }
+
+    // -- First-person basket camera. While the player stands in the balloon's basket the camera leaves the
+    //    over-the-shoulder rig and settles into the eyes, and dragging the view then turns the body inside the
+    //    basket instead of the balloon (Direction steers the balloon in the crew's own frame, which never turns).
+    //    The blend is published through BalloonEyeBlend so Player can keep the body out of the camera's way
+    //    exactly while the camera is close to its head. --
+    const float BalloonEyeSeconds = 0.35f;   // full shoulder-to-eye crossing, both ways
+    const float BalloonEyeHeight = 0.9f;     // eye height as a fraction of the body, measured up from the feet
+    const float BalloonEyeForward = 0.3f;    // eye nudge along the view, so the rim stops cutting off the ground below
+    const float ShoulderBack = 6f;           // over-the-shoulder distance behind the view's horizontal heading
+    const float ShoulderLift = 3.5f;         // rig height over the player anchor: BindCamera's 3 m target lift + 0.5 m
+
+    float balloonEye;                        // 0 = over-the-shoulder rig, 1 = inside the eyes
+    Vector3 balloonEyeFrom;                  // camera spot the entry blend starts from
+
+    /// <summary>
+    /// How far the basket camera has moved off the shoulder rig (0) and into the eyes (1). Player reads it to hide
+    /// the body once the camera is over halfway in, and to bring it back only once the camera is over halfway out.
+    /// </summary>
+    internal float BalloonEyeBlend => balloonEye;
+
+    /// <summary>
+    /// Drives the basket camera. Called after the balloon has been updated, because the eyes are the seat the player
+    /// was bound to earlier in the frame and the balloon is the one the frame will draw. The look vector is carried
+    /// through the transition unchanged: only the camera body moves, so the player arrives at the eyes still looking
+    /// where the shoulder rig was looking.
+    /// </summary>
+    void UpdateBalloonCamera(float time)
+    {
+        var balloon = hotAirBalloon;
+        float target = balloon != null && balloon.Aboard ? 1f : 0f;
+
+        bool entering = target > balloonEye;
+        if (entering && balloonEye <= 0f)
+            balloonEyeFrom = CameraPos;
+
+        float step = time / BalloonEyeSeconds;
+        balloonEye = MathF.Abs(target - balloonEye) <= step
+            ? target
+            : balloonEye + MathF.Sign(target - balloonEye) * step;
+
+        var model = player?.model;
+        if (model == null || balloonEye <= 0f)
+            return;
+
+        var view = CameraTarget - CameraPos;
+        if (view.LengthSquared() < 1e-8f)
+            view = Vector3.UnitZ;
+
+        // Horizontal view: the eye nudge below rides along it, and the exit rig backs off along it.
+        var horiz = new Vector2(view.X, view.Z);
+        horiz = horiz.LengthSquared() > 1e-8f ? Vector2.Normalize(horiz) : new Vector2(0f, -1f);
+
+        // The anchor is the body's bounding-box center, so the feet are half a height below PosY and the eyes sit
+        // nine tenths of a (half-size) body above them: just past the basket rim, at the waving crew's eye level.
+        float height = model.Height ?? 0f;
+        var eye = new Vector3(model.PosX, model.PosY - height * 0.5f + height * BalloonEyeHeight, model.PosZ);
+
+        // The rim in front of the eye cuts a wide wedge out of the lower view and hides the ground below the basket;
+        // nudging the eye toward that rim shrinks the wedge. The balloon holds the nudge inside its own wicker, so
+        // the camera never leaves the basket.
+        if (balloon != null)
+            eye = balloon.NudgedEye(eye, horiz, BalloonEyeForward);
+
+        Vector3 from;
+        if (entering)
+        {
+            // Entry leaves from the spot the over-the-shoulder camera was actually holding, whatever distance the
+            // player had dragged it out to, so the first blended frame never snaps.
+            from = balloonEyeFrom;
+        }
+        else
+        {
+            // Exit rebuilds the shoulder rig from the current view every frame instead of remembering one spot, so
+            // the camera lands behind a player who has already started walking or jumping away.
+            from = new Vector3(
+                model.PosX - horiz.X * ShoulderBack,
+                model.PosY + ShoulderLift,
+                model.PosZ - horiz.Y * ShoulderBack);
+        }
+
+        // Smoothstep, so the camera eases out of the rig and into the eyes instead of starting at full speed.
+        float t = balloonEye * balloonEye * (3f - 2f * balloonEye);
+        CameraPos = Vector3.Lerp(from, eye, t);
+        CameraTarget = CameraPos + view;
     }
 
     /// <summary>
@@ -429,6 +525,13 @@ internal class App : BaseApp
                 Season.Basic.Graphics.Instance, new Season.Rendering.InstanceCullEffect()))
         {
         }
+
+        // P1：逐实例 GPU 骨骼求值。Phase=FrameStart 且 Scope=App：调色板必须在场景 Pass 之前写完，而 Vulkan 在 Pass 内
+        // 禁止 dispatch、Metal 的 compute 与 render encoder 互斥，所以只能落在 Record 里；整帧只有一份调色板，不该随视图重复。
+        // 注册失败（后端无 kernel 源、或不能把 storage buffer 绑进顶点阶段）时 InstanceSkinning.Enabled 保持 false，
+        // 各端 InstancedModel 于是整模型退回 CPU 重放，不会去画一份没人写的调色板。
+        Season.Rendering.FrameSchedule.RegisterCompute(
+            Season.Basic.Graphics.Instance, new Season.Rendering.InstanceSkinningEffect());
 
         // 1-6 compute-baseline validation: register the built-in PlasmaEffect.
         // It dispatches every frame in the FrameStart phase and writes a 256x256 storage texture.
@@ -745,6 +848,9 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         littleHouse = new LittleHouse();
         AddPanel(littleHouse);
 
+        hotAirBalloon = new HotAirBalloon();
+        AddPanel(hotAirBalloon);
+
         sphere = new Sphere();
         AddPanel(sphere);
 
@@ -840,6 +946,9 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         birds = new Birds();
         AddPanel(birds);
 
+        planes = new Planes();
+        AddPanel(planes);
+
         // P3 acceptance: the island scene's two extra cameras. Created here because platform initialization has already
         // registered the main view's offscreen attachments, so the mirror can copy its SceneColor format and MRT shape.
         // Its slots therefore exist before the first frame and the sensor textures do not appear a frame late.
@@ -924,6 +1033,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         picker.Targets.Add(streetLight.lightsPunctualLamp);
         picker.Targets.Add(house.model);
         picker.Targets.Add(littleHouse.model);
+        picker.Targets.Add(hotAirBalloon.model);
         if (campfire != null)
         {
             picker.Targets.Add(campfire.logs);
@@ -962,6 +1072,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             picker.InstancedTargets.Add(robots.robotField);
         }
         picker.InstancedTargets.Add(birds.seagullsModel);
+        picker.InstancedTargets.Add(planes.planesModel);
         // 船也是普通可选实体：点击选中后可在属性面板里查看它，与房子/瀑布同一条路径。
         picker.Targets.Add(boat.Hull);
         AddPanel(picker);
@@ -1361,7 +1472,10 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // each frame the character aligns with the camera's horizontal facing,
         // so dragging the camera also turns the character and forward motion always matches the view projected onto the ground.
         // Per-frame synchronization makes mode switches and long-jump landings converge naturally.
-        if (Movement == Movement.Character && Mode is Mode.Play or Mode.Debug)
+        // In the balloon's basket the sync runs regardless of movement mode: the seat there hands over only a position,
+        // so the per-frame camera facing is the one and only thing that turns the body inside the basket.
+        if ((Movement == Movement.Character && Mode is Mode.Play or Mode.Debug)
+            || (hotAirBalloon != null && hotAirBalloon.Aboard))
         {
             SyncPlayerYawToCamera();
         }
@@ -1424,11 +1538,19 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
 
         littleHouse?.Update(time);
 
+        hotAirBalloon?.Update(time);
+
+        // The basket camera re-pins after the balloon has moved this frame: Player.Update above has already bound the
+        // body to the seat, so the eyes are at this frame's spot and the first-person view does not lag the ride.
+        UpdateBalloonCamera(time);
+
         ball?.Update(time);
 
         robots?.Update(time);
 
         birds?.Update(time);
+
+        planes?.Update(time);
 
         //cubeField?.Update(time);
         //billboard?.Update(time);

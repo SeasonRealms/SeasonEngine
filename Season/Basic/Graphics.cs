@@ -292,6 +292,24 @@ public interface IGraphics
     /// returns false when a non-ComputeAndIndirectArgs buffer is passed or the backend is not integrated, and the caller abandons the frame's indirect submission accordingly.</summary>
     bool TryPrepareIndirectArgs(Season.Rendering.StorageBuffer buffer) => false;
 
+    // Contract P0 instance palette: compute writes, vertex shader reads.
+    // - This is the second half of <see cref="Season.Rendering.StorageBufferUsage.ComputeAndVertexShaderRead"/>, and it is a different
+    //   handoff from <see cref="TryPrepareIndirectArgs"/>: that one ends in the DrawIndirect stage, this one ends in the vertex shader's
+    //   own read. Vulkan and D3D12 both need a barrier/transition for it, Metal and WebGPU track it themselves.
+    // - Like every other Prepare entry point it must be recorded outside a Pass. A Vulkan render-pass instance cannot contain barriers,
+    //   so the handoff has to happen before the pass that will draw the palette, not inside it.
+    // - The consumer is the palette slot the shader already declares (t6 this frame, t8 the previous one), so a producer that swaps the
+    //   CPU palette ring for a storage ring changes no shader, no root signature and no descriptor layout.
+
+    /// <summary>Whether the backend can bind a compute-written storage buffer into the vertex stage. When false, the instance palette must
+    /// stay on the CPU-written ring: a producer tests this once at allocation time and keeps its CPU path rather than degrading mid-frame.</summary>
+    bool VertexShaderStorageReadSupported => false;
+
+    /// <summary>Hands a storage buffer over from the compute write state to the vertex-shader read state and returns whether it has been recorded.
+    /// Must be called outside a Pass; returns false when the buffer did not declare <see cref="Season.Rendering.StorageBufferUsage.ComputeAndVertexShaderRead"/>
+    /// or the backend is not integrated, in which case the frame must not draw from it.</summary>
+    bool TryPrepareVertexShaderRead(Season.Rendering.StorageBuffer buffer) => false;
+
     /// <summary>Returns null when the indirect instanced quad draw capability is missing, in which case the particle effect is not registered at all; a non-null return means the ExecuteIndirect-equivalent primitive has been integrated.</summary>
     Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline() => null;
 

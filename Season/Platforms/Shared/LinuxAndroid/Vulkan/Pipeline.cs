@@ -2274,6 +2274,9 @@ layout(std140, binding = 3) uniform BoneMatrices {
     mat4 boneMatrices[100];
 };
 
+// P2 L1: row instanceSlot doubles as that instance's pose-pool tag (see the decode in main), so a pooled palette addresses
+// joints from the row the tag names instead of from the stride product. Row count is only ever Capacity * Stride, and
+// instanceSlot < Capacity, so the tag fetch stays in bounds whatever the pool does.
 layout(std430, binding = 9) readonly buffer InstanceBoneMatrices {
     mat4 instanceBoneMatrices[];
 };
@@ -2394,6 +2397,37 @@ void main() {
         normal = normalize(normal + morphNormalDelta);
     }
 
+    // P2 L1 / P3 L2: pose-pool tag. Each instance's palette block ends with one row that holds nothing but the tag: the block is
+    // bonePaletteStride rows, the first (bonePaletteStride - 1) of which are joints. Bytes 48 and 52 of that last row carry the
+    // current- and previous-frame block this instance draws its joints from.
+    //
+    // The tag row is not the row whose index equals the instance slot. instanceBoneMatrices[i] resolves to row i of the flat
+    // palette, which belongs to instance i / bonePaletteStride at joint i % bonePaletteStride - a live joint of a neighbour. That
+    // address stayed harmless only while every one of those rows held zero in both lanes, which is why this lookup now goes
+    // through the stride product instead.
+    //
+    // The two lanes are M41 and M42, the last row of the matrix. An affine palette guarantees they are zero in a joint row - it
+    // holds transpose(IBM * world * inverseMesh), every factor is affine so the product's last column is (0, 0, 0, 1), and the
+    // transpose moves that column into the last row. Nothing multiplies by the tag row, so its two lanes are plain storage. GLSL
+    // indexes matrices by column, so that row's first two lanes are [3].x and [3].y of the same row-major upload the other three
+    // backends read.
+    //
+    // An unpooled palette decodes to 0 and keeps the historical instanceSlot * stride address below. The decode only ever selects
+    // an address and never rewrites a matrix, so both branches are bit-exact. Gated on isSkinned as well: a plain instanced draw
+    // binds no palette, and its block would be an out-of-bounds fetch rather than a tag row.
+    int stride = int(max(bonePaletteStride, 1u));
+    int boneBase = isInstanced == 1u ? int(instanceSlot) * stride : 0;
+    int prevBoneBase = boneBase;
+    if (isInstanced == 1u && isSkinned != 0u) {
+        int tagRow = boneBase + stride - 1;
+        uint pooledRow = floatBitsToUint(instanceBoneMatrices[tagRow][3].x);      // PoseTagCurrentOffset = 48
+        uint pooledPrevRow = floatBitsToUint(instanceBoneMatrices[tagRow][3].y);  // PoseTagPreviousOffset = 52
+        if (pooledRow != 0u)
+            boneBase = int(pooledRow);
+        if (pooledPrevRow != 0u)
+            prevBoneBase = int(pooledPrevRow);
+    }
+
     float totalWeight = inWeights.x + inWeights.y + inWeights.z + inWeights.w;
     if (isSkinned != 0u && totalWeight > 0.0) {
         vec4 skinnedPos = vec4(0.0);
@@ -2402,9 +2436,7 @@ void main() {
             float w = inWeights[i];
             if (w > 0.0) {
                 int idx = int(inJoints[i]);
-                int baseIdx = isInstanced == 1u
-                    ? int(instanceSlot) * int(max(bonePaletteStride, 1u)) + idx
-                    : idx;
+                int baseIdx = isInstanced == 1u ? boneBase + idx : idx;
                 mat4 boneMatrix = instanceBoneMatrices[baseIdx];
 
                 skinnedPos    += (localPos * boneMatrix) * w;
@@ -2510,9 +2542,7 @@ void main() {
                 float w = inWeights[i];
                 if (w <= 0.0) continue;
                 int idx = int(inJoints[i]);
-                int baseIdx = isInstanced == 1u
-                    ? int(instanceSlot) * int(max(bonePaletteStride, 1u)) + idx
-                    : idx;
+                int baseIdx = isInstanced == 1u ? prevBoneBase + idx : idx;
                 mat4 bm;
                 if (hasPrevBones != 0u) {
                     bm = prevBoneMatrices[baseIdx];

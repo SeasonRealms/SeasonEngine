@@ -218,9 +218,19 @@ internal class Player : Panel
         // While the player is on the boat the deck owns the pose: the seat position, the deck height and the boat's
         // heading are copied in before the rig is placed, so the torch reads the deck on the same frame. The long jump
         // is exempt because it is steering the body itself, and the landing test decides whether the player stayed
-        // aboard or stepped off.
+        // aboard or stepped off. The balloon's basket works the same way, one branch over, except that its seat only
+        // hands over the position: the heading stays with the camera (App.SyncPlayerYawToCamera), so the body turns
+        // freely inside the basket while the balloon keeps its own course.
         var boat = App.Instance.boat;
-        if (boat != null && boat.Aboard && !jumping)
+        var balloon = App.Instance.hotAirBalloon;
+        if (balloon != null && balloon.Aboard && !jumping)
+        {
+            var seat = balloon.SeatPosition;
+            model.PosX = seat.X;
+            model.PosZ = seat.Z;
+            model.PosY = seat.Y + (model.Height ?? 0f) * 0.5f;
+        }
+        else if (boat != null && boat.Aboard && !jumping)
         {
             var seat = boat.SeatPosition;
             model.PosX = seat.X;
@@ -236,6 +246,19 @@ internal class Player : Panel
             var planted = model.GetWorldBoundsRaw();
             model.PosY = App.Instance.collider.FloorHeightUnder(planted.Center, planted.Extents) + (model.Height ?? 0f) * 0.5f;
         }
+
+        // While the eye camera is up, the rig has to step out of its own view: alpha zero skips the draw and
+        // cast-shadows off keeps the invisible body from leaving a shadow in the wicker. The torch and its flame
+        // go with it because they hang right in front of the face; only the light stays lit, since it is what
+        // warms the basket around the player. Hiding starts as the camera passes the halfway mark toward the eyes
+        // and ends once it is back past it, so the camera never travels through a body that is still drawn.
+        bool eyeView = App.Instance.BalloonEyeBlend > 0.5f;
+        float rigAlpha = eyeView ? 0f : 1f;
+        model.Alpha = rigAlpha;
+        model.CastShadows = !eyeView;
+        torch.Alpha = rigAlpha;
+        torch.CastShadows = !eyeView;
+        torchFlame.Alpha = rigAlpha;
 
         // Direction and Skill have already moved and turned the character by the time App.Update reaches this
         // panel, so the rig follows this frame's final pose rather than a frame-old one.

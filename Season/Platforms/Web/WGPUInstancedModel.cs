@@ -105,6 +105,45 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
     public bool InstanceHistoryValid { get; private set; }
     public byte[] BoneMatricesBytes { get; private set; } = Array.Empty<byte>();
 
+    /// <summary>
+    /// P1: the shared latch for this frame's palette ring, bake and per-instance parameter rows. The ring arrives from the control
+    /// (<see cref="Season.Controls.InstancedModel.BoneStorage"/>) or is allocated here for the GPU route. On this backend the swap is two
+    /// storage buffers bound as the current and previous palettes of <see cref="SkinKey"/>, which the draw paths already look up by that key,
+    /// so no draw code changes. Its stride must stay <see cref="MaxBonesPerInstance"/>: the vertex stage addresses the palette at
+    /// <c>instance * 100</c> regardless of which route produced it.
+    /// </summary>
+    readonly Season.Rendering.InstanceSkinningTarget _skinning = new();
+
+    /// <summary>Whether this frame runs the GPU route: the palette comes from the FrameStart kernel and the CPU replay below is skipped.
+    /// False is the historical route in full, which is what keeps the A/B comparison meaningful.</summary>
+    bool _gpuSkin;
+
+    /// <summary>The ring this model allocated for the GPU route when the control did not supply one. Disposed with the model; a ring supplied
+    /// by the control is used as-is and never disposed here.</summary>
+    Season.Rendering.InstanceBoneStorage? _ownedPalette;
+
+    /// <summary>The ids last handed to JS, so a frame that does not advance the ring does not re-enter interop for nothing.</summary>
+    string? _boneStorageBoundCurrent;
+    string? _boneStorageBoundPrevious;
+
+    /// <summary>Frames this model has advanced its ring by. There is no backend frame ring on Web, so the model is the clock both the
+    /// producer and the consumer read their slot from.</summary>
+    uint _boneStorageFrame;
+
+    // P3 L2: the pose pool. Lazy bake, but along the instance axis rather than time: a group of instances that P3a decided shares one
+    // (clip, quantized tick) sample is evaluated once into a palette block of its own, and every member's tag row points at that
+    // block. The pool is rebuilt every frame, so its size is bounded by this frame's instance count and never by how many clips the
+    // asset has - which is the whole difference from pre-baking poses at load.
+    //
+    // The representative is chosen by P3a (the first instance to register the key) and is not known to be one until a second
+    // instance asks for it, so the plan is recorded here and written back after the loop; a representative's parameter row is
+    // already uploaded by then and only gains its pool row.
+    readonly Dictionary<int, int> _posePoolBucketBySource = new();
+    readonly List<(int Write, uint Clip, float Time)> _posePoolRewrites = new();
+    /// <summary>Parameter rows the loop above produced, indexed by the Instances index, so a bucket found later in the same replay
+    /// can address the representative without assuming the write index equals the Instances index.</summary>
+    (int Write, uint Clip, float Time)[] _posePoolPending = Array.Empty<(int, uint, float)>();
+
     // Unified highlight: per-instance bounds boxes for the current frame (lazy-growing pool + draw list; Wireframe shell extends this in Phase 3).
     internal bool BoundsActive { get; private set; }
     internal readonly List<WebBoundsBox> InstanceBoundsBoxes = new();
@@ -212,9 +251,18 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
         _skins.Clear();
         _skins.AddRange(runtimeModel.Asset.GetAllSkins());
 
+        // P1: build the load-time bake for the GPU route, once, while the node tree is still at its rest pose. It also owns the
+        // eligibility test (every animated node being a joint among them), so an ineligible model simply gets no bake and keeps the CPU
+        // replay no matter what the property says.
+        Season.Models.InstanceSkinBake.TryBake(runtimeModel.Asset, model.SkinningMode);
+
         _runtimeModel = runtimeModel;
         SkinKey = _primitives.Any(static p => p.HasSkinning) ? $"INSTSKIN:{Name}:{model.ID}" : null;
         BoneMatricesBytes = Array.Empty<byte>();
+
+        // Registered for the whole life of the model: the effect asks every target once per frame, and a target with no bake (or a frame
+        // that fell back to the CPU) answers false in one branch.
+        Season.Rendering.InstanceSkinning.Register(_skinning);
     }
 
     public IReadOnlyList<string> GetAnimationNames()
@@ -274,8 +322,46 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
                 EnabledInstanceCount++;
         }
 
+        // P1: latch the palette source with the frame, before the early return, so a frame with nothing to draw also clears the latch
+        // instead of leaving the kernel pointed at the previous frame's parameter block. The ring only exists on the GPU route - a model on
+        // the CPU route never allocates one, which is what keeps its path byte-identical to what it was before P1. A model whose primitives
+        // carry no skinning has nothing that reads a palette, so it never takes the route even when the asset itself could be baked.
+        bool skinnable = !string.IsNullOrEmpty(SkinKey);
+        Season.Rendering.InstanceBoneStorage? paletteRing = skinnable ? model.BoneStorage : null;
+        if (skinnable && model.GpuSkinning)
+        {
+            if (paletteRing == null)
+            {
+                _ownedPalette ??= new Season.Rendering.InstanceBoneStorage();
+                paletteRing = _ownedPalette;
+            }
+        }
+        else if (_ownedPalette != null)
+        {
+            // The mode, the process-wide override, or the model itself turned the GPU route off after the ring had been allocated for it.
+            _ownedPalette.Dispose();
+            _ownedPalette = null;
+        }
+
+        // The Web palette is addressed at MaxBonesPerInstance rows per instance by the vertex stage, so that fixed stride - not the model's
+        // joint total - is what the ring is shaped with; the shared latch rejects a bake that would not fit in it.
+        //
+        // P3 L2 asks for the tag row on top of the joints, and this is the one backend where that can fail: a bake filling all
+        // MaxBonesPerInstance rows leaves no free row at the end. Rather than dropping a model that used to take the GPU route, the
+        // request degrades to zero tag rows - the kernel then writes no tag, the vertex stage reads joint MaxBonesPerInstance - 1
+        // whose two lanes an affine palette keeps at zero anyway, and the parameter write below skips pooling for the frame. The
+        // route survives; only the sharing does not.
+        var skinBake = _runtimeModel.Asset.SkinBake;
+        int tagRows = skinBake != null && skinBake.PaletteStride + Season.Rendering.InstanceSkinning.PoseTagRows <= MaxBonesPerInstance
+            ? Season.Rendering.InstanceSkinning.PoseTagRows
+            : 0;
+        _gpuSkin = _skinning.Begin(paletteRing, skinBake, MaxBonesPerInstance, _runtimeModel.Asset._animations.Count, tagRows);
+
         if (EnabledInstanceCount <= 0)
         {
+            // Nothing reads a palette this frame: drop the target so the kernel skips it, and let the next frame re-latch.
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
             foreach (var stream in _primitiveStreams.Values)
             {
                 stream.Worlds = Array.Empty<Matrix4x4>();
@@ -287,6 +373,8 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
                 stream.PrevReady = false;
             }
             BoneMatricesBytes = Array.Empty<byte>();
+            // No instance draws this frame, so nothing reads the ring either: release the binding so the next upload refills the CPU side.
+            UnbindBoneStorageFromJs();
             TransformInitialized = true;
             PrevBonesReady = false;
             InstanceHistoryValid = false;
@@ -314,10 +402,24 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
                 break;
             }
         }
-        EnsureInstanceBoneCapacity(EnabledInstanceCount);
+        // P1: shape the GPU route's palette ring before anything else, so the CPU palette block below is allocated only when it will
+        // actually be written. Web has no backend frame ring, so this model is the clock: the slot advanced here is both the one the
+        // kernel writes and the one the draw path binds, which is what keeps the two on the same buffer.
+        if (_gpuSkin && !ShapeSkinningRing(EnabledInstanceCount))
+        {
+            // The ring cannot be allocated at this shape, or the parameter block cannot be sized. The CPU route below is then the only
+            // correct answer, and it is reachable: the CPU block is allocated on the next line.
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+        }
+
+        // On the GPU route the CPU palette block is neither written nor uploaded, so it is not allocated: that layout is the per-frame
+        // upload's source, and its only remaining purpose was to be the fallback for a frame the kernel did not serve.
+        if (!_gpuSkin)
+            EnsureInstanceBoneCapacity(EnabledInstanceCount);
 
         bool hasAnimation = _runtimeModel.Asset._animations.Count > 0;
-        bool hasSkinning = !string.IsNullOrEmpty(SkinKey) && _skins.Count > 0;
+        bool hasSkinning = skinnable && _skins.Count > 0;
         float deltaTime = Math.Max(time, 0f);
         bool anySampled = false;
 
@@ -333,6 +435,18 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
         var cullRoots = MemoryMarshal.Cast<byte, float>(_cullSourceBytes.AsSpan());
 
         int writeIndex = 0;
+
+        // P3 L2: the pool lives for exactly one replay, like P3a's dedup table it is keyed against. A pool block addressed by a
+        // previous frame's tag would still hold that frame's pose, which is why a slot's tag is written for every instance every
+        // frame rather than only for the ones that end up pooled.
+        //
+        // pooling is read from the latched target, not from tagRows above: a ring that could not be shaped calls Begin(null, ...) and
+        // zeroes TagRows, and a pool decided against a tag nobody will write is a render error rather than wasted work.
+        bool pooling = _gpuSkin && _skinning.TagRows > 0;
+        _posePoolBucketBySource.Clear();
+        _posePoolRewrites.Clear();
+        if (_posePoolPending.Length < model.Instances.Count)
+            _posePoolPending = new (int Write, uint Clip, float Time)[model.Instances.Count];
         for (int i = 0; i < model.Instances.Count; i++)
         {
             var instance = model.Instances[i];
@@ -378,17 +492,21 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
             anySampled |= samplePose;
 
             // P3a: a sampled instance at tier 2 or slower may share another instance's sample for the same (clip, quantized
-            // time) pair. Replay the clip only on a miss; on a hit the cached rows are copied and the streams below are built
-            // from them exactly as on a throttled frame, so the instance transform still applies this frame.
+            // time) pair. On the CPU route a hit copies the cached rows and the streams below are built from them exactly as on a
+            // throttled frame, so the instance transform still applies this frame. On the GPU route the same hit is P3 L2's signal
+            // that this instance can point its tag at a pool block instead of evaluating again - see the parameter write below.
             float sampleTime = playbackTime;
             int poseSource = -1;
-            if (samplePose && model.TryReuseInstancePose(i, clip, playbackTime, out poseSource, out sampleTime))
+            bool poseShared = samplePose && model.TryReuseInstancePose(i, clip, playbackTime, out poseSource, out sampleTime);
+            if (poseShared && !_gpuSkin)
             {
                 _poseCache.CopyRow(poseSource, i);
                 samplePose = false;
             }
 
-            if (samplePose)
+            // P1: on the GPU route nothing is replayed here at all - not the node tree, not the palette. The clock above already holds
+            // this instance's (clip, time), and the kernel turns that into the pose at FrameStart.
+            if (samplePose && !_gpuSkin)
             {
                 RestoreNodesToRestPose();
 
@@ -398,7 +516,7 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
                     _runtimeModel.Asset._animationPlayer.UpdateAllNodeTransforms(_workNodes);
             }
 
-            if (hasSkinning)
+            if (hasSkinning && !_gpuSkin)
             {
                 if (samplePose)
                 {
@@ -409,6 +527,52 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
 
                 // P1: a throttled frame re-uploads the palette it sampled last, which is the pose its instance is drawn with.
                 CopyInstanceBoneMatrices(writeIndex, _poseCache.Bones[i]);
+            }
+
+            // P1: the entire per-frame cost of the GPU route on the CPU side - one 16-byte row per instance, which the FrameStart kernel
+            // expands into that instance's whole palette. The time is normalized by the clock first so the kernel only has to lerp.
+            //
+            // P3 L2: the time is the deduped one - a tick boundary for a participant, the exact clock for everyone else - because a
+            // pool block is shared by instances that have to evaluate to bitwise the same pose. A shared instance writes only its tag
+            // row; its representative's row is upgraded with the block after the loop, at which point the group is known to exist.
+            if (_gpuSkin && _runtimeModel.Asset.SkinBake is { } gpuBake)
+            {
+                float gpuTime = gpuBake.NormalizeTime(clip, sampleTime, _runtimeModel.Asset._animationPlayer.Loop);
+                uint poolRow = 0;
+                bool evaluate = true;
+                if (poseShared && pooling)
+                {
+                    if (!_posePoolBucketBySource.TryGetValue(poseSource, out int bucket))
+                    {
+                        // One block per *shared* group, so a frame in which nothing shares reserves nothing. The count is bounded by
+                        // the instance count, which is what PreparePalette sized the pool region by, so the address below always
+                        // lands inside the reservation.
+                        if (_posePoolRewrites.Count < EnabledInstanceCount)
+                        {
+                            bucket = _posePoolRewrites.Count;
+                            _posePoolBucketBySource[poseSource] = bucket;
+                            _posePoolRewrites.Add(_posePoolPending[poseSource]);
+                        }
+                        else
+                        {
+                            bucket = -1;
+                        }
+                    }
+
+                    if (bucket >= 0)
+                    {
+                        poolRow = (uint)((EnabledInstanceCount + bucket) * MaxBonesPerInstance);
+                        evaluate = false;
+                    }
+                }
+
+                // Recorded whenever this instance ended up owning its own block, including the degenerate case where the pool
+                // reservation ran out above: it is still a candidate, and the next instance that asks for the same pair will adopt it.
+                // The write index is only known here - the Instances index skips disabled entries, the write index does not.
+                if (evaluate)
+                    _posePoolPending[i] = (writeIndex, (uint)clip, gpuTime);
+
+                _skinning.SetInstance(writeIndex, (uint)clip, gpuTime, evaluate, poolRow);
             }
 
             for (int p = 0; p < _primitives.Count; p++)
@@ -497,10 +661,27 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
             writeIndex++;
         }
 
+        // P3 L2: upgrade each representative's parameter row now that this frame's groups are known. This is the only parameter write
+        // that happens after the loop, and it is the reason the plan is recorded instead of decided inline: an instance cannot know it
+        // is a representative until a second instance asks for the same (clip, tick) pair, by which time its own row is already
+        // written. The write index it recorded is the same slot the vertex stage will read, so the block is found and the pose is not
+        // evaluated twice.
+        for (int b = 0; b < _posePoolRewrites.Count; b++)
+        {
+            var representative = _posePoolRewrites[b];
+            uint poolRow = (uint)((EnabledInstanceCount + b) * MaxBonesPerInstance);
+            _skinning.SetInstance(representative.Write, representative.Clip, representative.Time, true, poolRow);
+        }
+
+        // P3 L2: publish the group count. A frame that pools nothing renders the same image as the pre-pool path on purpose, so this
+        // number is the only evidence that the pool code ran at all - "identical and pooled" and "never pooled" look the same.
+        _skinning.PooledGroups = _posePoolRewrites.Count;
+
         // P1: publish the pose generation the shadow-atlas reuse digest keys on. It advances only on frames where at least
         // one instance's pose was actually replayed -- exactly when the rendered pose set can differ -- so throttled and held
-        // frames keep the cached atlas and any real motion invalidates it. A static host never advances it.
-        if (hasAnimation && anySampled)
+        // frames keep the cached atlas and any real motion invalidates it. A static host never advances it. The GPU route replays
+        // every submitted instance every frame, so its poses always change and the generation always moves.
+        if (hasAnimation && (anySampled || _gpuSkin))
             model.AnimationPoseGeneration++;
 
         // Outline2D active = host active union any active instance
@@ -524,17 +705,33 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
         // A7: resources and the parameter table only; every upload waits for PrepareCullInputs (writeBuffer is not allowed inside a Pass).
         UpdateCullUpload(model);
 
-        if (hasSkinning)
+        if (hasSkinning && _gpuSkin)
+        {
+            // P1: the palette is the kernel's output in the ring's current slot, so there is nothing to upload and no CPU block to fall
+            // back to this frame. The binding is only re-sent when the ids moved. A key that cannot be pointed at the ring drops the route
+            // for this frame (which also makes the kernel skip it) rather than leaving JS half-bound to a palette nobody writes.
+            if (!BindBoneStorageToJs())
+            {
+                UnbindBoneStorageFromJs();
+                _skinning.Begin(null, null, 0, 0);
+                _gpuSkin = false;
+            }
+
+            BoneMatricesBytes = Array.Empty<byte>();
+        }
+        else if (hasSkinning)
         {
             // Reinterpret as bytes and write into the persistent buffer to avoid a per-frame ToByteArray allocation.
             int boneByteLength = _instanceBoneMatrices.Length * Unsafe.SizeOf<Matrix4x4>();
             if (BoneMatricesBytes.Length != boneByteLength)
                 BoneMatricesBytes = new byte[boneByteLength];
             MemoryMarshal.AsBytes(_instanceBoneMatrices.AsSpan()).CopyTo(BoneMatricesBytes);
+            UnbindBoneStorageFromJs();
         }
         else
         {
             BoneMatricesBytes = Array.Empty<byte>();
+            UnbindBoneStorageFromJs();
         }
 
         TransformInitialized = true;
@@ -920,7 +1117,16 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
     }
 
     /// <summary>On unload, remove the cull target from the shared layer, otherwise the list would keep a reference to dead JS handles.</summary>
-    public void Dispose() => ReleaseCullResources();
+    public void Dispose()
+    {
+        // The skinning target goes first: it has to leave the scheduler before the buffers it points at are released, and JS has to stop
+        // reading the ring before the backend retires it.
+        UnbindBoneStorageFromJs();
+        _skinning.Dispose();
+        _ownedPalette?.Dispose();
+        _ownedPalette = null;
+        ReleaseCullResources();
+    }
 
     /// <summary>Writes one root instance world as an 80B cull record: four matrix rows plus a zero vec4, the layout of every instance stream.</summary>
     static void WriteCullRoot(Span<float> data, int index, in Matrix4x4 world)
@@ -1155,6 +1361,63 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
             _instanceBoneMatrices[i] = Matrix4x4.Identity;
     }
 
+    /// <summary>
+    /// P1: points the ring at this frame's slots and grows it to the shape the draw needs. Web has no backend frame ring, so this model is
+    /// the clock: the slot chosen here is the one the kernel writes at FrameStart and the one the draw binds later in the same frame, which
+    /// is what keeps the producer and the consumer on the same buffer.
+    ///
+    /// The stride is not negotiated here: it is <see cref="MaxBonesPerInstance"/> because the vertex stage hardcodes
+    /// <c>instance * 100</c>, and the shared latch has already rejected any bake that does not fit in a block that wide.
+    /// </summary>
+    bool ShapeSkinningRing(int instanceCount)
+    {
+        var palette = _skinning.Palette;
+        if (palette == null) return false;
+
+        // Two slots minimum: the previous palette is read from a different buffer, never from this frame's own slot.
+        int slots = Math.Max(2, palette.Slots.Length);
+        int slot = (int)(_boneStorageFrame % (uint)slots);
+        int previousSlot = (slot + slots - 1) % slots;
+
+        if (!_skinning.PreparePalette(Season.Basic.Graphics.Instance, slots, slot, previousSlot, instanceCount))
+            return false;
+
+        // Advanced only after the ring holds the shape, so a frame that fell back to the CPU does not skip a slot the GPU may still read.
+        _boneStorageFrame++;
+        return _skinning.BeginFrame(instanceCount);
+    }
+
+    /// <summary>Points the skin key at the ring's current and previous slots, skipping the interop round trip when the ids did not move.</summary>
+    bool BindBoneStorageToJs()
+    {
+        if (_skinning.Palette is not { Current: WGPUStorageBuffer current } ring)
+            return false;
+
+        var previous = ring.Previous as WGPUStorageBuffer ?? current;
+        if (string.Equals(current.Id, _boneStorageBoundCurrent, StringComparison.Ordinal)
+            && string.Equals(previous.Id, _boneStorageBoundPrevious, StringComparison.Ordinal))
+            return true;
+
+        if (string.IsNullOrEmpty(SkinKey) || !WebGPUInterop.BindSkinnedBoneStorage(SkinKey, current.Id, previous.Id))
+            return false;
+
+        _boneStorageBoundCurrent = current.Id;
+        _boneStorageBoundPrevious = previous.Id;
+        return true;
+    }
+
+    /// <summary>Drops the binding so JS accepts the CPU upload again on its next frame. Frames that never bound anything skip the round trip.</summary>
+    void UnbindBoneStorageFromJs()
+    {
+        if (_boneStorageBoundCurrent == null && _boneStorageBoundPrevious == null)
+            return;
+
+        _boneStorageBoundCurrent = null;
+        _boneStorageBoundPrevious = null;
+        if (!string.IsNullOrEmpty(SkinKey))
+            WebGPUInterop.UnbindSkinnedBoneStorage(SkinKey);
+    }
+
     void CopyInstanceBoneMatrices(int instanceIndex, Matrix4x4[] sourceBones)
     {
         int baseIndex = instanceIndex * MaxBonesPerInstance;
@@ -1162,6 +1425,11 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
         for (int i = 0; i < count; i++)
             _instanceBoneMatrices[baseIndex + i] = sourceBones[i];
 
+        // P2 L1 / P3 L2: this tail fill is also the tag-row clear the other three backends spell out explicitly. The block is
+        // MaxBonesPerInstance rows wide and the bake is guaranteed to be at most one row narrower (the latch rejects the rest), so
+        // writing Identity from count to the end always lands on the tag row and always writes the (0, 0, 0, 1) last row that makes
+        // bytes 48 and 52 decode as an unpooled zero. A palette left over from an earlier pooled frame therefore cannot point the
+        // vertex stage at a pool block this route never filled.
         for (int i = count; i < MaxBonesPerInstance; i++)
             _instanceBoneMatrices[baseIndex + i] = Matrix4x4.Identity;
     }

@@ -43,6 +43,47 @@ public partial class InstancedModel : InstancedMesh3DBase
 
     protected override bool HasContent => !string.IsNullOrEmpty(ModelName);
 
+    /// <summary>
+    /// P0: optional GPU-resident palette ring. When set and fully allocated, t6/t8 read it instead of the backend's CPU-written ring, and
+    /// the backend stages the same rows into it so the two routes render identically. A producer (a compute effect) owns this ring: it
+    /// writes the palette on the GPU and calls <see cref="InstanceBoneStorage.Publish(IGraphics, int)"/> to record the vertex-read handoff.
+    /// The control only hands it to the backend every frame, and never allocates or disposes it; the backend may only grow it to the shape
+    /// it can bind (see the type's ownership clause).
+    /// <para>
+    /// It is per model, not per backend, so an app sets it the same way on all four platforms and a platform that cannot bind storage into
+    /// the vertex stage simply leaves it unused (see <see cref="Graphics.VertexShaderStorageReadSupported"/>).
+    /// </para>
+    /// </summary>
+    public InstanceBoneStorage? BoneStorage { get; set; }
+
+    /// <summary>
+    /// P1: which route computes this model's bone palette. <see cref="InstanceSkinningMode.Cpu"/> is the default and is the historical
+    /// path unchanged: the clock and the clip replay both run on the CPU, and one palette upload per frame carries the result across.
+    /// <see cref="InstanceSkinningMode.Gpu"/> keeps only the clock on the CPU and lets the FrameStart kernel evaluate from the
+    /// load-time bake.
+    /// <para>
+    /// It is a property rather than a global because it is a per-model decision: it pays only when every animated node is a joint and
+    /// the primitive tree hangs off static nodes, and a model that fails that test falls back to the CPU no matter what this says. The
+    /// environment variable <c>SEASON_INSTANCE_SKINNING=gpu|cpu</c> overrides it process-wide, which is what the pixel-for-pixel A/B
+    /// comparison flips between runs.
+    /// </para>
+    /// <para>
+    /// Set it in the object initializer, next to <see cref="Model.ModelName"/>: the bake is built once during <see cref="Load"/>, so
+    /// assigning this afterwards selects nothing - the route already taken stands until the model is reloaded.
+    /// </para>
+    /// </summary>
+    public InstanceSkinningMode SkinningMode { get; set; } = InstanceSkinningMode.Cpu;
+
+    /// <summary>
+    /// Whether this model may take the GPU route this frame. Three things have to agree: the backend compiled the kernel
+    /// (<see cref="InstanceSkinning.Enabled"/>), the effective mode asks for it, and the asset actually produced a bake. The last one
+    /// is where "every animated node is a joint" and the table size ceiling are enforced, once, at load time.
+    /// </summary>
+    internal bool GpuSkinning
+        => InstanceSkinning.Enabled
+        && (InstanceSkinning.Override ?? SkinningMode) == InstanceSkinningMode.Gpu
+        && Asset?.SkinBake != null;
+
     Bounds3D _templateCullBounds;
 
     /// <summary>

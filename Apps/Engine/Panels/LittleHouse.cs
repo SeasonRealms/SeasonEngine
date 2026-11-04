@@ -28,10 +28,10 @@ namespace Engine.Panels;
 /// <c>GetAnimationNames</c> allocation every frame.</para>
 ///
 /// <para><b>The asset is the merged variant.</b> The pristine Sketchfab export
-/// (<c>little_house_game_ready.glb</c>, still in the Raw set) is a DCC export that never merged geometry:
+/// (<c>little_house_game_ready.glb</c>, no longer shipped) is a DCC export that never merged geometry:
 /// 1041 nodes, 466 meshes holding exactly one primitive each, 8,498 triangles in total (about 18 per
-/// primitive), against 1-39 primitives for every other prop here and 14 for the haunted
-/// <see cref="House"/>. Its material is <c>alphaMode: BLEND</c> with <c>doubleSided</c>, so the renderer
+/// primitive), against 1-39 primitives for every other prop here and 1 for the haunted
+/// <see cref="House"/> after it was merged the same way. Its material is <c>alphaMode: BLEND</c> with <c>doubleSided</c>, so the renderer
 /// puts it in the transparent bucket and draws each primitive twice (front-cull, then back-cull): that
 /// file costs 932 submissions plus a 466-entry per-frame depth sort. <c>little_house_game_ready_merged.glb</c>
 /// bakes the 464 static meshes' node world matrices into their positions/normals/tangents and merges them
@@ -48,12 +48,11 @@ namespace Engine.Panels;
 internal class LittleHouse : Panel
 {
     /// <summary>The cottage GLB, carried in the Raw asset set. This is the merged variant baked offline
-    /// from <see cref="LittleHouseSourceGlbPath"/>; see the class header for what the merge preserves.</summary>
+    /// from the pristine Sketchfab export (little_house_game_ready.glb); see the class header for what
+    /// the merge preserves. The pristine file is no longer shipped -- its 466 primitives were the whole
+    /// reason for the merge -- so there is deliberately no source-path constant pointing at a missing
+    /// asset. Re-bake from a fresh export of the same name if the merge ever has to be redone.</summary>
     internal const string LittleHouseGlbPath = @"Assets/little_house_game_ready_merged.glb";
-
-    /// <summary>The pristine export the merged asset was baked from, kept for re-baking and comparison.
-    /// Never loaded at runtime: its 466 primitives are what the merged file exists to avoid.</summary>
-    internal const string LittleHouseSourceGlbPath = @"Assets/little_house_game_ready.glb";
 
     // -- Placement, in world meters on the flat meadow (grass is y = 0 here). --
 

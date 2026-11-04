@@ -157,7 +157,7 @@ internal class Birds : Panel
 
         seagullsModel = new InstancedModel()
         {
-            ModelName = @"Assets/flying_seagull.glb"
+            ModelName = @"Assets/flying_seagull_merged.glb"
         };
         AddControl(seagullsModel);
 

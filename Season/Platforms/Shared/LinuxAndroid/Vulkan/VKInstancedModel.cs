@@ -28,6 +28,20 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
     byte*[] _mappedInstanceBoneBuffers = null!;
     uint _instanceBoneCapacity;
 
+    // P3 L2: the pose pool. Lazy bake, but along the instance axis rather than time: a group of instances that P3a decided shares one
+    // (clip, quantized tick) sample is evaluated once into a palette block of its own, and every member's tag row points at that
+    // block. The pool is rebuilt every frame, so its size is bounded by this frame's instance count and never by how many clips the
+    // asset has - which is the whole difference from pre-baking poses at load.
+    //
+    // The representative is chosen by P3a (the first instance to register the key) and is not known to be one until a second
+    // instance asks for it, so the plan is recorded here and written back after the loop; a representative's parameter row is
+    // already uploaded by then and only gains its pool row.
+    readonly Dictionary<int, int> _posePoolBucketBySource = new();
+    readonly List<(int Write, uint Clip, float Time)> _posePoolRewrites = new();
+    /// <summary>Parameter rows the loop below produced, indexed by the Instances index, so a bucket found later in the same replay
+    /// can address the representative without assuming the write index equals the Instances index.</summary>
+    (int Write, uint Clip, float Time)[] _posePoolPending = Array.Empty<(int, uint, float)>();
+
     // 2-3 Step C (track B): the previous frame's palette is NOT a second buffer. Each slot of the ring below
     // holds the palette of the frame that wrote it, so slot (fi + n - 1) % n already IS the previous frame's
     // palette and GetPrevBoneBufferInfo points the shader there. The old code kept a parallel prev buffer and
@@ -88,8 +102,10 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
     /// <summary>
     /// Load primitives from the shared model template.
     /// The caller must ensure the template has already been loaded.
+    /// <paramref name="skinningMode"/> is the owning control's <c>SkinningMode</c>, copied in because this is the only point where the
+    /// control and the loaded template meet: it decides whether a GPU bake is attempted, and a model that declines keeps the CPU route.
     /// </summary>
-    public void Load(VKModel template, Season.Controls.Model model)
+    public void Load(VKModel template, Season.Controls.Model model, InstanceSkinningMode skinningMode = InstanceSkinningMode.Cpu)
     {
         var nodeMap = new Dictionary<GltfNodeBase, GltfNodeBase>();
         CloneAnimationData(template.Asset, nodeMap);
@@ -98,7 +114,23 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
 
         _skins.Clear();
         _skins.AddRange(_asset.GetAllSkins());
-        _bonePaletteStride = Math.Max(1, _skins.Sum(static s => s.Joints.Count));
+        // P2 L1 / P3 L2: one extra palette row per instance block for the pose-pool tag, which the vertex stage finds at
+        // instanceSlot * stride + stride - 1. The joints keep their instanceSlot * stride + jointIndex address, so this widens the
+        // block without moving a byte of what the draw reads.
+        _bonePaletteStride = Math.Max(1, _skins.Sum(static s => s.Joints.Count)) + InstanceSkinning.PoseTagRows;
+
+        // P1: build the GPU route's immutable tables while the node tree is still at rest. Declining leaves SkinBake null, which keeps
+        // every instance on the CPU route; it is a property of the asset (its animated nodes are not all joints), not an error.
+        InstanceSkinBake.TryBake(_asset, skinningMode);
+        if (_asset.SkinBake != null && _skins.Count > 0)
+        {
+            // The GPU route's picking pose. Once the kernel owns the evaluation nothing else advances the shared player, so it
+            // would keep whatever the last CPU replay left. Park it at rest, which is what InstancedModel.TryPickInstanceSurface
+            // falls back to on a backend with no per-instance pick shadow. L0 boundary: the pick shape stays at rest while the
+            // render shows the animated pose.
+            _asset._animationPlayer.UpdateBoneMatrices(_skins);
+        }
+
         CreateInstanceBoneBuffers();
 
         var templatePrimitives = new List<PrimitiveData>();
@@ -120,6 +152,9 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         SyncInstancedSkinningMaterialParams();
         RebuildPrimitiveBuckets();
         SyncAlpha(model.Alpha);
+
+        // P1: the skinning scheduler holds this group for its lifetime; a frame that runs the CPU route reports nothing and is skipped.
+        Season.Rendering.InstanceSkinning.Register(_skinning);
     }
 
     /// <summary>
@@ -463,9 +498,138 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
     }
 
     protected override BufferResource[] InstanceBoneBuffers
-        => _instanceBoneBuffers != null && _instanceBoneBuffers.Length > 0
-            ? _instanceBoneBuffers
-            : Pipeline.IdentityInstanceBoneBuffers;
+    {
+        get
+        {
+            // P0: descriptor set fi is written once for frame fi, not per frame, so a storage ring has to be handed over slot for slot -
+            // ring slot fi is exactly what this frame writes and what descriptor set fi reads. That is also why the swap needs a
+            // descriptor rewrite (see SyncBoneStorageRing) while a CPU-ring upload inside the same buffer does not.
+            if (_boneStorageRing != null)
+                return _boneStorageRing;
+
+            return _instanceBoneBuffers != null && _instanceBoneBuffers.Length > 0
+                ? _instanceBoneBuffers
+                : Pipeline.IdentityInstanceBoneBuffers;
+        }
+    }
+
+    /// <summary>
+    /// P1: the GPU skinning route's frame state - the palette ring the descriptor sets bind, the load-time bake the kernel evaluates,
+    /// and the 16-byte per-instance parameter block. Shared with the other three backends so the layout cannot drift between them.
+    /// </summary>
+    readonly Season.Rendering.InstanceSkinningTarget _skinning = new();
+
+    /// <summary>
+    /// True while this frame runs the GPU route. Latched once per Update so a frame cannot half-switch between the two palettes.
+    /// False is the historical path, untouched: <c>Evaluate</c> per instance, the palette written into the mapped ring by
+    /// <see cref="UploadInstanceBoneMatrices"/>, and no storage ring bound.
+    /// </summary>
+    bool _gpuSkin;
+
+    /// <summary>The palette ring this class created because the model asked for the GPU route without supplying one. Owned here,
+    /// disposed here; a ring the model supplied is never touched.</summary>
+    Season.Rendering.InstanceBoneStorage? _ownedPalette;
+
+    /// <summary>The ring flattened into the shape the descriptor writer consumes, rebuilt only when the ring's buffer set changes.</summary>
+    BufferResource[]? _boneStorageRing;
+
+    /// <summary>
+    /// Rebuilds <see cref="_boneStorageRing"/> and returns whether the buffers it points at changed, which is the condition for rewriting the
+    /// descriptor sets: the sets hold the VkBuffer handle by value, so a reallocation - or the first switch to a ring at all - leaves them
+    /// addressing a retired buffer.
+    /// </summary>
+    bool SyncBoneStorageRing()
+    {
+        // Descriptor set fi binds ring slot fi, which is the slot this frame's kernel writes, so the binding decision is this frame's
+        // latch rather than the handoff result: on Vulkan the set is per slot and the vertex-read barrier is recorded by the effect at
+        // FrameStart, after Update has already rebuilt these sets. Dropping the flattened copy is what tells the commit below to
+        // republish them to the CPU ring after a fallback.
+        var ring = _gpuSkin ? _skinning.Palette : null;
+        if (ring == null)
+        {
+            bool had = _boneStorageRing != null;
+            _boneStorageRing = null;
+            return had;
+        }
+
+        int count = ring.Slots.Length;
+        bool changed = _boneStorageRing == null || _boneStorageRing.Length != count;
+        if (changed)
+            _boneStorageRing = new BufferResource[count];
+
+        for (int i = 0; i < count; i++)
+        {
+            var buffer = ring.Slots[i] is VKStorageBuffer vk ? vk.Buffer : default;
+            if (_boneStorageRing![i].Buffer.Handle != buffer.Buffer.Handle)
+            {
+                _boneStorageRing[i] = buffer;
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// P1: latches this frame's palette source. Runs before the early-out for an empty instance list, so a group that stops submitting
+    /// never leaves the scheduler holding last frame's instance count. The storage ring only exists on the GPU route - a model on the
+    /// CPU route keeps the historical path and never allocates one.
+    /// </summary>
+    void BeginSkinningFrame(InstancedModel model)
+    {
+        // Descriptor set fi exists per frame slot, and a ring of one slot would read the palette it just wrote as "previous".
+        if (Device.frameCount < 2)
+        {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+            return;
+        }
+
+        Season.Rendering.InstanceBoneStorage? paletteRing = model.BoneStorage;
+        if (paletteRing == null && model.GpuSkinning)
+        {
+            _ownedPalette ??= new Season.Rendering.InstanceBoneStorage();
+            paletteRing = _ownedPalette;
+        }
+        else if (!model.GpuSkinning && _ownedPalette != null)
+        {
+            // The mode (or the process-wide override) turned the GPU route off after the ring had been allocated for it.
+            _ownedPalette.Dispose();
+            _ownedPalette = null;
+        }
+
+        // P2 L1 / P3 L2: the tag row count travels with the latch so the kernel writes a tag exactly on the backends whose vertex
+        // stage reads one. Passing zero here would leave the kernel filling the last joint row instead.
+        _gpuSkin = _skinning.Begin(paletteRing, _asset.SkinBake, _bonePaletteStride, _asset._animations.Count, InstanceSkinning.PoseTagRows);
+    }
+
+    /// <summary>
+    /// P1: shapes the ring for this frame. "Previous" is the slot the previous frame wrote, exactly as for the CPU ring, and the slot
+    /// count has to be the frame ring's depth because the descriptor writer reads <see cref="InstanceBoneBuffers"/> by frame index.
+    /// Returns false when the CPU route is the only correct answer, which the caller applies by clearing the latch.
+    /// </summary>
+    bool ShapeSkinningRing()
+    {
+        int slots = (int)Device.frameCount;
+        int slot = (int)Device.FrameIndex % slots;
+        return _skinning.PreparePalette(Season.Basic.Graphics.Instance, slots, slot, (slot + slots - 1) % slots, _instanceCount)
+            && _skinning.BeginFrame(_instanceCount);
+    }
+
+    /// <summary>
+    /// P0: the ring becomes the palette only after a successful publish, so this runs after it and republishes the VkBuffer handles to
+    /// every descriptor set when the buffer set changed - a first switch, a fallback, or a resize all leave the sets pointing at a buffer
+    /// that is no longer the palette.
+    /// </summary>
+    void CommitBoneStorageRing()
+    {
+        if (!SyncBoneStorageRing())
+            return;
+
+        for (int i = 0; i < _primitives.Count; i++)
+            RewriteDescriptorSets(_primitives[i]);
+        RewriteShellDescriptorSets();
+    }
 
     void CreateInstanceBoneBuffers()
     {
@@ -540,6 +704,15 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         {
             Unsafe.CopyBlock(_mappedInstanceBoneBuffers[fi] + offset, matricesPtr, (uint)totalSize);
         }
+
+        // P2 L1 / P3 L2: the tag row is the one row of the block this upload does not fill from the pose, and it has to read zero
+        // here. A ring slot is reused every frame, so a row left over from an earlier pooled frame - or from a compute handoff the
+        // CPU route took back - would send the vertex stage to a pool block this route never wrote. Cleared unconditionally rather
+        // than only when the route changed, so there is one rule for the row instead of two.
+        byte* tagRow = _mappedInstanceBoneBuffers[fi] + offset
+            + (long)(_bonePaletteStride - InstanceSkinning.PoseTagRows) * Unsafe.SizeOf<Matrix4x4>();
+        *(uint*)(tagRow + InstanceSkinning.PoseTagCurrentOffset) = 0;
+        *(uint*)(tagRow + InstanceSkinning.PoseTagPreviousOffset) = 0;
     }
 
     // 2-3 Step C (track C-a): create or grow the prev per-instance world SSBO
@@ -669,6 +842,14 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
     // 2-3 Step C: override the base virtual methods to return the actual prev SSBOs
     protected override DescriptorBufferInfo GetPrevBoneBufferInfo(int fi)
     {
+        // P0: with a storage ring the previous palette is the ring's previous slot, the same one-slot-back rule the CPU ring uses.
+        if (_boneStorageRing != null && _boneStorageRing.Length > 0)
+        {
+            var prevSlot = _boneStorageRing[((fi % _boneStorageRing.Length) + _boneStorageRing.Length - 1) % _boneStorageRing.Length];
+            if (prevSlot.Buffer.Handle != 0)
+                return new() { Buffer = prevSlot.Buffer, Offset = 0, Range = Vk.WholeSize };
+        }
+
         if (_instanceBoneBuffers == null || _instanceBoneBuffers.Length == 0)
             return base.GetPrevBoneBufferInfo(fi);
         int slots = _instanceBoneBuffers.Length;
@@ -689,8 +870,9 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
             : base.GetPrevMorphWeightsBufferInfo(fi);
 
     // 2-3 Step C (tracks B/C-b): this path owns both history streams once their rings exist, so the base class can publish
-    // all three flags from one place, every frame (see VKInstancedPrimitiveGroup.UpdatePrevStateFlags).
-    protected override bool HasPrevBoneHistory => _instanceBoneBuffers != null && _instanceBoneBuffers.Length > 0;
+    // all three flags from one place, every frame (see VKInstancedPrimitiveGroup.UpdatePrevStateFlags). The GPU route has no mapped CPU
+    // ring - it was never allocated - but its storage ring does hold a previous slot, so that counts as history too.
+    protected override bool HasPrevBoneHistory => (_instanceBoneBuffers != null && _instanceBoneBuffers.Length > 0) || _boneStorageRing != null;
 
     /// <inheritdoc cref="HasPrevBoneHistory"/>
     protected override bool HasPrevMorphHistory => _prevMorphWeightsBuffers != null;
@@ -721,8 +903,15 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
                 _instanceCount++;
         }
 
+        // P1: latch this frame's palette source. Runs before the empty-list early-out, so a group that stops submitting never leaves
+        // the scheduler holding the previous frame's instance count.
+        BeginSkinningFrame(model);
+
         if (_instanceCount == 0)
         {
+            // P1: drop the latch before the early-out, so the scheduler never dispatches with last frame's instance count.
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
             _transformInitialized = true;
             SyncAlpha(model.Alpha);
             SetOutline2DState(false, default, default);
@@ -731,7 +920,14 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
 
         EnsureAnimationStateCapacity(model.Instances.Count);
         EnsurePrimitiveInstanceCapacity(_instanceCount);
-        EnsureInstanceBoneCapacity((uint)Math.Max(_instanceCount, 1));
+        // P1: shape the GPU route's ring first, then allocate the CPU palette ring only if it will actually be written.
+        if (_gpuSkin && !ShapeSkinningRing())
+        {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+        }
+        if (!_gpuSkin)
+            EnsureInstanceBoneCapacity((uint)Math.Max(_instanceCount, 1));
         // 2-3 Step C: create or grow the prev SSBOs
         EnsurePrevInstanceWorldCapacity(_instanceCount);
         EnsurePrevMorphWeightsCapacity(_instanceCount);
@@ -783,6 +979,15 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         }
 
         int writeIndex = 0;
+
+        // P3 L2: the pool lives for exactly one replay, like P3a's dedup table it is keyed against. A pool block addressed by a
+        // previous frame's tag would still hold that frame's pose, which is why a slot's tag is written for every instance every
+        // frame rather than only for the ones that end up pooled.
+        _posePoolBucketBySource.Clear();
+        _posePoolRewrites.Clear();
+        if (_posePoolPending.Length < model.Instances.Count)
+            _posePoolPending = new (int Write, uint Clip, float Time)[model.Instances.Count];
+
         for (int i = 0; i < model.Instances.Count; i++)
         {
             var instance = model.Instances[i];
@@ -829,17 +1034,21 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
             anySampled |= samplePose;
 
             // P3a: a sampled instance at tier 2 or slower may share another instance's sample for the same (clip, quantized
-            // time) pair. Replay the clip only on a miss; on a hit the cached rows are copied and the streams below are built
-            // from them exactly as on a throttled frame, so the instance transform still applies this frame.
+            // time) pair. On the CPU route a hit copies the cached rows and the streams below are built from them exactly as on a
+            // throttled frame, so the instance transform still applies this frame. On the GPU route the same hit is P3 L2's signal
+            // that this instance can point its tag at a pool block instead of evaluating again - see the parameter write below.
             float sampleTime = playbackTime;
             int poseSource = -1;
-            if (samplePose && model.TryReuseInstancePose(i, clip, playbackTime, out poseSource, out sampleTime))
+            bool poseShared = samplePose && model.TryReuseInstancePose(i, clip, playbackTime, out poseSource, out sampleTime);
+            if (poseShared && !_gpuSkin)
             {
                 _poseCache.CopyRow(poseSource, i);
                 samplePose = false;
             }
 
-            if (samplePose)
+            // P1: the whole CPU evaluation - rest restore, clip replay, node transform pass - is what the GPU route replaces. The clock
+            // above still runs for every tier, so the instance is drawn at the pose its time names, whoever evaluates it.
+            if (samplePose && !_gpuSkin)
             {
                 RestoreNodesToRestPose();
 
@@ -849,7 +1058,7 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
                     _asset._animationPlayer.UpdateAllNodeTransforms(_workNodes);
             }
 
-            if (hasSkin)
+            if (hasSkin && !_gpuSkin)
             {
                 if (samplePose)
                 {
@@ -860,6 +1069,52 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
 
                 // P1: a throttled frame re-uploads the palette it sampled last, which is the pose its instance is drawn with.
                 UploadInstanceBoneMatrices(writeIndex, _poseCache.Bones[i]);
+            }
+
+            // P1 GPU route: 16 bytes per instance, the clip index plus the time the clock just produced, already wrapped or clamped the
+            // way the player would have done it. This is the entire per-frame CPU work the palette costs now.
+            //
+            // P3 L2: the time is the deduped one - a tick boundary for a participant, the exact clock for everyone else - because a
+            // pool block is shared by instances that have to evaluate to bitwise the same pose. A shared instance writes only its tag
+            // row; its representative's row is upgraded with the block after the loop, at which point the group is known to exist.
+            if (_gpuSkin && _asset.SkinBake is { } gpuBake)
+            {
+                float gpuTime = gpuBake.NormalizeTime(clip, sampleTime, _asset._animationPlayer.Loop);
+                uint poolRow = 0;
+                bool evaluate = true;
+                if (poseShared)
+                {
+                    if (!_posePoolBucketBySource.TryGetValue(poseSource, out int bucket))
+                    {
+                        // One block per *shared* group, so a frame in which nothing shares reserves nothing. The count is bounded by
+                        // the instance count, which is what PreparePalette sized the pool region by, so the address below always
+                        // lands inside the reservation.
+                        if (_posePoolRewrites.Count < _instanceCount)
+                        {
+                            bucket = _posePoolRewrites.Count;
+                            _posePoolBucketBySource[poseSource] = bucket;
+                            _posePoolRewrites.Add(_posePoolPending[poseSource]);
+                        }
+                        else
+                        {
+                            bucket = -1;
+                        }
+                    }
+
+                    if (bucket >= 0)
+                    {
+                        poolRow = (uint)((_instanceCount + bucket) * _bonePaletteStride);
+                        evaluate = false;
+                    }
+                }
+
+                // Recorded whenever this instance ended up owning its own block, including the degenerate case where the pool
+                // reservation ran out above: it is still a candidate, and the next instance that asks for the same pair will adopt it.
+                // The write index is only known here - the Instances index skips disabled entries, the write index does not.
+                if (evaluate)
+                    _posePoolPending[i] = (writeIndex, (uint)clip, gpuTime);
+
+                _skinning.SetInstance(writeIndex, (uint)clip, gpuTime, evaluate, poolRow);
             }
 
             for (int p = 0; p < _primitives.Count; p++)
@@ -959,10 +1214,37 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
             writeIndex++;
         }
 
+        // P3 L2: upgrade each representative's parameter row now that this frame's groups are known. This is the only parameter write
+        // that happens after the loop, and it is the reason the plan is recorded instead of decided inline: an instance cannot know it
+        // is a representative until a second instance asks for the same (clip, tick) pair, by which time its own row is already
+        // written. The write index it recorded is the same slot the vertex stage will read, so the block is found and the pose is not
+        // evaluated twice.
+        for (int b = 0; b < _posePoolRewrites.Count; b++)
+        {
+            var representative = _posePoolRewrites[b];
+            uint poolRow = (uint)((_instanceCount + b) * _bonePaletteStride);
+            _skinning.SetInstance(representative.Write, representative.Clip, representative.Time, true, poolRow);
+        }
+
+        // P3 L2: publish the group count. The image a zero-group frame produces is by design identical to the unpooled one, so a
+        // capture that only compared pixels could not tell the two apart; this is the number that says the path ran.
+        _skinning.PooledGroups = _posePoolRewrites.Count;
+
+        // P1: nothing is uploaded from here any more. The GPU route's only per-frame CPU work is the 16-byte row written above; the
+        // dispatch that turns it into a palette, and the compute-write-to-vertex-read barrier that makes the palette readable, are both
+        // recorded by InstanceSkinningEffect at FrameStart. That is the only phase where the command buffer is recording and no render
+        // pass is open - the same constraint that governs the cull uploads, and the reason P0's staging could not stay in Update.
+        //
+        // The descriptor sets hold VkBuffer handles by value, so a ring that appeared, disappeared or was reallocated has to be
+        // republished. It is keyed on this frame's latch rather than on the handoff result: on Vulkan the binding is per frame slot
+        // (set fi binds ring slot fi, the slot this frame's kernel writes), so the sets are correct before the barrier is recorded.
+        CommitBoneStorageRing();
+
         // P1: publish the pose generation the shadow-atlas reuse digest keys on. It advances only on frames where at least
         // one instance's pose was actually replayed -- exactly when the rendered pose set can differ -- so throttled and held
         // frames keep the cached atlas and any real motion invalidates it. A static host never advances it.
-        if (hasAnimation && anySampled)
+        // The GPU route replays every instance every frame, so every frame can differ.
+        if (hasAnimation && (anySampled || _gpuSkin))
             model.AnimationPoseGeneration++;
 
         // Outline2D activation = host-level activation union any per-instance activation.
@@ -1310,6 +1592,12 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
 
         _instanceBoneBuffers = null!;
         _mappedInstanceBoneBuffers = null!;
+
+        // P1: leave the skinning scheduler and release the two blocks it owns. The palette ring is only disposed here when this class
+        // created it, which is the same ownership rule the CPU ring above follows.
+        _skinning.Dispose();
+        _ownedPalette?.Dispose();
+        _ownedPalette = null;
 
         // 2-3 Step C: release the prev SSBOs
         if (_prevInstanceWorldBuffers != null)

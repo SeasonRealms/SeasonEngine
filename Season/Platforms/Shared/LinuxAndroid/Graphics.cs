@@ -2478,7 +2478,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             };
 
             var vkInstancedModel = new VKInstancedModel(model.ModelName);
-            vkInstancedModel.Load(template, wrapperModel);
+            vkInstancedModel.Load(template, wrapperModel, model.SkinningMode);
 
             // A7: replay the clips on the instance's own runtime asset before it is published through model.Asset (picking reads
             // its node tree), since sampling poses it; nothing else holds it yet. The shared template's player is never touched.
@@ -3394,6 +3394,40 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         Vulkan.Device.Vk.CmdPipelineBarrier(cmd,
             VkPipelineStageFlags.ComputeShaderBit,
             VkPipelineStageFlags.DrawIndirectBit,
+            0, 0, null, 1, &barrier, 0, null);
+        return true;
+    }
+
+    /// <summary>
+    /// P0: the instance palette can be compute-written and read by the vertex shader. Vulkan needs no extra VkBufferUsageFlags -
+    /// VK_BUFFER_USAGE_STORAGE_BUFFER already covers shader reads - but the visibility does have to be declared: the kernel's write ends in
+    /// ComputeShader/ShaderWrite, and a vertex-stage SSBO read is VertexShader/ShaderRead. That is a different barrier from the one the
+    /// indirect handoff records (its destination stage is DrawIndirect), so the two cannot stand in for each other.
+    /// </summary>
+    public bool VertexShaderStorageReadSupported => ComputeSupported;
+
+    public unsafe bool TryPrepareVertexShaderRead(Season.Rendering.StorageBuffer buffer)
+    {
+        var cmd = Vulkan.Device.GraphicsCommandBuffer;
+        if (cmd.Handle == 0 || Vulkan.Device.InRenderPass
+            || buffer is not VKStorageBuffer vkBuffer || vkBuffer.Buffer.Buffer.Handle == 0
+            || vkBuffer.Usage != Season.Rendering.StorageBufferUsage.ComputeAndVertexShaderRead)
+            return false;
+
+        var barrier = new VkBufferMemoryBarrier
+        {
+            SType = VkStructureType.BufferMemoryBarrier,
+            SrcAccessMask = VkAccessFlags.ShaderWriteBit,
+            DstAccessMask = VkAccessFlags.ShaderReadBit,
+            SrcQueueFamilyIndex = SVk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = SVk.QueueFamilyIgnored,
+            Buffer = vkBuffer.Buffer.Buffer,
+            Offset = 0,
+            Size = SVk.WholeSize,
+        };
+        Vulkan.Device.Vk.CmdPipelineBarrier(cmd,
+            VkPipelineStageFlags.ComputeShaderBit,
+            VkPipelineStageFlags.VertexShaderBit,
             0, 0, null, 1, &barrier, 0, null);
         return true;
     }

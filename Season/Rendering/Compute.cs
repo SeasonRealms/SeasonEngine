@@ -197,6 +197,14 @@ public abstract class StorageBuffer
     /// the shared layer keeps a copy so TryPrepareIndirectArgs can reject a plain compute buffer before any backend sees it.</summary>
     public StorageBufferUsage Usage;
 
+    /// <summary>
+    /// Element stride of the structured view a <see cref="StorageBufferUsage.ComputeAndVertexShaderRead"/> buffer exposes to the vertex stage.
+    /// It is 64 because the consumer is the instance bone palette and the shader declares it as <c>StructuredBuffer&lt;float4x4&gt;</c>;
+    /// D3D12 types the view by this stride, so a raw (ByteAddressBuffer) view would not match the declaration. The other usages
+    /// ignore it: they are either raw buffers or fed to a stage that does not care about element boundaries.
+    /// </summary>
+    public const int VertexShaderReadElementBytes = 64;
+
     public abstract void Dispose();
 }
 

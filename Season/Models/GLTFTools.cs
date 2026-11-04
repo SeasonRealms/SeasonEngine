@@ -184,6 +184,32 @@ public static class GLTFTools
         return null;
     }
 
+    /// <summary>
+    /// Builds a unit tangent perpendicular to the given normal for assets that carry a normalTexture but
+    /// no TANGENT attribute. Without this the loader leaves the tangent at (0,0,0,0), the shader's
+    /// normalize(tangent.xyz) returns NaN, the TBN collapses and the surface renders pure black. Picks the
+    /// world axis least aligned with the normal so the cross product is well-conditioned, and returns
+    /// W = 1 (positive bitangent handedness). A degenerate normal falls back to UnitX.
+    /// </summary>
+    static System.Numerics.Vector4 BuildFallbackTangent(System.Numerics.Vector3 normal)
+    {
+        float length = normal.Length();
+        if (length < 1e-6f)
+            return new System.Numerics.Vector4(1f, 0f, 0f, 1f);
+
+        var n = normal / length;
+
+        // Axis least aligned with n: crossing against it stays near unit length and never degenerates.
+        var a = System.Numerics.Vector3.Abs(n);
+        var helper = a.X <= a.Y && a.X <= a.Z
+            ? System.Numerics.Vector3.UnitX
+            : (a.Y <= a.Z ? System.Numerics.Vector3.UnitY : System.Numerics.Vector3.UnitZ);
+
+        var tangent = System.Numerics.Vector3.Normalize(System.Numerics.Vector3.Cross(n, helper));
+
+        return new System.Numerics.Vector4(tangent.X, tangent.Y, tangent.Z, 1f);
+    }
+
     public static (List<Vertex> vertices, List<uint> indices) LoadMeshPrimitive(MeshPrimitive meshPrimitive)
     {
         var vertices = new List<Vertex>();
@@ -289,6 +315,20 @@ public static class GLTFTools
             // Once both normal and tangent are mirrored on Z, the cross-product result already has the correct Z sign,
             // so W does not need further adjustment.
             var tangent = tangentBuffer != null ? tangentBuffer[(int)i] : System.Numerics.Vector4.Zero;
+
+            // A glTF asset may carry a normalTexture yet no TANGENT attribute (common for auto-UV /
+            // non-DCC exports). Leaving the tangent at the all-zero default makes the shader's
+            // normalize(tangent.xyz) return NaN and cross(normal, tangent.xyz) * tangent.w collapse the
+            // TBN, so the normal-mapped surface shades to pure black (correct silhouette, zero detail).
+            // When the attribute is absent, synthesize a unit tangent perpendicular to the geometric
+            // normal. It is built in the raw glTF (right-handed) convention, exactly like a real TANGENT
+            // accessor, so the vertex construction below negates its Z the same way; perpendicularity is
+            // preserved because that flip is the same reflection applied to both N and T. The shader
+            // Gram-Schmidt-orthogonalizes T against N anyway, so any non-degenerate, non-parallel unit T
+            // yields a valid orthonormal basis. This only affects tangent-less assets, which were already
+            // broken; assets with tangents and assets that skip the TBN (no normal map) are untouched.
+            if (tangentBuffer is null)
+                tangent = BuildFallbackTangent(normal);
 
             // Skinning data.
             var jointIndicesVec = jointIndices != null ? jointIndices[(int)i] : System.Numerics.Vector4.Zero;

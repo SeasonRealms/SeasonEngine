@@ -50,9 +50,13 @@ internal class Robots : Panel
 
     internal Robots()
     {
+        // P1: this panel's animation is entirely joint-driven, so the load-time bake applies and the FrameStart kernel can
+        // build the palette. Twenty instances each on a different clip is also the worst case for P3 pooling - no two of
+        // them share a bucket - so a pooled frame has to reproduce this image exactly while evaluating every instance.
         robotField = new InstancedModel()
         {
-            ModelName = "Assets/3DGodotRobot.glb"
+            ModelName = "Assets/3DGodotRobot.glb",
+            SkinningMode = InstanceSkinningMode.Gpu
         };
         AddControl(robotField);
 

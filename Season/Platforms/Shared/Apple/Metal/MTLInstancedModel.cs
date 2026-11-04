@@ -26,6 +26,39 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
     IMTLBuffer[] _instanceBoneBuffers = Array.Empty<IMTLBuffer>();
     uint _instanceBoneCapacity = 1;
 
+    // P3 L2: the pose pool. Lazy bake, but along the instance axis rather than time: a group of instances that P3a decided shares one
+    // (clip, quantized tick) sample is evaluated once into a palette block of its own, and every member's tag row points at that
+    // block. The pool is rebuilt every frame, so its size is bounded by this frame's instance count and never by how many clips the
+    // asset has - which is the whole difference from pre-baking poses at load.
+    //
+    // The representative is chosen by P3a (the first instance to register the key) and is not known to be one until a second
+    // instance asks for it, so the plan is recorded here and written back after the loop; a representative's parameter row is
+    // already uploaded by then and only gains its pool row.
+    readonly Dictionary<int, int> _posePoolBucketBySource = new();
+    readonly List<(int Write, uint Clip, float Time)> _posePoolRewrites = new();
+    /// <summary>Parameter rows the loop below produced, indexed by the Instances index, so a bucket found later in the same replay
+    /// can address the representative without assuming the write index equals the Instances index.</summary>
+    (int Write, uint Clip, float Time)[] _posePoolPending = Array.Empty<(int, uint, float)>();
+
+    /// <summary>
+    /// P1: the GPU skinning route's frame state - the palette ring the draws bind, the load-time bake the kernel evaluates, and the
+    /// 16-byte per-instance parameter block. Shared with the other three backends so the layout cannot drift between them.
+    /// Metal needs nothing at creation time and nothing at submit time for the ring itself - an MTLBuffer has no usage bits and the
+    /// driver's hazard tracking orders the producer's dispatch against the draw - so the whole backend-side cost is the buffer handle.
+    /// </summary>
+    readonly Season.Rendering.InstanceSkinningTarget _skinning = new();
+
+    /// <summary>
+    /// True while this frame runs the GPU route. Latched once per Update so a frame cannot half-switch between the two palettes.
+    /// False is the historical path, untouched: <c>Evaluate</c> per instance, the palette written into the shared buffer by
+    /// <see cref="UploadInstanceBoneMatrices"/>, and no storage ring bound.
+    /// </summary>
+    bool _gpuSkin;
+
+    /// <summary>The palette ring this class created because the model asked for the GPU route without supplying one. Owned here,
+    /// disposed here; a ring the model supplied is never touched.</summary>
+    Season.Rendering.InstanceBoneStorage? _ownedPalette;
+
     (Vector3 Translation, Quaternion Rotation, Vector3 Scale, float[] Weights)[] _restPoseSnapshot = Array.Empty<(Vector3, Quaternion, Vector3, float[])>();
     List<GltfNodeBase> _workNodes = new();
     readonly List<GLTFSkin> _skins = new();
@@ -83,8 +116,10 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
 
     /// <summary>
     /// Loads primitives from the shared model template. The caller must ensure template has already been loaded.
+    /// <paramref name="skinningMode"/> is the owning control's <c>SkinningMode</c>, copied in because this is the only point where the
+    /// control and the loaded template meet: it decides whether a GPU bake is attempted, and a model that declines keeps the CPU route.
     /// </summary>
-    public void Load(MTLModel template, Season.Controls.Model model)
+    public void Load(MTLModel template, Season.Controls.Model model, InstanceSkinningMode skinningMode = InstanceSkinningMode.Cpu)
     {
         var nodeMap = new Dictionary<GltfNodeBase, GltfNodeBase>();
         CloneAnimationData(template.Asset, nodeMap);
@@ -93,7 +128,23 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
 
         _skins.Clear();
         _skins.AddRange(_asset.GetAllSkins());
-        _bonePaletteStride = Math.Max(1, _skins.Sum(static s => s.Joints.Count));
+        // P2 L1 / P3 L2: one extra palette row per instance block for the pose-pool tag, which the vertex stage finds at
+        // instanceSlot * stride + stride - 1. The joints keep their instanceSlot * stride + jointIndex address, so this widens the
+        // block without moving a byte of what the draw reads.
+        _bonePaletteStride = Math.Max(1, _skins.Sum(static s => s.Joints.Count)) + Season.Rendering.InstanceSkinning.PoseTagRows;
+
+        // P1: build the GPU route's immutable tables while the node tree is still at rest. Declining leaves SkinBake null, which keeps
+        // every instance on the CPU route; it is a property of the asset (its animated nodes are not all joints), not an error.
+        InstanceSkinBake.TryBake(_asset, skinningMode);
+        if (_asset.SkinBake != null && _skins.Count > 0)
+        {
+            // The GPU route's picking pose. Once the kernel owns the evaluation nothing else advances the shared player, so it
+            // would keep whatever the last CPU replay left. Park it at rest, which is what InstancedModel.TryPickInstanceSurface
+            // falls back to on a backend with no per-instance pick shadow. L0 boundary: the pick shape stays at rest while the
+            // render shows the animated pose.
+            _asset._animationPlayer.UpdateBoneMatrices(_skins);
+        }
+
         CreateInstanceBoneBuffers();
 
         var templatePrimitives = new List<PrimitiveData>();
@@ -115,6 +166,9 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
         SyncInstancedSkinningMaterialParams();
         RebuildPrimitiveBuckets();
         SyncAlpha(model.Alpha);
+
+        // P1: the skinning scheduler holds this group for its lifetime; a frame that runs the CPU route reports nothing and is skipped.
+        Season.Rendering.InstanceSkinning.Register(_skinning);
     }
 
     /// <summary>
@@ -522,10 +576,75 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
         int fi = Device.FrameIndex;
         nuint offset = (nuint)(instanceIndex * _bonePaletteStride * Unsafe.SizeOf<Matrix4x4>());
         Device.ResourceManager.UpdateBuffer(_instanceBoneBuffers[fi], boneMatrices, offset);
+
+        // P2 L1 / P3 L2: the tag row is the one row of the block this upload does not fill from the pose, and it has to read zero
+        // here. A ring slot is reused every frame, so a row left over from an earlier pooled frame - or from a compute handoff the
+        // CPU route took back - would send the vertex stage to a pool block this route never wrote. The two lanes are adjacent, so
+        // one two-word copy covers both. Cleared unconditionally rather than only when the route changed, so there is one rule for
+        // the row instead of two.
+        nuint tagOffset = offset + (nuint)((_bonePaletteStride - Season.Rendering.InstanceSkinning.PoseTagRows)
+            * Unsafe.SizeOf<Matrix4x4>() + Season.Rendering.InstanceSkinning.PoseTagCurrentOffset);
+        Device.ResourceManager.UpdateBuffer(_instanceBoneBuffers[fi], ZeroPoseTag, tagOffset);
+    }
+
+    /// <summary>P2 L1 / P3 L2: zero words for the tag lanes, which sit at offsets 48 and 52 of the tag row.</summary>
+    static readonly uint[] ZeroPoseTag = new uint[2];
+
+    /// <summary>
+    /// P0/P1: latches this frame's palette source. Runs before the empty-list early-out, so a group that stops submitting never leaves
+    /// the scheduler holding the previous frame's instance count. The storage ring only exists on the GPU route.
+    /// </summary>
+    void BeginSkinningFrame(InstancedModel model)
+    {
+        // A one-slot ring has no previous frame to point at; Ready would then be reading the slot it just wrote as history.
+        if (Device.frameCount < 2)
+        {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+            return;
+        }
+
+        Season.Rendering.InstanceBoneStorage? paletteRing = model.BoneStorage;
+        if (paletteRing == null && model.GpuSkinning)
+        {
+            _ownedPalette ??= new Season.Rendering.InstanceBoneStorage();
+            paletteRing = _ownedPalette;
+        }
+        else if (!model.GpuSkinning && _ownedPalette != null)
+        {
+            // The mode (or the process-wide override) turned the GPU route off after the ring had been allocated for it.
+            _ownedPalette.Dispose();
+            _ownedPalette = null;
+        }
+
+        // P2 L1 / P3 L2: the tag row count travels with the latch so the kernel writes a tag exactly on the backends whose vertex
+        // stage reads one. Passing zero here would leave the kernel filling the last joint row instead.
+        _gpuSkin = _skinning.Begin(paletteRing, _asset.SkinBake, _bonePaletteStride, _asset._animations.Count,
+            Season.Rendering.InstanceSkinning.PoseTagRows);
+    }
+
+    /// <summary>
+    /// P1: shapes the ring for this frame. The ring mirrors the backend's frame ring, so its depth is the backend's choice: growing it
+    /// here keeps slot arithmetic and "previous frame" meaning the same thing on both sides. Returns false when the CPU route is the
+    /// only correct answer, which the caller applies by clearing the latch.
+    /// </summary>
+    bool ShapeSkinningRing()
+    {
+        int slots = (int)Device.frameCount;
+        int slot = (int)Device.FrameIndex % slots;
+        return _skinning.PreparePalette(Season.Basic.Graphics.Instance, slots, slot, (slot + slots - 1) % slots, _instanceCount)
+            && _skinning.BeginFrame(_instanceCount);
     }
 
     IMTLBuffer GetInstanceBoneBuffer(int frameIndex)
     {
+        // P1: the ring's slot for this frame is the palette. It is laid out instance-major exactly like the CPU buffer, so the draw
+        // offsets the shader and the callers already compute stay valid without a single call-site change. The gate is this frame's latch
+        // rather than the handoff result: on this route the CPU ring was never allocated, so falling through after a failed handoff would
+        // draw the rest pose, while the ring still holds the last palette the kernel produced.
+        if (_gpuSkin && _skinning.Palette?.Current is MTLStorageBuffer storageBone)
+            return storageBone.Buffer;
+
         if (_instanceBoneBuffers.Length == 0 || _instanceBoneBuffers[frameIndex] == null)
             return IdentityInstanceBoneBuffers[frameIndex];
 
@@ -536,13 +655,17 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
     protected override IMTLBuffer InstanceBoneBufferForDraw(int fi) => GetInstanceBoneBuffer(fi);
 
     /// <summary>Shell rendering for skinned shells uses the previous-frame per-instance bone-frame ring at slot [fi-1], sharing the same source as the main pass.</summary>
-    protected override IMTLBuffer PrevInstanceBoneBufferForDraw(int fi) => GetInstanceBoneBuffer(PrevFrameIndex);
+    protected override IMTLBuffer PrevInstanceBoneBufferForDraw(int fi)
+        => _gpuSkin && _skinning.Palette?.Previous is MTLStorageBuffer storageBone
+            ? storageBone.Buffer
+            : GetInstanceBoneBuffer(PrevFrameIndex);
 
-    /// <summary>The per-instance bone-frame ring always exists on this path (created in Load), so the group can publish the
-    /// previous-bone bit; the per-primitive IsSkinned gate still decides which primitives actually read it.</summary>
-    protected override bool HasPrevBoneHistory => _instanceBoneBuffers.Length > 0;
+    /// <summary>The per-instance bone-frame ring always exists on this path (created in Load), or the GPU route's storage ring stands in
+    /// for it, so the group can publish the previous-bone bit; the per-primitive IsSkinned gate still decides which primitives read it.</summary>
+    protected override bool HasPrevBoneHistory => _instanceBoneBuffers.Length > 0 || _gpuSkin;
 
-    /// <summary>Bone addressing stride for shell rendering on skinned shells: the number of palette matrices per instance, where boneOffset = 64B × stride × slot.</summary>
+    /// <summary>Bone addressing stride for shell rendering on skinned shells: the number of palette matrices per instance, where boneOffset = 64B × stride × slot.
+    /// It is the same number in ring mode: the ring is laid out instance-major, so the same offset formula lands on the same rows.</summary>
     protected override int ShellBonePaletteStride => _bonePaletteStride;
 
     public IReadOnlyList<string> GetAnimationNames()
@@ -608,8 +731,14 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
                 _instanceCount++;
         }
 
+        // P1: latch this frame's palette source. Runs before the empty-list early-out, so a group that stops submitting never leaves
+        // the scheduler holding the previous frame's instance count.
+        BeginSkinningFrame(model);
+
         if (_instanceCount == 0)
         {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
             _transformInitialized = true;
             SyncAlpha(model.Alpha);
             SetOutline2DState(false, default, default);
@@ -618,7 +747,14 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
 
         EnsureAnimationStateCapacity(model.Instances.Count);
         EnsurePrimitiveInstanceCapacity(_instanceCount);
-        EnsureInstanceBoneCapacity((uint)Math.Max(_instanceCount, 1));
+        // P1: shape the GPU route's ring first, then allocate the CPU palette buffer only if it will actually be written.
+        if (_gpuSkin && !ShapeSkinningRing())
+        {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+        }
+        if (!_gpuSkin)
+            EnsureInstanceBoneCapacity((uint)Math.Max(_instanceCount, 1));
 
         // A7 cull input: one root instance world per enabled instance, in write order. The per-primitive streams below hold
         // "node world × instance world", which differs per primitive, so none of them can stand in for the instance as a whole;
@@ -635,6 +771,15 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
         _poseCache.Ensure(model.Instances.Count, _primitives.Count, hasSkin ? _bonePaletteStride : 0);
 
         int writeIndex = 0;
+
+        // P3 L2: the pool lives for exactly one replay, like P3a's dedup table it is keyed against. A pool block addressed by a
+        // previous frame's tag would still hold that frame's pose, which is why a slot's tag is written for every instance every
+        // frame rather than only for the ones that end up pooled.
+        _posePoolBucketBySource.Clear();
+        _posePoolRewrites.Clear();
+        if (_posePoolPending.Length < model.Instances.Count)
+            _posePoolPending = new (int Write, uint Clip, float Time)[model.Instances.Count];
+
         for (int i = 0; i < model.Instances.Count; i++)
         {
             var instance = model.Instances[i];
@@ -681,17 +826,21 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
             anySampled |= samplePose;
 
             // P3a: a sampled instance at tier 2 or slower may share another instance's sample for the same (clip, quantized
-            // time) pair. Replay the clip only on a miss; on a hit the cached rows are copied and the streams below are built
-            // from them exactly as on a throttled frame, so the instance transform still applies this frame.
+            // time) pair. On the CPU route a hit copies the cached rows and the streams below are built from them exactly as on a
+            // throttled frame, so the instance transform still applies this frame. On the GPU route the same hit is P3 L2's signal
+            // that this instance can point its tag at a pool block instead of evaluating again - see the parameter write below.
             float sampleTime = playbackTime;
             int poseSource = -1;
-            if (samplePose && model.TryReuseInstancePose(i, clip, playbackTime, out poseSource, out sampleTime))
+            bool poseShared = samplePose && model.TryReuseInstancePose(i, clip, playbackTime, out poseSource, out sampleTime);
+            if (poseShared && !_gpuSkin)
             {
                 _poseCache.CopyRow(poseSource, i);
                 samplePose = false;
             }
 
-            if (samplePose)
+            // P1: the whole CPU evaluation - rest restore, clip replay, node transform pass - is what the GPU route replaces. The clock
+            // above still runs for every tier, so the instance is drawn at the pose its time names, whoever evaluates it.
+            if (samplePose && !_gpuSkin)
             {
                 RestoreNodesToRestPose();
 
@@ -701,7 +850,7 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
                     _asset._animationPlayer.UpdateAllNodeTransforms(_workNodes);
             }
 
-            if (hasSkin)
+            if (hasSkin && !_gpuSkin)
             {
                 if (samplePose)
                 {
@@ -712,6 +861,52 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
 
                 // P1: a throttled frame re-uploads the palette it sampled last, which is the pose its instance is drawn with.
                 UploadInstanceBoneMatrices(writeIndex, _poseCache.Bones[i]);
+            }
+
+            // P1 GPU route: 16 bytes per instance, the clip index plus the time the clock just produced, already wrapped or clamped the
+            // way the player would have done it. This is the entire per-frame CPU work the palette costs now.
+            //
+            // P3 L2: the time is the deduped one - a tick boundary for a participant, the exact clock for everyone else - because a
+            // pool block is shared by instances that have to evaluate to bitwise the same pose. A shared instance writes only its tag
+            // row; its representative's row is upgraded with the block after the loop, at which point the group is known to exist.
+            if (_gpuSkin && _asset.SkinBake is { } gpuBake)
+            {
+                float gpuTime = gpuBake.NormalizeTime(clip, sampleTime, _asset._animationPlayer.Loop);
+                uint poolRow = 0;
+                bool evaluate = true;
+                if (poseShared)
+                {
+                    if (!_posePoolBucketBySource.TryGetValue(poseSource, out int bucket))
+                    {
+                        // One block per *shared* group, so a frame in which nothing shares reserves nothing. The count is bounded by
+                        // the instance count, which is what PreparePalette sized the pool region by, so the address below always
+                        // lands inside the reservation.
+                        if (_posePoolRewrites.Count < _instanceCount)
+                        {
+                            bucket = _posePoolRewrites.Count;
+                            _posePoolBucketBySource[poseSource] = bucket;
+                            _posePoolRewrites.Add(_posePoolPending[poseSource]);
+                        }
+                        else
+                        {
+                            bucket = -1;
+                        }
+                    }
+
+                    if (bucket >= 0)
+                    {
+                        poolRow = (uint)((_instanceCount + bucket) * _bonePaletteStride);
+                        evaluate = false;
+                    }
+                }
+
+                // Recorded whenever this instance ended up owning its own block, including the degenerate case where the pool
+                // reservation ran out above: it is still a candidate, and the next instance that asks for the same pair will adopt it.
+                // The write index is only known here - the Instances index skips disabled entries, the write index does not.
+                if (evaluate)
+                    _posePoolPending[i] = (writeIndex, (uint)clip, gpuTime);
+
+                _skinning.SetInstance(writeIndex, (uint)clip, gpuTime, evaluate, poolRow);
             }
 
             for (int p = 0; p < _primitives.Count; p++)
@@ -805,10 +1000,31 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
             writeIndex++;
         }
 
+        // P3 L2: upgrade each representative's parameter row now that this frame's groups are known. This is the only parameter write
+        // that happens after the loop, and it is the reason the plan is recorded instead of decided inline: an instance cannot know it
+        // is a representative until a second instance asks for the same (clip, tick) pair, by which time its own row is already
+        // written. The write index it recorded is the same slot the vertex stage will read, so the block is found and the pose is not
+        // evaluated twice.
+        for (int b = 0; b < _posePoolRewrites.Count; b++)
+        {
+            var representative = _posePoolRewrites[b];
+            uint poolRow = (uint)((_instanceCount + b) * _bonePaletteStride);
+            _skinning.SetInstance(representative.Write, representative.Clip, representative.Time, true, poolRow);
+        }
+
+        // P3 L2: publish the group count. The image a zero-group frame produces is by design identical to the unpooled one, so a
+        // capture that only compared pixels could not tell the two apart; this is the number that says the path ran.
+        _skinning.PooledGroups = _posePoolRewrites.Count;
+
+        // P1: nothing is uploaded from here any more. The GPU route's only per-frame CPU work is the 16-byte row written above; the
+        // dispatch that turns it into a palette, and the compute-write-to-vertex-read handoff that makes it readable, are both recorded
+        // by InstanceSkinningEffect at FrameStart - outside any render or compute encoder, which Metal requires.
+
         // P1: publish the pose generation the shadow-atlas reuse digest keys on. It advances only on frames where at least
         // one instance's pose was actually replayed -- exactly when the rendered pose set can differ -- so throttled and held
         // frames keep the cached atlas and any real motion invalidates it. A static host never advances it.
-        if (hasAnimation && anySampled)
+        // The GPU route replays every instance every frame, so every frame can differ.
+        if (hasAnimation && (anySampled || _gpuSkin))
             model.AnimationPoseGeneration++;
 
         // Outline2D activation is the union of host-wide activation and any per-instance activation.
@@ -1119,6 +1335,12 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
     public override void Dispose()
     {
         ReleasePrimitiveInstanceBuffers();
+
+        // P1: leave the skinning scheduler and release the two blocks it owns. The palette ring is only disposed here when this class
+        // created it, which is the same ownership rule the CPU buffer below follows.
+        _skinning.Dispose();
+        _ownedPalette?.Dispose();
+        _ownedPalette = null;
 
         foreach (var primitive in _primitives)
         {

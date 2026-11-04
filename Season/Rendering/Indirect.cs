@@ -37,6 +37,30 @@ public enum StorageBufferUsage
     /// an MTLBuffer has no usage bits at all, but both still honour the declaration for validation symmetry.
     /// </summary>
     ComputeAndVertexInput,
+
+    /// <summary>
+    /// Compute read/write plus use as a shader resource <em>inside the vertex stage</em>, which is what a
+    /// compute-written, VS-consumed data block needs. This is not <see cref="ComputeAndVertexInput"/>: that one feeds
+    /// IA vertex attributes, addressed per vertex/instance by the input assembler, while this one is read by the vertex
+    /// shader itself through an SRV/SSBO at a slot the shader indexes freely. The instance bone palette deliberately
+    /// takes this route rather than a vertex attribute: the joint index is per vertex and the palette row is per
+    /// instance, so the two are combined in the shader, not by the IA.
+    /// <para>
+    /// Backend consequences. Vulkan needs no extra VkBufferUsageFlags (StorageBufferBit already covers it) but does need
+    /// a shader-stage barrier, because a compute-side write must become visible to VERTEX_SHADER reads; that barrier is
+    /// recorded outside any render pass by <c>Graphics.TryPrepareVertexShaderRead</c>. D3D12 needs the resource moved to
+    /// NON_PIXEL_SHADER_RESOURCE, recorded by the same entry point, and a <em>structured</em> SRV whose stride matches the
+    /// shader declaration (a raw ByteAddressBuffer view would not type-match a StructuredBuffer). Metal and WebGPU need
+    /// nothing extra at submit time: Metal tracks the dependency through its encoder barriers, and WebGPU inserts
+    /// synchronization between passes itself. WebGPU does require the bind group layout to declare the binding with
+    /// <c>GPUShaderStage.VERTEX</c> visibility, which is a pipeline-side property, not a buffer property.
+    /// </para>
+    /// <para>
+    /// Read-only from the shader's point of view on all four backends: core WebGPU has no read_write storage access in
+    /// the vertex stage, so a producer that needs to read back its own output must do so in compute.
+    /// </para>
+    /// </summary>
+    ComputeAndVertexShaderRead,
 }
 
 /// <summary>

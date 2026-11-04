@@ -204,6 +204,11 @@ internal class Room : Panel
         busterDrone = new Season.Controls.Model()
         {
             Name = @"Assets/busterDrone.glb",
+            // The drone is 39 primitives and the shadow pass replays every opaque primitive once per
+            // shadow atlas quadrant (three cascades plus the spot), so it alone adds about 152 shadow
+            // draws a frame while casting a small, high shadow that the lamp cones already cover.
+            // Skipping it there keeps the ceiling lamps and the room intact and costs nothing visible.
+            CastShadows = false,
             PosX = 0,
             PosY = 2,
             PosZ = 57,

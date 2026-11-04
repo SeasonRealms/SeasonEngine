@@ -1243,6 +1243,9 @@ TextGlyphData LoadTextGlyph(uint instanceID)
 // Layout: [instanceSlot * bonePaletteStride + jointIndex], instanceSlot being the original instance index decoded at the top of VSMain.
 // Regular and shadow passes always use boneBase=0. OutlineMask carries the slot base through root constants
 // for per-slot drawing.
+// P2 L1 / P3 L2: the last row of each block is that instance's pose-pool tag (see the decode in VSMain), so a pooled palette
+// addresses joints from the block the tag names instead of from the stride product. Row count is Capacity * Stride with the tag
+// rows counted in, and the fetch is instanceSlot * stride + stride - 1, inside the block whatever the pool does.
 StructuredBuffer<float4x4> g_InstanceBoneMatrices : register(t6);
 
 // 2-3 Step C: previous-frame data SBs (same layout as t6, indexed by instanceID/jointIndex;
@@ -1384,6 +1387,43 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
         localTangentXYZ = normalize(localTangentXYZ + morphTangentDelta);
     }
     
+    // P2 L1 / P3 L2: pose-pool tag. Each instance's palette block ends with one row that holds nothing but the tag: the block is
+    // bonePaletteStride rows, the first (bonePaletteStride - 1) of which are joints. Bytes 48 and 52 of that last row carry the
+    // current- and previous-frame block this instance draws its joints from.
+    //
+    // The tag row is not the row whose index equals the instance slot. g_InstanceBoneMatrices[i] resolves to row i of the flat
+    // palette, which belongs to instance i / bonePaletteStride at joint i % bonePaletteStride - a live joint of a neighbour. That
+    // address stayed harmless only while every one of those rows held zero in both lanes, which is why this lookup now goes
+    // through the stride product instead.
+    //
+    // The two lanes are M41 and M42, the last row of the matrix. In a joint row an affine palette guarantees they are zero - it
+    // holds transpose(IBM * world * inverseMesh), every factor is affine so the product's last column is (0, 0, 0, 1), and the
+    // transpose moves that column into the last row. The vertex stage multiplies row vectors (v * P * W), so a non-zero M41 there
+    // would displace the vertex by v.w times it. Nothing multiplies by the tag row, so its two lanes are plain storage. The
+    // translation lives in the *other* position (see below), so a tag written there would be read back as a bogus row number.
+    //
+    // Note the indexing: the upload is row-major 64-byte matrices, but HLSL reads a float4x4 column-major, so m[3] is the
+    // fourth *row* and its four lanes sit at bytes 12, 28, 44, 60 - poseTag[3].x and [3].y are bytes 12 and 28, the
+    // translation. The two reserved bytes are m[0].w and m[1].w instead, which is why the other three backends spell the same
+    // two lanes as m[3].x and m[3].y: their matrices are indexed by column, so m[3] already starts at byte 48. Same bytes,
+    // different letter. A disassembly confirms the loads land on l(48) and l(52).
+    //
+    // An unpooled palette decodes to 0 and keeps the historical instanceSlot * stride address below. The decode only ever selects
+    // an address and never rewrites a matrix, so both branches are bit-exact. Gated on isSkinned as well: a plain instanced draw
+    // (the tree field) binds no palette, and its block would be an out-of-bounds fetch rather than a tag row.
+    int boneBase = isInstanced ? (int)instanceSlot * (int)bonePaletteStride : 0;
+    int prevBoneBase = boneBase;
+    if (isInstanced && isSkinned)
+    {
+        float4x4 poseTag = g_InstanceBoneMatrices[boneBase + (int)bonePaletteStride - 1];
+        uint pooledRow = asuint(poseTag[0].w);       // PoseTagCurrentOffset = 48
+        uint pooledPrevRow = asuint(poseTag[1].w);   // PoseTagPreviousOffset = 52
+        if (pooledRow != 0u)
+            boneBase = (int)pooledRow;
+        if (pooledPrevRow != 0u)
+            prevBoneBase = (int)pooledPrevRow;
+    }
+
     // Skeletal skinning
     float totalWeight = input.weights.x + input.weights.y + input.weights.z + input.weights.w;
     if (totalWeight > 0.0)
@@ -1402,7 +1442,7 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
                 // Both regular models and GPU-instanced draws read from the dynamic bone StructuredBuffer.
                 if (isSkinned)
                 {
-                    int baseIdx = isInstanced ? (int)instanceSlot * (int)bonePaletteStride + jointIndex : jointIndex;
+                    int baseIdx = isInstanced ? boneBase + jointIndex : jointIndex;
                     float4x4 boneMatrix = g_InstanceBoneMatrices[baseIdx];
                     skinnedPosition += mul(localPosition, boneMatrix) * weight;
                     float3x3 boneMatrix3x3 = (float3x3)boneMatrix;
@@ -1551,7 +1591,7 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
                 if (w <= 0.0)
                     continue;
                 int j = (int)input.jointIndices[i];
-                int idx = isInstanced != 0 ? ((int)instanceSlot * (int)bonePaletteStride + j) : j;
+                int idx = isInstanced != 0 ? (prevBoneBase + j) : j;
                 float4x4 bm;
                 if (hasPrevBones != 0)
                 {

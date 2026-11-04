@@ -1172,6 +1172,8 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         Season.Rendering.StorageBufferUsage usage = Season.Rendering.StorageBufferUsage.Compute)
     {
         var buffer = new WGPUStorageBuffer(sizeInBytes, usage);
+        // A0.1/A7: only the two usages that change the GPUBufferUsage bits travel to JS. P0's ComputeAndVertexShaderRead needs none:
+        // the storage bit already covers a vertex-stage read, and stage visibility lives in the bind group layout, not in the buffer.
         WebGPUInterop.CreateStorageBuffer(buffer.Id, (int)sizeInBytes,
             usage == Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs,
             usage == Season.Rendering.StorageBufferUsage.ComputeAndVertexInput);
@@ -1195,6 +1197,19 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             && buffer is WGPUStorageBuffer wgpuBuffer
             && wgpuBuffer.Usage == Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs
             && wgpuBuffer.SizeInBytes >= Season.Rendering.IndirectDrawIndexedArgs.SizeInBytes;
+
+    /// <summary>
+    /// P0: the instance palette can be compute-written and read by the vertex shader. WebGPU inserts synchronization between passes itself,
+    /// so the compute write and the vertex read need nothing recorded here; the real requirement is on the pipeline side, where the bind
+    /// group layout must declare that binding with <c>GPUShaderStage.VERTEX</c> visibility. The palette binding already does, because
+    /// the CPU route binds the same slot every frame - which is exactly why swapping the buffer is the whole change.
+    /// </summary>
+    public bool VertexShaderStorageReadSupported => _initialized;
+
+    public bool TryPrepareVertexShaderRead(Season.Rendering.StorageBuffer buffer)
+        => _initialized
+            && buffer is WGPUStorageBuffer wgpuBuffer
+            && wgpuBuffer.Usage == Season.Rendering.StorageBufferUsage.ComputeAndVertexShaderRead;
 
     /// <summary>1-8: 3D storage textures are registered only into the dedicated JS-side <c>_textures3d</c>
     /// dictionary and **not** into <c>DictionaryWGPUTexture</c>. The latter is the name-based lookup source
