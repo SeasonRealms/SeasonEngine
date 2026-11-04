@@ -263,7 +263,7 @@ internal unsafe class VKInstancedMesh3D : VKInstancedPrimitiveGroup
             anyInstanceOutline ? _outline2DInstanceColor : mesh.Highlight.OutlineColor,
             anyInstanceOutline ? _outline2DInstanceWidth : mesh.Highlight.OutlineWidth);
 
-        Device.ResourceManager.UpdateBuffer(_instanceBuffer, _instanceData);
+        UploadInstanceStream(_instanceData, _instanceCount);
 
         // A7: the culling input is bit-for-bit identical to the IA instance stream, so this array is reused directly rather than storing a second copy.
         UpdateCullUpload(mesh);
@@ -281,13 +281,13 @@ internal unsafe class VKInstancedMesh3D : VKInstancedPrimitiveGroup
 
         _transformInitialized = true;
 
-        // 2-3 Step C: from the second frame onward, the prev SB contains valid data,
-        // so notify the shader path that it can start reading it.
-        // Also rewrite the DescriptorSet to switch binding 14 from the default zero buffer
-        // to the actual prev SSBO.
+        // 2-3 Step C: publishes whether the previous-frame stream may be read. Not a one-shot call any more: the history is
+        // addressed by the compacted instance slot, so it only lines up while the enabled order is unchanged
+        // (see InstancedMesh3DBase.InstanceHistoryValid). The first frame after load has no history and passes false.
+        // The DescriptorSet rewrite stays one-shot: it only switches binding 14 from the zero placeholder to the real SSBO.
+        UpdatePrevStateFlags(wasInitialized && mesh.InstanceHistoryValid);
         if (wasInitialized)
         {
-            SetPrevInstanceWorldReady();
             foreach (var primitive in _primitives)
                 RewriteDescriptorSets(primitive);
             // Keep shell primitive descriptor sets in sync
@@ -349,27 +349,8 @@ internal unsafe class VKInstancedMesh3D : VKInstancedPrimitiveGroup
             ? new() { Buffer = _prevInstanceWorldBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize }
             : base.GetPrevInstanceWorldBufferInfo(fi);
 
-    /// <summary>2-3 Step C (track C-a): after the prev instance world SB has been filled with valid data,
-    /// set MaterialParams.HasPrevInstanceWorld = 1 for all primitives
-    /// (written across all N-buffered frames),
-    /// so the shader side starts reading the prev instance world SB.
-    /// This is written only on the first call because the value does not change afterward.</summary>
-    void SetPrevInstanceWorldReady()
-    {
-        for (int i = 0; i < _primitives.Count; i++)
-        {
-            var primitive = _primitives[i];
-            if (primitive.MaterialParams.HasPrevInstanceWorld != 0)
-                continue;
-            primitive.MaterialParams.HasPrevInstanceWorld = 1;
-            for (int f = 0; f < Device.frameCount; f++)
-                Unsafe.Write(primitive.MappedMaterialBuffers[f], primitive.MaterialParams);
-        }
-        // Synchronize prev flags for shell primitives:
-        // cover both template sets and both instance-box pools,
-        // since pooled boxes may have been created earlier and have stale flags
-        SyncShellPrevFlags(hasPrevInstanceWorld: true, hasPrevBones: false, hasPrevMorph: false);
-    }
+    // 2-3 Step C (track C-a): the prev instance world SB is published by UpdatePrevStateFlags in the base class, which runs
+    // every frame so it can withdraw history for a frame whose compacted instance order changed.
 
     public override void Dispose()
     {

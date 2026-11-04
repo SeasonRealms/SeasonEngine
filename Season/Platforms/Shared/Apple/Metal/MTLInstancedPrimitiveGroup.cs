@@ -34,6 +34,11 @@ internal struct InstanceTransformData
 /// It centralizes instance-buffer management, transparent sorting, and three-bucket grouped rendering.
 /// Derived types include MTLInstancedModel for glTF template cloning
 /// and MTLInstancedMesh3D for generated geometry.
+///
+/// A7c note -- the cull input is still uploaded every frame on purpose. The instance stream is a frame ring (one slot per
+/// frame in flight) and the upload lands in this frame's slot, so an alias would have to be rebuilt and re-validated on every
+/// frame boundary, while all it would save is a memcpy that unified memory already makes nearly free. Metal keeps the copy;
+/// the bytes are identical, so the picture matches the D3D12 path exactly.
 /// </summary>
 internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.Rendering.IInstanceCullTarget
 {
@@ -72,20 +77,29 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     protected bool _outline2DHostActive;
 
     /// <summary>
-    /// Contract clause 8(c) of 2-3: double-buffered instance streams.
-    /// The write side at [_instanceWriteIndex] is fully rewritten every frame,
-    /// while the opposite side contains the previous-frame per-instance world transforms and morph weights.
-    /// That opposite side can be bound directly as the prev source at VS buffer(9),
-    /// with no extra CPU copy.
-    /// When capacity changes, both sides are rebuilt and cleared together,
+    /// Contract clause 8(c) of 2-3: the instance stream is a frame ring with one slot per in-flight frame.
+    /// The slot at [FrameIndex] is fully rewritten every frame, while the slot at [FrameIndex - 1]
+    /// still holds the previous frame's per-instance world transforms and morph weights,
+    /// so the prev source at VS buffer(9) is a handle swap rather than a copy.
+    /// Two slots are not enough: Device allows frameCount frames in flight, and frame k would overwrite the slot frame k-2
+    /// is still reading. When capacity changes, every slot is rebuilt and cleared together,
     /// where r3.w == 0 acts as the "no history" sentinel.
     /// </summary>
-    protected readonly IMTLBuffer[] _instanceBuffers = new IMTLBuffer[2];
-    protected int _instanceWriteIndex;
+    protected IMTLBuffer[] _instanceBuffers = Array.Empty<IMTLBuffer>();
 
-    /// <summary>The previous-instance stream for the current frame.
+    /// <summary>Ring slot this frame writes and reads.</summary>
+    protected static int InstanceFrameSlot => (int)(Device.FrameIndex % Device.frameCount);
+
+    /// <summary>The previous-instance stream for the current frame: the slot the previous frame wrote.
     /// If no history exists yet, it falls back to the write side so the shader uses current values through the r3.w == 0 sentinel.</summary>
-    protected IMTLBuffer PrevInstanceBuffer => _instanceBuffers[_instanceWriteIndex ^ 1] ?? _instanceBuffer;
+    protected IMTLBuffer PrevInstanceBuffer
+    {
+        get
+        {
+            var prev = _instanceBuffers.Length > 0 ? _instanceBuffers[PrevFrameIndex] : null;
+            return prev ?? _instanceBuffer;
+        }
+    }
 
     // === A7 per-instance GPU culling ===
     // Corresponds item-by-item to DXInstancedPrimitiveGroup / VKInstancedPrimitiveGroup: the five buffers are rebuilt only when capacity changes, "grow-only".
@@ -101,7 +115,6 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     Season.Rendering.StorageBuffer?[] _cullStreamSources = Array.Empty<Season.Rendering.StorageBuffer?>();
     Season.Rendering.StorageBuffer? _cullArgs;
     Season.Rendering.StorageBuffer? _cullVisible;
-    Season.Rendering.StorageBuffer? _cullPrimInfo;
     int _cullCapacity = -1;
     /// <summary>Number of parameter-table entries already uploaded to the GPU. When it differs from <see cref="_cullPrimInfoPending"/>, this frame needs a re-upload.</summary>
     int _cullPrimitiveCount = -1;
@@ -110,6 +123,10 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     byte[]? _cullPrimInfoBytes;
     /// <summary>Number of entries in the CPU-side parameter table; -1 means it has never been constructed.</summary>
     int _cullPrimInfoPending = -1;
+    /// <summary>A7b: the arg-buffer image composed from <see cref="_cullPrimInfoBytes"/>. It exists for the same reason as that table --
+    /// its content only changes with the primitive set, so the per-frame path is one "is it stale" comparison and the per-frame reset
+    /// dispatch it replaces is gone.</summary>
+    byte[]? _cullArgsTemplate;
     bool _cullRegistered;
     Vector3 _cullLocalCenter;
     Vector3 _cullLocalExtents;
@@ -136,8 +153,8 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     protected virtual ReadOnlySpan<InstanceTransformData> GetCullDrawStream(int stream) => default;
 
     /// <summary>
-    /// The index range the indirect args must replay for <paramref name="primitive"/>. The reset kernel writes it into every slot's
-    /// args and the indirect draw no longer passes a range of its own, so it must come from the same source as the direct draw's
+    /// The index range the indirect args must replay for <paramref name="primitive"/>. <see cref="Season.Rendering.InstanceCull.BuildArgsTemplate"/> writes
+    /// it into every slot's args and the indirect draw no longer passes a range of its own, so it must come from the same source as the direct draw's
     /// drawIndexedPrimitives arguments -- a group drawing a sub-range of a shared index buffer overrides this, otherwise its indirect
     /// draws would replay the whole buffer from index 0. The default mirrors the indexCount every direct call site passes.
     /// </summary>
@@ -205,37 +222,90 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
         if (count <= 0)
             return;
 
-        if (_instanceBuffers[0] != null && _instanceCapacity == count)
+        if (_instanceCapacity == count && _instanceBuffers.Length == Device.frameCount)
             return;
 
-        // On capacity changes, rebuild and clear both sides together.
+        // On capacity changes, rebuild and clear every slot together.
         // After clearing, r3.w == 0 makes the shader fall back to the current world,
         // preventing stale indices on the old side from generating fake velocity when instance counts change.
         nuint size = (nuint)(Unsafe.SizeOf<InstanceTransformData>() * count);
-        for (int i = 0; i < 2; i++)
+        // The old ring may be empty (first build) or shorter (a device whose frameCount shrank), so index it only
+        // where it actually reaches.
+        var previous = _instanceBuffers;
+        var buffers = new IMTLBuffer[Device.frameCount];
+        for (int i = 0; i < buffers.Length; i++)
         {
-            _instanceBuffers[i]?.Dispose();
-            _instanceBuffers[i] = Device.ResourceManager.CreateBuffer(size);
+            if ((uint)i < (uint)previous.Length)
+                previous[i]?.Dispose();
+            buffers[i] = Device.ResourceManager.CreateBuffer(size);
             unsafe
             {
-                new Span<byte>((void*)_instanceBuffers[i].Contents, (int)size).Clear();
+                new Span<byte>((void*)buffers[i].Contents, (int)size).Clear();
             }
         }
 
+        _instanceBuffers = buffers;
         _instanceCapacity = count;
     }
 
     /// <summary>
-    /// Advances the write side of the double-buffered instance stream for 2-3 and uploads current-frame data.
-    /// Derived Update methods call this at the end,
-    /// after which <see cref="_instanceBuffer"/> points to the current-frame write side
-    /// and <see cref="PrevInstanceBuffer"/> points to the previous-frame side.
+    /// Uploads this frame's instance stream into this frame's ring slot and makes <see cref="_instanceBuffer"/> point at it.
+    /// Derived Update methods call this at the end, after which <see cref="PrevInstanceBuffer"/> is the slot the previous
+    /// frame wrote -- a handle swap, not a second upload.
     /// </summary>
-    protected void FlipAndUploadInstanceStream(InstanceTransformData[] data, int count)
+    protected void UploadInstanceStream(InstanceTransformData[] data, int count)
     {
-        _instanceWriteIndex ^= 1;
-        _instanceBuffer = _instanceBuffers[_instanceWriteIndex];
+        int slot = InstanceFrameSlot;
+        if ((uint)slot >= (uint)_instanceBuffers.Length)
+            return;
+
+        _instanceBuffer = _instanceBuffers[slot];
+        if (_instanceBuffer == null || count <= 0)
+            return;
+
         Device.ResourceManager.UpdateBuffer(_instanceBuffer, new ReadOnlySpan<InstanceTransformData>(data, 0, count));
+    }
+
+    /// <summary>Whether this group owns a previous-frame per-instance bone palette. Model-only: the generated-geometry path
+    /// carries no skeletons, so its bit stays off and the shader never looks for a palette.</summary>
+    protected virtual bool HasPrevBoneHistory => false;
+
+    /// <summary>Whether this group owns previous-frame per-instance morph weights. Model-only for the same reason as
+    /// <see cref="HasPrevBoneHistory"/>; on this backend the weights ride the instance stream anyway, so it stays off.</summary>
+    protected virtual bool HasPrevMorphHistory => false;
+
+    /// <summary>
+    /// 2-3 Step C: publishes whether previous-frame data may be read this frame, on the main primitives and the highlight
+    /// shells alike. It is called every frame instead of once, because "the previous frame" is only the previous frame while the
+    /// compacted instance order holds: switching one instance off shifts every later instance's slot, and reading history then pairs
+    /// each instance with its predecessor (a one-frame velocity spike on everything past the change). Passing false makes the
+    /// shaders fall back to current data. Shell primitives are kept in sync, otherwise the shell keeps a trail the body no longer has.
+    /// </summary>
+    protected void UpdatePrevStateFlags(bool historyValid)
+    {
+        uint prevWorld = historyValid ? 1u : 0u;
+        uint prevMorph = historyValid && HasPrevMorphHistory ? 1u : 0u;
+        // Bones stay gated per primitive: only a skinned primitive has a palette to read at all.
+        bool hasPrevBones = historyValid && HasPrevBoneHistory;
+
+        for (int i = 0; i < _primitives.Count; i++)
+        {
+            var primitive = _primitives[i];
+            uint prevBones = hasPrevBones && primitive.MaterialParams.IsSkinned != 0 ? 1u : 0u;
+            if (primitive.MaterialParams.HasPrevInstanceWorld == prevWorld
+                && primitive.MaterialParams.HasPrevBones == prevBones
+                && primitive.MaterialParams.HasPrevMorph == prevMorph)
+                continue;
+
+            primitive.MaterialParams.HasPrevInstanceWorld = prevWorld;
+            primitive.MaterialParams.HasPrevBones = prevBones;
+            primitive.MaterialParams.HasPrevMorph = prevMorph;
+            for (int f = 0; f < Device.frameCount; f++)
+                WriteStruct(primitive.MaterialBuffers[f], primitive.MaterialParams);
+        }
+
+        // Both template sets and both instance-box pools: a pooled box may have been created before the flags settled.
+        SyncShellPrevFlags(prevWorld != 0, hasPrevBones, prevMorph != 0);
     }
 
     public new void Draw()
@@ -537,8 +607,6 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullStreamSorted(int stream)
         => (uint)stream < (uint)_cullSorted.Length ? _cullSorted[stream] : null;
 
-    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullPrimitiveInfo => _cullPrimInfo;
-
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullArgs => _cullArgs;
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullVisible => _cullVisible;
@@ -609,10 +677,10 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
                         streamSources[s] = g.CreateStorageBuffer((uint)capacity * Season.Rendering.InstanceCull.WorldStride);
                 }
                 _cullVisible = g.CreateStorageBuffer((uint)(Season.Rendering.InstanceCull.MaxSlots * capacity) * 4u);
-                _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsBytes,
+                // A7b: ArgsTotalBytes, not ArgsBytes -- the per-slot visible-count accumulator lives in the tail of the same block, which
+                // is what lets the per-frame reset dispatch go away without a second buffer or a second upload path behind it.
+                _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsTotalBytes,
                     Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs);
-                _cullPrimInfo = g.CreateStorageBuffer(
-                    (uint)Season.Rendering.InstanceCull.MaxPrimitives * Season.Rendering.InstanceCull.PrimitiveInfoStride);
             }
             catch (Exception ex)
             {
@@ -628,7 +696,7 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
                 complete &= b != null;
 
             if (!complete || _cullSource == null || _cullVisible == null
-                || _cullArgs == null || _cullPrimInfo == null)
+                || _cullArgs == null)
             {
                 ReleaseCullResources();
                 return;
@@ -650,12 +718,12 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     /// <summary>
     /// Construct the parameter-table bytes only, without touching the GPU -- the safe timing for construction and upload differs: construction can happen at any time,
     /// while the upload must wait until a blit encoder can be opened (see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>).
-    /// If the primitive set is unchanged, do not rebuild. The index range and the draw side must share the same source: the reset kernel writes this
-    /// range into the indirect parameters, and the draw side no longer supplies it itself -- hence <see cref="GetCullPrimitiveRange"/>.
+    /// If the primitive set is unchanged, do not rebuild. The index range and the draw side must share the same source: the arg image
+    /// carries this range into the indirect parameters, and the draw side no longer supplies it itself -- hence <see cref="GetCullPrimitiveRange"/>.
     /// </summary>
     void EnsureCullPrimitiveInfo()
     {
-        if (_cullPrimInfo == null)
+        if (_cullArgs == null)
             return;
         int n = _opaquePrimitives.Count;
         if (n <= 0 || n > Season.Rendering.InstanceCull.MaxPrimitives)
@@ -663,6 +731,7 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
             // Explicitly record "there is no parameter table to upload": otherwise PrepareCullInputs would repeatedly upload the previous bytes,
             // whose count looks matching but whose contents are the stale copy.
             _cullPrimInfoBytes = null;
+            _cullArgsTemplate = null;
             _cullPrimInfoPending = 0;
             _cullPrimitiveCount = 0;
             return;
@@ -681,6 +750,9 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
 
         _cullPrimInfoBytes = bytes;
         _cullPrimInfoPending = n;
+        // A7b: the arg image is composed here too -- a pure function of this table plus the fixed slot layout, i.e. exactly the bytes
+        // the reset kernel used to write every frame, now built once when its input changes.
+        _cullArgsTemplate = Season.Rendering.InstanceCull.BuildArgsTemplate(bytes, n);
     }
 
     /// <summary>
@@ -690,6 +762,8 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
     /// The input is bit-for-bit identical to the IA instance stream (both are InstanceTransformData, stride 80 matching WorldStride),
     /// so the same array is reused directly without storing an extra copy. A per-primitive-stream group additionally uploads each
     /// primitive's own stream as that stream's gather source (see <see cref="CullPerPrimitiveStreams"/>).
+    /// A7b: what the arg slot no longer carries is the reset kernel's per-frame output -- the template upload above only happens when the
+    /// primitive set changes, which is the entire dispatch saving.
     /// </summary>
     bool Season.Rendering.IInstanceCullTarget.PrepareCullInputs()
     {
@@ -699,12 +773,13 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
         var g = Season.Basic.Graphics.Instance;
 
         // The parameter table follows the geometry rather than the frame, so it is re-uploaded only when the entry count changes.
+        // A7b: what it carries is frame-invariant (the index ranges) or re-derived by the GPU later in the same frame (the instance
+        // counts, published by gather), which is exactly why this once-per-primitive-set upload can stand in for a per-frame reset dispatch.
         if (_cullPrimInfoPending != _cullPrimitiveCount)
         {
-            if (_cullPrimInfoPending <= 0 || _cullPrimInfoBytes == null || _cullPrimInfo == null)
+            if (_cullPrimInfoPending <= 0 || _cullArgsTemplate == null || _cullArgs == null)
                 return false;
-            int bytes = _cullPrimInfoPending * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride;
-            if (!g.TryUpdateStorageBuffer(_cullPrimInfo, new ReadOnlySpan<byte>(_cullPrimInfoBytes, 0, bytes)))
+            if (!g.TryUpdateStorageBuffer(_cullArgs, _cullArgsTemplate))
                 return false;
             _cullPrimitiveCount = _cullPrimInfoPending;
         }
@@ -772,10 +847,10 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
         _cullStreamSources = Array.Empty<Season.Rendering.StorageBuffer?>();
         _cullArgs?.Dispose(); _cullArgs = null;
         _cullVisible?.Dispose(); _cullVisible = null;
-        _cullPrimInfo?.Dispose(); _cullPrimInfo = null;
         _cullCapacity = -1;
         _cullPrimitiveCount = -1;
         _cullPrimInfoBytes = null;
+        _cullArgsTemplate = null;
         _cullPrimInfoPending = -1;
         _cullDrawReady = false;
     }

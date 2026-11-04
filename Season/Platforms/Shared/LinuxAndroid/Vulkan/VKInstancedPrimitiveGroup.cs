@@ -36,6 +36,12 @@ internal struct InstanceTransformData
 /// and three-bucket grouped drawing.
 /// Derived classes: VKInstancedModel (glTF template cloning) /
 /// VKInstancedMesh3D (code-generated geometry).
+///
+/// A7c note -- why this backend still uploads its own copy of the cull input every frame instead of aliasing the IA instance buffer the way D3D12 does:
+/// a VkBuffer's usage flags are fixed at vkCreateBuffer time, while the instance buffer is created through CreateVertexBuffer (VERTEX_BUFFER_BIT only).
+/// Aliasing would mean baking STORAGE_BUFFER_BIT into that creation, which on the host-visible memory Android uses risks an allocation failure, and having
+/// the GPU read host-visible memory is slower than reading the device-local copy it would replace. The bytes are the same either way, so the culling
+/// result is identical to the D3D12 path; only the transport differs.
 /// </summary>
 internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Season.Rendering.IInstanceCullTarget
 {
@@ -47,9 +53,16 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
     protected InstanceTransformData[] _instanceData = Array.Empty<InstanceTransformData>();
     protected Matrix4x4[] _instanceWorlds = Array.Empty<Matrix4x4>();
 
+    /// <summary>This frame's IA instance buffer: <see cref="UploadInstanceStream"/> points it at the ring slot the frame writes.</summary>
     protected BufferResource _instanceBuffer;
+    /// <summary>Instance stream ring, one slot per frame in flight. The buffer is written through host-visible memory
+    /// every frame, so a single buffer would let frame k overwrite the bytes frame k-2 is still reading on the GPU.</summary>
+    protected BufferResource[] _instanceBuffers = Array.Empty<BufferResource>();
     protected int _instanceCapacity;
     protected int _instanceCount;
+
+    /// <summary>Ring slot this frame writes and reads.</summary>
+    protected static int InstanceFrameSlot => (int)(Device.FrameIndex % Device.frameCount);
 
     /// <summary>Whether any instance enabled Wireframe highlighting in this frame
     /// (written during Update and used as a zero-cost gate during Draw;
@@ -99,7 +112,6 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
     Season.Rendering.StorageBuffer?[] _cullStreamSources = Array.Empty<Season.Rendering.StorageBuffer?>();
     Season.Rendering.StorageBuffer? _cullArgs;
     Season.Rendering.StorageBuffer? _cullVisible;
-    Season.Rendering.StorageBuffer? _cullPrimInfo;
     int _cullCapacity = -1;
     /// <summary>Number of primitive-info entries already uploaded to the GPU. When it differs from <see cref="_cullPrimInfoPending"/>, this frame must re-upload.</summary>
     int _cullPrimitiveCount = -1;
@@ -109,6 +121,10 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
     byte[]? _cullPrimInfoBytes;
     /// <summary>Number of CPU-side primitive-info entries; -1 means it has never been built.</summary>
     int _cullPrimInfoPending = -1;
+    /// <summary>A7b: the arg-buffer image composed from <see cref="_cullPrimInfoBytes"/>. It exists for the same reason as that table --
+    /// its content only changes with the primitive set, so the per-frame path is one "is it stale" comparison, and the per-frame reset
+    /// dispatch it replaces is gone.</summary>
+    byte[]? _cullArgsTemplate;
     bool _cullRegistered;
     bool _cullDrawReady;
     /// <summary>The owner's effective draw path is <see cref="Season.Controls.InstanceDrawPath.Indirect"/>, latched in Update so the cull dispatch and the draw see the same answer.</summary>
@@ -130,8 +146,8 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
     protected virtual ReadOnlySpan<InstanceTransformData> GetCullDrawStream(int stream) => default;
 
     /// <summary>
-    /// The index range the indirect args must replay for <paramref name="primitive"/>. The reset kernel writes it into every slot's
-    /// args and the indirect draw no longer passes a range of its own, so it must come from the same source as the direct draw's
+    /// The index range the indirect args must replay for <paramref name="primitive"/>. <see cref="Season.Rendering.InstanceCull.BuildArgsTemplate"/> writes
+    /// it into every slot's args and the indirect draw no longer passes a range of its own, so it must come from the same source as the direct draw's
     /// vkCmdDrawIndexed arguments -- a group drawing a sub-range of a shared index buffer overrides this, otherwise its indirect
     /// draws would replay the whole buffer from index 0. The default mirrors the indexCount every direct call site passes.
     /// </summary>
@@ -200,20 +216,43 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
         if (count <= 0)
             return;
 
-        if (_instanceBuffer.Buffer.Handle != 0 && _instanceCapacity == count)
+        if (_instanceCapacity == count && _instanceBuffers.Length == (int)Device.frameCount)
             return;
 
-        if (_instanceBuffer.Buffer.Handle != 0)
+        for (int i = 0; i < _instanceBuffers.Length; i++)
         {
             // Never destroy a vertex buffer that a frame in flight may still reference. A capacity change happens at most
             // one frame after the previous one, so the old buffer is still bound by pending command buffers; destroying it
             // here is VUID-vkDestroyBuffer-buffer-00922, and on Android tilers it can read freed pages.
-            var retired = _instanceBuffer;
-            Device.EnqueueDeferredRelease(() => Device.ResourceManager.DestroyBuffer(retired));
+            var retired = _instanceBuffers[i];
+            if (retired.Buffer.Handle != 0)
+                Device.EnqueueDeferredRelease(() => Device.ResourceManager.DestroyBuffer(retired));
         }
 
-        _instanceBuffer = Device.ResourceManager.CreateVertexBuffer<InstanceTransformData>((uint)count);
+        int slots = (int)Device.frameCount;
+        var buffers = new BufferResource[slots];
+        for (int i = 0; i < slots; i++)
+            buffers[i] = Device.ResourceManager.CreateVertexBuffer<InstanceTransformData>((uint)count);
+
+        _instanceBuffers = buffers;
         _instanceCapacity = count;
+    }
+
+    /// <summary>
+    /// Uploads this frame's instance stream into this frame's ring slot and makes <see cref="_instanceBuffer"/> point at it.
+    /// Derived Update methods call this at the end, so every draw this frame binds the bytes they just produced.
+    /// </summary>
+    protected void UploadInstanceStream(InstanceTransformData[] data, int count)
+    {
+        int slot = InstanceFrameSlot;
+        if ((uint)slot >= (uint)_instanceBuffers.Length)
+            return;
+
+        _instanceBuffer = _instanceBuffers[slot];
+        if (_instanceBuffer.Buffer.Handle == 0 || count <= 0)
+            return;
+
+        Device.ResourceManager.UpdateBuffer(_instanceBuffer, data);
     }
 
     public new void Draw()
@@ -483,8 +522,6 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullStreamSorted(int stream)
         => (uint)stream < (uint)_cullSorted.Length ? _cullSorted[stream] : null;
 
-    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullPrimitiveInfo => _cullPrimInfo;
-
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullArgs => _cullArgs;
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullVisible => _cullVisible;
@@ -503,6 +540,44 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
         _cullDrawReady = false;
         _cullMainView = owner.EffectiveDrawPath == Season.Controls.InstanceDrawPath.Indirect;
         EnsureCullResources(_instanceCount);
+    }
+
+    /// <summary>Whether this group owns a previous-frame bone palette. Only the model path does.</summary>
+    protected virtual bool HasPrevBoneHistory => false;
+
+    /// <summary>Whether this group owns previous-frame morph weights. Model-only, same as <see cref="HasPrevBoneHistory"/>.</summary>
+    protected virtual bool HasPrevMorphHistory => false;
+
+    /// <summary>
+    /// 2-3 Step C: publishes whether previous-frame data may be read this frame, on the main primitives and the highlight shells alike.
+    /// It is called every frame rather than once, because "the previous frame" is only the previous frame while the compacted instance
+    /// order holds: switching one instance off shifts every later instance's slot, and reading history then pairs each instance with its
+    /// predecessor (a one-frame velocity spike on everything past the change). Passing false makes the shaders fall back to current data.
+    /// See <see cref="Season.Controls.InstancedMesh3DBase.InstanceHistoryValid"/>.
+    /// Shell primitives are kept in sync (plan risk 2), otherwise the shell keeps a trail the body no longer has.
+    /// </summary>
+    protected void UpdatePrevStateFlags(bool historyValid)
+    {
+        uint prevWorld = historyValid ? 1u : 0u;
+        uint prevBones = historyValid && HasPrevBoneHistory ? 1u : 0u;
+        uint prevMorph = historyValid && HasPrevMorphHistory ? 1u : 0u;
+
+        for (int i = 0; i < _primitives.Count; i++)
+        {
+            var primitive = _primitives[i];
+            if (primitive.MaterialParams.HasPrevInstanceWorld == prevWorld
+                && primitive.MaterialParams.HasPrevBones == prevBones
+                && primitive.MaterialParams.HasPrevMorph == prevMorph)
+                continue;
+
+            primitive.MaterialParams.HasPrevInstanceWorld = prevWorld;
+            primitive.MaterialParams.HasPrevBones = prevBones;
+            primitive.MaterialParams.HasPrevMorph = prevMorph;
+            for (int f = 0; f < Device.frameCount; f++)
+                Unsafe.Write(primitive.MappedMaterialBuffers[f], primitive.MaterialParams);
+        }
+
+        SyncShellPrevFlags(prevWorld != 0, prevBones != 0, prevMorph != 0);
     }
 
     /// <summary>Capacity is aligned to 64 so small instance-count jitter does not recreate the five buffers every frame.
@@ -551,10 +626,10 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
                         streamSources[s] = g.CreateStorageBuffer((uint)capacity * Season.Rendering.InstanceCull.WorldStride);
                 }
                 _cullVisible = g.CreateStorageBuffer((uint)(Season.Rendering.InstanceCull.MaxSlots * capacity) * 4u);
-                _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsBytes,
+                // A7b: ArgsTotalBytes, not ArgsBytes: the per-slot visible-count accumulator shares this block, which is what removed
+                // the need for a per-frame reset dispatch without adding a second buffer or a second upload path per backend.
+                _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsTotalBytes,
                     Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs);
-                _cullPrimInfo = g.CreateStorageBuffer(
-                    (uint)Season.Rendering.InstanceCull.MaxPrimitives * Season.Rendering.InstanceCull.PrimitiveInfoStride);
             }
             catch (Exception ex)
             {
@@ -570,7 +645,7 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
                 complete &= b != null;
 
             if (!complete || _cullSource == null || _cullVisible == null
-                || _cullArgs == null || _cullPrimInfo == null)
+                || _cullArgs == null)
             {
                 ReleaseCullResources();
                 return;
@@ -595,11 +670,11 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
     /// the command buffer enters the recording state
     /// (see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>).
     /// Nothing is rebuilt while the primitive set stays unchanged. The range comes from <see cref="GetCullPrimitiveRange"/>, the same
-    /// source as the direct draw's, because the reset kernel writes it into the indirect args and the draw no longer passes one.
+    /// source as the direct draw's, because the arg template writes it into the indirect args and the draw no longer passes one.
     /// </summary>
     void EnsureCullPrimitiveInfo()
     {
-        if (_cullPrimInfo == null)
+        if (_cullArgs == null)
             return;
         int n = _opaquePrimitives.Count;
         if (n <= 0 || n > Season.Rendering.InstanceCull.MaxPrimitives)
@@ -608,6 +683,7 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
             // PrepareCullInputs would repeatedly upload the previous bytes, and the entry count
             // would look right while the contents were the stale copy.
             _cullPrimInfoBytes = null;
+            _cullArgsTemplate = null;
             _cullPrimInfoPending = 0;
             _cullPrimitiveCount = 0;
             return;
@@ -626,6 +702,9 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
 
         _cullPrimInfoBytes = bytes;
         _cullPrimInfoPending = n;
+        // A7b: the arg image is composed here too -- it is a pure function of this table and the fixed slot layout, i.e. exactly the
+        // bytes the reset kernel used to write every frame, built once at the moment its input changes.
+        _cullArgsTemplate = Season.Rendering.InstanceCull.BuildArgsTemplate(bytes, n);
     }
 
     /// <summary>
@@ -643,12 +722,14 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
         var g = Season.Basic.Graphics.Instance;
 
         // The primitive-info table follows the geometry, not the frame, so it is re-uploaded only when the entry count changes.
+        // A7b: what it writes is frame-invariant (index ranges) or re-derived by the GPU later in the same frame (instance counts,
+        // published by gather), which is why this upload could take over from the per-frame reset dispatch:
+        // the arg table only has to be framed once per primitive-set change, not once per frame.
         if (_cullPrimInfoPending != _cullPrimitiveCount)
         {
-            if (_cullPrimInfoPending <= 0 || _cullPrimInfoBytes == null || _cullPrimInfo == null)
+            if (_cullPrimInfoPending <= 0 || _cullArgsTemplate == null || _cullArgs == null)
                 return false;
-            int bytes = _cullPrimInfoPending * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride;
-            if (!g.TryUpdateStorageBuffer(_cullPrimInfo, new ReadOnlySpan<byte>(_cullPrimInfoBytes, 0, bytes)))
+            if (!g.TryUpdateStorageBuffer(_cullArgs, _cullArgsTemplate))
                 return false;
             _cullPrimitiveCount = _cullPrimInfoPending;
         }
@@ -723,10 +804,10 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
         _cullStreamSources = Array.Empty<Season.Rendering.StorageBuffer?>();
         _cullArgs?.Dispose(); _cullArgs = null;
         _cullVisible?.Dispose(); _cullVisible = null;
-        _cullPrimInfo?.Dispose(); _cullPrimInfo = null;
         _cullCapacity = -1;
         _cullPrimitiveCount = -1;
         _cullPrimInfoBytes = null;
+        _cullArgsTemplate = null;
         _cullPrimInfoPending = -1;
         _cullDrawReady = false;
     }
@@ -770,10 +851,12 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
         _transparentPrimitives.Clear();
         _transparentInstanceOrder.Clear();
 
-        if (_instanceBuffer.Buffer.Handle != 0)
+        for (int i = 0; i < _instanceBuffers.Length; i++)
         {
-            Device.ResourceManager.DestroyBuffer(_instanceBuffer);
-            _instanceBuffer = default;
+            if (_instanceBuffers[i].Buffer.Handle != 0)
+                Device.ResourceManager.DestroyBuffer(_instanceBuffers[i]);
         }
+        _instanceBuffers = Array.Empty<BufferResource>();
+        _instanceBuffer = default;
     }
 }

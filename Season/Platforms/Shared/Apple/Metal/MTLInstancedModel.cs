@@ -42,27 +42,26 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
     sealed class PrimitiveInstanceStream
     {
         /// <summary>
-        /// Contract clause 8(c) of 2-3:
-        /// double-buffered per-primitive instance streams.
-        /// Each frame fully rewrites the [WriteIndex] side,
-        /// while the opposite side holds the previous-frame per-instance world transforms and morph weights
-        /// and is bound directly as the prev source at VS buffer(9).
+        /// Contract clause 8(c) of 2-3: the per-primitive instance stream is a frame ring, one slot per in-flight frame.
+        /// Each frame fully rewrites the [FrameIndex] side, while the [FrameIndex - 1] side holds the previous-frame
+        /// per-instance world transforms and morph weights and is bound directly as the prev source at VS buffer(9).
+        /// Two slots would alias: with frameCount frames in flight, frame k would overwrite the slot frame k-2 still reads.
         /// </summary>
-        public readonly IMTLBuffer?[] Buffers = new IMTLBuffer?[2];
-        public int WriteIndex;
+        public IMTLBuffer?[] Buffers = Array.Empty<IMTLBuffer?>();
         public InstanceTransformData[] Data = Array.Empty<InstanceTransformData>();
         public Matrix4x4[] Worlds = Array.Empty<Matrix4x4>();
         public int Capacity;
 
-        public IMTLBuffer? Buffer => Buffers[WriteIndex];
+        public IMTLBuffer? Buffer
+            => (uint)Device.FrameIndex < (uint)Buffers.Length ? Buffers[Device.FrameIndex] : null;
 
-        /// <summary>The previous-frame write side. If no history exists yet, it falls back to the current-frame side, which is already zeroed so the r3.w == 0 sentinel remains effective.</summary>
-        public IMTLBuffer? PrevBuffer => Buffers[WriteIndex ^ 1] ?? Buffers[WriteIndex];
+        /// <summary>The previous-frame side. If no history exists yet, it falls back to the current-frame side, which is already zeroed so the r3.w == 0 sentinel remains effective.</summary>
+        public IMTLBuffer? PrevBuffer
+            => ((uint)PrevFrameIndex < (uint)Buffers.Length ? Buffers[PrevFrameIndex] : null) ?? Buffer;
 
-        public void FlipAndUpload(int count)
+        public void Upload(int count)
         {
-            WriteIndex ^= 1;
-            var buffer = Buffers[WriteIndex];
+            var buffer = Buffer;
             if (buffer != null && count > 0)
                 Device.ResourceManager.UpdateBuffer(buffer, new ReadOnlySpan<InstanceTransformData>(Data, 0, count));
         }
@@ -377,23 +376,28 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
         for (int i = 0; i < _primitiveInstanceStreams.Length; i++)
         {
             var stream = _primitiveInstanceStreams[i];
-            if (stream.Capacity >= count && stream.Buffers[0] != null)
+            if (stream.Capacity >= count && stream.Buffers.Length == Device.frameCount)
                 continue;
 
-            // For 2-3, rebuild and clear both sides together when capacity changes,
+            // For 2-3, rebuild and clear every slot together when capacity changes,
             // because Metal CreateBuffer does not guarantee zero-filled memory.
             // This prevents stale instance indices from producing fake velocity after capacity changes.
             nuint size = (nuint)(Unsafe.SizeOf<InstanceTransformData>() * count);
-            for (int face = 0; face < stream.Buffers.Length; face++)
+            // The old ring starts empty and may lag Device.frameCount, so it is indexed only where it reaches.
+            var previous = stream.Buffers;
+            var buffers = new IMTLBuffer?[Device.frameCount];
+            for (int slot = 0; slot < buffers.Length; slot++)
             {
-                stream.Buffers[face]?.Dispose();
+                if ((uint)slot < (uint)previous.Length)
+                    previous[slot]?.Dispose();
                 var buffer = Device.ResourceManager.CreateVertexBuffer<InstanceTransformData>((uint)count);
                 unsafe
                 {
                     new Span<byte>((void*)buffer.Contents, (int)size).Clear();
                 }
-                stream.Buffers[face] = buffer;
+                buffers[slot] = buffer;
             }
+            stream.Buffers = buffers;
 
             stream.Capacity = count;
             stream.Data = new InstanceTransformData[count];
@@ -433,7 +437,8 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
     /// A7: every opaque primitive draws its own instance stream (node world × instance world, plus its own morph weights), so gather
     /// materializes one reordered stream per opaque primitive. The visibility decision itself is made once per instance from the
     /// root instance worlds in the base <see cref="MTLInstancedPrimitiveGroup._instanceData"/> against the model-space clip-union box.
-    /// The previous-frame side of each stream (buffer 9) needs no reordering: the VS indexes it by the decoded original instance.
+    /// The previous-frame side of each stream (buffer 9) needs no reordering either: the VS indexes it by the row's tag, and that tag is
+    /// exactly the compacted slot this stream was written in.
     /// </summary>
     protected override bool CullPerPrimitiveStreams => true;
 
@@ -453,8 +458,9 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
             // previous per-instance world transforms and morph weights come from the opposite side
             // of the double-buffered instance stream,
             // and the previous bone palette comes from the [fi-1] slot of the per-instance bone-frame ring.
-            // Cold states for both are already covered by zero-value sentinels in the data itself,
-            // so the sentinel flags can be enabled here once.
+            // These bits are only seeded here; Update republishes them every frame from
+            // InstancedModel.InstanceHistoryValid (see MTLInstancedPrimitiveGroup.UpdatePrevStateFlags),
+            // so a frame whose enabled order shifted withdraws them and the shaders fall back to current data.
             primitive.MaterialParams.HasPrevInstanceWorld = 1u;
             primitive.MaterialParams.HasPrevBones = primitive.MaterialParams.IsSkinned;
             for (int fi = 0; fi < Device.frameCount; fi++)
@@ -522,6 +528,10 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
     /// <summary>Shell rendering for skinned shells uses the previous-frame per-instance bone-frame ring at slot [fi-1], sharing the same source as the main pass.</summary>
     protected override IMTLBuffer PrevInstanceBoneBufferForDraw(int fi) => GetInstanceBoneBuffer(PrevFrameIndex);
 
+    /// <summary>The per-instance bone-frame ring always exists on this path (created in Load), so the group can publish the
+    /// previous-bone bit; the per-primitive IsSkinned gate still decides which primitives actually read it.</summary>
+    protected override bool HasPrevBoneHistory => _instanceBoneBuffers.Length > 0;
+
     /// <summary>Bone addressing stride for shell rendering on skinned shells: the number of palette matrices per instance, where boneOffset = 64B × stride × slot.</summary>
     protected override int ShellBonePaletteStride => _bonePaletteStride;
 
@@ -532,6 +542,7 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
 
     public void Update(InstancedModel model, float time)
     {
+        bool wasInitialized = _transformInitialized;
         _instanceCount = 0;
 
         // Unified highlighting:
@@ -709,7 +720,7 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
         {
             // For 2-3, advance the double-buffer write side so the opposite side automatically becomes
             // this frame's previous-instance stream.
-            stream?.FlipAndUpload(_instanceCount);
+            stream?.Upload(_instanceCount);
         }
 
         // A7: the box must be in the root instance's model space and cover every clip pose, because the kernel culls the whole
@@ -731,6 +742,11 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
             WriteStruct(primitive.MatrixBuffers[fi], matrices);
 
         _transformInitialized = true;
+
+        // 2-3 Step C: publishes whether the previous-frame streams may be read this frame. Not a one-shot call any more: the
+        // history is addressed by the compacted instance slot, so it only lines up while the enabled order is unchanged
+        // (see InstancedMesh3DBase.InstanceHistoryValid). The first frame after load has no history and passes false.
+        UpdatePrevStateFlags(wasInitialized && model.InstanceHistoryValid);
         SyncAlpha(model.Alpha);
     }
 
@@ -752,8 +768,9 @@ internal sealed class MTLInstancedModel : MTLInstancedPrimitiveGroup
         var prevInstanceBoneBuffer = GetInstanceBoneBuffer(PrevFrameIndex);
 
         // A7 main view: each opaque primitive reads the main-view segment of its own reordered stream, with the instance count from
-        // the args entry (MainViewSlot, i). The bone / prev-bone / prev-instance buffers stay indexed by the original instance (bone
-        // offset 0): the VS recovers it from the tag gather writes into each record, so skinned and morphing models need nothing extra.
+        // the args entry (MainViewSlot, i). The bone / prev-bone tables need no reordering of their own: the tag gather writes into each
+        // record IS the compacted instance slot (bone offset = stride × slot), which is exactly how those tables are laid out, so the
+        // reordered rows line up row for row and skinned models need nothing extra.
         // Fade stays direct for the same reason as the base class (per-instance back-to-front splitting).
         for (int i = 0; i < _opaquePrimitives.Count; i++)
         {

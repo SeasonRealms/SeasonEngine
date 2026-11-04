@@ -10,6 +10,10 @@ namespace Season.Platforms.Web;
 /// The current implementation already includes per-instance animation state,
 /// aggregated bone matrices, and morph-weight writes for the unified WGSL pipeline on Web.
 /// A7: also the GPU cull target of the model (see the A7 section below), since the Web side has no primitive-group object to hang it on.
+///
+/// A7c note -- the cull input is still a dedicated storage buffer uploaded every frame. A GPUBuffer's usage is fixed at creation time and the IA
+/// instance buffer is created as a vertex buffer through the JS interop layer, so aliasing it would mean changing that layer's buffer creation rather
+/// than the cull path. The bytes are identical, so the culling result matches the D3D12 path.
 /// </summary>
 internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
 {
@@ -83,6 +87,12 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
     /// The actual previous bone buffer is populated automatically by the JS-side shadow copy in uploadSkinnedBones,
     /// and the C# side only controls the ready flag.</summary>
     public bool PrevBonesReady { get; private set; }
+
+    /// <summary>2-3 Step C: whether the previous-frame streams still line up with this frame, taken from the control's
+    /// <see cref="Season.Controls.InstancedMesh3DBase.InstanceHistoryValid"/>. They are addressed by the compacted instance slot,
+    /// so a frame whose enabled order changed must not read them: each instance would be paired with its predecessor, which is a
+    /// one-frame velocity spike on everything past the change. False makes every draw fall back to current-frame data.</summary>
+    public bool InstanceHistoryValid { get; private set; }
     public byte[] BoneMatricesBytes { get; private set; } = Array.Empty<byte>();
 
     // Unified highlight: per-instance bounds boxes for the current frame (lazy-growing pool + draw list; Wireframe shell extends this in Phase 3).
@@ -137,7 +147,6 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
     Season.Rendering.StorageBuffer? _cullSource;
     Season.Rendering.StorageBuffer? _cullArgs;
     Season.Rendering.StorageBuffer? _cullVisible;
-    Season.Rendering.StorageBuffer? _cullPrimInfo;
     /// <summary>Per gather stream, in parameter-table order: the primitive's own instance stream as uploaded for gather to read.</summary>
     readonly Season.Rendering.StorageBuffer?[] _cullStreamSources = new Season.Rendering.StorageBuffer?[Season.Rendering.InstanceCull.MaxPrimitives];
     /// <summary>Per gather stream, in parameter-table order: the slot-tiled reordered stream the draw side binds as its instance stream.</summary>
@@ -147,6 +156,9 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
     int _cullPrimitiveCount = -1;
     byte[]? _cullPrimPendingBytes;
     int _cullPrimPendingCount = -1;
+    /// <summary>A7b: the arg-buffer image composed from <see cref="_cullPrimPendingBytes"/>. It exists for the same reason as that table --
+    /// its content only changes with the primitive set -- and it is what replaced the per-frame reset dispatch.</summary>
+    byte[]? _cullArgsTemplateBytes;
     /// <summary>Uploaded parameter-table signature, one bit per entry of <see cref="_primitives"/>; the draw side derives each primitive's
     /// args record and reordered stream from it, so it only ever changes together with the table it describes.</summary>
     int _cullPrimMask = -1;
@@ -210,7 +222,7 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
         {
             worlds = stream.Worlds;
             instanceBytes = stream.InstanceBytes;
-            prevInstanceBytes = stream.PrevReady ? stream.PrevInstanceBytes : Array.Empty<byte>();
+            prevInstanceBytes = stream.PrevReady && InstanceHistoryValid ? stream.PrevInstanceBytes : Array.Empty<byte>();
             return true;
         }
 
@@ -266,6 +278,7 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
             BoneMatricesBytes = Array.Empty<byte>();
             TransformInitialized = true;
             PrevBonesReady = false;
+            InstanceHistoryValid = false;
             ModelAlpha = model.Alpha;
             // Reset Outline2D aggregate state (all instances disabled -> no outline).
             Outline2DActive = false;
@@ -384,7 +397,7 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
                 EnsureShellGeometry(model, model.Highlight.EdgeWidth);
                 WireframeActive = true;
                 Matrix4x4 prevWorld = default;
-                if (_shellStream != null && writeIndex < _shellStream.Worlds.Length
+                if (model.InstanceHistoryValid && _shellStream != null && writeIndex < _shellStream.Worlds.Length
                     && _shellStream.InstanceBytes.Length >= (writeIndex + 1) * 20 * sizeof(float))
                 {
                     prevWorld = DecodeWorldFromInstanceBytes(_shellStream.InstanceBytes, writeIndex);
@@ -444,7 +457,8 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
         }
 
         TransformInitialized = true;
-        PrevBonesReady = wasInitialized && hasSkinning;
+        InstanceHistoryValid = model.InstanceHistoryValid;
+        PrevBonesReady = wasInitialized && hasSkinning && InstanceHistoryValid;
         ModelAlpha = model.Alpha;
     }
 
@@ -471,8 +485,6 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullStreamSorted(int stream)
         => (uint)stream < (uint)_cullStreamSorted.Length ? _cullStreamSorted[stream] : null;
-
-    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullPrimitiveInfo => _cullPrimInfo;
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullArgs => _cullArgs;
 
@@ -607,17 +619,17 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
                 var g = Season.Basic.Graphics.Instance;
                 _cullSource = g.CreateStorageBuffer((uint)capacity * Season.Rendering.InstanceCull.WorldStride);
                 _cullVisible = g.CreateStorageBuffer((uint)(Season.Rendering.InstanceCull.MaxSlots * capacity) * 4u);
-                _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsBytes,
+                // A7b: fixed size, table plus the per-slot count accumulator the gather kernels clear; the parameter-table buffer that
+                // used to sit next to it is gone, because what the kernels need from it now travels as the arg template built below.
+                _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsTotalBytes,
                     Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs);
-                _cullPrimInfo = g.CreateStorageBuffer(
-                    (uint)Season.Rendering.InstanceCull.MaxPrimitives * Season.Rendering.InstanceCull.PrimitiveInfoStride);
             }
             catch (Exception ex)
             {
                 DeviceServices.BaseApp?.AddLog(LogType.Error, $"[InstanceCull] Buffer creation failed: {ex.Message}");
             }
 
-            if (_cullSource == null || _cullVisible == null || _cullArgs == null || _cullPrimInfo == null)
+            if (_cullSource == null || _cullVisible == null || _cullArgs == null)
             {
                 ReleaseCullResources();
                 return;
@@ -639,7 +651,7 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
     /// </summary>
     void EnsureCullPrimitiveInfo()
     {
-        if (_cullPrimInfo == null)
+        if (_cullArgs == null)
             return;
 
         if (_primitives.Count > 31)
@@ -684,6 +696,9 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
         _cullPrimPendingBytes = bytes;
         _cullPrimPendingCount = n;
         _cullPrimPendingMask = mask;
+        // A7b: the arg image is composed here too -- it is a pure function of this table plus the fixed slot layout, i.e. exactly the bytes
+        // the reset kernel used to write every frame, now built once when its input changes.
+        _cullArgsTemplateBytes = Season.Rendering.InstanceCull.BuildArgsTemplate(bytes, n);
     }
 
     /// <summary>
@@ -719,6 +734,7 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
     void AbandonCullPrimitiveInfo()
     {
         _cullPrimPendingBytes = null;
+        _cullArgsTemplateBytes = null;
         _cullPrimPendingCount = 0;
         _cullPrimPendingMask = -1;
         _cullPrimitiveCount = 0;
@@ -740,11 +756,11 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
 
         if (_cullPrimPendingCount != _cullPrimitiveCount || _cullPrimPendingMask != _cullPrimMask)
         {
-            if (_cullPrimPendingCount <= 0 || _cullPrimPendingBytes == null || _cullPrimInfo == null)
+            // A7b: the upload is the whole arg block, not just the index ranges -- its layout is fixed, so a single write replaces the
+            // per-frame reset dispatch that used to rewrite the frame-invariant half of it.
+            if (_cullPrimPendingCount <= 0 || _cullArgsTemplateBytes == null || _cullArgs == null)
                 return false;
-            int primBytes = _cullPrimPendingCount * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride;
-            if (!g.TryUpdateStorageBuffer(_cullPrimInfo,
-                    new ReadOnlySpan<byte>(_cullPrimPendingBytes, 0, primBytes)))
+            if (!g.TryUpdateStorageBuffer(_cullArgs, _cullArgsTemplateBytes))
                 return false;
             _cullPrimitiveCount = _cullPrimPendingCount;
             _cullPrimMask = _cullPrimPendingMask;
@@ -805,7 +821,6 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
         _cullSource?.Dispose(); _cullSource = null;
         _cullArgs?.Dispose(); _cullArgs = null;
         _cullVisible?.Dispose(); _cullVisible = null;
-        _cullPrimInfo?.Dispose(); _cullPrimInfo = null;
         for (int s = 0; s < _cullStreamSources.Length; s++)
         {
             _cullStreamSources[s]?.Dispose(); _cullStreamSources[s] = null;
@@ -815,6 +830,7 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
         _cullPrimitiveCount = -1;
         _cullPrimMask = -1;
         _cullPrimPendingBytes = null;
+        _cullArgsTemplateBytes = null;
         _cullPrimPendingCount = -1;
         _cullPrimPendingMask = -1;
         _cullLocalCenter = Vector3.Zero;
@@ -1030,7 +1046,7 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
         }
 
         instanceBytes = _shellStream.InstanceBytes;
-        prevInstanceBytes = _shellStream.PrevReady ? _shellStream.PrevInstanceBytes : Array.Empty<byte>();
+        prevInstanceBytes = _shellStream.PrevReady && InstanceHistoryValid ? _shellStream.PrevInstanceBytes : Array.Empty<byte>();
         return true;
     }
 

@@ -64,7 +64,11 @@ public class InstancedModel : InstancedMesh3DBase
     {
         var result = base.Update(time, alpha: alpha);
 
-        if (Ready && HasContent && Enable)
+        // Latched before the backend call so the renderer and the history flags below agree on which frame submitted streams.
+        bool submitting = Ready && HasContent && Enable;
+        RefreshInstanceHistory(submitting);
+
+        if (submitting)
         {
             // Unified positioning model: settle per-instance default dimensions
             // (zero dimension means template-local size) before each backend calls

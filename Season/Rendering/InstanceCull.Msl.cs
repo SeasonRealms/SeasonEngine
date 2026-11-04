@@ -6,45 +6,15 @@ namespace Season.Rendering;
 
 public sealed partial class InstanceCullEffect
 {
-    // A7's four Metal kernels. MSL has no compile-time group-size declaration; the 64 is given by the second argument of DispatchThreadgroups,
+    // A7's three Metal kernels. MSL has no compile-time group-size declaration; the 64 is given by the second argument of DispatchThreadgroups,
     // so the C# constant here is the only source; buffer slots are laid out as "Params at 0, other buffers starting at 1".
     // finalize is the only kernel with a group size of 1, and the matching C# WorkgroupX/Y/Z are also 1.
-
-    const string ResetMsl = """
-#include <metal_stdlib>
-using namespace metal;
-
-#define MAX_PRIMITIVES 16u
-#define ARGS_STRIDE_U 5u
-
-struct ResetParams
-{
-    uint primCount;
-    uint slotCount;
-    uint mode;
-    uint pad;
-};
-
-kernel void CSMain(uint3 id [[thread_position_in_grid]],
-                   constant ResetParams& resetParams [[buffer(0)]],
-                   const device uint* primInfo [[buffer(1)]],
-                   device uint* drawArgs [[buffer(2)]])
-{
-    uint idx = id.x;
-    uint slot = idx / MAX_PRIMITIVES;
-    uint prim = idx % MAX_PRIMITIVES;
-    if (slot >= resetParams.slotCount || prim >= resetParams.primCount)
-        return;
-
-    uint base = idx * ARGS_STRIDE_U;
-    uint info = prim * 4u;
-    drawArgs[base + 0u] = primInfo[info + 0u];
-    drawArgs[base + 1u] = 0u;
-    drawArgs[base + 2u] = primInfo[info + 1u];
-    drawArgs[base + 3u] = primInfo[info + 2u];
-    drawArgs[base + 4u] = 0u;
-}
-""";
+    // A7b removed the reset kernel: the frame-invariant part of the arg table is uploaded from InstanceCull.BuildArgsTemplate
+    // when the primitive set changes, and the per-slot counter is a region of the arg buffer that gather clears every run.
+    //
+    // No offline MSL validator exists in this repository, so a mistake in these strings is only caught when the Metal backend compiles them at runtime,
+    // and a failed compile drops all of A7 back to CPU culling while the image keeps looking normal. Any change here has to be paired with a device run,
+    // not just a C# build.
 
     const string CullMsl = """
 #include <metal_stdlib>
@@ -63,7 +33,7 @@ struct CullParams
     uint primCount;
     uint capacity;
     uint slotMask;
-    uint pad0;
+    uint slotCountsOffset;
     uint pad1;
     uint pad2;
 };
@@ -121,7 +91,9 @@ kernel void CSMain(uint3 id [[thread_position_in_grid]],
             continue;
         if (!visible_in_slot(slotMatrices, slot, center, radius))
             continue;
-        uint k = atomic_fetch_add_explicit(&drawArgs[slot * MAX_PRIMITIVES * ARGS_STRIDE_U + 1u], 1u,
+        // A7b: the counter lives in the arg buffer's accumulator region, not in the arg table's InstanceCount -- see
+        // InstanceCull.SlotCountsOffset for why the two cannot be the same word. The offset is in bytes, this array in uints.
+        uint k = atomic_fetch_add_explicit(&drawArgs[(cullParams.slotCountsOffset >> 2u) + slot], 1u,
                                           memory_order_relaxed);
         visibleIds[slot * cullParams.capacity + k] = i;
     }
@@ -135,7 +107,7 @@ using namespace metal;
 struct FinalizeParams
 {
     uint slotCount;
-    uint slotStride;
+    uint slotCountsOffset;
     uint groupSize;
     uint pad;
 };
@@ -149,7 +121,7 @@ kernel void CSMain(uint3 id [[thread_position_in_grid]],
 {
     uint maxCount = 0u;
     for (uint slot = 0u; slot < finalizeParams.slotCount; ++slot)
-        maxCount = max(maxCount, drawArgs[(slot * finalizeParams.slotStride + 4u) >> 2u]);
+        maxCount = max(maxCount, drawArgs[(finalizeParams.slotCountsOffset >> 2u) + slot]);
 
     uint groups = (maxCount + finalizeParams.groupSize - 1u) / finalizeParams.groupSize;
     dispatchArgs[0] = groups;
@@ -172,6 +144,10 @@ struct GatherParams
     uint primCount;
     uint slotCount;
     uint tagMask;
+    uint slotCountsOffset;
+    uint clearSlotCounts;
+    uint pad0;
+    uint pad1;
 };
 
 kernel void CSMain(uint3 id [[thread_position_in_grid]],
@@ -188,13 +164,20 @@ kernel void CSMain(uint3 id [[thread_position_in_grid]],
         return;
 
     uint argsBase = slot * MAX_PRIMITIVES * ARGS_STRIDE_U;
-    uint count = drawArgs[argsBase + 1u];
+    // A7b: the count comes from the accumulator cull filled this frame; the arg table's own InstanceCount is written below,
+    // so it only ever holds a finished frame's result for the draw to read.
+    uint count = drawArgs[(gatherParams.slotCountsOffset >> 2u) + slot];
 
     // Fan-out: a slot's total visible count must be written into the instance count of every primitive entry for that slot.
     if (k == 0u)
     {
+        drawArgs[argsBase + 1u] = count;
         for (uint q = 1u; q < gatherParams.primCount; ++q)
             drawArgs[argsBase + q * ARGS_STRIDE_U + 1u] = count;
+        // Only the last gather of a group clears: every stream reads the same counts, so clearing on the first
+        // would make the rest publish zeroes into the arg table and the group would vanish for the frame.
+        if (gatherParams.clearSlotCounts != 0u)
+            drawArgs[(gatherParams.slotCountsOffset >> 2u) + slot] = 0u;
     }
     if (k >= count)
         return;

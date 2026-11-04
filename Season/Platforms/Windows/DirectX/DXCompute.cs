@@ -203,6 +203,14 @@ internal sealed unsafe class DXComputeKernel : Season.Rendering.ComputeKernel
 /// NonPixelShaderResource before Read binding, to UnorderedAccess before
 /// ReadWrite binding, and insert a UAV barrier after dispatch
 /// for same-frame kernel-chain dependencies.
+///
+/// A7c adds a second lifetime mode next to "owns a resource": the borrowed read-only view (<see cref="CreateReadOnlyView"/>
+/// and the alias constructor). It owns no resource, uploads nothing and records no barrier, because what it points at is an upload-heap
+/// vertex buffer that the engine maps directly and that the D3D12 runtime keeps in GenericRead for the resource's whole life. All three
+/// omissions are mandatory, not an optimization: a barrier on an upload heap is an invalid transition, there is no UAV descriptor behind
+/// a read-only alias so a ReadWrite binding would be a lie the heap cannot back, and releasing the resource here would leave the IA
+/// binding dangling while the instance buffer still uses it. The instance buffer's owner releases it; this object retires only its SRV
+/// descriptor, together with the resource's fence value, so no later allocation can overwrite a descriptor an in-flight frame still reads.
 /// </summary>
 internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
 {
@@ -240,6 +248,42 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
 
     readonly uint _alignedSize;
 
+    /// <summary>
+    /// A7c: this handle only aliases somebody else's resource (the IA instance stream) instead of owning one. It then skips every
+    /// owning behavior: no resource release, no state barrier, no upload, and no bound-check against a capacity it does not have.
+    /// </summary>
+    readonly bool _borrowed;
+
+    /// <summary>
+    /// A7c: wraps an existing buffer as a read-only storage view so the culling kernel can read the stream the engine already
+    /// uploads for instanced drawing. Before this, every frame copied the very same 80-bytes-per-instance bytes into a second,
+    /// dedicated storage buffer: the cull input and the IA instance stream are bit-identical by contract, so the copy moved no new
+    /// information to the GPU and only cost an extra staging write plus a copy command per group (per primitive stream for a glTF model).
+    ///
+    /// The source is a vertex buffer that the engine writes through Map/Unmap and that the D3D12 runtime keeps in GenericRead for its
+    /// whole lifetime (an upload heap cannot leave that state). GenericRead already includes NON_PIXEL_SHADER_RESOURCE, so binding the
+    /// raw SRV needs neither a transition nor a state tracked here -- which is exactly why the alias must never record a barrier itself.
+    /// </summary>
+    internal static DXStorageBuffer CreateReadOnlyView(ID3D12Resource* resource, uint sizeInBytes)
+        => new(resource, sizeInBytes);
+
+    /// <summary>
+    /// A7c: the alias constructor. <paramref name="sizeInBytes"/> is the real resource size, never a rounded-up capacity:
+    /// a raw SRV's NumElements must stay inside the resource the engine created for vertex input.
+    /// </summary>
+    internal DXStorageBuffer(ID3D12Resource* resource, uint sizeInBytes)
+    {
+        SizeInBytes = sizeInBytes;
+        // Read-only by construction: there is no UAV descriptor and the owner keeps writing the resource through Map, so anything
+        // above a plain read binding would be a lie the descriptor heap could not back anyway.
+        Usage = Season.Rendering.StorageBufferUsage.Compute;
+        _borrowed = true;
+        _alignedSize = (sizeInBytes + 15u) & ~15u;
+        Resource = resource;
+        CurrentState = ResourceStates.GenericRead;
+        CreateSrv(sizeInBytes / 4);
+    }
+
     internal DXStorageBuffer(uint sizeInBytes, Season.Rendering.StorageBufferUsage usage)
     {
         // Raw views are addressed in 4-byte elements, so round capacity up to
@@ -276,23 +320,7 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
 
         uint numElements = alignedSize / 4;
 
-        SrvDescriptorID = Device.DescriptorAllocator.Allocate();
-        SrvGpuHandle = Device.SrvHeapManager.GetGpuHandle(SrvDescriptorID);
-        const uint DefaultShader4ComponentMapping = 0x00001688;
-        var srvDesc = new ShaderResourceViewDesc
-        {
-            Format = Format.FormatR32Typeless,
-            ViewDimension = SrvDimension.Buffer,
-            Shader4ComponentMapping = DefaultShader4ComponentMapping,
-            Buffer = new BufferSrv
-            {
-                FirstElement = 0,
-                NumElements = numElements,
-                StructureByteStride = 0,
-                Flags = BufferSrvFlags.Raw,
-            },
-        };
-        Device.D3dDevice->CreateShaderResourceView(Resource, &srvDesc, Device.SrvHeapManager.GetCpuHandle(SrvDescriptorID));
+        CreateSrv(numElements);
 
         UavDescriptorID = Device.DescriptorAllocator.Allocate();
         UavGpuHandle = Device.SrvHeapManager.GetGpuHandle(UavDescriptorID);
@@ -312,6 +340,29 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
         Device.D3dDevice->CreateUnorderedAccessView(Resource, null, &uavDesc, Device.SrvHeapManager.GetCpuHandle(UavDescriptorID));
     }
 
+    /// <summary>Raw (ByteAddressBuffer) SRV over <see cref="Resource"/>, shared by the owning and the alias constructor: the two differ in
+    /// who owns the resource and how many elements are addressable, not in the view type the kernels expect.</summary>
+    void CreateSrv(uint numElements)
+    {
+        SrvDescriptorID = Device.DescriptorAllocator.Allocate();
+        SrvGpuHandle = Device.SrvHeapManager.GetGpuHandle(SrvDescriptorID);
+        const uint DefaultShader4ComponentMapping = 0x00001688;
+        var srvDesc = new ShaderResourceViewDesc
+        {
+            Format = Format.FormatR32Typeless,
+            ViewDimension = SrvDimension.Buffer,
+            Shader4ComponentMapping = DefaultShader4ComponentMapping,
+            Buffer = new BufferSrv
+            {
+                FirstElement = 0,
+                NumElements = numElements,
+                StructureByteStride = 0,
+                Flags = BufferSrvFlags.Raw,
+            },
+        };
+        Device.D3dDevice->CreateShaderResourceView(Resource, &srvDesc, Device.SrvHeapManager.GetCpuHandle(SrvDescriptorID));
+    }
+
     /// <summary>
     /// 1-8: CPU data upload path. This is the escape hatch for the 128-byte
     /// Params limit and carries large DDGI-scale constant blocks.
@@ -328,6 +379,11 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
     internal void Upload(ID3D12GraphicsCommandList* cmd, ReadOnlySpan<byte> data)
     {
         if (data.Length == 0)
+            return;
+        // A7c: an alias has neither a destination state of its own nor an upload heap to write from; the owner (the instance buffer)
+        // is the one that publishes these bytes. Silently ignoring the call is deliberate: it keeps a mistaken caller from recording a
+        // CopyBufferRegion into an upload-heap vertex buffer, which the debug layer would only report after the fact.
+        if (_borrowed)
             return;
         if ((uint)data.Length > _alignedSize)
             throw new ArgumentException(
@@ -391,7 +447,9 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
     /// state is unchanged.</summary>
     internal void TransitionTo(ID3D12GraphicsCommandList* cmd, ResourceStates newState)
     {
-        if (CurrentState == newState)
+        // A7c: the aliased vertex buffer never changes state -- an upload heap must stay in GenericRead for its whole life, and that
+        // state already covers compute SRV reads. Recording a barrier here would be an invalid transition on an upload heap.
+        if (_borrowed || CurrentState == newState)
             return;
 
         var barrier = Device.InitTransition(Resource, CurrentState, newState);
@@ -402,7 +460,8 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
     public override void Dispose()
     {
         if (Resource == null && SrvDescriptorID < 0 && UavDescriptorID < 0) return;
-        nint resource = (nint)Resource;
+        // A7c: the alias does not own the resource (the instance buffer releases it), so only the descriptor it allocated is ours.
+        nint resource = _borrowed ? 0 : (nint)Resource;
         var uploads = (IntPtr[])_uploadHeaps.Clone();
         int srv = SrvDescriptorID, uav = UavDescriptorID;
         var allocator = Device.DescriptorAllocator;

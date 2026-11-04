@@ -25,43 +25,35 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
     // ============================================================
     internal readonly GltfAsset _asset = new GltfAsset();
 
-    // Per-instance bone-matrix StructuredBuffer, replacing the old CBV path
+    // Per-instance bone-matrix StructuredBuffer ring: one slot per frame in flight (see the frame-ring note in
+    // DXInstancedPrimitiveGroup). A frame writes its own slot, so the palette it uploads cannot be overwritten by a
+    // frame the GPU has not finished reading yet.
     private int _bonePaletteStride = 1;
-    private ID3D12Resource* _instanceBoneBuffer;
-    private byte* _mappedInstanceBoneBuffer;
-    private GpuDescriptorHandle _instanceBoneSrvHandle;
-    private int _instanceBoneDescriptorId = -1;
+    /// <summary>Capacity the palette ring starts at. It grows to the real instance count on the first Update, and
+    /// pre-allocating one palette per frame slot for a crowd a model never reaches would only buy memory pressure.</summary>
+    private const uint InitialInstanceBoneCapacity = 256;
+    private ID3D12Resource*[] _instanceBoneBuffers = EmptyResourceRing;
+    private byte*[] _mappedInstanceBoneBuffers = EmptyMappedRing;
+    private GpuDescriptorHandle[] _instanceBoneSrvHandles = Array.Empty<GpuDescriptorHandle>();
+    private int[] _instanceBoneDescriptorIds = Array.Empty<int>();
     private uint _instanceBoneCapacity;
 
-    // 2-3 Step C (tier B): previous per-instance bone SB
-    // (same capacity as _instanceBoneBuffer, with _bonePaletteStride matrices
-    // per entry).
-    // Before each frame upload, memcpy the current mapped bone-buffer region into
-    // the mapped prev region so the GPU always holds the previous frame's bone
-    // palette.
-    // Contents are zeroed before the first frame (sentinel _m33==0), so the
-    // shader falls back to current bones joint by joint.
-    private ID3D12Resource* _prevInstanceBoneBuffer;
-    private byte* _mappedPrevInstanceBoneBuffer;
-    private GpuDescriptorHandle _prevInstanceBoneSrvHandle;
-    private int _prevInstanceBoneDescriptorId = -1;
-    private uint _prevInstanceBoneCapacity;
+    // 2-3 Step C (tier B): previous per-instance bone palette.
+    // This is NOT a second buffer: it is the same ring read one slot back (PrevFrameSlot), because each slot holds
+    // the palette of the frame that wrote it. That replaced the per-frame memcpy of the whole palette, and with it a
+    // read of write-combined upload memory that cost far more than the write it fed.
+    // Cold slots are zeroed before the first frame (sentinel _m33==0), so the shader falls back to current bones
+    // joint by joint until a slot has real history.
 
-    // 2-3 Step C (tier C-b): previous per-instance morph-weights SB
-    // (one float4 per entry).
-    // Capacity = _instanceCount. All primitives share the same SB and index it
-    // by instanceID.
-    // Before extracting this frame's morph weights, copy the current CPU shadow
-    // into the mapped prev-SB region, then extract new weights and update the
-    // shadow.
-    private ID3D12Resource* _prevMorphWeightsBuffer;
-    private byte* _mappedPrevMorphWeightsBuffer;
-    private GpuDescriptorHandle _prevMorphWeightsSrvHandle;
-    private int _prevMorphWeightsDescriptorId = -1;
-    private int _prevMorphWeightsCapacity;
+    // 2-3 Step C (tier C-b): per-instance morph-weights ring (one float4 per entry), same one-slot-per-frame
+    // contract as the bone palette; the previous frame is the slot the previous frame wrote.
+    private ID3D12Resource*[] _instanceMorphWeightsBuffers = EmptyResourceRing;
+    private byte*[] _mappedMorphWeightsBuffers = EmptyMappedRing;
+    private GpuDescriptorHandle[] _instanceMorphWeightsSrvHandles = Array.Empty<GpuDescriptorHandle>();
+    private int[] _instanceMorphWeightsDescriptorIds = Array.Empty<int>();
+    private int _instanceMorphWeightsCapacity;
     // CPU shadow of the current morph weights per primitive, indexed by
-    // InstanceStreamIndex. Copy it to the prev SB before extracting new weights,
-    // then update it afterward.
+    // InstanceStreamIndex. Uploaded into this frame's ring slot once per frame.
     private Vector4[] _currentMorphShadow = Array.Empty<Vector4>();
 
     // Rest-pose snapshot of nodes, used to restore the initial TRS state for
@@ -84,11 +76,18 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
 
     sealed class PrimitiveInstanceStream
     {
-        public ID3D12Resource* Buffer;
-        public VertexBufferView View;
+        /// <summary>One IA buffer per frame in flight; a frame writes and binds its own slot.</summary>
+        public ID3D12Resource*[] Buffers = EmptyResourceRing;
+        public VertexBufferView[] Views = Array.Empty<VertexBufferView>();
         public InstanceTransformData[] Data = Array.Empty<InstanceTransformData>();
         public Matrix4x4[] Worlds = Array.Empty<Matrix4x4>();
         public int Capacity;
+
+        public ID3D12Resource* BufferAt(int slot)
+            => (uint)slot < (uint)Buffers.Length ? Buffers[slot] : null;
+
+        public VertexBufferView ViewAt(int slot)
+            => (uint)slot < (uint)Views.Length ? Views[slot] : default;
     }
 
     public DXInstancedModel(string name) : base(name)
@@ -139,8 +138,8 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
 
         SyncInstancedSkinningMaterialParams();
 
-        // Step 5: create the per-instance bone-matrix StructuredBuffer
-        CreateInstanceBoneBuffer();
+        // Step 5: create the per-instance bone-matrix StructuredBuffer ring
+        EnsureInstanceBoneCapacity(InitialInstanceBoneCapacity);
 
         RebuildPrimitiveBuckets();
         SyncAlpha(model.Alpha);
@@ -358,6 +357,10 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         Array.Resize(ref _animationStates, count);
     }
 
+    /// <summary>
+    /// Grows every primitive's IA instance stream. Each one is a ring with a slot per frame in flight, for the same
+    /// reason as the group-level instance buffer: the GPU may still be reading the slot this frame is about to write.
+    /// </summary>
     void EnsurePrimitiveInstanceCapacity(int count)
     {
         if (_primitiveInstanceStreams.Length == 0)
@@ -366,16 +369,19 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         for (int i = 0; i < _primitiveInstanceStreams.Length; i++)
         {
             var stream = _primitiveInstanceStreams[i];
-            if (stream.Capacity >= count && stream.Buffer != null)
+            if (stream.Capacity >= count && stream.Buffers.Length == FrameSlotCount)
                 continue;
 
-            if (stream.Buffer != null)
-            {
-                stream.Buffer->Release();
-                stream.Buffer = null;
-            }
+            ReleaseRingDeferred(stream.Buffers);
 
-            stream.Buffer = Device.CreateVertexBuffer<InstanceTransformData>((uint)count, out stream.View);
+            int slots = FrameSlotCount;
+            var buffers = new ID3D12Resource*[slots];
+            var views = new VertexBufferView[slots];
+            for (int slot = 0; slot < slots; slot++)
+                buffers[slot] = Device.CreateVertexBuffer<InstanceTransformData>((uint)count, out views[slot]);
+
+            stream.Buffers = buffers;
+            stream.Views = views;
             stream.Capacity = count;
             stream.Data = new InstanceTransformData[count];
             stream.Worlds = new Matrix4x4[count];
@@ -386,14 +392,13 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
     {
         foreach (var stream in _primitiveInstanceStreams)
         {
-            if (stream?.Buffer != null)
-            {
-                stream.Buffer->Release();
-                stream.Buffer = null;
-            }
+            if (stream != null)
+                ReleaseRingDeferred(stream.Buffers);
 
             if (stream != null)
             {
+                stream.Buffers = EmptyResourceRing;
+                stream.Views = Array.Empty<VertexBufferView>();
                 stream.Data = Array.Empty<InstanceTransformData>();
                 stream.Worlds = Array.Empty<Matrix4x4>();
                 stream.Capacity = 0;
@@ -430,10 +435,15 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
     /// </summary>
     protected override bool CullPerPrimitiveStreams => true;
 
-    protected override ReadOnlySpan<InstanceTransformData> GetCullDrawStream(int stream)
-        => (uint)stream < (uint)_opaquePrimitives.Count && GetPrimitiveInstanceStream(_opaquePrimitives[stream]) is { } s
-            ? s.Data
-            : default;
+    protected override bool TryGetCullDrawStreamRing(int stream, out ID3D12Resource*[] ring, out int capacity)
+    {
+        var s = (uint)stream < (uint)_opaquePrimitives.Count
+            ? GetPrimitiveInstanceStream(_opaquePrimitives[stream])
+            : null;
+        ring = s?.Buffers ?? EmptyResourceRing;
+        capacity = s?.Capacity ?? 0;
+        return ring.Length > 0 && capacity > 0;
+    }
 
     void SyncInstancedSkinningMaterialParams()
     {
@@ -446,198 +456,194 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         }
     }
 
-    /// <summary>Creates the per-instance bone-matrix StructuredBuffer on the
-    /// upload heap.</summary>
-    void CreateInstanceBoneBuffer()
-    {
-        _instanceBoneCapacity = 256;
-        ulong bufferSize = (ulong)(_bonePaletteStride * _instanceBoneCapacity * sizeof(Matrix4x4));
-        _instanceBoneBuffer = Device.ResourceManager.CreateBuffer(
-            HeapType.Upload, bufferSize, ResourceStates.GenericRead);
-        void* pData;
-        _instanceBoneBuffer->Map(0, null, &pData);
-        _mappedInstanceBoneBuffer = (byte*)pData;
-
-        _instanceBoneDescriptorId = Device.DescriptorAllocator.Allocate();
-        var cpuHandle = Device.SrvHeapManager.GetCpuHandle(_instanceBoneDescriptorId);
-        var srvDesc = new ShaderResourceViewDesc
-        {
-            Format = Silk.NET.DXGI.Format.FormatUnknown,
-            ViewDimension = SrvDimension.Buffer,
-            Shader4ComponentMapping = 0x00001688u,
-            Buffer = new BufferSrv
-            {
-                FirstElement = 0,
-                NumElements = (uint)(_bonePaletteStride * _instanceBoneCapacity),
-                StructureByteStride = (uint)sizeof(Matrix4x4),
-                Flags = BufferSrvFlags.None
-            }
-        };
-        Device.D3dDevice->CreateShaderResourceView(_instanceBoneBuffer, &srvDesc, cpuHandle);
-        _instanceBoneSrvHandle = Device.SrvHeapManager.GetGpuHandle(_instanceBoneDescriptorId);
-    }
-
+    /// <summary>Creates the per-instance bone-matrix StructuredBuffer ring on the
+    /// upload heap. Size follows the real instance count: the palette can be
+    /// megabytes per slot, so pre-allocating for a crowd a model never reaches
+    /// would only buy memory pressure.</summary>
     void EnsureInstanceBoneCapacity(uint capacity)
     {
-        if (capacity <= _instanceBoneCapacity)
+        if (capacity <= _instanceBoneCapacity && _instanceBoneBuffers.Length == FrameSlotCount)
             return;
 
-        if (_instanceBoneBuffer != null)
+        ReleaseBoneRingDeferred(_instanceBoneBuffers, _instanceBoneDescriptorIds);
+
+        int slots = FrameSlotCount;
+        ulong bufferSize = (ulong)(_bonePaletteStride * capacity * sizeof(Matrix4x4));
+        var buffers = new ID3D12Resource*[slots];
+        var mapped = new byte*[slots];
+        var handles = new GpuDescriptorHandle[slots];
+        var descriptorIds = new int[slots];
+
+        for (int slot = 0; slot < slots; slot++)
         {
-            _instanceBoneBuffer->Unmap(0, null);
-            _instanceBoneBuffer->Release();
+            var buffer = Device.ResourceManager.CreateBuffer(HeapType.Upload, bufferSize, ResourceStates.GenericRead);
+            void* pData;
+            buffer->Map(0, null, &pData);
+            mapped[slot] = (byte*)pData;
+            // Zero every slot, not just the first: the prev-bone sentinel (Bh[3][3] == 0) is what makes a slot with no
+            // history yet fall back to this frame's bones instead of reading whatever the driver handed back.
+            new Span<byte>(mapped[slot], (int)bufferSize).Clear();
+
+            descriptorIds[slot] = Device.DescriptorAllocator.Allocate();
+            var srvDesc = new ShaderResourceViewDesc
+            {
+                Format = Silk.NET.DXGI.Format.FormatUnknown,
+                ViewDimension = SrvDimension.Buffer,
+                Shader4ComponentMapping = 0x00001688u,
+                Buffer = new BufferSrv
+                {
+                    FirstElement = 0,
+                    NumElements = (uint)(_bonePaletteStride * capacity),
+                    StructureByteStride = (uint)sizeof(Matrix4x4),
+                    Flags = BufferSrvFlags.None
+                }
+            };
+            Device.D3dDevice->CreateShaderResourceView(buffer, &srvDesc, Device.SrvHeapManager.GetCpuHandle(descriptorIds[slot]));
+            handles[slot] = Device.SrvHeapManager.GetGpuHandle(descriptorIds[slot]);
+            buffers[slot] = buffer;
         }
 
-        if (_instanceBoneDescriptorId >= 0)
-        {
-            Device.DescriptorAllocator.Free(_instanceBoneDescriptorId);
-            _instanceBoneDescriptorId = -1;
-        }
-
+        _instanceBoneBuffers = buffers;
+        _mappedInstanceBoneBuffers = mapped;
+        _instanceBoneSrvHandles = handles;
+        _instanceBoneDescriptorIds = descriptorIds;
         _instanceBoneCapacity = capacity;
-        ulong bufferSize = (ulong)(_bonePaletteStride * _instanceBoneCapacity * sizeof(Matrix4x4));
-        _instanceBoneBuffer = Device.ResourceManager.CreateBuffer(
-            HeapType.Upload, bufferSize, ResourceStates.GenericRead);
-        void* pData;
-        _instanceBoneBuffer->Map(0, null, &pData);
-        _mappedInstanceBoneBuffer = (byte*)pData;
-
-        _instanceBoneDescriptorId = Device.DescriptorAllocator.Allocate();
-        var cpuHandle = Device.SrvHeapManager.GetCpuHandle(_instanceBoneDescriptorId);
-        var srvDesc = new ShaderResourceViewDesc
-        {
-            Format = Silk.NET.DXGI.Format.FormatUnknown,
-            ViewDimension = SrvDimension.Buffer,
-            Shader4ComponentMapping = 0x00001688u,
-            Buffer = new BufferSrv
-            {
-                FirstElement = 0,
-                NumElements = (uint)(_bonePaletteStride * _instanceBoneCapacity),
-                StructureByteStride = (uint)sizeof(Matrix4x4),
-                Flags = BufferSrvFlags.None
-            }
-        };
-        Device.D3dDevice->CreateShaderResourceView(_instanceBoneBuffer, &srvDesc, cpuHandle);
-        _instanceBoneSrvHandle = Device.SrvHeapManager.GetGpuHandle(_instanceBoneDescriptorId);
     }
 
-    // 2-3 Step C (tier B): grow/shrink the previous per-instance bone SB
-    // (same capacity as current; clear on first creation)
-    void EnsurePrevInstanceBoneCapacity(uint capacity)
+    /// <summary>2-3 Step C (tier C-b): grow the previous per-instance morph-weights ring (one float4 per entry).</summary>
+    void EnsureMorphWeightsCapacity(int count)
     {
-        if (capacity <= _prevInstanceBoneCapacity)
+        if (count <= _instanceMorphWeightsCapacity && _instanceMorphWeightsBuffers.Length == FrameSlotCount)
             return;
 
-        if (_prevInstanceBoneBuffer != null)
-        {
-            _prevInstanceBoneBuffer->Unmap(0, null);
-            _prevInstanceBoneBuffer->Release();
-        }
-        if (_prevInstanceBoneDescriptorId >= 0)
-        {
-            Device.DescriptorAllocator.Free(_prevInstanceBoneDescriptorId);
-            _prevInstanceBoneDescriptorId = -1;
-        }
+        ReleaseBoneRingDeferred(_instanceMorphWeightsBuffers, _instanceMorphWeightsDescriptorIds);
 
-        _prevInstanceBoneCapacity = capacity;
-        ulong bufferSize = (ulong)(_bonePaletteStride * _prevInstanceBoneCapacity * sizeof(Matrix4x4));
-        _prevInstanceBoneBuffer = Device.ResourceManager.CreateBuffer(
-            HeapType.Upload, bufferSize, ResourceStates.GenericRead);
-        void* pData;
-        _prevInstanceBoneBuffer->Map(0, null, &pData);
-        _mappedPrevInstanceBoneBuffer = (byte*)pData;
-        new Span<byte>(_mappedPrevInstanceBoneBuffer, (int)bufferSize).Clear();
-
-        _prevInstanceBoneDescriptorId = Device.DescriptorAllocator.Allocate();
-        var cpuHandle = Device.SrvHeapManager.GetCpuHandle(_prevInstanceBoneDescriptorId);
-        var srvDesc = new ShaderResourceViewDesc
-        {
-            Format = Silk.NET.DXGI.Format.FormatUnknown,
-            ViewDimension = SrvDimension.Buffer,
-            Shader4ComponentMapping = 0x00001688u,
-            Buffer = new BufferSrv
-            {
-                FirstElement = 0,
-                NumElements = (uint)(_bonePaletteStride * _prevInstanceBoneCapacity),
-                StructureByteStride = (uint)sizeof(Matrix4x4),
-                Flags = BufferSrvFlags.None
-            }
-        };
-        Device.D3dDevice->CreateShaderResourceView(_prevInstanceBoneBuffer, &srvDesc, cpuHandle);
-        _prevInstanceBoneSrvHandle = Device.SrvHeapManager.GetGpuHandle(_prevInstanceBoneDescriptorId);
-    }
-
-    // 2-3 Step C (tier C-b): grow/shrink the previous per-instance
-    // morph-weights SB (one float4 per entry; clear on first creation)
-    void EnsurePrevMorphWeightsCapacity(int count)
-    {
-        if (count <= _prevMorphWeightsCapacity)
-            return;
-
-        if (_prevMorphWeightsBuffer != null)
-        {
-            _prevMorphWeightsBuffer->Unmap(0, null);
-            _prevMorphWeightsBuffer->Release();
-        }
-        if (_prevMorphWeightsDescriptorId >= 0)
-        {
-            Device.DescriptorAllocator.Free(_prevMorphWeightsDescriptorId);
-            _prevMorphWeightsDescriptorId = -1;
-        }
-
-        _prevMorphWeightsCapacity = count;
+        int slots = FrameSlotCount;
         ulong bufferSize = (ulong)(count * sizeof(Vector4));
-        _prevMorphWeightsBuffer = Device.ResourceManager.CreateBuffer(
-            HeapType.Upload, bufferSize, ResourceStates.GenericRead);
-        void* pData;
-        _prevMorphWeightsBuffer->Map(0, null, &pData);
-        _mappedPrevMorphWeightsBuffer = (byte*)pData;
-        new Span<byte>(_mappedPrevMorphWeightsBuffer, (int)bufferSize).Clear();
+        var buffers = new ID3D12Resource*[slots];
+        var mapped = new byte*[slots];
+        var handles = new GpuDescriptorHandle[slots];
+        var descriptorIds = new int[slots];
 
-        _prevMorphWeightsDescriptorId = Device.DescriptorAllocator.Allocate();
-        var cpuHandle = Device.SrvHeapManager.GetCpuHandle(_prevMorphWeightsDescriptorId);
-        var srvDesc = new ShaderResourceViewDesc
+        for (int slot = 0; slot < slots; slot++)
         {
-            Format = Silk.NET.DXGI.Format.FormatUnknown,
-            ViewDimension = SrvDimension.Buffer,
-            Shader4ComponentMapping = 0x00001688u,
-            Buffer = new BufferSrv
-            {
-                FirstElement = 0,
-                NumElements = (uint)count,
-                StructureByteStride = (uint)sizeof(Vector4),
-                Flags = BufferSrvFlags.None
-            }
-        };
-        Device.D3dDevice->CreateShaderResourceView(_prevMorphWeightsBuffer, &srvDesc, cpuHandle);
-        _prevMorphWeightsSrvHandle = Device.SrvHeapManager.GetGpuHandle(_prevMorphWeightsDescriptorId);
+            var buffer = Device.ResourceManager.CreateBuffer(HeapType.Upload, bufferSize, ResourceStates.GenericRead);
+            void* pData;
+            buffer->Map(0, null, &pData);
+            mapped[slot] = (byte*)pData;
+            new Span<byte>(mapped[slot], (int)bufferSize).Clear();
 
-        // Keep the CPU shadow at the same capacity as the SB
+            descriptorIds[slot] = Device.DescriptorAllocator.Allocate();
+            var srvDesc = new ShaderResourceViewDesc
+            {
+                Format = Silk.NET.DXGI.Format.FormatUnknown,
+                ViewDimension = SrvDimension.Buffer,
+                Shader4ComponentMapping = 0x00001688u,
+                Buffer = new BufferSrv
+                {
+                    FirstElement = 0,
+                    NumElements = (uint)count,
+                    StructureByteStride = (uint)sizeof(Vector4),
+                    Flags = BufferSrvFlags.None
+                }
+            };
+            Device.D3dDevice->CreateShaderResourceView(buffer, &srvDesc, Device.SrvHeapManager.GetCpuHandle(descriptorIds[slot]));
+            handles[slot] = Device.SrvHeapManager.GetGpuHandle(descriptorIds[slot]);
+            buffers[slot] = buffer;
+        }
+
+        _instanceMorphWeightsBuffers = buffers;
+        _mappedMorphWeightsBuffers = mapped;
+        _instanceMorphWeightsSrvHandles = handles;
+        _instanceMorphWeightsDescriptorIds = descriptorIds;
+        _instanceMorphWeightsCapacity = count;
+
+        // Keep the CPU shadow at the same capacity as the ring
         // (per primitive, indexed by InstanceStreamIndex)
         if (_currentMorphShadow.Length < count)
             _currentMorphShadow = new Vector4[count];
     }
 
-    /// <summary>Uploads per-instance bone matrices into the GPU StructuredBuffer.</summary>
+    /// <summary>Retires a ring together with its SRV descriptors. Both halves have to wait for the fence: a frame in
+    /// flight may still be reading through the descriptor and from the resource behind it.</summary>
+    static void ReleaseBoneRingDeferred(ID3D12Resource*[] ring, int[] descriptorIds)
+    {
+        ReleaseRingDeferred(ring);
+        if (descriptorIds == null || descriptorIds.Length == 0)
+            return;
+        ulong fence = Device.GetCurrentRetireFenceValue();
+        Device.EnqueueDeferredRelease(fence, () =>
+        {
+            foreach (int id in descriptorIds)
+            {
+                if (id >= 0)
+                    Device.DescriptorAllocator.Free(id);
+            }
+        });
+    }
+
+    /// <summary>Uploads per-instance bone matrices into this frame's ring slot.</summary>
     void UploadInstanceBoneMatrices(int instanceIndex, Matrix4x4[] boneMatrices)
     {
-        if (boneMatrices.Length == 0 || _mappedInstanceBoneBuffer == null)
+        int slot = FrameSlot;
+        if (boneMatrices.Length == 0 || (uint)slot >= (uint)_mappedInstanceBoneBuffers.Length)
+            return;
+
+        byte* destination = _mappedInstanceBoneBuffers[slot];
+        if (destination == null)
             return;
 
         int offset = instanceIndex * _bonePaletteStride * sizeof(Matrix4x4);
         int totalSize = sizeof(Matrix4x4) * Math.Min(boneMatrices.Length, _bonePaletteStride);
         fixed (void* matricesPtr = boneMatrices)
         {
-            Unsafe.CopyBlock(_mappedInstanceBoneBuffer + offset, matricesPtr, (uint)totalSize);
+            Unsafe.CopyBlock(destination + offset, matricesPtr, (uint)totalSize);
         }
     }
 
+    /// <summary>2-3 Step C (tier C-b): publishes this frame's morph shadow into this frame's ring slot. The previous
+    /// frame is the slot that frame wrote, so no copy between the two exists.</summary>
+    void UploadMorphWeightsForFrame()
+    {
+        int slot = FrameSlot;
+        if ((uint)slot >= (uint)_mappedMorphWeightsBuffers.Length)
+            return;
+        byte* destination = _mappedMorphWeightsBuffers[slot];
+        if (destination == null)
+            return;
+
+        int count = Math.Min(_currentMorphShadow.Length, _instanceMorphWeightsCapacity);
+        if (count <= 0)
+            return;
+        fixed (Vector4* pSrc = _currentMorphShadow)
+            Unsafe.CopyBlock(destination, pSrc, (uint)(count * sizeof(Vector4)));
+    }
+
     protected override GpuDescriptorHandle GetInstanceBoneSrvHandle()
-        => DXSceneDrawCollection.Structured(_instanceBoneBuffer, 64, _instanceBoneSrvHandle);
+    {
+        int slot = FrameSlot;
+        if ((uint)slot >= (uint)_instanceBoneBuffers.Length)
+            return default;
+        return DXSceneDrawCollection.Structured(_instanceBoneBuffers[slot], 64, _instanceBoneSrvHandles[slot]);
+    }
+
+    /// <summary>2-3 Step C (tier B): the previous frame's palette is the same ring one slot back.</summary>
     protected override GpuDescriptorHandle GetPrevBoneSrvHandle()
-        => DXSceneDrawCollection.Structured(_prevInstanceBoneBuffer, 64, _prevInstanceBoneSrvHandle);
+    {
+        int slot = PrevFrameSlot;
+        if ((uint)slot >= (uint)_instanceBoneBuffers.Length)
+            return default;
+        return DXSceneDrawCollection.Structured(_instanceBoneBuffers[slot], 64, _instanceBoneSrvHandles[slot]);
+    }
+
+    /// <summary>2-3 Step C (tier C-b): the previous frame's morph weights are the same ring one slot back.</summary>
     protected override GpuDescriptorHandle GetPrevMorphSrvHandle()
-        => DXSceneDrawCollection.Structured(_prevMorphWeightsBuffer, 16, _prevMorphWeightsSrvHandle);
+    {
+        int slot = PrevFrameSlot;
+        if ((uint)slot >= (uint)_instanceMorphWeightsBuffers.Length)
+            return default;
+        return DXSceneDrawCollection.Structured(_instanceMorphWeightsBuffers[slot], 16, _instanceMorphWeightsSrvHandles[slot]);
+    }
 
     public IReadOnlyList<string> GetAnimationNames()
     {
@@ -679,9 +685,11 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
 
         EnsureAnimationStateCapacity(model.Instances.Count);
         EnsurePrimitiveInstanceCapacity(_instanceCount);
+        // This class never draws from the group-level IA buffer, but t9 (previous instance world) lives in the base
+        // class's ring, so that ring has to be sized here rather than by EnsureInstanceBufferCapacity.
+        EnsureInstanceWorldCapacity(_instanceCount);
         EnsureInstanceBoneCapacity((uint)Math.Max(_instanceCount, 1));
-        EnsurePrevInstanceBoneCapacity((uint)Math.Max(_instanceCount, 1));
-        EnsurePrevMorphWeightsCapacity(_instanceCount);
+        EnsureMorphWeightsCapacity(_instanceCount);
 
         // A7 cull input: one root instance world per enabled instance, in write order. The per-primitive streams below hold
         // "node world × instance world", which differs per primitive, so none of them can stand in for the instance as a whole;
@@ -693,36 +701,11 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         bool hasSkin = _skins.Count > 0;
         float deltaTime = Math.Max(time, 0f);
 
-        // 2-3 Step C (tiers B/C-b): before uploading this frame, first copy the
-        // current GPU buffer / CPU shadow to the prev side.
-        // On the first frame, the current side is still all zero
-        // (or the shadow is zero), so the prev side stays zero and the sentinel
-        // semantics remain correct.
-        if (_mappedPrevInstanceBoneBuffer != null && _mappedInstanceBoneBuffer != null)
-        {
-            ulong copySize = (ulong)(_bonePaletteStride * _instanceCount * sizeof(Matrix4x4));
-            if (copySize > 0)
-                Unsafe.CopyBlock((void*)_mappedPrevInstanceBoneBuffer, (void*)_mappedInstanceBoneBuffer, (uint)copySize);
-        }
-        if (_mappedPrevMorphWeightsBuffer != null && _currentMorphShadow.Length > 0)
-        {
-            fixed (Vector4* pSrc = _currentMorphShadow)
-                Unsafe.CopyBlock(_mappedPrevMorphWeightsBuffer, pSrc,
-                    (uint)(_currentMorphShadow.Length * sizeof(Vector4)));
-        }
-
-        // 2-3 Step C (tier C-a): copy the previous frame's instance worlds into
-        // the prev instance-world SB maintained by the base class.
-        // Use the first valid stream.Worlds because all primitives share the
-        // same world data source.
-        foreach (var stream in _primitiveInstanceStreams)
-        {
-            if (stream?.Worlds != null && stream.Worlds.Length >= _instanceCount)
-            {
-                FillPrevInstanceWorldFrom(stream.Worlds, _instanceCount);
-                break;
-            }
-        }
+        // 2-3 Step C (tiers B/C-b): nothing is copied here any more. Each GPU ring above holds one frame in flight per
+        // slot, so "the previous frame's palette / morph weights" is simply the slot the previous frame wrote, and the
+        // shader reads it through PrevFrameSlot. The old code memcpy'd the whole palette forward once per frame, and on
+        // D3D12 that read from write-combined upload memory -- the one access mode the CPU performs an order of
+        // magnitude slower -- to produce bytes the ring already held.
 
         int writeIndex = 0;
 
@@ -861,11 +844,13 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
                 if (primitive.MaterialParams.HasMorphTargets != 0)
                 {
                     instanceData.MorphWeights = ExtractMorphWeights(primitive.OwnerNode);
-                    // 2-3 Step C (tier C-b): update the CPU shadow immediately
-                    // after extraction so it can be uploaded as prev on the next frame
-                    int pidx = primitive.InstanceStreamIndex;
-                    if ((uint)pidx < (uint)_currentMorphShadow.Length)
-                        _currentMorphShadow[pidx] = instanceData.MorphWeights;
+                    // 2-3 Step C (tier C-b): update the CPU shadow immediately after extraction, so it can be published as
+                    // this frame's history below. The destination is the compacted instance slot (the same slot the VS reads as
+                    // instanceSlot), never the primitive's stream index: a model with several morphing primitives would otherwise
+                    // scatter each instance's weights into a different slot, and the history stream would hold one primitive's
+                    // last instance in place of every instance's own weights.
+                    if ((uint)writeIndex < (uint)_currentMorphShadow.Length)
+                        _currentMorphShadow[writeIndex] = instanceData.MorphWeights;
                 }
 
                 stream.Worlds[writeIndex] = finalWorld;
@@ -875,11 +860,22 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
             writeIndex++;
         }
 
+        int slotIndex = FrameSlot;
+        Matrix4x4[]? frameWorlds = null;
         foreach (var stream in _primitiveInstanceStreams)
         {
-            if (stream?.Buffer != null)
-                Device.SetVertexBuffer(stream.Buffer, stream.View, stream.Data);
+            var instanceBuffer = stream?.BufferAt(slotIndex);
+            if (instanceBuffer == null)
+                continue;
+
+            Device.SetVertexBuffer(instanceBuffer, stream!.ViewAt(slotIndex), stream.Data);
+            // 2-3 Step C (tier C-a): publish this frame's worlds into this frame's ring slot. The previous frame's worlds
+            // are the slot that frame wrote, so nothing is copied between the two.
+            frameWorlds ??= stream.Worlds;
         }
+
+        if (frameWorlds != null)
+            UploadInstanceWorldsForFrame(frameWorlds, _instanceCount);
 
         // A7: the box must be in the root instance's model space and cover every clip pose, because the kernel culls the whole
         // instance with it once and every primitive stream only replays that decision.
@@ -898,13 +894,10 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
 
         _transformInitialized = true;
 
-        // 2-3 Step C: from the second frame onward, prev SBs contain valid data,
-        // so notify the shader that it may start reading them.
-        if (wasInitialized)
-        {
-            SetPrevInstanceWorldReady();
-            SetPrevBonesAndMorphReady();
-        }
+        // 2-3 Step C: publishes whether the previous-frame streams may be read this frame. Not a one-shot call any more: the
+        // history is addressed by the compacted instance slot, so it only lines up while the enabled order is unchanged
+        // (see InstancedMesh3DBase.InstanceHistoryValid). The first frame after load has no history and passes false.
+        UpdatePrevStateFlags(wasInitialized && model.InstanceHistoryValid);
 
         // Outline2D active = host-active union any-instance-active.
         // Host activation uses the full mask and ignores the per-instance list.
@@ -944,39 +937,12 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         _asset.InstancePickBones = bones;
     }
 
-    /// <summary>2-3 Step C (tiers B/C-b): once prev bone + prev morph SBs
-    /// contain valid data, sets MaterialParams.HasPrevBones / HasPrevMorph = 1
-    /// for every primitive.
-    /// This is written only on the first call because later frames keep the same
-    /// value and are guarded by early-out. Shell primitives are updated in sync
-    /// as well (plan risk 2), otherwise the shell has no trail.</summary>
-    void SetPrevBonesAndMorphReady()
-    {
-        for (int i = 0; i < _primitives.Count; i++)
-        {
-            var primitive = _primitives[i];
-            bool changed = false;
-            if (primitive.MaterialParams.HasPrevBones == 0 && _prevInstanceBoneSrvHandle.Ptr != 0)
-            {
-                primitive.MaterialParams.HasPrevBones = 1;
-                changed = true;
-            }
-            if (primitive.MaterialParams.HasPrevMorph == 0 && _prevMorphWeightsSrvHandle.Ptr != 0)
-            {
-                primitive.MaterialParams.HasPrevMorph = 1;
-                changed = true;
-            }
-            if (changed)
-            {
-                for (int f = 0; f < Device.frameCount; f++)
-                    Unsafe.Write(primitive.MappedMaterialBuffers[f], primitive.MaterialParams);
-            }
-        }
-        // Synchronize prev flags for shell primitives too: cover both template
-        // sets and both instance-box pools, because pooled boxes may have been
-        // created before this frame and still carry stale flags.
-        SyncShellPrevFlags(false, _prevInstanceBoneSrvHandle.Ptr != 0, _prevMorphWeightsSrvHandle.Ptr != 0);
-    }
+    /// <summary>2-3 Step C (tiers B/C-b): this path owns both history streams once their rings exist, so the base class can
+    /// publish all three flags from one place.</summary>
+    protected override bool HasPrevBoneHistory => GetPrevBoneSrvHandle().Ptr != 0;
+
+    /// <inheritdoc cref="HasPrevBoneHistory"/>
+    protected override bool HasPrevMorphHistory => GetPrevMorphSrvHandle().Ptr != 0;
 
     public override void Draw()
     {
@@ -988,14 +954,16 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         bool forceFadeByAlpha = _currentAlpha < 1f;
 
         // A7 main view: each opaque primitive reads the main-view segment of its own reordered stream, with the instance count from
-        // the args entry (MainViewSlot, i). The bone / prev-bone / prev-world / prev-morph tables stay indexed by the original instance:
-        // the VS recovers it from the tag gather writes into each record, so skinned and morphing models need nothing extra here.
+        // the args entry (MainViewSlot, i). The bone / prev-bone / prev-world / prev-morph tables need no reordering of their own:
+        // the tag gather writes into each record IS the compacted instance slot the cull kernel numbered, which is exactly how those
+        // tables are laid out, so the reordered rows line up row for row and skinned / morphing models need nothing extra here.
         // Fade stays direct for the same reason as the base class (per-instance back-to-front splitting).
         for (int i = 0; i < _opaquePrimitives.Count; i++)
         {
             var primitive = _opaquePrimitives[i];
             var stream = GetPrimitiveInstanceStream(primitive);
-            if (stream == null || stream.Buffer == null)
+            var streamBuffer = stream?.BufferAt(FrameSlot);
+            if (stream == null || streamBuffer == null)
                 continue;
 
             if (!forceFadeByAlpha && TryGetMainViewSegment(i, out var segment, out var sortedResource, out var argsResource))
@@ -1004,24 +972,23 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
                 Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], &segment, 0, 0,
                     GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(),
                     sortedResource, argsResource,
-                    Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i), stream.Buffer);
+                    Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i), streamBuffer);
                 Season.Rendering.InstanceCull.MainViewDraws++;
                 continue;
             }
 
             Pipeline.SetPipeline(forceFadeByAlpha ? PipelineMode.Fade : PipelineMode.Opaque, primitive.DoubleSided);
-            fixed (VertexBufferView* instanceVB = &stream.View)
-            {
-                Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, (uint)_instanceCount, 0,
-                    GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), stream.Buffer);
-            }
+            var instanceVBValue = stream.ViewAt(FrameSlot);
+            VertexBufferView* instanceVB = &instanceVBValue;
+            Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, (uint)_instanceCount, 0,
+                GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), streamBuffer);
         }
 
         for (int i = 0; i < _transparentPrimitives.Count; i++)
         {
             var primitive = _transparentPrimitives[i];
             var stream = GetPrimitiveInstanceStream(primitive);
-            if (stream == null || stream.Buffer == null)
+            if (stream == null || stream.BufferAt(FrameSlot) == null)
                 continue;
 
             _transparentInstanceOrder.Clear();
@@ -1036,22 +1003,22 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
                     return depthB.CompareTo(depthA);
                 });
 
-            fixed (VertexBufferView* instanceVB = &stream.View)
+            var transparentVBValue = stream.ViewAt(FrameSlot);
+            VertexBufferView* instanceVB = &transparentVBValue;
+            var transparentBuffer = stream.BufferAt(FrameSlot);
+            for (int orderIndex = 0; orderIndex < _transparentInstanceOrder.Count; orderIndex++)
             {
-                for (int orderIndex = 0; orderIndex < _transparentInstanceOrder.Count; orderIndex++)
+                int instanceIndex = _transparentInstanceOrder[orderIndex];
+                if (primitive.DoubleSided)
                 {
-                    int instanceIndex = _transparentInstanceOrder[orderIndex];
-                    if (primitive.DoubleSided)
-                    {
-                        Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Front);
-                        Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, 1, (uint)instanceIndex,
-                            GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), stream.Buffer);
-                    }
-
-                    Pipeline.SetPipeline(PipelineMode.Transparent, primitive.DoubleSided ? PipelineCullVariant.Back : PipelineCullVariant.Back);
+                    Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Front);
                     Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, 1, (uint)instanceIndex,
-                        GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), stream.Buffer);
+                        GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), transparentBuffer);
                 }
+
+                Pipeline.SetPipeline(PipelineMode.Transparent, primitive.DoubleSided ? PipelineCullVariant.Back : PipelineCullVariant.Back);
+                Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, 1, (uint)instanceIndex,
+                    GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), transparentBuffer);
             }
         }
 
@@ -1068,9 +1035,10 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         {
             foreach (var stream in _primitiveInstanceStreams)
             {
-                if (stream?.Buffer != null)
+                var streamBuffer = stream?.BufferAt(FrameSlot);
+                if (streamBuffer != null)
                 {
-                    DrawShellBoxes(lightCB, stream.Buffer, stream.View);
+                    DrawShellBoxes(lightCB, streamBuffer, stream!.ViewAt(FrameSlot));
                     break;
                 }
             }
@@ -1096,8 +1064,8 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
 
         // Group-invariant t6/t8/t9/t10 are bound once per group.
         // This class changes only VB/IB/matrix CB per primitive.
-        Pipeline.SetShadowGroupBindings(_instanceBoneSrvHandle, _prevInstanceBoneSrvHandle,
-            _prevInstanceWorldSrvHandle, _prevMorphWeightsSrvHandle);
+        Pipeline.SetShadowGroupBindings(GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(),
+            GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle());
 
         // When b2/t5 are identical within the group, only let the first
         // primitive bind them (see CanShareShadowMaterial)
@@ -1109,7 +1077,7 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         {
             var primitive = _opaquePrimitives[i];
             var stream = GetPrimitiveInstanceStream(primitive);
-            if (stream == null || stream.Buffer == null)
+            if (stream == null || stream.BufferAt(FrameSlot) == null)
                 continue;
 
             // A7: this slot's segment of primitive i's own reordered stream, instance count from args (slot, i). Decided per
@@ -1123,11 +1091,10 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
                 continue;
             }
 
-            fixed (VertexBufferView* instanceVB = &stream.View)
-            {
-                Pipeline.DrawShadowPrimitive(primitive, _matrixBuffers[fi], instanceVB,
-                    (uint)_instanceCount, 0, bindMaterial: !shareMaterial || !materialBound);
-            }
+            var shadowVBValue = stream.ViewAt(FrameSlot);
+            VertexBufferView* instanceVB = &shadowVBValue;
+            Pipeline.DrawShadowPrimitive(primitive, _matrixBuffers[fi], instanceVB,
+                (uint)_instanceCount, 0, bindMaterial: !shareMaterial || !materialBound);
             // Primitives without an instance stream are skipped by continue and
             // submit no bindings, so mark this only after a real draw.
             materialBound = true;
@@ -1158,36 +1125,40 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         {
             var primitive = _opaquePrimitives[i];
             var stream = GetPrimitiveInstanceStream(primitive);
-            if (stream == null || stream.Buffer == null)
+            if (stream == null || stream.BufferAt(FrameSlot) == null)
                 continue;
+
+            var boneSrv = GetInstanceBoneSrvHandle();
+            var prevBoneSrv = GetPrevBoneSrvHandle();
+            var prevWorldSrv = GetPrevInstanceWorldSrvHandle();
+            var prevMorphSrv = GetPrevMorphSrvHandle();
 
             Pipeline.SetPipeline(PipelineMode.Opaque,
                 primitive.DoubleSided ? PipelineCullVariant.None : PipelineCullVariant.Back, depthWrite: false);
             OnBeforeDraw();
-            fixed (VertexBufferView* instanceVB = &stream.View)
+            var maskVBValue = stream.ViewAt(FrameSlot);
+            VertexBufferView* instanceVB = &maskVBValue;
+            if (_outline2DHostActive)
             {
-                if (_outline2DHostActive)
+                Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, (uint)_instanceCount, 0,
+                    boneSrv, prevBoneSrv, prevWorldSrv, prevMorphSrv);
+            }
+            else
+            {
+                for (int k = 0; k < _outline2DInstances.Count; k++)
                 {
-                    Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, (uint)_instanceCount, 0,
-                        _instanceBoneSrvHandle, _prevInstanceBoneSrvHandle, _prevInstanceWorldSrvHandle, _prevMorphWeightsSrvHandle);
-                }
-                else
-                {
-                    for (int k = 0; k < _outline2DInstances.Count; k++)
-                    {
-                        int idx = _outline2DInstances[k];
-                        if ((uint)idx >= (uint)_instanceCount)
-                            continue;
-                        // boneBase=idx: SV_InstanceID does not include
-                        // StartInstanceLocation, so the slot base must be carried
-                        // explicitly by a root constant.
-                        // Color comes from this slot's own instance OutlineColor.
-                        // Multiple colors may coexist in the same frame, and the
-                        // mask carries them per pixel.
-                        Pipeline.SetOutlineMaskColor(_outline2DInstanceColors[k], (uint)idx);
-                        Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, 1, (uint)idx,
-                            _instanceBoneSrvHandle, _prevInstanceBoneSrvHandle, _prevInstanceWorldSrvHandle, _prevMorphWeightsSrvHandle);
-                    }
+                    int idx = _outline2DInstances[k];
+                    if ((uint)idx >= (uint)_instanceCount)
+                        continue;
+                    // boneBase=idx: SV_InstanceID does not include
+                    // StartInstanceLocation, so the slot base must be carried
+                    // explicitly by a root constant.
+                    // Color comes from this slot's own instance OutlineColor.
+                    // Multiple colors may coexist in the same frame, and the
+                    // mask carries them per pixel.
+                    Pipeline.SetOutlineMaskColor(_outline2DInstanceColors[k], (uint)idx);
+                    Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, 1, (uint)idx,
+                        boneSrv, prevBoneSrv, prevWorldSrv, prevMorphSrv);
                 }
             }
         }
@@ -1250,48 +1221,19 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         _primitiveInstanceStreams = Array.Empty<PrimitiveInstanceStream>();
         _animationStates = Array.Empty<InstanceAnimationState>();
 
-        if (_instanceBoneBuffer != null)
-        {
-            _instanceBoneBuffer->Unmap(0, null);
-            _instanceBoneBuffer->Release();
-            _instanceBoneBuffer = null;
-        }
+        ReleaseBoneRingDeferred(_instanceBoneBuffers, _instanceBoneDescriptorIds);
+        _instanceBoneBuffers = EmptyResourceRing;
+        _mappedInstanceBoneBuffers = EmptyMappedRing;
+        _instanceBoneSrvHandles = Array.Empty<GpuDescriptorHandle>();
+        _instanceBoneDescriptorIds = Array.Empty<int>();
+        _instanceBoneCapacity = 0;
 
-        if (_instanceBoneDescriptorId >= 0)
-        {
-            Device.DescriptorAllocator.Free(_instanceBoneDescriptorId);
-            _instanceBoneDescriptorId = -1;
-        }
-
-        _mappedInstanceBoneBuffer = null;
-
-        // 2-3 Step C (tier B): release the previous per-instance bone SB
-        if (_prevInstanceBoneBuffer != null)
-        {
-            _prevInstanceBoneBuffer->Unmap(0, null);
-            _prevInstanceBoneBuffer->Release();
-            _prevInstanceBoneBuffer = null;
-        }
-        if (_prevInstanceBoneDescriptorId >= 0)
-        {
-            Device.DescriptorAllocator.Free(_prevInstanceBoneDescriptorId);
-            _prevInstanceBoneDescriptorId = -1;
-        }
-        _mappedPrevInstanceBoneBuffer = null;
-
-        // 2-3 Step C (tier C-b): release the previous per-instance morph-weights SB
-        if (_prevMorphWeightsBuffer != null)
-        {
-            _prevMorphWeightsBuffer->Unmap(0, null);
-            _prevMorphWeightsBuffer->Release();
-            _prevMorphWeightsBuffer = null;
-        }
-        if (_prevMorphWeightsDescriptorId >= 0)
-        {
-            Device.DescriptorAllocator.Free(_prevMorphWeightsDescriptorId);
-            _prevMorphWeightsDescriptorId = -1;
-        }
-        _mappedPrevMorphWeightsBuffer = null;
+        ReleaseBoneRingDeferred(_instanceMorphWeightsBuffers, _instanceMorphWeightsDescriptorIds);
+        _instanceMorphWeightsBuffers = EmptyResourceRing;
+        _mappedMorphWeightsBuffers = EmptyMappedRing;
+        _instanceMorphWeightsSrvHandles = Array.Empty<GpuDescriptorHandle>();
+        _instanceMorphWeightsDescriptorIds = Array.Empty<int>();
+        _instanceMorphWeightsCapacity = 0;
         _currentMorphShadow = Array.Empty<Vector4>();
 
         // Unified highlighting: release the highlight pool

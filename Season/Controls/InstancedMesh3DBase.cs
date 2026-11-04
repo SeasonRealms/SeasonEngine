@@ -110,6 +110,46 @@ public abstract class InstancedMesh3DBase : Control
     public List<MeshInstanceTransform> Instances { get; } = new List<MeshInstanceTransform>();
 
     /// <summary>
+    /// Whether this frame's compacted instance order is identical to the last frame that actually submitted instance streams,
+    /// i.e. whether the per-instance history (previous world / bones / morph weights) still lines up slot for slot.
+    ///
+    /// History is addressed by the compacted slot, not by the position in <see cref="Instances"/>: the direct path reaches it as
+    /// SV_InstanceID and the A7 indirect path as the index gather stamps into each record, and both mean "the Nth enabled instance".
+    /// Switching one instance off therefore shifts every later instance down a slot, and without this flag the first frame after such
+    /// a change pairs each instance with its predecessor's history -- a one-frame velocity spike, worst on the instance that took the
+    /// disabled one's place. Backends read this and withhold previous-frame data for that one frame; the cost is a single frame whose
+    /// motion vectors carry camera motion only, which is strictly better than a wrong vector on every instance past the change.
+    /// </summary>
+    public bool InstanceHistoryValid { get; private set; }
+
+    ulong _instanceLayoutHash;
+    bool _instanceLayoutPrimed;
+
+    /// <summary>
+    /// Recomputes <see cref="InstanceHistoryValid"/> once per frame, immediately before the backend consumes the instance list.
+    /// <paramref name="submitting"/> is the caller's own gate: a frame that skips the backend update writes no history either, so the
+    /// next frame has nothing valid to read even when the enabled set is unchanged. That covers the "whole group disabled for a frame"
+    /// case, which would otherwise make the history one ring slot older than "the previous frame".
+    /// </summary>
+    internal void RefreshInstanceHistory(bool submitting)
+    {
+        ulong hash = 14695981039346656037UL;
+        int enabled = 0;
+        for (int i = 0; i < Instances.Count; i++)
+        {
+            if (!Instances[i].Enable)
+                continue;
+            enabled++;
+            hash = (hash ^ (ulong)i) * 1099511628211UL;
+        }
+
+        bool submit = submitting && enabled > 0;
+        InstanceHistoryValid = submit && _instanceLayoutPrimed && hash == _instanceLayoutHash;
+        _instanceLayoutHash = hash;
+        _instanceLayoutPrimed = submit;
+    }
+
+    /// <summary>
     /// Host-level batch highlight configuration for composite objects, see <see cref="Highlight"/>.
     /// When explicitly replaced, it cascades as a whole to all currently existing instances via CopyFrom,
     /// applying style/on-off/two-color/outline width in one step. When instances are added only after the host
@@ -143,6 +183,11 @@ public abstract class InstancedMesh3DBase : Control
     /// all replaying one per-instance decision made against the clip-union box (<see cref="InstancedModel.TemplateCullBounds"/>), so a
     /// skinned or node-animated model is culled by every pose its clips can reach rather than by the rest pose (morph displacement is not
     /// replayed; the rest box it is unioned with is what covers it).
+    ///
+    /// There is deliberately no size threshold that turns this on by itself. Whether a group profits depends on how much of its instance count
+    /// is off screen and on the fixed per-target cost of the cull chain, and neither is knowable from here -- a small group pays the chain and
+    /// gains nothing, a large one pays it once and saves thousands of vertices. So opting in is a decision made by the scene that creates the
+    /// control, at initialization, and it stays a caller decision rather than a heuristic hidden in the renderer.
     /// </summary>
     public InstanceDrawPath DrawPath { get; set; } = InstanceDrawPath.Direct;
 

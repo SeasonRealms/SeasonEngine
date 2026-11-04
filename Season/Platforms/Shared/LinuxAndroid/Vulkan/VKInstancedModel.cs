@@ -28,14 +28,12 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
     byte*[] _mappedInstanceBoneBuffers = null!;
     uint _instanceBoneCapacity;
 
-    // 2-3 Step C (track B): prev per-instance bone SSBO
-    // (same capacity as _instanceBoneBuffers).
-    // Before each frame upload, memcpy the current bone-buffer mapped region into the prev mapped region,
-    // so the GPU always holds the bone palette from the previous frame.
-    // Before the first frame, the content is all zero (sentinel _m33 == 0),
-    // and the shader falls back to the current bone per joint.
-    BufferResource[] _prevInstanceBoneBuffers = null!;
-    byte*[] _mappedPrevInstanceBoneBuffers = null!;
+    // 2-3 Step C (track B): the previous frame's palette is NOT a second buffer. Each slot of the ring below
+    // holds the palette of the frame that wrote it, so slot (fi + n - 1) % n already IS the previous frame's
+    // palette and GetPrevBoneBufferInfo points the shader there. The old code kept a parallel prev buffer and
+    // memcpy'd _mappedInstanceBoneBuffers[fi] into it before uploading, which copied the palette of the frame
+    // that last used slot fi -- three frames old, not one. Cold slots stay zeroed, so the shader's _m33 sentinel
+    // still falls back to this frame's bones joint by joint until a slot has real history.
 
     // 2-3 Step C (track C-a): prev per-instance world SSBO
     // (same capacity as _instanceWorlds).
@@ -485,7 +483,6 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
 
     void CreateOrResizeInstanceBoneBuffers(uint capacity)
     {
-        var identity = Matrix4x4.Identity;
         int elementCount = Math.Max(1, _bonePaletteStride * (int)capacity);
         ulong size = (ulong)(elementCount * Unsafe.SizeOf<Matrix4x4>());
 
@@ -512,8 +509,10 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
                 throw new Exception("vkMapMemory (InstancedModel bone storage) failed");
 
             _mappedInstanceBoneBuffers[i] = (byte*)mapped;
-            for (int j = 0; j < elementCount; j++)
-                Unsafe.Write(_mappedInstanceBoneBuffers[i] + j * Unsafe.SizeOf<Matrix4x4>(), identity);
+            // Zero, not identity: a slot that has never been written must read as "no previous frame" through the
+            // shader's _m33 == 0 sentinel, which is what makes it fall back to this frame's bones instead of
+            // extrapolating from an identity pose.
+            new Span<byte>(mapped, (int)size).Clear();
         }
 
         _instanceBoneCapacity = capacity;
@@ -530,48 +529,6 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         fixed (void* matricesPtr = boneMatrices)
         {
             Unsafe.CopyBlock(_mappedInstanceBoneBuffers[fi] + offset, matricesPtr, (uint)totalSize);
-        }
-    }
-
-    // 2-3 Step C (track B): create or grow the prev per-instance bone SSBO
-    // (same capacity as current; zero-initialized on first creation)
-    void EnsurePrevInstanceBoneCapacity(uint capacity)
-    {
-        if (capacity <= (_prevInstanceBoneBuffers != null ? (uint)_prevInstanceBoneBuffers.Length : 0))
-            return;
-
-        // Release the old buffers
-        if (_prevInstanceBoneBuffers != null)
-        {
-            for (int i = 0; i < _prevInstanceBoneBuffers.Length; i++)
-            {
-                // Same retire rule as the current bone SSBO above: the set written for a frame in flight still points here.
-                var retired = _prevInstanceBoneBuffers[i];
-                if (_mappedPrevInstanceBoneBuffers != null && i < _mappedPrevInstanceBoneBuffers.Length
-                    && _mappedPrevInstanceBoneBuffers[i] != null && retired.Memory.Handle != 0)
-                    Device.Vk.UnmapMemory(Device.LogicalDevice, retired.Memory);
-                if (retired.Memory.Handle != 0)
-                    Device.EnqueueDeferredRelease(() => Device.ResourceManager.DestroyBuffer(retired));
-            }
-        }
-
-        int n = (int)Device.frameCount;
-        int elementCount = Math.Max(1, _bonePaletteStride * (int)capacity);
-        ulong size = (ulong)(elementCount * Unsafe.SizeOf<Matrix4x4>());
-        _prevInstanceBoneBuffers = new BufferResource[n];
-        _mappedPrevInstanceBoneBuffers = new byte*[n];
-
-        for (int i = 0; i < n; i++)
-        {
-            _prevInstanceBoneBuffers[i] = Device.ResourceManager.CreateBuffer(
-                size,
-                BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferDstBit,
-                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit);
-            void* mapped;
-            if (Device.Vk.MapMemory(Device.LogicalDevice, _prevInstanceBoneBuffers[i].Memory, 0, size, 0, &mapped) != Result.Success)
-                throw new Exception("vkMapMemory (PrevInstanceBoneBuffers) failed");
-            _mappedPrevInstanceBoneBuffers[i] = (byte*)mapped;
-            new Span<byte>(mapped, (int)size).Clear();
         }
     }
 
@@ -659,9 +616,15 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
 
     // 2-3 Step C: override the base virtual methods to return the actual prev SSBOs
     protected override DescriptorBufferInfo GetPrevBoneBufferInfo(int fi)
-        => _prevInstanceBoneBuffers != null && fi < _prevInstanceBoneBuffers.Length
-            ? new() { Buffer = _prevInstanceBoneBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize }
+    {
+        if (_instanceBoneBuffers == null || _instanceBoneBuffers.Length == 0)
+            return base.GetPrevBoneBufferInfo(fi);
+        int slots = _instanceBoneBuffers.Length;
+        var prev = _instanceBoneBuffers[((fi % slots) + slots - 1) % slots];
+        return prev.Buffer.Handle != 0
+            ? new() { Buffer = prev.Buffer, Offset = 0, Range = Vk.WholeSize }
             : base.GetPrevBoneBufferInfo(fi);
+    }
 
     protected override DescriptorBufferInfo GetPrevInstanceWorldBufferInfo(int fi)
         => _prevInstanceWorldBuffers != null && fi < _prevInstanceWorldBuffers.Length
@@ -673,41 +636,12 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
             ? new() { Buffer = _prevMorphWeightsBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize }
             : base.GetPrevMorphWeightsBufferInfo(fi);
 
-    // 2-3 Step C (tracks B/C-b): after the prev bone + prev morph SBs contain valid data,
-    // set MaterialParams.HasPrevBones / HasPrevInstanceWorld / HasPrevMorph = 1
-    // for all primitives.
-    void SetPrevBonesAndMorphReady()
-    {
-        for (int i = 0; i < _primitives.Count; i++)
-        {
-            var primitive = _primitives[i];
-            bool changed = false;
-            if (primitive.MaterialParams.HasPrevBones == 0 && _prevInstanceBoneBuffers != null)
-            {
-                primitive.MaterialParams.HasPrevBones = 1;
-                changed = true;
-            }
-            if (primitive.MaterialParams.HasPrevInstanceWorld == 0 && _prevInstanceWorldBuffers != null)
-            {
-                primitive.MaterialParams.HasPrevInstanceWorld = 1;
-                changed = true;
-            }
-            if (primitive.MaterialParams.HasPrevMorph == 0 && _prevMorphWeightsBuffers != null)
-            {
-                primitive.MaterialParams.HasPrevMorph = 1;
-                changed = true;
-            }
-            if (changed)
-            {
-                for (int f = 0; f < Device.frameCount; f++)
-                    Unsafe.Write(primitive.MappedMaterialBuffers[f], primitive.MaterialParams);
-            }
-        }
-        // Synchronize prev flags for shell primitives:
-        // cover both template sets and both instance-box pools,
-        // since pooled boxes may have been created earlier and have stale flags
-        SyncShellPrevFlags(_prevInstanceWorldBuffers != null, _prevInstanceBoneBuffers != null, _prevMorphWeightsBuffers != null);
-    }
+    // 2-3 Step C (tracks B/C-b): this path owns both history streams once their rings exist, so the base class can publish
+    // all three flags from one place, every frame (see VKInstancedPrimitiveGroup.UpdatePrevStateFlags).
+    protected override bool HasPrevBoneHistory => _instanceBoneBuffers != null && _instanceBoneBuffers.Length > 0;
+
+    /// <inheritdoc cref="HasPrevBoneHistory"/>
+    protected override bool HasPrevMorphHistory => _prevMorphWeightsBuffers != null;
 
     public IReadOnlyList<string> GetAnimationNames()
     {
@@ -746,7 +680,6 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         EnsurePrimitiveInstanceCapacity(_instanceCount);
         EnsureInstanceBoneCapacity((uint)Math.Max(_instanceCount, 1));
         // 2-3 Step C: create or grow the prev SSBOs
-        EnsurePrevInstanceBoneCapacity((uint)Math.Max(_instanceCount, 1));
         EnsurePrevInstanceWorldCapacity(_instanceCount);
         EnsurePrevMorphWeightsCapacity(_instanceCount);
 
@@ -760,17 +693,10 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         bool hasSkin = _skins.Count > 0;
         float deltaTime = Math.Max(time, 0f);
 
-        // 2-3 Step C (tracks B/C-b): before uploading this frame,
-        // first copy the current GPU buffer / CPU shadow to the prev side.
-        // On the first frame, the current side is all zero (or the shadow is zero),
-        // so the prev side remains zeroed and the sentinel semantics stay correct.
+        // 2-3 Step C (tracks C-a/C-b): hand the PREVIOUS frame's CPU-side data to the prev SSBO slots before
+        // overwriting them below. The bone palette needs no equivalent: it is a ring read one slot back (see
+        // GetPrevBoneBufferInfo), so the previous frame's palette is already the slot the GPU holds.
         int fi = (int)Device.FrameIndex;
-        if (_mappedPrevInstanceBoneBuffers != null && _mappedInstanceBoneBuffers != null)
-        {
-            ulong copySize = (ulong)(_bonePaletteStride * _instanceCount * Unsafe.SizeOf<Matrix4x4>());
-            if (copySize > 0 && fi < _mappedPrevInstanceBoneBuffers.Length && fi < _mappedInstanceBoneBuffers.Length)
-                Unsafe.CopyBlock(_mappedPrevInstanceBoneBuffers[fi], _mappedInstanceBoneBuffers[fi], (uint)copySize);
-        }
         if (_mappedPrevInstanceWorldBuffers != null)
         {
             if (fi < _mappedPrevInstanceWorldBuffers.Length && _mappedPrevInstanceWorldBuffers[fi] != null)
@@ -857,11 +783,13 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
                 if (primitive.MaterialParams.HasMorphTargets != 0)
                 {
                     instanceData.MorphWeights = ExtractMorphWeights(primitive.OwnerNode);
-                    // 2-3 Step C (track C-b): update the CPU shadow immediately after extraction,
-                    // so it can be uploaded as prev data in the next frame
-                    int pidx = primitive.InstanceStreamIndex;
-                    if ((uint)pidx < (uint)_currentMorphShadow.Length)
-                        _currentMorphShadow[pidx] = instanceData.MorphWeights;
+                    // 2-3 Step C (track C-b): update the CPU shadow immediately after extraction, so it can be published as
+                    // this frame's history below. The destination is the compacted instance slot (the same slot the VS reads as
+                    // instanceSlot), never the primitive's stream index: a model with several morphing primitives would otherwise
+                    // scatter each instance's weights into a different slot, and the history stream would hold one primitive's
+                    // last instance in place of every instance's own weights.
+                    if ((uint)writeIndex < (uint)_currentMorphShadow.Length)
+                        _currentMorphShadow[writeIndex] = instanceData.MorphWeights;
                 }
                 stream.Data[writeIndex] = instanceData;
             }
@@ -964,13 +892,13 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
 
         _transformInitialized = true;
 
-        // 2-3 Step C: from the second frame onward, the prev SBs contain valid data,
-        // so notify the shader path that it can start reading them.
-        // Also rewrite the DescriptorSet to switch bindings 13/14/15
-        // from the default zero buffers to the actual prev SSBOs.
+        // 2-3 Step C: publishes whether the previous-frame streams may be read this frame. Not a one-shot call any more: the
+        // history is addressed by the compacted instance slot, so it only lines up while the enabled order is unchanged
+        // (see InstancedMesh3DBase.InstanceHistoryValid). The first frame after load has no history and passes false.
+        // The DescriptorSet rewrite stays one-shot: it only switches bindings 13/14/15 to the real previous-frame SSBOs.
+        UpdatePrevStateFlags(wasInitialized && model.InstanceHistoryValid);
         if (wasInitialized)
         {
-            SetPrevBonesAndMorphReady();
             foreach (var primitive in _primitives)
                 RewriteDescriptorSets(primitive);
             // Keep shell primitive descriptor sets in sync
@@ -994,8 +922,9 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         int fi = (int)Device.FrameIndex;
 
         // A7 main view: each opaque primitive reads the main-view segment of its own reordered stream, with the instance count from
-        // the args entry (MainViewSlot, i). The bone / prev-bone / prev-world / prev-morph tables stay indexed by the original instance:
-        // the VS recovers it from the tag gather writes into each record, so skinned and morphing models need nothing extra here.
+        // the args entry (MainViewSlot, i). The bone / prev-bone / prev-world / prev-morph tables need no reordering of their own:
+        // the tag gather writes into each record IS the compacted instance slot the cull kernel numbered, which is exactly how those
+        // tables are laid out, so the reordered rows line up row for row and skinned / morphing models need nothing extra here.
         // Fade stays direct for the same reason as the base class (per-instance back-to-front splitting).
         for (int i = 0; i < _opaquePrimitives.Count; i++)
         {
@@ -1270,19 +1199,6 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         _mappedInstanceBoneBuffers = null!;
 
         // 2-3 Step C: release the prev SSBOs
-        if (_prevInstanceBoneBuffers != null)
-        {
-            for (int i = 0; i < _prevInstanceBoneBuffers.Length; i++)
-            {
-                if (_mappedPrevInstanceBoneBuffers != null && i < _mappedPrevInstanceBoneBuffers.Length
-                    && _mappedPrevInstanceBoneBuffers[i] != null && _prevInstanceBoneBuffers[i].Memory.Handle != 0)
-                    Device.Vk.UnmapMemory(Device.LogicalDevice, _prevInstanceBoneBuffers[i].Memory);
-                if (_prevInstanceBoneBuffers[i].Memory.Handle != 0)
-                    Device.ResourceManager?.DestroyBuffer(_prevInstanceBoneBuffers[i]);
-            }
-            _prevInstanceBoneBuffers = null!;
-            _mappedPrevInstanceBoneBuffers = null!;
-        }
         if (_prevInstanceWorldBuffers != null)
         {
             for (int i = 0; i < _prevInstanceWorldBuffers.Length; i++)

@@ -76,6 +76,14 @@ internal sealed class RiverSegment : Mesh3D
     const float WallWidth = 0.35f;
 
     /// <summary>
+    /// How far inside the nominal water line ±hw the visible shoreline actually runs: the water plane cuts the inner face
+    /// between its bed edge and its shoulder at that much past the shoulder, because the face is <see cref="WallWidth"/>
+    /// across while rising <see cref="CrestRise"/> over a <see cref="WaterDepth"/>-deep channel. The movement block stops on
+    /// this line rather than on ±hw, which is what leaves the bank pieces standing just outside it walkable.
+    /// </summary>
+    const float WaterlineDepth = WallWidth * CrestRise / (CrestRise + WaterDepth);
+
+    /// <summary>
     /// Water depth over the bed. Together with the course height this is what puts the bed 12 cm above the grass, i.e.
     /// the raised bed the levee plan asks for, instead of the 2 cm skim it was sitting at before.
     /// </summary>
@@ -113,6 +121,14 @@ internal sealed class RiverSegment : Mesh3D
     /// <see cref="Pond"/> derives the top of its rim from it: the rim is the top of a piece standing on the grass.
     /// </summary>
     internal const float DikeSink = 0.10f;
+
+    /// <summary>
+    /// The top of a standing piece, above the grass: its full height less the buried part. The anchor in SyncDikes is
+    /// placed at half this box regardless of the row's water surface, so this is absolute - <see cref="Pond"/> derives
+    /// <c>RimTop</c> from the very same pair of constants, which is what lets the pond's rim carry straight onto the
+    /// bank pieces at one height. The walkable <see cref="DikeSlab"/> tops must use this, not a water-referenced height.
+    /// </summary>
+    internal const float DikeTop = DikeHeight - DikeSink;
 
     /// <summary>How far the piece's inner edge sits behind the crest shoulder, i.e. how much it overlaps the levee.</summary>
     const float DikeInset = 0.06f;
@@ -267,6 +283,10 @@ internal sealed class RiverSegment : Mesh3D
 
     // One axis-aligned rectangle per row pair, in author space, for the movement footprint test.
     readonly List<WaterSlab> _slabs = new();
+
+    // One rectangle per bank piece, in author space, parallel to the piece slots: the top of a piece is a walkable floor,
+    // the same lift PlayerCollider derives from the pond's rim bands.
+    readonly List<DikeSlab> _dikeSlabs = new();
 
     // One entry per bank piece this stretch owns, in course order: filled by BuildSurface, instantiated by AddDikes.
     readonly List<DikeSlot> _slots = new();
@@ -431,6 +451,46 @@ internal sealed class RiverSegment : Mesh3D
         }
 
         return overlap;
+    }
+
+    /// <summary>
+    /// Walkable floor height under a footprint - world center plus half extents - from the tops of this stretch's bank
+    /// pieces: the same five samples <see cref="Management.PlayerCollider.FloorHeightUnder"/> takes over the pond's rim
+    /// bands, tested against each piece's footprint rectangle in author space. A piece's top stands at
+    /// <see cref="DikeTop"/> above the grass, the same height the pond derives as <c>RimTop</c>.
+    ///
+    /// <para>This is what lets the player jump onto the bank and walk along it: the block below the pieces only covers the
+    /// water, so once the feet are on a piece the two tests agree. Like the pond's rim, the top is more than one
+    /// <see cref="Management.PlayerCollider.StepLimit"/> above the grass, so it is reached by a jump, never by walking up.
+    /// Hand-edited pieces move with their instance because the query reads the stretch's live matrix.</para>
+    /// </summary>
+    internal float FloorHeightUnder(in Vector3 center, in Vector3 half)
+    {
+        if (_dikeSlabs.Count == 0) return 0f;
+        if (!Matrix4x4.Invert(BuildWorldMatrix(), out var inverse)) return 0f;
+
+        float top = 0f;
+        for (int sample = 0; sample < 5; sample++)
+        {
+            float sx = sample == 0 ? 0f : (sample & 1) == 0 ? -1f : 1f;
+            float sz = sample == 0 ? 0f : (sample & 2) == 0 ? -1f : 1f;
+            var point = Vector3.Transform(
+                new Vector3(center.X + sx * half.X, center.Y, center.Z + sz * half.Z), inverse);
+
+            for (int i = 0; i < _dikeSlabs.Count; i++)
+            {
+                var slab = _dikeSlabs[i];
+                var delta = point - slab.Center;
+                if (MathF.Abs(Vector3.Dot(delta, slab.Lateral)) <= slab.HalfWidth
+                    && MathF.Abs(Vector3.Dot(delta, slab.Flow)) <= slab.HalfLength)
+                {
+                    top = MathF.Max(top, slab.Top);
+                    break;
+                }
+            }
+        }
+
+        return top;
     }
 
     /// <summary>
@@ -625,12 +685,13 @@ internal sealed class RiverSegment : Mesh3D
     }
 
     /// <summary>
-    /// One rectangle per row pair, covering the water band's <b>maximum</b> half width of the two rows plus whatever
-    /// stands on the bank - the levee's toe, or the outer edge of the bank pieces where they are laid - and half the
-    /// chord length along the flow. Widening past the water is deliberate: the levee is a 66 cm physical barrier and the
-    /// pieces are another 76 cm of solid geometry, so the player stops outside both instead of walking into them and only
-    /// then meeting the water. Overshooting by a few centimetres is harmless, because the corners this samples are
-    /// already a footprint radius away from the body.
+    /// One rectangle per row pair, in author space, covering the water the movement footprint test blocks entry to: the
+    /// <b>maximum</b> visible shoreline of the two rows - ±hw less <see cref="WaterlineDepth"/>, because the water plane
+    /// cuts the inner face a little inside the shoulder. The bank pieces and the levee toe stand outside this band on
+    /// purpose: a piece's top is a walkable floor (<see cref="FloorHeightUnder"/>) the player can jump onto and walk
+    /// along, exactly like the pond's rim, and only stepping into the water itself is refused. Inside an opening the crest
+    /// has dropped onto the bed, so the water does reach its full ±hw and the band widens to it - which also keeps the
+    /// junction, where no pieces stand, closed to movement.
     /// </summary>
     void BuildSlabs(WaterRibbonRow[] sampled, float[] arc, int rows)
     {
@@ -646,19 +707,17 @@ internal sealed class RiverSegment : Mesh3D
 
             var flow = along / length;
 
-            // How far out the stretch blocks the player. Two things have to be inside the footprint: the levee's outer
-            // toe, and the bank pieces standing on the outer slope - they are visual only, so a footprint that stopped
-            // at the toe would let the player walk straight into a 76 cm bank. At an opening neither exists: there the
-            // levee is flat and the junction has to stay open water, which is what the extra ramp width is for.
+            // Where the levee is fully stood up the shoreline sits inside ±hw; where an opening has dropped the crest
+            // onto the bed the water spreads to ±hw itself. Smoothstepped with the opening, like everything else here.
             float junction = OpeningFactor((arc[row] + arc[row + 1]) * 0.5f);
-            float levee = CrestWidth + SkirtWidth + junction * 1.6f;
-            float dike = (1f - junction) * (CrestWidth - DikeInset + DikeWidth);
+            float shoulder = MathF.Max(
+                MathF.Max(start.HalfWidth, end.HalfWidth) - WaterlineDepth * (1f - junction), 0.05f);
 
             _slabs.Add(new WaterSlab(
                 (start.Center + end.Center) * 0.5f,
                 WaterRibbonMath.Lateral(flow),
                 flow,
-                MathF.Max(start.HalfWidth, end.HalfWidth) + MathF.Max(levee, dike),
+                shoulder,
                 length * 0.5f));
         }
     }
@@ -682,6 +741,7 @@ internal sealed class RiverSegment : Mesh3D
     void BuildDikeSlots(WaterRibbonRow[] sampled, float[] arc, int rows)
     {
         _slots.Clear();
+        _dikeSlabs.Clear();
 
         // Arc metres of every pair laid down so far. The opening pins below read it to tell a gap from a piece they would
         // only land on top of.
@@ -842,6 +902,10 @@ internal sealed class RiverSegment : Mesh3D
     ///
     /// <para>Returns whether anything was added, so a caller walking the course can tell "spacing says place here" from
     /// "this spot is refused".</para>
+    ///
+    /// <para>Every accepted piece also gets a <see cref="DikeSlab"/>: its top is the walkable floor
+    /// <see cref="FloorHeightUnder"/> reports, so a player who jumps onto the bank can stand and walk along it while the
+    /// narrower <see cref="BuildSlabs"/> band keeps the water itself refused.</para>
     /// </summary>
     bool AddDikePair(Vector3 center, Vector3 flow, float halfWidth, float along)
     {
@@ -865,6 +929,18 @@ internal sealed class RiverSegment : Mesh3D
                 continue;
 
             _slots.Add(new DikeSlot(center, lateral, flow, halfWidth, side));
+
+            // The piece's own footprint rectangle, same offset formula as SyncDikes: its center sits half a piece out
+            // from the water line plus the crest shoulder, and its top is the box top SyncDikes places - a full piece
+            // high less the buried part, above the grass. Not above the row's water surface: the anchor is placed at
+            // DikeHeight * 0.5 - DikeSink whatever this row's water height is, so adding center.Y here would float the
+            // player 34 cm over the visible surface on every raised-levee row.
+            float offset = halfWidth + CrestWidth - DikeInset + DikeWidth * 0.5f;
+            _dikeSlabs.Add(new DikeSlab(
+                center + lateral * (side * offset), lateral, flow,
+                DikeWidth * 0.5f, DikeLength * 0.5f,
+                DikeTop));
+
             added = true;
         }
 
@@ -1059,6 +1135,13 @@ internal sealed class RiverSegment : Mesh3D
 
     /// <summary>One collision footprint in author space: the midpoint of a row pair plus the frame its rectangle is built in.</summary>
     readonly record struct WaterSlab(Vector3 Center, Vector3 Lateral, Vector3 Flow, float HalfWidth, float HalfLength);
+
+    /// <summary>
+    /// One piece's walkable footprint in author space: its center plus the frame its rectangle is built in, the half
+    /// extents themselves, and the world top its surface stands at. Built beside <see cref="DikeSlot"/>s so a piece that
+    /// was refused by <see cref="CanStand"/> is neither drawn nor floor.
+    /// </summary>
+    readonly record struct DikeSlab(Vector3 Center, Vector3 Lateral, Vector3 Flow, float HalfWidth, float HalfLength, float Top);
 
     /// <summary>
     /// A piece's transform as the course asked for it: anchor, template-axis size and heading. Compared against the live
@@ -1809,6 +1892,19 @@ internal sealed class River : Panel
         for (int i = 0; i < Segments.Length; i++)
             overlap += Segments[i].WaterOverlap(center, half);
         return overlap;
+    }
+
+    /// <summary>
+    /// Walkable floor height under a movement footprint: the top of any bank piece it touches, across every stretch. This
+    /// is what turns the line of banks into ground the player can jump onto and walk along - the same lift the pond's rim
+    /// bands give, at the same height, so the pond's rim carries straight on onto the branch's banks through the opening.
+    /// </summary>
+    internal float FloorHeightUnder(in Vector3 center, in Vector3 half)
+    {
+        float top = 0f;
+        for (int i = 0; i < Segments.Length; i++)
+            top = MathF.Max(top, Segments[i].FloorHeightUnder(center, half));
+        return top;
     }
 
     /// <summary>Control points only flush the optional arguments onto the panel; the stretches have to be ticked explicitly.</summary>

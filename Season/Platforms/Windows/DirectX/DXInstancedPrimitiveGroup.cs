@@ -51,41 +51,96 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     protected ID3D12Resource*[] _matrixBuffers = null!;
     protected byte*[] _mappedMatrixBuffers = null!;
 
-    protected ID3D12Resource* _instanceBuffer;
-    protected VertexBufferView _instanceBufferView;
+    // ============================================================
+    // Frame ring: one slot per frame in flight
+    // ============================================================
+    // Every per-frame GPU buffer below is a ring with one slot per in-flight frame (Device.frameCount). A frame
+    // writes slot FrameSlot and reads slot FrameSlot; the GPU may still be executing the previous one or two
+    // frames, which read their own slots, so nothing a frame writes can be observed by another frame's work.
+    //
+    // "The previous frame" is therefore not a copy but a different slot of the SAME ring: PrevFrameSlot is the
+    // slot written by the frame before this one. That is what replaced the old whole-block memcpy, and on D3D12 it
+    // also removed a read of write-combined upload memory, which the CPU performs an order of magnitude slower
+    // than an ordinary write.
+    //
+    // The swap is only sound with one slot per in-flight frame: a two-slot swap would have frame k overwrite the
+    // data frame k-2 is still reading. Cold slots stay zero-initialized, which is what keeps the shader sentinels
+    // (_m33 == 0) meaningful on the first frame a slot is used.
+    protected static int FrameSlotCount => (int)Device.frameCount;
+
+    /// <summary>Empty ring, shared. A pointer type cannot be a generic argument, so <c>Array.Empty&lt;T&gt;()</c> does not
+    /// exist for these arrays; the empty rings below point here rather than allocate a fresh zero-length array.</summary>
+    protected static readonly ID3D12Resource*[] EmptyResourceRing = new ID3D12Resource*[0];
+    protected static readonly byte*[] EmptyMappedRing = new byte*[0];
+
+    /// <summary>Ring slot this frame writes and reads.</summary>
+    protected static int FrameSlot => (int)(Device.FrameIndex % Device.frameCount);
+
+    /// <summary>Ring slot holding the previous frame's data (see the frame-ring note above).</summary>
+    protected static int PrevFrameSlot => (int)((Device.FrameIndex + Device.frameCount - 1) % Device.frameCount);
+
+    protected ID3D12Resource*[] _instanceBuffers = EmptyResourceRing;
+    protected VertexBufferView[] _instanceBufferViews = Array.Empty<VertexBufferView>();
     protected int _instanceCapacity;
     protected int _instanceCount;
 
-    // 2-3 Step C (tier C-a): prev instance-world SB
-    // (same capacity as _instanceWorlds, one Matrix4x4 per entry).
-    // Each frame, UpdateInstanceData copies the current _instanceWorlds into the
-    // mapped prev-SB region before uploading the new frame, so the GPU always
-    // holds the previous frame's instance world and the shader can index it by
-    // instanceID.
-    // Contents are zeroed before the first frame (sentinel _m33==0), and the
-    // shader falls back to the current worldMatrix.
-    protected ID3D12Resource* _prevInstanceWorldBuffer;
-    protected byte* _mappedPrevInstanceWorldBuffer;
-    protected GpuDescriptorHandle _prevInstanceWorldSrvHandle;
-    protected int _prevInstanceWorldDescriptorId = -1;
-    protected int _prevInstanceWorldCapacity;
+    /// <summary>This frame's IA instance buffer and view.</summary>
+    protected ID3D12Resource* CurrentInstanceBuffer
+        => (uint)FrameSlot < (uint)_instanceBuffers.Length ? _instanceBuffers[FrameSlot] : null;
+    protected VertexBufferView CurrentInstanceBufferView
+        => (uint)FrameSlot < (uint)_instanceBufferViews.Length ? _instanceBufferViews[FrameSlot] : default;
+
+    // 2-3 Step C (tier C-a): instance-world ring (one Matrix4x4 per entry).
+    // Slot i holds the instance worlds of the frame that wrote slot i, so the shader reads the previous frame's
+    // worlds from PrevFrameSlot with no copy in between. Contents are zeroed before the first frame (sentinel
+    // _m33==0), and the shader falls back to the current worldMatrix.
+    protected ID3D12Resource*[] _instanceWorldBuffers = EmptyResourceRing;
+    protected byte*[] _mappedInstanceWorldBuffers = EmptyMappedRing;
+    protected GpuDescriptorHandle[] _instanceWorldSrvHandles = Array.Empty<GpuDescriptorHandle>();
+    protected int[] _instanceWorldDescriptorIds = Array.Empty<int>();
+    protected int _instanceWorldCapacity;
 
     // ============================================================
     // A7 per-instance GPU culling
     // ============================================================
-    // The five buffers are allocated and released together; capacity is aligned to 64 and only grows. When all
-    // are null this group does not participate in A7, and shadows fall back to whole-batch CPU culling rather
-    // than drawing with empty buffers.
+    // The culling resources are allocated and released together; capacity is aligned to 64 and only grows. When the owning ones are
+    // null this group does not participate in A7, and shadows fall back to whole-batch CPU culling rather than drawing with empty buffers.
+    //
+    // A7c maintenance contract. The read-only aliases (_cullSource on a single-stream group, _cullStreamSources on a per-primitive-stream one)
+    // are what removed the duplicate upload, and each of the following is a precondition rather than a detail:
+    //
+    // (1) Refresh ordering. EnsureBorrowedCullSources has to run after the instance buffer may have been recreated and before the dispatch. Update
+    // satisfies that today (EnsureInstanceBufferCapacity -> SetVertexBuffer -> EnsureCullResources). Growing or swapping the instance buffer
+    // anywhere later in the frame leaves the alias describing a released resource, and without the debug layer D3D12 reports nothing: the symptom is
+    // instances drawn with another object's transforms, which reads as a game-logic bug rather than a resource bug.
+    //
+    // (2) Key the alias on (pointer, size), never on capacity alone. Release a COM object and allocate the next one and the allocator can hand back the
+    // same address; a descriptor whose NumElements still describes the old capacity then either reads past a smaller resource or rejects a larger one.
+    //
+    // (3) The IA instance stream must not be rewritten after Device.SetVertexBuffer. This group's cull input is now that very buffer, so a later write
+    // would be seen by the cull kernel on D3D12 but not on Vulkan/Metal/WebGPU, which still upload a snapshot in PrepareCullInputs. "Same bytes, same
+    // frame" is the whole reason the four backends can disagree about the transport and still agree about the picture.
+    //
+    // (4) What this buys and what it costs. The instance buffer is recreated on every exact count change, so an unstable count allocates one SRV plus one
+    // deferred descriptor release per change, against the former per-frame staging write plus CopyBufferRegion plus two transitions. A stable count is
+    // strictly cheaper; a jittering one is roughly a wash, not a win. Measure before assuming the direction.
+
+    /// <summary>A7 cull input (see <see cref="Season.Rendering.IInstanceCullTarget.CullSourceWorlds"/>), with one of two origins:
+    /// a single-stream group aliases its IA instance ring, because its IA stream is bit-identical to this input and uploading it
+    /// twice moves no new information; a per-primitive-stream group owns a buffer instead, since the root instance worlds it culls against
+    /// exist nowhere else on the GPU. That is also why <see cref="PrepareCullInputs"/> uploads only the second kind.
+    /// The single-stream case is one alias per frame slot, for the same reason the buffers themselves are a ring.</summary>
+    Season.Rendering.StorageBuffer?[] _cullSourceSlots = Array.Empty<Season.Rendering.StorageBuffer?>();
+    /// <summary>The owned variant above (per-primitive-stream groups only).</summary>
     Season.Rendering.StorageBuffer? _cullSource;
     /// <summary>One reorder stream per gather stream (see <see cref="Season.Rendering.IInstanceCullTarget.CullStreamCount"/>): length 1 for a
     /// group whose primitives share one instance stream, one per opaque primitive when <see cref="CullPerPrimitiveStreams"/>. Empty means no A7.</summary>
     Season.Rendering.StorageBuffer?[] _cullSorted = Array.Empty<Season.Rendering.StorageBuffer?>();
-    /// <summary>Per-primitive-stream gather sources, parallel to <see cref="_cullSorted"/>. Empty for a single-stream group, whose one gather
-    /// source is the cull input <see cref="_cullSource"/> itself -- uploading the same bytes twice would buy nothing.</summary>
-    Season.Rendering.StorageBuffer?[] _cullStreamSources = Array.Empty<Season.Rendering.StorageBuffer?>();
+    /// <summary>Per-primitive-stream gather sources, parallel to <see cref="_cullSorted"/> and one alias per frame slot. Empty for a single-stream
+    /// group, whose one gather source is the cull input <see cref="_cullSourceSlots"/> itself -- uploading the same bytes twice would buy nothing.</summary>
+    Season.Rendering.StorageBuffer?[][] _cullStreamSourceSlots = Array.Empty<Season.Rendering.StorageBuffer?[]>();
     Season.Rendering.StorageBuffer? _cullArgs;
     Season.Rendering.StorageBuffer? _cullVisible;
-    Season.Rendering.StorageBuffer? _cullPrimInfo;
     int _cullCapacity = -1;
     /// <summary>Number of parameter-table entries already uploaded to the GPU. When it differs from <see cref="_cullPrimInfoPending"/> this frame must re-upload.</summary>
     int _cullPrimitiveCount = -1;
@@ -94,6 +149,9 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     byte[]? _cullPrimInfoBytes;
     /// <summary>Number of CPU-side parameter-table entries; -1 means it has not been built yet.</summary>
     int _cullPrimInfoPending = -1;
+    /// <summary>A7b: the arg-buffer image composed from <see cref="_cullPrimInfoBytes"/>, kept next to it for the same reason -- one array
+    /// whose content only changes with the primitive set, so the per-frame path is one "is it stale" comparison and nothing else.</summary>
+    byte[]? _cullArgsTemplate;
     bool _cullRegistered;
 
     /// <summary>Group-local merged bounding box. The culling kernel uses it to convert instance matrices into world bounding spheres, so a multi-surface group must pass the union.</summary>
@@ -109,19 +167,30 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     /// <summary>
     /// A7 multi-stream hook. False (default): every primitive reads the one group instance stream, which is also the cull input.
     /// True: opaque primitive i reads its own instance stream i (a glTF model, whose stream is "node world × instance world" plus that
-    /// primitive's morph weights), so gather materializes one reordered stream per opaque primitive from the shared index table, and
-    /// the derived class supplies each stream's bytes through <see cref="GetCullDrawStream"/>. The cull input stays the base
-    /// <see cref="_instanceData"/>, which the derived class fills with the root instance worlds.
+    /// primitive's morph weights), so gather materializes one reordered stream per opaque primitive from the shared index table.
+    /// The cull input stays the base <see cref="_instanceData"/>, which the derived class fills with the root instance worlds.
     /// </summary>
     protected virtual bool CullPerPrimitiveStreams => false;
 
-    /// <summary>CPU bytes of per-primitive stream <paramref name="stream"/> (index into <see cref="_opaquePrimitives"/>), in the same
-    /// instance order as <see cref="_instanceData"/>. Only called when <see cref="CullPerPrimitiveStreams"/> is true.</summary>
-    protected virtual ReadOnlySpan<InstanceTransformData> GetCullDrawStream(int stream) => default;
+    /// <summary>
+    /// A7c: the IA instance ring behind gather stream <paramref name="stream"/> and its capacity in instances (index into
+    /// <see cref="_opaquePrimitives"/>). Only called when <see cref="CullPerPrimitiveStreams"/> is true.
+    ///
+    /// The cull no longer uploads a copy of these streams: gather reads the very buffer the draw binds, through a read-only alias
+    /// (see <see cref="DXStorageBuffer.CreateReadOnlyView"/>). That is only sound as long as the alias is rebuilt whenever the buffer
+    /// object changes, which is why the capacity travels with the pointer instead of being assumed -- and why the whole ring travels
+    /// with it, now that a stream is one buffer per frame in flight rather than a single one.
+    /// </summary>
+    protected virtual bool TryGetCullDrawStreamRing(int stream, out ID3D12Resource*[] ring, out int capacity)
+    {
+        ring = EmptyResourceRing;
+        capacity = 0;
+        return false;
+    }
 
     /// <summary>
-    /// The index range the indirect args must replay for <paramref name="primitive"/>. The reset kernel writes it into every slot's
-    /// args and the indirect draw no longer passes a range of its own, so it must come from the same source as the direct draw's
+    /// The index range the indirect args must replay for <paramref name="primitive"/>. <see cref="InstanceCull.BuildArgsTemplate"/> writes
+    /// it into every slot's args and the indirect draw no longer passes a range of its own, so it must come from the same source as the direct draw's
     /// DrawIndexedInstanced arguments -- a group drawing a sub-range of a shared index buffer overrides this, otherwise its
     /// indirect draws would replay the whole buffer from index 0. The default mirrors <see cref="Pipeline.DrawPrimitive"/>.
     /// </summary>
@@ -244,74 +313,122 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     // Instance-buffer management
     // ============================================================
 
+    /// <summary>
+    /// Retire a per-frame ring. The unmaps are CPU-only and happen now; the releases wait for the fence value this
+    /// frame already signalled, because up to two frames in flight are still reading these slots. Releasing eagerly
+    /// here is what the old single-slot code did, and D3D12 only reports the consequence through DRED after the fact.
+    /// </summary>
+    protected static void ReleaseRingDeferred(ID3D12Resource*[] ring)
+    {
+        if (ring == null || ring.Length == 0)
+            return;
+
+        foreach (var resource in ring)
+        {
+            if (resource != null)
+                resource->Unmap(0, null);
+        }
+
+        ulong fence = Device.GetCurrentRetireFenceValue();
+        Device.EnqueueDeferredRelease(fence, () =>
+        {
+            foreach (var resource in ring)
+            {
+                if (resource != null)
+                    resource->Release();
+            }
+        });
+    }
+
     protected void EnsureInstanceBufferCapacity(int count)
     {
         if (count <= 0)
             return;
 
-        if (_instanceBuffer != null && _instanceCapacity == count)
+        if (_instanceCapacity == count && _instanceBuffers.Length == FrameSlotCount)
             return;
 
-        if (_instanceBuffer != null)
-        {
-            _instanceBuffer->Release();
-            _instanceBuffer = null;
-        }
+        ReleaseRingDeferred(_instanceBuffers);
 
-        _instanceBuffer = Device.CreateVertexBuffer<InstanceTransformData>((uint)count, out _instanceBufferView);
+        int slots = FrameSlotCount;
+        var buffers = new ID3D12Resource*[slots];
+        var views = new VertexBufferView[slots];
+        for (int i = 0; i < slots; i++)
+            buffers[i] = Device.CreateVertexBuffer<InstanceTransformData>((uint)count, out views[i]);
+
+        _instanceBuffers = buffers;
+        _instanceBufferViews = views;
         _instanceCapacity = count;
 
-        // 2-3 Step C: grow/shrink the prev instance-world SB together with the
+        // 2-3 Step C: grow/shrink the instance-world ring together with the
         // instance buffer (same capacity as _instanceWorlds, one Matrix4x4 per entry)
-        EnsurePrevInstanceWorldBufferCapacity(count);
+        EnsureInstanceWorldRingCapacity(count);
     }
 
-    // 2-3 Step C: create / grow / shrink the prev instance-world SB
-    // (upload heap, persistently mapped)
-    void EnsurePrevInstanceWorldBufferCapacity(int count)
+    // 2-3 Step C: create / grow / shrink the instance-world ring
+    // (upload heap, persistently mapped, one slot per frame in flight)
+    /// <summary>
+    /// Grows the instance-world ring on its own. A per-primitive-stream group (a glTF model) never uses the group-level
+    /// IA buffer -- each primitive has its own stream -- but the shader still reads the previous frame's worlds from this
+    /// ring, so it has to be sized independently of <see cref="EnsureInstanceBufferCapacity"/>.
+    /// </summary>
+    protected void EnsureInstanceWorldCapacity(int count) => EnsureInstanceWorldRingCapacity(count);
+
+    void EnsureInstanceWorldRingCapacity(int count)
     {
         if (count <= 0)
             return;
-        if (_prevInstanceWorldBuffer != null && _prevInstanceWorldCapacity == count)
+        if (_instanceWorldCapacity == count && _instanceWorldBuffers.Length == FrameSlotCount)
             return;
 
-        if (_prevInstanceWorldBuffer != null)
+        ReleaseRingDeferred(_instanceWorldBuffers);
+        foreach (int id in _instanceWorldDescriptorIds)
         {
-            _prevInstanceWorldBuffer->Unmap(0, null);
-            _prevInstanceWorldBuffer->Release();
-            _prevInstanceWorldBuffer = null;
-            _mappedPrevInstanceWorldBuffer = null;
+            if (id >= 0)
+                Device.DescriptorAllocator.Free(id);
         }
 
+        int slots = FrameSlotCount;
         ulong bufferSize = (ulong)(count * sizeof(Matrix4x4));
-        _prevInstanceWorldBuffer = Device.ResourceManager.CreateBuffer(
-            HeapType.Upload, bufferSize, ResourceStates.GenericRead);
-        void* pData;
-        _prevInstanceWorldBuffer->Map(0, null, &pData);
-        _mappedPrevInstanceWorldBuffer = (byte*)pData;
-        _prevInstanceWorldCapacity = count;
+        var buffers = new ID3D12Resource*[slots];
+        var mapped = new byte*[slots];
+        var handles = new GpuDescriptorHandle[slots];
+        var descriptorIds = new int[slots];
 
-        // First creation: clear to zero for the sentinel semantics
-        new Span<byte>(_mappedPrevInstanceWorldBuffer, count * sizeof(Matrix4x4)).Clear();
-
-        if (_prevInstanceWorldDescriptorId < 0)
-            _prevInstanceWorldDescriptorId = Device.DescriptorAllocator.Allocate();
-        var cpuHandle = Device.SrvHeapManager.GetCpuHandle(_prevInstanceWorldDescriptorId);
-        var srvDesc = new ShaderResourceViewDesc
+        for (int slot = 0; slot < slots; slot++)
         {
-            Format = Silk.NET.DXGI.Format.FormatUnknown,
-            ViewDimension = Silk.NET.Direct3D12.SrvDimension.Buffer,
-            Shader4ComponentMapping = 0x00001688u,
-            Buffer = new BufferSrv
+            var buffer = Device.ResourceManager.CreateBuffer(HeapType.Upload, bufferSize, ResourceStates.GenericRead);
+            void* pData;
+            buffer->Map(0, null, &pData);
+            mapped[slot] = (byte*)pData;
+            // Every slot starts zeroed, not just the first one: the shader's sentinel (_m33 == 0) is what makes an
+            // unwritten slot read as "no previous frame" instead of as whatever the driver handed back.
+            new Span<byte>(mapped[slot], count * sizeof(Matrix4x4)).Clear();
+
+            descriptorIds[slot] = Device.DescriptorAllocator.Allocate();
+            var srvDesc = new ShaderResourceViewDesc
             {
-                FirstElement = 0,
-                NumElements = (uint)count,
-                StructureByteStride = (uint)sizeof(Matrix4x4),
-                Flags = BufferSrvFlags.None
-            }
-        };
-        Device.D3dDevice->CreateShaderResourceView(_prevInstanceWorldBuffer, &srvDesc, cpuHandle);
-        _prevInstanceWorldSrvHandle = Device.SrvHeapManager.GetGpuHandle(_prevInstanceWorldDescriptorId);
+                Format = Silk.NET.DXGI.Format.FormatUnknown,
+                ViewDimension = Silk.NET.Direct3D12.SrvDimension.Buffer,
+                Shader4ComponentMapping = 0x00001688u,
+                Buffer = new BufferSrv
+                {
+                    FirstElement = 0,
+                    NumElements = (uint)count,
+                    StructureByteStride = (uint)sizeof(Matrix4x4),
+                    Flags = BufferSrvFlags.None
+                }
+            };
+            Device.D3dDevice->CreateShaderResourceView(buffer, &srvDesc, Device.SrvHeapManager.GetCpuHandle(descriptorIds[slot]));
+            handles[slot] = Device.SrvHeapManager.GetGpuHandle(descriptorIds[slot]);
+            buffers[slot] = buffer;
+        }
+
+        _instanceWorldBuffers = buffers;
+        _mappedInstanceWorldBuffers = mapped;
+        _instanceWorldSrvHandles = handles;
+        _instanceWorldDescriptorIds = descriptorIds;
+        _instanceWorldCapacity = count;
     }
 
     // ============================================================
@@ -365,18 +482,6 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         }
 
         EnsureInstanceBufferCapacity(_instanceCount);
-
-        // 2-3 Step C (tier C-a): before uploading this frame, first copy the
-        // current _instanceWorlds (which still holds the previous frame's "current")
-        // into the mapped prev-SB region.
-        // On the first frame, _instanceWorlds is still all zero
-        // (freshly allocated and not yet written), so prev SB stays zero and the
-        // sentinel semantics remain correct.
-        if (_mappedPrevInstanceWorldBuffer != null && _instanceCount > 0)
-        {
-            fixed (Matrix4x4* pSrc = _instanceWorlds)
-                Unsafe.CopyBlock(_mappedPrevInstanceWorldBuffer, pSrc, (uint)(_instanceCount * sizeof(Matrix4x4)));
-        }
 
         int writeIndex = 0;
 
@@ -466,7 +571,11 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             anyInstanceOutline ? _outline2DInstanceColor : owner.Highlight.OutlineColor,
             anyInstanceOutline ? _outline2DInstanceWidth : owner.Highlight.OutlineWidth);
 
-        Device.SetVertexBuffer(_instanceBuffer, _instanceBufferView, _instanceData);
+        Device.SetVertexBuffer(CurrentInstanceBuffer, CurrentInstanceBufferView, _instanceData);
+
+        // 2-3 Step C (tier C-a): publish this frame's instance worlds into this frame's ring slot. The shader reads
+        // the previous frame's worlds from the slot the previous frame wrote, so there is no copy between the two.
+        UploadInstanceWorldsForFrame(_instanceWorlds, _instanceCount);
 
         // A7: the culling kernel's input is the same bit-for-bit 80-byte matrix stream as the IA instance stream,
         // so reuse this CPU array directly -- no extra copy and no extra bounding-sphere computation (the sphere
@@ -486,38 +595,50 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
 
         _transformInitialized = true;
 
-        // 2-3 Step C (tier C-a): from the second frame onward, prev
-        // instance-world SB contains valid data, so notify the shader that it
-        // may read previous instance worlds. The first-frame all-zero sentinel is
-        // still guarded by the shader's _m33 check.
-        if (wasInitialized)
-            SetPrevInstanceWorldReady();
+        // 2-3 Step C (tier C-a): publishes whether the previous-frame streams may be read. Not a one-shot call any more:
+        // the history is addressed by the compacted instance slot, so it only lines up while the enabled order is unchanged
+        // (see InstancedMesh3DBase.InstanceHistoryValid). The first frame after load has no history and passes false.
+        UpdatePrevStateFlags(wasInitialized && owner.InstanceHistoryValid);
 
         SyncAlpha(alpha);
     }
 
-    /// <summary>2-3 Step C (tier C-a): once prev instance-world SB contains
-    /// valid data, sets MaterialParams.HasPrevInstanceWorld = 1 on all
-    /// primitives (writing every N-buffered frame) so the shader starts reading
-    /// prev instance-world SB.
-    /// Written only on the first call because the value never changes later.
-    /// Shell primitives are updated in sync as well (plan risk 2); otherwise the
-    /// shell has no trail.</summary>
-    protected void SetPrevInstanceWorldReady()
+    /// <summary>Whether this group owns a previous-frame bone palette. Only the model path does; a static surface group has no skinning.</summary>
+    protected virtual bool HasPrevBoneHistory => false;
+
+    /// <summary>Whether this group owns previous-frame morph weights. Model-only for the same reason as <see cref="HasPrevBoneHistory"/>.</summary>
+    protected virtual bool HasPrevMorphHistory => false;
+
+    /// <summary>
+    /// 2-3 Step C: publishes whether previous-frame data may be read this frame, on the main primitives and the highlight shells alike.
+    /// It is called every frame instead of once, because "the previous frame" is only the previous frame while the compacted instance
+    /// order holds: switching one instance off shifts every later instance's slot, and reading history then pairs each instance with its
+    /// predecessor (a one-frame velocity spike on everything past the change). Passing false makes the shaders fall back to current data.
+    /// Shell primitives are kept in sync (plan risk 2), otherwise the shell keeps a trail the body no longer has.
+    /// </summary>
+    protected void UpdatePrevStateFlags(bool historyValid)
     {
+        uint prevWorld = historyValid ? 1u : 0u;
+        uint prevBones = historyValid && HasPrevBoneHistory ? 1u : 0u;
+        uint prevMorph = historyValid && HasPrevMorphHistory ? 1u : 0u;
+
         for (int i = 0; i < _primitives.Count; i++)
         {
             var primitive = _primitives[i];
-            if (primitive.MaterialParams.HasPrevInstanceWorld != 0)
+            if (primitive.MaterialParams.HasPrevInstanceWorld == prevWorld
+                && primitive.MaterialParams.HasPrevBones == prevBones
+                && primitive.MaterialParams.HasPrevMorph == prevMorph)
                 continue;
-            primitive.MaterialParams.HasPrevInstanceWorld = 1;
+
+            primitive.MaterialParams.HasPrevInstanceWorld = prevWorld;
+            primitive.MaterialParams.HasPrevBones = prevBones;
+            primitive.MaterialParams.HasPrevMorph = prevMorph;
             for (int f = 0; f < Device.frameCount; f++)
                 Unsafe.Write(primitive.MappedMaterialBuffers[f], primitive.MaterialParams);
         }
-        // Synchronize prev flags for shell primitives too: cover both template
-        // sets and both instance-box pools, because pooled boxes may have been
-        // created before this frame and still carry stale flags.
-        SyncShellPrevFlags(hasPrevInstanceWorld: true, hasPrevBones: false, hasPrevMorph: false);
+
+        // Both template sets and both instance-box pools: a pooled box may have been created before the flags settled.
+        SyncShellPrevFlags(prevWorld != 0, prevBones != 0, prevMorph != 0);
     }
 
     // SyncAlpha is inherited from DXPrimitiveGroup and adapts automatically
@@ -645,7 +766,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
                 Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fiMain], &segment, 0, 0,
                     GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(),
                     sortedResource, argsResource,
-                    Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i), _instanceBuffer);
+                    Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i), CurrentInstanceBuffer);
                 Season.Rendering.InstanceCull.MainViewDraws++;
             }
         }
@@ -689,7 +810,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         if (_boundsActive)
             DrawBoundsBoxes(lightCB);
         if (_wireframeActive)
-            DrawShellBoxes(lightCB, _instanceBuffer, _instanceBufferView);
+            DrawShellBoxes(lightCB, CurrentInstanceBuffer, CurrentInstanceBufferView);
     }
 
     void BuildTransparentInstanceOrder(PrimitiveData primitive)
@@ -715,11 +836,12 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     void DrawPrimitiveInstances(PrimitiveData primitiveData, ID3D12Resource* lightConstantBuffer, uint instanceCount, uint startInstanceLocation)
     {
         int fi = (int)Device.FrameIndex;
-        fixed (VertexBufferView* instanceVB = &_instanceBufferView)
-        {
-            Pipeline.DrawPrimitive(primitiveData, lightConstantBuffer, _matrixBuffers[fi], instanceVB, instanceCount, startInstanceLocation,
-                GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), _instanceBuffer);
-        }
+        // A stack copy of this frame's view, taken by address directly: a local is already a fixed expression, so
+        // wrapping it in fixed is both redundant and rejected by the compiler.
+        var instanceVBValue = CurrentInstanceBufferView;
+        VertexBufferView* instanceVB = &instanceVBValue;
+        Pipeline.DrawPrimitive(primitiveData, lightConstantBuffer, _matrixBuffers[fi], instanceVB, instanceCount, startInstanceLocation,
+            GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), CurrentInstanceBuffer);
     }
 
     /// <summary>
@@ -829,13 +951,12 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             return;
         }
 
+        var shadowVBValue = CurrentInstanceBufferView;
+        VertexBufferView* shadowVB = &shadowVBValue;
         for (int i = 0; i < _opaquePrimitives.Count; i++)
         {
-            fixed (VertexBufferView* instanceVB = &_instanceBufferView)
-            {
-                Pipeline.DrawShadowPrimitive(_opaquePrimitives[i], _matrixBuffers[fi], instanceVB,
-                    (uint)_instanceCount, 0, bindMaterial: !shareMaterial || !materialBound);
-            }
+            Pipeline.DrawShadowPrimitive(_opaquePrimitives[i], _matrixBuffers[fi], shadowVB,
+                (uint)_instanceCount, 0, bindMaterial: !shareMaterial || !materialBound);
             materialBound = true;
         }
     }
@@ -861,29 +982,29 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
 
         int fi = (int)Device.FrameIndex;
         var lightCB = DXPrimitiveGroup.lightConstantBuffers[fi];
-        fixed (VertexBufferView* instanceVB = &_instanceBufferView)
+        var instanceBuffer = CurrentInstanceBuffer;
+        var instanceVBValue = CurrentInstanceBufferView;
+        VertexBufferView* instanceVB = &instanceVBValue;
+        for (int i = 0; i < _opaquePrimitives.Count; i++)
         {
-            for (int i = 0; i < _opaquePrimitives.Count; i++)
+            var p = _opaquePrimitives[i];
+            Pipeline.SetPipeline(PipelineMode.Opaque,
+                p.DoubleSided ? PipelineCullVariant.None : PipelineCullVariant.Back, depthWrite: false);
+            OnBeforeDraw();
+            if (_outline2DHostActive)
             {
-                var p = _opaquePrimitives[i];
-                Pipeline.SetPipeline(PipelineMode.Opaque,
-                    p.DoubleSided ? PipelineCullVariant.None : PipelineCullVariant.Back, depthWrite: false);
-                OnBeforeDraw();
-                if (_outline2DHostActive)
+                Pipeline.DrawPrimitive(p, lightCB, _matrixBuffers[fi], instanceVB, (uint)_instanceCount, 0,
+                    GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer);
+            }
+            else
+            {
+                for (int k = 0; k < _outline2DInstances.Count; k++)
                 {
-                    Pipeline.DrawPrimitive(p, lightCB, _matrixBuffers[fi], instanceVB, (uint)_instanceCount, 0,
-                        GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), _instanceBuffer);
-                }
-                else
-                {
-                    for (int k = 0; k < _outline2DInstances.Count; k++)
-                    {
-                        int idx = _outline2DInstances[k];
-                        if ((uint)idx >= (uint)_instanceCount)
-                            continue;
-                        Pipeline.DrawPrimitive(p, lightCB, _matrixBuffers[fi], instanceVB, 1, (uint)idx,
-                            GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), _instanceBuffer);
-                    }
+                    int idx = _outline2DInstances[k];
+                    if ((uint)idx >= (uint)_instanceCount)
+                        continue;
+                    Pipeline.DrawPrimitive(p, lightCB, _matrixBuffers[fi], instanceVB, 1, (uint)idx,
+                        GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer);
                 }
             }
         }
@@ -901,23 +1022,31 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     /// the previous per-instance bone SB SRV handle.</summary>
     protected override GpuDescriptorHandle GetPrevBoneSrvHandle() => default;
 
-    /// <summary>2-3 Step C (tier C-a): returns the prev instance-world SB SRV
-    /// handle maintained by the base class.</summary>
+    /// <summary>2-3 Step C (tier C-a): SRV of the previous frame's instance worlds. The "previous frame" is the
+    /// ring slot that frame wrote, not a copy of anything, so this is a handle swap by construction.</summary>
     protected GpuDescriptorHandle GetPrevInstanceWorldSrvHandle()
-        => DXSceneDrawCollection.Structured(_prevInstanceWorldBuffer, 64, _prevInstanceWorldSrvHandle);
-
-    /// <summary>2-3 Step C (tier C-a): when a derived class such as
-    /// DXInstancedModel manages its own instance-world array, it can explicitly
-    /// copy this frame's data into the prev SB.
-    /// The base class already calls this automatically inside UpdateInstanceData.
-    /// If a derived class bypasses that update path, it must call this manually
-    /// before uploading the current frame.</summary>
-    protected void FillPrevInstanceWorldFrom(Matrix4x4[] worlds, int count)
     {
-        if (_mappedPrevInstanceWorldBuffer == null || count <= 0 || worlds == null)
+        int slot = PrevFrameSlot;
+        if ((uint)slot >= (uint)_instanceWorldBuffers.Length)
+            return default;
+        return DXSceneDrawCollection.Structured(_instanceWorldBuffers[slot], 64, _instanceWorldSrvHandles[slot]);
+    }
+
+    /// <summary>2-3 Step C (tier C-a): copy this frame's instance worlds into this frame's ring slot. A derived class
+    /// that fills its own world array (instancing through per-primitive streams) calls this after its loop; the base
+    /// class already calls it inside <see cref="UpdateInstanceData"/>. The previous frame's data is never built here:
+    /// it is the slot that frame wrote.</summary>
+    protected void UploadInstanceWorldsForFrame(Matrix4x4[] worlds, int count)
+    {
+        int slot = FrameSlot;
+        if ((uint)slot >= (uint)_mappedInstanceWorldBuffers.Length || _mappedInstanceWorldBuffers[slot] == null)
             return;
+        if (count <= 0 || worlds == null)
+            return;
+        if (count > _instanceWorldCapacity)
+            count = _instanceWorldCapacity;
         fixed (Matrix4x4* pSrc = worlds)
-            Unsafe.CopyBlock(_mappedPrevInstanceWorldBuffer, pSrc, (uint)(count * sizeof(Matrix4x4)));
+            Unsafe.CopyBlock(_mappedInstanceWorldBuffers[slot], pSrc, (uint)(count * sizeof(Matrix4x4)));
     }
 
     // ============================================================
@@ -930,18 +1059,25 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
 
     int Season.Rendering.IInstanceCullTarget.CullPrimitiveCount => _opaquePrimitives.Count;
 
-    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSourceWorlds => _cullSource;
+    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullSourceWorlds
+        => CullPerPrimitiveStreams
+            ? _cullSource
+            : (uint)FrameSlot < (uint)_cullSourceSlots.Length ? _cullSourceSlots[FrameSlot] : null;
 
     int Season.Rendering.IInstanceCullTarget.CullStreamCount => _cullSorted.Length;
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullStreamSource(int stream)
-        => _cullStreamSources.Length == 0 ? (stream == 0 ? _cullSource : null)
-            : (uint)stream < (uint)_cullStreamSources.Length ? _cullStreamSources[stream] : null;
+    {
+        if (_cullStreamSourceSlots.Length == 0)
+            return stream == 0 ? ((Season.Rendering.IInstanceCullTarget)this).CullSourceWorlds : null;
+        if ((uint)stream >= (uint)_cullStreamSourceSlots.Length)
+            return null;
+        var slots = _cullStreamSourceSlots[stream];
+        return (uint)FrameSlot < (uint)slots.Length ? slots[FrameSlot] : null;
+    }
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullStreamSorted(int stream)
         => (uint)stream < (uint)_cullSorted.Length ? _cullSorted[stream] : null;
-
-    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullPrimitiveInfo => _cullPrimInfo;
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullArgs => _cullArgs;
 
@@ -984,30 +1120,34 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
 
         int capacity = (count + 63) / 64 * 64;
         if (_cullCapacity != capacity || _cullSorted.Length != streams
-            || _cullStreamSources.Length != (perPrimitive ? streams : 0))
+            || _cullStreamSourceSlots.Length != (perPrimitive ? streams : 0))
         {
             ReleaseCullResources();
             var sorted = new Season.Rendering.StorageBuffer?[streams];
-            var streamSources = perPrimitive ? new Season.Rendering.StorageBuffer?[streams] : Array.Empty<Season.Rendering.StorageBuffer?>();
+            var streamSourceSlots = perPrimitive
+                ? new Season.Rendering.StorageBuffer?[streams][]
+                : Array.Empty<Season.Rendering.StorageBuffer?[]>();
             bool complete = true;
             try
             {
                 var g = Season.Basic.Graphics.Instance;
-                _cullSource = g.CreateStorageBuffer((uint)capacity * Season.Rendering.InstanceCull.WorldStride);
+                // A7c: only a per-primitive-stream group owns a cull input. Its root instance worlds are not what any IA stream carries
+                // (each stream is "node world × instance world"), so they have to be uploaded somewhere; a single-stream group instead
+                // aliases the instance buffer it already uploaded (EnsureBorrowedCullSources), which is where the duplicate transfer used to be.
+                if (perPrimitive)
+                    _cullSource = g.CreateStorageBuffer((uint)capacity * Season.Rendering.InstanceCull.WorldStride);
                 for (int s = 0; s < streams; s++)
                 {
                     sorted[s] = g.CreateStorageBuffer(Season.Rendering.InstanceCull.SortedBytes(capacity),
                         Season.Rendering.StorageBufferUsage.ComputeAndVertexInput);
-                    if (perPrimitive)
-                        streamSources[s] = g.CreateStorageBuffer((uint)capacity * Season.Rendering.InstanceCull.WorldStride);
                 }
                 _cullVisible = g.CreateStorageBuffer((uint)(Season.Rendering.InstanceCull.MaxSlots * capacity) * 4u);
                 // The args buffer is the only one that must declare the indirect usage: all four backends bake that
                 // usage into the native object, and it cannot be added afterward.
-                _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsBytes,
+                // A7b: it is sized ArgsTotalBytes, not ArgsBytes -- the per-slot visible-count accumulator lives in the tail of the same
+                // block, which is what lets the per-frame reset dispatch go away without needing a second buffer or a second upload path.
+                _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsTotalBytes,
                     Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs);
-                _cullPrimInfo = g.CreateStorageBuffer(
-                    (uint)Season.Rendering.InstanceCull.MaxPrimitives * Season.Rendering.InstanceCull.PrimitiveInfoStride);
             }
             catch (Exception ex)
             {
@@ -1016,14 +1156,14 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
 
             // Hand the arrays over before checking, so a partial failure is released through the one path below.
             _cullSorted = sorted;
-            _cullStreamSources = streamSources;
+            _cullStreamSourceSlots = streamSourceSlots;
             foreach (var b in sorted)
                 complete &= b != null;
-            foreach (var b in streamSources)
-                complete &= b != null;
 
-            if (!complete || _cullSource == null || _cullVisible == null
-                || _cullArgs == null || _cullPrimInfo == null)
+            // The aliased inputs are deliberately not required here: they are created after this block from buffers this group does not
+            // own, and a missing one simply leaves this group on the direct path for the frame.
+            if (!complete || _cullVisible == null || _cullArgs == null
+                || (perPrimitive && _cullSource == null))
             {
                 ReleaseCullResources();
                 return;
@@ -1032,6 +1172,8 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             _cullCapacity = capacity;
             _cullPrimitiveCount = -1;
         }
+
+        EnsureBorrowedCullSources(streams);
 
         EnsureCullPrimitiveInfo();
 
@@ -1043,15 +1185,99 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     }
 
     /// <summary>
+    /// A7c: keep the read-only cull aliases in step with the instance buffers they point at.
+    ///
+    /// This cannot live inside the capacity branch of <see cref="EnsureCullResources"/>: that branch is keyed on the 64-aligned cull
+    /// capacity, while the buffers behind it move on a different schedule -- a group's instance buffer is recreated on every exact
+    /// instance-count change, and a glTF model rebuilds a primitive stream when its capacity grows. Keying the alias on the pointer
+    /// rather than on the capacity is what keeps a descriptor from outliving the buffer it describes: the debug layer reports that as
+    /// a stale descriptor, and without it the driver just reads whatever memory now lives there, showing up as instances drawn with
+    /// another object's transforms rather than as an error.
+    ///
+    /// The size has to be part of that check, not just the pointer: releasing a COM object and creating a new one immediately can hand
+    /// back the same address, and a descriptor whose NumElements still describes the old capacity would either read past a smaller
+    /// resource or reject a larger one. Comparing the expected byte size catches both.
+    /// </summary>
+    void EnsureBorrowedCullSources(int streams)
+    {
+        int slots = FrameSlotCount;
+
+        if (!CullPerPrimitiveStreams)
+        {
+            uint size = (uint)_instanceCapacity * Season.Rendering.InstanceCull.WorldStride;
+            if (AliasesMatch(_cullSourceSlots, _instanceBuffers, slots, size))
+                return;
+            DisposeAliases(_cullSourceSlots);
+            _cullSourceSlots = CreateAliases(_instanceBuffers, slots, size);
+            return;
+        }
+
+        if (_cullStreamSourceSlots.Length != streams)
+            return;
+        for (int s = 0; s < streams; s++)
+        {
+            TryGetCullDrawStreamRing(s, out var ring, out int capacity);
+            uint size = (uint)capacity * Season.Rendering.InstanceCull.WorldStride;
+            if (AliasesMatch(_cullStreamSourceSlots[s], ring, slots, size))
+                continue;
+            DisposeAliases(_cullStreamSourceSlots[s]);
+            _cullStreamSourceSlots[s] = CreateAliases(ring, slots, size);
+        }
+    }
+
+    /// <summary>Whether <paramref name="aliases"/> already describes exactly the buffers in <paramref name="ring"/>.
+    /// Every slot is checked, not just slot 0: the ring is created in one call today, but a future partial rebuild would
+    /// otherwise leave one slot describing a released resource, and D3D12 reports that only as "instances drawn with
+    /// another object's transforms".</summary>
+    static bool AliasesMatch(Season.Rendering.StorageBuffer?[] aliases, ID3D12Resource*[] ring, int slots, uint size)
+    {
+        if (aliases == null || aliases.Length != slots || ring == null || ring.Length != slots)
+            return false;
+        for (int i = 0; i < slots; i++)
+        {
+            if (ring[i] == null)
+            {
+                if (aliases[i] != null)
+                    return false;
+                continue;
+            }
+            if (aliases[i] is not DXStorageBuffer alias || alias.Resource != ring[i] || alias.SizeInBytes != size)
+                return false;
+        }
+        return true;
+    }
+
+    static Season.Rendering.StorageBuffer?[] CreateAliases(ID3D12Resource*[] ring, int slots, uint size)
+    {
+        var aliases = new Season.Rendering.StorageBuffer?[slots];
+        if (size == 0 || ring == null)
+            return aliases;
+        for (int i = 0; i < slots && i < ring.Length; i++)
+        {
+            if (ring[i] != null)
+                aliases[i] = DXStorageBuffer.CreateReadOnlyView(ring[i], size);
+        }
+        return aliases;
+    }
+
+    static void DisposeAliases(Season.Rendering.StorageBuffer?[] aliases)
+    {
+        if (aliases == null)
+            return;
+        foreach (var alias in aliases)
+            alias?.Dispose();
+    }
+
+    /// <summary>
     /// Build only the parameter-table bytes, without touching the GPU -- the safe timing for building and
     /// uploading differs: building can be done anytime, but uploading must wait until the command list is open
     /// (see <see cref="Season.Rendering.IInstanceCullTarget.PrepareCullInputs"/>). If the primitive set does not
-    /// change, do not rebuild. The index range must share one source with the draw side: the reset kernel writes
+    /// change, do not rebuild. The index range must share one source with the draw side: the arg template writes
     /// this range into the indirect args, and the draw side no longer provides one itself (see <see cref="GetCullPrimitiveRange"/>).
     /// </summary>
     void EnsureCullPrimitiveInfo()
     {
-        if (_cullPrimInfo == null)
+        if (_cullArgs == null)
             return;
         int n = _opaquePrimitives.Count;
         if (n <= 0 || n > Season.Rendering.InstanceCull.MaxPrimitives)
@@ -1059,6 +1285,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             // Explicitly record "there is no parameter table to upload": otherwise PrepareCullInputs would
             // re-upload last time's bytes over and over, where the entry count looks right but the content is stale.
             _cullPrimInfoBytes = null;
+            _cullArgsTemplate = null;
             _cullPrimInfoPending = 0;
             _cullPrimitiveCount = 0;
             return;
@@ -1077,6 +1304,9 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
 
         _cullPrimInfoBytes = bytes;
         _cullPrimInfoPending = n;
+        // A7b: the arg image is composed here as well, because it is a pure function of this table and the slot layout -- the same
+        // bytes the reset kernel used to write every frame, just built once at the moment the input changes.
+        _cullArgsTemplate = Season.Rendering.InstanceCull.BuildArgsTemplate(bytes, n);
     }
 
     /// <summary>
@@ -1093,32 +1323,29 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         var g = Season.Basic.Graphics.Instance;
 
         // The parameter table follows the geometry, not the frame, so re-upload only when the entry count changes.
+        // A7b: this upload replaced the reset dispatch. What it writes is frame-invariant (the index ranges) or re-derived by the GPU
+        // later in the same frame (the instance counts, published by gather), so paying for it once per primitive-set change instead of
+        // once per frame is the whole point: one dispatch per group per frame was exactly the fixed cost that made small groups unprofitable.
         if (_cullPrimInfoPending != _cullPrimitiveCount)
         {
-            if (_cullPrimInfoPending <= 0 || _cullPrimInfoBytes == null || _cullPrimInfo == null)
+            if (_cullPrimInfoPending <= 0 || _cullArgsTemplate == null || _cullArgs == null)
                 return false;
-            int bytes = _cullPrimInfoPending * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride;
-            if (!g.TryUpdateStorageBuffer(_cullPrimInfo, new ReadOnlySpan<byte>(_cullPrimInfoBytes, 0, bytes)))
+            if (!g.TryUpdateStorageBuffer(_cullArgs, _cullArgsTemplate))
                 return false;
             _cullPrimitiveCount = _cullPrimInfoPending;
         }
 
-        // The matrix stream changes every frame; upload only the valid range and leave no slack.
+        // A7c: a single-stream group is done here. Its cull input is a read-only alias of the instance buffer, which the engine already
+        // filled for this frame (Device.SetVertexBuffer in Update); uploading those same bytes into a second buffer was pure duplication.
+        if (!CullPerPrimitiveStreams)
+            return true;
+
+        // What still has to travel is the root-world stream: it is the only cull input with no IA counterpart, because each primitive
+        // stream is "node world × instance world" and cannot be inverted back on the GPU. The per-primitive streams themselves are
+        // aliases as well (EnsureBorrowedCullSources), so their former per-frame upload is gone too.
         if (_cullSource == null || !g.TryUpdateStorageBuffer(_cullSource,
                 MemoryMarshal.AsBytes(_instanceData.AsSpan(0, _instanceCount))))
             return false;
-
-        // Per-primitive streams: gather replays the one visibility decision onto each primitive's own stream, so each must hold
-        // this frame's instances in the cull input's order. A stream shorter than the instance count would make gather read past
-        // what the CPU wrote, so the whole group skips A7 this frame instead.
-        for (int s = 0; s < _cullStreamSources.Length; s++)
-        {
-            var data = GetCullDrawStream(s);
-            var source = _cullStreamSources[s];
-            if (source == null || data.Length < _instanceCount
-                || !g.TryUpdateStorageBuffer(source, MemoryMarshal.AsBytes(data.Slice(0, _instanceCount))))
-                return false;
-        }
         return true;
     }
 
@@ -1167,18 +1394,20 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             _cullRegistered = false;
         }
         _cullSource?.Dispose(); _cullSource = null;
+        DisposeAliases(_cullSourceSlots);
+        _cullSourceSlots = Array.Empty<Season.Rendering.StorageBuffer?>();
         foreach (var s in _cullSorted)
             s?.Dispose();
         _cullSorted = Array.Empty<Season.Rendering.StorageBuffer?>();
-        foreach (var s in _cullStreamSources)
-            s?.Dispose();
-        _cullStreamSources = Array.Empty<Season.Rendering.StorageBuffer?>();
+        foreach (var slots in _cullStreamSourceSlots)
+            DisposeAliases(slots);
+        _cullStreamSourceSlots = Array.Empty<Season.Rendering.StorageBuffer?[]>();
         _cullArgs?.Dispose(); _cullArgs = null;
         _cullVisible?.Dispose(); _cullVisible = null;
-        _cullPrimInfo?.Dispose(); _cullPrimInfo = null;
         _cullCapacity = -1;
         _cullPrimitiveCount = -1;
         _cullPrimInfoBytes = null;
+        _cullArgsTemplate = null;
         _cullPrimInfoPending = -1;
         _cullDrawReady = false;
     }
@@ -1201,25 +1430,35 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         _opaquePrimitives.Clear();
         _transparentPrimitives.Clear();
 
-        if (_instanceBuffer != null)
+        if (_instanceBuffers != null)
         {
-            _instanceBuffer->Release();
-            _instanceBuffer = null;
+            foreach (var buffer in _instanceBuffers)
+            {
+                if (buffer == null)
+                    continue;
+                buffer->Release();
+            }
+            _instanceBuffers = EmptyResourceRing;
+            _instanceBufferViews = Array.Empty<VertexBufferView>();
         }
 
-        // 2-3 Step C: release the previous instance-world SB
-        if (_prevInstanceWorldBuffer != null)
+        // 2-3 Step C: release the instance-world ring
+        foreach (var buffer in _instanceWorldBuffers)
         {
-            _prevInstanceWorldBuffer->Unmap(0, null);
-            _prevInstanceWorldBuffer->Release();
-            _prevInstanceWorldBuffer = null;
-            _mappedPrevInstanceWorldBuffer = null;
+            if (buffer == null)
+                continue;
+            buffer->Unmap(0, null);
+            buffer->Release();
         }
-        if (_prevInstanceWorldDescriptorId >= 0)
+        _instanceWorldBuffers = EmptyResourceRing;
+        _mappedInstanceWorldBuffers = EmptyMappedRing;
+        foreach (int id in _instanceWorldDescriptorIds)
         {
-            Device.DescriptorAllocator.Free(_prevInstanceWorldDescriptorId);
-            _prevInstanceWorldDescriptorId = -1;
+            if (id >= 0)
+                Device.DescriptorAllocator.Free(id);
         }
+        _instanceWorldDescriptorIds = Array.Empty<int>();
+        _instanceWorldSrvHandles = Array.Empty<GpuDescriptorHandle>();
 
         if (_matrixBuffers != null)
         {

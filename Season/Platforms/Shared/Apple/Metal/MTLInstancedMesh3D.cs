@@ -107,9 +107,9 @@ internal sealed class MTLInstancedMesh3D : MTLInstancedPrimitiveGroup
         p.MaterialParams.IsInstanced = 1;
         // Contract clause 8(c) of 2-3:
         // previous per-instance world transforms come from the double-buffered instance stream.
-        // On the first frame or after capacity changes, the opposite side is zeroed,
-        // and the shader falls back to the current world when r3.w == 0.
-        p.MaterialParams.HasPrevInstanceWorld = 1;
+        // The bit itself is republished every frame by UpdatePrevStateFlags (see the 2-3 Step C note there), so it starts at
+        // "no history": the first frame has nothing to read and the shader falls back to the current world.
+        p.MaterialParams.HasPrevInstanceWorld = 0u;
 
         for (int i = 0; i < Device.frameCount; i++)
             WriteStruct(p.MaterialBuffers[i], p.MaterialParams);
@@ -117,6 +117,7 @@ internal sealed class MTLInstancedMesh3D : MTLInstancedPrimitiveGroup
 
     public void Update(Season.Controls.InstancedMesh3D mesh, float time)
     {
+        bool wasInitialized = _transformInitialized;
         _instanceCount = 0;
 
         // Unified highlighting:
@@ -238,7 +239,7 @@ internal sealed class MTLInstancedMesh3D : MTLInstancedPrimitiveGroup
             anyInstanceOutline ? _outline2DInstanceColor : mesh.Highlight.OutlineColor,
             anyInstanceOutline ? _outline2DInstanceWidth : mesh.Highlight.OutlineWidth);
 
-        FlipAndUploadInstanceStream(_instanceData, _instanceCount);
+        UploadInstanceStream(_instanceData, _instanceCount);
 
         // A7: the cull input is bit-for-bit identical to the IA instance stream, so this array is reused directly without storing an extra copy.
         // Only this class wires it up: MTLInstancedModel's instance stream is split per surface and does not go through the base class _instanceBuffer,
@@ -258,6 +259,11 @@ internal sealed class MTLInstancedMesh3D : MTLInstancedPrimitiveGroup
             WriteStruct(primitive.MatrixBuffers[fi], matrices);
 
         _transformInitialized = true;
+
+        // 2-3 Step C: publishes whether the previous-frame streams may be read this frame. Not a one-shot call any more: the
+        // history is addressed by the compacted instance slot, so it only lines up while the enabled order is unchanged
+        // (see InstancedMesh3DBase.InstanceHistoryValid). The first frame after load has no history and passes false.
+        UpdatePrevStateFlags(wasInitialized && mesh.InstanceHistoryValid);
         SyncAlpha(mesh.Alpha);
     }
 

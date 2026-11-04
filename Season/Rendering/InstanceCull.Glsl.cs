@@ -6,46 +6,11 @@ namespace Season.Rendering;
 
 public sealed partial class InstanceCullEffect
 {
-    // A7's four kernels on the Vulkan side. Params go through push constants, and the remaining resources
+    // A7's three kernels on the Vulkan side. Params go through push constants, and the remaining resources
     // are placed by "declared index is the binding number", so binding 0 is reserved as a placeholder for
     // Params and is never taken by any buffer, consistent with the ComputeBindingType contract.
-
-    const string ResetGlsl = """
-#version 450
-
-#define MAX_PRIMITIVES 16u
-#define ARGS_STRIDE_U 5u
-
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-
-layout(push_constant) uniform ResetParams
-{
-    uint primCount;
-    uint slotCount;
-    uint mode;
-    uint pad;
-} resetParams;
-
-layout(std430, binding = 1) readonly buffer PrimInfo { uint primInfo[]; };
-layout(std430, binding = 2) buffer DrawArgs { uint drawArgs[]; };
-
-void main()
-{
-    uint idx = gl_GlobalInvocationID.x;
-    uint slot = idx / MAX_PRIMITIVES;
-    uint prim = idx % MAX_PRIMITIVES;
-    if (slot >= resetParams.slotCount || prim >= resetParams.primCount)
-        return;
-
-    uint base = idx * ARGS_STRIDE_U;
-    uint info = prim * 4u;
-    drawArgs[base + 0u] = primInfo[info + 0u];
-    drawArgs[base + 1u] = 0u;
-    drawArgs[base + 2u] = primInfo[info + 1u];
-    drawArgs[base + 3u] = primInfo[info + 2u];
-    drawArgs[base + 4u] = 0u;
-}
-""";
+    // A7b removed the reset kernel: the frame-invariant part of the arg table is uploaded from InstanceCull.BuildArgsTemplate
+    // when the primitive set changes, and the per-slot counter is a region of the arg buffer that gather clears every run.
 
     const string CullGlsl = """
 #version 450
@@ -65,7 +30,7 @@ layout(push_constant) uniform CullParams
     uint primCount;
     uint capacity;
     uint slotMask;
-    uint pad0;
+    uint slotCountsOffset;
     uint pad1;
     uint pad2;
 } cullParams;
@@ -124,7 +89,9 @@ void main()
             continue;
         if (!visibleInSlot(slot, center, radius))
             continue;
-        uint k = atomicAdd(drawArgs[slot * MAX_PRIMITIVES * ARGS_STRIDE_U + 1u], 1u);
+        // A7b: the counter lives in the arg buffer's accumulator region, not in the arg table's InstanceCount -- see
+        // InstanceCull.SlotCountsOffset for why the two cannot be the same word. The offset is in bytes, this array in uints.
+        uint k = atomicAdd(drawArgs[(cullParams.slotCountsOffset >> 2u) + slot], 1u);
         visibleIds[slot * cullParams.capacity + k] = i;
     }
 }
@@ -138,7 +105,7 @@ layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform FinalizeParams
 {
     uint slotCount;
-    uint slotStride;
+    uint slotCountsOffset;
     uint groupSize;
     uint pad;
 } finalizeParams;
@@ -150,7 +117,7 @@ void main()
 {
     uint maxCount = 0u;
     for (uint slot = 0u; slot < finalizeParams.slotCount; ++slot)
-        maxCount = max(maxCount, drawArgs[(slot * finalizeParams.slotStride + 4u) / 4u]);
+        maxCount = max(maxCount, drawArgs[(finalizeParams.slotCountsOffset >> 2u) + slot]);
 
     uint groups = (maxCount + finalizeParams.groupSize - 1u) / finalizeParams.groupSize;
     dispatchArgs[0] = groups;
@@ -174,6 +141,10 @@ layout(push_constant) uniform GatherParams
     uint primCount;
     uint slotCount;
     uint tagMask;
+    uint slotCountsOffset;
+    uint clearSlotCounts;
+    uint pad0;
+    uint pad1;
 } gatherParams;
 
 layout(std430, binding = 1) readonly buffer VisibleIds { uint visibleIds[]; };
@@ -191,12 +162,19 @@ void main()
         return;
 
     uint argsBase = slot * MAX_PRIMITIVES * ARGS_STRIDE_U;
-    uint count = drawArgs[argsBase + 1u];
+    // A7b: the count comes from the accumulator cull filled this frame; the arg table's own InstanceCount is written below,
+    // so it only ever holds a finished frame's result for the draw to read.
+    uint count = drawArgs[(gatherParams.slotCountsOffset >> 2u) + slot];
 
     if (k == 0u)
     {
+        drawArgs[argsBase + 1u] = count;
         for (uint q = 1u; q < gatherParams.primCount; ++q)
             drawArgs[argsBase + q * ARGS_STRIDE_U + 1u] = count;
+        // Only the last gather of a group clears: every stream reads the same counts, so clearing on the first
+        // would make the rest publish zeroes into the arg table and the group would vanish for the frame.
+        if (gatherParams.clearSlotCounts != 0u)
+            drawArgs[(gatherParams.slotCountsOffset >> 2u) + slot] = 0u;
     }
     if (k >= count)
         return;

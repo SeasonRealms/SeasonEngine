@@ -946,8 +946,8 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // The tower deck and flight are walkable surfaces as well, so the shaft blocks ground travel by
         // height alone, and only the thin railings and stair parapets are obstacles. See Tower.cs.
         collider.Tower = tower;
-        // The river channel is a raised levee, so its water blocks entry exactly like the pond's water;
-        // the banks themselves are walkable ground with no floor height of their own.
+        // The river's water blocks entry exactly like the pond's water, while its bank pieces are walkable floors the
+        // player can jump onto and walk along - the same treatment the pond's rim gets, at the same height.
         collider.River = river;
         foreach (var blocker in tower.Blockers)
         {

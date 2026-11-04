@@ -967,10 +967,9 @@ internal abstract class MTLPrimitiveGroup : IDisposable
     /// because the merged template cannot express per-skin palette offsets.
     /// Phase 2 solves that only with a one-time CPU bake of per-vertex palette offsets during construction.
     /// When no usable primitives exist, both templates remain null and later frames retry.
-    /// Shell primitives inherit HasPrevBones and HasPrevInstanceWorld from source material.
-    /// On Metal, these prev flags are set once during Load and cold states are covered by zero-data sentinels,
-    /// so lazily built shell templates become correct automatically by copying source MaterialParams
-    /// with no runtime patch-up.
+    /// Shell primitives inherit HasPrevBones and HasPrevInstanceWorld from source material, and a lazily built template
+    /// therefore starts from whatever those bits held at creation time; the instanced group republishes them every frame
+    /// through <see cref="SyncShellPrevFlags"/> (see MTLInstancedPrimitiveGroup.UpdatePrevStateFlags).
     /// edgeWidth comes from host Highlight.EdgeWidth as a model-scale ratio,
     /// and localSizeMax is the maximum local size of the template.
     /// Local thickness h is baked per primitive as edgeWidth × localSizeMax divided by node scale,
@@ -1200,6 +1199,51 @@ internal abstract class MTLPrimitiveGroup : IDisposable
         return box;
     }
 
+    /// <summary>Unified highlighting on the instanced path: publishes the three previous-frame bits onto the shell primitives.
+    /// Both shared templates and both instance-box pools are covered, because a pooled box may have been created while the
+    /// bits still held their source-material values. The whole frame ring is rewritten: a Metal constant buffer is mapped
+    /// memory and the draw binds only the current frame's slot, so leaving stale siblings behind would resurface on a slot switch.</summary>
+    protected void SyncShellPrevFlags(bool hasPrevInstanceWorld, bool hasPrevBones, bool hasPrevMorph)
+    {
+        if (_shellGeometry != null)
+            SyncShellBoxPrevFlags(_shellGeometry, hasPrevInstanceWorld, hasPrevBones, hasPrevMorph);
+        if (_skinnedShellGeometry != null)
+            SyncShellBoxPrevFlags(_skinnedShellGeometry, hasPrevInstanceWorld, hasPrevBones, hasPrevMorph);
+        foreach (var box in _instanceShellBoxes)
+            if (box != null)
+                SyncShellBoxPrevFlags(box, hasPrevInstanceWorld, hasPrevBones, hasPrevMorph);
+        foreach (var box in _skinnedInstanceShellBoxes)
+            if (box != null)
+                SyncShellBoxPrevFlags(box, hasPrevInstanceWorld, hasPrevBones, hasPrevMorph);
+    }
+
+    static void SyncShellBoxPrevFlags(HighlightBox box, bool hasPrevInstanceWorld, bool hasPrevBones, bool hasPrevMorph)
+    {
+        SyncShellPrimPrevFlags(box.Face, hasPrevInstanceWorld, hasPrevBones, hasPrevMorph);
+        SyncShellPrimPrevFlags(box.Edges, hasPrevInstanceWorld, hasPrevBones, hasPrevMorph);
+    }
+
+    static void SyncShellPrimPrevFlags(PrimitiveData primitive, bool hasPrevInstanceWorld, bool hasPrevBones, bool hasPrevMorph)
+    {
+        // Set, not just raise: the caller is the single per-frame publisher of these three bits, and it has to be able to
+        // withdraw previous-frame data for a frame whose instance order changed (see MTLInstancedPrimitiveGroup.UpdatePrevStateFlags).
+        // Bones stay gated per primitive here, because a shell inherits IsSkinned from its source and only a skinned shell has
+        // a palette to read at all -- this is exactly the value SyncInstancedSkinningMaterialParams seeds.
+        uint prevWorld = hasPrevInstanceWorld ? 1u : 0u;
+        uint prevBones = hasPrevBones && primitive.MaterialParams.IsSkinned != 0 ? 1u : 0u;
+        uint prevMorph = hasPrevMorph ? 1u : 0u;
+        if (primitive.MaterialParams.HasPrevInstanceWorld == prevWorld
+            && primitive.MaterialParams.HasPrevBones == prevBones
+            && primitive.MaterialParams.HasPrevMorph == prevMorph)
+            return;
+
+        primitive.MaterialParams.HasPrevInstanceWorld = prevWorld;
+        primitive.MaterialParams.HasPrevBones = prevBones;
+        primitive.MaterialParams.HasPrevMorph = prevMorph;
+        for (int f = 0; f < Device.frameCount; f++)
+            WriteStruct(primitive.MaterialBuffers[f], primitive.MaterialParams);
+    }
+
     /// <summary>Unified highlighting: derives a shared-geometry box from a template primitive.
     /// It copies CPU-side vertex and index array references together with material and texture references,
     /// while GPU pointers stay at default values.
@@ -1278,9 +1322,8 @@ internal abstract class MTLPrimitiveGroup : IDisposable
     /// and compute boneOffset as sizeof(Matrix4x4) × stride × slot, mirroring the 21-parameter signature used by the transparent per-slot path.
     /// Non-skinned shells keep the global Identity buffers and offset 0.
     /// prevInstanceBuffer is provided by the caller and points to the other side of the double-buffered instance stream.
-    /// HasPrevBones and HasPrevInstanceWorld are inherited from source material through the shell template.
-    /// On Metal, prev flags are set once during Load and cold states are covered by zero-data sentinels,
-    /// so no runtime patch-up is needed.</summary>
+    /// HasPrevBones and HasPrevInstanceWorld are inherited from source material through the shell template and are
+    /// republished every frame together with the main primitives, so a withdrawn history frame turns the shell off too.</summary>
     protected void DrawInstanceShellBox(HighlightBox box, HighlightBox geo, IMTLBuffer instanceBuffer, nuint instanceOffset, IMTLBuffer? prevInstanceBuffer)
     {
         var enc = Device.GraphicsEncoder;

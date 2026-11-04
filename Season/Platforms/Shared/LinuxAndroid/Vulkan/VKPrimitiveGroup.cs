@@ -1974,27 +1974,21 @@ internal unsafe abstract class VKPrimitiveGroup : IDisposable
 
     static void SyncShellPrimPrevFlags(PrimitiveData primitive, bool hasPrevInstanceWorld, bool hasPrevBones, bool hasPrevMorph)
     {
-        bool changed = false;
-        if (primitive.MaterialParams.HasPrevInstanceWorld == 0 && hasPrevInstanceWorld)
-        {
-            primitive.MaterialParams.HasPrevInstanceWorld = 1;
-            changed = true;
-        }
-        if (primitive.MaterialParams.HasPrevBones == 0 && hasPrevBones)
-        {
-            primitive.MaterialParams.HasPrevBones = 1;
-            changed = true;
-        }
-        if (primitive.MaterialParams.HasPrevMorph == 0 && hasPrevMorph)
-        {
-            primitive.MaterialParams.HasPrevMorph = 1;
-            changed = true;
-        }
-        if (changed)
-        {
-            for (int f = 0; f < Device.frameCount; f++)
-                Unsafe.Write(primitive.MappedMaterialBuffers[f], primitive.MaterialParams);
-        }
+        // Set, not just raise: the caller is the single per-frame publisher of these three bits, and it has to be able to
+        // withdraw previous-frame data for a frame whose instance order changed (see VKInstancedPrimitiveGroup.UpdatePrevStateFlags).
+        uint prevWorld = hasPrevInstanceWorld ? 1u : 0u;
+        uint prevBones = hasPrevBones ? 1u : 0u;
+        uint prevMorph = hasPrevMorph ? 1u : 0u;
+        if (primitive.MaterialParams.HasPrevInstanceWorld == prevWorld
+            && primitive.MaterialParams.HasPrevBones == prevBones
+            && primitive.MaterialParams.HasPrevMorph == prevMorph)
+            return;
+
+        primitive.MaterialParams.HasPrevInstanceWorld = prevWorld;
+        primitive.MaterialParams.HasPrevBones = prevBones;
+        primitive.MaterialParams.HasPrevMorph = prevMorph;
+        for (int f = 0; f < Device.frameCount; f++)
+            Unsafe.Write(primitive.MappedMaterialBuffers[f], primitive.MaterialParams);
     }
 
     /// <summary>Unified highlighting: release all highlight GPU resources

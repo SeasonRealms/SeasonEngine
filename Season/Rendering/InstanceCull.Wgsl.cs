@@ -6,40 +6,15 @@ namespace Season.Rendering;
 
 public sealed partial class InstanceCullEffect
 {
-    // A7's four kernels on the WebGPU side. WGSL uniform structs are 16-byte aligned, and CullParams is
+    // A7's three kernels on the WebGPU side. WGSL uniform structs are 16-byte aligned, and CullParams is
     // exactly 64 bytes, bit-for-bit identical to the HLSL/GLSL/MSL sides; the dispatch workgroup count is
     // supplied by C# and must match @workgroup_size.
-
-    const string ResetWgsl = """
-struct ResetParams
-{
-    primCount: u32,
-    slotCount: u32,
-    mode: u32,
-    pad: u32,
-};
-
-@group(0) @binding(0) var<uniform> resetParams: ResetParams;
-@group(0) @binding(1) var<storage, read> primInfo: array<u32>;
-@group(0) @binding(2) var<storage, read_write> drawArgs: array<u32>;
-
-@compute @workgroup_size(64, 1, 1)
-fn CSMain(@builtin(global_invocation_id) id: vec3<u32>)
-{
-    let idx: u32 = id.x;
-    let slot: u32 = idx / 16u;
-    let prim: u32 = idx % 16u;
-    if (slot >= resetParams.slotCount || prim >= resetParams.primCount) { return; }
-
-    let base: u32 = idx * 5u;
-    let info: u32 = prim * 4u;
-    drawArgs[base + 0u] = primInfo[info + 0u];
-    drawArgs[base + 1u] = 0u;
-    drawArgs[base + 2u] = primInfo[info + 1u];
-    drawArgs[base + 3u] = primInfo[info + 2u];
-    drawArgs[base + 4u] = 0u;
-}
-""";
+    // A7b removed the reset kernel: the frame-invariant part of the arg table is uploaded from InstanceCull.BuildArgsTemplate
+    // when the primitive set changes, and the per-slot counter is a region of the arg buffer that gather clears every run.
+    //
+    // Same verification gap as MSL: WGSL has no offline validator here either, and WebGPU additionally rejects any bind group whose layout does not
+    // match the shader exactly. Both failures surface as the kernel failing to register, i.e. all of A7 silently falling back to CPU culling with a
+    // normal-looking image, so a change to these strings is only proven by a browser run.
 
     const string CullWgsl = """
 struct CullParams
@@ -51,7 +26,7 @@ struct CullParams
     primCount: u32,
     capacity: u32,
     slotMask: u32,
-    pad0: u32,
+    slotCountsOffset: u32,
     pad1: u32,
     pad2: u32,
 };
@@ -108,7 +83,9 @@ fn CSMain(@builtin(global_invocation_id) id: vec3<u32>)
     {
         if ((cullParams.slotMask & (1u << slot)) == 0u) { continue; }
         if (!visibleInSlot(slot, center, radius)) { continue; }
-        let idx: u32 = slot * 16u * 5u + 1u;
+        // A7b: the counter lives in the arg buffer's accumulator region, not in the arg table's InstanceCount -- see
+        // InstanceCull.SlotCountsOffset for why the two cannot be the same word. The offset is in bytes, this array in uints.
+        let idx: u32 = (cullParams.slotCountsOffset >> 2u) + slot;
         let k: u32 = atomicAdd(&drawArgs[idx], 1u);
         visibleIds[slot * cullParams.capacity + k] = i;
     }
@@ -119,7 +96,7 @@ fn CSMain(@builtin(global_invocation_id) id: vec3<u32>)
 struct FinalizeParams
 {
     slotCount: u32,
-    slotStride: u32,
+    slotCountsOffset: u32,
     groupSize: u32,
     pad: u32,
 };
@@ -137,7 +114,7 @@ fn CSMain()
     var maxCount: u32 = 0u;
     for (var slot: u32 = 0u; slot < finalizeParams.slotCount; slot = slot + 1u)
     {
-        maxCount = max(maxCount, drawArgs[(slot * finalizeParams.slotStride + 4u) / 4u]);
+        maxCount = max(maxCount, drawArgs[(finalizeParams.slotCountsOffset >> 2u) + slot]);
     }
 
     let groups: u32 = (maxCount + finalizeParams.groupSize - 1u) / finalizeParams.groupSize;
@@ -154,6 +131,10 @@ struct GatherParams
     primCount: u32,
     slotCount: u32,
     tagMask: u32,
+    slotCountsOffset: u32,
+    clearSlotCounts: u32,
+    pad0: u32,
+    pad1: u32,
 };
 
 @group(0) @binding(0) var<uniform> gatherParams: GatherParams;
@@ -172,14 +153,23 @@ fn CSMain(@builtin(global_invocation_id) id: vec3<u32>)
     if (slot >= gatherParams.slotCount) { return; }
 
     let argsBase: u32 = slot * 16u * 5u;
-    let count: u32 = drawArgs[argsBase + 1u];
+    // A7b: the count comes from the accumulator cull filled this frame; the arg table's own InstanceCount is written below,
+    // so it only ever holds a finished frame's result for the draw to read.
+    let count: u32 = drawArgs[(gatherParams.slotCountsOffset >> 2u) + slot];
 
     // Fan-out: the total visible count of a slot must be written into the instance count of every primitive in that slot.
     if (k == 0u)
     {
+        drawArgs[argsBase + 1u] = count;
         for (var q: u32 = 1u; q < gatherParams.primCount; q = q + 1u)
         {
             drawArgs[argsBase + q * 5u + 1u] = count;
+        }
+        // Only the last gather of a group clears: every stream reads the same counts, so clearing on the first
+        // would make the rest publish zeroes into the arg table and the group would vanish for the frame.
+        if (gatherParams.clearSlotCounts != 0u)
+        {
+            drawArgs[(gatherParams.slotCountsOffset >> 2u) + slot] = 0u;
         }
     }
     if (k >= count) { return; }

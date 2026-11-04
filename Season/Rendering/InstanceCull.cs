@@ -11,6 +11,9 @@ namespace Season.Rendering;
 /// The heart of the contract is "original-index indirection": the cull kernel reads the instance world matrices, and each passing instance writes its **original index** into
 /// <see cref="CullVisible"/>; the draw side uses the compressed <c>SV_InstanceID</c> to restore the original index through this table and then fetch
 /// the transform. So the instance data itself is never rebuilt and never reordered; each frame only adds a 4-byte index table and a few indirect args.
+/// "Original" here means original to the cull input stream, not to the control's <c>Instances</c> list: the stream holds the enabled instances only, in
+/// write order, so the tag is exactly the compacted slot every per-instance table (world, bone palette, morph weights, their previous-frame sides) is
+/// laid out by, and never the index of an instance in <c>Instances</c>. The two coincide only while every instance is enabled.
 /// This is exactly the approach 1-5 deferred in <see cref="Season.Controls.InstancedMesh3DBase"/>: the comment there states
 /// "per-instance culling would require rebuilding and uploading the instance buffer for every cascade, violating clause 2 of 1-3", while the index table sidesteps the rebuild.
 ///
@@ -59,10 +62,11 @@ public interface IInstanceCullTarget
     /// </summary>
     StorageBuffer? CullStreamSorted(int stream);
 
-    /// <summary>16 bytes per primitive: index count, start index, base vertex, reserved. Updated only when the primitive set changes.</summary>
-    StorageBuffer? CullPrimitiveInfo { get; }
-
-    /// <summary><see cref="InstanceCull.MaxSlots"/> × <see cref="InstanceCull.MaxPrimitives"/> indirect draw args, written by the GPU.</summary>
+    /// <summary>
+    /// <see cref="InstanceCull.MaxSlots"/> × <see cref="InstanceCull.MaxPrimitives"/> indirect draw args, written by the GPU.
+    /// A7b: the block also carries <see cref="InstanceCull.SlotCountsBytes"/> of per-slot visible-count accumulator after the table
+    /// (<see cref="InstanceCull.SlotCountsOffset"/>), which is what replaced the per-frame reset dispatch.
+    /// </summary>
     StorageBuffer? CullArgs { get; }
 
     /// <summary><see cref="InstanceCull.MaxSlots"/> × capacity uints; one segment of the original index table per slot, written by the GPU.</summary>
@@ -111,6 +115,36 @@ public interface IInstanceCullTarget
 /// <summary>
 /// A7: cross-backend constants and registry for per-instance GPU culling. Every number here is a contract that the four backends' shaders and the C# allocations both depend on;
 /// changing any one of them requires updating all four kernel sources in sync, otherwise it shows up as "culled results out of place" rather than a compile error.
+///
+/// A7b/A7c maintenance contract. What follows are invariants rather than choices, and every one of them fails silently -- instances drawn at the wrong
+/// position, or culling quietly dropping to the CPU -- instead of raising an error, so none of them is discovered by a compile or a test run:
+///
+/// (1) Arg layout. <see cref="ArgsTotalBytes"/> is both what a target must allocate and what <see cref="IInstanceCullTarget.CullArgs"/> is checked against.
+/// The accumulator offset reaches the kernels as a parameter in all four dialects (cullParams[13] / finalizeParams[1] / gatherParams[4]) and must never be
+/// hardcoded there: the accumulator would then land inside the arg table and the atomic add would corrupt the indirect draw arguments themselves.
+/// A backend still allocating <see cref="ArgsBytes"/> fails safe -- the guard in <see cref="InstanceCullEffect"/> rejects that target for the frame and it keeps
+/// the direct path -- whereas a mismatched offset inside a kernel does not fail at all.
+///
+/// (2) Accumulator clearing. Only gather clears it, and only on <c>k == 0</c> with <c>clearSlotCounts != 0</c>. That rests on three facts that currently hold:
+/// <see cref="GatherGroupsY"/> dispatches a row for every slot cull can write; the last stream of a group is the one that sets the clear flag; and a zero-group
+/// indirect dispatch implies every count is already zero, because finalize derives the group count from the maximum over those same rows. Narrowing the Y
+/// dimension per target, or making one stream's dispatch conditional, leaves a count above zero across frames -- the next frame's atomic add starts where the
+/// last one ended and the draw reads a reordered segment that was never written. Both A/B paths break together, so a pixel comparison cannot catch it.
+///
+/// (3) Dispatch economy. Removing reset turned one dispatch per target per frame into a one-off upload (<see cref="BuildArgsTemplate"/>). The saving is CPU
+/// record/submit time, not GPU work: reset was a single thread group writing this block, and the gather it precedes dwarfs it in ALU terms. A future change
+/// argued on "the GPU cost of a dispatch" is arguing from the wrong baseline.
+///
+/// (4) Why the cull buffers are single-copy under frames-in-flight. <see cref="IInstanceCullTarget.CullSourceWorlds"/>, the arg template and the slot matrices
+/// are CPU-authored every frame, yet one copy of each is enough -- unlike the instance/bone/history streams, which had to be ringed. The difference is the
+/// delivery path: those streams are written straight into host-visible memory the GPU reads, so frame k+1's CPU write can land while frame k is still reading;
+/// these go through <c>TryUpdateStorageBuffer</c>, i.e. a per-frame staging slot plus a buffered copy, and buffered copies execute in submission order. The GPU
+/// producers (<see cref="IInstanceCullTarget.CullStreamSorted"/>, <see cref="IInstanceCullTarget.CullVisible"/>, the arg table and the indirect dispatch block) are
+/// ordered for the same reason: frame k+1's cull and gather cannot start before frame k's draws have finished. Nothing here needs N copies, and adding them
+/// would multiply the largest allocation in the chain (<see cref="SortedBytes"/>, 80 bytes per instance per slot) for no behavioral change.
+/// The invariant this rests on is therefore "every CPU-side cull input reaches the GPU as a recorded copy, never as a direct write". Turning one of them into a
+/// mapped host-visible write would silently reintroduce exactly the frame k / frame k-2 overlap this note exists to rule out, and it would not fail on any
+/// single backend uniformly.
 /// </summary>
 public static class InstanceCull
 {
@@ -135,7 +169,7 @@ public static class InstanceCull
     /// <summary>
     /// Slots whose reordered records get the original instance index written into M14 by gather: all of them.
     /// The main view needs it for motion vectors (t9/t10) and per-instance palettes; the shadow slots need it as soon as a skinned group draws
-    /// from them, because its bone palette is laid out by original index and a compacted SV_InstanceID would read another instance's pose.
+    /// from them, because its bone palette is laid out by that same index (the compacted slot, see the interface note) and a compacted SV_InstanceID would read another instance's pose.
     /// Tagging a slot that does not need it is free of visible effect: every vertex stage, the shadow variant included, decodes the tag and
     /// restores M14 to 0 before using the matrix, so a tagged record yields bit for bit the world matrix of an untagged one.
     /// </summary>
@@ -159,6 +193,31 @@ public static class InstanceCull
     /// <summary>Total byte size of the indirect arg table: slots × primitives × 20.</summary>
     public const uint ArgsBytes = (uint)(MaxSlots * MaxPrimitives) * ArgsStride;
 
+    /// <summary>
+    /// A7b: byte offset of the per-slot visible-count accumulator, placed right after the arg table so it shares the arg buffer.
+    ///
+    /// Why the counts live apart from the arg table's own InstanceCount: cull accumulates with an atomic add, so the destination has
+    /// to already be zero when it starts, and a value that a draw reads cannot be zeroed while the same frame still needs it. Storing
+    /// the accumulator in the same block keeps that separation free of a second buffer, a second upload path and a second "did the
+    /// allocation succeed" branch in all four backends; the draw side never looks here, so the two roles cannot collide.
+    ///
+    /// Its only writer is cull and its only reset is gather, at the very end of a run; the conditions that has to stay true are listed on the class.
+    /// The least obvious of them is that gather must be dispatched for every slot cull can touch, or a leftover count survives into the next frame.
+    /// </summary>
+    public const uint SlotCountsOffset = ArgsBytes;
+
+    /// <summary>
+    /// A7b: bytes reserved for the accumulator, rounded up to 16 like every other storage-buffer size in this file, so the four
+    /// backends' alignment rules all hold without a special case.
+    /// </summary>
+    public const uint SlotCountsBytes = ((uint)MaxSlots * 4u + 15u) & ~15u;
+
+    /// <summary>
+    /// A7b: the size <see cref="IInstanceCullTarget.CullArgs"/> must have. Everything the cull chain touches is inside this one block,
+    /// so "the arg buffer is too small" is a single check rather than one per region.
+    /// </summary>
+    public const uint ArgsTotalBytes = SlotCountsOffset + SlotCountsBytes;
+
     /// <summary>Total byte size of the reordered instance stream: slots × capacity × 80. Capacity is grow-only, same policy as the instance buffer.</summary>
     public static uint SortedBytes(int capacity) => (uint)(MaxSlots * capacity) * WorldStride;
 
@@ -169,16 +228,10 @@ public static class InstanceCull
     /// </summary>
     public static uint GatherGroupsX(int capacity) => (uint)((long)capacity + CullGroupSize - 1) / CullGroupSize;
 
-    /// <summary>Gather kernel's group count along Y, one row per slot. Both dispatch paths use this value: the A/B comparison is only allowed to vary the X dimension.</summary>
+    /// <summary>Gather kernel's group count along Y, one row per slot. Both dispatch paths use this value: the A/B comparison is only allowed to vary the X dimension.
+    /// It is also a correctness constant, not merely a dispatch shape: the accumulator is cleared from inside these rows, so a slot with no row keeps its
+    /// count across frames (see the accumulator notes on <see cref="SlotCountsOffset"/> and the class-level A7b contract).</summary>
     public const uint GatherGroupsY = MaxSlots;
-
-    /// <summary>Thread count of the reset kernel: covers all slots and primitives in one go.
-    /// It is no longer a single workgroup (5 × 16 = 80 > 64), so it is dispatched as <see cref="ResetGroups"/> groups of <see cref="CullGroupSize"/>;
-    /// the kernel already discards the threads past the last slot.</summary>
-    public const uint ResetThreads = (uint)(MaxSlots * MaxPrimitives);
-
-    /// <summary>Group count of the reset dispatch.</summary>
-    public const uint ResetGroups = (ResetThreads + CullGroupSize - 1) / CullGroupSize;
 
     /// <summary>Byte size of the slot matrix buffer.</summary>
     public const uint SlotMatrixBytes = (uint)MaxSlots * SlotMatrixStride;
@@ -233,7 +286,7 @@ public static class InstanceCull
 
     /// <summary>
     /// Writes the four fields of one primitive descriptor. It lives in the shared layer because the offsets of these four fields are
-    /// a contract the reset kernel and all four draw backends depend on; writing it once per backend would let one of them drift.
+    /// a contract <see cref="BuildArgsTemplate"/> and all four draw backends depend on; writing it once per backend would let one of them drift.
     /// The layout is fixed as indexCount / startIndex / baseVertex / reserved, consistent with <see cref="PrimitiveInfoStride"/>.
     /// </summary>
     public static void WritePrimitiveInfo(Span<byte> dst, int offset, uint indexCount, uint startIndex, int baseVertex)
@@ -243,6 +296,44 @@ public static class InstanceCull
         span[1] = startIndex;
         span[2] = (uint)baseVertex;
         span[3] = 0u;
+    }
+
+    /// <summary>
+    /// A7b: composes the initial content of a target's arg buffer from the CPU-side primitive table: every slot carries the same
+    /// per-primitive index range, InstanceCount starts at zero everywhere, and the slot-count accumulator at
+    /// <see cref="SlotCountsOffset"/> is zero.
+    ///
+    /// This replaces the reset kernel that used to run once per target per frame. The reason it can: every field it wrote is either
+    /// frame-invariant (the index range, which only changes when the primitive set does) or re-derived by the GPU later in the same
+    /// frame (the instance counts, which gather publishes). What is left is one upload at the moment the primitive set changes,
+    /// instead of a dispatch on every frame in between.
+    ///
+    /// The layout is the contract the cull, finalize and gather kernels address, so it lives in the shared layer next to
+    /// <see cref="WritePrimitiveInfo"/> rather than once per backend.
+    /// </summary>
+    public static byte[] BuildArgsTemplate(ReadOnlySpan<byte> primInfo, int primitives)
+    {
+        var bytes = new byte[ArgsTotalBytes];
+        int n = Math.Min(primitives, MaxPrimitives);
+        for (int slot = 0; slot < MaxSlots; slot++)
+        {
+            for (int prim = 0; prim < n; prim++)
+            {
+                int src = prim * (int)PrimitiveInfoStride;
+                int dst = slot * (int)MaxPrimitives * (int)ArgsStride + prim * (int)ArgsStride;
+                // indexCount / startIndex / baseVertex come straight from the primitive table; both instance-count
+                // fields and the trailing reserved dword stay zero, exactly what the reset kernel used to write.
+                primInfo.Slice(src, (int)PrimitiveInfoStride).CopyTo(bytes.AsSpan(dst, (int)PrimitiveInfoStride));
+                int at = dst + 4;
+                bytes[at] = 0; bytes[at + 1] = 0; bytes[at + 2] = 0; bytes[at + 3] = 0;
+                int tail = dst + 16;
+                bytes[tail] = 0; bytes[tail + 1] = 0; bytes[tail + 2] = 0; bytes[tail + 3] = 0;
+            }
+        }
+        // The accumulator region is already zero (a fresh array); it is spelled out here so the dependency is visible:
+        // cull's atomic add is only correct on top of zeroes.
+        bytes.AsSpan((int)SlotCountsOffset, (int)SlotCountsBytes).Clear();
+        return bytes;
     }
 
     /// <summary>Registers a cull target. Re-registration has no side effect, avoiding the same group being added twice along multiple paths.</summary>
@@ -264,10 +355,15 @@ public static class InstanceCull
 /// (Vulkan forbids dispatch inside a Pass, and Metal's compute and render encoders are mutually exclusive), and the shadow atlas is a single one per frame,
 /// so it should not be culled repeatedly per view.
 ///
-/// Each group does four dispatches per frame: reset fills the arg table, cull compresses per slot, finalize reduces the visible counts into gather's dispatch size,
-/// and gather materializes the reordered stream by index and fans the instance count out to the remaining primitives. All four must be outside a Pass, exactly like the
-/// particle system's A0.1 chain; the only difference is that what is produced here is "one indirect arg set per slot + one original index table" rather than a single
-/// apply command.
+/// Each group does two or three dispatches per frame: cull compresses per slot, finalize (indirect gather path only) reduces the visible counts into gather's dispatch size,
+/// and gather materializes the reordered stream by index, publishes the slot counts into the indirect args and fans the instance count out to the remaining primitives.
+/// All of them must be outside a Pass, exactly like the particle system's A0.1 chain; the only difference is that what is produced here is
+/// "one indirect arg set per slot + one original index table" rather than a single apply command.
+///
+/// A7b: the arg table no longer needs a per-frame reset dispatch. Its frame-invariant fields are uploaded once from
+/// <see cref="InstanceCull.BuildArgsTemplate"/> when the primitive set changes, and the per-slot visible count now accumulates in a
+/// region of the same buffer that gather clears at the end of every run, so nothing has to rewrite zeroes at the start of one.
+/// That is one dispatch fewer per target per frame -- the fixed cost that used to make small groups unprofitable to cull on the GPU.
 ///
 /// finalize is only recorded when gather takes the indirect dispatch path (<see cref="IndirectGather"/>). Fixed dispatch does not need it:
 /// the capacity in the CPU's hands is a sufficient upper bound, and any extra threads dispatched just read one uint each and exit early.
@@ -297,17 +393,15 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         Environment.GetEnvironmentVariable("SEASON_CULL_INDIRECT") == "1";
 
     readonly Vector4[] _slotMatrices = new Vector4[InstanceCull.MaxSlots * 4];
-    readonly uint[] _resetParams = new uint[4];
-    readonly uint[] _gatherParams = new uint[4];
+    readonly uint[] _gatherParams = new uint[8];
     readonly uint[] _finalizeParams = new uint[4];
     readonly float[] _cullParams = new float[16];
-    readonly ComputeResourceRef[] _resetRefs = new ComputeResourceRef[2];
     readonly ComputeResourceRef[] _cullRefs = new ComputeResourceRef[4];
     readonly ComputeResourceRef[] _finalizeRefs = new ComputeResourceRef[2];
     readonly ComputeResourceRef[] _gatherRefs = new ComputeResourceRef[4];
 
     IGraphics? _graphics;
-    ComputeKernel? _reset, _cull, _finalize, _gather;
+    ComputeKernel? _cull, _finalize, _gather;
     StorageBuffer? _slotBuffer;
 
     /// <summary>
@@ -328,11 +422,10 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         _graphics = g;
         try
         {
-            _reset = g.CreateComputeKernel(CreateResetKernel());
             _cull = g.CreateComputeKernel(CreateCullKernel());
             _finalize = g.CreateComputeKernel(CreateFinalizeKernel());
             _gather = g.CreateComputeKernel(CreateGatherKernel());
-            if (_reset == null || _cull == null || _finalize == null || _gather == null) { Dispose(); return false; }
+            if (_cull == null || _finalize == null || _gather == null) { Dispose(); return false; }
             _slotBuffer = g.CreateStorageBuffer(InstanceCull.SlotMatrixBytes);
             if (_slotBuffer == null || _slotBuffer.SizeInBytes < InstanceCull.SlotMatrixBytes) { Dispose(); return false; }
 
@@ -366,7 +459,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
 
     public override void Record(IGraphics g)
     {
-        if (!ReferenceEquals(g, _graphics) || _reset == null || _cull == null || _finalize == null
+        if (!ReferenceEquals(g, _graphics) || _cull == null || _finalize == null
             || _gather == null || _slotBuffer == null) return;
         if (InstanceCull.Targets.Count == 0) return;
 
@@ -448,18 +541,16 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         if (capacity < count || primitives <= 0 || primitives > InstanceCull.MaxPrimitives) return;
 
         var source = target.CullSourceWorlds;
-        var info = target.CullPrimitiveInfo;
         var args = target.CullArgs;
         var visible = target.CullVisible;
         int streams = target.CullStreamCount;
-        if (source == null || info == null || args == null || visible == null || streams <= 0) return;
+        if (source == null || args == null || visible == null || streams <= 0) return;
 
         // The capacity checks live in the shared layer so the four backends do not each repeat them: args is fixed-size, and visible and the reordered stream must hold the full capacity.
         // source only needs to hold this frame's instances -- it is uploaded by instance count, with no spare room reserved.
-        if (args.SizeInBytes < InstanceCull.ArgsBytes) return;
+        if (args.SizeInBytes < InstanceCull.ArgsTotalBytes) return;
         if (visible.SizeInBytes < (uint)(InstanceCull.MaxSlots * capacity) * 4u) return;
         if (source.SizeInBytes < (uint)count * InstanceCull.WorldStride) return;
-        if (info.SizeInBytes < (uint)primitives * InstanceCull.PrimitiveInfoStride) return;
         // Every stream is checked before anything is dispatched: a stream found short after the cull already ran would leave the args
         // saying "N visible" over a reordered segment that was never written, and the draw side would read last frame's records.
         for (int s = 0; s < streams; s++)
@@ -471,24 +562,10 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             if (streamSorted.SizeInBytes < InstanceCull.SortedBytes(capacity)) return;
         }
 
-        // 1) reset: writes the index count and start offset for each entry, and zeroes InstanceCount.
-        _resetParams[0] = (uint)primitives;
-        _resetParams[1] = (uint)InstanceCull.MaxSlots;
-        _resetParams[2] = 0;
-        _resetParams[3] = 0;
-        _resetRefs[0] = info;
-        _resetRefs[1] = args;
-        g.DispatchCompute(new ComputeDispatchArgs
-        {
-            Kernel = _reset!,
-            Params = MemoryMarshal.AsBytes(_resetParams.AsSpan()),
-            Resources = _resetRefs,
-            GroupsX = InstanceCull.ResetGroups,
-            GroupsY = 1,
-            GroupsZ = 1,
-        });
-
-        // 2) cull: one thread per instance, testing the sphere against the six clipping planes for each slot.
+        // 1) cull: one thread per instance, testing the sphere against the six clipping planes for each slot.
+        //    The passing instances atomic-add into the slot's accumulator at InstanceCull.SlotCountsOffset rather than into the
+        //    arg table's own InstanceCount: the accumulator belongs to the GPU chain and gather clears it every run, while the
+        //    InstanceCount is the value a draw reads, so it must only ever hold a finished frame's result.
         _cullParams[0] = target.CullLocalCenter.X;
         _cullParams[1] = target.CullLocalCenter.Y;
         _cullParams[2] = target.CullLocalCenter.Z;
@@ -506,7 +583,9 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         _cullParams[10] = BitConverter.UInt32BitsToSingle((uint)primitives);
         _cullParams[11] = BitConverter.UInt32BitsToSingle((uint)capacity);
         _cullParams[12] = BitConverter.UInt32BitsToSingle((uint)slotMask);
-        _cullParams[13] = 0f;
+        // pad0 carries the accumulator's byte offset: the block is a 16-byte-aligned mix of floats and uints, so the offset
+        // has to travel as the raw bit pattern like the five counts above.
+        _cullParams[13] = BitConverter.UInt32BitsToSingle(InstanceCull.SlotCountsOffset);
         _cullParams[14] = 0f;
         _cullParams[15] = 0f;
 
@@ -524,7 +603,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             GroupsZ = 1,
         });
 
-        // 3) finalize (indirect path only): reduces the per-slot visible counts into "how many groups to dispatch along X".
+        // 2) finalize (indirect path only): reduces the per-slot visible counts into "how many groups to dispatch along X".
         //    The size can only come from the GPU -- the index table is compressed, and the CPU only has capacity as an upper bound.
         //    It is the only [numthreads(1,1,1)] kernel among the four backends: the slot count is at most 5, and reading five uints serially
         //    is far cheaper than opening a workgroup to do a reduction and then synchronize, and it avoids writing a threadsync dialect per backend.
@@ -534,10 +613,10 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             // The slot count scanned is exactly gather's Y-dimension group count; it takes MaxSlots directly rather than GatherGroupsY:
             // the two are currently equal but semantically different -- the latter is "how many rows to dispatch", the former is "how many rows are in the arg table".
             _finalizeParams[0] = (uint)InstanceCull.MaxSlots;
-            // Slot stride = how many bytes of arg table one slot occupies. Written as a parameter rather than giving the kernel its own constant:
-            // that MAX_PRIMITIVES × 20 multiplication is a contract both reset and gather depend on,
-            // and writing it an extra time adds one more drift point.
-            _finalizeParams[1] = (uint)InstanceCull.MaxPrimitives * InstanceCull.ArgsStride;
+            // A7b: the second field used to be the arg-table stride and now points at the slot-count accumulator, which is what
+            // the kernel actually reads. It is still a parameter rather than a kernel constant for the same reason: that
+            // MAX_PRIMITIVES × 20 multiplication is a contract several kernels depend on, and writing it more times adds drift points.
+            _finalizeParams[1] = InstanceCull.SlotCountsOffset;
             _finalizeParams[2] = InstanceCull.CullGroupSize;
             _finalizeParams[3] = 0;
             _finalizeRefs[0] = args;
@@ -553,7 +632,8 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             });
         }
 
-        // 4) gather: materializes visible instances into the slot segments by the index table, and fans the instance count out to the remaining primitives along the way.
+        // 3) gather: materializes visible instances into the slot segments by the index table, publishes the slot's visible count into
+        // the indirect args and fans it out to the remaining primitives along the way.
         // The X dimension is the index within a slot, the Y dimension is the slot. This two-dimensional mapping is fully shared by both dispatch paths -- otherwise the A/B comparison would
         // not be about "the dispatch mode" but about two different addressing schemes, and any difference could not be attributed.
         _gatherParams[0] = (uint)capacity;
@@ -561,6 +641,12 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         _gatherParams[2] = (uint)InstanceCull.MaxSlots;
         // Tag mask: every slot's records get the original index written into M14 (see the gather kernel and InstanceCull.TagMask).
         _gatherParams[3] = InstanceCull.TagMask;
+        // A7b: where the slot-count accumulator lives inside the arg block, and whether this dispatch is the one that clears it.
+        // Only the last stream of a group clears: every stream reads the same counts, so clearing on the first would leave the
+        // rest publishing zeroes into the arg table.
+        _gatherParams[4] = InstanceCull.SlotCountsOffset;
+        _gatherParams[6] = 0u;
+        _gatherParams[7] = 0u;
         _gatherRefs[0] = visible;
         _gatherRefs[3] = args;
         // The counters sit at the dispatch point rather than at the branch test: if finalize is ever merged into another kernel in the future, the branch would still be there while gather might
@@ -572,6 +658,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         // only replays it. The repeated fan-out is harmless (it reads primitive 0, which no gather writes), and the dispatch block is only read.
         for (int s = 0; s < streams; s++)
         {
+            _gatherParams[5] = (uint)(s == streams - 1 ? 1 : 0);
             _gatherRefs[1] = target.CullStreamSource(s)!;
             _gatherRefs[2] = target.CullStreamSorted(s)!;
             g.DispatchCompute(new ComputeDispatchArgs
@@ -602,7 +689,6 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             InstanceCull.Targets.Clear();
             _routed = false;
         }
-        _reset?.Dispose(); _reset = null;
         _cull?.Dispose(); _cull = null;
         _finalize?.Dispose(); _finalize = null;
         _gather?.Dispose(); _gather = null;
@@ -612,33 +698,14 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
     }
 
     // ── Kernel declarations ──
-    // reset:    [0] Params 16B / [1] StorageBufferRead primInfo -> t0 / [2] StorageBufferReadWrite args -> u0
     // cull:     [0] Params 64B / [1] StorageBufferRead slotMatrices -> t0 / [2] StorageBufferRead source -> t1
     //           [3] StorageBufferReadWrite args -> u0 / [4] StorageBufferReadWrite visible -> u1
     // finalize: [0] Params 16B / [1] StorageBufferRead args -> t0 / [2] StorageBufferReadWrite dispatch -> u0
-    // gather:   [0] Params 16B / [1] StorageBufferRead visible -> t0 / [2] StorageBufferRead source -> t1
+    // gather:   [0] Params 32B / [1] StorageBufferRead visible -> t0 / [2] StorageBufferRead source -> t1
     //           [3] StorageBufferReadWrite sorted -> u0 / [4] StorageBufferReadWrite args -> u1
+    // The old reset kernel is gone: its frame-invariant output is uploaded from InstanceCull.BuildArgsTemplate when the primitive
+    // set changes, and the per-slot counter it used to clear is now cleared by gather at the end of every run.
     // 64B is far below the 128B cross-backend limit of Vulkan push constants and WebGPU uniforms.
-
-    static ComputeKernelDesc CreateResetKernel() => new()
-    {
-        Name = "instanceCullReset",
-        Source = new ShaderSourceSet
-        {
-            Hlsl = ResetHlsl, Glsl = ResetGlsl, Msl = ResetMsl, Wgsl = ResetWgsl, EntryPoint = "CSMain",
-        },
-        Bindings = new[]
-        {
-            new ComputeBindingDesc { Type = ComputeBindingType.Params, SizeInBytes = 16 },
-            new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferRead },
-            new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferReadWrite },
-        },
-        // The group size is the shared 64 rather than ResetThreads: with the main-view slot the thread count is 80, past the 64 the
-        // HLSL/GLSL/WGSL sources declare, and Metal takes this value as its threadgroup width directly.
-        WorkgroupX = InstanceCull.CullGroupSize,
-        WorkgroupY = 1,
-        WorkgroupZ = 1,
-    };
 
     static ComputeKernelDesc CreateCullKernel() => new()
     {
@@ -690,7 +757,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         },
         Bindings = new[]
         {
-            new ComputeBindingDesc { Type = ComputeBindingType.Params, SizeInBytes = 16 },
+            new ComputeBindingDesc { Type = ComputeBindingType.Params, SizeInBytes = 32 },
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferRead },
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferRead },
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferReadWrite },

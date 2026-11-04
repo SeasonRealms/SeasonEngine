@@ -207,7 +207,23 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         _batchCount++;
     }
 
-    internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
+    /// <summary>
+    /// Uploads the bone palette at most once per skinKey per frame. Later passes in the same frame
+    /// reuse the bytes already on the GPU; the caller must not mutate them mid-frame.
+    /// </summary>
+    void UploadSkinnedBonesOnce(string skinKey, byte[] boneMatricesBytes)
+    {
+        if (string.IsNullOrEmpty(skinKey) || boneMatricesBytes == null || boneMatricesBytes.Length == 0)
+            return;
+
+        if (_skinnedBonesUploadFrame.TryGetValue(skinKey, out var uploadedFrame) && uploadedFrame == _frameIndex)
+            return;
+
+        _skinnedBonesUploadFrame[skinKey] = _frameIndex;
+        WebGPUInterop.UploadSkinnedBones(skinKey, boneMatricesBytes);
+    }
+
+internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     {
         FlushDrawMesh3DBatch();
 
@@ -217,7 +233,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
         _currentSkinnedBatchSkinKey = skinKey;
 
         if (boneMatricesBytes != null && boneMatricesBytes.Length > 0)
-            WebGPUInterop.UploadSkinnedBones(skinKey, boneMatricesBytes);
+            UploadSkinnedBonesOnce(skinKey, boneMatricesBytes);
     }
 
     internal void EnqueueDrawSkinnedMesh(string cacheKey, float[] uniformData)
@@ -577,6 +593,14 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     // ── Unified GlyphAtlasManager atlas (aligned with Windows/VK/Metal) ──
     GlyphAtlasManager<WGPUTexture> _glyphAtlas;
     uint _frameIndex;
+
+    // P0 buffering: skinKey -> frame serial of its last bone upload.
+    // The main view, the shadow pass, and the outline mask pass all draw the same per-model palette,
+    // and the JS side already rolls the prev palette forward only on the first call of a frame,
+    // so a repeat upload carries identical bytes. It is not just wasted bandwidth:
+    // _writeSceneBuffer is copy-on-write within a frame, so a buffer already snapshotted by an
+    // earlier pass is replaced instead of overwritten, which allocates a throwaway GPU buffer per pass.
+    readonly Dictionary<string, uint> _skinnedBonesUploadFrame = new(StringComparer.Ordinal);
 
     // ── Shape (procedural geometry) ──
     Dictionary<(Season.Controls.ShapeType, int, int, int), WGPUTexture> DictionaryShapeTexture = new();
@@ -3673,7 +3697,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             WritePrevMatrices(uniformData);
 
             // The args record order is the table's order, so the counter only advances on masked surfaces. The prev stream goes
-            // down whole: the VS indexes it by the original instance decoded from the reordered row, not by the compacted one.
+            // down whole because the row's tag IS the compacted slot, so it lines up with the reordered rows row for row.
             if (mainIndirect && (mainPrimitiveMask & (1 << surfaceIndex)) != 0)
             {
                 _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3DIndirect",
@@ -3849,8 +3873,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
         float modelAlpha = wgpuModel.ModelAlpha;
         bool isSkinned = !string.IsNullOrEmpty(wgpuModel.SkinKey);
-        if (isSkinned && wgpuModel.BoneMatricesBytes.Length > 0)
-            WebGPUInterop.UploadSkinnedBones(wgpuModel.SkinKey, wgpuModel.BoneMatricesBytes);
+        if (isSkinned)
+            UploadSkinnedBonesOnce(wgpuModel.SkinKey, wgpuModel.BoneMatricesBytes);
 
         // 1. Opaque
         foreach (var prim in opaquePrimitives)
@@ -3879,7 +3903,7 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
             WritePrevMatrices(uniformData);
 
             // A7 main view: the primitive's own reordered stream at the main-view segment, with its args record. The prev stream and the
-            // bone palette go down whole: the VS indexes both by the original instance decoded from the reordered row. A primitive whose
+            // bone palette go down whole because the row's tag IS the compacted slot they are addressed by. A primitive whose
             // own base-color alpha is below one is drawn by JS in a fade mode, which the indirect entry refuses (a GPU-sized draw cannot be
             // split back to front), so it keeps the direct draw even inside an opaque model; collection also hands transparent
             // primitives through this loop, and those have no record.
@@ -4215,8 +4239,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
         float modelAlpha = wgpuModel.ModelAlpha;
         bool isSkinned = !string.IsNullOrEmpty(wgpuModel.SkinKey);
-        if (isSkinned && wgpuModel.BoneMatricesBytes.Length > 0)
-            WebGPUInterop.UploadSkinnedBones(wgpuModel.SkinKey, wgpuModel.BoneMatricesBytes);
+        if (isSkinned)
+            UploadSkinnedBonesOnce(wgpuModel.SkinKey, wgpuModel.BoneMatricesBytes);
 
         // A7: each primitive with a record draws its own reordered stream at this slot's segment; the rest keep the direct draw. Unlike
         // the mesh this needs no all-or-nothing fallback, because a record and its stream are both addressed by the primitive's own entry,
@@ -4527,8 +4551,8 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
         float modelAlpha = wgpuModel.ModelAlpha;
         bool isSkinned = !string.IsNullOrEmpty(wgpuModel.SkinKey);
-        if (isSkinned && wgpuModel.BoneMatricesBytes.Length > 0)
-            WebGPUInterop.UploadSkinnedBones(wgpuModel.SkinKey, wgpuModel.BoneMatricesBytes);
+        if (isSkinned)
+            UploadSkinnedBonesOnce(wgpuModel.SkinKey, wgpuModel.BoneMatricesBytes);
 
         foreach (var prim in wgpuModel.Primitives)
         {

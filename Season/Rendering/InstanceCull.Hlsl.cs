@@ -6,60 +6,29 @@ namespace Season.Rendering;
 
 public sealed partial class InstanceCullEffect
 {
-    // A7's four D3D12 kernels. The [numthreads] of reset and cull must equal the C# value
+    // A7's three D3D12 kernels. The [numthreads] of cull must equal the C# value
     // InstanceCull.CullGroupSize(64), and MAX_PRIMITIVES must equal InstanceCull.MaxPrimitives(16): these two numbers are the entire
-    // basis for "fixed-stride addressing", and any drift shows up as an arg-table misalignment rather than a compile error. reset covers
-    // InstanceCull.ResetThreads(80) entries in InstanceCull.ResetGroups(2) groups; the threads past the last slot exit on the slot test.
+    // basis for "fixed-stride addressing", and any drift shows up as an arg-table misalignment rather than a compile error.
     // gather's [numthreads] is likewise 64, but its group count is given in the X/Y dimensions,
     // and finalize is fixed single-threaded -- it only reads 5 uints and reduces them into a dispatch size, with nothing to parallelize.
     //
+    // A7b removed the fourth kernel (reset). What it did split in two: the frame-invariant part of the arg table is now uploaded from
+    // InstanceCull.BuildArgsTemplate when the primitive set changes, and the per-slot instance counter is a region of the same arg
+    // buffer that gather clears at the end of every run. That is one dispatch fewer for every participating group, every frame.
+    //
     // Parameters always go through a cbuffer + struct instance rather than SM5.1's ConstantBuffer<T> template: the DX12 backend compiles cs_5_0 with fxc,
-    // where the template form reports "unrecognized identifier 'ConstantBuffer'", and all four kernels would fail registration together,
+    // where the template form reports "unrecognized identifier 'ConstantBuffer'", and all three kernels would fail registration together,
     // showing up as all of A7 silently falling back to CPU culling (InstanceCull.Enabled stays false and the image looks completely normal, so it is hard to notice).
     // The two forms have the same byte layout on b0, and the field accesses in the code need not change either.
-
-    const string ResetHlsl = """
-// A7 reset: writes each (slot, primitive) indirect arg entry to fixed values and zeroes the instance count.
-// mode 0 fills the args, mode 1 fans the instance count of primitive 0 within a slot out to the remaining primitives.
-// It is split into two dispatches rather than done in one, because the fan-out must wait for the cull kernel to finish accumulating the counts.
-
-#define MAX_PRIMITIVES 16
-#define ARGS_STRIDE 20
-
-struct ResetParams
-{
-    uint primCount;
-    uint slotCount;
-    uint mode;
-    uint pad;
-};
-
-cbuffer ResetParamsCB : register(b0)
-{
-    ResetParams resetParams;
-};
-ByteAddressBuffer primInfo : register(t0);
-RWByteAddressBuffer drawArgs : register(u0);
-
-[numthreads(64, 1, 1)]
-void CSMain(uint3 id : SV_DispatchThreadID)
-{
-    uint idx = id.x;
-    uint slot = idx / MAX_PRIMITIVES;
-    uint prim = idx % MAX_PRIMITIVES;
-    ResetParams p = resetParams;
-    if (slot >= p.slotCount || prim >= p.primCount)
-        return;
-
-    uint base = idx * ARGS_STRIDE;
-    uint info = prim * 16;
-    drawArgs.Store(base + 0, primInfo.Load(info + 0));
-    drawArgs.Store(base + 4, 0);
-    drawArgs.Store(base + 8, primInfo.Load(info + 4));
-    drawArgs.Store(base + 12, primInfo.Load(info + 8));
-    drawArgs.Store(base + 16, 0);
-}
-""";
+    //
+    // Same failure shape, different cause -- known fxc trap: compiling cull with /Od /Zi makes fxc report
+    // "X4000: use of potentially uninitialized variable (VisibleInSlot)". That is a false positive on a helper with several early returns; with the runtime's
+    // flags (0) the same source is clean, which is why it is left as is. It matters anyway because any diagnostic is fatal to ShaderCompiler: turning debug
+    // flags on does not produce a warning to investigate, it drops all of A7 back to CPU culling with a perfectly normal-looking image. If cull stops
+    // participating, check the compile flags before checking the kernel.
+    //
+    // slotCountsOffset is a parameter of all three kernels on purpose. Replacing it with the literal 1600 would put the accumulator inside the arg table and
+    // let the atomic add corrupt the indirect draw arguments -- see the A7b contract on InstanceCull for why that cannot be caught afterwards.
 
     const string CullHlsl = """
 // A7 per-instance culling: one thread per instance, computing the world bounding sphere and then testing it against the six clipping planes for each slot.
@@ -83,7 +52,7 @@ struct CullParams
     uint primCount;
     uint capacity;
     uint slotMask;
-    uint pad0;
+    uint slotCountsOffset;
     uint pad1;
     uint pad2;
 };
@@ -149,8 +118,10 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             continue;
 
         // Each slot is compressed independently: an instance can be visible in several cascades, and the index table holds one segment per slot.
+        // A7b: the counter lives in the arg buffer's accumulator region, not in the arg table's InstanceCount -- see InstanceCull.SlotCountsOffset
+        // for why the two cannot be the same word.
         uint k;
-        drawArgs.InterlockedAdd(slot * MAX_PRIMITIVES * ARGS_STRIDE + 4, 1u, k);
+        drawArgs.InterlockedAdd(p.slotCountsOffset + slot * 4u, 1u, k);
         visibleIds.Store((slot * p.capacity + k) * 4, i);
     }
 }
@@ -168,7 +139,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 struct FinalizeParams
 {
     uint slotCount;     // how many slots to scan, which is also dispatch's Y-dimension group count
-    uint slotStride;    // how many bytes of arg table one slot occupies (MaxPrimitives * ARGS_STRIDE)
+    uint slotCountsOffset; // where the per-slot visible counts sit inside the arg buffer (InstanceCull.SlotCountsOffset)
     uint groupSize;     // gather's workgroup size, X-dimension group count = ceil(maxCount / groupSize)
     uint pad;
 };
@@ -186,7 +157,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     FinalizeParams p = finalizeParams;
     uint maxCount = 0;
     for (uint slot = 0; slot < p.slotCount; slot++)
-        maxCount = max(maxCount, drawArgs.Load(slot * p.slotStride + 4));
+        maxCount = max(maxCount, drawArgs.Load(p.slotCountsOffset + slot * 4));
 
     // When maxCount is 0, groups is also 0: all four backends allow dispatching "0 groups" (it does nothing),
     // so a frame whose whole group is culled away does not need another CPU-side branch.
@@ -225,6 +196,10 @@ struct GatherParams
     uint primCount;
     uint slotCount;
     uint tagMask;
+    uint slotCountsOffset;  // A7b: where the per-slot visible counts sit inside the arg buffer
+    uint clearSlotCounts;   // A7b: 1 on the last stream of a group, which is the dispatch that resets the accumulator
+    uint pad0;
+    uint pad1;
 };
 
 cbuffer GatherParamsCB : register(b0)
@@ -248,14 +223,21 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         return;
 
     uint argsBase = slot * MAX_PRIMITIVES * ARGS_STRIDE;
-    uint count = drawArgs.Load(argsBase + 4);
+    // A7b: the count comes from the accumulator, which cull filled this frame; the arg table's own InstanceCount is
+    // written below, so it only ever holds a finished frame's result for the draw to read.
+    uint count = drawArgs.Load(p.slotCountsOffset + slot * 4);
 
     // Fan-out: primitive 0's instance count is the slot's total visible count; the remaining primitives copy it verbatim.
     // Each primitive has a different index range, so the arg table must store one entry per primitive rather than sharing a single one.
     if (k == 0)
     {
+        drawArgs.Store(argsBase + 4, count);
         for (uint q = 1; q < p.primCount; q++)
             drawArgs.Store(argsBase + q * ARGS_STRIDE + 4, count);
+        // Only the last gather of a group clears: every stream of a group reads the same counts, so clearing on the first would
+        // make the rest publish zeroes into the arg table and the group would vanish for the frame.
+        if (p.clearSlotCounts != 0u)
+            drawArgs.Store(p.slotCountsOffset + slot * 4, 0u);
     }
     if (k >= count)
         return;

@@ -51,6 +51,10 @@ internal unsafe class VKModel : VKPrimitiveGroup
     // and the shader falls back to the current bone per joint.
     BufferResource[] _prevBonePaletteBuffers = null!;
     byte*[] _mappedPrevBonePaletteBuffers = null!;
+    /// <summary>CPU copy of the bone palette this model uploaded last frame. The prev SSBO is filled from here
+    /// rather than from <c>_mappedBoneMatrixBuffers[fi]</c>: that slot holds the palette of the frame that last used
+    /// fi, which with N frames in flight is N frames old, not one.</summary>
+    Matrix4x4[] _prevBonePaletteCpu = Array.Empty<Matrix4x4>();
 
     // 2-3 Step C (track C-b completion): prev morph weights SSBO
     // (one float4 = 16 bytes).
@@ -458,6 +462,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
         int n = (int)Device.frameCount;
         _prevBonePaletteBuffers = new BufferResource[n];
         _mappedPrevBonePaletteBuffers = new byte*[n];
+        _prevBonePaletteCpu = Array.Empty<Matrix4x4>();
         ulong size = (ulong)(Unsafe.SizeOf<Matrix4x4>() * MaxBones);
 
         for (int i = 0; i < n; i++)
@@ -863,14 +868,15 @@ internal unsafe class VKModel : VKPrimitiveGroup
         int totalSize = matrixSize * Math.Min(boneMatrices.Length, MaxBones);
         int fi = (int)Device.FrameIndex;
 
-        // 2-3 Step C (track B): before uploading new bone matrices,
-        // first copy the old matrices from the current frame buffer into the prev SSBO.
-        // On the first frame, prev content is all zero (sentinel _m33 == 0),
-        // and the shader falls back to the current bone per joint.
+        // 2-3 Step C (track B): publish the PREVIOUS frame's palette (CPU shadow) into this frame's prev SSBO slot
+        // before the current palette overwrites anything. On the first frame the shadow is empty, so the slot stays
+        // zeroed and the shader's _m33 == 0 sentinel falls back to the current bone per joint.
         if (_mappedPrevBonePaletteBuffers != null && fi < _mappedPrevBonePaletteBuffers.Length
-            && _mappedPrevBonePaletteBuffers[fi] != null)
+            && _mappedPrevBonePaletteBuffers[fi] != null && _prevBonePaletteCpu.Length > 0)
         {
-            Unsafe.CopyBlock(_mappedPrevBonePaletteBuffers[fi], _mappedBoneMatrixBuffers[fi], (uint)totalSize);
+            int prevCount = Math.Min(_prevBonePaletteCpu.Length, MaxBones);
+            fixed (Matrix4x4* pPrev = _prevBonePaletteCpu)
+                Unsafe.CopyBlock(_mappedPrevBonePaletteBuffers[fi], pPrev, (uint)(matrixSize * prevCount));
         }
 
         fixed (void* matricesPtr = boneMatrices)
@@ -882,6 +888,11 @@ internal unsafe class VKModel : VKPrimitiveGroup
                 Unsafe.CopyBlock(_mappedInstanceBoneBuffers[fi], matricesPtr, (uint)dynamicSize);
             }
         }
+
+        // Remember this frame's palette for the next frame's prev slot.
+        if (_prevBonePaletteCpu.Length != boneMatrices.Length)
+            _prevBonePaletteCpu = new Matrix4x4[boneMatrices.Length];
+        Array.Copy(boneMatrices, _prevBonePaletteCpu, boneMatrices.Length);
     }
 
     void ApplyUserTransformToNodeTree(GltfNodeBase nodeBase, Matrix4x4 userTransform)

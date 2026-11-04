@@ -66,7 +66,7 @@ internal class Pond : Panel
     /// Top of the rim: the top of a bank piece standing on the grass, i.e. its height less the part that is buried. This is
     /// what the steps climb to, and the height <see cref="FloorHeightAtWorld"/> reports along the ring.
     /// </summary>
-    internal const float RimTop = RiverSegment.DikeHeight - RiverSegment.DikeSink;
+    internal const float RimTop = RiverSegment.DikeTop;
 
     /// <summary>
     /// Water surface above the grass: deep enough for refraction and depth-based absorption to read a real thickness, and

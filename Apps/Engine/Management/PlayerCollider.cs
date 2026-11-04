@@ -27,7 +27,9 @@ namespace Engine.Management;
 /// the player is lifted to that top surface and steps back down level by level when leaving.
 /// Walkable surfaces are climbed one riser at a time: a move whose target floor rises more than
 /// StepLimit above the feet is retracted, so raised slabs such as the pond rim are reached only
-/// through their steps, while stepping down is always allowed. The pond water area blocks entry the same way.
+/// through their steps or a jump, while stepping down is always allowed. The pond and river water areas block entry the
+/// same way; the river's bank pieces are walkable floors at the pond rim's height, so the two read as one continuous
+/// bank to the player.
 /// Consumed by Direction.MovePlayer and UpdateLongJump.
 /// </summary>
 internal sealed class PlayerCollider
@@ -51,8 +53,9 @@ internal sealed class PlayerCollider
     internal Tower Tower;
 
     /// <summary>
-    /// Registered river: its channel is a raised levee whose water surface blocks entry exactly like the pond's water.
-    /// Null means no river; the footprint test then behaves as if the island has no flowing water.
+    /// Registered river: its water blocks entry exactly like the pond's water, while its bank pieces are walkable floors
+    /// through <see cref="River.FloorHeightUnder"/>, so the player can jump onto the bank and walk along it but not into
+    /// the channel. Null means no river; the footprint test then behaves as if the island has no flowing water.
     /// </summary>
     internal River River;
 
@@ -295,11 +298,12 @@ internal sealed class PlayerCollider
     /// Floor height under the footprint: sample the center plus the four corners and take the maximum.
     /// As soon as the footprint touches a step or indoor floor, the player is lifted to that top surface,
     /// preventing feet from sinking into a higher step ahead. Stepping off lowers symmetrically level by level.
-    /// Without a registered Room, Pond, or Tower, the floor height is always zero.
+    /// The river's bank pieces enter through <see cref="River.FloorHeightUnder"/>, which samples the same five points
+    /// against each piece's footprint. Without a registered Room, Pond, Tower, or River, the floor height is always zero.
     /// </summary>
     internal float FloorHeightUnder(in Vector3 center, in Vector3 half)
     {
-        if (Room == null && Pond == null && Tower == null)
+        if (Room == null && Pond == null && Tower == null && River == null)
             return 0f;
 
         float h = FloorHeightAt(center.X, center.Z);
@@ -307,7 +311,7 @@ internal sealed class PlayerCollider
         h = MathF.Max(h, FloorHeightAt(center.X - half.X, center.Z + half.Z));
         h = MathF.Max(h, FloorHeightAt(center.X + half.X, center.Z - half.Z));
         h = MathF.Max(h, FloorHeightAt(center.X + half.X, center.Z + half.Z));
-        return h;
+        return River != null ? MathF.Max(h, River.FloorHeightUnder(center, half)) : h;
     }
 
     float FloorHeightAt(float x, float z)

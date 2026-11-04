@@ -4,6 +4,13 @@
 
 namespace Season.Platforms.Web;
 
+/// <summary>
+/// WebGPU rendering backend for GPU-instanced Mesh3D, and the A7 cull target of the mesh (the Web side has no primitive-group object to hang it on).
+///
+/// A7c note -- same decision as <see cref="WGPUInstancedModel"/>: the cull input stays a dedicated storage buffer uploaded every frame, because aliasing the
+/// IA instance buffer needs a usage flag that is fixed at creation time and lives in the JS interop layer rather than here. The two Web controls are kept on
+/// the same transport on purpose, so their culling cannot drift apart.
+/// </summary>
 internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
 {
     public string Name { get; }
@@ -63,7 +70,6 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     Season.Rendering.StorageBuffer? _cullSorted;
     Season.Rendering.StorageBuffer? _cullArgs;
     Season.Rendering.StorageBuffer? _cullVisible;
-    Season.Rendering.StorageBuffer? _cullPrimInfo;
     int _cullCapacity = -1;
     /// <summary>Number of parameter-table entries already uploaded to the GPU. A mismatch with <see cref="_cullPrimPendingCount"/> means this frame must re-upload.</summary>
     int _cullPrimitiveCount = -1;
@@ -72,6 +78,9 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     byte[]? _cullPrimPendingBytes;
     /// <summary>Entry count of the CPU-side parameter table; -1 means it has not been built yet.</summary>
     int _cullPrimPendingCount = -1;
+    /// <summary>A7b: the arg-buffer image composed from <see cref="_cullPrimPendingBytes"/>. It exists for the same reason as that table --
+    /// its content only changes with the primitive set -- and it is what replaced the per-frame reset dispatch.</summary>
+    byte[]? _cullArgsTemplateBytes;
     bool _cullRegistered;
     Vector3 _cullLocalCenter;
     Vector3 _cullLocalExtents;
@@ -154,9 +163,13 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
             // (anchor-pivot semantics, see InstancedMesh3DBase).
             // 2-3 contract clause 6: roll the shadow copy forward before overwriting the current-frame world matrix
             // (same ordering as host UpdateMesh3D; zero matrix sentinel on the first frame).
+            // 2-3 Step C: the shadow copy is addressed by the compacted slot, so it only means "this instance's previous frame"
+            // while the enabled order holds (see InstancedMesh3DBase.InstanceHistoryValid). Otherwise the slot is zeroed, which
+            // the shell shader reads as "no history" and replaces with the current world, exactly like the withdrawn prev bits.
             var instanceWorld = mesh.BuildInstanceMatrix(instance);
-            if (TransformInitialized)
-                ShellPrevWorlds[writeIndex] = InstanceWorlds[writeIndex];
+            ShellPrevWorlds[writeIndex] = TransformInitialized && mesh.InstanceHistoryValid
+                ? InstanceWorlds[writeIndex]
+                : default;
             InstanceWorlds[writeIndex] = instanceWorld;
 
             // Outline2D (per-instance active): record the writeIndex slot and per-instance outline color
@@ -238,6 +251,13 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
         }
 
         InstanceBytes = FillInstanceBytes(writeTarget, InstanceWorlds);
+
+        // 2-3 Step C: withdraw history when the enabled order changed. The streams are addressed by the compacted slot, so after
+        // a switch every later instance would read its predecessor's previous world (one frame of false motion); an empty prev
+        // stream is the "no history" signal the JS side already understands, and it restarts from the length check next frame.
+        if (!mesh.InstanceHistoryValid)
+            PrevInstanceBytes = Array.Empty<byte>();
+
         TransformInitialized = true;
         MeshAlpha = mesh.Alpha;
 
@@ -308,8 +328,6 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullStreamSource(int stream) => stream == 0 ? _cullSource : null;
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullStreamSorted(int stream) => stream == 0 ? _cullSorted : null;
-
-    Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullPrimitiveInfo => _cullPrimInfo;
 
     Season.Rendering.StorageBuffer? Season.Rendering.IInstanceCullTarget.CullArgs => _cullArgs;
 
@@ -434,10 +452,10 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
                 _cullSorted = g.CreateStorageBuffer(Season.Rendering.InstanceCull.SortedBytes(capacity),
                     Season.Rendering.StorageBufferUsage.ComputeAndVertexInput);
                 _cullVisible = g.CreateStorageBuffer((uint)(Season.Rendering.InstanceCull.MaxSlots * capacity) * 4u);
-                _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsBytes,
+                // A7b: ArgsTotalBytes, not ArgsBytes -- the per-slot visible-count accumulator shares this block, which is what removed the
+                // need for a per-frame reset dispatch without adding a second buffer or a second upload path on this backend.
+                _cullArgs = g.CreateStorageBuffer(Season.Rendering.InstanceCull.ArgsTotalBytes,
                     Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs);
-                _cullPrimInfo = g.CreateStorageBuffer(
-                    (uint)Season.Rendering.InstanceCull.MaxPrimitives * Season.Rendering.InstanceCull.PrimitiveInfoStride);
             }
             catch (Exception ex)
             {
@@ -445,7 +463,7 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
             }
 
             if (_cullSource == null || _cullSorted == null || _cullVisible == null
-                || _cullArgs == null || _cullPrimInfo == null)
+                || _cullArgs == null)
             {
                 ReleaseCullResources();
                 return;
@@ -474,7 +492,7 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     /// </summary>
     void EnsureCullPrimitiveInfo(Season.Controls.InstancedMesh3D mesh)
     {
-        if (_cullPrimInfo == null)
+        if (_cullArgs == null)
             return;
 
         int surfaces = mesh.Surfaces.Count;
@@ -524,6 +542,9 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
         _cullPrimPendingBytes = bytes;
         _cullPrimPendingCount = n;
         _cullPrimPendingMask = mask;
+        // A7b: the arg image is composed here too -- it is a pure function of this table plus the fixed slot layout, i.e. exactly the bytes
+        // the reset kernel used to write every frame, now built once when its input changes.
+        _cullArgsTemplateBytes = Season.Rendering.InstanceCull.BuildArgsTemplate(bytes, n);
     }
 
     /// <summary>
@@ -533,6 +554,7 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     void AbandonCullPrimitiveInfo()
     {
         _cullPrimPendingBytes = null;
+        _cullArgsTemplateBytes = null;
         _cullPrimPendingCount = 0;
         _cullPrimPendingMask = -1;
         _cullPrimitiveCount = 0;
@@ -556,11 +578,11 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
         // would be treated as a no-op because the count is unchanged, and indexCount would be misaligned from then on.
         if (_cullPrimPendingCount != _cullPrimitiveCount || _cullPrimPendingMask != _cullPrimMask)
         {
-            if (_cullPrimPendingCount <= 0 || _cullPrimPendingBytes == null || _cullPrimInfo == null)
+            if (_cullPrimPendingCount <= 0 || _cullArgsTemplateBytes == null || _cullArgs == null)
                 return false;
-            int primBytes = _cullPrimPendingCount * (int)Season.Rendering.InstanceCull.PrimitiveInfoStride;
-            if (!g.TryUpdateStorageBuffer(_cullPrimInfo,
-                    new ReadOnlySpan<byte>(_cullPrimPendingBytes, 0, primBytes)))
+            // A7b: the upload is the whole arg block, because the index ranges and the zeroed counts now travel together; the
+            // accumulator region the kernel adds into is part of that same image and starts at zero.
+            if (!g.TryUpdateStorageBuffer(_cullArgs, _cullArgsTemplateBytes))
                 return false;
             _cullPrimitiveCount = _cullPrimPendingCount;
             _cullPrimMask = _cullPrimPendingMask;
@@ -639,11 +661,11 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
         _cullSorted?.Dispose(); _cullSorted = null;
         _cullArgs?.Dispose(); _cullArgs = null;
         _cullVisible?.Dispose(); _cullVisible = null;
-        _cullPrimInfo?.Dispose(); _cullPrimInfo = null;
         _cullCapacity = -1;
         _cullPrimitiveCount = -1;
         _cullPrimMask = -1;
         _cullPrimPendingBytes = null;
+        _cullArgsTemplateBytes = null;
         _cullPrimPendingCount = -1;
         _cullPrimPendingMask = -1;
         _cullLocalCenter = Vector3.Zero;
