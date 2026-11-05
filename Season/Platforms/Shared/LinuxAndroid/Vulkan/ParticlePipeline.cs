@@ -22,8 +22,10 @@ namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 /// On the Vulkan side, "attachment shape" has one more dimension than in D3D12. D3D12 only needs to distinguish whether a velocity slot is present, whereas here the Scene Pass
 /// has three real shapes under Device.BeginPass: color + velocity + depth (three targets), color + depth (two targets or an RT with its own RP),
 /// and color only (the RT declares NoImplicitDepth, so its own RP is colorOnly). Enabling depth testing in the last case is illegal,
-/// so the shape must be inferred from the actual bindings rather than assumed. The sample count does not go into the key: all three RPs above hard-code Count1Bit,
-/// so any non-single-sampled target is rejected outright instead of baking a PSO that is guaranteed not to match.
+/// so the shape must be inferred from the actual bindings rather than assumed.
+/// The sample count is the fourth key dimension in the Msaa4x tier: the scene passes then render into the target's private
+/// 4x colour + 4x depth pair and resolve inside their own render pass, which is not render-pass compatible with any 1x anchor,
+/// so particles bake a separate 4x PSO and always take the color+depth shape (the multisampled pair always carries depth).
 /// </summary>
 internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleDrawPipeline
 {
@@ -37,8 +39,8 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
     /// <summary>The real attachment shape of the current Pass, which determines the PSO's attachment count and depth state.</summary>
     enum Attachments { ColorOnly, ColorDepth, ColorVelocityDepth, ColorVelocityNormalDepth }
 
-    /// <summary>PSO signature. The sample count is not part of it; see the class comment.</summary>
-    readonly record struct PipelineKey(Format Color, Attachments Shape);
+    /// <summary>PSO signature. Samples is 1 everywhere except the Msaa4x scene tier; see the class comment.</summary>
+    readonly record struct PipelineKey(Format Color, Attachments Shape, uint Samples);
 
     readonly Dictionary<PipelineKey, (VkPipeline Pipeline, RenderPass Anchor)> _pipelines = [];
     readonly List<DescriptorSet>[] _sets = new List<DescriptorSet>[(int)Device.frameCount];
@@ -100,9 +102,13 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
         // A PSO only needs to be "compatible" with the actual render pass, i.e. the attachment formats, sample counts, and subpass structure must match;
         // LoadOp/StoreOp/layout do not participate in the check. So an isomorphic anchor RP is synthesized here for baking, the same technique used by VKFogCompositePipeline
         // and the HDR anchor in Pipeline.Init, without borrowing the handle the Pass is currently using.
-        RenderPass anchor = velocity
-            ? VKRenderTarget.CreateVelocityRenderPassForFormat(key.Color, withNormal: normal)
-            : VKRenderTarget.CreateColorRenderPassForFormat(key.Color, colorOnly: !depth);
+        // The Msaa4x tier bakes against the multisampled scene shape (4x colour + 4x depth + the 1x resolve slot),
+        // which is the anchor the whole main PSO family uses there as well.
+        RenderPass anchor = key.Samples > 1
+            ? VKRenderTarget.CreateMsaaSceneRenderPassForFormat(key.Color, clearColor: true, clearDepth: true, key.Samples)
+            : velocity
+                ? VKRenderTarget.CreateVelocityRenderPassForFormat(key.Color, withNormal: normal)
+                : VKRenderTarget.CreateColorRenderPassForFormat(key.Color, colorOnly: !depth);
         ShaderModule vertex = default, fragment = default;
         VkPipeline pipeline = default;
         try
@@ -133,7 +139,7 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
                     // The billboard's winding order depends on the combination of the camera basis and index order, so disabling culling is more reliable than flipping signs in the shader.
                     CullMode = CullModeFlags.None, FrontFace = FrontFace.Clockwise, LineWidth = 1 };
                 var samples = new PipelineMultisampleStateCreateInfo { SType = StructureType.PipelineMultisampleStateCreateInfo,
-                    RasterizationSamples = SampleCountFlags.Count1Bit };
+                    RasterizationSamples = key.Samples > 1 ? (SampleCountFlags)key.Samples : SampleCountFlags.Count1Bit };
                 // Depth test on, depth write off: particles are not sorted against one another, and writing depth would only let later draws be occluded by earlier ones.
                 // Scene depth is forward (the main Pipeline uses Less/LessOrEqual), so LessOrEqual is used here.
                 var depthState = new PipelineDepthStencilStateCreateInfo { SType = StructureType.PipelineDepthStencilStateCreateInfo,
@@ -242,7 +248,9 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
             || Device.GraphicsCommandBuffer.Handle != _command.Handle
             || Device.FrameIndex != _frameIndex
             || Device.GetCurrentRetireFenceValue() != _stamp) return false;
-        // Vulkan's Scene Pass has no MSAA variant, so the identity check can be strict reference equality.
+        // Vulkan's scene pass has no MSAA variant at 1x, so the identity check can be strict reference equality;
+        // in the Msaa4x tier the bound colour view is the target's private multisample view, while ActiveColorTarget
+        // is still the RT the shared layer handed over, so the same equality holds there as well.
         if (!ReferenceEquals(Device.ActiveColorTarget, color)
             || color.ColorViewVersion != _colorViewVersion) return false;
         // null == use the depth the target ships with, which likewise requires that Prepare saw null, otherwise the depth semantics have already changed.
@@ -250,6 +258,10 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
 
         // The attachment shape can only be inferred from the actual bindings: a velocity slot means three targets (four if the normal slot is also present); otherwise an explicit depth target means two;
         // when neither is present the target's own RP is used, and whether it carries depth is decided by NoImplicitDepth.
+        // Msaa4x scene tier: the pass resolves inside its own multisampled render pass, which always carries a multisampled
+        // depth attachment even though no explicit depth RT is bound, so the shape is color+depth and the PSO bakes at 4x.
+        uint samples = Device.MsaaSampleCount > 1 && Device.IsMsaaScenePass(Device.ActivePassId)
+            ? Device.MsaaSampleCount : 1;
         var velocity = Device.ActiveVelocityTarget;
         var normalTarget = Device.ActiveNormalTarget;
         Attachments shape;
@@ -260,10 +272,11 @@ internal sealed unsafe class VKParticleDrawPipeline : Season.Rendering.ParticleD
             if (normalTarget != null && normalTarget.ColorFormat != Format.R16G16B16A16Sfloat) return false;
             shape = normalTarget != null ? Attachments.ColorVelocityNormalDepth : Attachments.ColorVelocityDepth;
         }
+        else if (samples > 1) shape = Attachments.ColorDepth;
         else if (Device.ActiveDepthTarget != null) shape = Attachments.ColorDepth;
         else shape = color.Desc.NoImplicitDepth ? Attachments.ColorOnly : Attachments.ColorDepth;
 
-        var pipeline = GetOrCreatePipeline(new PipelineKey(color.ColorFormat, shape));
+        var pipeline = GetOrCreatePipeline(new PipelineKey(color.ColorFormat, shape, samples));
         if (pipeline.Handle == 0) return false;
 
         var vk = Device.Vk;

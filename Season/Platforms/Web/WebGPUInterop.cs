@@ -69,6 +69,9 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.drawCollectedOpaque")]
     internal static partial void DrawCollectedOpaque();
 
+    [JSImport("globalThis.seasonWebGPU.discardCollectedOpaque")]
+    internal static partial void DiscardCollectedOpaque();
+
     [JSImport("globalThis.seasonWebGPU.drawCollectedTransparent")]
     internal static partial void DrawCollectedTransparent(bool sampleFog);
 

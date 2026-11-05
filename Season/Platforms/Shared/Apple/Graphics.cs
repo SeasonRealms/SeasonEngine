@@ -38,6 +38,8 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
 
     public void DrawCollectedOpaque() => _sceneCollection.DrawOpaque();
 
+    public void DiscardCollectedOpaque() => _sceneCollection.DiscardOpaque();
+
     public void DrawCollectedTransparent(bool sampleFog) => _sceneCollection.DrawTransparent(sampleFog);
 
     public void ReleaseSceneCollection() => _sceneCollection.Release();
@@ -297,9 +299,11 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
     /// <summary>
     /// Metal renders a secondary view through its own attachments plus its own ViewConstants buffer, and those
     /// targets come from the same MTLRenderTarget path the main view uses, so the PSO family stays pass compatible.
-    /// There is no MSAA tier to decline here, so the capability is unconditional.
+    /// The Msaa4x tier is the one exception: the scene passes draw into a single backend-private multisample pair,
+    /// so a second view's own color target cannot be attached at the same time. The tier is finalized during
+    /// initialization, which is why this is a per-session constant rather than a runtime decision.
     /// </summary>
-    public bool SecondaryViewSupported => true;
+    public bool SecondaryViewSupported => Metal.Device.MsaaSampleCount <= 1;
 
     /// <summary>
     /// Publishes an offscreen target as a sampleable texture: an <see cref="MTLTexture"/> that borrows the target's

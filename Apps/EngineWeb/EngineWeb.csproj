@@ -27,4 +27,20 @@
     </Content>
   </ItemGroup>
 
+  <!-- The single Web asset source is ..\Engine\Resources\Raw\Assets. EngineWasm projects that directory into its own
+       wwwroot through Content/TargetPath, but the copy only reaches the WASM build output: the static web asset
+       manifest records EngineWasm\wwwroot as the content root, and that directory does not exist in the source tree.
+       In Development the manifest handler therefore returns nothing for those entries and the client receives an empty
+       200 (the not-found re-execution) instead of the GLB. Mirror the source into this project's wwwroot before the
+       static file middleware serves it; the Content Remove above keeps the copies out of the manifest itself. -->
+  <ItemGroup>
+    <RawWebAsset Include="..\Engine\Resources\Raw\Assets\*.*" />
+  </ItemGroup>
+
+  <Target Name="SyncRawWebAssets" BeforeTargets="BeforeBuild"
+          Inputs="@(RawWebAsset)"
+          Outputs="@(RawWebAsset->'wwwroot\Assets\%(Filename)%(Extension)')">
+    <Copy SourceFiles="@(RawWebAsset)" DestinationFolder="wwwroot\Assets" SkipUnchangedFiles="true" />
+  </Target>
+
 </Project>

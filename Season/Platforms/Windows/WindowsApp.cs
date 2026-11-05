@@ -925,6 +925,24 @@ public static class WindowsApp
             RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] AO is mutually exclusive with Msaa4x (MSAA depth cannot be used as compute input), falling back to Off");
         }
+        // Decals and SSR both sample an explicit single-sampled SceneDepth, which the Msaa4x tier never creates
+        // (the multisampled depth is backend-private and cannot be sampled). They are dropped here rather than
+        // left to read an unwritten plane; water / waterfall splits need the same plane and exit inside the
+        // shared pass code once SceneDepth stays null.
+        if (!immediate2D
+            && RenderQuality.Current.Decals
+            && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
+        {
+            RenderQuality.Current.Decals = false;
+            DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] Decals require an explicit single-sampled SceneDepth, which Msaa4x does not create; falling back to false");
+        }
+        if (!immediate2D
+            && RenderQuality.Current.ScreenSpaceReflections != Season.Rendering.SsrMode.Off
+            && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
+        {
+            RenderQuality.Current.ScreenSpaceReflections = Season.Rendering.SsrMode.Off;
+            DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] SSR requires an explicit single-sampled SceneDepth, which Msaa4x does not create; falling back to Off");
+        }
         if (!immediate2D && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off)
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
@@ -941,9 +959,12 @@ public static class WindowsApp
         // velocity render pass demands three real attachments; D3D12 can run the MRT scene pass against
         // the backend default depth, which is why this platform was the one still leaving it null and
         // why the dilation input was missing on exactly the validated backend.
-        // SampleCount 1 is unconditionally correct here: MotionVectors and Msaa4x were already made
-        // mutually exclusive above, so this branch is never reached with a multisampled scene.
+        // SampleCount 1 is unconditionally correct here: MotionVectors, AO, Decals and SSR were all made
+        // mutually exclusive with Msaa4x above, so this branch is never reached with a multisampled scene.
+        // The tier is excluded explicitly as well: its scene passes attach a backend-private multisampled
+        // depth pair, so a 1x plane created here would never be written.
         if (!immediate2D && Season.Rendering.FrameSchedule.SceneDepth == null
+            && RenderQuality.Current.EffectiveAntiAliasing != Season.Rendering.AaMode.Msaa4x
             && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresAtmosphereSceneDepth(
                 DirectX.Device.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)
                 || RenderQuality.Current.RequiresDecalSceneDepth(DirectX.Device.HdrSceneColor, immediate2D)

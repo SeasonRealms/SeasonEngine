@@ -137,6 +137,13 @@ internal unsafe sealed class DXSceneDrawCollection
         _queue.DrawOpaque();
     }
 
+    internal void DiscardOpaque()
+    {
+        Validate();
+        if (Device.ActivePassId != RenderPassId.SceneOpaque) throw new InvalidOperationException("Invalid Pass for the opaque queue.");
+        _queue.DiscardOpaque();
+    }
+
     internal void DrawTransparent(bool sampleFog)
     {
         Validate();

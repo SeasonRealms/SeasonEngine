@@ -230,10 +230,6 @@ internal class App : BaseApp
 
     internal Logo logo;
 
-    Season.AI.Panels.AIButton aiButton;
-
-    internal Season.AI.Panels.AIPanel aiPanel;
-
     Skill skill;
 
     Painting painting;
@@ -293,6 +289,10 @@ internal class App : BaseApp
     internal App()
     {
         Title = "SeasonEngine";
+
+        // Contract 3-1: hand the island to the cost runner. Guarded so an ordinary launch does not even build the
+        // scenario table: without SEASON_PROFILE the runner is disabled and this is the entire cost of the feature.
+        if (CostProfile.Enabled) CostProfile.RegisterScene(new CostProfileScene());
 
         StorageService.DirectoryBase = "SeasonEngine";
 
@@ -1006,27 +1006,6 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         logo = new Logo();
         AddPanel(logo);
 
-        aiButton = new Season.AI.Panels.AIButton()
-        {
-            OnClick = () =>
-            {
-                if (aiPanel is null)
-                {
-                    aiPanel = new Season.AI.Panels.AIPanel()
-                    {
-                        OnClose = () =>
-                        {
-                            Season.AI.Panels.AIPanel.Instance = null;
-                            App.Instance.RemovePanel(aiPanel);
-                            aiPanel = null;
-                        }
-                    };
-                    App.Instance.AddPanel(aiPanel);
-                }
-            }
-        };
-        AddPanel(aiButton);
-
         skill = new Skill();
         AddPanel(skill);
 
@@ -1311,7 +1290,8 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     {
         // 逐像素 A/B 的取证钩子（见 AbCapture）：未启用时这两行分别是原样返回与一个静态布尔判断。
         // delta 必须在 base.Update 之前替换，否则 Time 已经按墙上时钟推进过一帧了。
-        time = AbCapture.FrameDelta(time);
+        // Contract 3-1 的固定步长走同一个开关位：成本表要求 t 是帧号的纯函数，两个钩子都关着时只是一次静态布尔判断。
+        time = FrameProfiler.FixedDelta(AbCapture.FrameDelta(time));
         AbCapture.Tick();
 
         base.Update(time, alpha: alpha, posX: posX, posY: posY, width: width, height: height);
@@ -1397,15 +1377,6 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
 
             return false;
         }
-
-        if (aiPanel != null)
-        {
-            aiPanel.Update(time, alpha: 0.8f, posX: 100, posY: 0, width: (int)App.Instance.ExtendResolution.X - 200, height: (int)App.Instance.ExtendResolution.Y);
-
-            return false;
-        }
-
-        aiButton?.Update(time);
 
         logo?.Update(time);
 
@@ -1665,6 +1636,10 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         fade?.Update(time);
 
         //debugPanel?.Update(time);
+
+        // Contract 3-1: last, so every panel and every camera rig above has already written this frame's pose and the
+        // measurement either overwrites it or leaves it alone. Disabled runs pay one static bool read.
+        CostProfile.Tick(this);
 
         return false;
     }

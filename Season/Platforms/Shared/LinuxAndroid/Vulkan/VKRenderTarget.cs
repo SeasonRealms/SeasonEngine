@@ -87,6 +87,38 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
 
     public Framebuffer Framebuffer { get; private set; }
 
+    // ── Msaa4x private multisample pair (2-1 clause 5, aligned with DX MsaaSceneRT and MTLMsaaTarget) ──
+    // The shared layer only ever sees the single-sampled ColorImage above. The multisampled colour and depth
+    // are backend-private attachments of the three scene pass ids, resolved into ColorView at the end of each
+    // multisampled pass through PResolveAttachments (VKRenderTarget.CreateMsaaSceneRenderPassForFormat), which
+    // is this backend's equivalent of DX ResolveSubresource / Metal MultisampleResolve / WebGPU resolveTarget.
+    // They are allocated lazily on the first multisampled scene pass, so only the target that actually hosts
+    // the scene (SceneColor, and each secondary view's own colour target) pays for them.
+    uint _msaaSampleCount;
+
+    Image _msaaColorImage;
+
+    DeviceMemory _msaaColorMemory;
+
+    Silk.NET.Vulkan.ImageView _msaaColorView;
+
+    Image _msaaDepthImage;
+
+    DeviceMemory _msaaDepthMemory;
+
+    Silk.NET.Vulkan.ImageView _msaaDepthView;
+
+    /// <summary>Multisampled render passes, one per load-op pair (clear for SceneOpaque/Scene, load for SceneTransparent).
+    /// They only depend on the attachment formats and the sample count, so like <see cref="RenderPass"/> they survive
+    /// Recreate and double as the PSO compatibility anchor.</summary>
+    RenderPass _msaaClearRenderPass;
+
+    RenderPass _msaaLoadRenderPass;
+
+    Framebuffer _msaaClearFramebuffer;
+
+    Framebuffer _msaaLoadFramebuffer;
+
     /// <summary>
     /// Sample descriptor set for the output plane (BlitPipeline.SetLayout), rewritten in place on Recreate.
     /// The color shape points to ColorView (FinalBlit / Post input);
@@ -249,6 +281,188 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
         if (Device.Vk.CreateRenderPass(Device.LogicalDevice, in rpInfo, null, out var rp) != Result.Success)
             throw new Exception("vkCreateRenderPass (offscreen) failed");
         return rp;
+    }
+
+    /// <summary>
+    /// Msaa4x scene RP: multisampled colour + multisampled depth + the single-sampled resolve target
+    /// (attachment 2, PResolveAttachments of slot 0). This is the Vulkan form of DX ResolveSubresource and
+    /// Metal's StoreAndMultisampleResolve: the whole resolve happens inside the pass, so there is no explicit
+    /// CmdResolveImage (which would need its own layout transitions and barriers) and no resolve pass.
+    ///
+    /// Load-op contract, matching the three scene pass ids:
+    /// - clear (SceneOpaque / unsegmented Scene): both the multisampled colour and depth start Undefined and Clear;
+    /// - load (SceneTransparent): both Load from the layouts the previous multisampled pass left behind, so the
+    ///   transparent stage draws on top of the opaque content of the same multisampled image.
+    /// loadOp/storeOp of a resolve attachment are ignored by the spec, so the resolve target never takes a clear
+    /// value; it leaves the image in ShaderReadOnlyOptimal, which lets FinalBlit / Post / AfterScene compute sample
+    /// the single-sampled SceneColor with zero explicit barriers, exactly like the 1x scene RP.
+    /// Render-pass compatibility: the two load-op variants differ only in load ops and initial layouts, which do not
+    /// participate in compatibility (same rule Display.RenderPass/RenderPassLoad already relies on), so one PSO family
+    /// serves both.
+    /// </summary>
+    internal static RenderPass CreateMsaaSceneRenderPassForFormat(Format colorFormat, bool clearColor, bool clearDepth,
+        uint samples)
+    {
+        var sampleFlags = (SampleCountFlags)samples;
+
+        var colorAttachment = new AttachmentDescription
+        {
+            Format = colorFormat,
+            Samples = sampleFlags,
+            LoadOp = clearColor ? AttachmentLoadOp.Clear : AttachmentLoadOp.Load,
+            StoreOp = AttachmentStoreOp.Store,
+            StencilLoadOp = AttachmentLoadOp.DontCare,
+            StencilStoreOp = AttachmentStoreOp.DontCare,
+            InitialLayout = clearColor ? ImageLayout.Undefined : ImageLayout.ColorAttachmentOptimal,
+            FinalLayout = ImageLayout.ColorAttachmentOptimal
+        };
+
+        var depthAttachment = new AttachmentDescription
+        {
+            Format = Device.DepthBufferFormat,
+            Samples = sampleFlags,
+            LoadOp = clearDepth ? AttachmentLoadOp.Clear : AttachmentLoadOp.Load,
+            StoreOp = AttachmentStoreOp.DontCare,
+            StencilLoadOp = AttachmentLoadOp.DontCare,
+            StencilStoreOp = AttachmentStoreOp.DontCare,
+            InitialLayout = clearDepth ? ImageLayout.Undefined : ImageLayout.DepthStencilAttachmentOptimal,
+            FinalLayout = ImageLayout.DepthStencilAttachmentOptimal
+        };
+
+        var resolveAttachment = new AttachmentDescription
+        {
+            Format = colorFormat,
+            Samples = SampleCountFlags.Count1Bit,
+            LoadOp = AttachmentLoadOp.DontCare,
+            StoreOp = AttachmentStoreOp.Store,
+            StencilLoadOp = AttachmentLoadOp.DontCare,
+            StencilStoreOp = AttachmentStoreOp.DontCare,
+            InitialLayout = clearColor ? ImageLayout.Undefined : ImageLayout.ShaderReadOnlyOptimal,
+            FinalLayout = ImageLayout.ShaderReadOnlyOptimal
+        };
+
+        var attachments = stackalloc AttachmentDescription[3] { colorAttachment, depthAttachment, resolveAttachment };
+
+        var colorRef = new AttachmentReference(0, ImageLayout.ColorAttachmentOptimal);
+        var resolveRef = new AttachmentReference(2, ImageLayout.ColorAttachmentOptimal);
+        var depthRef = new AttachmentReference(1, ImageLayout.DepthStencilAttachmentOptimal);
+
+        var subpass = new SubpassDescription
+        {
+            PipelineBindPoint = PipelineBindPoint.Graphics,
+            ColorAttachmentCount = 1,
+            PColorAttachments = &colorRef,
+            PResolveAttachments = &resolveRef,
+            PDepthStencilAttachment = &depthRef
+        };
+
+        var dependencies = stackalloc SubpassDependency[2];
+        Display.FillColorDependencies(dependencies);
+
+        var rpInfo = new RenderPassCreateInfo
+        {
+            SType = StructureType.RenderPassCreateInfo,
+            AttachmentCount = 3,
+            PAttachments = attachments,
+            SubpassCount = 1,
+            PSubpasses = &subpass,
+            DependencyCount = 2,
+            PDependencies = dependencies
+        };
+
+        if (Device.Vk.CreateRenderPass(Device.LogicalDevice, in rpInfo, null, out var rp) != Result.Success)
+            throw new Exception("vkCreateRenderPass (msaa scene) failed");
+        return rp;
+    }
+
+    /// <summary>
+    /// Lazily prepares the private multisample pair (only on the target that actually hosts the scene) and returns
+    /// the render pass plus framebuffer of the requested load-op shape.
+    /// Returns false when this target cannot host a multisampled scene (no colour plane, zero size) or when the
+    /// Msaa4x tier is off, so <see cref="Device.BeginPass"/> falls back to the single-sampled path.
+    /// The colour and depth attachments must clear together or load together; a mixed request is a contract
+    /// violation because one render pass is baked per pair (see CreateMsaaSceneRenderPassForFormat).
+    /// </summary>
+    internal bool EnsureMsaaScenePass(bool clearColor, bool clearDepth, out RenderPass renderPass, out Framebuffer framebuffer)
+    {
+        renderPass = default;
+        framebuffer = default;
+
+        uint samples = Device.MsaaSampleCount;
+        if (samples < 2 || !HasColor || Width == 0 || Height == 0) return false;
+        if (clearColor != clearDepth)
+            throw new InvalidOperationException("[VKRenderTarget] The MSAA scene pass must clear or load colour and depth together.");
+
+        if (_msaaSampleCount != samples || _msaaColorView.Handle == 0 || _msaaDepthView.Handle == 0)
+            CreateMsaaResources(samples);
+
+        if (clearColor)
+        {
+            if (_msaaClearRenderPass.Handle == 0)
+                _msaaClearRenderPass = CreateMsaaSceneRenderPassForFormat(_colorFormat, true, true, samples);
+            if (_msaaClearFramebuffer.Handle == 0) _msaaClearFramebuffer = CreateMsaaFramebuffer(_msaaClearRenderPass);
+            renderPass = _msaaClearRenderPass;
+            framebuffer = _msaaClearFramebuffer;
+        }
+        else
+        {
+            if (_msaaLoadRenderPass.Handle == 0)
+                _msaaLoadRenderPass = CreateMsaaSceneRenderPassForFormat(_colorFormat, false, false, samples);
+            if (_msaaLoadFramebuffer.Handle == 0) _msaaLoadFramebuffer = CreateMsaaFramebuffer(_msaaLoadRenderPass);
+            renderPass = _msaaLoadRenderPass;
+            framebuffer = _msaaLoadFramebuffer;
+        }
+        return true;
+    }
+
+    void CreateMsaaResources(uint samples)
+    {
+        ReleaseMsaaSizeDependentResources();
+        var sampleFlags = (SampleCountFlags)samples;
+
+        // Neither plane is ever sampled or copied: the multisampled colour exists only to be resolved, and the
+        // multisampled depth is read only by the depth test of the passes that write it.
+        (_msaaColorImage, _msaaColorMemory, _msaaColorView) = CreateImage(
+            Width, Height, _colorFormat, ImageUsageFlags.ColorAttachmentBit, ImageAspectFlags.ColorBit, sampleFlags);
+        (_msaaDepthImage, _msaaDepthMemory, _msaaDepthView) = CreateImage(
+            Width, Height, Device.DepthBufferFormat, ImageUsageFlags.DepthStencilAttachmentBit, ImageAspectFlags.DepthBit, sampleFlags);
+        _msaaSampleCount = samples;
+    }
+
+    Framebuffer CreateMsaaFramebuffer(RenderPass renderPass)
+    {
+        var attachments = stackalloc Silk.NET.Vulkan.ImageView[3] { _msaaColorView, _msaaDepthView, ColorView };
+        var fbInfo = new FramebufferCreateInfo
+        {
+            SType = StructureType.FramebufferCreateInfo,
+            RenderPass = renderPass,
+            AttachmentCount = 3,
+            PAttachments = attachments,
+            Width = Width,
+            Height = Height,
+            Layers = 1
+        };
+        if (Device.Vk.CreateFramebuffer(Device.LogicalDevice, in fbInfo, null, out var fb) != Result.Success)
+            throw new Exception("vkCreateFramebuffer (msaa scene) failed");
+        return fb;
+    }
+
+    /// <summary>Drops the size-dependent multisample resources; the render passes stay (format-only, like RenderPass).
+    /// Called from Recreate after DeviceWaitIdle, so the destruction is immediate.</summary>
+    void ReleaseMsaaSizeDependentResources()
+    {
+        var vk = Device.Vk;
+        var device = Device.LogicalDevice;
+
+        if (_msaaClearFramebuffer.Handle != 0) { vk.DestroyFramebuffer(device, _msaaClearFramebuffer, null); _msaaClearFramebuffer = default; }
+        if (_msaaLoadFramebuffer.Handle != 0) { vk.DestroyFramebuffer(device, _msaaLoadFramebuffer, null); _msaaLoadFramebuffer = default; }
+        if (_msaaColorView.Handle != 0) { vk.DestroyImageView(device, _msaaColorView, null); _msaaColorView = default; }
+        if (_msaaColorImage.Handle != 0) { vk.DestroyImage(device, _msaaColorImage, null); _msaaColorImage = default; }
+        if (_msaaColorMemory.Handle != 0) { vk.FreeMemory(device, _msaaColorMemory, null); _msaaColorMemory = default; }
+        if (_msaaDepthView.Handle != 0) { vk.DestroyImageView(device, _msaaDepthView, null); _msaaDepthView = default; }
+        if (_msaaDepthImage.Handle != 0) { vk.DestroyImage(device, _msaaDepthImage, null); _msaaDepthImage = default; }
+        if (_msaaDepthMemory.Handle != 0) { vk.FreeMemory(device, _msaaDepthMemory, null); _msaaDepthMemory = default; }
+        _msaaSampleCount = 0;
     }
 
     /// <summary>
@@ -835,7 +1049,7 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
         Framebuffer = fb;
     }
 
-    static (Image, DeviceMemory, Silk.NET.Vulkan.ImageView) CreateImage(uint width, uint height, Format format, ImageUsageFlags usage, ImageAspectFlags aspect)
+    static (Image, DeviceMemory, Silk.NET.Vulkan.ImageView) CreateImage(uint width, uint height, Format format, ImageUsageFlags usage, ImageAspectFlags aspect, SampleCountFlags samples = SampleCountFlags.Count1Bit)
     {
         var imgInfo = new ImageCreateInfo
         {
@@ -845,7 +1059,7 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
             Extent = new Extent3D(width, height, 1),
             MipLevels = 1,
             ArrayLayers = 1,
-            Samples = SampleCountFlags.Count1Bit,
+            Samples = samples,
             Tiling = ImageTiling.Optimal,
             Usage = usage,
             SharingMode = SharingMode.Exclusive,
@@ -884,6 +1098,10 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
         var vk = Device.Vk;
         var device = Device.LogicalDevice;
 
+        // The multisample pair tracks the same size, so it goes with the rest; it is re-allocated lazily by
+        // the next multisampled scene pass, exactly like on the first frame.
+        ReleaseMsaaSizeDependentResources();
+
         if (Framebuffer.Handle != 0) { vk.DestroyFramebuffer(device, Framebuffer, null); Framebuffer = default; }
         if (ColorView.Handle != 0) { vk.DestroyImageView(device, ColorView, null); ColorView = default; }
         if (ColorImage.Handle != 0) { vk.DestroyImage(device, ColorImage, null); ColorImage = default; }
@@ -913,6 +1131,16 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
         // and destroy the snapshots in the deferred action
         // (the object itself can be discarded right away)
         var fb = Framebuffer; Framebuffer = default;
+        var msaaClearFb = _msaaClearFramebuffer; _msaaClearFramebuffer = default;
+        var msaaLoadFb = _msaaLoadFramebuffer; _msaaLoadFramebuffer = default;
+        var msaaClearRp = _msaaClearRenderPass; _msaaClearRenderPass = default;
+        var msaaLoadRp = _msaaLoadRenderPass; _msaaLoadRenderPass = default;
+        var msaaColorView = _msaaColorView; _msaaColorView = default;
+        var msaaColorImage = _msaaColorImage; _msaaColorImage = default;
+        var msaaColorMemory = _msaaColorMemory; _msaaColorMemory = default;
+        var msaaDepthView = _msaaDepthView; _msaaDepthView = default;
+        var msaaDepthImage = _msaaDepthImage; _msaaDepthImage = default;
+        var msaaDepthMemory = _msaaDepthMemory; _msaaDepthMemory = default;
         var colorView = ColorView; ColorView = default;
         var colorImage = ColorImage; ColorImage = default;
         var colorMemory = _colorMemory; _colorMemory = default;
@@ -928,6 +1156,16 @@ internal unsafe sealed class VKRenderTarget : Season.Rendering.RenderTarget
             var device = Device.LogicalDevice;
             if (blitSet.Handle != 0) Device.DescriptorAllocator.FreeSet(blitSet);
             if (fb.Handle != 0) vk.DestroyFramebuffer(device, fb, null);
+            if (msaaClearFb.Handle != 0) vk.DestroyFramebuffer(device, msaaClearFb, null);
+            if (msaaLoadFb.Handle != 0) vk.DestroyFramebuffer(device, msaaLoadFb, null);
+            if (msaaClearRp.Handle != 0) vk.DestroyRenderPass(device, msaaClearRp, null);
+            if (msaaLoadRp.Handle != 0) vk.DestroyRenderPass(device, msaaLoadRp, null);
+            if (msaaColorView.Handle != 0) vk.DestroyImageView(device, msaaColorView, null);
+            if (msaaColorImage.Handle != 0) vk.DestroyImage(device, msaaColorImage, null);
+            if (msaaColorMemory.Handle != 0) vk.FreeMemory(device, msaaColorMemory, null);
+            if (msaaDepthView.Handle != 0) vk.DestroyImageView(device, msaaDepthView, null);
+            if (msaaDepthImage.Handle != 0) vk.DestroyImage(device, msaaDepthImage, null);
+            if (msaaDepthMemory.Handle != 0) vk.FreeMemory(device, msaaDepthMemory, null);
             if (colorView.Handle != 0) vk.DestroyImageView(device, colorView, null);
             if (colorImage.Handle != 0) vk.DestroyImage(device, colorImage, null);
             if (colorMemory.Handle != 0) vk.FreeMemory(device, colorMemory, null);

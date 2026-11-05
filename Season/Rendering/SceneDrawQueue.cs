@@ -192,9 +192,21 @@ public sealed class SceneDrawQueue<T> where T : struct, ISceneDrawCommand
 
     public void DrawOpaque()
     {
+        ConsumeOpaque();
+        for (int i = 0; i < _opaque.Count; i++) _opaque[i].Command.Draw();
+    }
+
+    /// <summary>
+    /// Consumes the opaque bucket without submitting a single draw. The cost-table scenarios that switch the geometry stage
+    /// off still collect (the transparent bucket and the pass structure must stay identical), so the queue has to hand out its
+    /// one opaque consumption without replaying; the transparent stage still follows it exactly once.
+    /// </summary>
+    public void DiscardOpaque() => ConsumeOpaque();
+
+    void ConsumeOpaque()
+    {
         if (!_sealed || _opaqueDrawn) throw new InvalidOperationException("The opaque queue is not sealed or has already been consumed.");
         _opaqueDrawn = true;
-        for (int i = 0; i < _opaque.Count; i++) _opaque[i].Command.Draw();
     }
 
     public void DrawTransparent()
@@ -245,6 +257,8 @@ public interface ISegmentedSceneGraphics
     void BeginSceneCollection();
     void SealSceneCollection();
     void DrawCollectedOpaque();
+    /// <summary>Consumes the collected opaque bucket without replaying it (the geometry-off measurement row). Must still be issued in the SceneOpaque pass and exactly once, before the transparent stage.</summary>
+    void DiscardCollectedOpaque();
     void DrawCollectedTransparent(bool sampleFog);
     void ReleaseSceneCollection();
 }

@@ -61,6 +61,14 @@ public struct RenderTargetDesc
 
     public RtFormat DepthFormat;
 
+    /// <summary>
+    /// Marks a fixed-size depth plane as this view's scene depth rather than a shadow-map-style depth plane.
+    /// The Web backend bakes every scene pipeline against depth24plus, so a plane that the SceneOpaque/SceneTransparent
+    /// pair shares must be created with that same format even though it is not resized with the backbuffer.
+    /// DX12/Vulkan/Metal already use one identical D32 plane for both cases, so they ignore this flag.
+    /// </summary>
+    public bool SceneDepth;
+
     /// <summary>The color target does not create the platform-compatible implicit depth; default false keeps the old attachment shape, and an explicit DepthFormat is unaffected.</summary>
     public bool NoImplicitDepth;
 
@@ -922,6 +930,23 @@ public static class FrameSchedule
 
     public static void Execute(IGraphics g, BaseApp app, in Vector4 clearColor)
     {
+        // Contract 3-1: the frame boundary. It sits outside every other try in this method on purpose - a frame that throws
+        // must still close its interval table, otherwise one exception leaves a half-open pairing behind and the next frame
+        // publishes numbers derived from it.
+        FrameProfiler.BeginFrame(g);
+
+        try
+        {
+            ExecuteFrame(g, app, clearColor);
+        }
+        finally
+        {
+            FrameProfiler.EndFrame();
+        }
+    }
+
+    static void ExecuteFrame(IGraphics g, BaseApp app, in Vector4 clearColor)
+    {
         BeginSceneFrame(app);
         FrameIndex++;
 
@@ -961,6 +986,8 @@ public static class FrameSchedule
         // background color. No offscreen target, effect, or compute phase exists to run here.
         if (Immediate2DMode.Enabled)
         {
+            FrameProfiler.BeginPass(RenderPassId.Overlay, ActiveTargets.Index);
+
             g.BeginPass(new PassDesc
             {
                 Id = RenderPassId.Overlay,
@@ -979,6 +1006,7 @@ public static class FrameSchedule
             finally
             {
                 g.EndPass();
+                FrameProfiler.EndPass();
             }
             return;
         }
@@ -1002,6 +1030,8 @@ public static class FrameSchedule
         // body - the pass clears the atlas on entry, so entering it at all destroys the very contents being reused.
         if (ShadowMap != null && RenderShadow != null && !shadowReuse)
         {
+            FrameProfiler.BeginPass(RenderPassId.Shadow, ActiveTargets.Index);
+
             g.BeginPass(new PassDesc
             {
                 Id = RenderPassId.Shadow,
@@ -1013,6 +1043,7 @@ public static class FrameSchedule
             RenderShadow(g);
 
             g.EndPass();
+            FrameProfiler.EndPass();
         }
 
         // Views. The main view always runs first and closes the frame for App-scope effects, exactly as in the
@@ -1036,6 +1067,8 @@ public static class FrameSchedule
         AfterViews?.Invoke(g);
 
         // Overlay: UI/debug drawn once, on top of whichever view presented to the backbuffer.
+        FrameProfiler.BeginPass(RenderPassId.Overlay, ActiveTargets.Index);
+
         g.BeginPass(new PassDesc
         {
             Id = RenderPassId.Overlay,
@@ -1053,6 +1086,7 @@ public static class FrameSchedule
         finally
         {
             g.EndPass();
+            FrameProfiler.EndPass();
         }
     }
 
@@ -1183,9 +1217,13 @@ public static class FrameSchedule
             else if (particleSubmit && SceneColor != null)
                 particles = PrepareParticles(g, SceneColor);
 
+            var scenePassId = split || deferredScene ? RenderPassId.SceneOpaque : RenderPassId.Scene;
+
+            FrameProfiler.BeginPass(scenePassId, ActiveTargets.Index);
+
             g.BeginPass(new PassDesc
             {
-                Id = split || deferredScene ? RenderPassId.SceneOpaque : RenderPassId.Scene,
+                Id = scenePassId,
                 ColorTarget = SceneColor,
                 DepthTarget = SceneDepth,
                 VelocityTarget = SceneVelocity,
@@ -1197,14 +1235,21 @@ public static class FrameSchedule
             });
             try
             {
-                if (split || deferredScene) segmented!.DrawCollectedOpaque();
+                // ViewFeature.Opaque off still collects (the transparent bucket and the pass structure must stay identical), so the
+                // collected opaque bucket is consumed without a replay here. Skipping that consumption outright breaks the queue
+                // contract on the first frame - the transparent queue is only allowed to follow an opaque consumption.
+                if (split || deferredScene)
+                {
+                    if (opaque) segmented!.DrawCollectedOpaque();
+                    else segmented!.DiscardCollectedOpaque();
+                }
                 else if (opaque)
                 {
                     app.DrawScene();
                     if (particles) SubmitParticles(g);
                 }
             }
-            finally { g.EndPass(); }
+            finally { g.EndPass(); FrameProfiler.EndPass(); }
 
             // D1: decals write SceneColor only, and the depth here is a sampling source rather than an attachment. They must be
             // ordered before the fog/rain-curtain composites, otherwise EffectiveSceneColor already points at the post-composite
@@ -1213,6 +1258,8 @@ public static class FrameSchedule
             // s9: SceneNormal is attached as the second color attachment only when roughness actually has to be rewritten (it therefore cannot be a sampling source at the same time).
             if (decalSplit && DecalRenderer!.Prepare(g, app.Decals, SceneColor, SceneDepth, SceneNormal))
             {
+                FrameProfiler.BeginPass(RenderPassId.SceneDecal, ActiveTargets.Index);
+
                 g.BeginPass(new PassDesc
                 {
                     Id = RenderPassId.SceneDecal,
@@ -1223,7 +1270,7 @@ public static class FrameSchedule
                     StoreDepth = true,
                 });
                 try { DecalRenderer!.Draw(g); }
-                finally { g.EndPass(); }
+                finally { g.EndPass(); FrameProfiler.EndPass(); }
             }
 
             // AfterOpaque: the fog pass integrates its volume here and the weather curtain prepares its frame data,
@@ -1237,6 +1284,8 @@ public static class FrameSchedule
             // the final image. Transparent primitives come later and are naturally never treated as a reflection source.
             if (ssrSplit && SsrOutputReady && PrepareSsrComposite!(g))
             {
+                FrameProfiler.BeginPass(RenderPassId.SsrComposite, ActiveTargets.Index);
+
                 g.BeginPass(new PassDesc
                 {
                     Id = RenderPassId.SsrComposite,
@@ -1246,7 +1295,7 @@ public static class FrameSchedule
                     StoreDepth = false,
                 });
                 try { RenderSsrComposite!(g); }
-                finally { g.EndPass(); }
+                finally { g.EndPass(); FrameProfiler.EndPass(); }
             }
 
             if (split)
@@ -1254,11 +1303,13 @@ public static class FrameSchedule
                 bool composited = false;
                 if (weatherSplit && WeatherOutputReady && (PrepareWeatherComposite?.Invoke(g) ?? false))
                 {
+                    FrameProfiler.BeginPass(RenderPassId.WeatherComposite, ActiveTargets.Index);
+
                     g.BeginPass(new PassDesc { Id = RenderPassId.WeatherComposite, ColorTarget = WeatherCompositeTarget,
                         ClearColorEnable = true, ClearDepthEnable = false, StoreDepth = false });
                     FogCompositeResult weatherResult;
                     try { weatherResult = RenderWeatherComposite!(g, EffectiveSceneColor!); }
-                    finally { g.EndPass(); }
+                    finally { g.EndPass(); FrameProfiler.EndPass(); }
                     if (weatherResult.Success)
                     {
                         PublishSceneComposite(WeatherCompositeTarget!, weatherResult.AoApplied);
@@ -1267,6 +1318,8 @@ public static class FrameSchedule
                 }
                 if (fogSplit && FogOutputReady && (PrepareFogComposite?.Invoke(g) ?? true))
                 {
+                    FrameProfiler.BeginPass(RenderPassId.FogComposite, ActiveTargets.Index);
+
                     g.BeginPass(new PassDesc
                     {
                         Id = RenderPassId.FogComposite,
@@ -1277,7 +1330,7 @@ public static class FrameSchedule
                     });
                     FogCompositeResult result;
                     try { result = RenderFogComposite!(g, EffectiveSceneColor!); }
-                    finally { g.EndPass(); }
+                    finally { g.EndPass(); FrameProfiler.EndPass(); }
                     if (result.Success)
                     {
                         PublishSceneComposite(FogCompositeTarget!, result.AoApplied);
@@ -1295,6 +1348,8 @@ public static class FrameSchedule
                     && g.CopyRenderTarget(waterColor, snapshot)
                     && WaterRenderer!.Prepare(g, app.Waters, waterColor, snapshot, SceneDepth, app.Time))
                 {
+                    FrameProfiler.BeginPass(RenderPassId.SceneWater, ActiveTargets.Index);
+
                     g.BeginPass(new PassDesc
                     {
                         Id = RenderPassId.SceneWater,
@@ -1304,7 +1359,7 @@ public static class FrameSchedule
                         StoreDepth = false,
                     });
                     try { WaterRenderer!.Draw(g); }
-                    finally { g.EndPass(); }
+                    finally { g.EndPass(); FrameProfiler.EndPass(); }
                 }
 
                 // P1 waterfall curtain: after the water surface, before transparent geometry. There is no snapshot to make, and
@@ -1313,6 +1368,8 @@ public static class FrameSchedule
                 if (waterfallSplit && EffectiveSceneColor is { } waterfallColor
                     && WaterfallRenderer!.Prepare(g, app.Waterfalls, waterfallColor, SceneDepth, app.Time))
                 {
+                    FrameProfiler.BeginPass(RenderPassId.SceneWaterfall, ActiveTargets.Index);
+
                     g.BeginPass(new PassDesc
                     {
                         Id = RenderPassId.SceneWaterfall,
@@ -1322,7 +1379,7 @@ public static class FrameSchedule
                         StoreDepth = false,
                     });
                     try { WaterfallRenderer!.Draw(g); }
-                    finally { g.EndPass(); }
+                    finally { g.EndPass(); FrameProfiler.EndPass(); }
                 }
 
                 // P1 river ribbon: after the curtain, before transparent geometry. Same pass id (the pipeline checks
@@ -1330,6 +1387,8 @@ public static class FrameSchedule
                 if (riverSplit && EffectiveSceneColor is { } riverColor
                     && RiverRenderer!.Prepare(g, app.Rivers, riverColor, SceneDepth, app.Time))
                 {
+                    FrameProfiler.BeginPass(RenderPassId.SceneWaterfall, ActiveTargets.Index);
+
                     g.BeginPass(new PassDesc
                     {
                         Id = RenderPassId.SceneWaterfall,
@@ -1339,7 +1398,7 @@ public static class FrameSchedule
                         StoreDepth = false,
                     });
                     try { RiverRenderer!.Draw(g); }
-                    finally { g.EndPass(); }
+                    finally { g.EndPass(); FrameProfiler.EndPass(); }
                 }
 
                 // Transparent geometry is the second half of the scene; a view that switched it off still gets the
@@ -1348,6 +1407,8 @@ public static class FrameSchedule
                 {
                     var transparentColor = EffectiveSceneColor;
                     particles = particleSubmit && PrepareParticles(g, transparentColor);
+                    FrameProfiler.BeginPass(RenderPassId.SceneTransparent, ActiveTargets.Index);
+
                     g.BeginPass(new PassDesc
                     {
                         Id = RenderPassId.SceneTransparent,
@@ -1364,7 +1425,7 @@ public static class FrameSchedule
                         segmented!.DrawCollectedTransparent(composited);
                         if (particles) SubmitParticles(g);
                     }
-                    finally { g.EndPass(); }
+                    finally { g.EndPass(); FrameProfiler.EndPass(); }
                 }
             }
             else if (deferredScene && transparent)
@@ -1373,6 +1434,8 @@ public static class FrameSchedule
                 // is still SceneColor; sampleFog is passed false - the view did not request Fog, and the backend uses this to keep the
                 // volumetric trio at zero gating rather than the previous frame's leftovers.
                 particles = particleSubmit && PrepareParticles(g, EffectiveSceneColor);
+                FrameProfiler.BeginPass(RenderPassId.SceneTransparent, ActiveTargets.Index);
+
                 g.BeginPass(new PassDesc
                 {
                     Id = RenderPassId.SceneTransparent,
@@ -1389,7 +1452,7 @@ public static class FrameSchedule
                     segmented!.DrawCollectedTransparent(false);
                     if (particles) SubmitParticles(g);
                 }
-                finally { g.EndPass(); }
+                finally { g.EndPass(); FrameProfiler.EndPass(); }
             }
         }
         finally
@@ -1418,6 +1481,8 @@ public static class FrameSchedule
         var blitSource = EffectiveSceneColor;
         if (blitSource != null && PostColor != null && RenderPost != null && (features & ViewFeature.Post) != 0)
         {
+            FrameProfiler.BeginPass(RenderPassId.Post, ActiveTargets.Index);
+
             g.BeginPass(new PassDesc
             {
                 Id = RenderPassId.Post,
@@ -1430,6 +1495,7 @@ public static class FrameSchedule
             RenderPost(g, blitSource);
 
             g.EndPass();
+            FrameProfiler.EndPass();
             blitSource = PostColor;
         }
 
@@ -1439,6 +1505,8 @@ public static class FrameSchedule
         var presentTarget = targets.Present ? null : targets.UiColor;
         if (blitSource != null && (targets.Present || presentTarget != null))
         {
+            FrameProfiler.BeginPass(RenderPassId.FinalBlit, ActiveTargets.Index);
+
             g.BeginPass(new PassDesc
             {
                 Id = RenderPassId.FinalBlit,
@@ -1451,6 +1519,7 @@ public static class FrameSchedule
             g.BlitToBackbuffer(blitSource);
 
             g.EndPass();
+            FrameProfiler.EndPass();
         }
     }
 
@@ -1471,7 +1540,12 @@ public static class FrameSchedule
             // per-view scratch targets) disappears instead of being dispatched and ignored.
             var required = effect.RequiredFeature;
             if (required != ViewFeature.None && (ActiveFeatures & required) == 0) continue;
+            // Contract 3-1: the second instrumentation family. Compute effects run outside every pass, so their intervals are siblings of
+            // the pass intervals rather than children and the frame's table stays one flat list. The name is the effect's own,
+            // which is what makes a CSV row readable without a decoder ring.
+            FrameProfiler.BeginCompute(effect.Name);
             effect.Record(g);
+            FrameProfiler.EndCompute();
         }
     }
 }

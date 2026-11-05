@@ -94,6 +94,15 @@ internal partial class Graphics : IGraphics, ISegmentedSceneGraphics
     internal static bool HdrSceneColor;
 
     /// <summary>
+    /// Sample count of the scene passes in the Msaa4x tier (1 = off), finalized by WebApp before
+    /// <see cref="InitializeAsync"/> because the JS main PSO family bakes it through
+    /// <c>multisample.count</c>, exactly like <c>Display.MsaaSampleCount</c> on D3D12/Vulkan and
+    /// <c>Device.MsaaSampleCount</c> on Metal. Render targets handed out to the shared layer stay
+    /// single-sampled: the multisampled pair is a JS-private attachment of the three scene pass ids.
+    /// </summary>
+    internal static uint MsaaSampleCount = 1;
+
+    /// <summary>
     /// Linearize the HDR-chain clear color: the display-space background color is approximated to linear
     /// space with <c>pow(2.2)</c>, which is the inverse of the <c>pow(1/2.2)</c> encoding in the FinalBlit
     /// tonemap variant. This keeps the background visually aligned with the LDR baseline. Alpha is unchanged.
@@ -741,7 +750,10 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             // helper; the JS side re-clamps only because a stale host mirror could otherwise pass an illegal value.
             RenderQuality.ClampAnisotropy(RenderQuality.Current.TextureMaxAnisotropy),
             RenderQuality.Current.RequiresAtmosphereSceneDepth(HdrSceneColor, true, Season.Rendering.Immediate2DMode.Enabled),
-            normalOutput);
+            normalOutput,
+            // 2-1 clause 5: the Msaa4x tier's sample count, baked into the main PSO family. The scene pass
+            // renders into a JS-private multisample pair and resolves into the single-sampled SceneColor.
+            (int)MsaaSampleCount);
         _initialized = true;
 
         // P2: 2D sprites / text draw in clip space, so their slot holds identity View/Projection and is uploaded
@@ -786,6 +798,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     }
 
     public void DrawCollectedOpaque() => WebGPUInterop.DrawCollectedOpaque();
+    public void DiscardCollectedOpaque() => WebGPUInterop.DiscardCollectedOpaque();
     public void DrawCollectedTransparent(bool sampleFog) => WebGPUInterop.DrawCollectedTransparent(sampleFog);
 
     public void ReleaseSceneCollection()
@@ -901,7 +914,9 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         // (D32Float shadow map, used both as attachment and sampled resource). formatKind is encoded for JS (0/1/2).
         // 2-2: depth-only + MatchBackbufferSize = SceneDepth → formatKind 3 (depth24plus, matching the depth
         // format already baked into the pipeline, which is required for dual-target Scene-pass rebinding).
-        // Fixed-size depth targets (shadow maps) still use 2.
+        // P3: a secondary view's SceneDepth is fixed-size but still shared by its SceneOpaque/SceneTransparent
+        // pair, so it also needs depth24plus → formatKind 7. Shadow-map-style depth planes (the only remaining
+        // fixed-size consumer) keep formatKind 2 (depth32float).
         // 2-3: Rg16Float color-only = SceneVelocity → formatKind 4
         // (JS creates no paired depth and no blit bind group; it is only used as MRT slot 1 and as a compute
         // sampling source, never as a standalone pass target or present source).
@@ -911,7 +926,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         else if (desc.ColorFormat == Season.Rendering.RtFormat.Rgba16Float && desc.DepthFormat == Season.Rendering.RtFormat.None)
             formatKind = desc.NoImplicitDepth ? 5 : 1;
         else if (desc.ColorFormat == Season.Rendering.RtFormat.None && desc.DepthFormat == Season.Rendering.RtFormat.D32Float)
-            formatKind = desc.MatchBackbufferSize ? 3 : 2;
+            formatKind = desc.SceneDepth ? 7 : desc.MatchBackbufferSize ? 3 : 2;
         else if (desc.ColorFormat == Season.Rendering.RtFormat.Rg16Float && desc.DepthFormat == Season.Rendering.RtFormat.None)
             formatKind = 4;
         else
@@ -941,8 +956,11 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     /// <summary>
     /// WebGPU already renders every pass into a named offscreen target and writes per-view constants into a slot of
     /// its own, so an additional view needs no tier restriction: the presentation target is simply samplable.
+    /// The Msaa4x tier is the one exception: the three scene passes attach a single backend-private multisample
+    /// pair, which cannot be shared with a second view's own colour target, so secondary views are refused there
+    /// exactly as on the other three backends.
     /// </summary>
-    public bool SecondaryViewSupported => _initialized;
+    public bool SecondaryViewSupported => _initialized && MsaaSampleCount <= 1;
 
     /// <summary>
     /// Publishes the presentation target into the JS texture dictionary, which is the dictionary every 2D draw path

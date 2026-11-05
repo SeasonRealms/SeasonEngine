@@ -13,12 +13,22 @@ internal class Logo : Panel
     /// <summary>Contract 1-9 readout: one small line under the logo, e.g. "FPS 60 / GPU 200M / CPU 500M".</summary>
     Texts statisticsText;
 
+    /// <summary>
+    /// Contract 3-1 readout: the second line, only present while <c>SEASON_PROFILE</c> is set. It carries the frame totals
+    /// plus the five most expensive passes or compute effects, so "did that change cost anything" is answered without
+    /// opening a CSV. Empty otherwise, and an empty Texts lays out nothing, so an ordinary run draws exactly what it did.
+    /// </summary>
+    Texts profileText;
+
     // Last numbers the line was built from. The statistics are sampled at most twice per second, so the string and the
     // relayout it triggers only happen when a published number actually moved.
     float statisticsFps;
     long statisticsGpuUsed;
     long statisticsCpu;
     bool statisticsGpuKnown;
+
+    /// <summary>Profiler statistics version the profile line was last built from; it advances once per recomputed window.</summary>
+    int profileVersion = -1;
 
     internal Logo()
     {
@@ -31,6 +41,14 @@ internal class Logo : Panel
         };
 
         AddControl(statisticsText);
+
+        profileText = new Texts()
+        {
+            Color = Season.Basic.Colors.DarkRed,
+            Scale = new Vector2(0.7f, 0.7f)
+        };
+
+        AddControl(profileText);
 
         sprite2D = new Sprite2D()
         {
@@ -134,6 +152,8 @@ internal class Logo : Panel
 
         result |= UpdateStatistics(time, size);
 
+        result |= UpdateProfile(time, size);
+
         return result;
     }
 
@@ -171,5 +191,34 @@ internal class Logo : Panel
         float width = statisticsText.Width ?? 0f;
 
         return statisticsText.Update(time, alpha: 0.75f, posX: App.Instance.ExtendResolution.X - size - width, posY: (float)(size * 2.5));
+    }
+
+    /// <summary>
+    /// Contract 3-1: the per-pass cost line, drawn directly under the frame-rate line while the profiler is running.
+    ///
+    /// It is rebuilt only when <see cref="FrameProfiler.Version"/> moves, which happens when the profiler recomputes its
+    /// rolling window (every 15th frame). Rebuilding a string per frame would put the HUD's own allocation into the very
+    /// allocation column it prints next to it.
+    ///
+    /// Right-aligned against the logo for the same reason as the line above it: one long pass name must grow leftwards
+    /// rather than run off the edge of the screen.
+    /// </summary>
+    bool UpdateProfile(float time, int size)
+    {
+        // Pixel-exact A/B measures the picture, and a line that changes every second is a line that differs between runs.
+        if (AbCapture.Enabled) return false;
+
+        if (FrameProfiler.Version != profileVersion)
+        {
+            profileVersion = FrameProfiler.Version;
+            profileText.Content = FrameProfiler.ToCompactString();
+        }
+
+        if (string.IsNullOrEmpty(profileText.Content)) return false;
+
+        float width = profileText.Width ?? 0f;
+
+        return profileText.Update(time, alpha: 0.75f, posX: App.Instance.ExtendResolution.X - size - width,
+            posY: (float)(size * 2.5) + (statisticsText.Height ?? 0f));
     }
 }

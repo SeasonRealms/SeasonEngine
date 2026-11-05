@@ -133,6 +133,7 @@ public sealed class SecondaryView : IDisposable
             targets.SceneDepth = created.CreateTarget("SceneDepth", new RenderTargetDesc
             {
                 DepthFormat = RtFormat.D32Float,
+                SceneDepth = true,
                 MatchBackbufferSize = false,
                 Width = (uint)width,
                 Height = (uint)height,

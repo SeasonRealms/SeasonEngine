@@ -303,9 +303,19 @@ public static VkPipeline TransparentBackFacePipelineState;
         // so the main PSO is never used to render the backbuffer.
         // The LDR tier keeps baking against the backbuffer render pass,
         // because BackbufferCompatible offscreen render passes stay compatible with it and PSOs remain reusable.
-        _renderPass = Device.HdrSceneColor
-            ? VKRenderTarget.CreateColorRenderPassForFormat(Device.SceneColorFormat)
-            : renderPass;
+        // Msaa4x tier (2-1 clause 5, aligned with DX Device and Metal Pipeline):
+        // the three scene pass ids render into the target's private 4x colour + 4x depth pair and resolve into the
+        // single-sampled SceneColor inside the same render pass. A render pass with a different sample count is not
+        // render-pass compatible, so the whole main PSO family is baked against that multisampled shape and
+        // RasterizationSamples follows it. The tier is locked during initialization, so there is only ever one family.
+        // This takes precedence over the HDR anchor below because Msaa4x is not an HDR-only tier.
+        bool msaaScene = Device.MsaaSampleCount > 1;
+        _renderPass = msaaScene
+            ? VKRenderTarget.CreateMsaaSceneRenderPassForFormat(Device.SceneColorFormat, clearColor: true, clearDepth: true,
+                Device.MsaaSampleCount)
+            : Device.HdrSceneColor
+                ? VKRenderTarget.CreateColorRenderPassForFormat(Device.SceneColorFormat)
+                : renderPass;
 
         // The Overlay bake anchor is always the backbuffer render pass:
         // the Overlay pass renders directly to the backbuffer, B8G8R8A8_SRGB.
@@ -2065,10 +2075,14 @@ vec4 ApplySceneFog(vec4 color, vec3 worldPos);
                 LineWidth = 1.0f
             };
 
+            // Msaa4x: only the main family renders into the multisampled scene pair (see Init). Shadow, velocity,
+            // OutlineMask and Overlay are all baked against single-sampled render passes and must stay at 1x, or
+            // vkCreateGraphicsPipelines would bake a PSO that can never be bound.
+            bool msaaScene = Device.MsaaSampleCount > 1 && !shadowPass && !velocity && !outlineMask && !overlay;
             var multisample = new PipelineMultisampleStateCreateInfo
             {
                 SType = StructureType.PipelineMultisampleStateCreateInfo,
-                RasterizationSamples = SampleCountFlags.Count1Bit,
+                RasterizationSamples = msaaScene ? (SampleCountFlags)Device.MsaaSampleCount : SampleCountFlags.Count1Bit,
                 SampleShadingEnable = false
             };
 

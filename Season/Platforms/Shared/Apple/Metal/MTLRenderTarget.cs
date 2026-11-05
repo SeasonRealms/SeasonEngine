@@ -61,6 +61,15 @@ internal sealed class MTLRenderTarget : Season.Rendering.RenderTarget
     /// <summary>Velocity RT shape for 2-3 in Rg16Float. It has no companion depth because it relies on the explicit Scene-pass depth.</summary>
     public bool IsVelocity => Desc.ColorFormat == Season.Rendering.RtFormat.Rg16Float;
 
+    /// <summary>Metal pixel format of the color plane, derived from Desc the same way EnsureSize derives it.
+    /// The Msaa4x pair is created with this format so its attachments are compatible with the pass.</summary>
+    public MTLPixelFormat ColorPixelFormat => Desc.ColorFormat switch
+    {
+        Season.Rendering.RtFormat.Rgba16Float => MTLPixelFormat.RGBA16Float,
+        Season.Rendering.RtFormat.Rg16Float => MTLPixelFormat.RG16Float,
+        _ => Device.BackBufferFormat,
+    };
+
     /// <summary>Rebuilds textures in place when size changes. The first call also creates them.</summary>
     public void EnsureSize(int width, int height)
     {
@@ -72,12 +81,7 @@ internal sealed class MTLRenderTarget : Season.Rendering.RenderTarget
         {
             if (!IsDepthOnly)
             {
-                var colorFormat = Desc.ColorFormat switch
-                {
-                    Season.Rendering.RtFormat.Rgba16Float => MTLPixelFormat.RGBA16Float,
-                    Season.Rendering.RtFormat.Rg16Float => MTLPixelFormat.RG16Float,
-                    _ => Device.BackBufferFormat,
-                };
+                var colorFormat = ColorPixelFormat;
                 using var colorDesc = MTLTextureDescriptor.CreateTexture2DDescriptor(
                     colorFormat, (nuint)width, (nuint)height, false);
                 colorDesc.Usage = MTLTextureUsage.RenderTarget | MTLTextureUsage.ShaderRead;

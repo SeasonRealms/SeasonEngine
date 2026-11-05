@@ -384,6 +384,67 @@ public interface IGraphics
     /// exposes. Never throws; an unavailable query returns <see cref="GraphicsMemoryInfo.Unknown"/>.
     /// </summary>
     GraphicsMemoryInfo QueryGraphicsMemory() => default;
+
+    // Contract 3-1 GPU frame timing.
+    // - The shared layer owns the instrumentation (see FrameProfiler); the backend owns only the two device facts it alone knows:
+    //   whether this device can write timestamps, and how to read the results back without stalling a frame.
+    // - Returning null - the default here - is the honest answer for a backend that has not integrated a timer yet.
+    //   The profiler then reports the CPU and allocation columns and prints "--" for every GPU number, which is a
+    //   measurement, not a fallback zero. A platform lifts this bit by implementing the interface, and nothing above it
+    //   changes: no runner, no CSV column, no HUD branch.
+    // - Called exactly once, on the render thread, the first time a profiled frame begins. The returned timer is owned by
+    //   the caller (FrameProfiler) and must be disposable, because building it allocates a query heap and readback ring.
+
+    /// <summary>
+    /// Creates this backend's GPU frame timer, or null when it has none. Called at most once per process, only while
+    /// profiling is enabled, so the cost of building a query heap is never paid by an ordinary run.
+    /// </summary>
+    IGpuFrameTimer? CreateGpuFrameTimer() => null;
+}
+
+/// <summary>
+/// Contract 3-1: the GPU half of frame profiling, implemented by a backend that can write timestamps into its command
+/// stream and read the results back later.
+///
+/// <para>The shape is deliberately narrow. The shared layer decides what is worth timing and what the numbers mean; the
+/// backend only answers "write a timestamp here", "record the readback", and "tell me which frames are done". That split
+/// is what lets the CSV columns, the runner and the HUD stay backend-agnostic across D3D12, Vulkan, Metal and WebGPU.</para>
+///
+/// <para>Threading: every member is called on the render thread, in submission order. No member may block: an
+/// implementation that waits for the GPU would make the profiler the cost it is trying to measure.</para>
+/// </summary>
+public interface IGpuFrameTimer : IDisposable
+{
+    /// <summary>False once the device is lost or a call has failed; the profiler then stops asking and keeps the CPU columns.</summary>
+    bool Available { get; }
+
+    /// <summary>Nanoseconds per timestamp tick, from the queue's own frequency. Multiply a tick delta by this for real time.</summary>
+    double NanosecondsPerTick { get; }
+
+    /// <summary>Marks this timer accepts per frame. <see cref="Season.Rendering.FrameProfiler.MaxIntervals"/> intervals need twice this budget.</summary>
+    int Capacity { get; }
+
+    /// <summary>Starts a new frame and resets the mark cursor. <paramref name="token"/> is echoed back by <see cref="TryTake"/>.</summary>
+    void BeginFrame(long token);
+
+    /// <summary>Writes one timestamp and returns its slot, or -1 when this frame has exhausted <see cref="Capacity"/>.</summary>
+    int Mark();
+
+    /// <summary>
+    /// Records the resolve-and-copy of this frame's marks. Called while the frame's command list is still open, after the
+    /// last mark. A frame that never reaches this call (it threw, or its Begin/End pair was unbalanced) is simply dropped.
+    /// </summary>
+    void EndFrame();
+
+    /// <summary>Called after the queue submitted the command lists, so the timer can signal its own fence.</summary>
+    void OnSubmitted();
+
+    /// <summary>
+    /// Non-blocking readback of one finished frame. Returns false when nothing is ready. <paramref name="ticks"/> stays valid
+    /// only until the next call, so the caller copies what it needs before asking again. A frame whose slot was still busy
+    /// is never returned: it is dropped and the caller publishes its GPU column as unknown.
+    /// </summary>
+    bool TryTake(out long token, out ReadOnlySpan<ulong> ticks);
 }
 
 /// <summary>

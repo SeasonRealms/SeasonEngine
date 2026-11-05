@@ -61,7 +61,10 @@ namespace Season.Platforms.Shared.Apple.Metal;
 ///    Then BeginPass and EndPass repeat for N passes, followed by AfterRender,
 ///    which performs a defensive EndEncoding fallback, CaptureApp blit, Present, and Commit.
 ///    One command buffer maps to one Commit, while multiple passes are represented only by multiple encoder segments.
-///    There is no offscreen MSAA path, and that does not affect the CaptureApp convention for MSAA-specific screenshots.
+///    The Msaa4x tier is an offscreen-only path, exactly like the HDR chain: the three scene pass ids
+///    (Scene / SceneOpaque / SceneTransparent) render into a backend-private multisample color+depth pair and the
+///    color attachment resolves into the single-sampled SceneColor, so the CaptureApp convention (read the 1x
+///    backbuffer) is unchanged.
 /// 7. Render-quality 1-4 HDR chain, with shared contracts documented in RenderQuality summary and Metal-specific details here:
 ///    1) HdrSceneColor is finalized by AppDelegate from RenderQuality tiers before Pipeline.Init, where PSOs are baked,
 ///       and must never change afterward.
@@ -158,6 +161,16 @@ internal static class Device
 
     /// <summary>HDR-chain exposure multiplier. This is the local read-only forwarding of shared RenderQuality.HdrExposure for step-B delivery, where 1.0 means neutral exposure.</summary>
     internal static float HdrExposure => RenderQuality.Current.HdrExposure;
+
+    /// <summary>Sample count of the scene passes in the Msaa4x tier (1 = off), finalized by AppDelegate before
+    /// Pipeline.Init because every main PSO bakes it through RasterSampleCount, exactly like Display.MsaaSampleCount
+    /// on D3D12 and VkDevice Display on Vulkan. Offscreen targets handed out to the shared layer stay single-sampled:
+    /// the multisampled attachments are backend-private.</summary>
+    internal static uint MsaaSampleCount = 1;
+
+    /// <summary>Backend-private multisample color+depth pair for the scene passes, created lazily and rebuilt when
+    /// the SceneColor target changes size or format.</summary>
+    internal static readonly MTLMsaaTarget MsaaSceneTarget = new();
 
     /// <summary>
     /// Linearizes the HDR-chain clear color by applying pow(2.2) to BackgroundColor in display space,
@@ -497,6 +510,11 @@ internal static class Device
         MTLRenderPassDescriptor rpd;
         double vpWidth, vpHeight;
         bool depthOnly = false;
+        // Non-null while this pass draws into the Msaa4x multisample pair and resolves into the offscreen color target.
+        MTLMsaaTarget? msaa = null;
+        // Resolve destination of that pair: the single-sampled colour plane of the target this pass was handed.
+        // Captured here because the pattern-matched target below is out of scope by the time load/store actions are set.
+        IMTLTexture? msaaResolve = null;
         // D1: decals only blend and do not clear, and no Clear is allowed regardless of how PassDesc is written —— what would be cleared is exactly the opaque result just drawn.
         // P2 water surface is the same: it blends onto the already-composited scene color, and clearing would wipe the entire background to a single color.
         // P0 SSR composite is the same: the reflection increment is added additively into SceneColor, and a single clear would wipe out the whole frame's scene.
@@ -519,17 +537,28 @@ internal static class Device
             // The LDR path passes through unchanged. See rule 7.4 in the class header.
             if (!depthOnly && rt.Desc.ColorFormat == Season.Rendering.RtFormat.Rgba16Float)
                 c = LinearizeClearColor(c);
+            // Msaa4x tier: the scene passes draw into the backend-private multisample pair and resolve into this
+            // target. It is offscreen-only (the init gate requires the offscreen SceneColor chain), single-target
+            // (velocity is mutually exclusive with Msaa4x) and depth-explicit-free (no SceneDepth exists).
+            if (MsaaSampleCount > 1 && !depthOnly && IsMsaaScenePass(desc.Id)
+                && desc.VelocityTarget == null && desc.DepthTarget == null)
+            {
+                msaa = MsaaSceneTarget;
+                msaa.EnsureSize(rt.Width, rt.Height, rt.ColorPixelFormat, Device.DepthBufferFormat, MsaaSampleCount);
+                msaaResolve = rt.ColorTexture;
+            }
+
             rpd = new MTLRenderPassDescriptor();
             if (!depthOnly)
-                rpd.ColorAttachments[0].Texture = rt.ColorTexture;
+                rpd.ColorAttachments[0].Texture = msaa?.ColorTexture ?? rt.ColorTexture;
             // Fog composite uses a separate depthless full-screen pipeline; the transparent stage then attaches the original scene depth.
             // For D1 decals and P2 water surface, depth is a sampling source rather than an attachment: the same resource cannot be both sampled and used as the depth attachment.
             // P0 SSR composite has no depth requirement, and the implicit depth carried by SceneColor must still be left for the transparent stage at this point, so it cannot be attached here.
-            rpd.DepthAttachment.Texture = desc.Id is Season.Rendering.RenderPassId.FogComposite
+            rpd.DepthAttachment.Texture = msaa?.DepthTexture ?? (desc.Id is Season.Rendering.RenderPassId.FogComposite
                 or Season.Rendering.RenderPassId.WeatherComposite or Season.Rendering.RenderPassId.SceneDecal
                 or Season.Rendering.RenderPassId.SceneWater or Season.Rendering.RenderPassId.SsrComposite
                 or Season.Rendering.RenderPassId.SceneWaterfall
-                ? null : explicitDepth?.DepthTexture ?? rt.DepthTexture;
+                ? null : explicitDepth?.DepthTexture ?? rt.DepthTexture);
             // When color is absent, rt itself is that depth map (Shadow), and it is indeed this Pass's depth attachment;
             // otherwise only an explicit depth RT counts, and when the RT's own implicit depth is used there is no RT to record.
             if (rpd.DepthAttachment.Texture != null)
@@ -566,6 +595,19 @@ internal static class Device
             rpd.ColorAttachments[0].LoadAction = desc.ClearColorEnable && !decalPass ? MTLLoadAction.Clear : MTLLoadAction.Load;
             rpd.ColorAttachments[0].StoreAction = MTLStoreAction.Store;
             rpd.ColorAttachments[0].ClearColor = new MTLClearColor(c.X, c.Y, c.Z, c.W);
+
+            // Msaa4x tier: the multisampled attachment is resolved into the single-sampled SceneColor at pass end
+            // (one resolve per scene pass, which is exactly the pass boundary). The resolve destination is the
+            // target this pass was handed, so the opaque resolve is what the transparent stage loads back in.
+            // The opaque root must keep the multisampled content as well, because SceneTransparent loads it;
+            // the two passes that can close the scene (Scene unsegmented and SceneTransparent) discard theirs.
+            if (msaa != null && msaaResolve != null)
+            {
+                rpd.ColorAttachments[0].StoreAction = desc.Id == Season.Rendering.RenderPassId.SceneOpaque
+                    ? MTLStoreAction.StoreAndMultisampleResolve
+                    : MTLStoreAction.MultisampleResolve;
+                rpd.ColorAttachments[0].ResolveTexture = msaaResolve;
+            }
 
             // 2-3 velocity attachment:
             // clearing to (0, 0) means zero velocity, and store makes it available to AfterScene and TAA.
@@ -744,6 +786,12 @@ internal static class Device
             ActiveNormalTexture = null;
         }
     }
+
+    /// <summary>The passes that render the 3D scene. All three ids draw the same scene and share the Msaa4x
+    /// multisample pair (the segmented route uses SceneOpaque then SceneTransparent, the unsegmented one Scene).</summary>
+    internal static bool IsMsaaScenePass(Season.Rendering.RenderPassId id)
+        => id is Season.Rendering.RenderPassId.Scene or Season.Rendering.RenderPassId.SceneOpaque
+            or Season.Rendering.RenderPassId.SceneTransparent;
 
     /// <summary>
     /// P2: copies one offscreen color target as-is into another target of the same shape, so water surface refraction can obtain a
@@ -955,6 +1003,7 @@ internal static class Device
 
         _captureStagingBuffer?.Dispose();
         _captureStagingBuffer = null;
+        MsaaSceneTarget.Dispose();
         TextureUploadBatch?.Dispose();
         GraphicsQueue?.Dispose();
 

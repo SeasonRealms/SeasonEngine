@@ -108,18 +108,21 @@ public static class WebApp
             // main pipeline inside JS initialize, earlier than on the other platforms.
             Graphics.HdrSceneColor = !immediate2D && UseOffscreenSceneColor && RenderQuality.Current.HdrSceneColor;
 
+            // WebGPU always supports compute; resolve the fog's single-sampled requirement before the sample
+            // count is baked into the main PSO family inside JS initialize, mirroring WindowsApp.
+            var fogAa = RenderQuality.Current.ResolveFogAntiAliasing(Graphics.HdrSceneColor, immediate2D);
+            if (fogAa != RenderQuality.Current.EffectiveAntiAliasing)
+            {
+                RenderQuality.Current.EffectiveAntiAliasing = fogAa;
+                DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] Volumetric fog requires a single-sampled scene; Msaa4x downgraded to {fogAa}");
+            }
+
             // 2-1 Contract Clause 5: finalize the AA tier at initialization time
             // (single-choice and mutually exclusive; fall back with a log when unsupported, with zero runtime branching).
-            // Msaa4x is a legacy D3D12 tier and becomes Fxaa here because this backend has no MSAA offscreen chain.
             // Fxaa depends on the HDR offscreen chain because the Post uber pass is the tonemap convergence point.
             // If that is unavailable, fall back to Off. Mirrors LinuxApp.
             // The whole tier normalization is skipped in immediate-2D mode: no AA path exists to
             // configure, and the values stay unused because no pass ever consults them.
-            if (!immediate2D && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
-            {
-                RenderQuality.Current.EffectiveAntiAliasing = Season.Rendering.AaMode.Fxaa;
-                DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] AaMode.Msaa4x is supported only on D3D12; falling back to Fxaa");
-            }
             if (!immediate2D && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Taa)
             {
                 // 2-3 Contract Clause 1: selecting Taa forces the velocity infrastructure to be enabled,
@@ -150,6 +153,26 @@ public static class WebApp
             // them forces velocity on before InitializeAsync bakes the VELOCITY_OUTPUT variant. Mirrors WindowsApp.
             if (!immediate2D && RenderQuality.Current.SceneNormals)
                 RenderQuality.Current.MotionVectors = true;
+
+            // 2-3 Contract Clauses 1/8: MotionVectors is finalized here, before InitializeAsync, because the
+            // WGSL VELOCITY_OUTPUT variant and the velocity target table are both derived from it.
+            // It is mutually exclusive with Msaa4x because every MRT attachment of a pass must use the same
+            // sample count, and a multisampled colour cannot be paired with a single-sampled velocity slot.
+            if (!immediate2D
+                && RenderQuality.Current.MotionVectors
+                && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
+            {
+                RenderQuality.Current.MotionVectors = false;
+                DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] MotionVectors is mutually exclusive with Msaa4x (all MRT attachments must use the same sample count), falling back to false"
+                    + (RenderQuality.Current.SceneNormals ? "; SceneNormals goes with it" : ""));
+            }
+
+            // 2-1 clause 5: the Msaa4x tier's sample count is fixed here, before InitializeAsync bakes it into
+            // the JS main PSO family and the scene-pass multisample pair. The offscreen chain is a hard
+            // requirement: a multisampled scene resolves into SceneColor and never renders straight to the
+            // swap-chain texture.
+            Graphics.MsaaSampleCount = !immediate2D && UseOffscreenSceneColor
+                && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x ? 4u : 1u;
 
             _graphics = new Graphics(_jsRuntime, canvasId, httpClient, _assetBasePath);
             
@@ -238,6 +261,24 @@ public static class WebApp
                 RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
                 DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] AO is incompatible with Msaa4x (MSAA depth cannot be used as compute input); falling back to Off");
             }
+            // Decals and SSR both sample an explicit single-sampled SceneDepth, which the Msaa4x tier never
+            // creates (the multisampled depth is backend-private and cannot be sampled). They are dropped here
+            // rather than left to silently read an unwritten plane. Water / waterfall splits need the same
+            // plane, so they exit inside the shared pass code once SceneDepth stays null.
+            if (!immediate2D
+                && RenderQuality.Current.Decals
+                && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
+            {
+                RenderQuality.Current.Decals = false;
+                DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] Decals require an explicit single-sampled SceneDepth, which Msaa4x does not create; falling back to false");
+            }
+            if (!immediate2D
+                && RenderQuality.Current.ScreenSpaceReflections != Season.Rendering.SsrMode.Off
+                && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
+            {
+                RenderQuality.Current.ScreenSpaceReflections = Season.Rendering.SsrMode.Off;
+                DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] SSR requires an explicit single-sampled SceneDepth, which Msaa4x does not create; falling back to Off");
+            }
             if (!immediate2D && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off)
             {
                 Season.Rendering.FrameSchedule.SceneDepth = _graphics.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
@@ -281,10 +322,12 @@ public static class WebApp
 
             // Supplement to contract 2-3 clause 2: the velocity path also needs SceneDepth to be explicit,
             // so TAA can read the current frame's depth and dilate velocity towards the closest neighbour
-            // (clause 10). Mirrors WindowsApp/LinuxApp/AndroidApp/AppDelegate. SampleCount 1 needs no guard
-            // here for a different reason than on D3D12: this backend has no MSAA offscreen chain at all and
-            // rewrote Msaa4x to Fxaa during tier finalization, so a multisampled scene is unreachable.
+            // (clause 10). Mirrors WindowsApp/LinuxApp/AndroidApp/AppDelegate. The Msaa4x tier is excluded
+            // because its three scene passes render into a backend-private multisampled depth pair: a 1x plane
+            // created here would never be written, and every consumer that requires one has already been
+            // dropped above (AO / Decals / SSR / MotionVectors / volumetric fog).
             if (!immediate2D && Season.Rendering.FrameSchedule.SceneDepth == null
+                && RenderQuality.Current.EffectiveAntiAliasing != Season.Rendering.AaMode.Msaa4x
                 && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresAtmosphereSceneDepth(
                     Graphics.HdrSceneColor, _graphics.ComputeSupported, immediate2D)
                     || RenderQuality.Current.RequiresDecalSceneDepth(Graphics.HdrSceneColor, immediate2D)

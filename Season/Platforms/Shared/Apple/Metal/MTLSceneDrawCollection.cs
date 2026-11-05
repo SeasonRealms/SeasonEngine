@@ -215,6 +215,15 @@ internal sealed class MTLSceneDrawCollection
         _queue.DrawOpaque();
     }
 
+    internal void DiscardOpaque()
+    {
+        if (Device.ActivePassId != RenderPassId.SceneOpaque)
+            throw new InvalidOperationException("The opaque queue's Pass is invalid.");
+        // The geometry-off row must leave the same cross-Pass state behind as the real opaque stage.
+        Pipeline.SceneFogParams = default;
+        _queue.DiscardOpaque();
+    }
+
     internal void DrawTransparent(bool sampleFog)
     {
         if (Device.ActivePassId != RenderPassId.SceneTransparent)

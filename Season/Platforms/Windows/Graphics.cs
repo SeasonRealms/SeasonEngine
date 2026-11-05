@@ -13,6 +13,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public void BeginSceneCollection() => _sceneCollection.Begin();
     public void SealSceneCollection() => _sceneCollection.Seal();
     public void DrawCollectedOpaque() => _sceneCollection.DrawOpaque();
+    public void DiscardCollectedOpaque() => _sceneCollection.DiscardOpaque();
     public void DrawCollectedTransparent(bool sampleFog) => _sceneCollection.DrawTransparent(sampleFog);
     public void ReleaseSceneCollection() => _sceneCollection.Release();
 
@@ -3321,4 +3322,30 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         => DirectX.Device.TryQueryVideoMemory(out long used, out long total)
             ? new GraphicsMemoryInfo(used, total)
             : GraphicsMemoryInfo.Unknown;
+
+    /// <summary>
+    /// Contract 3-1: D3D12 writes timestamps straight into the frame's command list, which is why this is the first backend
+    /// to lift the capability bit. Building the timer allocates a query heap and four readback buffers, so it happens only
+    /// when the profiler asks - an ordinary run never touches this method.
+    /// </summary>
+    public IGpuFrameTimer? CreateGpuFrameTimer()
+    {
+        var device = DirectX.Device.D3dDevice;
+        var queue = DirectX.Device.CommandQueue;
+
+        if (device == null || queue == null) return null;
+
+        try
+        {
+            return new DirectX.DXGpuFrameTimer(device, queue);
+        }
+        catch (Exception exception)
+        {
+            // Losing the GPU column must not lose the frame: the profiler keeps the CPU and allocation columns and
+            // prints "--" for everything GPU, exactly as it does on a backend without support.
+            Debug.WriteLine($"[FrameProfiler] GPU timestamps unavailable: {exception.Message}");
+
+            return null;
+        }
+    }
 }

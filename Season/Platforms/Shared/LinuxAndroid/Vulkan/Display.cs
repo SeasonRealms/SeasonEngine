@@ -11,8 +11,9 @@ namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 /// <summary>
 /// Vulkan display object aligned with DX12 Display:
 /// owns the depth image and view, render pass, framebuffer array, and viewport and scissor.
-/// The current implementation uses 1x MSAA with no MSAA resolve path,
-/// so it does not yet match the DX default of 4x and can be extended later if needed.
+/// The backbuffer and this display depth stay single-sampled in every tier: the Msaa4x multisample pair is private
+/// to the offscreen scene target and is resolved into the single-sampled SceneColor inside its own render pass
+/// (VKRenderTarget.EnsureMsaaScenePass), so no swapchain image is ever multisampled and no explicit resolve exists here.
 /// The viewport uses negative height to implement Y flip on Vulkan 1.1 and later,
 /// keeping NDC consistent with the DX left-handed convention.
 ///
@@ -40,6 +41,8 @@ internal unsafe sealed class Display : IDisposable
 
     public Format DepthBufferFormat { get; }
 
+    /// <summary>Sample count of the swapchain pass. Always 1: the Msaa4x pair lives on the offscreen scene target
+    /// (<see cref="VKRenderTarget.EnsureMsaaScenePass"/>) and resolves into the single-sampled SceneColor there.</summary>
     public uint MsaaSampleCount => 1;
 
     public Image DepthImage { get; private set; }

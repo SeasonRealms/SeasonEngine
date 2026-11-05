@@ -629,7 +629,31 @@ internal unsafe static class Device
             DeviceServices.BaseApp?.AddLog(LogType.Backend, "Vulkan independentBlend unavailable; velocity/TAA disabled.");
         }
 
+        // Msaa4x capability probe: both planes of the private multisample pair must accept the sample count, and
+        // the tier is still changeable here because the scene targets, the render passes and the main PSO family
+        // are all created after Init. Falling back now is the only alternative to a hard vkCreateImage/vkCreateRenderPass
+        // failure (or a device loss on a tiler) at the first scene pass.
+        if (MsaaSampleCount > 1
+            && (!SupportsSampleCount(picked, SceneColorFormat, ImageUsageFlags.ColorAttachmentBit, MsaaSampleCount)
+                || !SupportsSampleCount(picked, DepthBufferFormat, ImageUsageFlags.DepthStencilAttachmentBit, MsaaSampleCount)))
+        {
+            uint requested = MsaaSampleCount;
+            MsaaSampleCount = 1;
+            if (RenderQuality.Current.EffectiveAntiAliasing == AaMode.Msaa4x)
+                RenderQuality.Current.EffectiveAntiAliasing = HdrSceneColor ? AaMode.Fxaa : AaMode.Off;
+            DeviceServices.BaseApp?.AddLog(LogType.Backend,
+                $"Vulkan {requested}x MSAA is not supported by the scene formats; the Msaa4x tier falls back to {RenderQuality.Current.EffectiveAntiAliasing}.");
+        }
+
         FindQueueFamilies(picked);
+    }
+
+    /// <summary>Whether the device accepts a 2D optimal-tiling image of the given format, usage and sample count.</summary>
+    static bool SupportsSampleCount(PhysicalDevice device, Format format, ImageUsageFlags usage, uint samples)
+    {
+        var result = Vk.GetPhysicalDeviceImageFormatProperties(device, format, ImageType.Type2D,
+            ImageTiling.Optimal, usage, ImageCreateFlags.None, out var props);
+        return result == Result.Success && (props.SampleCounts & (SampleCountFlags)samples) != 0;
     }
 
     /// <summary>
@@ -1033,6 +1057,21 @@ internal unsafe static class Device
 
     /// <summary>A0.2: the normal RT actually bound as color attachment 2 in this pass; it can only be non-null when velocity is also an attachment. Side pipelines use it to bake the four-attachment PSO.</summary>
     internal static VKRenderTarget? ActiveNormalTarget;
+
+    /// <summary>
+    /// Sample count of the Msaa4x tier's backend-private multisample pair (1 = tier off), finalized by
+    /// LinuxApp/AndroidApp before <see cref="Init"/> because the main PSO family and the scene render pass both bake
+    /// it, exactly like Display.MsaaSampleCount on D3D12 and Device.MsaaSampleCount on Metal.
+    /// The backbuffer and every target the shared layer can see stay single-sampled: only the three scene pass ids
+    /// render into the multisampled pair and resolve into the shared SceneColor at the end of each pass.
+    /// </summary>
+    internal static uint MsaaSampleCount = 1;
+
+    /// <summary>The scene pass ids that the Msaa4x tier renders into the backend-private multisample pair,
+    /// mirroring DX Device.IsMsaaScenePass and Metal Device.IsMsaaScenePass.</summary>
+    internal static bool IsMsaaScenePass(Season.Rendering.RenderPassId id)
+        => id is Season.Rendering.RenderPassId.Scene or Season.Rendering.RenderPassId.SceneOpaque
+            or Season.Rendering.RenderPassId.SceneTransparent;
 
     // Pending texture layout transitions.
     // When requested inside a render pass they are queued here and drained outside passes during the next frame.
@@ -1573,7 +1612,7 @@ internal unsafe static class Device
         if (hasDepth && desc.DepthFormat != Season.Rendering.RtFormat.D32Float)
             throw new NotSupportedException($"[CreateRenderTarget] Only D32Float is supported as the depth format, got {desc.DepthFormat}.");
         if (desc.SampleCount > 1)
-            throw new NotSupportedException("VK offscreen RT does not support MSAA yet, and Display is currently also 1x.");
+            throw new NotSupportedException("VK offscreen RT does not support MSAA. The Msaa4x tier keeps its multisampled pair private to the scene target (see VKRenderTarget.EnsureMsaaScenePass); every target the shared layer sees is single-sampled.");
 
         uint width = desc.MatchBackbufferSize ? (uint)_backbufferWidth : desc.Width;
         uint height = desc.MatchBackbufferSize ? (uint)_backbufferHeight : desc.Height;
@@ -1680,6 +1719,15 @@ internal unsafe static class Device
         ActivePassId = desc.Id;
         PushDebugGroup(_passLabels[(int)desc.Id]);
 
+        // Msaa4x invariant: the multisampled pair is backend-private, so a scene pass can never carry an explicit
+        // depth / velocity / normal attachment (those are all single-sampled shared targets). Initialization enforces
+        // this by dropping every feature that would create one; failing loudly here is better than silently baking
+        // an incompatible render pass for the Msaa4x PSO family.
+        if (MsaaSampleCount > 1 && IsMsaaScenePass(desc.Id)
+            && (desc.DepthTarget != null || desc.VelocityTarget != null || desc.NormalTarget != null))
+            throw new InvalidOperationException(
+                $"[BeginPass] Msaa4x cannot attach an explicit depth/velocity/normal target to {desc.Id}; initialization must have dropped MotionVectors, AO, Decals, SSR and volumetric fog.");
+
         // Target resolution:
         // the triple-target path, SceneColor plus SceneVelocity plus explicit SceneDepth for 2-3, uses its dedicated render pass and framebuffer.
         // the dual-target path, SceneColor plus explicit SceneDepth for 2-2, uses its dedicated render pass and framebuffer.
@@ -1768,6 +1816,25 @@ internal unsafe static class Device
             (renderPass, framebuffer) = EnsureSsrCompositePass(ssrColor);
             extent = new Extent2D(ssrColor.Width, ssrColor.Height);
             attachmentCount = 1u;
+        }
+        else if (MsaaSampleCount > 1 && IsMsaaScenePass(desc.Id)
+            && desc.ColorTarget is VKRenderTarget msaaColor
+            && desc.DepthTarget == null && desc.VelocityTarget == null && desc.NormalTarget == null)
+        {
+            // Msaa4x scene tier: Scene / SceneOpaque / SceneTransparent render into the target's private
+            // multisampled colour + depth pair and resolve into its single-sampled colour at the end of the pass.
+            // Initialization makes the shape unambiguous by construction: MotionVectors (and the normals that
+            // ride on it), AO, Decals, SSR and volumetric fog are all mutually exclusive with Msaa4x, so the
+            // explicit depth / velocity / normal slots are always absent, and SceneDepth is never created.
+            // The clear/load split mirrors the 1x path: the opaque stage (or the unsegmented Scene pass) starts
+            // a new multisampled image, the transparent stage loads what it left behind in the same image.
+            if (!msaaColor.EnsureMsaaScenePass(desc.ClearColorEnable, desc.ClearDepthEnable, out renderPass, out framebuffer))
+                throw new InvalidOperationException(
+                    $"[BeginPass] Msaa4x is active but the scene target cannot host a multisampled pass (hasColor={msaaColor.HasColor}, {msaaColor.Width}x{msaaColor.Height}).");
+            extent = new Extent2D(msaaColor.Width, msaaColor.Height);
+            // Only the multisampled colour and depth take clear values; the resolve slot is written by the resolve
+            // itself and its load/store ops are ignored, so the clear-value count stays at two.
+            attachmentCount = 2u;
         }
         else if (desc.ColorTarget is VKRenderTarget colorRT && desc.DepthTarget is VKRenderTarget depthRT)
         {

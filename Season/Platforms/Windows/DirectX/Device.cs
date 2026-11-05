@@ -1735,6 +1735,14 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     // RebuildRenderTargetWrappers.
     internal static DXRenderTarget[] BackbufferRTs = null!;
     internal static DXRenderTarget? MsaaSceneRT;
+
+    /// <summary>True while <see cref="MsaaSceneRT"/> holds scene content that has not been resolved yet.
+    /// The scene is drawn in up to two consecutive passes (SceneOpaque then SceneTransparent, or the single
+    /// unsegmented Scene pass) and both write the same multisampled target; resolving once, immediately before
+    /// the first pass that reads the single-sampled color, avoids a second full-screen resolve per frame and
+    /// keeps the transparent stage loading what the opaque stage wrote.</summary>
+    static bool _msaaScenePending;
+
     static DXRenderTarget? _activePass;
     internal static DXRenderTarget? ActiveTarget => _activePass;
     internal static DXRenderTarget? ActiveDepthTarget { get; private set; }
@@ -2153,6 +2161,10 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         // Reset the command list and allocator through the FrameContext
         CurrentFrame.Reset(Pipeline.OpaquePipelineState);
 
+        // Every frame opens with nothing owed to the MSAA path: AfterRender flushed the previous frame's
+        // resolve before closing the list, so a stale flag here would only describe a frame that threw.
+        _msaaScenePending = false;
+
         // Bind descriptor heaps once per frame; the binding remains valid across
         // passes
         ID3D12DescriptorHeap*[] heaps = [SrvHeapManager.Heap];
@@ -2169,8 +2181,9 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     /// Otherwise, desc.ColorTarget == null means backbuffer and non-null means an
     /// offscreen RT. The Scene pass also supports dual explicit targets
     /// (2-2: ColorTarget + private SceneDepth instead of the global DSV).
-    /// MSAA applies only to the Scene pass (render into the MSAA target, then
-    /// resolve to ColorTarget/backbuffer in EndPass).
+    /// MSAA applies to the three scene pass ids (Scene / SceneOpaque / SceneTransparent): they render into
+    /// the multisampled target, and the single-sampled color is resolved once, outside a pass, immediately
+    /// before its first consumer (see FlushMsaaResolve).
     /// Handles viewport/scissor (driven by target size) -> barrier -> Clear ->
     /// OMSetRenderTargets.
     /// </summary>
@@ -2208,12 +2221,20 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
             return;
         }
 
-        // Resolve the color target: Scene+MSAA always uses the MSAA target
+        // MSAA scene tier: Scene, SceneOpaque and SceneTransparent all render into the multisampled target,
+        // and the single-sampled color is produced by one resolve just before its first consumer. Any other
+        // pass that starts while that resolve is still owed runs it here, because BeginPass is the only point
+        // outside a pass where the command list may record copies (the same rule VK and Metal follow).
+        bool msaaScenePass = _msaaSampleCount > 1 && IsMsaaScenePass(desc.Id);
+        if (!msaaScenePass)
+            FlushMsaaResolve();
+
+        // Resolve the color target: the MSAA scene passes always use the MSAA target
         // (resolve destination = explicit RT or backbuffer); all other passes use
         // the explicit RT or the backbuffer directly.
         var explicitRT = desc.ColorTarget as DXRenderTarget;
         DXRenderTarget colorRT;
-        if (desc.Id == RenderPassId.Scene && _msaaSampleCount > 1)
+        if (msaaScenePass)
         {
             if (MsaaSceneRT == null)
                 throw new InvalidOperationException(
@@ -2222,6 +2243,9 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
 
             colorRT = MsaaSceneRT;
             colorRT.ResolveDest = explicitRT ?? BackbufferRTs[FrameIndex];
+            // The opaque stage (or the unsegmented Scene pass) starts a new multisampled image; the
+            // transparent stage loads what it left behind.
+            _msaaScenePending = true;
         }
         else
         {
@@ -2294,6 +2318,10 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
             }
             bool bindDepth = desc.Id != RenderPassId.OutlineMask || _msaaSampleCount <= 1 || desc.DepthTarget is DXRenderTarget;
             if (decalPass) bindDepth = false;
+            // A multisampled color attachment can only pair with a multisampled depth attachment. The Msaa4x
+            // tier has no single-sampled SceneDepth (decals, SSR and AO decline to register), so a lingering
+            // explicit depth here would be a sample-count mismatch; drop the depth binding instead.
+            if (colorRT == MsaaSceneRT) bindDepth = false;
 
             // 2-3 contract rule 2: Scene uses three targets
             // (slot 0=color, slot 1=velocity, plus depth).
@@ -2410,7 +2438,8 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     /// Ends the current render pass and finalizes according to the target:
     /// - depth-only (Shadow): transition depth to PixelShaderResource so later
     ///   passes can sample it directly;
-    /// - MSAA Scene: resolve to ResolveDest
+    /// - MSAA Scene: mark the single-sampled color as stale; <see cref="FlushMsaaResolve"/>
+    ///   runs the one resolve immediately before the first pass that reads it
     ///   (backbuffer -> Present/Capture; offscreen -> remain in ResolveDest for
     ///   Blit to take over);
     /// - direct backbuffer rendering: transition to Present (readback for capture
@@ -2432,27 +2461,10 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         }
         else if (colorRT == MsaaSceneRT)
         {
-            var dest = colorRT.ResolveDest!;   // Bound in BeginPass: backbuffer or offscreen SceneColor
-
-            // Prepare resolve: MSAA target -> resolve source, destination ->
-            // resolve destination
-            colorRT.TransitionTo(GraphicsCommandList, ResourceStates.ResolveSource);
-            dest.TransitionTo(GraphicsCommandList, ResourceStates.ResolveDest);
-
-            // Execute resolve. The format follows the Scene target:
-            // LDR = backbuffer format, HDR = RGBA16F
-            GraphicsCommandList->ResolveSubresource(dest.Color, 0, colorRT.Color, 0, SceneColorFormat);
-
-            // Restore msaaRenderTarget from ResolveSource back to RenderTarget so
-            // the next frame can render into it again
-            colorRT.TransitionTo(GraphicsCommandList, ResourceStates.RenderTarget);
-
-            if (dest == BackbufferRTs[FrameIndex])
-            {
-                FinishBackbufferForPresent(dest);
-            }
-            // Offscreen destination stays in ResolveDest; BlitToBackbuffer will
-            // later transition it to PixelShaderResource
+            // Defer: the transparent stage (or a later MSAA scene stage) loads this very content, and the
+            // resolve would otherwise run twice per frame. FlushMsaaResolve keeps the flag and the target
+            // together, so the resolve always happens before the first single-sampled consumer.
+            _msaaScenePending = true;
         }
         else if (colorRT == BackbufferRTs[FrameIndex])
         {
@@ -2466,6 +2478,46 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
             DXFogCompositePipeline.ResetTransparent();
         ActivePassId = RenderPassId.Scene;
         PopDebugGroup();
+    }
+
+    /// <summary>The passes that render the 3D scene into the multisampled target. Both segments of the
+    /// segmented route (SceneOpaque/SceneTransparent) and the unsegmented Scene pass share the same
+    /// multisampled image, so the tier must cover all three ids.</summary>
+    static bool IsMsaaScenePass(RenderPassId id)
+        => id is RenderPassId.Scene or RenderPassId.SceneOpaque or RenderPassId.SceneTransparent;
+
+    /// <summary>
+    /// Runs the one outstanding MSAA resolve, if any, outside any pass.
+    /// Called from BeginPass for every pass that is not itself an MSAA scene pass, and once from
+    /// AfterRender as a safety net, so the single-sampled color can never be presented unresolved.
+    /// </summary>
+    static void FlushMsaaResolve()
+    {
+        if (!_msaaScenePending || MsaaSceneRT == null)
+            return;
+        _msaaScenePending = false;
+
+        var colorRT = MsaaSceneRT;
+        var dest = colorRT.ResolveDest ?? BackbufferRTs[FrameIndex];
+
+        // Prepare resolve: MSAA target -> resolve source, destination -> resolve destination.
+        colorRT.TransitionTo(GraphicsCommandList, ResourceStates.ResolveSource);
+        dest.TransitionTo(GraphicsCommandList, ResourceStates.ResolveDest);
+
+        // Execute resolve. The format follows the Scene target:
+        // LDR = backbuffer format, HDR = RGBA16F
+        GraphicsCommandList->ResolveSubresource(dest.Color, 0, colorRT.Color, 0, SceneColorFormat);
+
+        // Restore msaaRenderTarget from ResolveSource back to RenderTarget so
+        // the next scene pass can render into it again
+        colorRT.TransitionTo(GraphicsCommandList, ResourceStates.RenderTarget);
+
+        if (dest == BackbufferRTs[FrameIndex])
+        {
+            FinishBackbufferForPresent(dest);
+        }
+        // Offscreen destination stays in ResolveDest; BlitToBackbuffer will
+        // later transition it to PixelShaderResource
     }
 
     /// <summary>
@@ -2654,6 +2706,11 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
     {
         CheckResult();
 
+        // A frame that never reached a consumer of the scene color still owes its resolve; this is the
+        // last point where the list is open, and presenting an unresolved target would show the previous
+        // frame's scene.
+        FlushMsaaResolve();
+
         // Last chance to read the frame out: the backbuffer now holds every pass
         // including Overlay, and the command list is still open.
         CaptureFinishedFrame();
@@ -2669,6 +2726,11 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
             (ID3D12CommandList*)GraphicsCommandList,
         };
         CommandQueue->ExecuteCommandLists(CommandListsCount, ppCommandLists);
+
+        // Contract 3-1: the frame's timestamps are now in the queue. The profiler signals its own fence here - not the
+        // swap-chain ring fence, whose monotonic completed value MoveToNextFrame and the deferred release queue depend on.
+        // It must stay after the submission and before Present so the copy lands inside this frame's GPU work.
+        Season.Rendering.FrameProfiler.OnSubmitted();
 
         CheckResult(D3dDevice->GetDeviceRemovedReason());
 

@@ -1023,6 +1023,9 @@ internal static class Pipeline
             FragmentFunction = overlay ? OverlayFragmentFunction : velocity ? VelocityFragmentFunction : FragmentFunction,
             VertexDescriptor = vd,
             DepthAttachmentPixelFormat = depthFormat,
+            // The scene family bakes the Msaa4x sample count, exactly like DX SampleDesc and VK RasterizationSamples;
+            // Overlay renders straight to the 1x backbuffer and therefore never multisamples.
+            RasterSampleCount = (nuint)(overlay ? 1 : Device.MsaaSampleCount),
         };
 
         var att = psd.ColorAttachments[0];

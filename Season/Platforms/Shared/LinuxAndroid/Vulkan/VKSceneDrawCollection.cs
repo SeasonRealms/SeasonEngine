@@ -199,6 +199,16 @@ internal sealed unsafe class VKSceneDrawCollection
         _queue.DrawOpaque();
     }
 
+    internal void DiscardOpaque()
+    {
+        Validate();
+        if (Device.ActivePassId != RenderPassId.SceneOpaque)
+            throw new InvalidOperationException("The opaque queue's pass is invalid.");
+        // The geometry-off row must leave the same cross-pass state behind as the real opaque stage.
+        Pipeline.SceneFogParams = default;
+        _queue.DiscardOpaque();
+    }
+
     internal void DrawTransparent(bool sampleFog)
     {
         Validate();

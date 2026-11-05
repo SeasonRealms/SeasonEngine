@@ -30,9 +30,11 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
     /// <summary>The 6 indices of the unit quad, with a winding order matching the 0,1,2,1,3,2 shared by the other three backends; the corners are expanded from the low two bits of [[vertex_id]].</summary>
     static readonly ushort[] QuadIndices = [0, 1, 2, 1, 3, 2];
 
-    /// <summary>PSO signature. Metal bakes the attachment formats into the PSO, so the signature is just the format combination of the actual attachments; the sample count does not enter the key, see the class comment.</summary>
+    /// <summary>PSO signature. Metal bakes the attachment formats into the PSO, so the signature is the format
+    /// combination of the actual attachments. The sample count is part of it as well: the Msaa4x tier binds a
+    /// multisampled color attachment, and a PSO baked for 1x would be rejected by the encoder.</summary>
     readonly record struct PipelineKey(MTLPixelFormat Color, MTLPixelFormat Depth, MTLPixelFormat Velocity,
-        MTLPixelFormat Normal);
+        MTLPixelFormat Normal, nuint Samples);
 
     readonly Dictionary<PipelineKey, IMTLRenderPipelineState> _pipelines = [];
 
@@ -116,7 +118,8 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
             VertexFunction = _vertexFunction,
             FragmentFunction = velocity ? _fragmentVelocityFunction : _fragmentFunction,
             DepthAttachmentPixelFormat = key.Depth,
-            StencilAttachmentPixelFormat = MTLPixelFormat.Invalid, RasterSampleCount = 1,
+            StencilAttachmentPixelFormat = MTLPixelFormat.Invalid,
+            RasterSampleCount = key.Samples,
         };
         var color = desc.ColorAttachments[0];
         color.PixelFormat = key.Color;
@@ -195,13 +198,20 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
         var encoder = Device.GraphicsEncoder;
         // Metal has no fence retirement value to compare against, so the identity check is "managed reference to the same command buffer + the same
         // FrameIndex": the command buffer is recreated every frame, so both holding at once rules out reusing the prepare result across frames.
+        // Msaa4x: the encoder binds the backend-private multisample color instead of the shared target by design, and the
+        // multisample one resolves into exactly this target at pass end, so the two forms mean the same surface.
+        var activeColorTexture = Device.ActiveColorTexture;
+        bool msaaScene = Device.MsaaSampleCount > 1 && Device.IsMsaaScenePass(Device.ActivePassId)
+            && activeColorTexture != null && activeColorTexture.SampleCount > 1
+            && ReferenceEquals(Device.MsaaSceneTarget.ColorTexture, activeColorTexture);
         if (encoder == null || encoder.Handle == IntPtr.Zero
             || command.Handle == IntPtr.Zero || !ReferenceEquals(command, Device.GraphicsCommandBuffer)
             || frameIndex != Device.FrameIndex
             || Device.ActivePassId is not (Season.Rendering.RenderPassId.Scene
+                or Season.Rendering.RenderPassId.SceneOpaque
                 or Season.Rendering.RenderPassId.SceneTransparent)
             || !ReferenceEquals(color, Device.ActiveColorTarget)
-            || Device.ActiveColorTexture?.Handle != colorTexture.Handle) return false;
+            || (activeColorTexture?.Handle != colorTexture.Handle && !msaaScene)) return false;
         // null == use the depth built into that target, which likewise requires that null was seen during preparation, otherwise the depth semantics have already changed.
         if (!ReferenceEquals(Device.ActiveDepthTarget, depth)) return false;
 
@@ -218,7 +228,7 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
         }
         var depthFormat = Device.ActiveDepthTexture?.PixelFormat ?? MTLPixelFormat.Invalid;
         var pipeline = GetOrCreatePipeline(new PipelineKey(colorTexture.PixelFormat, depthFormat, velocityFormat,
-            normalFormat));
+            normalFormat, activeColorTexture?.SampleCount ?? 1));
         if (pipeline == null) return false;
 
         // The main pipeline rebinds the PSO, depth state, culling and vertex slots 0..4 on every draw (see Pipeline.DrawPrimitive),

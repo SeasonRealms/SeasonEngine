@@ -101,6 +101,12 @@ window.seasonWebGPU = (() => {
     // A0.2: SceneNormal (MRT slot 2, rgba16float). Fixed at initialize and only ever true with _velocityOutput, so
     // it does not add a table: it changes the velocity table itself to fs_main_mrtn + three targets.
     let _normalOutput = false;
+    // Msaa4x tier: the three scene pass ids render into a backend-private multisample color+depth pair and
+    // resolve into the single-sampled SceneColor, exactly like the other three backends. The targets handed
+    // out to the shared layer stay single-sampled, so every consumer keeps reading `colorView`; the
+    // multisample pair is created lazily by the first scene pass and retired with its target. Fixed at
+    // initialize because the main PSO family bakes the count.
+    let _msaaSampleCount = 1;
     // Overlay PSO family (backbuffer format + depth off):
     // the Overlay pass (passId===5) renders directly to the backbuffer.
     // In HDR mode, attachment state is incompatible with _sceneFormat (rgba16float),
@@ -170,7 +176,7 @@ window.seasonWebGPU = (() => {
 
     function _clearActivePass() {
         _activePassId = -1; _activeColorTarget = _activeColorView = _activeDepthView = _activeNormalView = null;
-        _passDepthOnly = _passVelocity = _passNormal = _passOutlineMask = _passOverlay = false;
+        _passDepthOnly = _passVelocity = _passNormal = _passOutlineMask = _passOverlay = _passMsaa = false;
     }
 
     // Buffer pools: grouped by usage and reused by resetting cursors each frame
@@ -828,7 +834,7 @@ window.seasonWebGPU = (() => {
     // the Overlay family and passes it here, while this backend still bakes the overlay PSOs from the main module.
     // The parameter is declared so the positional slot is visible rather than silently dropped, which is what let the
     // trailing maxAnisotropy argument be added safely behind it.
-    async function initialize(canvasId, shaderSource, blitShaderSource, hdrSceneColor, shadowDepthBias, shadowSlopeBias, velocityOutput, overlayShaderSource, maxAnisotropy = 1, fogSampling = false, normalOutput = false) {
+    async function initialize(canvasId, shaderSource, blitShaderSource, hdrSceneColor, shadowDepthBias, shadowSlopeBias, velocityOutput, overlayShaderSource, maxAnisotropy = 1, fogSampling = false, normalOutput = false, msaaSampleCount = 1) {
         if (_device) throw new Error('Reload the page before starting a second WebGPU host');
         _mesh3DShader = shaderSource;
         _blitShaderWGSL = blitShaderSource;
@@ -846,6 +852,9 @@ window.seasonWebGPU = (() => {
         _velocityOutput = !!velocityOutput;
         // A0.2: the WGSL NORMAL_OUTPUT constant has been injected in sync by the same C# substitution.
         _normalOutput = _velocityOutput && !!normalOutput;
+        // Msaa4x: assigned before the main PSO family is baked below, exactly like the two flags above.
+        // A host mirror that reports an illegal count degrades to 1x rather than failing the device.
+        _msaaSampleCount = (msaaSampleCount | 0) >= 2 ? (msaaSampleCount | 0) : 1;
         if (!navigator.gpu) throw new Error('WebGPU not supported.');
         const adapter = await navigator.gpu.requestAdapter();
         if (!adapter) throw new Error('WebGPU adapter unavailable.');
@@ -1459,7 +1468,7 @@ window.seasonWebGPU = (() => {
         return { format: 'rgba16float', writeMask: modeKey.startsWith('opaque') ? GPUColorWrite.ALL : 0 };
     }
 
-    function _createUnifiedPipelineVariant(shaderModule, bindGroupLayout, modeKey, cullModeKey = 'back', vertexEntryPoint = 'vs_main', vertexBuffers = null, velocity = false, overlay = false) {
+    function _createUnifiedPipelineVariant(shaderModule, bindGroupLayout, modeKey, cullModeKey = 'back', vertexEntryPoint = 'vs_main', vertexBuffers = null, velocity = false, overlay = false, samples = 1) {
         // 2-2 contract clause 7:
         // suffix Nd = GTAO-exempt mode, routed from the flags.w NoDepthWrite bit.
         // It is byte-for-byte identical to the base mode except for depthWriteEnabled
@@ -1524,6 +1533,9 @@ window.seasonWebGPU = (() => {
                 depthCompare,
                 format: 'depth24plus',
             },
+            // Msaa4x: must match the sample count of every attachment the pass binds, or setPipeline fails
+            // asynchronously (rule 3). The overlay and velocity tables stay at 1x.
+            multisample: { count: samples },
         });
         if (sampleFog) _fogMaterialPipelines.add(pipeline);
         return pipeline;
@@ -1543,6 +1555,10 @@ window.seasonWebGPU = (() => {
     // draw sites implicitly route to the MRT variant table,
     // with zero new draw API on the C# side.
     let _passVelocity = false;
+    // Msaa4x: set by beginPass when the pass renders into the backend-private multisample pair and resets with
+    // the rest of the active-pass state. Draw sites that bake their own PSO from the real attachments
+    // (particles) read it; the main table already bakes the tier's count.
+    let _passMsaa = false;
     // A0.2: set by beginPass when the SceneNormal attachment (slot 2) is present, reset by endPass. Draw sites do not
     // route on it - the velocity table already carries slot 2 when _normalOutput - it only lets them refuse a pass
     // whose attachment set disagrees with what was baked.
@@ -1730,23 +1746,28 @@ window.seasonWebGPU = (() => {
             }
         ];
 
+        // Msaa4x: the main table is the only family the scene pass draws through, so it bakes the tier's
+        // sample count. The velocity table below stays 1x (its attachments are 1x and the tier keeps them
+        // off), and the overlay family renders straight to the backbuffer.
+        const mainVariant = (modeKey, cullMode) => _createUnifiedPipelineVariant(
+            shaderModule, bindGroupLayout, modeKey, cullMode, 'vs_main', vertexBuffers, false, false, _msaaSampleCount);
         _mesh3DPipeline = {
             bindGroupLayout,
-            opaque: _createUnifiedPipelineVariant(shaderModule, bindGroupLayout, 'opaque', 'back', 'vs_main', vertexBuffers),
-            opaqueDoubleSided: _createUnifiedPipelineVariant(shaderModule, bindGroupLayout, 'opaque', 'none', 'vs_main', vertexBuffers),
-            fade: _createUnifiedPipelineVariant(shaderModule, bindGroupLayout, 'fade', 'back', 'vs_main', vertexBuffers),
-            fadeDoubleSided: _createUnifiedPipelineVariant(shaderModule, bindGroupLayout, 'fade', 'none', 'vs_main', vertexBuffers),
+            opaque: mainVariant('opaque', 'back'),
+            opaqueDoubleSided: mainVariant('opaque', 'none'),
+            fade: mainVariant('fade', 'back'),
+            fadeDoubleSided: mainVariant('fade', 'none'),
             // 2-2 contract clause 7: GTAO-exempt variants
             // depthWriteEnabled=false while everything else is byte-for-byte identical to the base mode.
             // flags.w NoDepthWrite routes here through _selectPipelineMode.
             // Transparent already does not write depth, so it has no Nd variant.
-            opaqueNd: _createUnifiedPipelineVariant(shaderModule, bindGroupLayout, 'opaqueNd', 'back', 'vs_main', vertexBuffers),
-            opaqueNdDoubleSided: _createUnifiedPipelineVariant(shaderModule, bindGroupLayout, 'opaqueNd', 'none', 'vs_main', vertexBuffers),
-            fadeNd: _createUnifiedPipelineVariant(shaderModule, bindGroupLayout, 'fadeNd', 'back', 'vs_main', vertexBuffers),
-            fadeNdDoubleSided: _createUnifiedPipelineVariant(shaderModule, bindGroupLayout, 'fadeNd', 'none', 'vs_main', vertexBuffers),
-            transparent: _createUnifiedPipelineVariant(shaderModule, bindGroupLayout, 'transparent', 'back', 'vs_main', vertexBuffers),
-            transparentDoubleSided: _createUnifiedPipelineVariant(shaderModule, bindGroupLayout, 'transparent', 'none', 'vs_main', vertexBuffers),
-            transparentBackFace: _createUnifiedPipelineVariant(shaderModule, bindGroupLayout, 'transparent', 'front', 'vs_main', vertexBuffers),
+            opaqueNd: mainVariant('opaqueNd', 'back'),
+            opaqueNdDoubleSided: mainVariant('opaqueNd', 'none'),
+            fadeNd: mainVariant('fadeNd', 'back'),
+            fadeNdDoubleSided: mainVariant('fadeNd', 'none'),
+            transparent: mainVariant('transparent', 'back'),
+            transparentDoubleSided: mainVariant('transparent', 'none'),
+            transparentBackFace: mainVariant('transparent', 'front'),
         };
 
         // 2-3 contract clauses 2/3: velocity variant table
@@ -1957,6 +1978,31 @@ window.seasonWebGPU = (() => {
         return rt.auxDepthView;
     }
 
+    // Msaa4x: backend-private multisample pair for the scene passes. Created lazily on the first scene pass
+    // that renders into this target, so fog / SSR / secondary-view targets never pay for it, and retired
+    // with the target. Both views are rebuilt together because WebGPU requires the depth attachment of a
+    // multisampled pass to carry the same sample count and size as the color attachment.
+    function _ensureTargetMsaa(rt) {
+        if (_msaaSampleCount <= 1 || !rt || rt.depthOnly || rt.velocity || !rt.colorView) return false;
+        if (rt.msaaColorView && rt.msaaDepthView && rt.msaaWidth === rt.width && rt.msaaHeight === rt.height
+            && rt.msaaFormat === rt.colorFormat) return true;
+        // The previous pair may still be referenced by a command buffer that has not completed.
+        if (rt.msaaColorTex) _queueComputeRetirement(rt.msaaColorTex);
+        if (rt.msaaDepthTex) _queueComputeRetirement(rt.msaaDepthTex);
+        rt.msaaColorTex = _device.createTexture({
+            label: 'rt_msaa_color', size: [rt.width, rt.height], format: rt.colorFormat,
+            sampleCount: _msaaSampleCount, usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        rt.msaaDepthTex = _device.createTexture({
+            label: 'rt_msaa_depth', size: [rt.width, rt.height], format: 'depth24plus',
+            sampleCount: _msaaSampleCount, usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        rt.msaaColorView = rt.msaaColorTex.createView();
+        rt.msaaDepthView = rt.msaaDepthTex.createView();
+        rt.msaaWidth = rt.width; rt.msaaHeight = rt.height; rt.msaaFormat = rt.colorFormat;
+        return true;
+    }
+
     function _createRenderTargetResources(rt, width, height) {
         if (rt.depthOnly) {
             rt.depthTex = _device.createTexture({
@@ -2035,8 +2081,11 @@ window.seasonWebGPU = (() => {
         if (rt.colorTex) _queueComputeRetirement(rt.colorTex);
         if (rt.depthTex) _queueComputeRetirement(rt.depthTex);
         if (rt.auxDepthTex) _queueComputeRetirement(rt.auxDepthTex);
+        if (rt.msaaColorTex) _queueComputeRetirement(rt.msaaColorTex);
+        if (rt.msaaDepthTex) _queueComputeRetirement(rt.msaaDepthTex);
         rt.colorTex = rt.depthTex = rt.colorView = rt.depthView = null;
         rt.auxDepthTex = rt.auxDepthView = null;
+        rt.msaaColorTex = rt.msaaDepthTex = rt.msaaColorView = rt.msaaDepthView = null;
         rt.blitBindGroup = rt.blitBindGroupLinear = rt.variantBindGroups = null;
         _invalidateComputeBindGroups();
     }
@@ -2044,7 +2093,8 @@ window.seasonWebGPU = (() => {
     function _resizeRenderTargetResources(rt, width, height) {
         // 完整分配成功才替换；旧命令引用在提交完成前继续有效。
         const replacement = { ...rt, colorTex: null, depthTex: null, colorView: null, depthView: null,
-            auxDepthTex: null, auxDepthView: null };
+            auxDepthTex: null, auxDepthView: null,
+            msaaColorTex: null, msaaDepthTex: null, msaaColorView: null, msaaDepthView: null };
         try { _createRenderTargetResources(replacement, width, height); }
         catch (error) { _destroyRenderTargetResources(replacement); throw error; }
         _destroyRenderTargetResources(rt);
@@ -2079,17 +2129,20 @@ window.seasonWebGPU = (() => {
     // 4 = Rg16Float velocity color
     //   (2-3: dedicated to MRT slot 1 - no companion depth, no blit bind group,
     //   and matches SceneVelocity format on the other three backends)
+    // 7 = fixed-size depth-only SceneDepth
+    //   (P3: a secondary view's plane does not follow the backbuffer, but its SceneOpaque/SceneTransparent
+    //   pair shares it, so it must be the same depth24plus shape the scene pipelines bake)
     function createRenderTarget(name, width, height, matchBackbuffer, formatKind) {
         const rt = {
             name,
             matchBackbuffer: !!matchBackbuffer,
-            depthOnly: formatKind === 2 || formatKind === 3,
+            depthOnly: formatKind === 2 || formatKind === 3 || formatKind === 7,
             velocity: formatKind === 4,
             // 5/6 保留 HDR/LDR 颜色，但不创建兼容旧场景管线的隐式深度。
             noImplicitDepth: formatKind === 5 || formatKind === 6,
         };
         if (rt.depthOnly) {
-            rt.depthFormat = formatKind === 3 ? 'depth24plus' : 'depth32float';
+            rt.depthFormat = (formatKind === 3 || formatKind === 7) ? 'depth24plus' : 'depth32float';
         } else if (rt.velocity) {
             rt.colorFormat = 'rg16float';
         } else {
@@ -2747,10 +2800,10 @@ window.seasonWebGPU = (() => {
         // rebind the depth plane to explicit SceneDepth
         // (depth24plus shape, formatKind 3, matching the format already baked into pipelines).
         // Lazy-rebuild rules are the same as for color targets.
-        // P3: a secondary view supplies its own depth plane, but as a depth32float shadow-shaped target
-        // (formatKind 2), which no scene pipeline accepts. Only a depth24plus plane - or a colour target that has
-        // none of its own - is bound here; otherwise the colour target's implicit plane is kept, which is exactly
-        // the same size and format the view's attachments need.
+        // P3: a secondary view supplies its own depth plane as a fixed-size depth24plus target (formatKind 7), so its
+        // SceneOpaque stays bound to the very plane SceneTransparent loads, and both match the depth24plus baked into
+        // every scene pipeline. Only a depth24plus plane - or a colour target that has none of its own - is bound here;
+        // a shadow-map-style depth32float plane is ignored and the colour target's implicit plane is kept instead.
         const drt = depthTargetName ? _renderTargets[depthTargetName] : null;
         if (drt && (!rt || !rt.depthView || drt.depthFormat === 'depth24plus')) {
             if (drt.matchBackbuffer && (drt.width !== _canvas.width || drt.height !== _canvas.height)) {
@@ -2793,8 +2846,21 @@ window.seasonWebGPU = (() => {
         }
         const normalView = nrt ? nrt.colorView : null;
 
+        // Msaa4x tier: the three scene pass ids render into the backend-private multisample pair and resolve
+        // into the single-sampled SceneColor at pass end, the same contract as the other three backends.
+        // The tier's shared rules keep every 1x attachment off these passes (no velocity/normal slot, no
+        // decal/water/SSR/waterfall split, no explicit SceneDepth rebinding), so the pair can be attached
+        // alone. SceneTransparent loads what SceneOpaque left in the pair, which is why the attachment stores
+        // instead of discarding.
+        const msaaScene = _msaaSampleCount > 1 && !depthOnly && rt !== null && !blendPass
+            && passId !== 7 && passId !== 9 && !velocityTargetName && !normalTargetName && !depthTargetName
+            && (passId === 1 || passId === 6 || passId === 8) && _ensureTargetMsaa(rt);
+
         const colorAttachments = depthOnly ? [] : [{
-            view: colorView,
+            view: msaaScene ? rt.msaaColorView : colorView,
+            // WebGPU resolves when the pass ends, and a multisampled attachment may only target a
+            // same-format single-sampled view - which is exactly the shared SceneColor.
+            ...(msaaScene ? { resolveTarget: colorView } : {}),
             clearValue: { r: clearR, g: clearG, b: clearB, a: clearA },
             // 贴花与水面都只叠加：哪怕 PassDesc 里误写了 Clear 也不执行，那会抹掉刚画完的不透明结果。
             loadOp: clearColorEnable && !blendPass ? 'clear' : 'load',
@@ -2823,7 +2889,7 @@ window.seasonWebGPU = (() => {
             colorAttachments,
             // FogComposite=7 只写颜色，不挂载也不清除原场景深度。
             depthStencilAttachment: (blendPass || passId === 7 || passId === 9) ? undefined : {
-                view: depthView,
+                view: msaaScene ? rt.msaaDepthView : depthView,
                 depthClearValue: 1.0,
                 depthLoadOp: clearDepthEnable ? 'clear' : 'load',
                 // StoreDepth=false maps to discard
@@ -2848,8 +2914,12 @@ window.seasonWebGPU = (() => {
         _passOverlay = (passId === 5);
         _activePassId = passId;
         _activeColorTarget = rt;
+        // Deliberately the single-sampled view: consumers prepare against it outside the pass and the
+        // multisample pair resolves into it at pass end, so both forms mean the same surface.
         _activeColorView = colorView;
-        _activeDepthView = (blendPass || passId === 7 || passId === 9) ? null : depthView;
+        _passMsaa = msaaScene;
+        _activeDepthView = (blendPass || passId === 7 || passId === 9) ? null
+            : (msaaScene ? rt.msaaDepthView : depthView);
         _activeNormalView = normalView;
     }
 
@@ -2918,6 +2988,13 @@ window.seasonWebGPU = (() => {
         if (!_passEncoder || _activePassId !== 6) throw new Error('不透明命令只能在 SceneOpaque 消费');
         c.stage = 3;
         for (const index of c.opaque) _executeSceneDraw(c.entries[index]);
+    }
+
+    // 几何关闭的测量行：收集照旧（透明桶与帧结构不变），但不重放不透明命令。
+    function discardCollectedOpaque() {
+        const c = _requireSceneCollection(2);
+        if (!_passEncoder || _activePassId !== 6) throw new Error('不透明命令只能在 SceneOpaque 消费');
+        c.stage = 3;
     }
 
     function drawCollectedTransparent(sampleFog) {
@@ -4482,8 +4559,9 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
 
     // 颜色与深度格式由本帧真实附件决定，但速度槽的有无只有进了 Pass 才知道（_passVelocity）。
     // 所以同一附件形状下两个变体一起烘焙，Draw 时按标志取用，绝不在 Pass 内创建管线。
-    function _particleVariant(state, colorFormat, depthFormat) {
-        const key = `${colorFormat}|${depthFormat}`;
+    // Msaa4x：场景 Pass 挂的是后端私有的多重采样对，1x 管线会被校验器拒绕，所以采样数入 key。
+    function _particleVariant(state, colorFormat, depthFormat, samples) {
+        const key = `${colorFormat}|${depthFormat}|${samples}`;
         let variant = state.variants[key];
         if (variant) return variant;
         variant = { color: null, velocity: null };
@@ -4501,7 +4579,7 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
             primitive: { topology: 'triangle-list', cullMode: 'none' },
             // 粒子是最后一层透明：测试但不写深度，与主管线透明档的 less-equal 一致。
             depthStencil: { depthWriteEnabled: false, depthCompare: 'less-equal', format: depthFormat },
-            multisample: { count: 1 },
+            multisample: { count: samples },
         };
         let scopeOpen = false;
         try {
@@ -4553,15 +4631,19 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         const colorFormat = color.colorFormat || _sceneFormat;
         const depthFormat = depth ? depth.depthFormat : 'depth24plus';
         if (!colorFormat || !depthFormat || !color.colorView) return null;
+        // Msaa4x：带着后端私有多重采样对的目标意味着本帧场景 Pass 走 MSAA；粒子只落在场景 Pass，
+        // 所以这里按目标形状决定变体采样数，与 drawParticles 的 _passMsaa 判定同源。
+        // Prepare 发生在 Pass 外，首帧必须主动把这对纹理建出来，否则会烘出 1x 变体。
+        const samples = _msaaSampleCount > 1 && _ensureTargetMsaa(color) ? _msaaSampleCount : 1;
         return { color, depth, instances, args, frame, colorFormat, depthFormat,
-            colorView: color.colorView, depthView: depth ? depth.depthView : null };
+            colorView: color.colorView, depthView: depth ? depth.depthView : null, samples };
     }
 
     function _sameParticleRefs(a, b) {
         return !!a && !!b && a.color === b.color && a.depth === b.depth
             && a.instances === b.instances && a.args === b.args && a.frame === b.frame
             && a.colorView === b.colorView && a.depthView === b.depthView
-            && a.colorFormat === b.colorFormat && a.depthFormat === b.depthFormat;
+            && a.colorFormat === b.colorFormat && a.depthFormat === b.depthFormat && a.samples === b.samples;
     }
 
     function prepareParticleDraw(name, color, depth, instances, args, frame) {
@@ -4574,7 +4656,7 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         try {
             const refs = _resolveParticleDraw(input);
             if (!refs) return false;
-            const variant = _particleVariant(state, refs.colorFormat, refs.depthFormat);
+            const variant = _particleVariant(state, refs.colorFormat, refs.depthFormat, refs.samples);
             // 首次见到这组附件形状时管线仍在异步编译：本帧明确不绘制，下一帧再试。
             if (state.failed || !variant.color || !variant.velocity) return false;
             if (!_sameParticleRefs(state.refs, refs)) {
@@ -4607,7 +4689,11 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
             || (_passVelocity && _passNormal !== _normalOutput)
             || _activeColorTarget !== prepared.refs.color || _activeColorView !== prepared.refs.colorView
             // depth 为空时无法比对身份：默认深度视图每个 Pass 现建，只能要求它确实存在。
-            || !_activeDepthView || (prepared.refs.depthView && _activeDepthView !== prepared.refs.depthView)
+            // Msaa4x：场景 Pass 挂的是后端私有的多重采样深度，1x 那一份本帧没有被写入，不能拿来比对。
+            || !_activeDepthView
+            || (_passMsaa
+                ? (!prepared.refs.color.msaaDepthView || _activeDepthView !== prepared.refs.color.msaaDepthView)
+                : (prepared.refs.depthView && _activeDepthView !== prepared.refs.depthView))
             || !_sameParticleRefs(prepared.refs, _resolveParticleDraw(prepared.input))) return false;
         const pipeline = _passVelocity ? prepared.variant.velocity : prepared.variant.color;
         if (!pipeline) return false;
@@ -6016,7 +6102,7 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         decodeH264Video,
         beginFrame,
         beginSceneCollection, setSceneDrawPriority, sealSceneCollection,
-        drawCollectedOpaque, drawCollectedTransparent, releaseSceneCollection,
+        drawCollectedOpaque, discardCollectedOpaque, drawCollectedTransparent, releaseSceneCollection,
         beginPass,
         endPass,
         createRenderTarget,

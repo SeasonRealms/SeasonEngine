@@ -42,6 +42,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public void BeginSceneCollection() => _sceneCollection.Begin();
     public void SealSceneCollection() => _sceneCollection.Seal();
     public void DrawCollectedOpaque() => _sceneCollection.DrawOpaque();
+    public void DiscardCollectedOpaque() => _sceneCollection.DiscardOpaque();
     public void DrawCollectedTransparent(bool sampleFog) => _sceneCollection.DrawTransparent(sampleFog);
     public void ReleaseSceneCollection() => _sceneCollection.Release();
 
@@ -2939,9 +2940,11 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     /// <summary>
     /// Vulkan renders a secondary view through its own attachments plus its own set 2, and those targets are created
     /// by the same VKRenderTarget path the main view uses, so the main PSO family stays render-pass compatible.
-    /// There is no MSAA tier to decline here, so the capability is unconditional.
+    /// The Msaa4x tier is the one exception: the main family is then baked against the multisampled scene shape, and a
+    /// secondary view's targets would inherit the same pair, which is legal but doubles the multisampled bandwidth of
+    /// the frame. It is declined here for the same reason Metal and WebGPU decline it.
     /// </summary>
-    public bool SecondaryViewSupported => true;
+    public bool SecondaryViewSupported => Vulkan.Device.MsaaSampleCount <= 1;
 
     /// <summary>
     /// Publishes an offscreen target as a sampleable texture: a <see cref="VkTexture"/> that borrows the target's

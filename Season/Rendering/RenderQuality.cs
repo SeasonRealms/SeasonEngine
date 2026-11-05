@@ -16,7 +16,12 @@ public enum AaMode
 {
     Off,
 
-    /// <summary>4x MSAA (legacy tier: currently D3D12-only; HDR resolve quality is compromised and bandwidth cost is high, but it remains as a VR fallback).</summary>
+    /// <summary>4x MSAA, implemented and stabilized on D3D12, Vulkan, Metal and WebGPU. The three scene pass ids
+    /// (Scene / SceneOpaque / SceneTransparent) render into a backend-private multisample colour+depth pair and resolve
+    /// into the single-sampled SceneColor, so the shared layer never sees a multisampled target. It is mutually exclusive
+    /// with MotionVectors (and the SceneNormals that ride on it), AO, Decals and SSR - all of which need a single-sampled
+    /// SceneDepth the tier never creates - and volumetric fog downgrades the tier to Fxaa before the backends are
+    /// initialized. HDR resolve quality is compromised and bandwidth cost is high, but it remains as a VR fallback.</summary>
     Msaa4x,
 
     /// <summary>FXAA 3.11 (introduced in 2-1; raster variant in post-tonemap LDR, using Post uber composite + FinalBlit FXAA presentation).</summary>

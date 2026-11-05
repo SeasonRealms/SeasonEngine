@@ -514,20 +514,23 @@ public static class AndroidApp
         // Direct rendering therefore falls back to the LDR baseline.
         VkDevice.HdrSceneColor = !immediate2D && UseOffscreenSceneColor && RenderQuality.Current.HdrSceneColor;
 
+        // Vulkan always supports compute; resolve the fog's single-sampled requirement before the render
+        // pass shape and the main PSO family bake the sample count, mirroring WindowsApp.
+        var fogAa = RenderQuality.Current.ResolveFogAntiAliasing(VkDevice.HdrSceneColor, immediate2D);
+        if (fogAa != RenderQuality.Current.EffectiveAntiAliasing)
+        {
+            RenderQuality.Current.EffectiveAntiAliasing = fogAa;
+            Diag($"[RenderQuality] Volumetric fog requires a single-sampled scene; Msaa4x downgraded to {fogAa}");
+        }
+
         // Anti-aliasing contract 2-1 clause 5:
         // finalize the AA tier during initialization, where options are mutually exclusive.
         // If the capability is unavailable, fall back and log the change so runtime stays branch-free.
-        // Msaa4x is a D3D12 legacy mode and this backend has no MSAA offscreen path, so it falls back to Fxaa.
         // Taa and Fxaa both depend on the HDR offscreen path,
         // where the post uber pass finishes with tone mapping.
         // Fallback order is Taa -> Fxaa -> Off, mirroring WindowsApp and LinuxApp.
         // The whole tier normalization is skipped in immediate-2D mode: no AA path exists to
         // configure, and the values stay unused because no pass ever consults them.
-        if (!immediate2D && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
-        {
-            RenderQuality.Current.EffectiveAntiAliasing = Season.Rendering.AaMode.Fxaa;
-            DeviceServices.BaseApp.AddLog(LogType.Backend, $"{DateTime.UtcNow} [RenderQuality] AaMode.Msaa4x is only supported on D3D12, falling back to Fxaa");
-        }
         if (!immediate2D && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Taa)
         {
             // Contract 2-3 clause 1: selecting Taa forces motion-vector infrastructure to be enabled,
@@ -558,6 +561,23 @@ public static class AndroidApp
         // VkDevice.Init may still drop velocity when independentBlend is missing, and the normals go with it.
         if (!immediate2D && RenderQuality.Current.SceneNormals)
             RenderQuality.Current.MotionVectors = true;
+
+        // Contract 2-3 clauses 1/8: MotionVectors is finalized here, before the render passes and the main
+        // PSO family are built. It is mutually exclusive with Msaa4x because every attachment of a pass must
+        // share one sample count, and a multisampled colour cannot be paired with a single-sampled velocity slot.
+        if (!immediate2D
+            && RenderQuality.Current.MotionVectors
+            && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
+        {
+            RenderQuality.Current.MotionVectors = false;
+            Diag("[RenderQuality] MotionVectors is mutually exclusive with Msaa4x (all MRT attachments must use the same sample count), falling back to false"
+                + (RenderQuality.Current.SceneNormals ? "; SceneNormals goes with it" : ""));
+        }
+
+        // 2-1 clause 5: the Msaa4x tier's sample count is fixed here, before the swap chain, render passes and
+        // main PSO family are created. The offscreen chain is a hard requirement.
+        VkDevice.MsaaSampleCount = !immediate2D && UseOffscreenSceneColor
+            && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x ? 4u : 1u;
 
         // 1) Android instance extensions: fixed to VK_KHR_surface plus VK_KHR_android_surface.
         var androidExts = new[] { "VK_KHR_surface", "VK_KHR_android_surface" };
@@ -724,6 +744,24 @@ public static class AndroidApp
             RenderQuality.Current.AmbientOcclusion = Season.Rendering.AoMode.Off;
             DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] AO is incompatible with Msaa4x because MSAA depth cannot be used as compute input, falling back to Off");
         }
+        // Decals and SSR both sample an explicit single-sampled SceneDepth, which the Msaa4x tier never creates
+        // (the multisampled depth is backend-private and cannot be sampled). They are dropped here rather than
+        // left to read an unwritten plane; water / waterfall splits need the same plane and exit inside the
+        // shared pass code once SceneDepth stays null.
+        if (!immediate2D
+            && RenderQuality.Current.Decals
+            && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
+        {
+            RenderQuality.Current.Decals = false;
+            Diag("[RenderQuality] Decals require an explicit single-sampled SceneDepth, which Msaa4x does not create; falling back to false");
+        }
+        if (!immediate2D
+            && RenderQuality.Current.ScreenSpaceReflections != Season.Rendering.SsrMode.Off
+            && RenderQuality.Current.EffectiveAntiAliasing == Season.Rendering.AaMode.Msaa4x)
+        {
+            RenderQuality.Current.ScreenSpaceReflections = Season.Rendering.SsrMode.Off;
+            Diag("[RenderQuality] SSR requires an explicit single-sampled SceneDepth, which Msaa4x does not create; falling back to Off");
+        }
         if (!immediate2D && RenderQuality.Current.AmbientOcclusion != Season.Rendering.AoMode.Off)
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
@@ -738,8 +776,11 @@ public static class AndroidApp
         // MotionVectors requires an explicit depth target because the velocity RenderPass expects
         // three attachments: color, velocity, and depth.
         // When AO is disabled, SceneDepth may be null, but MotionVectors still needs a depth attachment,
-        // so fill it in here.
+        // so fill it in here. The Msaa4x tier is excluded: its scene passes attach a backend-private
+        // multisampled depth, so a 1x plane created here would never be written, and every consumer that
+        // requires one (AO / Decals / SSR / MotionVectors / volumetric fog) was already dropped above.
         if (!immediate2D && Season.Rendering.FrameSchedule.SceneDepth == null
+            && RenderQuality.Current.EffectiveAntiAliasing != Season.Rendering.AaMode.Msaa4x
             && (RenderQuality.Current.MotionVectors || RenderQuality.Current.RequiresAtmosphereSceneDepth(
                 VkDevice.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)
                 || RenderQuality.Current.RequiresDecalSceneDepth(VkDevice.HdrSceneColor, immediate2D)
