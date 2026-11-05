@@ -62,3 +62,4 @@ nunit-*.xml
 /Tests
 /Apps/Engine/.dbg/_river_bin
 /Season/.dbg/_river_bin
+/.dbg
