@@ -65,6 +65,35 @@ internal unsafe class VKModel : VKPrimitiveGroup
     BufferResource[] _prevMorphWeightsBuffers = null!;
     float*[] _mappedPrevMorphWeightsBuffers = null!;
 
+    // --- single-model GPU skinning (Model.SkinningMode = Gpu) ---
+    //
+    // The same kernel, parameter row and frame latch the instanced path uses, filled with exactly one row. What differs on this
+    // backend is only where the palette lives: the kernel writes a compute-created storage buffer, so the host-visible ring both
+    // routes uploaded into before cannot carry it, and the descriptor sets - which hold the VkBuffer handle by value - have to be
+    // rewritten whenever the buffer they name changes. That rewrite is the one thing VK needs and Metal does not.
+
+    /// <summary>The shared target implementation, one instance wide. Registered at load, unregistered by Dispose.</summary>
+    readonly Season.Rendering.InstanceSkinningTarget _skinning = new();
+
+    /// <summary>True while this frame draws from the kernel's palette. Latched once per Update so a frame cannot half-switch
+    /// between the two palettes, which would compose half a pose from one source and half from the other.</summary>
+    bool _gpuSkin;
+
+    /// <summary>Set once a bake has been asked for and refused. A refusal is permanent - it comes from the asset's shape, which
+    /// nothing changes after load - and without this the retry in <see cref="BeginSkinningFrame"/> would rescan the whole clip set
+    /// every frame for the life of a model the bake declines.</summary>
+    bool _bakeRefused;
+
+    /// <summary>The palette ring this class creates because the GPU route needs a compute-written palette. Owned here, disposed here.</summary>
+    Season.Rendering.InstanceBoneStorage? _gpuPalette;
+
+    /// <summary>The ring flattened into the shape the descriptor writer consumes, rebuilt only when the ring's buffer set changes.</summary>
+    BufferResource[]? _boneStorageRing;
+
+    /// <summary>The rest pose, shared with the other three backends so a route whose correctness rests on two matrices cancelling
+    /// has one implementation of the snapshot rather than four.</summary>
+    readonly Season.Models.RestPoseSnapshot _restPose = new();
+
     public VKModel(string name)
     {
         Name = name;
@@ -90,6 +119,13 @@ internal unsafe class VKModel : VKPrimitiveGroup
         CreatePrevBonePaletteBuffer();
         CreatePrevMorphWeightsBuffer();
         SyncSkinningMaterialParams();
+
+        // Single-model GPU skinning: the palette ring and the bake are created lazily by the first BeginSkinningFrame, because
+        // whether either is wanted is a property of the control (SkinningMode, possibly overridden per process) and this call may
+        // precede that decision. The rest snapshot does belong here: it is a property of the asset alone, and capturing it at load
+        // means the first GPU frame already has the matrix the palette will be relative to.
+        _restPose.Capture(_asset);
+        Season.Rendering.InstanceSkinning.Register(_skinning);
 
         _asset.ValidateSkinData();
 
@@ -195,6 +231,11 @@ internal unsafe class VKModel : VKPrimitiveGroup
         model.Asset = instance._asset;
         instance.CreateInstanceBoneBuffers();
         instance.SyncSkinningMaterialParams();
+
+        // Single-model GPU skinning on a shared-template instance: the cloned tree is complete by now, so the rest snapshot is
+        // taken from the instance's own nodes rather than shared with the template - the clone is what the draw walks.
+        instance._restPose.Capture(instance._asset);
+        Season.Rendering.InstanceSkinning.Register(instance._skinning);
 
         var all = new List<PrimitiveData>();
         instance.CollectPrimitives(all);
@@ -392,9 +433,10 @@ internal unsafe class VKModel : VKPrimitiveGroup
     /// overriding the base class's default IdentityBoneBuffers.</summary>
     protected override BufferResource[] BoneMatrixBuffers => _boneMatrixBuffers;
     protected override BufferResource[] InstanceBoneBuffers
-        => _instanceBoneBuffers != null && _instanceBoneBuffers.Length > 0
-            ? _instanceBoneBuffers
-            : Pipeline.IdentityInstanceBoneBuffers;
+        => _boneStorageRing
+            ?? (_instanceBoneBuffers != null && _instanceBoneBuffers.Length > 0
+                ? _instanceBoneBuffers
+                : Pipeline.IdentityInstanceBoneBuffers);
 
     GltfNodeBase CreateGLTFNode(SharpGLTF.Schema2.Node node)
     {
@@ -504,9 +546,23 @@ internal unsafe class VKModel : VKPrimitiveGroup
 
     // 2-3 Step C: override the base virtual methods to return the actual prev SSBOs
     protected override DescriptorBufferInfo GetPrevBoneBufferInfo(int fi)
-        => _prevBonePaletteBuffers != null && fi < _prevBonePaletteBuffers.Length
+    {
+        // GPU route: the previous palette is the ring's slot one back, not a CPU copy. Descriptor set fi binds ring slot fi - the
+        // slot this frame's kernel writes - so fi - 1 is exactly what the previous frame wrote. The CPU ring's own prev SSBO is
+        // not updated on this route at all, and pointing the motion-vector path at it would compare this frame against whichever
+        // CPU-route pose the model last left there.
+        if (_boneStorageRing != null && _boneStorageRing.Length > 0)
+        {
+            int slots = _boneStorageRing.Length;
+            var prevSlot = _boneStorageRing[((fi % slots) + slots - 1) % slots];
+            if (prevSlot.Buffer.Handle != 0)
+                return new() { Buffer = prevSlot.Buffer, Offset = 0, Range = Vk.WholeSize };
+        }
+
+        return _prevBonePaletteBuffers != null && fi < _prevBonePaletteBuffers.Length
             ? new() { Buffer = _prevBonePaletteBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize }
             : base.GetPrevBoneBufferInfo(fi);
+    }
 
     protected override DescriptorBufferInfo GetPrevMorphWeightsBufferInfo(int fi)
         => _prevMorphWeightsBuffers != null && fi < _prevMorphWeightsBuffers.Length
@@ -524,6 +580,143 @@ internal unsafe class VKModel : VKPrimitiveGroup
             for (int i = 0; i < Device.frameCount; i++)
                 Unsafe.Write(primitive.MappedMaterialBuffers[i], primitive.MaterialParams);
         }
+    }
+
+    /// <summary>
+    /// Locks this frame onto one of the two routes and returns the bake the kernel will evaluate, or null for the CPU route. The
+    /// null return is what the caller branches on, so it never has to re-read the mode.
+    ///
+    /// Two settings differ from the instanced path. The block is one instance wide, and it reserves no tag row: a tag exists so a
+    /// non-zero instance index can find its own block, and a single model always addresses row <c>jointIndex</c> from row zero
+    /// because <c>isInstanced</c> is false. Reserving one here would make the kernel write a row the vertex stage never reads.
+    /// </summary>
+    Season.Models.InstanceSkinBake? BeginSkinningFrame(Season.Controls.Model model)
+    {
+        bool wanted = Season.Rendering.InstanceSkinning.Enabled
+            && (Season.Rendering.InstanceSkinning.Override ?? model.SkinningMode) == Season.Rendering.InstanceSkinningMode.Gpu;
+
+        if (wanted && _asset.SkinBake == null && !_bakeRefused)
+        {
+            // The mode may have been turned on after load, which is not the intended order but is not worth refusing: the build is
+            // a one-off cost at the next Update, and silently keeping the CPU route for the rest of the run is invisible to whoever
+            // set the property. TryCreate rather than TryBake: what has to be told apart here is "cannot be built" from "not built
+            // yet", and a backend without vertex-stage storage reads counts as the former even though it is a capability rather
+            // than a shape - capability is fixed for the life of the process, and building tables on such a backend would spend
+            // memory on data no draw could read.
+            var g = Season.Basic.Graphics.Instance;
+            if (g == null || !g.ComputeSupported || !g.VertexShaderStorageReadSupported)
+                _bakeRefused = true;
+            else if (Season.Models.InstanceSkinBake.TryCreate(_asset, out var freshBake))
+                _asset.SkinBake = freshBake;
+            else
+                _bakeRefused = true;
+        }
+
+        var bake = wanted ? _asset.SkinBake : null;
+        bool wasGpu = _gpuSkin;
+
+        if (bake == null)
+        {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+            return null;
+        }
+
+        // A ring of one slot has no previous frame to point at, and the previous-slot read would then alias the slot this frame
+        // writes. Vulkan always runs with at least two frames in flight, but the fallback is one comparison.
+        if (Device.frameCount < 2)
+        {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+            return null;
+        }
+
+        _gpuPalette ??= new Season.Rendering.InstanceBoneStorage();
+        // tagRows = 0. The stride is the joint count on both sides: the bake's PaletteStride and the block the ring allocates.
+        if (!_skinning.Begin(_gpuPalette, bake, _bonePaletteStride, _asset._animations.Count, 0))
+        {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+            return null;
+        }
+
+        int slots = (int)Device.frameCount;
+        int current = (int)(Device.FrameIndex % Device.frameCount);
+        int previous = (int)((Device.FrameIndex + Device.frameCount - 1) % Device.frameCount);
+
+        // One instance, so one parameter row; the kernel evaluates that row and writes rows [0, jointCount).
+        if (!_skinning.PreparePalette(Season.Basic.Graphics.Instance, slots, current, previous, 1)
+            || !_skinning.BeginFrame(1))
+        {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+            return null;
+        }
+
+        _gpuSkin = true;
+
+        // The palette is relative to the rest pose, so the per-primitive factor has to be the rest world too. Entering the route
+        // from the CPU one leaves an animated pose in the tree, and picking leaves one behind mid-route; both are undone here
+        // rather than where they happen, because this is the only place that knows the tree is being handed over.
+        if (!wasGpu || _asset.CpuPoseDisturbed)
+        {
+            _asset.CpuPoseDisturbed = false;
+            _restPose.Restore(_asset);
+        }
+
+        return bake;
+    }
+
+    /// <summary>
+    /// Rebuilds <see cref="_boneStorageRing"/> and returns whether the buffers it points at changed, which is the condition for
+    /// rewriting the descriptor sets: the sets hold the VkBuffer handle by value, so a reallocation - or the first switch to a ring
+    /// at all - leaves them addressing a retired buffer. The decision is this frame's latch rather than the handoff result, because
+    /// the set is per slot and the vertex-read barrier is recorded by the effect at FrameStart, after Update has already rebuilt
+    /// these sets.
+    /// </summary>
+    bool SyncBoneStorageRing()
+    {
+        var ring = _gpuSkin ? _skinning.Palette : null;
+        if (ring == null)
+        {
+            bool had = _boneStorageRing != null;
+            _boneStorageRing = null;
+            return had;
+        }
+
+        int count = ring.Slots.Length;
+        bool changed = _boneStorageRing == null || _boneStorageRing.Length != count;
+        if (changed)
+            _boneStorageRing = new BufferResource[count];
+
+        for (int i = 0; i < count; i++)
+        {
+            var buffer = ring.Slots[i] is VKStorageBuffer vk ? vk.Buffer : default;
+            if (_boneStorageRing![i].Buffer.Handle != buffer.Buffer.Handle)
+            {
+                _boneStorageRing[i] = buffer;
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// Republishes the palette binding to every descriptor set when the buffer set changed - a first switch to the ring, a
+    /// fallback to the CPU ring, or a resize. Shell sets are included for the same reason as on a bone-buffer resize: they bind
+    /// the same palette, and leaving them on a retired buffer reads freed memory.
+    /// </summary>
+    void CommitBoneStorageRing()
+    {
+        if (!SyncBoneStorageRing())
+            return;
+
+        var primitives = new List<PrimitiveData>();
+        CollectPrimitives(primitives);
+        for (int i = 0; i < primitives.Count; i++)
+            RewriteDescriptorSets(primitives[i]);
+        RewriteShellDescriptorSets();
     }
 
     void ProcessPrimitive(MeshPrimitive meshPrimitive, GltfNodeBase node, Season.Controls.Model model)
@@ -859,6 +1052,11 @@ internal unsafe class VKModel : VKPrimitiveGroup
     /// and dynamic storage buffer.</summary>
     void UploadBoneMatricesToGpu()
     {
+        // The GPU route's whole saving is this early exit: the kernel produced the palette and the ring it wrote is what the
+        // descriptor sets bind, so no curve is sampled and no byte is copied here. Both callers (Update and OnBeforeDraw) land
+        // on this same gate, which matters because OnBeforeDraw runs after Update has latched the route for the frame.
+        if (_gpuSkin) return;
+
         _asset._animationPlayer.UpdateBoneMatrices(_asset.GetAllSkins());
         var boneMatrices = _asset._animationPlayer.GetBoneMatricesArray();
 
@@ -932,9 +1130,34 @@ internal unsafe class VKModel : VKPrimitiveGroup
     {
         bool wasInitialized = _transformInitialized;
 
-        // Update animation through the animation player
-        // (time advancement, keyframe lookup, TRS interpolation, and node-transform updates are handled internally)
-        _asset._animationPlayer.Update(time, _asset.gltfNodes);
+        // Latch the route before anything reads the tree. A frame that switched halfway would compose half a pose on the CPU and
+        // half in the kernel, which renders as a plausible wrong pose rather than as an error.
+        var gpuBake = BeginSkinningFrame(model);
+
+        if (gpuBake != null)
+        {
+            // The kernel samples the bake, so no curve is evaluated and no node transform is touched: the clock and one 16-byte
+            // parameter row are the whole per-frame cost. WorldTransform stays at rest, which is exactly what the palette is
+            // relative to - the vertex stage multiplies each primitive by restWorld * userTransform while the palette carries
+            // inverse(restWorld), so the two cancel and only the user transform survives.
+            var player = _asset._animationPlayer;
+            player.Advance(time);
+            int clip = player.CurrentAnimationIndex;
+            _skinning.SetInstance(0, (uint)clip, gpuBake.NormalizeTime(clip, player.AnimationTime, player.Loop));
+
+            // Picking cannot read a storage buffer, so it asks for a CPU pose instead; see GltfAsset.EnsureCpuPose.
+            _asset.CpuPoseStale = true;
+        }
+        else
+        {
+            // Update animation through the animation player
+            // (time advancement, keyframe lookup, TRS interpolation, and node-transform updates are handled internally)
+            _asset._animationPlayer.Update(time, _asset.gltfNodes);
+        }
+
+        // Morph channels are one of the bake's eligibility rules, so on the GPU route no curve can move a weight and this pass
+        // rewrites last frame's values. It is kept regardless because it is also the upload, and a weight set by code rather than
+        // by a clip still has to reach the GPU.
         UpdateMorphTargetsRecursive(_asset.gltfNodes);
 
         // Apply the user transform to the root nodes
@@ -948,8 +1171,15 @@ internal unsafe class VKModel : VKPrimitiveGroup
         foreach (var rootNode in rootNodes)
             ApplyUserTransformToNodeTree(rootNode, userTransform);
 
-        // Update bone matrices
-        UploadBoneMatricesToGpu();
+        // Update bone matrices. On the GPU route the kernel already produced them and the ring it wrote is what the draw binds,
+        // so the CPU palette is not written at all - which is the saving this route exists for.
+        if (gpuBake == null)
+            UploadBoneMatricesToGpu();
+
+        // The descriptor sets hold VkBuffer handles by value, so a ring that appeared, disappeared or was reallocated has to be
+        // republished. Keyed on this frame's latch rather than on the handoff result, exactly as the instanced path does: the set
+        // is per frame slot, and slot fi is the slot this frame's kernel writes.
+        CommitBoneStorageRing();
 
         _transformInitialized = true;
 
@@ -1097,6 +1327,15 @@ internal unsafe class VKModel : VKPrimitiveGroup
 
     public override void Dispose()
     {
+        // Leave the scheduler before the buffers it points at go away, and release the compute-side parameter and scratch blocks
+        // the target owns. The palette ring is this class's own, so it dies here too; the flattened ring is only a view and is
+        // dropped without touching the buffers.
+        _skinning.Dispose();
+        _gpuPalette?.Dispose();
+        _gpuPalette = null;
+        _boneStorageRing = null;
+        _gpuSkin = false;
+
         foreach (var nodeBase in _asset.gltfNodes)
         {
             if (nodeBase is not GLTFNode node) continue;

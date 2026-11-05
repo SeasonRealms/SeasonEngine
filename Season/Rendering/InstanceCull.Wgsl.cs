@@ -34,7 +34,7 @@ struct CullParams
 @group(0) @binding(0) var<uniform> cullParams: CullParams;
 @group(0) @binding(1) var<storage, read> slotMatrices: array<f32>;
 @group(0) @binding(2) var<storage, read> worlds: array<f32>;
-@group(0) @binding(3) var<storage, read_write> drawArgs: array<u32>;
+@group(0) @binding(3) var<storage, read_write> drawArgs: array<atomic<u32>>;
 @group(0) @binding(4) var<storage, read_write> visibleIds: array<u32>;
 
 // clip = pos * VP (row-vector convention): clip.x is the dot product of the position with column 0, and column 3 is w.
@@ -85,6 +85,9 @@ fn CSMain(@builtin(global_invocation_id) id: vec3<u32>)
         if (!visibleInSlot(slot, center, radius)) { continue; }
         // A7b: the counter lives in the arg buffer's accumulator region, not in the arg table's InstanceCount -- see
         // InstanceCull.SlotCountsOffset for why the two cannot be the same word. The offset is in bytes, this array in uints.
+        // The declaration is array<atomic<u32>> and not array<u32>: WGSL has no implicit atomicity, so atomicAdd is only legal on
+        // an atomic type, and the module fails validation (kernel never registers) otherwise. Finalize/Gather read the same buffer
+        // through their own array<u32> bindings, which is fine -- the access mode lives in each shader, not in the bind group layout.
         let idx: u32 = (cullParams.slotCountsOffset >> 2u) + slot;
         let k: u32 = atomicAdd(&drawArgs[idx], 1u);
         visibleIds[slot * cullParams.capacity + k] = i;

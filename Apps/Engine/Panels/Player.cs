@@ -9,11 +9,22 @@ internal class Player : Panel
     // Long-jump state: starts on click, advances in UpdateLongJump, and resets on landing.
     internal bool jumping;
 
+    /// <summary>
+    /// True while the automated plane is lifting the pilot back out of the cockpit. The plane drives the body for
+    /// the length of that arc, so the seat bind and the floor pin below must both stand down; it is deliberately
+    /// not <see cref="jumping"/>, which would hand the body to Skill's long-jump step.
+    /// </summary>
+    internal bool planeExit;
+
     bool modelFirst = true;
 
     bool modelSettled;
 
-    internal Season.Controls.Model model;
+    /// <summary>
+    /// The character. It carries a full attitude rather than yaw alone (see <see cref="AttitudeBody"/>) because the
+    /// cockpit of a banking aircraft takes the pilot over with it.
+    /// </summary>
+    internal AttitudeBody model;
 
     internal Season.Controls.Model torch;
 
@@ -99,7 +110,7 @@ internal class Player : Panel
 
     internal Player()
     {
-        model = new Season.Controls.Model()
+        model = new AttitudeBody()
         {
             Name = @"Assets/3DGodotRobot.glb",
             Highlight =
@@ -108,7 +119,7 @@ internal class Player : Panel
             },
             PosX = 0,
             PosY = 0.5f,
-            PosZ = 0,
+            PosZ = 0.5f,
             Width = BodyWidth,
             Height = BodyHeight,
             Depth = BodyDepth,
@@ -220,10 +231,46 @@ internal class Player : Panel
         // is exempt because it is steering the body itself, and the landing test decides whether the player stayed
         // aboard or stepped off. The balloon's basket works the same way, one branch over, except that its seat only
         // hands over the position: the heading stays with the camera (App.SyncPlayerYawToCamera), so the body turns
-        // freely inside the basket while the balloon keeps its own course.
+        // freely inside the basket while the balloon keeps its own course. The aircraft's cockpit is the third seat:
+        // the plane owns the whole ride, so it hands over both the position and the heading.
         var boat = App.Instance.boat;
         var balloon = App.Instance.hotAirBalloon;
-        if (balloon != null && balloon.Aboard && !jumping)
+        var plane = App.Instance.aeroPlane;
+
+        // Upright by default: the two extra axes belong to the cockpit alone, so a body that steps back out of a
+        // banking aircraft, or hangs under a canopy, is not left leaning. Every branch below that wants a tilt
+        // writes it again after this.
+        model.Pitch = 0f;
+        model.Roll = 0f;
+
+        if (plane != null && plane.Aboard && !jumping && !planeExit)
+        {
+            // In the cockpit: the seat is on the fuselage centre line and the body faces the way the nose points,
+            // so the pilot rides the climb with the airframe instead of standing level in a pitching aircraft. The
+            // pitch and the bank come across as well: the pilot is strapped into a seat that tilts with the wings,
+            // and a body left upright while the cockpit rolls forty degrees is what reads as standing in the wrong
+            // place in the cabin.
+            //
+            // Both angles are negated, because the pilot's yaw is half a turn off the airframe's (PilotYaw): the
+            // character's own +X and +Z both end up pointing opposite the aircraft's, so an angle copied straight
+            // across turns the body the other way in the world - the seat would lean out of the wing it is tucked
+            // into, and the pilot would pitch nose-down as the jet climbs.
+            //
+            // The half-height is measured along the airframe's up (SeatUp), not the world's: the body turns about its
+            // own centre, so lifting the centre straight up would leave the feet hanging off the floor sideways by
+            // half the body times the sine of the bank. Along SeatUp the feet sit exactly on the seat at any attitude.
+            var seat = plane.SeatPosition;
+            var up = plane.SeatUp;
+            float half = (model.Height ?? 0f) * 0.5f;
+
+            model.PosX = seat.X + up.X * half;
+            model.PosY = seat.Y + up.Y * half;
+            model.PosZ = seat.Z + up.Z * half;
+            model.Rotation = plane.PilotYaw;
+            model.Pitch = -plane.PilotPitch;
+            model.Roll = -plane.PilotRoll;
+        }
+        else if (balloon != null && balloon.Aboard && !jumping)
         {
             var seat = balloon.SeatPosition;
             model.PosX = seat.X;
@@ -238,7 +285,7 @@ internal class Player : Panel
             model.PosY = seat.Y + (model.Height ?? 0f) * 0.5f;
             model.Rotation = boat.Heading;
         }
-        else if (!jumping && poseScale != poseTarget)
+        else if (!jumping && !planeExit && poseScale != poseTarget)
         {
             // The feet are the fixed end of a body still changing size, so the centre has to be re-read from the
             // floor and the height it has right now. Without this a body growing back to full size sinks half of
@@ -339,5 +386,49 @@ internal class Player : Panel
         // calls for at every distance, and it moves with the pose instead of stepping at the ends of it; the range
         // stays fixed, because shortening it would cut the lit circle off instead of dimming it.
         torchLight.Intensity = TorchLightIntensity * k;
+    }
+}
+
+/// <summary>
+/// A model with a full three-axis attitude instead of the single yaw <see cref="Season.Controls.Model"/> turns about.
+/// Two things in this sample need one: the airframe (<see cref="PlaneBody"/>), whose nose rises on the climb and whose
+/// wings bank into the turns, and the pilot, who is strapped into that airframe and therefore has to tilt with it.
+///
+/// <para>The matrix is built from the body axes rather than from three chained <c>CreateRotation*</c> calls: yaw sets
+/// the nose and the starboard axis, pitch swings both about the starboard axis, and bank swings the wing about the
+/// nose. Writing the result as rows means <c>p * R</c> maps a local point onto the world, which is the layout
+/// <c>BuildWorldMatrix</c> expects, so the drawn pose, the anchor offset, the picking box and the shadow box all read
+/// the same attitude.</para>
+/// </summary>
+internal class AttitudeBody : Season.Controls.Model
+{
+    /// <summary>Nose-up angle about the starboard axis, radians. Positive raises the nose.</summary>
+    internal float Pitch;
+
+    /// <summary>Bank angle about the nose, radians. Positive lifts the starboard side.</summary>
+    internal float Roll;
+
+    protected override Matrix4x4 GetRotationMatrix()
+    {
+        float cy = MathF.Cos(Rotation), sy = MathF.Sin(Rotation);
+
+        // Engine space: the asset's nose is its local +Z (the loader mirrors the glTF -Z), +Y is up, +X starboard.
+        var right = new Vector3(cy, 0f, -sy);
+        var up = Vector3.UnitY;
+        var noseFlat = new Vector3(sy, 0f, cy);
+
+        float cp = MathF.Cos(Pitch), sp = MathF.Sin(Pitch);
+        var nose = noseFlat * cp + up * sp;
+        var pitchedUp = up * cp - noseFlat * sp;
+
+        float cr = MathF.Cos(Roll), sr = MathF.Sin(Roll);
+        var bankedRight = right * cr + pitchedUp * sr;
+        var bankedUp = pitchedUp * cr - right * sr;
+
+        return new Matrix4x4(
+            bankedRight.X, bankedRight.Y, bankedRight.Z, 0f,
+            bankedUp.X, bankedUp.Y, bankedUp.Z, 0f,
+            nose.X, nose.Y, nose.Z, 0f,
+            0f, 0f, 0f, 1f);
     }
 }

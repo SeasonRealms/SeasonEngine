@@ -245,7 +245,9 @@ internal class Campfire : Panel
         Acceleration = new Vector3(0.10f, 0.85f, 0.05f),
         Spread = 0.12f,
         Turbulence = 0.42f,
-        WindVelocity = new Vector3(0.32f, 0f, 0.10f),
+        // Seeded from the world wind rather than a fixed breeze: Update writes Wind.Velocity here every frame, so
+        // this value only covers the frame before the first Update and the case where the effect is not advanced.
+        WindVelocity = Wind.Velocity,
         FadeIn = 0.12f,
         FadeOut = 0.45f,
         ParticleSize = 0.11f,
@@ -290,6 +292,17 @@ internal class Campfire : Panel
         elapsed += delta;
 
         float flicker = Flicker(elapsed);
+
+        // The plume is the scene's one airborne material, so it is also where the world wind shows. Wind.Velocity
+        // is read rather than cached so the settings rows act on the next frame; the shader integrates it as
+        // center += wind * age, which means a level change re-shapes the whole column immediately instead of
+        // bending only the particles born afterwards - the field is a closed-form function of age, not a
+        // simulation state, so there is nothing to ease in.
+        //
+        // Only the smoke follows it: the flame and the sparks keep their authored values because a fire's own
+        // convection dominates a few metres above the grass, and the brief asked for the smoke first.
+        if (smoke != null)
+            smoke.WindVelocity = Wind.Velocity;
 
         for (int i = 0; i < systems.Count; i++)
         {

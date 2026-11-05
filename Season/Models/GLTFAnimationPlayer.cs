@@ -153,10 +153,32 @@ internal class GLTFAnimationPlayer
         if (!_isAnimating || _animations.Count == 0 || allNodes == null || allNodes.Count == 0)
             return;
 
-        // Advance time.
+        Advance(deltaTime);
+
+        // Apply the current animation.
+        if (_currentAnimationIndex < _animations.Count)
+        {
+            ApplyAnimation(_animations[_currentAnimationIndex], _animationTime, allNodes);
+        }
+
+        // Update world transforms for all nodes.
+        UpdateAllNodeTransforms(allNodes);
+    }
+
+    /// <summary>
+    /// Advances the playback clock and nothing else. This is the exact slice of <see cref="Update"/> the GPU skinning route needs:
+    /// the kernel samples the bake, so no curve is evaluated and no node transform is touched, but the wrap and the "stopped at
+    /// the end" latch must remain identical, because the pair they decide - clip index and absolute time - is what the kernel is
+    /// handed. A route that kept its own copy of the clock would drift from the reference by one wrap per clip instead of
+    /// reporting it.
+    /// </summary>
+    public void Advance(float deltaTime)
+    {
+        if (!_isAnimating || _animations.Count == 0)
+            return;
+
         _animationTime += deltaTime;
 
-        // Handle looping.
         if (_animationTime > _animationDuration)
         {
             if (_loop)
@@ -167,15 +189,6 @@ internal class GLTFAnimationPlayer
                 _isAnimating = false;
             }
         }
-
-        // Apply the current animation.
-        if (_currentAnimationIndex < _animations.Count)
-        {
-            ApplyAnimation(_animations[_currentAnimationIndex], _animationTime, allNodes);
-        }
-
-        // Update world transforms for all nodes.
-        UpdateAllNodeTransforms(allNodes);
     }
 
     /// <summary>

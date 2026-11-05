@@ -82,6 +82,14 @@ internal sealed class WGPUStorageBuffer : Season.Rendering.StorageBuffer
 
     internal readonly string Id;
 
+    /// <summary>
+    /// C1: set by <c>TryPrepareVertexInput</c> once the JS side has been told to draw this buffer as slot 0, and cleared again as
+    /// soon as a dispatch writes it. WebGPU has no barrier to record - the queue order plus the usage bit declared at creation
+    /// carries the handoff - so this flag is the whole handoff, and it is what makes a stream that was never written (the cloth
+    /// never stepped, or the effect already disposed) fall back to the static vertex buffer.
+    /// </summary>
+    internal bool VertexInputReady;
+
     internal WGPUStorageBuffer(uint sizeInBytes, Season.Rendering.StorageBufferUsage usage)
     {
         SizeInBytes = sizeInBytes;
@@ -89,7 +97,13 @@ internal sealed class WGPUStorageBuffer : Season.Rendering.StorageBuffer
         Id = $"sb_{_nextId++}";
     }
 
-    public override void Dispose() => WebGPUInterop.DisposeStorageBuffer(Id);
+    public override void Dispose()
+    {
+        // A released stream is never in the vertex-input state, so any mesh still pointing at it draws its static buffer even
+        // before the producer clears Surface.VertexStream.
+        VertexInputReady = false;
+        WebGPUInterop.DisposeStorageBuffer(Id);
+    }
 }
 
 /// <summary>Standalone HDR fog composite handle; the native PSO, resource identity, and per-frame parameter slots are managed by JS.</summary>

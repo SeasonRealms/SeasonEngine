@@ -148,6 +148,11 @@ internal class Logo : Panel
     /// </summary>
     bool UpdateStatistics(float time, int size)
     {
+        // 逐像素 A/B（AbCapture）下这一行不画。它是画面上唯一取自墙上时钟的元素：固定步长把仿真钉住了，
+        // 帧率读数的分子却仍然是"机器这一秒跑了多少帧"。内存两项是确定的，但它们与帧率共用同一个字符串，
+        // 分开只剩一次无意义的取舍。不更新即不布局，statisticsText 从构造起内容为空，自然不产生像素。
+        if (AbCapture.Enabled) return false;
+
         var statistics = GraphicsStatistics.Current;
 
         if (statistics.Fps != statisticsFps

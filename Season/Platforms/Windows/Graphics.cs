@@ -636,6 +636,24 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         return true;
     }
 
+    /// <summary>
+    /// C1: a compute-written buffer can feed a Mesh3D surface's per-vertex IA stream. The same barrier A7 records for the gathered
+    /// instance stream (see DXInstancedPrimitiveGroup.PrepareCullDraw), lifted into the public contract. The draw side checks the
+    /// tracked state itself (PrimitiveData.ResolveVertexView), so a frame whose handoff did not happen draws the static vertices.
+    /// </summary>
+    public bool VertexInputStorageSupported => ComputeSupported;
+
+    public bool TryPrepareVertexInput(Season.Rendering.StorageBuffer buffer)
+    {
+        var cmd = DirectX.Device.GraphicsCommandList;
+        if (cmd == null || DirectX.Device.ActiveTarget != null
+            || buffer is not DXStorageBuffer dxBuffer || dxBuffer.Resource == null
+            || dxBuffer.Usage != Season.Rendering.StorageBufferUsage.ComputeAndVertexInput)
+            return false;
+        dxBuffer.TransitionTo(cmd, ResourceStates.VertexAndConstantBuffer);
+        return true;
+    }
+
     /// <summary>Indirect instanced quad draw pipeline. Returns null on creation failure, which makes the particle effect skip registration entirely and the image fall back to its pre-change state.</summary>
     public Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline()
     {

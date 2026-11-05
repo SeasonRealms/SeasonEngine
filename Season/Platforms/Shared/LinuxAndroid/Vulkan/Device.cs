@@ -1531,8 +1531,7 @@ internal unsafe static class Device
             || !ReferenceEquals(_decalNormalRT, normal)
             || _decalColorVersion != color.ColorViewVersion || _decalNormalVersion != normalVersion)
         {
-            if (_decalFramebuffer.Handle != 0)
-                Vk.DestroyFramebuffer(LogicalDevice, _decalFramebuffer, null);
+            RetireFramebuffer(_decalFramebuffer);
 
             var attachments = stackalloc Silk.NET.Vulkan.ImageView[2] { color.ColorView, normal?.ColorView ?? color.ColorView };
             var fbInfo = new FramebufferCreateInfo
@@ -1961,8 +1960,7 @@ internal unsafe static class Device
         if (_waterFramebuffer.Handle == 0 || !ReferenceEquals(_waterColorRT, color)
             || _waterColorVersion != color.ColorViewVersion)
         {
-            if (_waterFramebuffer.Handle != 0)
-                Vk.DestroyFramebuffer(LogicalDevice, _waterFramebuffer, null);
+            RetireFramebuffer(_waterFramebuffer);
 
             var attachments = stackalloc Silk.NET.Vulkan.ImageView[1] { color.ColorView };
             var fbInfo = new FramebufferCreateInfo
@@ -2017,8 +2015,7 @@ internal unsafe static class Device
         if (_ssrCompositeFramebuffer.Handle == 0 || !ReferenceEquals(_ssrCompositeColorRT, color)
             || _ssrCompositeColorVersion != color.ColorViewVersion)
         {
-            if (_ssrCompositeFramebuffer.Handle != 0)
-                Vk.DestroyFramebuffer(LogicalDevice, _ssrCompositeFramebuffer, null);
+            RetireFramebuffer(_ssrCompositeFramebuffer);
 
             var attachments = stackalloc Silk.NET.Vulkan.ImageView[1] { color.ColorView };
             var fbInfo = new FramebufferCreateInfo
@@ -2131,6 +2128,27 @@ internal unsafe static class Device
         return true;
     }
 
+    /// <summary>
+    /// Retires the framebuffer handle that a single-slot pass cache is about to replace. Never destroys immediately:
+    /// one frame binds more than one scene view, and the decal, water, SSR and mask caches hold a single slot each, so the
+    /// framebuffer replaced here is very likely the one bound by a pass recorded earlier in the command buffer that is
+    /// still recording. Destroying it at that point puts the whole buffer into the invalid state
+    /// (VUID-vkCmdBeginRenderPass-commandBuffer-recording: "objects bound to the command buffer were invalidated") and
+    /// every later command of that frame is reported as well.
+    /// Callers only swap the cached handle, so the new render pass and framebuffer take effect for the rest of the frame,
+    /// and this destroy lands once the timeline fence passes the retire value captured now — the same contract as
+    /// <see cref="VKRenderTarget.Dispose"/>.
+    /// </summary>
+    static void RetireFramebuffer(Framebuffer framebuffer)
+    {
+        if (framebuffer.Handle == 0)
+            return;
+
+        var vk = Vk;
+        var device = LogicalDevice;
+        EnqueueDeferredRelease(() => vk.DestroyFramebuffer(device, framebuffer, null));
+    }
+
     /// <summary>RT destruction retires by fence; only the GPU-idle point of Resize allows immediate cleanup.</summary>
     internal static void ReleaseSceneTargetPasses(VKRenderTarget target, bool immediate = false)
     {
@@ -2214,8 +2232,7 @@ internal unsafe static class Device
             _outlineMaskDepthRT != depthRT ||
             _outlineMaskDepthVersion != depthRT.DepthViewVersion)
         {
-            if (_outlineMaskFramebuffer.Handle != 0)
-                Vk.DestroyFramebuffer(LogicalDevice, _outlineMaskFramebuffer, null);
+            RetireFramebuffer(_outlineMaskFramebuffer);
 
             var attachments = stackalloc Silk.NET.Vulkan.ImageView[2] { maskRT.ColorView, depthRT.DepthView };
             var fbInfo = new FramebufferCreateInfo

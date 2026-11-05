@@ -51,9 +51,9 @@ internal class SettingPanel : BoardPanel
     Input inputPage;
     int page, pageCount = 1;
 
-    Texts textsMode, textsMovement, textsPlayerSpeed, textsFov, textsDayNightSpeed, textsStartHour, textsStep, textsAntiAliasing, textsGi, textsShadows, textsAo, textsSea, textsWaveHeight, textsWaveSpeed, textsFog, textsFogPreset, textsFogDensity, textsFogQuality, textsFogHistory, textsFogInfo, textsShadowOffset, textsShadowSoftness, textsShadowContact, textsNormalVariance, textsSceneNormals, textsLog;
+    Texts textsMode, textsMovement, textsPlayerSpeed, textsFov, textsDayNightSpeed, textsStartHour, textsStep, textsAntiAliasing, textsGi, textsShadows, textsAo, textsSea, textsWaveHeight, textsWaveSpeed, textsWindDirection, textsWindLevel, textsFog, textsFogPreset, textsFogDensity, textsFogQuality, textsFogHistory, textsFogInfo, textsShadowOffset, textsShadowSoftness, textsShadowContact, textsNormalVariance, textsSceneNormals, textsLog;
 
-    Input inputMode, inputMovement, inputPlayerSpeed, inputFov, inputDayNightSpeed, inputStartHour, inputStep, inputAntiAliasing, inputGi, inputShadows, inputAo, inputSea, inputWaveHeight, inputWaveSpeed, inputFog, inputFogPreset, inputFogDensity, inputFogQuality, inputFogHistory, inputFogInfo, inputShadowOffset, inputShadowSoftness, inputShadowContact, inputNormalVariance, inputSceneNormals, inputLog;
+    Input inputMode, inputMovement, inputPlayerSpeed, inputFov, inputDayNightSpeed, inputStartHour, inputStep, inputAntiAliasing, inputGi, inputShadows, inputAo, inputSea, inputWaveHeight, inputWaveSpeed, inputWindDirection, inputWindLevel, inputFog, inputFogPreset, inputFogDensity, inputFogQuality, inputFogHistory, inputFogInfo, inputShadowOffset, inputShadowSoftness, inputShadowContact, inputNormalVariance, inputSceneNormals, inputLog;
 
     BaseControl current = null;
 
@@ -1099,6 +1099,106 @@ internal class SettingPanel : BoardPanel
         };
         AddPanel(inputWaveSpeed);
 
+        // 风向与风量：一对配套的世界参数，所以和波纹一样紧挨着放在海面那组之后 —— 都是"这个世界此刻怎么动"的数值，
+        // 而不是"用哪一档渲染"。风本身由 Wind 统一换算成 m/s 的向量，面板只写这两个数。
+        //
+        // 风向是自由输入的 0~360，而不是像波纹那样的预设列表：角度没有"看得过的几个值"，任何一度都可能是想要的方向，
+        // 用弹窗输入才不至于把 0~360 砍成 8 个方位。输入框里的显示带 °，但回填给键盘的是裸数字，否则原样确认会因为
+        // 那个符号解析失败。超范围与负数由 WorldSettings.WindDirection 自己绕回 0~360。
+        textsWindDirection = new Texts()
+        {
+            Content = "风向",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsWindDirection);
+
+        inputWindDirection = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                // 回填的是格式化后的裸数字，而不是 inputWindDirection.Text：那个带 ° 后缀，原样确认会解析失败。
+                string seed = Wind.DirectionDegrees.ToString("0", System.Globalization.CultureInfo.InvariantCulture);
+
+                var result = await DeviceServices.Dialog.ShowKeyboard("风向".Translate(), "", new string[] { "OK".Translate(), "Cancel".Translate() }, seed);
+
+                if (result is not null && float.TryParse(result, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out float degrees))
+                {
+                    // 只写设置，不写粒子：火堆每帧自己读 Wind.Velocity，所以改完立刻生效，也不需要通知谁。
+                    WorldSettings.Current.WindDirection = degrees;
+
+                    DeviceServices.BaseApp?.RequestSaveSettings();
+                }
+            }
+        };
+        AddPanel(inputWindDirection);
+
+        // 风量是 0~10 的整数档，用预设列表而不是键盘：档位有界且只有十一项，列表比输入法可靠。0 明确写成"无风"，
+        // 因为 0 在这里不是"最小"而是一个特殊状态 —— 烟雾会笔直上升，而不是被吹得很慢。
+        textsWindLevel = new Texts()
+        {
+            Content = "风量",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsWindLevel);
+
+        inputWindLevel = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = () =>
+            {
+                var sources = new List<Season.Entities.EData>();
+
+                for (int level = 0; level <= Wind.MaxLevel; level++)
+                {
+                    string suffix = level == 0 ? "（无风）"
+                        : level == WorldSettings.DefaultWindLevel ? "（默认）"
+                        : "";
+
+                    sources.Add(new Season.Entities.EData()
+                    {
+                        Key = level.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        Title = level + " 级 · " + Wind.SpeedOfLevel(level).ToString("0.##",
+                            System.Globalization.CultureInfo.InvariantCulture) + " m/s" + suffix
+                    });
+                }
+
+                current = inputWindLevel;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null && int.TryParse(picked.Key, System.Globalization.NumberStyles.Integer,
+                            System.Globalization.CultureInfo.InvariantCulture, out int level))
+                        {
+                            WorldSettings.Current.WindLevel = level;
+
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputWindLevel);
+
         inputFog = new Input()
         {
             WidthMin = WidthMin,
@@ -1673,7 +1773,7 @@ internal class SettingPanel : BoardPanel
 
         // 同时限制列宽和行高，避免新增天气行后越出面板。短窗口压缩行距，放不下时分页。
         // 非当前页的输入停用且透明，防止看不见的旧位置仍参与命中。
-        const int rowCount = 29;
+        const int rowCount = 31;
         var rowTop = (int)(title.PosY + padding + paddingH);
         var rowWidth = inputLeft + width0 + 100;
         var panelWidth = (int)(width ?? App.Instance.ExtendResolution.X - 200);
@@ -1795,6 +1895,14 @@ internal class SettingPanel : BoardPanel
         Place(textsWaveHeight, inputWaveHeight, Season.Rendering.WorldSettings.Current.SeaWaveHeight.ToString("0.##",
             System.Globalization.CultureInfo.InvariantCulture) + " m");
         Place(textsWaveSpeed, inputWaveSpeed, Season.Rendering.WorldSettings.Current.SeaWaveSpeed.ToString("0.##",
+            System.Globalization.CultureInfo.InvariantCulture) + " m/s");
+
+        // 风向打印成整数度：Wind 内部是 0~360 的浮点，但一列像素宽的框里带小数只会挤，而 1° 在这个尺度上已经是
+        // 看不出来的差别。风量同时给出级和它对应的 m/s，因为两者是同一个风向量的两个说法 —— 级是面板的语言，
+        // m/s 是 Wind 真正交给烟雾的语言，写在一起就不必去翻代码对账。
+        Place(textsWindDirection, inputWindDirection, Wind.DirectionDegrees.ToString("0",
+            System.Globalization.CultureInfo.InvariantCulture) + "°");
+        Place(textsWindLevel, inputWindLevel, Wind.Level + " 级 · " + Wind.Speed.ToString("0.##",
             System.Globalization.CultureInfo.InvariantCulture) + " m/s");
 
         Place(textsShadowOffset, inputShadowOffset, RenderQuality.Current.ShadowNormalOffset.ToString("0.##",

@@ -200,6 +200,14 @@ internal class App : BaseApp
     // Bridge.cs.
     internal Bridge bridge;
 
+    // 水池东堤旁的海边阶梯与直路：三排石阶与 Pond 台阶同款、面朝大海、沿堤坝行居中，路从阶梯脚下
+    // 沿 z = -7.05 铺到 x = 74 的海岸岩石带为止，沥青纹路与南侧的路同出一处。See SeaRoad.cs.
+    internal SeaRoad seaRoad;
+
+    // 鬼屋与跑道正中间的圆形旗杆：底座是可行走的圆形平台，杆顶挂一面两面各印一幅海盗图的薄布旗。
+    // See Flagpole.cs.
+    internal Flagpole flagpole;
+
     // 维京小船：泊在水池北岸的台阶边，也就是 Player 出生点正下方，模型自带的 morph 动画驱动划桨与风帆。
     // 静止时由 Boat 自己算三个低频摇晃；跳上甲板后 Player 绑定在座位上、方向键驱动 Boat.Steer，
     // 可行水域（水池 / 支流 / 主河道 / 桥下 / 海口 / 海面 / 瀑布潭）见 Boat.cs。
@@ -212,6 +220,11 @@ internal class App : BaseApp
     // 飞机群：十架按 1/2/3/4 四列排成楔形，在岛外的海面上方、与高塔平台同高绕岛作圆周飞行，
     // 每架的螺旋桨循环自转。见 Planes.cs。
     internal Planes planes;
+
+    // 海边跑道上的玩家飞机：停在水池东堤旁那条沥青路上、机头朝海，Player 跳进座舱后整段航程自动完成
+    // （3-2-1 倒计时、滑跑、半程起飞、掠过 Rocks 爬升、左转汇入 Planes 的绕岛航线飞三圈、原路俯冲回跑道、
+    // 滑回停机位掉头）。见 AeroPlane.cs。
+    internal AeroPlane aeroPlane;
 
     CubeField cubeField;
 
@@ -932,6 +945,25 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         tower.PosZ = -26f;
         AddPanel(tower);
 
+        // Seaside stair and road beside the pond's east dike: the pond's three stone steps turned to face the sea,
+        // centered on the rim row, with the south road's asphalt running east from the stair foot to the coastal
+        // rock line at x = 74. The flight leans against the bank pieces' outer face without intersecting them.
+        // See SeaRoad.cs.
+        seaRoad = new SeaRoad();
+        AddPanel(seaRoad);
+
+        // Round flagpole on the direct line between the haunted house and the runway, halfway along it: a 0.2 m
+        // stone disc, a 10 m column half a player across, and a 2.4 x 1.6 m cloth at the top with a different
+        // pirate picture printed on each face. Created before the picker below, which registers the column and the
+        // cloth as ordinary selectable entities. See Flagpole.cs.
+        // The parts are authored around the pole axis, so the panel position is what puts the pole on the lawn;
+        // Flagpole.CenterX / CenterZ are that midpoint and FloorHeightAtWorld reads this same position back.
+        flagpole = new Flagpole();
+        flagpole.PosX = Flagpole.CenterX;
+        flagpole.PosY = 0f;
+        flagpole.PosZ = Flagpole.CenterZ;
+        AddPanel(flagpole);
+
         CreatePondDecals();
 
         robots = new Robots();
@@ -948,6 +980,13 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
 
         planes = new Planes();
         AddPanel(planes);
+
+        // The player's aircraft on the seaside road: parked nose-to-sea at x = 14 on the same centre line the
+        // asphalt follows, so a leap from the road lands on the fuselage deck and starts the automated trip.
+        // Created before the picker below, which registers the airframe as an ordinary selectable entity.
+        // See AeroPlane.cs.
+        aeroPlane = new AeroPlane();
+        AddPanel(aeroPlane);
 
         // P3 acceptance: the island scene's two extra cameras. Created here because platform initialization has already
         // registered the main view's offscreen attachments, so the mirror can copy its SceneColor format and MRT shape.
@@ -1075,6 +1114,11 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         picker.InstancedTargets.Add(planes.planesModel);
         // 船也是普通可选实体：点击选中后可在属性面板里查看它，与房子/瀑布同一条路径。
         picker.Targets.Add(boat.Hull);
+        // The player's aircraft is the same kind of entity: click it to inspect the airframe in the property panel.
+        picker.Targets.Add(aeroPlane.body);
+        // 旗杆与旗帜同样可选：杆柱和布面各算一个目标，点击后可在属性面板里查看位置与尺寸。
+        picker.Targets.Add(flagpole.Pole);
+        picker.Targets.Add(flagpole.Flag);
         AddPanel(picker);
 
         // Movement-collision registration: only register solid obstacles that block ground travel.
@@ -1100,6 +1144,15 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // the feet stand on the deck the river's water below is ignored so the crossing is not blocked. See
         // Bridge.cs.
         collider.Bridge = bridge;
+        // The seaside stair's three steps are walkable floors climbed one riser at a time from the east road, the
+        // same treatment the pond steps get; the road itself lies 5 cm into the grass and needs no height source.
+        collider.SeaRoad = seaRoad;
+        // The flagpole's platform is a walkable step rather than an obstacle, so the player steps onto the disc and
+        // is stopped by the column standing on it. See Flagpole.cs.
+        collider.Flagpole = flagpole;
+        // Only the column blocks. The 0.2 m disc is deliberately not an obstacle: a box around it would read as an
+        // invisible step at the platform edge, the same reason the campfire's ash bed is skipped below.
+        collider.Obstacles.Add(flagpole.Pole);
         foreach (var blocker in tower.Blockers)
         {
             collider.Obstacles.Add(blocker);
@@ -1356,6 +1409,14 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
 
         logo?.Update(time);
 
+        // The flagpole's red button is world geometry rather than an overlay control, so its tap is resolved before
+        // the picker: a press that lands on the disc runs the flag and is consumed, while a miss leaves the release
+        // for the picker to select the pole behind it. Same bottom-bar guard as the picker below.
+        if (painting == null || !painting.MouseOver)
+        {
+            flagpole?.TryTapButton();
+        }
+
         // Run hover picking last so picking and bounds matching read the final world matrices for this frame,
         // after every panel has finished updating.
         if ((painting == null || !painting.MouseOver) && picker != null && picker.Alpha > 0 && picker.Update(time))
@@ -1528,6 +1589,11 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // Background mountains are statically instanced and early-out internally until extraction finishes.
         mountains?.Update(time);
 
+        // The player's aircraft moves before Player, so the cockpit bind later in this frame reads the seat the
+        // aircraft is actually drawn at; it also finishes its own pilot-exit arc there (Player.planeExit keeps the
+        // bind off for that stretch). See AeroPlane.cs.
+        aeroPlane?.Update(time);
+
         player?.Update(time);
 
         streetLight?.Update(time);
@@ -1558,6 +1624,10 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         //bar?.Update(time);
 
         room?.Update(time);
+
+        seaRoad?.Update(time);
+
+        flagpole?.Update(time);
 
         pond?.Update(time);
 
@@ -1873,6 +1943,11 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     /// 贴图要过几秒才进字典，而水幕/河流的第一帧就要按名字取样，期间整条水带按“缺表即跳过”的约定不画。
     /// LoadSprite2D 内部是同步解码，队列里那条稍后会命中同一个缓存键，不会重复解码。
     ///
+    /// 浏览器是唯一例外：WASM 单线程运行时没有 Monitor，任何 Task.Wait / GetResult 都会抛
+    /// PlatformNotSupportedException（见下方），而浏览器取图本身也只能走异步 fetch，同步等不到任何东西。
+    /// 那里只保留 AddControl 排进队列的那一条，由图元队列逐帧解码（BaseApp.ProcessControlQueueFrame）；
+    /// 代价是水幕在最初几帧还没图、按缺表约定不画，等字典填上后自然出现。
+    ///
     /// 按名字去重：多条瀑布共用同一套三张贴图，不去重就是几个空 Sprite2D 各自加载同一份文件。
     /// internal：WaterfallPool 的潭底两张贴花走同一条命名纹理路径，不再另开加载链。
     /// </summary>
@@ -1892,6 +1967,10 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             Enable = false,
         };
         AddControl(sprite);
+
+        // 浏览器：AddControl 已经把它排进队列，那一条就是它唯一的解码路径 —— 这里若再直接调一次
+        // LoadSprite2D，两次都会走到 AddRef，队列那条稍后落空就是引用计数收支不一致。
+        if (OperatingSystem.IsBrowser()) return;
 
         try
         {

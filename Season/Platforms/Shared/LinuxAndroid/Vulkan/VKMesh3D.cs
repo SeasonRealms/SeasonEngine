@@ -174,6 +174,12 @@ internal unsafe class VKMesh3D : VKPrimitiveGroup
 
         _transformInitialized = true;
 
+        // C1: mirror each surface's compute stream onto its primitive (same order, reference copy only). The draw side decides
+        // per frame whether the stream or the static buffer is read, see PrimitiveData.ResolveVertexBuffer.
+        int streamCount = Math.Min(Primitives.Count, mesh.Surfaces.Count);
+        for (int i = 0; i < streamCount; i++)
+            Primitives[i].VertexStream = mesh.Surfaces[i].VertexStream as VKStorageBuffer;
+
         // Sync Mesh3D.Alpha to the material buffer of all primitives
         // (written only when changed, as determined by the base class)
         SyncAlpha(mesh.Alpha);

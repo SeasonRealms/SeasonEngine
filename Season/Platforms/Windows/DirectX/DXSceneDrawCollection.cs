@@ -230,7 +230,10 @@ internal unsafe sealed class DXSceneDrawCollection
         // twenty MB of geometry data per frame through the write-combined upload page, measured at ninety percent of the collection time.
         Arena.Retain(geometry.VertexBuffer);
         Arena.Retain(geometry.IndexBuffer);
-        draw.Vertex = primitive.VertexBufferView;
+        // C1: a compute-written stream is retained the same way; ResolveVertexView decides which of the two the draw reads.
+        if (geometry.VertexStream != null && geometry.VertexStream.Resource != null)
+            Arena.Retain(geometry.VertexStream.Resource);
+        draw.Vertex = primitive.ResolveVertexView();
         draw.Indices = primitive.IndexBufferView;
         draw.Indexed = true;
         draw.Count = (uint)primitive.Indices.Length;

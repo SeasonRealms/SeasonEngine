@@ -211,13 +211,17 @@ public static VkPipeline TransparentBackFacePipelineState;
     internal static void ResetActiveView() => ActiveViewIndex = 0;
 
     /// <summary>
-    /// One fog sampling set per frame slot. Written once at the start of the transparent phase and reused for the rest of the frame:
-    /// all transparent draw items in the same frame get the same fog resources (fog composite is produced per frame, independent of draw items),
-    /// so there is no need for a set per item, and the "write first, then bind" order also holds naturally.
+    /// Fog sampling sets, view slot × frame slot. One per view rather than one per frame slot:
+    /// every view runs its own fog composite, so a second view in the same frame needs different volumetric views, and
+    /// rewriting the set the first view already bound would invalidate the command buffer still being recorded
+    /// (a set without UPDATE_AFTER_BIND may not be rewritten once a recording buffer references it; the layer then reports
+    /// every following command of that frame as invalid, VUID-vkCmdBeginRenderPass-commandBuffer-recording).
+    /// Per-view sets are rewritten only when that view's turn comes around again on the same frame slot, which
+    /// <see cref="PrepareTransparentFog"/> covers with Device.WaitForFrameSlot.
     /// </summary>
-    static DescriptorSet[] _fogSets = null!;
+    static DescriptorSet[][] _fogSets = null!;
 
-    /// <summary>The fog sampling set to bind to set 1 for this frame's drawing; set to the current frame slot's set in the transparent phase, otherwise falling back to <see cref="DefaultFogSet"/>.</summary>
+    /// <summary>The fog sampling set to bind to set 1 for this frame's drawing; set to the current view's frame-slot set in the transparent phase, otherwise falling back to <see cref="DefaultFogSet"/>.</summary>
     internal static DescriptorSet CurrentFogSet;
 
     /// <summary>
@@ -732,8 +736,8 @@ public static VkPipeline TransparentBackFacePipelineState;
     static ulong FogFrameByteSize => (ulong)Season.Rendering.Effects.VolumetricFogEffect.FrameVectorCount * 16;
 
     /// <summary>
-    /// Builds the fog sampling sets: one default set that is never rewritten (zero frame + placeholder volume texture), plus one per frame slot.
-    /// The default set is bound by the direct-draw path and is equivalent to "fog gating off"; each per-slot set is rewritten by the transparent stage before binding.
+    /// Builds the fog sampling sets: one default set that is never rewritten (zero frame + placeholder volume texture), plus one per view and frame slot.
+    /// The default set is bound by the direct-draw path and is equivalent to "fog gating off"; each per-view set is rewritten by that view's transparent stage before binding.
     /// </summary>
     static void CreateFogSets()
     {
@@ -742,12 +746,16 @@ public static VkPipeline TransparentBackFacePipelineState;
         DefaultFogSet = Device.DescriptorAllocator.AllocateSet(FogSetLayout);
         WriteFogSet(DefaultFogSet, DefaultFogFrameBuffers[0].Buffer, FogFrameByteSize, dummy.View, dummy.View);
 
-        _fogSets = new DescriptorSet[n];
-        for (int i = 0; i < n; i++)
+        _fogSets = new DescriptorSet[MaxViews][];
+        for (int v = 0; v < MaxViews; v++)
         {
-            _fogSets[i] = Device.DescriptorAllocator.AllocateSet(FogSetLayout);
-            // These sets are not bound on frames where fog is off, but a descriptor set must hold valid content once created.
-            WriteFogSet(_fogSets[i], DefaultFogFrameBuffers[i].Buffer, FogFrameByteSize, dummy.View, dummy.View);
+            _fogSets[v] = new DescriptorSet[n];
+            for (int i = 0; i < n; i++)
+            {
+                _fogSets[v][i] = Device.DescriptorAllocator.AllocateSet(FogSetLayout);
+                // These sets are not bound on frames where fog is off, but a descriptor set must hold valid content once created.
+                WriteFogSet(_fogSets[v][i], DefaultFogFrameBuffers[i].Buffer, FogFrameByteSize, dummy.View, dummy.View);
+            }
         }
     }
 
@@ -862,7 +870,7 @@ public static VkPipeline TransparentBackFacePipelineState;
     }
 
     /// <summary>
-    /// Transparent-stage entry point: writes this frame's fog resources into the current frame slot's set and switches the set 1 binding target over to it.
+    /// Transparent-stage entry point: writes this view's fog resources into that view's frame-slot set and switches the set 1 binding target over to it.
     /// Must be called once before the first transparent draw; it is not rewritten again within the frame, so the "write then bind" ordering holds naturally.
     /// </summary>
     internal static void PrepareTransparentFog(Silk.NET.Vulkan.Buffer frame, ulong frameRange,
@@ -872,8 +880,9 @@ public static VkPipeline TransparentBackFacePipelineState;
         // The submission from three frames ago on this slot may still reference this set; without UPDATE_AFTER_BIND, rewriting it
         // would also invalidate that command buffer. See Device.WaitForFrameSlot. It has long retired by now, so this wait does not actually block.
         Device.WaitForFrameSlot(fi);
-        WriteFogSet(_fogSets[fi], frame, frameRange, integrated, local);
-        CurrentFogSet = _fogSets[fi];
+        var set = _fogSets[ActiveViewIndex][fi];
+        WriteFogSet(set, frame, frameRange, integrated, local);
+        CurrentFogSet = set;
     }
 
     /// <summary>
@@ -1032,6 +1041,9 @@ public static VkPipeline TransparentBackFacePipelineState;
         // Work package C: the scene segmented collection phase submits no draws; it just hands immutable handles to the replay queue.
         // This is the single exit for all 3D paths (model / instanced model / instanced mesh / outline shell),
         // so intercepting here once covers every PrimitiveData draw.
+        // C1: the slot-0 resolution has to happen before the capture, because the replay queue reuses the handle recorded here
+        // verbatim -- resolving later would leave a captured stream in place of the static buffer, or the other way round.
+        primitiveVertexBuffer = primitiveData.ResolveVertexBuffer(primitiveVertexBuffer);
         if (VKSceneDrawCollection.Active is { } collection)
         {
             collection.CapturePrimitive(cmd, primitiveData, primitiveVertexBuffer, primitiveIndexBuffer,
@@ -1196,6 +1208,9 @@ public static VkPipeline TransparentBackFacePipelineState;
     {
         var vk = Device.Vk;
 
+        // C1: resolving again here is idempotent and covers the direct callers that never go through DrawPrimitive.
+        primitiveVertexBuffer = primitiveData.ResolveVertexBuffer(primitiveVertexBuffer);
+
         if (!prepared)
             PreparePrimitive(cmd, primitiveData, descriptorSet);
 
@@ -1318,6 +1333,9 @@ public static VkPipeline TransparentBackFacePipelineState;
     {
         var vk = Device.Vk;
 
+        // C1: the shadow pass must rasterise the same sheet the scene shows, so it resolves slot 0 through the same call.
+        primitiveVertexBuffer = primitiveData.ResolveVertexBuffer(primitiveVertexBuffer);
+
         ulong vbOffset = 0;
         vk.CmdBindVertexBuffers(cmd, 0, 1, &primitiveVertexBuffer, &vbOffset);
 
@@ -1356,6 +1374,9 @@ public static VkPipeline TransparentBackFacePipelineState;
         ulong indirectOffset)
     {
         var vk = Device.Vk;
+
+        // C1: same resolution as the non-indirect shadow path; indirection only moves where the counts come from.
+        primitiveVertexBuffer = primitiveData.ResolveVertexBuffer(primitiveVertexBuffer);
 
         ulong vbOffset = 0;
         vk.CmdBindVertexBuffers(cmd, 0, 1, &primitiveVertexBuffer, &vbOffset);

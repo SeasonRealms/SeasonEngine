@@ -212,9 +212,10 @@ internal sealed unsafe class VKSceneDrawCollection
         {
             // The fog volumetric texture is a resource produced only in this frame's composite phase, its handle is not available during collection,
             // so the three-segment binding can only be completed inside the transparent pass.
-            // What is written is an independent set 1 (one per frame slot), not the draw item's own set 0:
-            // set 0 has already been bound and used in this frame's earlier shadow pass,
-            // and a set that does not declare UPDATE_AFTER_BIND will invalidate the whole buffer if rewritten after being referenced by the command buffer currently being recorded.
+            // What is written is an independent set 1 (one per view and frame slot), not the draw item's own set 0:
+            // set 0 has already been bound and used in this frame's earlier shadow pass, and the second view of the frame must not
+            // rewrite the set the first view has already bound — a set that does not declare UPDATE_AFTER_BIND will invalidate the
+            // whole buffer if rewritten after being referenced by the command buffer currently being recorded.
             // The order is still "finish writing first, then start drawing".
             Pipeline.PrepareTransparentFog(frame, frameRange, integrated, local);
             fog = true;

@@ -19,6 +19,21 @@ public class Model : Mesh3DBase
 
     public float Time { get; set; }
 
+    /// <summary>
+    /// Which route evaluates this model's skeleton. <see cref="Season.Rendering.InstanceSkinningMode.Cpu"/> is the historical
+    /// path: each frame samples the clips on the CPU, composes the node tree, and uploads the palette.
+    ///
+    /// <see cref="Season.Rendering.InstanceSkinningMode.Gpu"/> hands the evaluation to the same kernel the instanced path uses,
+    /// and a single draw needs nothing added for it: <c>isInstanced</c> is false, so the vertex stage addresses the palette at row
+    /// <c>jointIndex</c> - the kernel's instance-0 block - with no stride multiplication and no tag row.
+    ///
+    /// Opt-in on purpose, and not a free win. One model is one dispatch per frame against a CPU cost of one matrix multiply per
+    /// joint, so below a hundred-odd joints the two sit inside noise of each other; the route pays off when the skeleton is heavy
+    /// or the main thread is the bottleneck. An asset that cannot be baked (an animated node that is not a joint, morph channels,
+    /// no skin at all) or a backend without vertex-stage storage reads keeps the CPU route regardless, silently.
+    /// </summary>
+    public Season.Rendering.InstanceSkinningMode SkinningMode { get; set; } = Season.Rendering.InstanceSkinningMode.Cpu;
+
     public bool Unlit { get; set; } = false;
 
     public bool Positive { get; set; } = true;
@@ -218,6 +233,19 @@ public class Model : Mesh3DBase
         return Asset.GetCurrentAnimationName();
     }
 
+    /// <summary>
+    /// Pins the animation clock to an absolute time; see <see cref="Season.Models.GltfAsset.PinAnimationTime"/> for why this
+    /// exists and what it does to the route that reads the clock. Only the per-pixel A/B harness calls it, and it has no
+    /// effect on a model that is not loaded or whose clip is not running - those are exactly the models that cannot drift.
+    /// </summary>
+    public bool PinAnimationTime(float time)
+    {
+        if (Name.IsNullOrWhiteSpace() || !Ready || Asset == null)
+            return false;
+
+        return Asset.PinAnimationTime(time);
+    }
+
     /// <summary>Stops playback and parks the pose on the clip's first frame. A looping clip otherwise freezes wherever it
     /// happened to be, which reads as mid-stride; this returns a model that is meant to idle to its authored resting
     /// pose. Returns false when not loaded or when the asset carries no clip.</summary>
@@ -265,6 +293,10 @@ public class Model : Mesh3DBase
     {
         if (Asset == null)
             return base.TryPickSurface(rayOrigin, rayDirection, out distance);
+
+        // The GPU route leaves the node tree at rest and the palette in a storage buffer, so this is the one place that has to ask
+        // for a CPU pose explicitly. No-op on the CPU route, where the tree was evaluated by the last Update.
+        Asset.EnsureCpuPose();
 
         var userTransform = BuildWorldMatrix();
         if (!TryPickBroadPhase(rayOrigin, rayDirection, userTransform))

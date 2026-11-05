@@ -66,6 +66,20 @@ internal sealed class PlayerCollider
     /// </summary>
     internal Bridge Bridge;
 
+    /// <summary>
+    /// Registered seaside stair beside the pond's east dike: its three steps add walkable heights through
+    /// <see cref="SeaRoad.FloorHeightAtWorld"/>, so the player climbs them one riser at a time from the east road
+    /// onto the bank. Null means no seaside stair.
+    /// </summary>
+    internal SeaRoad SeaRoad;
+
+    /// <summary>
+    /// Registered flagpole: its stone disc adds one walkable height through <see cref="Flagpole.FloorHeightAtWorld"/>,
+    /// a fifth of a player up, so the player steps onto it without a jump. The column itself is an ordinary obstacle.
+    /// Null means no flagpole.
+    /// </summary>
+    internal Flagpole Flagpole;
+
     /// <summary>Contact margin: stop 1 mm before intersection to avoid jitter from floating-point boundary ambiguity.</summary>
     const float ContactEpsilon = 1e-3f;
 
@@ -333,7 +347,7 @@ internal sealed class PlayerCollider
     /// </summary>
     internal float FloorHeightUnder(in Vector3 center, in Vector3 half)
     {
-        if (Room == null && Pond == null && Tower == null && River == null && Bridge == null)
+        if (Room == null && Pond == null && Tower == null && River == null && Bridge == null && SeaRoad == null && Flagpole == null)
             return 0f;
 
         float h = FloorHeightAt(center.X, center.Z);
@@ -345,6 +359,8 @@ internal sealed class PlayerCollider
             h = MathF.Max(h, River.FloorHeightUnder(center, half));
         if (Bridge != null)
             h = MathF.Max(h, Bridge.FloorHeightUnder(center, half));
+        if (SeaRoad != null)
+            h = MathF.Max(h, SeaRoad.FloorHeightUnder(center, half));
         return h;
     }
 
@@ -353,7 +369,9 @@ internal sealed class PlayerCollider
         float h = Room != null ? Room.FloorHeightAtWorld(x, z) : 0f;
         if (Pond != null)
             h = MathF.Max(h, Pond.FloorHeightAtWorld(x, z));
-        return Tower != null ? MathF.Max(h, Tower.FloorHeightAtWorld(x, z)) : h;
+        if (Tower != null)
+            h = MathF.Max(h, Tower.FloorHeightAtWorld(x, z));
+        return Flagpole != null ? MathF.Max(h, Flagpole.FloorHeightAtWorld(x, z)) : h;
     }
 
     /// <summary>

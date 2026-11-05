@@ -132,6 +132,16 @@ public class Surface
     public bool ProceduralSky { get; set; }
 
     /// <summary>
+    /// C1: a compute-written per-vertex stream that replaces <see cref="Vertices"/> on the GPU, for geometry a kernel deforms
+    /// every frame (cloth). Runtime only, never part of the authored data. The buffer must be created with
+    /// <see cref="Season.Rendering.StorageBufferUsage.ComputeAndVertexInput"/>, hold exactly <c>Vertices.Length</c> records in the
+    /// <see cref="Vertex"/> layout (80-byte stride), and is still indexed by <see cref="Indices"/>; <see cref="Vertices"/> stays the
+    /// static fallback the backend draws whenever the stream was not handed over to vertex input this frame
+    /// (see <c>IGraphics.TryPrepareVertexInput</c>). Scene and shadow passes resolve the same source, so they never disagree.
+    /// </summary>
+    public Season.Rendering.StorageBuffer? VertexStream { get; set; }
+
+    /// <summary>
     /// Returns the effective texture source for the specified slot: first the matching TextureOverride
     /// (pixel data or path), then the slot path wrapped as TextureUpdateSource. If both are empty, returns default.
     /// During Load the backend resolves textures from this: the Image branch uploads directly to the GPU without
@@ -303,6 +313,25 @@ public class Mesh3D : Mesh3DBase
     /// clock, and the two would drift apart the first time the speed changed.
     /// </summary>
     public float WavePhase => _wavePhase;
+
+    /// <summary>
+    /// C1: bumped by the producer of a <see cref="Surface.VertexStream"/> every time it writes new vertices. The world bounds
+    /// of a deforming surface do not move with its shape, so this is what tells the shadow-reuse digest the caster changed.
+    /// </summary>
+    public int VertexStreamGeneration { get; set; }
+
+    /// <summary>C1: folds <see cref="VertexStreamGeneration"/> in while any surface draws from a compute stream, for the same
+    /// reason skinned models fold their pose (see <see cref="Control.ShadowPoseKey"/>); zero, the rigid default, otherwise.</summary>
+    protected override int ShadowPoseKey
+    {
+        get
+        {
+            foreach (var surface in Surfaces)
+                if (surface.VertexStream != null)
+                    return VertexStreamGeneration;
+            return 0;
+        }
+    }
 
     /// <summary>
     /// Phase integration. Uses a delta rather than elapsedTime x speed: the latter would teleport the whole waveform at the moment the speed is changed,

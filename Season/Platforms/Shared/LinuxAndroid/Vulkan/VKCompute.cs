@@ -15,7 +15,7 @@ namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 ///
 /// Binding layout (mechanically generated from Bindings, aligned with the GLSL slot
 /// conventions described in the ComputeBindingType summary):
-/// - Params (if present, must be Bindings[0]) -> push_constant (ComputeBit range, <= 128B;
+/// - Params (if present, must be Bindings[0]) -> push_constant (ComputeBit range, &lt;= 128B;
 ///   the strictest Vulkan minimum limit is treated as the contract maximum),
 ///   so binding slot 0 is left empty and omitted from the set layout;
 /// - Every remaining binding -> binding = declared index i:
@@ -255,6 +255,14 @@ internal sealed unsafe class VKComputeKernel : Season.Rendering.ComputeKernel
 internal sealed unsafe class VKStorageBuffer : Season.Rendering.StorageBuffer
 {
     internal BufferResource Buffer;
+
+    /// <summary>
+    /// C1: set by <c>TryPrepareVertexInput</c> once <see cref="BarrierToVertexInput"/> has been recorded for a write that is
+    /// already in this frame's command buffer, and cleared again as soon as a dispatch writes the buffer. A stream the
+    /// vertex stage reads must therefore be "written by compute, then handed over" every frame; one that is never written
+    /// (the cloth never stepped, or the effect already disposed) stays false and the draw keeps its static vertex buffer.
+    /// </summary>
+    internal bool VertexInputReady;
 
     /// <summary>2-4 Step 0: staging ring used for CPU -> GPU uploads
     /// (one slot per in-flight frame, created on first upload and kept resident).

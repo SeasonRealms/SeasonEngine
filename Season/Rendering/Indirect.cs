@@ -35,6 +35,11 @@ public enum StorageBufferUsage
     /// GPUBufferUsage.VERTEX) and refuse to widen it afterwards, so it has to be asked for at creation.
     /// D3D12 and Metal need nothing extra: a D3D12 resource moves into VERTEX_AND_CONSTANT_BUFFER by barrier and
     /// an MTLBuffer has no usage bits at all, but both still honour the declaration for validation symmetry.
+    /// <para>
+    /// C1 also uses it for a per-vertex stream: an effect writes whole <see cref="Vertex"/> records (80-byte stride, same field
+    /// order) and assigns the buffer to <c>Surface.VertexStream</c>, which then replaces the surface's static vertex buffer in the
+    /// scene and shadow passes. The handoff to the IA read state is <c>IGraphics.TryPrepareVertexInput</c>.
+    /// </para>
     /// </summary>
     ComputeAndVertexInput,
 

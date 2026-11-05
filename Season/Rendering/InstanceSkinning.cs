@@ -450,8 +450,17 @@ internal sealed class InstanceSkinningTarget : IInstanceSkinningTarget
         return true;
     }
 
+    /// <summary>
+    /// Diagnostic hook (<c>SEASON_AB_SKIN_PALETTE=storage</c>): runs after the dispatch and before the handoff, which is the only
+    /// point in the frame where a backend may overwrite the block the kernel just wrote with a CPU-produced copy of the same
+    /// palette, while the command list is still open and no Pass is in flight. It takes the kernel out of the picture and leaves
+    /// one question standing: does the vertex stage see this buffer at all. Null on every shipping path.
+    /// </summary>
+    public Action<IGraphics>? AfterDispatch;
+
     public bool PrepareSkinningDraw()
     {
+        AfterDispatch?.Invoke(Graphics.Instance);
         var current = Palette?.Current;
         Live = current != null && Graphics.Instance.TryPrepareVertexShaderRead(current);
         return Live;

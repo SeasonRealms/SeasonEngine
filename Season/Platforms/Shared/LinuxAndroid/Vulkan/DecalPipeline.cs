@@ -82,7 +82,10 @@ internal sealed unsafe class VKDecalPipeline : Season.Rendering.DecalPipeline
         if (point.Handle == 0 || linear.Handle == 0) throw new InvalidOperationException("Decal sampler not yet initialized.");
 
         var bindings = stackalloc DescriptorSetLayoutBinding[2];
-        bindings[0] = new() { Binding = 0, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit,
+        // Both stages read DecalFrame: the vertex stage fetches the view and projection rows to place the box, the pixel stage
+        // fetches the decal block. Declaring it as FRAGMENT-only makes vkCreateGraphicsPipelines fail
+        // (VUID-VkGraphicsPipelineCreateInfo-layout-07988: the SPIR-V vertex stage uses descriptor [Set 0, Binding 0]).
+        bindings[0] = new() { Binding = 0, DescriptorCount = 1, StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
             DescriptorType = DescriptorType.StorageBuffer };
         bindings[1] = new() { Binding = 1, DescriptorCount = 1, StageFlags = ShaderStageFlags.FragmentBit,
             DescriptorType = DescriptorType.CombinedImageSampler, PImmutableSamplers = &point };

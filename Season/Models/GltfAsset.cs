@@ -49,6 +49,42 @@ internal class GltfAsset
     /// </summary>
     internal InstanceSkinBake SkinBake;
 
+    /// <summary>
+    /// True while <see cref="gltfNodes"/>' world transforms and the bone palette describe a frame older than the one being drawn.
+    /// Only the single-model GPU route sets it: that route advances the clock and lets the kernel produce the palette, so the CPU
+    /// copies stay wherever the load-time bake left them, which is the rest pose.
+    ///
+    /// Picking is the one consumer that cannot ask the GPU for a pose - it needs node worlds and unposed vertices on the CPU - and
+    /// also the one consumer where reporting the rest pose would be visibly wrong rather than merely conservative. It calls
+    /// <see cref="EnsureCpuPose"/> instead of being handed a stale answer.
+    /// </summary>
+    internal bool CpuPoseStale;
+
+    /// <summary>
+    /// True once <see cref="EnsureCpuPose"/> has evaluated the tree while the GPU route owned it. The route multiplies each
+    /// primitive by its node world, and the kernel's palette is relative to the rest world; leaving an evaluated pose there would
+    /// make the two factors disagree on the next frame, which reads as the skin being applied twice. Kept apart from
+    /// <see cref="CpuPoseStale"/> because the two are consumed by different parties at different times.
+    /// </summary>
+    internal bool CpuPoseDisturbed;
+
+    /// <summary>
+    /// Brings the node tree and the bone palette up to the frame the GPU route is drawing, for the CPU consumers that cannot read
+    /// the kernel's output. Free when they are already current - the CPU route's normal state is one flag read - and one
+    /// evaluation when they are not.
+    /// </summary>
+    internal void EnsureCpuPose()
+    {
+        if (!CpuPoseStale) return;
+
+        CpuPoseStale = false;
+        CpuPoseDisturbed = true;
+
+        var player = _animationPlayer;
+        player.Evaluate(player.CurrentAnimationIndex, player.AnimationTime, gltfNodes);
+        player.UpdateBoneMatrices(GetAllSkins());
+    }
+
     internal List<GLTFSkin> GetAllSkins()
     {
         if (_allSkinsCache != null)
@@ -1030,11 +1066,38 @@ internal class GltfAsset
         _animationPlayer.IsAnimating = false;
         _animationPlayer.AnimationTime = 0f;
         _animationPlayer.Evaluate(_animationPlayer.CurrentAnimationIndex, 0f, gltfNodes);
+
+        // The evaluate above writes the tree, which is what the CPU route wants and what the GPU route has to be told about: that
+        // route multiplies each primitive by the node world while its palette already carries the world, so a tree left posed
+        // applies the skin twice. Flagged here rather than guarded by a route check because this type does not know which route the
+        // control is on, and on the CPU route the flag costs one clear on a frame that would not have read it.
+        CpuPoseDisturbed = true;
     }
 
     public void SetAnimationTime(float time)
     {
         _animationPlayer.AnimationTime = time;
+    }
+
+    /// <summary>
+    /// Pins the playback clock to an absolute time without sampling anything: the next update advances from this value
+    /// exactly as it would have advanced from its own, so the phase of frame N becomes a function of N alone.
+    ///
+    /// Only the per-pixel A/B harness reaches this, through <see cref="Season.Controls.Model.PinAnimationTime"/>. Playback
+    /// time accumulates from the frame the asset finished its asynchronous load, and that frame differs per run, so two
+    /// otherwise identical runs sample the same clip at permanently offset phases - measured as a 20677 px / worst 292
+    /// band in the A/B captures, produced by a morph model that has nothing to do with the route under test.
+    ///
+    /// Returns false when the clip is not running: a stopped or finished player does not accumulate, so nothing there can
+    /// drift between runs, and writing its clock would only hand a stale value to whatever plays it next.
+    /// </summary>
+    public bool PinAnimationTime(float time)
+    {
+        if (!_animationPlayer.IsAnimating || _animationPlayer.AnimationCount == 0)
+            return false;
+
+        _animationPlayer.AnimationTime = time;
+        return true;
     }
 
     public void PlayAnimation(string animationName = null)

@@ -171,6 +171,9 @@ internal static class AbCapture
     /// <summary>相位归零时实际命中了几套粒子系统；-1 表示还没到归零帧。</summary>
     static int _particleResets = -1;
 
+    /// <summary>最近一帧钉住了几个单模型动画的时钟，写进侧车用来核对该动作确实命中。</summary>
+    static int _pinnedModels;
+
     internal static bool Enabled => !string.IsNullOrEmpty(OutputPath);
 
     /// <summary>把本帧 delta 换成固定步长。未启用时原样返回，调用点因此可以无条件写这一行。</summary>
@@ -214,6 +217,40 @@ internal static class AbCapture
         // 取证时的姿态就永久错开。主视图 A/B 里跨路径的差异全部落在机器人和它们的影子上，就是这个签名。
         // 与粒子在同一个固定帧号上重启，才能让它与绘制路径的差异分开。
         App.Instance?.robots?.RestartAnimations();
+    }
+
+    /// <summary>
+    /// 把场景里每个单模型动画的播放时钟钉到"距归零帧经过了多少帧"上，每帧一次。
+    ///
+    /// 与粒子、机器人相位是同一类累积器，差别只在它没有归零入口：单模型的时钟从该资产异步加载落地那一帧起累加，
+    /// 各轮落地帧不同，取证时相位就永久差着几十帧。它污染的不是边角，是整张图的判据 ——
+    /// 实测 MorphStressTest（morph 形变，wireframe 壳跟着走）在世界坐标 x≈540..660 / y≈950..1045 上差出 211~292，
+    /// 门口自转的 busterDrone 差 356，两者都走默认的 CPU 路线，与被测的蒙皮路由毫无关系，
+    /// 却让"探针所在矩形"之外的每一格都带上了差值，之前整帧 A/B 的 2+2 分裂就是这么来的。
+    ///
+    /// 每帧重钉而不是只钉一次，理由与 <c>Robots.UpdateSingleProbe</c> 的持停模式相同：只钉一次要求钉的那一帧模型
+    /// 已经 Ready，而 Ready 的帧号本身就是各轮不同的量，晚加载的那些会重新错开。重钉幂等，且第 N 帧的相位从此是
+    /// 帧号的纯函数。只写时钟，不写姿态，也不碰 IsAnimating —— 停住的模型继续停在它自己的姿态上。
+    /// </summary>
+    static void PinModelPhases(long elapsedFrames)
+    {
+        if (App.Instance == null) return;
+
+        float time = elapsedFrames * FixedDelta;
+        _pinnedModels = 0;
+        PinModelPhases(App.Instance, time);
+    }
+
+    /// <summary>递归遍历面板树：面板既装控件也装子面板，两边都要走，否则挂在子面板下的模型会被漏掉。</summary>
+    static void PinModelPhases(Season.Panels.Panel panel, float time)
+    {
+        var controls = panel.Controls;
+        for (int i = 0; i < controls.Count; i++)
+            if (controls[i] is Season.Controls.Model model && model.PinAnimationTime(time)) _pinnedModels++;
+
+        var panels = panel.Panels;
+        for (int i = 0; i < panels.Count; i++)
+            PinModelPhases(panels[i], time);
     }
 
     /// <summary>
@@ -267,6 +304,10 @@ internal static class AbCapture
             // 归零点取取证前 ParticleWarmup 帧，给粒子留出从零相位走完一小段的时间 ——
             // 取 0 会让所有雨雪重合在同一位置，那一帧的画面对 A/B 没有代表性。
             if (_absFrame == ParticleResetFrame) ResetParticlePhases();
+
+            // 单模型动画时钟从归零帧起逐帧重钉（理由见 PinModelPhases）。它落在粒子归零的同一帧起步，
+            // 所以这里用 >=：归零那一帧本身的相位也应当是零，而不是"上一次累加到哪里算哪里"。
+            if (_absFrame >= ParticleResetFrame) PinModelPhases(_absFrame - ParticleResetFrame);
 
             if (_absFrame < AbsoluteFrame) return;
             _fired = true;
@@ -338,7 +379,7 @@ internal static class AbCapture
             // gather 派发路径"是判定 A/B 是否成立的前提，不能依赖可能被静默吞掉的通道。
             // a7 那段是早退诊断：gather 计数为 0 时，它把四个前置条件逐个摊开，省得靠二分法找是哪一条没成立。
             WriteSidecar($"frameAfterStable={_frame} absFrame={_absFrame} stableAt={_stableCount} "
-                + $"particleResets={_particleResets} "
+                + $"particleResets={_particleResets} pinnedModels={_pinnedModels} "
                 + $"time={DeviceServices.BaseApp.Time:F4} "
                 + $"aa={Season.Rendering.RenderQuality.Current.EffectiveAntiAliasing} "
                 + $"indirect={(InstanceCullEffect.IndirectGather ? 1 : 0)} "

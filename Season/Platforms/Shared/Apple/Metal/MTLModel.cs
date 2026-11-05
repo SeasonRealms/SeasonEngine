@@ -44,6 +44,36 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
     int _boneRingWarmup;
     bool _hasPrevBonesPublished;
 
+    // --- single-model GPU skinning (Model.SkinningMode = Gpu) ---
+    //
+    // The same kernel, parameter row and frame latch the instanced path uses, filled with exactly one row. Metal needs the least
+    // glue of the four backends: the palette is bound per draw through setVertexBuffer rather than through a descriptor set, so a
+    // compute-written storage buffer can stand in for the mapped bone UBO by swapping the handle this class hands the group - no
+    // rewrite step, no binding table.
+
+    /// <summary>The shared target implementation, one instance wide. Registered at load, unregistered by Dispose.</summary>
+    readonly Season.Rendering.InstanceSkinningTarget _skinning = new();
+
+    /// <summary>True while this frame draws from the kernel's palette. Latched once per Update so a frame cannot half-switch
+    /// between the two palettes, which would compose half a pose from one source and half from the other.</summary>
+    bool _gpuSkin;
+
+    /// <summary>Set once a bake has been asked for and refused. A refusal is permanent - it comes from the asset's shape, which
+    /// nothing changes after load - and without this the retry in <see cref="BeginSkinningFrame"/> would rescan the whole clip set
+    /// every frame for the life of a model the bake declines.</summary>
+    bool _bakeRefused;
+
+    /// <summary>The palette ring this class creates because the GPU route needs a compute-written palette. Owned here, disposed here.</summary>
+    Season.Rendering.InstanceBoneStorage? _gpuPalette;
+
+    /// <summary>The ring flattened to the frame-indexed shape <see cref="BoneMatrixBuffers"/> returns, rebuilt only when a slot's
+    /// buffer is replaced. Null on the CPU route, which is what makes that property fall through to the mapped ring.</summary>
+    IMTLBuffer[]? _boneStorageRing;
+
+    /// <summary>The rest pose, shared with the other three backends so a route whose correctness rests on two matrices cancelling
+    /// has one implementation of the snapshot rather than four.</summary>
+    readonly Season.Models.RestPoseSnapshot _restPose = new();
+
     internal GltfAsset Asset => _asset;
 
     public MTLModel(string name)
@@ -64,6 +94,12 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
 
         // Create the bone-matrix buffers, matching DX and VK with N UBOs for 100 bones each.
         CreateBoneMatrixBuffer();
+
+        // Single-model GPU skinning: the palette ring and the bake are created lazily by the first BeginSkinningFrame, because
+        // whether either is wanted is a property of the control (SkinningMode, possibly overridden per process) and this call may
+        // precede that decision. The rest snapshot does belong here: it is a property of the asset alone.
+        _restPose.Capture(_asset);
+        Season.Rendering.InstanceSkinning.Register(_skinning);
 
         _asset.ValidateSkinData();
     }
@@ -169,6 +205,11 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
             for (int i = 0; i < Device.frameCount; i++)
                 WriteStruct(primitive.MaterialBuffers[i], primitive.MaterialParams);
         }
+
+        // Single-model GPU skinning on a shared-template instance: the cloned tree is complete by now, so the rest snapshot is
+        // taken from the instance's own nodes rather than shared with the template - the clone is what the draw walks.
+        instance._restPose.Capture(instance._asset);
+        Season.Rendering.InstanceSkinning.Register(instance._skinning);
 
         return instance;
     }
@@ -352,8 +393,11 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         return result;
     }
 
-    /// <summary>MTLModel points BoneMatrixBuffers to its own N-buffered UBOs, overriding the base-class default IdentityBoneBuffers.</summary>
-    protected override IMTLBuffer[] BoneMatrixBuffers => _boneMatrixBuffers;
+    /// <summary>MTLModel points BoneMatrixBuffers to its own N-buffered UBOs, overriding the base-class default IdentityBoneBuffers.
+    /// On the GPU route it points at the storage ring instead: the vertex stage addresses joint <c>idx</c> from row zero when
+    /// <c>isInstanced</c> is false, which is the kernel's instance-0 block, so the same per-draw binding carries the palette with no
+    /// shader change at all.</summary>
+    protected override IMTLBuffer[] BoneMatrixBuffers => _boneStorageRing ?? _boneMatrixBuffers;
 
     GltfNodeBase CreateGLTFNode(SharpGLTF.Schema2.Node node)
     {
@@ -700,6 +744,10 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
     /// <summary>Computes bone matrices and writes them into the current-frame bone UBO by writing directly into Contents memory.</summary>
     void UploadBoneMatricesToGpu()
     {
+        // The GPU route's whole saving is this early exit: the kernel produced the palette and the ring it wrote is what the group
+        // binds, so no curve is sampled and no byte is copied here.
+        if (_gpuSkin) return;
+
         _asset._animationPlayer.UpdateBoneMatrices(_asset.GetAllSkins());
         var boneMatrices = _asset._animationPlayer.GetBoneMatricesArray();
 
@@ -744,6 +792,119 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         }
     }
 
+    /// <summary>
+    /// Locks this frame onto one of the two routes and returns the bake the kernel will evaluate, or null for the CPU route. The
+    /// null return is what the caller branches on, so it never has to re-read the mode.
+    ///
+    /// Two settings differ from the instanced path. The block is one instance wide, and it reserves no tag row: a tag exists so a
+    /// non-zero instance index can find its own block, and a single model always addresses row jointIndex from row zero because
+    /// isInstanced is false. Reserving one here would make the kernel write a row the vertex stage never reads.
+    /// </summary>
+    Season.Models.InstanceSkinBake? BeginSkinningFrame(Season.Controls.Model model)
+    {
+        bool wanted = Season.Rendering.InstanceSkinning.Enabled
+            && (Season.Rendering.InstanceSkinning.Override ?? model.SkinningMode) == Season.Rendering.InstanceSkinningMode.Gpu;
+
+        if (wanted && _asset.SkinBake == null && !_bakeRefused)
+        {
+            // The mode may have been turned on after load, which is not the intended order but is not worth refusing: the build is
+            // a one-off cost at the next Update, and silently keeping the CPU route for the rest of the run is invisible to whoever
+            // set the property. TryCreate rather than TryBake: what has to be told apart here is "cannot be built" from "not built
+            // yet", and a backend without vertex-stage storage reads counts as the former even though it is a capability rather
+            // than a shape - capability is fixed for the life of the process.
+            var g = Season.Basic.Graphics.Instance;
+            if (g == null || !g.ComputeSupported || !g.VertexShaderStorageReadSupported)
+                _bakeRefused = true;
+            else if (Season.Models.InstanceSkinBake.TryCreate(_asset, out var freshBake))
+                _asset.SkinBake = freshBake;
+            else
+                _bakeRefused = true;
+        }
+
+        var bake = wanted ? _asset.SkinBake : null;
+        bool wasGpu = _gpuSkin;
+
+        if (bake == null)
+        {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+            return null;
+        }
+
+        // A ring of one slot has no previous frame to point at, and the previous-slot read would then alias the slot this frame
+        // writes. Metal always runs with at least two frames in flight, but the fallback is one comparison.
+        if (Device.frameCount < 2)
+        {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+            return null;
+        }
+
+        _gpuPalette ??= new Season.Rendering.InstanceBoneStorage();
+        // tagRows = 0, and the stride is the bake's own palette stride: this backend leaves BonePaletteStride at 1 because the
+        // non-instanced vertex stage never multiplies by it, so there is no draw-side stride that could disagree with the bake.
+        if (!_skinning.Begin(_gpuPalette, bake, bake.PaletteStride, _asset._animations.Count, 0))
+        {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+            return null;
+        }
+
+        int slots = Device.frameCount;
+        int current = Device.FrameIndex % Device.frameCount;
+        int previous = (Device.FrameIndex + Device.frameCount - 1) % Device.frameCount;
+
+        // One instance, so one parameter row; the kernel evaluates that row and writes rows [0, jointCount).
+        if (!_skinning.PreparePalette(Season.Basic.Graphics.Instance, slots, current, previous, 1)
+            || !_skinning.BeginFrame(1))
+        {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+            return null;
+        }
+
+        _gpuSkin = true;
+
+        // The palette is relative to the rest pose, so the per-primitive factor has to be the rest world too. Entering the route
+        // from the CPU one leaves an animated pose in the tree, and picking leaves one behind mid-route; both are undone here
+        // rather than where they happen, because this is the only place that knows the tree is being handed over.
+        if (!wasGpu || _asset.CpuPoseDisturbed)
+        {
+            _asset.CpuPoseDisturbed = false;
+            _restPose.Restore(_asset);
+        }
+
+        return bake;
+    }
+
+    /// <summary>
+    /// Rebuilds the frame-indexed view over the palette ring, or clears it after a fallback. Unlike Vulkan there is nothing to
+    /// republish: the draw reads this property and binds the buffer directly, so replacing an entry is the whole update. The slot
+    /// count always matches the frame ring, because the shared target is given this backend's depth.
+    /// </summary>
+    void SyncBoneStorageRing()
+    {
+        var ring = _gpuSkin ? _skinning.Palette : null;
+        if (ring == null)
+        {
+            _boneStorageRing = null;
+            return;
+        }
+
+        int count = ring.Slots.Length;
+        if (_boneStorageRing == null || _boneStorageRing.Length != count)
+            _boneStorageRing = new IMTLBuffer[count];
+
+        for (int i = 0; i < count; i++)
+        {
+            // A slot without a storage buffer can only be a ring that failed to allocate, which PreparePalette already rejects;
+            // falling back to the mapped ring per slot keeps a broken frame drawable rather than binding null.
+            var buffer = ring.Slots[i] is MTLStorageBuffer slot ? slot.Buffer : _boneMatrixBuffers[i];
+            if (!ReferenceEquals(_boneStorageRing[i], buffer))
+                _boneStorageRing[i] = buffer;
+        }
+    }
+
     void ApplyUserTransformToNodeTree(GltfNodeBase nodeBase, Matrix4x4 userTransform)
     {
         // Apply the user transform to the current node.
@@ -779,9 +940,34 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
 
     public void Update(Season.Controls.Model model, float time)
     {
-        // Update animation through the animation player, which already handles time advancement,
-        // keyframe lookup, TRS interpolation, and node-transform updates internally.
-        _asset._animationPlayer.Update(time, _asset.gltfNodes);
+        bool wasInitialized = _transformInitialized;
+
+        // Latch the route before anything reads the tree. A frame that switched halfway would compose half a pose on the CPU and
+        // half in the kernel, which renders as a plausible wrong pose rather than as an error.
+        var gpuBake = BeginSkinningFrame(model);
+
+        if (gpuBake != null)
+        {
+            // The kernel samples the bake, so no curve is evaluated and no node transform is touched: the clock and one 16-byte
+            // parameter row are the whole per-frame cost. WorldTransform stays at rest, which is what the palette is relative to.
+            var player = _asset._animationPlayer;
+            player.Advance(time);
+            int clip = player.CurrentAnimationIndex;
+            _skinning.SetInstance(0, (uint)clip, gpuBake.NormalizeTime(clip, player.AnimationTime, player.Loop));
+
+            // Picking cannot read a storage buffer, so it asks for a CPU pose instead; see GltfAsset.EnsureCpuPose.
+            _asset.CpuPoseStale = true;
+        }
+        else
+        {
+            // Update animation through the animation player, which already handles time advancement,
+            // keyframe lookup, TRS interpolation, and node-transform updates internally.
+            _asset._animationPlayer.Update(time, _asset.gltfNodes);
+        }
+
+        // Morph channels are one of the bake's eligibility rules, so on the GPU route no curve can move a weight and this pass
+        // rewrites last frame's values. It is kept regardless because it is also the upload, and a weight set by code rather than
+        // by a clip still has to reach the GPU.
         UpdateMorphTargetsRecursive(_asset.gltfNodes);
 
         // Apply the user transform to root nodes,
@@ -795,8 +981,22 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         foreach (var rootNode in rootNodes)
             ApplyUserTransformToNodeTree(rootNode, userTransform);
 
-        // Update bone matrices.
-        UploadBoneMatricesToGpu();
+        // Update bone matrices. On the GPU route the kernel already produced them and the handle this class hands the group is the
+        // ring it wrote, so the mapped ring is not touched at all - which is the saving this route exists for.
+        if (gpuBake == null)
+            UploadBoneMatricesToGpu();
+
+        // Point the frame-indexed view at the ring, or back at the mapped UBOs after a fallback. There is no binding table to
+        // rewrite on this backend; the property above is read per draw.
+        SyncBoneStorageRing();
+
+        // From the second GPU frame onward the ring's previous slot holds a real palette, so the motion-vector path may read it.
+        // The CPU route publishes the same bit from its own warmup counter inside UploadBoneMatricesToGpu.
+        if (gpuBake != null && wasInitialized && !_hasPrevBonesPublished)
+        {
+            PublishHasPrevBones();
+            _hasPrevBonesPublished = true;
+        }
 
         _transformInitialized = true;
 
@@ -887,6 +1087,14 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
 
     public override void Dispose()
     {
+        // Leave the scheduler before the buffers it points at go away, and release the compute-side parameter and scratch blocks
+        // the target owns. The palette ring is this class's own; the frame-indexed view is only a view.
+        _skinning.Dispose();
+        _gpuPalette?.Dispose();
+        _gpuPalette = null;
+        _boneStorageRing = null;
+        _gpuSkin = false;
+
         foreach (var nodeBase in _asset.gltfNodes)
         {
             if (nodeBase is not GLTFNode node) continue;

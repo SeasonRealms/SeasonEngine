@@ -59,7 +59,7 @@ internal class Plane : MeshInstanceTransform
 internal class Planes : Panel
 {
     // Asset: the origin-centered airframe whose only clip is the propeller spin. Path is relative to Raw/.
-    const string PlaneGlbPath = @"Assets/plane.glb";
+    internal const string PlaneGlbPath = @"Assets/plane.glb";
 
     // Formation: four columns of 1, 2, 3 and 4 aircraft. Both spacings clear the 8m wingspan twice over, and the column
     // spacing also clears the ~6m fuselage length, so no two aircraft overlap along either axis of the wedge.
@@ -71,15 +71,15 @@ internal class Planes : Panel
     // Doubling the formation spacing widens the wedge to +/-33m laterally, so the radius grew with it: the innermost
     // aircraft still orbits at 113m, outside the ridge line, and the whole wedge stays over open water. The bank angle
     // comes out between roughly 17 and 26 degrees across the wedge.
-    const float OrbitRadius = 146f;
-    const float OrbitSpeed = 24f;        // ground speed at OrbitRadius, ~86 km/h
+    internal const float OrbitRadius = 146f;
+    internal const float OrbitSpeed = 24f;        // ground speed at OrbitRadius, ~86 km/h
     const float Gravity = 9.81f;
     const float OrbitStartAngle = MathF.PI * 0.5f;   // start north of the island, inside the initial camera's view
 
     // Flight level: the tower deck top (matches Tower.DeckTop; the tower sits at PosY = 0). The anchor is the
     // bounding-box center, so the fuselage centerline rides exactly at the platform height and the whole formation
     // sits level with a viewer standing on the deck.
-    const float FlightAltitude = 20f;
+    internal const float FlightAltitude = 20f;
 
     // Model size: 8m wingspan. Height and depth follow the asset's own 1.16944 x 0.41724 x 0.88113 local bounds, so
     // the airframe keeps its proportions instead of being stretched to a cube.

@@ -3027,6 +3027,25 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             && buffer is MTLStorageBuffer mtlBuffer && mtlBuffer.Buffer != null
             && mtlBuffer.Usage == Season.Rendering.StorageBufferUsage.ComputeAndVertexShaderRead;
 
+    /// <summary>
+    /// C1: the cloth's output streams are compute-written <see cref="Vertex"/> arrays the input assembler reads. As with the two
+    /// handoffs above, Metal needs no barrier: an MTLBuffer has no state machine, hazard tracking already orders the dispatch
+    /// before the draw, and there is nothing to record. The flag set here is what the draw side consults, so a stream that was
+    /// never written this frame keeps the static vertex buffer.
+    /// </summary>
+    public bool VertexInputStorageSupported => ComputeSupported;
+
+    public bool TryPrepareVertexInput(Season.Rendering.StorageBuffer buffer)
+    {
+        if (Metal.Device.GraphicsEncoder != null
+            || buffer is not MTLStorageBuffer mtlBuffer || mtlBuffer.Buffer == null
+            || mtlBuffer.Usage != Season.Rendering.StorageBufferUsage.ComputeAndVertexInput)
+            return false;
+
+        mtlBuffer.VertexInputReady = true;
+        return true;
+    }
+
     /// <summary>Indirect instanced quad draw pipeline. Returns null on creation failure, so the particle effect is not registered at all and the image falls back to before the change.</summary>
     public Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline()
     {
@@ -3175,6 +3194,10 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             {
                 enc.SetBuffer(buffer.Buffer, 0, bufferIdx + 1);
                 bufferIdx++;
+                // C1: this dispatch overwrites the buffer, so the vertex-input handoff recorded for an earlier write no longer
+                // describes its contents. The draw falls back to the static vertices until TryPrepareVertexInput marks it again.
+                if (bindings[i].Type == Season.Rendering.ComputeBindingType.StorageBufferReadWrite)
+                    buffer.VertexInputReady = false;
                 continue;
             }
 

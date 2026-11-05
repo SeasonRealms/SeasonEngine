@@ -152,7 +152,8 @@ internal class Ground : Panel
         return mesh;
     }
 
-    static Vertex MakeCubeVertex(Vector3 pos, Vector2 uv, Vector3 normal)
+    // internal so SeaRoad's east road builds its vertices and asphalt pixels from the exact same recipe.
+    internal static Vertex MakeCubeVertex(Vector3 pos, Vector2 uv, Vector3 normal)
     {
         // Any reasonable tangent is fine because Mesh3D v1 renderMode=0 does not use TBN in the pixel shader.
         return new Vertex
@@ -173,7 +174,7 @@ internal class Ground : Panel
     /// on a 1.6m road width and remains continuous across tiles, while the dashed center line sits around the middle
     /// 6% of u and occupies v in [0.35,0.65], giving one 0.75m dash plus a 1.75m gap per 2.5m segment.
     /// </summary>
-    static byte[] GenerateRoadTexturePixels(int size)
+    internal static byte[] GenerateRoadTexturePixels(int size)
     {
         var pixels = new byte[size * size * 4];
         const uint seed = 0x7AAD2026u;

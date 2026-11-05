@@ -310,6 +310,26 @@ public interface IGraphics
     /// or the backend is not integrated, in which case the frame must not draw from it.</summary>
     bool TryPrepareVertexShaderRead(Season.Rendering.StorageBuffer buffer) => false;
 
+    // Contract C1 per-vertex stream: compute writes whole vertices, the input assembler reads them.
+    // - This is the public half of <see cref="Season.Rendering.StorageBufferUsage.ComputeAndVertexInput"/>. A7 already used that
+    //   usage inside the D3D12 backend (the gather block becomes the instance stream); C1 lets an effect produce the
+    //   per-vertex stream of a Mesh3D surface instead, laid out exactly as <see cref="Vertex"/> (80 bytes per vertex).
+    // - Because the stream replaces the surface's static vertex buffer one for one, the vertex shader, the shadow vertex
+    //   shader, the PSO and the root signature are all the ordinary ones, so the shadow pass rasterizes the same shape the
+    //   scene pass shows by construction.
+    // - Like every other Prepare entry point it must be recorded outside a Pass. The return trip to the compute write state is
+    //   handled by DispatchCompute's own gated transition, so there is no matching "release" call.
+
+    /// <summary>Whether the backend can bind a compute-written storage buffer as a per-vertex IA stream. When false, a producer
+    /// keeps the surface's static vertices and registers nothing.</summary>
+    bool VertexInputStorageSupported => false;
+
+    /// <summary>Hands a storage buffer over from the compute write state to the vertex-input read state and returns whether it has
+    /// been recorded. Must be called outside a Pass; returns false when the buffer did not declare
+    /// <see cref="Season.Rendering.StorageBufferUsage.ComputeAndVertexInput"/> or the backend is not integrated, in which case the
+    /// frame must not draw from that stream (the backend falls back to the static vertices).</summary>
+    bool TryPrepareVertexInput(Season.Rendering.StorageBuffer buffer) => false;
+
     /// <summary>Returns null when the indirect instanced quad draw capability is missing, in which case the particle effect is not registered at all; a non-null return means the ExecuteIndirect-equivalent primitive has been integrated.</summary>
     Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline() => null;
 

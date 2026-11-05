@@ -3445,7 +3445,7 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         primitiveData.EmissiveTexture?.EnsureReadyForRendering(cmdList);
 
         var vertexViews = stackalloc VertexBufferView[2];
-        vertexViews[0] = primitiveData.VertexBufferView;
+        vertexViews[0] = primitiveData.ResolveVertexView();
         vertexViews[1] = instanceBufferView != null ? *instanceBufferView : IdentityInstanceBufferView;
         cmdList->IASetVertexBuffers(0, 2, vertexViews);
 
@@ -3754,7 +3754,7 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         var cmdList = Device.GraphicsCommandList;
 
         var vertexViews = stackalloc VertexBufferView[2];
-        vertexViews[0] = primitiveData.VertexBufferView;
+        vertexViews[0] = primitiveData.ResolveVertexView();
         vertexViews[1] = instanceBufferView != null ? *instanceBufferView : IdentityInstanceBufferView;
         cmdList->IASetVertexBuffers(0, 2, vertexViews);
 
@@ -3805,7 +3805,7 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
             return;
 
         var vertexViews = stackalloc VertexBufferView[2];
-        vertexViews[0] = primitiveData.VertexBufferView;
+        vertexViews[0] = primitiveData.ResolveVertexView();
         vertexViews[1] = instanceBufferView != null ? *instanceBufferView : IdentityInstanceBufferView;
         cmdList->IASetVertexBuffers(0, 2, vertexViews);
 

@@ -172,6 +172,12 @@ internal sealed class MTLMesh3D : MTLPrimitiveGroup
 
         _transformInitialized = true;
 
+        // C1: mirror each surface's compute stream onto its primitive (same order, reference copy only). The draw side decides
+        // per frame whether the stream or the static buffer is read, see PrimitiveData.ResolveVertexBuffer.
+        int streamCount = Math.Min(Primitives.Count, mesh.Surfaces.Count);
+        for (int i = 0; i < streamCount; i++)
+            Primitives[i].VertexStream = mesh.Surfaces[i].VertexStream as MTLStorageBuffer;
+
         // Sync Mesh3D.Alpha into every primitive material buffer.
         // The base class writes only when the value actually changes.
         SyncAlpha(mesh.Alpha);

@@ -44,6 +44,10 @@ internal class Skill : Panel
     //    the boarding test shrinks the rectangle by this much before a touchdown counts as a landing on deck. --
     const float DeckLandingMargin = 0.1f;
 
+    // -- Aircraft cockpit. The fuselage deck sits on the ground, so unlike the balloon's basket the boarding test
+    //    needs no altitude gate: the same shrunken-rectangle rule the hull uses is enough. --
+    const float CockpitLandingMargin = 0.1f;
+
     // -- Balloon basket. The wicker rectangle is a quarter of the hull's, and its rim is a wall the player can be
     //    stopped a step short of by the tower railing, so the boarding test grows the rectangle instead of shrinking
     //    it: a body that has reached the railing has reached the basket. --
@@ -119,6 +123,23 @@ internal class Skill : Panel
         // simply follows that facing, exactly like a jump from open ground.
         var boat = App.Instance.boat;
         var balloon = App.Instance.hotAirBalloon;
+        var plane = App.Instance.aeroPlane;
+
+        // The aircraft flies itself once boarded, so a press while seated is the one thing the pilot can do that
+        // matters: step out under a canopy and glide home while the jet finishes the trip on its own. On the strip
+        // there is nothing to jump from and the press is a no-op.
+        if (plane != null && plane.Aboard)
+        {
+            if (plane.CanBailOut)
+                plane.BailOut();
+
+            return;
+        }
+
+        // The canopy owns the body from the moment the pilot leaves the cockpit until the feet are down: no second
+        // jump, and no walk, until then.
+        if (plane != null && plane.Dropping)
+            return;
 
         // A leap out of the basket is only allowed while the balloon would stay reachable from where the player comes
         // down; anywhere else the press is a no-op and the player keeps standing in the basket.
@@ -155,7 +176,8 @@ internal class Skill : Panel
         // on the way to the deck and starts growing on the way off it, so the pose arrives with the jump instead of
         // popping when it lands. A leap off the deck grows back, and only a leap whose flight reaches the hull or the
         // basket heads for the deck pose; Land re-aims this at whatever the touchdown turned out to be, so a wrong
-        // guess costs a short walk back to the size the body actually needs.
+        // guess costs a short walk back to the size the body actually needs. The cockpit is the one seat that takes
+        // the body full size, so a leap that reaches the fuselage asks for no change at all.
         bool aimingForDeck = boat != null && !boat.Aboard && FlightReachesDeck(boat);
         bool aimingForBasket = balloon != null && !balloon.Aboard && AtBasketAltitude(model, balloon)
             && FlightReachesBasket(balloon);
@@ -283,6 +305,7 @@ internal class Skill : Panel
 
         var boat = App.Instance.boat;
         var balloon = App.Instance.hotAirBalloon;
+        var plane = App.Instance.aeroPlane;
 
         // Floor height at the landing point, based only on X/Z and independent of current PosY.
         // Shared by both the landing position and the arc baseline.
@@ -305,7 +328,7 @@ internal class Skill : Panel
 
         if (t >= 1f)
         {
-            Land(boat, balloon, model, groundY, bounds);
+            Land(boat, balloon, plane, model, groundY, bounds);
             return;
         }
 
@@ -316,14 +339,23 @@ internal class Skill : Panel
         // its 20 m height needs.
         if (boat != null && !boat.Aboard && boat.ContainsDeck(model.PosX, model.PosZ, DeckLandingMargin))
         {
-            Land(boat, balloon, model, groundY, bounds);
+            Land(boat, balloon, plane, model, groundY, bounds);
             return;
         }
 
         if (balloon != null && !balloon.Aboard && AtBasketAltitude(model, balloon)
             && balloon.ContainsBasket(model.PosX, model.PosZ, -BasketBoardReach))
         {
-            Land(boat, balloon, model, groundY, bounds);
+            Land(boat, balloon, plane, model, groundY, bounds);
+            return;
+        }
+
+        // The cockpit is boarded on contact as well, gated on the aircraft still being parked: a jet running the
+        // strip or circling the island has no floor to stand on.
+        if (plane != null && !plane.Aboard && plane.CanBoard
+            && plane.ContainsCockpit(model.PosX, model.PosZ, CockpitLandingMargin))
+        {
+            Land(boat, balloon, plane, model, groundY, bounds);
             return;
         }
 
@@ -355,13 +387,14 @@ internal class Skill : Panel
     }
 
     /// <summary>
-    /// Resolves where the jump came down. Four outcomes, in this order: the basket takes the player aboard and binds
+    /// Resolves where the jump came down. Five outcomes, in this order: the basket takes the player aboard and binds
     /// the body to the seat in front of the waving crew, the deck takes the player aboard and sits the body at the
-    /// oars, open water refuses the landing and restores the takeoff pose, and dry ground ends the trip with the
-    /// boat and the balloon left exactly where they are. Boarding is also what a mid-flight touch arrives through, so
-    /// the arc can end the moment the body meets the hull or the wicker.
+    /// oars, the aircraft's cockpit takes the pilot aboard and starts its automated trip, open water refuses the
+    /// landing and restores the takeoff pose, and dry ground ends the trip with the boat, the balloon and the plane
+    /// left exactly where they are. Boarding is also what a mid-flight touch arrives through, so the arc can end the
+    /// moment the body meets the hull, the wicker or the fuselage.
     /// </summary>
-    void Land(Boat? boat, HotAirBalloon? balloon, Season.Controls.Model model, float groundY, in Season.Rendering.Bounds3D bounds)
+    void Land(Boat? boat, HotAirBalloon? balloon, AeroPlane? plane, Season.Controls.Model model, float groundY, in Season.Rendering.Bounds3D bounds)
     {
         var app = App.Instance;
         var beforeLand = new Vector3(model.PosX, model.PosY, model.PosZ);
@@ -370,6 +403,8 @@ internal class Skill : Panel
             && AtBasketAltitude(model, balloon)
             && balloon.ContainsBasket(model.PosX, model.PosZ, -BasketBoardReach);
         bool onDeck = boat != null && boat.ContainsDeck(model.PosX, model.PosZ, DeckLandingMargin);
+        bool onCockpit = plane != null && plane.CanBoard
+            && plane.ContainsCockpit(model.PosX, model.PosZ, CockpitLandingMargin);
         bool wet = app.collider.InWater(bounds)
             || (boat != null && boat.Waterway.Contains(model.PosX, model.PosZ));
 
@@ -405,6 +440,24 @@ internal class Skill : Panel
             model.PosY = seat.Y + (float)model.Height * 0.5f;
             model.Rotation = boat.Heading;
         }
+        else if (onCockpit)
+        {
+            // In the cockpit: the aircraft remembers the takeoff spot of this leap, because the end of its trip puts
+            // the pilot back down there. The body faces the nose; the plane re-binds it every frame from then on.
+            if (balloon != null && balloon.Aboard)
+                balloon.Disembark();
+
+            if (boat != null && boat.Aboard)
+                boat.Disembark();
+
+            plane!.Board(jumpOrigin);
+
+            var seat = plane.SeatPosition;
+            model.PosX = seat.X;
+            model.PosZ = seat.Z;
+            model.PosY = seat.Y + (float)model.Height * 0.5f;
+            model.Rotation = plane.PilotYaw;
+        }
         else if (wet)
         {
             // Nothing to stand on: the jump is refused and the takeoff pose comes back, boat trip included.
@@ -433,14 +486,15 @@ internal class Skill : Panel
         }
 
         // The pose follows what happened, not the takeoff guess: a jump refused over water and a leap that missed
-        // the deck or the basket both walk the body back to the size their landing actually calls for.
+        // the deck or the basket all walk the body back to the size their landing actually calls for. The cockpit
+        // keeps the walking size, so landing in it leaves the pose alone.
         app.player.SetDeckPose((boat != null && boat.Aboard) || (balloon != null && balloon.Aboard));
 
         app.player.jumping = false;
 
-        // A body at the oars or in the basket sits still; the walking clips belong to the ground. Everything else
-        // restores what the player was doing before takeoff, matching the pre-boat behaviour.
-        string resume = onBasket || onDeck ? "Idle-loop" : jumpResumeAnimation;
+        // A body at the oars, in the basket or in the cockpit sits still; the walking clips belong to the ground.
+        // Everything else restores what the player was doing before takeoff, matching the pre-boat behaviour.
+        string resume = onBasket || onDeck || onCockpit ? "Idle-loop" : jumpResumeAnimation;
         if (model.GetCurrentAnimationName() != resume)
             model.PlayAnimation(resume);
 

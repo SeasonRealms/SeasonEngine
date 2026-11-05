@@ -83,6 +83,35 @@ internal class Direction : Panel
         AddControl(back);
     }
 
+    // Pans the camera rig while a ride owns the body. Forward and back follow the view's horizontal projection and
+    // left and right cross it, using the same step the walking keys use (scaled by the player speed setting), and
+    // both camera and target move so the look direction and the distance the player dragged out are kept as they
+    // were. The ride then carries the whole rig along, so the view stays where it was put relative to the aircraft.
+    void PanCamera(float dx, float dz)
+    {
+        var app = App.Instance;
+
+        var dir = app.CameraTarget - app.CameraPos;
+        dir.Y = 0f;
+        if (dir.LengthSquared() < 1e-8f)
+            return;
+
+        var forward = Vector3.Normalize(dir);
+
+        // Right is forward turned -90 degrees around +Y, the same rule MovePlayer's Character branch uses: a
+        // positive dx is the right key, so it moves the rig toward (forward.Z, 0, -forward.X).
+        var right = new Vector3(forward.Z, 0f, -forward.X);
+
+        var move = forward * dz + right * dx;
+        if (move.LengthSquared() < 1e-10f)
+            return;
+
+        move *= app.playerSpeed;
+
+        app.CameraPos += move;
+        app.CameraTarget += move;
+    }
+
     // Moves horizontally straight forward or backward relative to the camera view.
     // Only X and Z change; Y remains fixed.
     void MoveCamera(bool forward)
@@ -124,6 +153,16 @@ internal class Direction : Panel
         // Locked during a long jump: facing is already frozen to the takeoff direction and movement is handled by UpdateLongJump.
         if (app.player != null && app.player.jumping)
             return;
+
+        // The automated aircraft is not steerable: for the whole ride the cockpit owns the body. The keys are not
+        // wasted, though - they pan the view instead, so the trip can be watched from wherever the player wants;
+        // the ride carries that rig along with the aircraft. See AeroPlane.ChaseCamera. The parachute descent works
+        // the same way once the pilot has stepped out: the canopy owns the body, so the keys move only the view.
+        if (app.aeroPlane != null && (app.aeroPlane.Aboard || app.aeroPlane.Dropping))
+        {
+            PanCamera(dx, dz);
+            return;
+        }
 
         var model = app.player.model;
 

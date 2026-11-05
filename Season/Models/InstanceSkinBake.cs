@@ -501,6 +501,7 @@ internal sealed class InstanceSkinBake
         // original curve - so its residual is reported but never treated as a failure.
         var player = asset._animationPlayer;
         bool savedLoop = player.Loop;
+        int savedClip = player.CurrentAnimationIndex;
         float worst = 0f;           // on-key: a real defect if large
         float worstBetween = 0f;    // mid-key: the documented resampling residual
         int worstJoint = -1;
@@ -576,7 +577,12 @@ internal sealed class InstanceSkinBake
         finally
         {
             player.Loop = savedLoop;
-            player.Evaluate(-1, 0f, nodes);
+            // Restored through the same entry point TryCreate's own finally uses, not through Evaluate(-1). The negative index
+            // resets the node tree but leaves the player's clip index and duration on whichever clip the probe loop stopped at -
+            // and a caller that plays through this player reads both back. On the direct-load path that caller is the asset's own
+            // control: a single model on the GPU route hands the kernel CurrentAnimationIndex and AnimationTime verbatim, so a
+            // stale index means it animates to the last clip of the file for the rest of the run.
+            player.Evaluate(savedClip, 0f, nodes);
             RestoreInitialPose(nodes, parentOf);
         }
 

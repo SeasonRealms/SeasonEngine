@@ -3,6 +3,7 @@
 // https://github.com/SeasonRealms/SeasonEngine
 
 using Silk.NET.Vulkan;
+using VkBuffer = Silk.NET.Vulkan.Buffer;
 
 namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 
@@ -86,6 +87,30 @@ internal unsafe class PrimitiveData : IDisposable
     public Vector3 LocalBoundsExtents;
 
     public BufferResource VertexBuffer;
+
+    /// <summary>
+    /// C1: the compute-written per-vertex stream mirrored from Surface.VertexStream by VKMesh3D.Update; a reference, never owned
+    /// here (the producing effect disposes it). Null for every primitive whose geometry is static.
+    /// </summary>
+    public VKStorageBuffer? VertexStream;
+
+    /// <summary>
+    /// C1: the single place every draw path (scene direct, scene collection, shadow direct, shadow indirect) takes its slot-0
+    /// buffer from, so the shadow can never rasterise a different shape than the scene shows. The stream is used only when its
+    /// flag says the handoff to vertex input was recorded this frame (IGraphics.TryPrepareVertexInput) and it is large enough for
+    /// every vertex the indices may address; any other frame draws the static buffer, which keeps validation quiet and the two
+    /// passes consistent with each other.
+    /// </summary>
+    public VkBuffer ResolveVertexBuffer(VkBuffer fallback)
+    {
+        var stream = VertexStream;
+        if (stream == null || stream.Buffer.Buffer.Handle == 0 || !stream.VertexInputReady || Vertices == null)
+            return fallback;
+        ulong bytes = (ulong)Vertices.Count * (ulong)sizeof(Vertex);
+        if (bytes == 0 || stream.SizeInBytes < bytes)
+            return fallback;
+        return stream.Buffer.Buffer;
+    }
 
     public BufferResource IndexBuffer;
 

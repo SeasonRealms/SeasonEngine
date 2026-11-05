@@ -83,6 +83,39 @@ internal unsafe class PrimitiveData
     public ID3D12Resource* IndexBuffer;
     public IndexBufferView IndexBufferView;
 
+    /// <summary>
+    /// C1: the compute-written per-vertex stream mirrored from Surface.VertexStream by DXMesh3D.Update; a reference, never owned
+    /// here (the producing effect disposes it). Null for every primitive whose geometry is static.
+    /// </summary>
+    public DXStorageBuffer? VertexStream;
+
+    /// <summary>
+    /// C1: the single place every draw path (scene direct, scene collection, shadow direct, shadow indirect) takes its slot-0 view
+    /// from, so the shadow can never rasterize a different shape than the scene shows. The stream is used only when its tracked
+    /// state says the handoff to vertex input was recorded (IGraphics.TryPrepareVertexInput) and it is large enough for every
+    /// vertex the indices may address; any other frame draws the static buffer, which keeps the debug layer quiet and the two
+    /// passes consistent with each other.
+    /// </summary>
+    public VertexBufferView ResolveVertexView()
+    {
+        // A highlight shell shares its template's geometry, so it follows the template's stream as well.
+        var geometry = SharedGeometrySource ?? this;
+        var stream = geometry.VertexStream;
+        if (stream == null || stream.Resource == null || stream.CurrentState != ResourceStates.VertexAndConstantBuffer
+            || geometry.Vertices == null)
+            return VertexBufferView;
+        uint stride = (uint)sizeof(Vertex);
+        uint bytes = (uint)geometry.Vertices.Count * stride;
+        if (bytes == 0 || stream.SizeInBytes < bytes)
+            return VertexBufferView;
+        return new VertexBufferView
+        {
+            BufferLocation = stream.Resource->GetGPUVirtualAddress(),
+            SizeInBytes = bytes,
+            StrideInBytes = stride,
+        };
+    }
+
     public ID3D12Resource*[] MaterialBuffers;
     public byte*[] MappedMaterialBuffers;
 

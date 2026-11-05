@@ -51,6 +51,74 @@ internal unsafe class DXModel : DXPrimitiveGroup
     private int _prevBonePaletteDescriptorId = -1;
     private GpuDescriptorHandle _prevBonePaletteSrvHandle;
 
+    // --- single-model GPU skinning (Model.SkinningMode = Gpu) ---
+    //
+    // P1's kernel, parameter block and frame latch are reused verbatim, filled with exactly one row. What a single model needs
+    // that the instanced path does not is a palette the CPU never touches: the kernel writes a storage buffer, so the mapped
+    // upload ring both routes used before cannot carry it, and the previous-frame copy stops being a memcpy and becomes the
+    // ring's other slot.
+
+    /// <summary>The shared target implementation, one instance wide. Registered at load, unregistered by Dispose.</summary>
+    readonly Season.Rendering.InstanceSkinningTarget _skinning = new();
+
+    /// <summary>True while this frame draws from the kernel's palette. Latched once per Update so a frame cannot half-switch
+    /// between the two palettes, which would compose half a pose from one source and half from the other.</summary>
+    bool _gpuSkin;
+
+    /// <summary>The palette ring this class creates because the GPU route needs a compute-written palette. Owned here, disposed here.</summary>
+    Season.Rendering.InstanceBoneStorage? _gpuPalette;
+
+    /// <summary>The rest pose, shared with the other three backends so a route whose correctness rests on two matrices cancelling
+    /// has one implementation of the snapshot rather than four.</summary>
+    readonly Season.Models.RestPoseSnapshot _restPose = new();
+
+    /// <summary>Rest world of every node, indexed exactly like <c>_asset.gltfNodes</c>. The GPU route's palette carries
+    /// inverse(rest world), so the per-primitive factor the vertex stage multiplies by has to be that same rest world; anything
+    /// evaluated on the CPU in the meantime (picking) is undone from this snapshot.</summary>
+    System.Numerics.Matrix4x4[] _restWorld => _restPose.Worlds;
+
+    /// <summary>Set once a bake has been asked for and refused. The retry in <see cref="BeginSkinningFrame"/> exists so the mode
+    /// can be turned on after load, which is why it cannot simply run at load; but a refusal is not the same answer as "not yet",
+    /// and treating them alike would rescan the whole clip set every frame for the life of a model the bake declines - a channel
+    /// on a non-joint, a morph weight track, no animations at all. A refusal is permanent: it comes from the asset's shape, which
+    /// nothing changes after load.</summary>
+    bool _bakeRefused;
+
+    /// <summary>Diagnostic only (<c>SEASON_AB_SKIN_PALETTE=storage</c>): the second half of the palette control. <c>cpu</c> swaps the
+    /// palette source but keeps the CPU upload ring as the binding, so it proves the route's plumbing is clean; this one keeps the
+    /// CPU palette and swaps the *binding* to the compute-written storage ring instead. A frame that reproduces the CPU route under
+    /// this switch says the storage view and its handoff are byte-equivalent to the upload ring, which leaves the kernel's output as
+    /// the only remaining suspect. Never set outside a comparison run.</summary>
+    readonly bool _paletteFromStorage = PaletteSourceIs("storage");
+
+    /// <summary>Diagnostic only (<c>SEASON_AB_SKIN_PALETTE=cpu</c>): keep the GPU route's schedule intact - the bake, the
+    /// parameter row, the dispatch, the handoff - and draw with a palette recomputed on the CPU from the very clip and time
+    /// the kernel was handed. The two halves of this route fail differently: a wrong table or a wrong parameter renders as a
+    /// limb in the wrong place, while a palette the vertex stage cannot actually see renders as the previous pose or as
+    /// nothing at all. Swapping only the palette source tells those apart, because everything else stays put. Never set
+    /// outside a comparison run: on this path the CPU does the work twice and the kernel's output goes unread.</summary>
+    readonly bool _paletteFromCpu = PaletteSourceIs("cpu") || PaletteSourceIs("storage");
+
+    /// <summary>Whether the palette diagnostic names <paramref name="source"/>. Static so the two latches above can each be a field
+    /// initializer; comparing against a word rather than a flag is what let an earlier round read "1" as a run that had never
+    /// entered the branch it was meant to select.</summary>
+    static bool PaletteSourceIs(string source) => string.Equals(
+        Environment.GetEnvironmentVariable("SEASON_AB_SKIN_PALETTE"), source, StringComparison.OrdinalIgnoreCase);
+
+#if DEBUG
+    /// <summary>One-shot latch for the handoff line below, so a 7000-frame run logs the parameters once instead of per frame.</summary>
+    bool _gpuSkinLogged;
+
+    /// <summary>Frame the storage probe last printed on, so the per-primitive SRV read logs once per sampled frame.</summary>
+    uint _storageProbeFrame = uint.MaxValue;
+
+    /// <summary>Same latch for the publish-side probe, kept separate so the two cannot swallow each other's line.</summary>
+    uint _publishProbeFrame = uint.MaxValue;
+
+    /// <summary>One-shot latch for the rest-versus-posed measurement.</summary>
+    bool _restCheckLogged;
+#endif
+
     // 2-3 Step C (tier C-b completion): previous morph-weights SB
     // (1 float4 = 16 bytes).
     // In the non-instanced path, the shader reads g_PrevMorphWeights[0], so only
@@ -85,6 +153,13 @@ internal unsafe class DXModel : DXPrimitiveGroup
         CreateBoneMatrixBuffer();
 
         _asset.ValidateSkinData();
+
+        // P1: on the direct-load path the asset belongs to this model, so the bake is built here. The shared-template path builds
+        // it in CreateInstance instead, where the requesting control's mode is first known. Either way it runs before anything
+        // disturbs the rest pose, so the snapshot taken right after it is the world the bake used for its inverse-mesh factor.
+        InstanceSkinBake.TryBake(_asset, model.SkinningMode);
+        CaptureRestWorld();
+        Season.Rendering.InstanceSkinning.Register(_skinning);
     }
 
     public DXModel CreateInstance(Season.Controls.Model model)
@@ -177,6 +252,15 @@ internal unsafe class DXModel : DXPrimitiveGroup
         model.Asset = instance._asset;
         instance.InitializeBonePaletteResources();
         instance.CreateBoneMatrixBuffer();
+
+        // P1: the three bake tables are a function of the rest pose and the curves, both of which are identical here and on the
+        // template, so the template builds them once and every clone references that one set. Without this a scene holding fifty
+        // copies of one character would carry fifty identical copies of the tracks - the same argument that keeps the kernel's
+        // output buffers shared through EnsureUploaded rather than allocated per instance.
+        InstanceSkinBake.TryBake(_asset, model.SkinningMode);
+        instance._asset.SkinBake = _asset.SkinBake;
+        instance.CaptureRestWorld();
+        Season.Rendering.InstanceSkinning.Register(instance._skinning);
 
         return instance;
     }
@@ -875,6 +959,51 @@ internal unsafe class DXModel : DXPrimitiveGroup
 
     }
 
+    /// <summary>
+    /// Diagnostic half of <c>SEASON_AB_SKIN_PALETTE=storage</c>: overwrites the slot the kernel just wrote with the palette the CPU
+    /// route uploaded this frame, laid out the way the kernel would have laid it out. Runs from the skinning target between the
+    /// dispatch and the handoff, which is the only point in the frame where the command list is open, no Pass is in flight, and the
+    /// kernel's own output is already behind us. Everything the vertex stage sees - the resource, its structured view, the handoff -
+    /// is then the one the real route uses, with only the bytes changed.
+    /// </summary>
+    void PublishCpuPalette(IGraphics g)
+    {
+        var ring = _gpuPalette;
+        if (g == null || ring == null || ring.Current == null) return;
+
+        var palette = _asset._animationPlayer.GetBoneMatricesArray();
+        int rows = Math.Min(palette.Length, ring.Stride);
+        if (rows <= 0) return;
+
+        bool published;
+        fixed (System.Numerics.Matrix4x4* source = palette)
+            published = ring.Publish(g, new ReadOnlySpan<byte>(source, rows * InstanceBoneStorage.BoneMatrixBytes));
+
+#if DEBUG
+        // The control kept landing in one of two states, both stable for thousands of frames and both reachable from the very same
+        // bytes, so neither is explained by the palette content. What is left is the draw reading a different resource - in which
+        // case these bytes never reach the vertex stage at all, however correct they are. The descriptor identifiers and GPU
+        // pointers are what tell the two apart: a zero or a reused slot names the mechanism, a healthy pair sends the search back to
+        // the table index the draw sets.
+        if (_publishProbeFrame != Device.FrameIndex && (uint)(Device.FrameIndex - _publishProbeFrame) >= 500u)
+        {
+            _publishProbeFrame = Device.FrameIndex;
+            var current = ring.Current as DXStorageBuffer;
+            var previous = ring.Previous as DXStorageBuffer;
+            ulong currentPtr = current != null ? (ulong)current.VertexSrvGpuHandle.Ptr : 0;
+            ulong previousPtr = previous != null ? (ulong)previous.VertexSrvGpuHandle.Ptr : 0;
+            var head = palette.Length > 0 ? palette[0] : System.Numerics.Matrix4x4.Identity;
+            DeviceServices.BaseApp?.AddLog(LogType.Error,
+                $"[StoragePublish] frame={Device.FrameIndex} publish={published} live={_skinning.Live} "
+                + $"slots={ring.Slots.Length} cur={ring.CurrentSlot} prev={ring.PreviousSlot} "
+                + $"stride={ring.Stride} cap={ring.Capacity} pool={ring.PoolRows} rows={rows} "
+                + $"curId={current?.VertexSrvDescriptorID ?? -1} curPtr={currentPtr} "
+                + $"prevId={previous?.VertexSrvDescriptorID ?? -1} prevPtr={previousPtr} "
+                + $"m0=({head.M11:F4},{head.M12:F4},{head.M42:F4},{head.M43:F4})");
+        }
+#endif
+    }
+
     void ApplyUserTransformToNodeTree(GltfNodeBase nodeBase, System.Numerics.Matrix4x4 userTransform)
     {
         // Apply the user transform to the current node.
@@ -921,10 +1050,35 @@ internal unsafe class DXModel : DXPrimitiveGroup
     {
         bool wasInitialized = _transformInitialized;
 
-        // Update animation through the animation player
-        // (time advance, keyframe lookup, TRS interpolation, and node-transform
-        // updates are all handled internally)
-        _asset._animationPlayer.Update(time, _asset.gltfNodes);
+        // Latch the route before anything reads the tree. A frame that switched halfway would compose half a pose on the CPU and
+        // half in the kernel, which renders as a plausible wrong pose rather than as an error.
+        var gpuBake = BeginSkinningFrame(model);
+
+        if (gpuBake != null)
+        {
+            // The kernel samples the bake, so no curve is evaluated and no node transform is touched: the clock and one 16-byte
+            // parameter row are the whole per-frame cost. WorldTransform stays at rest, which is exactly what the palette is
+            // relative to - the vertex stage multiplies each primitive by restWorld * userTransform while the palette carries
+            // inverse(restWorld), so the two cancel and only the user transform survives.
+            var player = _asset._animationPlayer;
+            player.Advance(time);
+            int clip = player.CurrentAnimationIndex;
+            _skinning.SetInstance(0, (uint)clip, gpuBake.NormalizeTime(clip, player.AnimationTime, player.Loop));
+
+            // Picking cannot read a storage buffer, so it asks for a CPU pose instead; see GltfAsset.EnsureCpuPose.
+            _asset.CpuPoseStale = true;
+        }
+        else
+        {
+            // Update animation through the animation player
+            // (time advance, keyframe lookup, TRS interpolation, and node-transform
+            // updates are all handled internally)
+            _asset._animationPlayer.Update(time, _asset.gltfNodes);
+        }
+
+        // Morph channels are one of the bake's eligibility rules, so on the GPU route no curve can move a weight and this pass
+        // rewrites last frame's values. It is kept regardless because it is also the upload, and a weight set by code rather than
+        // by a clip still has to reach the GPU.
         UpdateMorphTargetsRecursive(_asset.gltfNodes);
 
         // Apply the user transform to root nodes
@@ -942,10 +1096,85 @@ internal unsafe class DXModel : DXPrimitiveGroup
             ApplyUserTransformToNodeTree(rootNode, userTransform);
         }
 
-        // Update bone matrices
-        UploadBoneMatricesToGpu();
+        // Update bone matrices. On the GPU route the kernel already produced them and the ring it wrote is what the draw binds,
+        // so the CPU palette is not written at all - which is the saving this route exists for.
+        if (gpuBake == null)
+            UploadBoneMatricesToGpu();
+        else if (_paletteFromCpu)
+        {
+            // Diagnostic: the same clip and time the kernel was handed, evaluated here instead, and then the node walk is run
+            // a second time so the primitive buffers carry the very pose this palette is relative to. Restoring the rest world
+            // instead - which is what the real route does - would pair the palette with a matrix it was not built from, and the
+            // difference that produced could then be blamed on either half. Re-walking is what leaves the control one question:
+            // palette and world both from the CPU should reproduce the CPU route's frame exactly.
+            var probe = _asset._animationPlayer;
+            int probeClip = probe.CurrentAnimationIndex;
+            probe.Evaluate(probeClip, gpuBake.NormalizeTime(probeClip, probe.AnimationTime, probe.Loop), _asset.gltfNodes);
+            UploadBoneMatricesToGpu();
+
+            foreach (var rootNode in rootNodes)
+            {
+                ApplyUserTransformToNodeTree(rootNode, userTransform);
+            }
+        }
 
         _transformInitialized = true;
+
+#if DEBUG
+        // One measurement of the assumption this route rests on. The palette carries inverse(rest world) and the primitive
+        // buffers carry rest world * user, so the pair cancels only if the tree really is still at rest here - after the morph
+        // pass and the node walk - and only if the inverse the bake holds was taken from that same rest world. Both are cheap
+        // to check once and impossible to read off a picture, since a wrong one renders as a slightly wrong pose.
+        if (!_restCheckLogged && gpuBake != null)
+        {
+            _restCheckLogged = true;
+            var skins = _asset.GetAllSkins();
+            var bind = skins.Count > 0 ? skins[0].BindNode : null;
+            int bindIndex = bind != null ? _asset.gltfNodes.IndexOf(bind) : -1;
+            if (bind != null && bindIndex >= 0 && _restWorld != null && bindIndex < _restWorld.Length)
+            {
+                var snapshot = _restWorld[bindIndex];
+
+                // Delta between the world the draw will actually use and the matrix the palette inverted.
+                float walkDelta = MaxElementDelta(bind.WorldTransform, snapshot);
+
+                // Every node that owns a primitive is a node whose world the draw multiplies by, while the palette only cancels
+                // the one its skin binds to. Those are the same node in the usual export, and the route depends on it: if any
+                // other owner moves between rest and the clip's first frame, the two routes cancel against different matrices
+                // and the rendered pose differs even when both palettes agree to the last bit. Measured rather than assumed,
+                // because the export shape is not something this file can see.
+                var owners = new List<GLTFNode>();
+                foreach (var nodeBase in _asset.gltfNodes)
+                {
+                    if (nodeBase is GLTFNode owner && owner.Primitives.Count > 0)
+                        owners.Add(owner);
+                }
+                var restOwners = new System.Numerics.Matrix4x4[owners.Count];
+                for (int i = 0; i < owners.Count; i++)
+                    restOwners[i] = owners[i].WorldTransform;
+
+                // Delta between the clip's first frame and that same snapshot: what the CPU route composes instead, and the
+                // reason the two routes cancel against different matrices. A large number here is expected and harmless as
+                // long as each side cancels against its own; it is only reported so the numbers can be read together.
+                _asset._animationPlayer.Evaluate(0, 0f, _asset.gltfNodes);
+                float posedDelta = MaxElementDelta(bind.WorldTransform, snapshot);
+
+                string moving = "";
+                for (int i = 0; i < owners.Count; i++)
+                {
+                    float d = MaxElementDelta(owners[i].WorldTransform, restOwners[i]);
+                    if (d > 1e-5f)
+                        moving += $" {owners[i].Name}={d:E1}";
+                }
+                RestoreRestWorld();
+
+                DeviceServices.BaseApp?.AddLog(LogType.Error,
+                    $"[SingleGpuSkin] bind='{bind.Name}' idx={bindIndex} skins={skins.Count} owners={owners.Count} "
+                    + $"bindOwns={owners.Exists(o => ReferenceEquals(o, bind))} "
+                    + $"restVsDraw={walkDelta:E3} posedVsRest={posedDelta:E3} moving=[{moving} ]");
+            }
+        }
+#endif
 
         // 2-3 Step C (tier B): from the second frame onward, previous
         // bone-palette SB contains valid data, so notify the shader that it may
@@ -1008,6 +1237,145 @@ internal unsafe class DXModel : DXPrimitiveGroup
 
         SetOutline2DState(model.Highlight.Outline,
             model.Highlight.OutlineColor, model.Highlight.OutlineWidth);
+    }
+
+    /// <summary>
+    /// Locks this frame onto one of the two routes and returns the bake the kernel will evaluate, or null for the CPU route. The
+    /// null return is what the caller branches on, so it never has to re-read the mode.
+    ///
+    /// Two settings differ from the instanced path. The block is one instance wide, and it reserves no tag row: a tag exists so a
+    /// non-zero instance index can find its own block, and a single model always addresses row <c>jointIndex</c> from row zero
+    /// because <c>isInstanced</c> is false. Reserving one here would make the kernel write a row the vertex stage never reads.
+    /// </summary>
+    InstanceSkinBake? BeginSkinningFrame(Season.Controls.Model model)
+    {
+        bool wanted = Season.Rendering.InstanceSkinning.Enabled
+            && (Season.Rendering.InstanceSkinning.Override ?? model.SkinningMode) == Season.Rendering.InstanceSkinningMode.Gpu;
+
+        if (wanted && _asset.SkinBake == null && !_bakeRefused)
+        {
+            // The mode was turned on after the asset loaded, which is not the intended order but is not worth refusing: the build
+            // is a one-off cost at the next Update, and the alternative - silently keeping the CPU route for the rest of the run -
+            // is invisible to whoever set the property.
+            //
+            // TryCreate rather than TryBake: the effective mode is already known to be Gpu here, and what has to be told apart is
+            // "cannot be built" from "not built yet". A backend without vertex-stage storage reads counts as the former even
+            // though it is a capability rather than a shape, because capability is fixed for the life of the process - and
+            // building the tables on such a backend would spend memory on data no draw could read.
+            var g = Season.Basic.Graphics.Instance;
+            if (g == null || !g.ComputeSupported || !g.VertexShaderStorageReadSupported)
+                _bakeRefused = true;
+            else if (InstanceSkinBake.TryCreate(_asset, out var freshBake))
+                _asset.SkinBake = freshBake;
+            else
+                _bakeRefused = true;
+        }
+
+        var bake = wanted ? _asset.SkinBake : null;
+        bool wasGpu = _gpuSkin;
+
+        if (bake == null)
+        {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+            return null;
+        }
+
+        _gpuPalette ??= new Season.Rendering.InstanceBoneStorage();
+        // tagRows = 0. The stride is the joint count on both sides: the bake's PaletteStride and the block the ring allocates.
+        if (!_skinning.Begin(_gpuPalette, bake, _bonePaletteStride, _asset._animations.Count, 0))
+        {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+            return null;
+        }
+
+        int slots = (int)Device.frameCount;
+        int current = (int)(Device.FrameIndex % Device.frameCount);
+        int previous = (int)((Device.FrameIndex + Device.frameCount - 1) % Device.frameCount);
+
+        // One instance, so one parameter row; the kernel evaluates that row and writes rows [0, jointCount).
+        if (!_skinning.PreparePalette(Season.Basic.Graphics.Instance, slots, current, previous, 1)
+            || !_skinning.BeginFrame(1))
+        {
+            _skinning.Begin(null, null, 0, 0);
+            _gpuSkin = false;
+            return null;
+        }
+
+        _gpuSkin = true;
+
+        // The storage diagnostic keeps the whole schedule - bake, parameter row, dispatch - and changes only what the vertex stage
+        // reads afterwards. The slot is overwritten with the CPU palette at the one point between the dispatch and the handoff, so
+        // the block the kernel just wrote is never what the draw sees; a frame that still differs from the CPU route then cannot be
+        // explained by the kernel at all.
+        _skinning.AfterDispatch = _paletteFromStorage ? PublishCpuPalette : null;
+
+#if DEBUG
+        // The numbers the kernel and the vertex stage each have to agree on, logged once. A mismatch here renders as a plausible
+        // pose rather than as an error, so it is worth having in the capture's stderr next to the dispatch counts.
+        if (!_gpuSkinLogged)
+        {
+            _gpuSkinLogged = true;
+            var logged = _asset._animationPlayer;
+            DeviceServices.BaseApp?.AddLog(LogType.Error,
+                $"[SingleGpuSkin] joints={_skinning.JointCount} stride={_skinning.PaletteStride}/{_bonePaletteStride} "
+                + $"clips={_skinning.ClipCount} bakeStride={bake.PaletteStride} slots={_gpuPalette.Slots.Length} "
+                + $"cur={_gpuPalette.CurrentSlot} prev={_gpuPalette.PreviousSlot} "
+                + $"palette={(_paletteFromStorage ? "storage" : _paletteFromCpu ? "cpu" : "gpu")} "
+                + $"rest={_restWorld?.Length}/{_asset.gltfNodes.Count} clip={logged.CurrentAnimationIndex} "
+                + $"t={logged.AnimationTime:F4} loop={logged.Loop}");
+        }
+#endif
+
+        // The palette is relative to the rest pose, so the per-primitive factor has to be the rest world too. Entering the route
+        // from the CPU one leaves an animated pose in the tree, and picking leaves one behind mid-route; both are undone here
+        // rather than where they happen, because this is the only place that knows the tree is being handed over.
+        if (!wasGpu || _asset.CpuPoseDisturbed)
+        {
+            _asset.CpuPoseDisturbed = false;
+            RestoreRestWorld();
+        }
+
+        return bake;
+    }
+
+    /// <summary>
+    /// Snapshots every node's rest world through the shared <see cref="Season.Models.RestPoseSnapshot"/>. That type exists because
+    /// the palette carries <c>inverse(rest world)</c> and the vertex stage multiplies by this matrix immediately after, so the pair
+    /// cancels only when both sides are the same value; computing it the way the bake does - local TRS from the initial values,
+    /// walked up the parent chain - is what makes it depend on nothing.
+    /// </summary>
+    void CaptureRestWorld()
+    {
+        _restPose.Capture(_asset);
+    }
+
+#if DEBUG
+    /// <summary>Largest absolute element difference between two matrices, for the route's one-shot diagnostics.</summary>
+    static float MaxElementDelta(in System.Numerics.Matrix4x4 a, in System.Numerics.Matrix4x4 b)
+    {
+        float d = 0f;
+        d = MathF.Max(d, MathF.Abs(a.M11 - b.M11)); d = MathF.Max(d, MathF.Abs(a.M12 - b.M12));
+        d = MathF.Max(d, MathF.Abs(a.M13 - b.M13)); d = MathF.Max(d, MathF.Abs(a.M14 - b.M14));
+        d = MathF.Max(d, MathF.Abs(a.M21 - b.M21)); d = MathF.Max(d, MathF.Abs(a.M22 - b.M22));
+        d = MathF.Max(d, MathF.Abs(a.M23 - b.M23)); d = MathF.Max(d, MathF.Abs(a.M24 - b.M24));
+        d = MathF.Max(d, MathF.Abs(a.M31 - b.M31)); d = MathF.Max(d, MathF.Abs(a.M32 - b.M32));
+        d = MathF.Max(d, MathF.Abs(a.M33 - b.M33)); d = MathF.Max(d, MathF.Abs(a.M34 - b.M34));
+        d = MathF.Max(d, MathF.Abs(a.M41 - b.M41)); d = MathF.Max(d, MathF.Abs(a.M42 - b.M42));
+        d = MathF.Max(d, MathF.Abs(a.M43 - b.M43)); d = MathF.Max(d, MathF.Abs(a.M44 - b.M44));
+        return d;
+    }
+#endif
+
+    /// <summary>
+    /// Puts every node back to the snapshot through the shared <see cref="Season.Models.RestPoseSnapshot"/>, which writes the TRS
+    /// triple alongside the world matrix: rest is a property of the triple, not of the cached product, so leaving an evaluated
+    /// triple behind would read back as animated the first time anything recomposes the tree.
+    /// </summary>
+    void RestoreRestWorld()
+    {
+        _restPose.Restore(_asset);
     }
 
     /// <summary>2-3 Step C (tier B): once previous bone-palette SB contains
@@ -1110,14 +1478,56 @@ internal unsafe class DXModel : DXPrimitiveGroup
     }
 
     protected override GpuDescriptorHandle GetBoneSrvHandle()
-        => DXSceneDrawCollection.Structured(_bonePaletteBuffer, 64, _bonePaletteSrvHandle);
+    {
+        // On the GPU route the palette lives in a compute-written storage buffer, whose structured view was created with it, so
+        // the mapped upload ring is not consulted at all. Gated on the latch rather than on the handoff result, for the reason the
+        // instanced path spells out: the ring always holds the last palette the kernel produced, while falling through here would
+        // bind a buffer this route never wrote. The storage diagnostic deliberately keeps this binding while swapping the source,
+        // which is what makes it a different question from the cpu switch.
+        if (_gpuSkin && (!_paletteFromCpu || _paletteFromStorage) && _skinning.Palette?.Current is DXStorageBuffer gpuBone)
+        {
+#if DEBUG
+            // Printed from the draw side rather than the publish side, because the question is not what was written but what this
+            // call hands the command list. A zero pointer here is the whole answer: the draw then binds the default palette, whose
+            // contents no dispatch ever touches, and every run that lands on it renders the same wrong pose regardless of bytes.
+            if (_paletteFromStorage && _storageProbeFrame != Device.FrameIndex
+                && (uint)(Device.FrameIndex - _storageProbeFrame) >= 500u)
+            {
+                _storageProbeFrame = Device.FrameIndex;
+                var prev = _skinning.Palette?.Previous as DXStorageBuffer;
+                DeviceServices.BaseApp?.AddLog(LogType.Error,
+                    $"[StorageDraw] frame={Device.FrameIndex} gpuSkin={_gpuSkin} live={_skinning.Live} "
+                    + $"cur={_skinning.Palette?.CurrentSlot} prev={_skinning.Palette?.PreviousSlot} "
+                    + $"id={gpuBone.VertexSrvDescriptorID} ptr={(ulong)gpuBone.VertexSrvGpuHandle.Ptr} "
+                    + $"prevPtr={(prev != null ? (ulong)prev.VertexSrvGpuHandle.Ptr : 0)}");
+            }
+#endif
+            return gpuBone.VertexSrvGpuHandle;
+        }
+        return DXSceneDrawCollection.Structured(_bonePaletteBuffer, 64, _bonePaletteSrvHandle);
+    }
+
     protected override GpuDescriptorHandle GetPrevBoneSrvHandle()
-        => DXSceneDrawCollection.Structured(_prevBonePaletteBuffer, 64, _prevBonePaletteSrvHandle);
+    {
+        // The previous frame is the ring one slot back, which is where the kernel wrote it last frame. The CPU memcpy that feeds
+        // the upload ring cannot see a compute-written buffer at all, so on this route that copy simply does not happen. Under the
+        // storage diagnostic the slot is one this class published itself last frame, with the same CPU palette.
+        if (_gpuSkin && (!_paletteFromCpu || _paletteFromStorage) && _skinning.Palette?.Previous is DXStorageBuffer gpuPrev)
+            return gpuPrev.VertexSrvGpuHandle;
+        return DXSceneDrawCollection.Structured(_prevBonePaletteBuffer, 64, _prevBonePaletteSrvHandle);
+    }
     protected override GpuDescriptorHandle GetPrevMorphSrvHandle()
         => DXSceneDrawCollection.Structured(_prevMorphWeightsBuffer, 16, _prevMorphWeightsSrvHandle);
 
     public override void Dispose()
     {
+        // Leave the scheduler before the buffers it points at go away, and release the compute-side parameter and scratch blocks
+        // the target owns. The palette ring is this class's own, so it dies here too.
+        _skinning.Dispose();
+        _gpuPalette?.Dispose();
+        _gpuPalette = null;
+        _gpuSkin = false;
+
         foreach (var nodeBase in _asset.gltfNodes)
         {
             var node = nodeBase as GLTFNode;

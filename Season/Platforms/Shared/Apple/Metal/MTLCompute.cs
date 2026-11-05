@@ -109,6 +109,14 @@ internal sealed class MTLStorageBuffer : Season.Rendering.StorageBuffer
 {
     internal IMTLBuffer Buffer;
 
+    /// <summary>
+    /// C1: set by <c>TryPrepareVertexInput</c> once the buffer holds vertices the vertex input stage may read this frame, and
+    /// cleared again as soon as a dispatch writes it. Metal records nothing for the handoff - hazard tracking orders the
+    /// producer before the draw - so this flag is the whole handoff, and it is what makes a stream that was never written (the
+    /// cloth never stepped, or the effect already disposed) fall back to the static vertex buffer.
+    /// </summary>
+    internal bool VertexInputReady;
+
     readonly nuint _alignedSize;
 
     /// <summary>Step 0 of 2-4: a StorageModeShared staging ring for CPU-to-GPU uploads, split by in-flight frame slot.

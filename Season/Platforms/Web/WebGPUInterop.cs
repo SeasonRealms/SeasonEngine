@@ -468,6 +468,14 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.disposeStorageBuffer")]
     internal static partial void DisposeStorageBuffer(string id);
 
+    /// <summary>
+    /// C1: overrides slot 0 of one mesh cache key with a compute-written storage buffer, or clears the override when
+    /// <paramref name="storageId"/> is null. JS keeps the mapping across frames and falls back to the uploaded static buffer
+    /// whenever the id is absent or its GPUBuffer has already been released, so a released cloth degrades by itself.
+    /// </summary>
+    [JSImport("globalThis.seasonWebGPU.setMeshVertexStream")]
+    internal static partial void SetMeshVertexStream(string cacheKey, string? storageId);
+
     /// <summary>1-8: registers a 3D storage texture into the dedicated JS _textures3d dictionary (**not** into _textures),
     /// otherwise drawSprite2D and material name lookups would hit a 3D view.
     /// formatKind is aligned with ComputeStorageFormat.

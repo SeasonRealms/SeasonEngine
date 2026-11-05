@@ -203,6 +203,50 @@ public class WorldSettings
     /// </summary>
     public float SeaWaveSpeed { get; set; } = DefaultSeaWaveSpeed;
 
+    /// <summary>Default value for WindDirection (overrideable in the app constructor and captured by Init()).</summary>
+    public static float DefaultWindDirection = 17f;
+
+    /// <summary>Default value for WindLevel (overrideable in the app constructor and captured by Init()).</summary>
+    public static int DefaultWindLevel = 1;
+
+    float windDirection = DefaultWindDirection;
+
+    /// <summary>
+    /// Ambient wind bearing in degrees, always normalised into 0~360. The angle is measured the way every other
+    /// direction in the engine is - see <see cref="Wind"/> - so 0° blows toward +X and 90° toward +Z.
+    ///
+    /// The setter wraps rather than rejects, because this is a panel value a person types: 370° and -10° are the
+    /// same wind as 350°, and refusing them would only make the row feel broken. A non-finite value is ignored
+    /// instead of wrapped, because NaN would survive the modulo and then reach
+    /// <see cref="Effects.ParticleSystemEffect.WindVelocity"/>, whose validator throws - one bad edit would turn
+    /// into a throw on every frame.
+    /// </summary>
+    public float WindDirection
+    {
+        get => windDirection;
+        set
+        {
+            if (!float.IsFinite(value))
+                return;
+
+            float wrapped = value % 360f;
+            windDirection = wrapped < 0f ? wrapped + 360f : wrapped;
+        }
+    }
+
+    int windLevel = DefaultWindLevel;
+
+    /// <summary>
+    /// Ambient wind strength on the 0~10 ladder, 0 being dead calm. Only the level is stored, not the m/s it stands
+    /// for: the ladder itself lives in <see cref="Wind.SpeedOfLevel"/>, so retuning it is not a settings migration
+    /// and a file saved at 3级 keeps meaning 3级. Clamped on write so a corrupt file cannot index past the ladder.
+    /// </summary>
+    public int WindLevel
+    {
+        get => windLevel;
+        set => windLevel = Math.Clamp(value, 0, Wind.MaxLevel);
+    }
+
     /// <summary>Spatial weather configuration. Null when an old settings file lacks this entry; the app fills in the scene's default regions.</summary>
     public WeatherRegionSettings[] WeatherRegions { get; set; } = [];
 

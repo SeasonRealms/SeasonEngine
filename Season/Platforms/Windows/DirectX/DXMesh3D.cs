@@ -175,6 +175,12 @@ internal unsafe class DXMesh3D : DXPrimitiveGroup
 
         _transformInitialized = true;
 
+        // C1: mirror each surface's compute stream onto its primitive (same order, reference copy only). The draw side decides
+        // per frame whether the stream or the static buffer is read, see PrimitiveData.ResolveVertexView.
+        int streamCount = Math.Min(Primitives.Count, mesh.Surfaces.Count);
+        for (int i = 0; i < streamCount; i++)
+            Primitives[i].VertexStream = mesh.Surfaces[i].VertexStream as DXStorageBuffer;
+
         // Sync Mesh3D.Alpha to every primitive material buffer
         // (written only when it changes; the base class handles the check)
         SyncAlpha(mesh.Alpha);

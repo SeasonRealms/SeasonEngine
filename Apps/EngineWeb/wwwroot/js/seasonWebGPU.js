@@ -144,6 +144,10 @@ window.seasonWebGPU = (() => {
     // Therefore a frame-serial gate ensures it rolls exactly once per frame per skinKey:
     // the first call is effective, later calls in the same frame only write current data.
     const _prevSkinnedBoneFrame = {};
+    // P0: skin keys whose palette comes from a storage ring instead of an upload. bindSkinnedBoneStorage fills this in and points both the
+    // current and previous maps straight at ring slots, which also replaces the shadow copy above: with a ring, "previous" is a different
+    // buffer rather than last frame's bytes, so there is nothing to roll forward.
+    const _skinnedBoneStorageKeys = {};
     let _frameSerial = 0;
     let _skinnedLogCount = 0;
     const _instancedDiag = {
@@ -234,6 +238,25 @@ window.seasonWebGPU = (() => {
     // Persistent cache for static meshes
     // geometry is reused across frames and only uniforms are updated per frame
     const _staticMeshes = {};
+
+    // C1: cache key -> storage buffer id whose contents replace the uploaded static vertices at slot 1.
+    // Written by setMeshVertexStream when a compute effect hands a per-vertex stream over, and read by every
+    // draw path that would otherwise bind mesh.vBuffer, so the scene, shadow and outline-mask passes resolve
+    // the same source. A disposed effect releases the GPUBuffer, and _meshVertexBuffer then falls back to the
+    // static buffer without the C# side having to republish anything.
+    const _meshVertexStreams = {};
+
+    function setMeshVertexStream(cacheKey, storageId) {
+        if (!cacheKey) return;
+        if (storageId) _meshVertexStreams[cacheKey] = storageId;
+        else delete _meshVertexStreams[cacheKey];
+    }
+
+    function _meshVertexBuffer(cacheKey, mesh) {
+        const id = _meshVertexStreams[cacheKey];
+        const stream = id ? _storageBuffers[id] : null;
+        return stream || mesh.vBuffer;
+    }
 
     function _uploadStaticMeshInternal(cacheKey, vertexData, indexData, textureName, normalTextureName, mrTextureName, aoTextureName, emissiveTextureName, vertexStrideFloats, indexFormat, doubleSided, skinned, morphBytes = null, morphTargetCount = 0, morphVertexCount = 0) {
         const resolvedIndexFormat = indexFormat === 'uint32' ? 'uint32' : 'uint16';
@@ -399,6 +422,8 @@ window.seasonWebGPU = (() => {
     function uploadSkinnedBones(skinKey, boneBytes) {
         boneBytes = _interopToU8(boneBytes);
         if (!boneBytes || boneBytes.byteLength === 0) return;
+        // P0: a storage-bound skin key is produced on the GPU; overwriting it here would put a stale CPU palette behind the ring.
+        if (_skinnedBoneStorageKeys[skinKey]) return;
 
         if (boneBytes.byteLength < MIN_SKINNED_BONE_BUFFER_BYTES) {
             const paddedBytes = new Uint8Array(MIN_SKINNED_BONE_BUFFER_BYTES);
@@ -432,6 +457,30 @@ window.seasonWebGPU = (() => {
             _log(`[WebSkinningJS] uploadSkinnedBones skinKey=${skinKey} boneBytes=${boneBytes.byteLength}`);
             _skinnedLogCount++;
         }
+    }
+
+    // P0: pointer swap from "a CPU upload per frame" to "a slot of the GPU-resident palette ring". Both maps that the draw paths read are
+    // filled here, so the two routes are byte-identical from the shader's point of view and the draw code needs no branch of its own.
+    function bindSkinnedBoneStorage(skinKey, currentId, previousId) {
+        if (!_device || !skinKey) return false;
+        const current = _storageBuffers[currentId];
+        if (!current) return false;
+        const previous = _storageBuffers[previousId] || current;
+        _skinnedBoneBuffers[skinKey] = current;
+        _prevSkinnedBoneBuffers[skinKey] = previous;
+        _skinnedBoneStorageKeys[skinKey] = true;
+        // The shadow copy is dead weight for this key from now on; dropping it keeps a later unbind from reinstating a stale palette.
+        delete _prevSkinnedBoneBytes[skinKey];
+        delete _prevSkinnedBoneFrame[skinKey];
+        return true;
+    }
+
+    function unbindSkinnedBoneStorage(skinKey) {
+        if (!skinKey || !_skinnedBoneStorageKeys[skinKey]) return;
+        delete _skinnedBoneStorageKeys[skinKey];
+        // Only the references go: the buffers belong to the producer, these maps never owned them.
+        delete _skinnedBoneBuffers[skinKey];
+        delete _prevSkinnedBoneBuffers[skinKey];
     }
 
     function updateStaticMeshVertices(cacheKey, vertexBytes) {
@@ -3579,6 +3628,8 @@ window.seasonWebGPU = (() => {
             if (_debugLog) console.warn(`[drawMesh3DCached] missing key=${cacheKey}, fallback ignored`);
             return;
         }
+        // C1: a compute-written stream replaces the uploaded static vertices while it is alive.
+        const vBuffer = _meshVertexBuffer(cacheKey, mesh);
 
         if (!ArrayBuffer.isView(uniformData)) uniformData = new Float32Array(uniformData);
 
@@ -3600,7 +3651,7 @@ window.seasonWebGPU = (() => {
             whiteView);
 
         const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[46], _getUniformI32View(uniformData)[50], _getUniformI32View(uniformData)[51]);
-        _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, _identityInstanceBuffer, mesh.vBuffer, mesh.iBuffer,
+        _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, _identityInstanceBuffer, vBuffer, mesh.iBuffer,
             mesh.indexFormat || 'uint16', mesh.indexCount, 1, 0,
             _isSceneCollecting() ? _sceneDrawDepth(uniformData, mesh.boundsCenter) : 0);
     }
@@ -3648,6 +3699,8 @@ window.seasonWebGPU = (() => {
                 const cacheKey = cacheKeys[i];
                 const mesh = _staticMeshes[cacheKey];
                 if (!mesh) continue;
+                // C1: resolved once per draw so all three passes (shadow, outline mask, scene) read the same slot 0.
+                const vBuffer = _meshVertexBuffer(cacheKey, mesh);
 
                 const uniformBase = i * STRIDE;
                 const alphaMode = intView[uniformBase + 50];
@@ -3669,7 +3722,7 @@ window.seasonWebGPU = (() => {
                         activePipeline = _shadowPipeline;
                     }
                     _passEncoder.setVertexBuffer(0, _identityInstanceBuffer);
-                    _setSceneVertexBuffer(1, mesh.vBuffer);
+                    _setSceneVertexBuffer(1, vBuffer);
                     _passEncoder.setIndexBuffer(mesh.iBuffer, mesh.indexFormat || 'uint16');
                     _passEncoder.setBindGroup(0, sBindGroup);
                     _passEncoder.drawIndexed(mesh.indexCount);
@@ -3710,7 +3763,7 @@ window.seasonWebGPU = (() => {
                         activePipeline = maskPipeline;
                     }
                     _passEncoder.setVertexBuffer(0, _identityInstanceBuffer);
-                    _setSceneVertexBuffer(1, mesh.vBuffer);
+                    _setSceneVertexBuffer(1, vBuffer);
                     _passEncoder.setIndexBuffer(mesh.iBuffer, mesh.indexFormat || 'uint16');
                     _passEncoder.setBindGroup(0, mBindGroup);
                     _passEncoder.drawIndexed(mesh.indexCount);
@@ -3740,7 +3793,7 @@ window.seasonWebGPU = (() => {
                     mesh.morphDataBuffer,
                     prevBoneBuffer);
 
-                _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, _identityInstanceBuffer, mesh.vBuffer, mesh.iBuffer,
+                _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, _identityInstanceBuffer, vBuffer, mesh.iBuffer,
                     mesh.indexFormat || 'uint16', mesh.indexCount, 1, 0,
                     _isSceneCollecting() ? _sceneDrawDepth(uniformView, mesh.boundsCenter) : 0);
             }
@@ -5984,6 +6037,8 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         uploadStaticSkinnedMesh,
         uploadStaticMeshInterop,
         uploadSkinnedBones,
+        bindSkinnedBoneStorage,
+        unbindSkinnedBoneStorage,
         updateSceneLights,
         setViewConstants,
         setShadowViewport,
@@ -6040,6 +6095,8 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         createComputeTexture,
         createStorageBuffer,
         disposeStorageBuffer,
+        // C1: per-mesh slot-1 override so a compute-written vertex stream draws through the ordinary mesh pipeline.
+        setMeshVertexStream,
         dispatchCompute,
         // 1-8 Compute 3D resource expansion
         createComputeTexture3D, releaseComputeTexture3D,

@@ -239,6 +239,25 @@ window.seasonWebGPU = (() => {
     // geometry is reused across frames and only uniforms are updated per frame
     const _staticMeshes = {};
 
+    // C1: cache key -> storage buffer id whose contents replace the uploaded static vertices at slot 1.
+    // Written by setMeshVertexStream when a compute effect hands a per-vertex stream over, and read by every
+    // draw path that would otherwise bind mesh.vBuffer, so the scene, shadow and outline-mask passes resolve
+    // the same source. A disposed effect releases the GPUBuffer, and _meshVertexBuffer then falls back to the
+    // static buffer without the C# side having to republish anything.
+    const _meshVertexStreams = {};
+
+    function setMeshVertexStream(cacheKey, storageId) {
+        if (!cacheKey) return;
+        if (storageId) _meshVertexStreams[cacheKey] = storageId;
+        else delete _meshVertexStreams[cacheKey];
+    }
+
+    function _meshVertexBuffer(cacheKey, mesh) {
+        const id = _meshVertexStreams[cacheKey];
+        const stream = id ? _storageBuffers[id] : null;
+        return stream || mesh.vBuffer;
+    }
+
     function _uploadStaticMeshInternal(cacheKey, vertexData, indexData, textureName, normalTextureName, mrTextureName, aoTextureName, emissiveTextureName, vertexStrideFloats, indexFormat, doubleSided, skinned, morphBytes = null, morphTargetCount = 0, morphVertexCount = 0) {
         const resolvedIndexFormat = indexFormat === 'uint32' ? 'uint32' : 'uint16';
         if (_staticMeshes[cacheKey]) {
@@ -3609,6 +3628,8 @@ window.seasonWebGPU = (() => {
             if (_debugLog) console.warn(`[drawMesh3DCached] missing key=${cacheKey}, fallback ignored`);
             return;
         }
+        // C1: a compute-written stream replaces the uploaded static vertices while it is alive.
+        const vBuffer = _meshVertexBuffer(cacheKey, mesh);
 
         if (!ArrayBuffer.isView(uniformData)) uniformData = new Float32Array(uniformData);
 
@@ -3630,7 +3651,7 @@ window.seasonWebGPU = (() => {
             whiteView);
 
         const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[46], _getUniformI32View(uniformData)[50], _getUniformI32View(uniformData)[51]);
-        _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, _identityInstanceBuffer, mesh.vBuffer, mesh.iBuffer,
+        _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, _identityInstanceBuffer, vBuffer, mesh.iBuffer,
             mesh.indexFormat || 'uint16', mesh.indexCount, 1, 0,
             _isSceneCollecting() ? _sceneDrawDepth(uniformData, mesh.boundsCenter) : 0);
     }
@@ -3678,6 +3699,8 @@ window.seasonWebGPU = (() => {
                 const cacheKey = cacheKeys[i];
                 const mesh = _staticMeshes[cacheKey];
                 if (!mesh) continue;
+                // C1: resolved once per draw so all three passes (shadow, outline mask, scene) read the same slot 0.
+                const vBuffer = _meshVertexBuffer(cacheKey, mesh);
 
                 const uniformBase = i * STRIDE;
                 const alphaMode = intView[uniformBase + 50];
@@ -3699,7 +3722,7 @@ window.seasonWebGPU = (() => {
                         activePipeline = _shadowPipeline;
                     }
                     _passEncoder.setVertexBuffer(0, _identityInstanceBuffer);
-                    _setSceneVertexBuffer(1, mesh.vBuffer);
+                    _setSceneVertexBuffer(1, vBuffer);
                     _passEncoder.setIndexBuffer(mesh.iBuffer, mesh.indexFormat || 'uint16');
                     _passEncoder.setBindGroup(0, sBindGroup);
                     _passEncoder.drawIndexed(mesh.indexCount);
@@ -3740,7 +3763,7 @@ window.seasonWebGPU = (() => {
                         activePipeline = maskPipeline;
                     }
                     _passEncoder.setVertexBuffer(0, _identityInstanceBuffer);
-                    _setSceneVertexBuffer(1, mesh.vBuffer);
+                    _setSceneVertexBuffer(1, vBuffer);
                     _passEncoder.setIndexBuffer(mesh.iBuffer, mesh.indexFormat || 'uint16');
                     _passEncoder.setBindGroup(0, mBindGroup);
                     _passEncoder.drawIndexed(mesh.indexCount);
@@ -3770,7 +3793,7 @@ window.seasonWebGPU = (() => {
                     mesh.morphDataBuffer,
                     prevBoneBuffer);
 
-                _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, _identityInstanceBuffer, mesh.vBuffer, mesh.iBuffer,
+                _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, _identityInstanceBuffer, vBuffer, mesh.iBuffer,
                     mesh.indexFormat || 'uint16', mesh.indexCount, 1, 0,
                     _isSceneCollecting() ? _sceneDrawDepth(uniformView, mesh.boundsCenter) : 0);
             }
@@ -6072,6 +6095,8 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         createComputeTexture,
         createStorageBuffer,
         disposeStorageBuffer,
+        // C1: per-mesh slot-1 override so a compute-written vertex stream draws through the ordinary mesh pipeline.
+        setMeshVertexStream,
         dispatchCompute,
         // 1-8 Compute 3D resource expansion
         createComputeTexture3D, releaseComputeTexture3D,

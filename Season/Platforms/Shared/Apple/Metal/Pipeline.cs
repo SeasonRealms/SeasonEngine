@@ -33,7 +33,7 @@ internal enum PipelineMode
 ///   - one MTLVertexDescriptor aligned exactly with the 80-byte stride and 6 attributes in src/Controls/Vertex.cs
 ///
 /// Conversion rules from GLSL and HLSL into MSL:
-///   1. `layout(std140, binding=N) uniform Block` → `constant Block& blk [[buffer(N)]]`
+///   1. `layout(std140, binding=N) uniform Block` → `constant Block&amp; blk [[buffer(N)]]`
 ///   2. `uniform sampler2D` → `texture2d&lt;float&gt; tex [[texture(N)]]` + `sampler s [[sampler(0)]]`
 ///   3. `mat3(mat4 M)` → `float3x3(M[0].xyz, M[1].xyz, M[2].xyz)`
 ///   4. `discard` → `discard_fragment()`
@@ -695,6 +695,8 @@ internal static class Pipeline
     {
         // Work package D: this is the single exit for all 3D paths (model / instanced model / instanced mesh / highlight shell / sprite shell box),
         // so intercepting once covers all PrimitiveData draws. The collection phase submits no draw; it only hands immutable handles to the replay queue.
+        // C1: slot 0 is resolved before the capture, because the replay queue reuses the handle recorded here verbatim.
+        primitiveVertexBuffer = primitiveData.ResolveVertexBuffer(primitiveVertexBuffer);
         if (MTLSceneDrawCollection.Active is { } collecting)
         {
             collecting.CapturePrimitive(primitiveData, primitiveVertexBuffer, primitiveIndexBuffer,
@@ -827,6 +829,9 @@ internal static class Pipeline
         nuint instanceBoneBufferOffset,
         bool bindMaterial = true)
     {
+        // C1: the shadow pass must rasterise the same sheet the scene shows, so it resolves slot 0 through the same call.
+        primitiveVertexBuffer = primitiveData.ResolveVertexBuffer(primitiveVertexBuffer);
+
         enc.SetVertexBuffer(primitiveVertexBuffer, 0, 0); // VB slot 0
         enc.SetVertexBuffer(matrixBuffer, 0, 1);          // b1 Matrices
         BindView(enc, MainViewBuffer);                    // b11 ViewConstants (shadow does not read view/proj, placeholder kept)
@@ -874,6 +879,9 @@ internal static class Pipeline
         nuint indirectOffset,
         bool bindMaterial = true)
     {
+        // C1: same resolution as the non-indirect shadow path; indirection only moves where the counts come from.
+        primitiveVertexBuffer = primitiveData.ResolveVertexBuffer(primitiveVertexBuffer);
+
         enc.SetVertexBuffer(primitiveVertexBuffer, 0, 0); // VB slot 0
         enc.SetVertexBuffer(matrixBuffer, 0, 1);          // b1 Matrices
         BindView(enc, MainViewBuffer);                    // b11 ViewConstants (shadow does not read view/proj, placeholder kept)

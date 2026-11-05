@@ -48,6 +48,31 @@ internal class Robots : Panel
     // Set by RestartAnimations and consumed by the next ApplyPersons. See there for why it takes two frames.
     bool _restartAnimations;
 
+    /// <summary>
+    /// One plain <see cref="Model"/> beside the instanced field, created only when <c>SEASON_AB_SINGLE</c> is set. Every other
+    /// sample in this panel is an InstancedModel, so the single-model GPU route - which shares the kernel with the instanced one
+    /// and none of the instancing around it - has nothing here to be compared against. Cross-run comparison is sound at this
+    /// placement: two CPU-path runs of this scene differ by zero pixels inside the probe's rectangle.
+    ///
+    /// The value selects the playback mode. <c>stop</c> parks the probe on the clip's first frame, which is the only setting where
+    /// both routes sample the identical time and a difference can only be a plumbing defect rather than the kernel lerping
+    /// between 60 Hz keys the CPU sampler interpolated from the original curve. Any other value restarts the clip and lets that
+    /// documented residual back in, which is the setting to use when checking that animation actually plays.
+    /// </summary>
+    internal Model? singleProbe;
+
+    /// <summary>Set by <see cref="RestartAnimations"/> until the probe's clock has actually been pinned, so a frame boundary
+    /// that arrives before the asset finished loading does not leave the two runs on different phases.</summary>
+    bool _restartSingleProbe;
+
+    /// <summary>Whether the probe holds its first frame instead of playing. Read once from the variable at creation so the
+    /// restart below and the route selection cannot disagree about which mode the run is in.</summary>
+    bool _singleProbeStop;
+
+    const string SingleProbeVariable = "SEASON_AB_SINGLE";
+
+    const string SingleProbeClip = "Run-loop";
+
     internal Robots()
     {
         // P1: this panel's animation is entirely joint-driven, so the load-time bake applies and the FrameStart kernel can
@@ -123,10 +148,13 @@ internal class Robots : Panel
 
         var texts = new string[] { "Where do you come from?", "What's beyond the sea?" };
 
+        // 每进程抽一次，让重开时换句问候。逐像素 A/B 却要两轮画出同一行字：无种子抽取在那里是五成硬币，
+        // 实测在 x≈1520..1719 / y≈820..859 上贡献了 worst 739 的差值 —— 比整条被测路由的残差大两个数量级。
+        // 取证运行时直接取第一句，抽取本身在正常运行时照旧。
         bubbleText = new Texts()
         {
             RenderDomain = RenderDomain.Overlay,
-            Content = texts[new Random().Next(0, texts.Length)],
+            Content = texts[AbCapture.Enabled ? 0 : new Random().Next(0, texts.Length)],
             Color = Season.Basic.Colors.Black,
             Scale = Vector2.One * 0.7f,
             Alpha = 0f
@@ -194,11 +222,75 @@ internal class Robots : Panel
     }
 
     /// <summary>
+    /// Creates or ticks the single-model probe. Placement is beside the instanced field rather than in it: the field occupies
+    /// x = ±2, z = 6..33, so x = -6 keeps the probe fully lit and clear of the field's own silhouettes, which is what lets a
+    /// capture be reduced to one rectangle instead of the whole frame.
+    /// </summary>
+    void UpdateSingleProbe(float time)
+    {
+        if (singleProbe == null)
+        {
+            var raw = Environment.GetEnvironmentVariable(SingleProbeVariable);
+            if (string.IsNullOrEmpty(raw)) return;
+
+            // Two independent dimensions carried by one variable: "gpu" picks the route, "stop" the playback mode. They are
+            // spelled together because the comparison that decides anything - both routes parked on the clip's first frame,
+            // where a difference cannot be the kernel resampling the 60 Hz keys the CPU sampler interpolated from the
+            // original curve - is one run of each, and one variable keeps that pair from drifting apart. Neither word
+            // contains the other, so a contains check each is unambiguous.
+            _singleProbeStop = raw.Contains("stop", StringComparison.OrdinalIgnoreCase);
+
+            singleProbe = new Model
+            {
+                Name = "Assets/3DGodotRobot.glb",
+                PosX = -6f,
+                PosY = 1f,
+                PosZ = 6f,
+                Width = 1f,
+                Height = 1f,
+                Depth = 1f,
+                Rotation = MathF.PI,
+                SkinningMode = raw.Contains("gpu", StringComparison.OrdinalIgnoreCase)
+                    ? InstanceSkinningMode.Gpu
+                    : InstanceSkinningMode.Cpu
+            };
+            AddControl(singleProbe);
+        }
+
+        // Pin the clock from here on rather than from the asset load. StopAnimationAtRest zeroes the playback time and evaluates
+        // the clip's first frame; PlayAnimation on that same clip flips the animating flag back on without touching the time, so
+        // the two calls together are "restart at zero" without the asset needing a seek API. Retried until it lands, because
+        // Ready is false on any frame before the asynchronous load finishes.
+        //
+        // The holding mode re-pins every frame instead of once. A single attempt is enough for the restart path because
+        // PlayAnimation leaves the clock running and therefore visible, but this mode's whole purpose is a pose that does not
+        // depend on when anything happened: the asset starts playing from PlayAnimation in Load, the load frame varies by run, and
+        // a stop that lands once - or lands before the load - leaves the probe at whatever phase the rest of the run accumulated,
+        // which makes two runs of the same settings differ. Re-pinning is idempotent and costs one CPU sample per frame, the same
+        // work the CPU route does anyway.
+        if (_singleProbeStop)
+        {
+            singleProbe.StopAnimationAtRest();
+        }
+        else if (_restartSingleProbe)
+        {
+            singleProbe.StopAnimationAtRest();
+            _restartSingleProbe = singleProbe.PlayAnimation(SingleProbeClip) == null;
+        }
+
+        singleProbe.Update(time);
+    }
+
+    /// <summary>
     /// Restarts every person's animation from its time offset, two frames from now. Only the per-pixel A/B harness calls it:
     /// playback time accumulates from the frame the model finished its asynchronous load, which differs per run, so without a
     /// restart at a fixed frame number two otherwise identical runs capture the robots in different poses.
     /// </summary>
-    internal void RestartAnimations() => _restartAnimations = true;
+    internal void RestartAnimations()
+    {
+        _restartAnimations = true;
+        _restartSingleProbe = true;
+    }
 
     /// <summary>Resolves an animation clip index by name. Null, empty, unmatched, or not-yet-loaded cases all fall back to 0, the default clip.</summary>
     int ResolveAnimationClip(string? name)
@@ -223,6 +315,8 @@ internal class Robots : Panel
         SyncInstances();
         ApplyPersons();
         robotField.Update(time);
+
+        UpdateSingleProbe(time);
 
         happy.Update(time);
 

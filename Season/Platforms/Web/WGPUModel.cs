@@ -23,6 +23,40 @@ internal class WGPUModel
     // Bone-matrix byte buffer (persistently reused and overwritten in place every frame).
     byte[] _boneMatricesBytes = Array.Empty<byte>();
 
+    // --- single-model GPU skinning (Model.SkinningMode = Gpu) ---
+    //
+    // The same kernel, parameter row and frame latch the instanced path uses, filled with exactly one row. Web carries none of the
+    // glue the native backends need - no descriptor set to rewrite, no buffer binding to swap: the JS side already resolves a skin key
+    // to either an uploaded CPU palette or two storage buffers, so switching routes is one interop call that rebinds the key, and an
+    // empty upload is what tells JS to stop expecting one.
+
+    /// <summary>The shared target implementation, one instance wide. Registered at load, unregistered by Dispose.</summary>
+    readonly Season.Rendering.InstanceSkinningTarget _skinning = new();
+
+    /// <summary>True while this frame draws from the kernel's palette. Latched once per Update so a frame cannot half-switch
+    /// between the two palettes, which would compose half a pose from one source and half from the other.</summary>
+    bool _gpuSkin;
+
+    /// <summary>Set once a bake has been asked for and refused. A refusal is permanent - it comes from the asset's shape, which
+    /// nothing changes after load - and without this the retry in <see cref="BeginSkinningFrame"/> would rescan the whole clip set
+    /// every frame for the life of a model the bake declines.</summary>
+    bool _bakeRefused;
+
+    /// <summary>The palette ring this class creates because the GPU route needs a compute-written palette. Owned here, disposed here.</summary>
+    Season.Rendering.InstanceBoneStorage? _gpuPalette;
+
+    /// <summary>The ids last handed to JS, so a frame that does not advance the ring does not re-enter interop for nothing.</summary>
+    string? _boneStorageBoundCurrent;
+    string? _boneStorageBoundPrevious;
+
+    /// <summary>Frames this model has advanced its ring by. There is no backend frame ring on Web, so the model is the clock both the
+    /// producer and the consumer read their slot from.</summary>
+    uint _boneStorageFrame;
+
+    /// <summary>The rest pose, shared with the other three backends so a route whose correctness rests on two matrices cancelling
+    /// has one implementation of the snapshot rather than four.</summary>
+    readonly Season.Models.RestPoseSnapshot _restPose = new();
+
     // Unified highlight: host bounds-box state (built lazily; extended by Wireframe shell in Phase 3).
     bool _boundsActive;
     WebBoundsBox? _boundsBox;
@@ -60,6 +94,12 @@ internal class WGPUModel
         model.Asset = _asset;
 
         _asset.Load(model);
+
+        // Single-model GPU skinning: the palette ring and the bake are created lazily by the first BeginSkinningFrame, because
+        // whether either is wanted is a property of the control (SkinningMode, possibly overridden per process) and this call may
+        // precede that decision. The rest snapshot does belong here: it is a property of the asset alone.
+        _restPose.Capture(_asset);
+        Season.Rendering.InstanceSkinning.Register(_skinning);
     }
 
     /// <summary>Shared-template instancing: clones the node tree.
@@ -155,6 +195,11 @@ internal class WGPUModel
         // Shared-template instancing path: inject the instance asset into the control
         // with the same semantics used by the direct-load path in Load.
         model.Asset = instance._asset;
+
+        // Single-model GPU skinning on a shared-template instance: the cloned tree is complete by now, so the rest snapshot is
+        // taken from the instance's own nodes rather than shared with the template - the clone is what the draw walks.
+        instance._restPose.Capture(instance._asset);
+        Season.Rendering.InstanceSkinning.Register(instance._skinning);
 
         return instance;
     }
@@ -639,17 +684,37 @@ internal class WGPUModel
         // Mirroring VK: being initialized at the start of this Update means the previous frame already produced
         // a complete set of bone and morph data.
         bool wasInitialized = _transformInitialized;
-        _asset._animationPlayer.Update(time, _asset.gltfNodes);
-        if (_hasSkinning)
+
+        // Latch the route before anything reads the tree, and let the latch shape the palette ring: on Web the model, not the backend,
+        // is the clock, so the slot chosen below inside BeginSkinningFrame is both the one the kernel writes and the one the draw binds.
+        var gpuBake = BeginSkinningFrame(model);
+
+        if (gpuBake != null)
         {
-            _asset._animationPlayer.UpdateBoneMatrices(_asset.GetAllSkins());
-            // Reinterpret the shared buffer directly as bytes and write it into the persistent buffer
-            // to avoid per-frame ToArray/ToByteArray allocations.
-            var boneMatrices = _asset._animationPlayer.GetBoneMatricesArray();
-            int byteLength = boneMatrices.Length * Unsafe.SizeOf<Matrix4x4>();
-            if (_boneMatricesBytes.Length != byteLength)
-                _boneMatricesBytes = new byte[byteLength];
-            MemoryMarshal.AsBytes(boneMatrices.AsSpan()).CopyTo(_boneMatricesBytes);
+            var player = _asset._animationPlayer;
+            player.Advance(time);
+            int clip = player.CurrentAnimationIndex;
+            _skinning.SetInstance(0, (uint)clip, gpuBake.NormalizeTime(clip, player.AnimationTime, player.Loop));
+            _asset.CpuPoseStale = true;
+
+            // Nothing is uploaded on this route: an empty stream is what tells JS the key now resolves to storage buffers rather than
+            // to an upload, and it is also what keeps BeginSkinnedModelDraw from paying for a copy the kernel already made redundant.
+            _boneMatricesBytes = Array.Empty<byte>();
+        }
+        else
+        {
+            _asset._animationPlayer.Update(time, _asset.gltfNodes);
+            if (_hasSkinning)
+            {
+                _asset._animationPlayer.UpdateBoneMatrices(_asset.GetAllSkins());
+                // Reinterpret the shared buffer directly as bytes and write it into the persistent buffer
+                // to avoid per-frame ToArray/ToByteArray allocations.
+                var boneMatrices = _asset._animationPlayer.GetBoneMatricesArray();
+                int byteLength = boneMatrices.Length * Unsafe.SizeOf<Matrix4x4>();
+                if (_boneMatricesBytes.Length != byteLength)
+                    _boneMatricesBytes = new byte[byteLength];
+                MemoryMarshal.AsBytes(boneMatrices.AsSpan()).CopyTo(_boneMatricesBytes);
+            }
         }
 
         // Unified transform pattern: converge on BuildWorldMatrix (anchor-pivot semantics, see Mesh3DBase).
@@ -715,6 +780,132 @@ internal class WGPUModel
         _outline2DActive = model.Highlight.Outline;
         _outline2DColor = model.Highlight.OutlineColor;
         _outline2DWidth = model.Highlight.OutlineWidth;
+    }
+
+    /// <summary>
+    /// Latches this frame's skinning route and, when the GPU route wins, leaves the palette ring shaped and the skin key bound to it.
+    /// Every early return here means "draw from the CPU palette this frame", and each of them clears the target so the kernel has
+    /// nothing to write - the shared layer sizes its dispatch from the target, not from the model's wishes.
+    /// </summary>
+    Season.Models.InstanceSkinBake? BeginSkinningFrame(Season.Controls.Model model)
+    {
+        bool wanted = Season.Rendering.InstanceSkinning.Enabled
+            && (Season.Rendering.InstanceSkinning.Override ?? model.SkinningMode) == Season.Rendering.InstanceSkinningMode.Gpu;
+
+        if (wanted && _asset.SkinBake == null && !_bakeRefused)
+        {
+            var g = Season.Basic.Graphics.Instance;
+            if (g == null || !g.ComputeSupported || !g.VertexShaderStorageReadSupported)
+                _bakeRefused = true;
+            else if (Season.Models.InstanceSkinBake.TryCreate(_asset, out var freshBake))
+                _asset.SkinBake = freshBake;
+            else
+                _bakeRefused = true;
+        }
+
+        var bake = wanted ? _asset.SkinBake : null;
+
+        // Three shapes cannot use the route at all: no bake, nothing to skin, and no key for JS to resolve. The key is assigned only
+        // on the shared-template path, so a template loaded straight through Load has no upload target either and stays on the CPU.
+        if (bake == null || !_hasSkinning || string.IsNullOrEmpty(_skinCacheKey))
+        {
+            StopGpuSkin();
+            return null;
+        }
+
+        _gpuPalette ??= new Season.Rendering.InstanceBoneStorage();
+
+        // tagRows = 0: there is no pool on the single-model path, so no row addresses another row's block and every row is its own.
+        if (!_skinning.Begin(_gpuPalette, bake, bake.PaletteStride, _asset._animations.Count, 0)
+            || !ShapeSkinningRing()
+            || !BindBoneStorageToJs())
+        {
+            StopGpuSkin();
+            return null;
+        }
+
+        bool wasGpu = _gpuSkin;
+        _gpuSkin = true;
+
+        // The tree must hold the rest pose on this route: the palette carries the rest world's inverse and the vertex stage multiplies
+        // by the node world, and the two only cancel if the node world is the same rest world. A route that stayed GPU since the last
+        // frame already has it, unless something on the CPU side evaluated the tree in between (picking, bounds, a stop call).
+        if (!wasGpu || _asset.CpuPoseDisturbed)
+        {
+            _asset.CpuPoseDisturbed = false;
+            _restPose.Restore(_asset);
+        }
+
+        return bake;
+    }
+
+    /// <summary>
+    /// P1: points the ring at this frame's slots and grows it to the shape the draw needs. Web has no backend frame ring, so this model
+    /// is the clock: the slot chosen here is the one the kernel writes at FrameStart and the one the draw binds later in the same frame,
+    /// which is what keeps the producer and the consumer on the same buffer.
+    ///
+    /// The stride is the bake's own: unlike the instanced path, whose vertex stage multiplies by a hardcoded 100, the non-instanced
+    /// stage addresses joint <c>idx</c> from row zero, so the block only has to be as wide as the bake needs.
+    /// </summary>
+    bool ShapeSkinningRing()
+    {
+        var palette = _skinning.Palette;
+        if (palette == null) return false;
+
+        // Two slots minimum: the previous palette is read from a different buffer, never from this frame's own slot.
+        int slots = Math.Max(2, palette.Slots.Length);
+        int slot = (int)(_boneStorageFrame % (uint)slots);
+        int previousSlot = (slot + slots - 1) % slots;
+
+        if (!_skinning.PreparePalette(Season.Basic.Graphics.Instance, slots, slot, previousSlot, 1))
+            return false;
+
+        // Advanced only after the ring holds the shape, so a frame that fell back to the CPU does not skip a slot the GPU may still read.
+        _boneStorageFrame++;
+        return _skinning.BeginFrame(1);
+    }
+
+    /// <summary>Points the skin key at the ring's current and previous slots, skipping the interop round trip when the ids did not move.</summary>
+    bool BindBoneStorageToJs()
+    {
+        if (_skinning.Palette is not { Current: WGPUStorageBuffer current } ring)
+            return false;
+
+        var previous = ring.Previous as WGPUStorageBuffer ?? current;
+        if (string.Equals(current.Id, _boneStorageBoundCurrent, StringComparison.Ordinal)
+            && string.Equals(previous.Id, _boneStorageBoundPrevious, StringComparison.Ordinal))
+            return true;
+
+        if (string.IsNullOrEmpty(_skinCacheKey) || !WebGPUInterop.BindSkinnedBoneStorage(_skinCacheKey, current.Id, previous.Id))
+            return false;
+
+        _boneStorageBoundCurrent = current.Id;
+        _boneStorageBoundPrevious = previous.Id;
+        return true;
+    }
+
+    /// <summary>Drops the binding so JS accepts the CPU upload again on its next frame. Frames that never bound anything skip the round trip.</summary>
+    void UnbindBoneStorageFromJs()
+    {
+        if (_boneStorageBoundCurrent == null && _boneStorageBoundPrevious == null)
+            return;
+
+        _boneStorageBoundCurrent = null;
+        _boneStorageBoundPrevious = null;
+        if (!string.IsNullOrEmpty(_skinCacheKey))
+            WebGPUInterop.UnbindSkinnedBoneStorage(_skinCacheKey);
+    }
+
+    /// <summary>
+    /// Takes the frame back to the CPU route: clears the target so the kernel has nothing to write, and drops the JS binding so the
+    /// next upload is not swallowed by a key that still resolves to storage buffers. Every fallback goes through here rather than
+    /// clearing the latch alone - a frame that stopped dispatching but stayed bound would draw the previous frame's palette.
+    /// </summary>
+    void StopGpuSkin()
+    {
+        _skinning.Begin(null, null, 0, 0);
+        UnbindBoneStorageFromJs();
+        _gpuSkin = false;
     }
 
     void ApplyUserTransformToNodeTree(GltfNodeBase nodeBase, Matrix4x4 userTransform)
@@ -1163,6 +1354,14 @@ internal class WGPUModel
 
     public void Dispose()
     {
+        // Single-model GPU skinning: unregister and release before the nodes go, because the target holds the palette the kernel
+        // writes and the binding keeps JS pointing at it. Unbinding last would leave a key resolving to a freed buffer.
+        _skinning.Dispose();
+        UnbindBoneStorageFromJs();
+        _gpuPalette?.Dispose();
+        _gpuPalette = null;
+        _gpuSkin = false;
+
         _asset._nodeMap.Clear();
     }
 }
@@ -1249,6 +1448,15 @@ internal class WGPUMesh3D
         public string LastOcclusionTextureName;
         public string LastEmissiveTextureName;
         public bool LastDoubleSided;
+
+        /// <summary>
+        /// C1: the surface's compute-written vertex stream, mirrored here so every draw of this cache key (scene, shadow, outline
+        /// mask) tells JS the same override. Null for static geometry. Only a reference - the producing effect owns the buffer.
+        /// </summary>
+        public Season.Rendering.StorageBuffer? VertexStream;
+
+        /// <summary>What was last pushed to JS as this cache key's override, so the interop call only happens when it changes.</summary>
+        public string? PublishedStreamId;
     }
     public readonly Dictionary<object, SurfaceCacheEntry> SurfaceCaches = new();
 

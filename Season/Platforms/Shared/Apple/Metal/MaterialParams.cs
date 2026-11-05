@@ -96,6 +96,29 @@ internal sealed class PrimitiveData : IDisposable
 
     public IMTLBuffer VertexBuffer = null!;
 
+    /// <summary>
+    /// C1: the compute-written per-vertex stream mirrored from Surface.VertexStream by MTLMesh3D.Update; a reference, never owned
+    /// here. Dispose below releases VertexBuffer, so the stream must not be released through this field as well.
+    /// </summary>
+    public MTLStorageBuffer? VertexStream;
+
+    /// <summary>
+    /// C1: the single place every draw path (scene direct, scene collection, shadow direct, shadow indirect) takes its slot-0
+    /// buffer from, so the shadow can never rasterise a different shape than the scene shows. The stream is used only when its
+    /// flag says the handoff to vertex input was made this frame (IGraphics.TryPrepareVertexInput) and it is large enough for
+    /// every vertex the indices may address; any other frame draws the static buffer, which keeps the two passes consistent.
+    /// </summary>
+    public unsafe IMTLBuffer ResolveVertexBuffer(IMTLBuffer fallback)
+    {
+        var stream = VertexStream;
+        if (stream == null || stream.Buffer == null || !stream.VertexInputReady || Vertices == null)
+            return fallback;
+        ulong bytes = (ulong)Vertices.Count * (ulong)sizeof(Vertex);
+        if (bytes == 0 || stream.SizeInBytes < bytes)
+            return fallback;
+        return stream.Buffer;
+    }
+
     public IMTLBuffer IndexBuffer = null!;
 
     /// <summary>N-buffered matrices at b0 containing world, view, and projection, with length equal to Device.frameCount.</summary>

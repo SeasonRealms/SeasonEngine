@@ -3432,6 +3432,28 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         return true;
     }
 
+    /// <summary>
+    /// C1: the cloth's output streams are compute-written <see cref="Vertex"/> arrays the input assembler reads. The usage bit is
+    /// already declared at creation by <see cref="Season.Rendering.StorageBufferUsage.ComputeAndVertexInput"/>, so all that is
+    /// left is the barrier - and it is a third, separate one: the destination is VertexInput/VertexAttributeRead, not
+    /// VertexShader/ShaderRead nor DrawIndirect. Like the other two handoffs it has to be recorded outside a render pass.
+    /// </summary>
+    public bool VertexInputStorageSupported => ComputeSupported;
+
+    public unsafe bool TryPrepareVertexInput(Season.Rendering.StorageBuffer buffer)
+    {
+        var cmd = Vulkan.Device.GraphicsCommandBuffer;
+        if (cmd.Handle == 0 || Vulkan.Device.InRenderPass
+            || buffer is not VKStorageBuffer vkBuffer || vkBuffer.Buffer.Buffer.Handle == 0
+            || vkBuffer.Usage != Season.Rendering.StorageBufferUsage.ComputeAndVertexInput)
+            return false;
+
+        // The one barrier definition lives on the buffer, next to the usage bit it pairs with.
+        vkBuffer.BarrierToVertexInput(cmd);
+        vkBuffer.VertexInputReady = true;
+        return true;
+    }
+
     /// <summary>Indirect instanced quad draw pipeline. Returns null on creation failure, so the particle effect is not registered as a whole and the image falls back to before the change.</summary>
     public Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline()
     {
@@ -3630,6 +3652,10 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
                     PBufferInfo = &bufferInfos[i],
                 };
                 kernel.ResolvedScratch[i] = buffer;
+                // C1: this dispatch overwrites the buffer, so the vertex-input handoff recorded for an earlier write no longer
+                // describes its contents. The draw falls back to the static vertices until TryPrepareVertexInput records a new one.
+                if (bindings[i].Type == Season.Rendering.ComputeBindingType.StorageBufferReadWrite)
+                    buffer.VertexInputReady = false;
                 continue;
             }
 

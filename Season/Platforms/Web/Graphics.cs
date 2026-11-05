@@ -1211,6 +1211,26 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             && buffer is WGPUStorageBuffer wgpuBuffer
             && wgpuBuffer.Usage == Season.Rendering.StorageBufferUsage.ComputeAndVertexShaderRead;
 
+    /// <summary>
+    /// C1: the cloth's output streams are compute-written <see cref="Vertex"/> arrays the input assembler reads. As with the P0
+    /// palette handoff above, nothing has to be recorded: the queue order already orders the dispatch before the draw, and the
+    /// <c>GPUBufferUsage.VERTEX</c> bit was declared at creation by
+    /// <see cref="Season.Rendering.StorageBufferUsage.ComputeAndVertexInput"/>. The flag set here is the admission the mesh draw
+    /// paths consult before they hand the stream's id to JS, so a stream that was never written this frame keeps the static
+    /// vertex buffer.
+    /// </summary>
+    public bool VertexInputStorageSupported => _initialized;
+
+    public bool TryPrepareVertexInput(Season.Rendering.StorageBuffer buffer)
+    {
+        if (!_initialized || buffer is not WGPUStorageBuffer wgpuBuffer
+            || wgpuBuffer.Usage != Season.Rendering.StorageBufferUsage.ComputeAndVertexInput)
+            return false;
+
+        wgpuBuffer.VertexInputReady = true;
+        return true;
+    }
+
     /// <summary>1-8: 3D storage textures are registered only into the dedicated JS-side <c>_textures3d</c>
     /// dictionary and **not** into <c>DictionaryWGPUTexture</c>. The latter is the name-based lookup source
     /// for Sprite2D/LoadSprite2D and materials, so writing 3D textures there would make those 2D paths hit a
@@ -1290,12 +1310,31 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         }
 
         args.Params.CopyTo(_computeParamsScratch);
-        return WebGPUInterop.DispatchCompute(
+        bool dispatched = WebGPUInterop.DispatchCompute(
             kernel.JsName,
             _computeParamsScratch.AsSpan(0, args.Params.Length),
             kernel.ResolveResourcesJson(args.Resources),
             (int)args.GroupsX, (int)args.GroupsY, (int)args.GroupsZ,
             indirectId, (int)indirectOffset);
+
+        if (dispatched)
+        {
+            // C1: this dispatch overwrote every ReadWrite storage buffer, so the vertex-input handoff recorded for its previous
+            // contents no longer describes them. The mesh draw paths fall back to the static vertices until the producer hands
+            // the stream over again. The resource list skips Params, so its cursor advances only for real bindings.
+            var bindings = kernel.Desc.Bindings;
+            int r = 0;
+            for (int i = 0; i < bindings.Length && r < args.Resources.Length; i++)
+            {
+                if (bindings[i].Type == Season.Rendering.ComputeBindingType.Params)
+                    continue;
+                if (bindings[i].Type == Season.Rendering.ComputeBindingType.StorageBufferReadWrite
+                    && args.Resources[r].Buffer is WGPUStorageBuffer written)
+                    written.VertexInputReady = false;
+                r++;
+            }
+        }
+        return dispatched;
     }
 
     // ── 1-7 Cubemap (see the summaries at the top of IGraphics / RenderQuality for the contract) ──
@@ -3188,7 +3227,25 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             surfaceTextureInfo.occlusionTextureName,
             surfaceTextureInfo.emissiveTextureName);
 
+        PublishVertexStream(cache, surface);
         EnqueueDrawMesh3D(cache.CacheKey, uniformData);
+    }
+
+    /// <summary>
+    /// C1: tells JS which storage buffer, if any, replaces slot 0 for one mesh cache key. JS keeps the mapping across frames and
+    /// falls back to the uploaded static buffer whenever the id is absent or its GPUBuffer is already released, so this crosses the
+    /// boundary only when the answer changes. The stream is admitted only while the producer's handoff flag is set, which is false
+    /// from the moment a dispatch overwrites the buffer until TryPrepareVertexInput follows it.
+    /// </summary>
+    void PublishVertexStream(WGPUMesh3D.SurfaceCacheEntry cache, Surface surface)
+    {
+        var stream = surface.VertexStream as WGPUStorageBuffer;
+        string? id = stream != null && stream.VertexInputReady ? stream.Id : null;
+        cache.VertexStream = surface.VertexStream;
+        if (id == cache.PublishedStreamId)
+            return;
+        WebGPUInterop.SetMeshVertexStream(cache.CacheKey, id);
+        cache.PublishedStreamId = id;
     }
 
     // ── Unified highlight: Bounds box (Web backend uses separate cacheKey uploads + batched draws;
@@ -4149,6 +4206,8 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             wgpuMesh.ResolvedTextures.TryGetValue(surface, out var resolvedTextures);
             var uniformData = _scratchUniform;
             BuildSurfaceUniform(uniformData, matrixData, surface, wgpuMesh.MeshAlpha, resolvedTextures: resolvedTextures);
+            // C1: the shadow pass must rasterise the same sheet the scene shows, so it publishes the same override.
+            PublishVertexStream(cache, surface);
             EnqueueDrawMesh3D(cache.CacheKey, uniformData);
         }
     }
@@ -4501,6 +4560,8 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             // This must run after BuildSurfaceUniform because its internal Array.Clear overwrites the whole
             // history region starting at PrevWorld, including this slot.
             new WebGPUUniformWriter(uniformData).SetOutlineMaskColor(wgpuMesh.Outline2DMaskColor);
+            // C1: the outline mask is a third consumer of the same geometry; it publishes the same override.
+            PublishVertexStream(cache, surface);
             EnqueueDrawMesh3D(cache.CacheKey, uniformData);
         }
     }
