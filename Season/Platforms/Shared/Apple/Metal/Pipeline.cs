@@ -42,7 +42,7 @@ internal enum PipelineMode
 ///
 /// Buffer-slot contract, with Vertex and Fragment spaces independent:
 ///   VS: buffer(0)=vertex stream ([[stage_in]]), buffer(1)=Matrices(b0), buffer(2)=instance stream ([[stage_in]])
-///       buffer(3)=BoneMatrices(b3), buffer(4)=MaterialParams(b2), buffer(5)=MorphDeltas, buffer(6)=InstanceBoneMatrices
+///       buffer(3)=retired b3 placeholder (no shader declares it), buffer(4)=MaterialParams(b2), buffer(5)=MorphDeltas, buffer(6)=bone palette
 ///       buffer(7)=TextDrawParams for Text GPU Instancing, matching VK binding 11
 ///       buffer(11)=ViewConstants, matching DX b8 and VK set 2
 ///   FS: buffer(1)=SceneLights(b1), buffer(2)=MaterialParams(b2), buffer(3)=TextDrawParams
@@ -166,6 +166,12 @@ internal static class Pipeline
 
     /// <summary>Identity instance buffer of 80 bytes, bound to the per-instance slot at buffer(2) for regular non-instanced draws.</summary>
     public static IMTLBuffer IdentityInstanceBuffer = null!;
+
+    /// <summary>
+    /// One white InstanceExtras record at buffer(12): the fallback for every non-instanced 3D draw, whose VS declares the
+    /// extras argument (it is gated on isInstanced when read) and therefore needs a valid binding for Metal API Validation.
+    /// </summary>
+    public static IMTLBuffer DefaultInstanceExtrasBuffer = null!;
 
     /// <summary>Default TextDrawParams buffer of 32 bytes.
     /// MSL statically declares VS buffer(7) and FS buffer(3),
@@ -329,6 +335,17 @@ internal static class Pipeline
         unsafe
         {
             *(InstanceTransformData*)IdentityInstanceBuffer.Contents = identityData;
+        }
+
+        // Create the white InstanceExtras record at buffer(12), the fallback for non-instanced draws.
+        DefaultInstanceExtrasBuffer = Device.MtlDevice.CreateBuffer((nuint)Unsafe.SizeOf<InstanceExtras>(), MTLResourceOptions.CpuCacheModeDefault);
+        unsafe
+        {
+            *(InstanceExtras*)DefaultInstanceExtrasBuffer.Contents = new InstanceExtras
+            {
+                Color = Vector4.One,
+                Extra = Vector4.Zero,
+            };
         }
 
         // Create the default TextDrawParams buffer as the fallback binding for VS buffer(7) and FS buffer(3),
@@ -509,6 +526,7 @@ internal static class Pipeline
         StaticSampler?.Dispose(); StaticSampler = null!;
         WrapSampler?.Dispose(); WrapSampler = null!;
         IdentityInstanceBuffer?.Dispose(); IdentityInstanceBuffer = null!;
+        DefaultInstanceExtrasBuffer?.Dispose(); DefaultInstanceExtrasBuffer = null!;
         DefaultTextDrawParamsBuffer?.Dispose(); DefaultTextDrawParamsBuffer = null!;
         DefaultFogFrameBuffer?.Dispose(); DefaultFogFrameBuffer = null!;
         foreach (var viewSlot in _viewBuffers)
@@ -691,7 +709,8 @@ internal static class Pipeline
         nuint prevBoneBufferOffset = 0,
         IMTLBuffer? viewBuffer = null,
         IMTLBuffer? indirectBuffer = null,
-        nuint indirectOffset = 0)
+        nuint indirectOffset = 0,
+        IMTLBuffer? instanceExtrasBuffer = null)
     {
         // Work package D: this is the single exit for all 3D paths (model / instanced model / instanced mesh / highlight shell / sprite shell box),
         // so intercepting once covers all PrimitiveData draws. The collection phase submits no draw; it only hands immutable handles to the replay queue.
@@ -703,7 +722,7 @@ internal static class Pipeline
                 matrixBuffer, materialBuffer, lightBuffer, boneBuffer, morphBuffer, instanceBoneBuffer,
                 indexType, indexCount, indexBufferOffset, instanceBuffer, instanceBufferOffset, instanceCount,
                 instanceBoneBufferOffset, prevInstanceBuffer, prevBoneBuffer, prevBoneBufferOffset,
-                viewBuffer ?? ActiveViewBuffer, indirectBuffer, indirectOffset);
+                viewBuffer ?? ActiveViewBuffer, indirectBuffer, indirectOffset, instanceExtrasBuffer);
             return;
         }
 
@@ -711,10 +730,10 @@ internal static class Pipeline
         enc.SetVertexBuffer(primitiveVertexBuffer, 0, 0); // VB slot 0
         enc.SetVertexBuffer(matrixBuffer, 0, 1);          // b1 Matrices
         BindView(enc, viewBuffer ?? ActiveViewBuffer);     // b11 ViewConstants
-        enc.SetVertexBuffer(boneBuffer, 0, 3);            // b3 BoneMatrices
+        enc.SetVertexBuffer(boneBuffer, 0, 3);            // slot 3: retired b3 placeholder
         enc.SetVertexBuffer(materialBuffer, 0, 4);        // b2 MaterialParams (read by VS)
         enc.SetVertexBuffer(morphBuffer, 0, 5);           // b4 MorphDeltas
-        enc.SetVertexBuffer(instanceBoneBuffer, instanceBoneBufferOffset, 6); // b5 InstanceBoneMatrices
+        enc.SetVertexBuffer(instanceBoneBuffer, instanceBoneBufferOffset, 6); // bone palette (VS buffer(6))
 
         // FS
         enc.SetFragmentBuffer(lightBuffer, 0, 1);         // b1 SceneLights
@@ -731,6 +750,10 @@ internal static class Pipeline
         // Instance buffer, falling back to identity when null.
         var instBuf = instanceBuffer ?? IdentityInstanceBuffer;
         enc.SetVertexBuffer(instBuf, instanceBufferOffset, 2);
+
+        // Generic per-instance extras at buffer(12). A non-instanced draw gets the shared white record: its VS never reads
+        // it (the read is gated on isInstanced), but the argument is declared and Metal API Validation requires a binding.
+        enc.SetVertexBuffer(instanceExtrasBuffer ?? DefaultInstanceExtrasBuffer, 0, 12);
 
         // Contract clause 8(b)(c) of 2-3:
         // previous-state sources. Variants with VELOCITY_OUTPUT=0 do not declare buffer(9) or buffer(10),
@@ -835,13 +858,13 @@ internal static class Pipeline
         enc.SetVertexBuffer(primitiveVertexBuffer, 0, 0); // VB slot 0
         enc.SetVertexBuffer(matrixBuffer, 0, 1);          // b1 Matrices
         BindView(enc, MainViewBuffer);                    // b11 ViewConstants (shadow does not read view/proj, placeholder kept)
-        enc.SetVertexBuffer(boneBuffer, 0, 3);            // b3 BoneMatrices
+        enc.SetVertexBuffer(boneBuffer, 0, 3);            // slot 3: retired b3 placeholder
         if (bindMaterial)
         {
             enc.SetVertexBuffer(materialBuffer, 0, 4);    // b2 MaterialParams (VS reads the deformation flag)
             enc.SetVertexBuffer(morphBuffer, 0, 5);       // b4 MorphDeltas
         }
-        enc.SetVertexBuffer(instanceBoneBuffer, instanceBoneBufferOffset, 6); // b5 InstanceBoneMatrices
+        enc.SetVertexBuffer(instanceBoneBuffer, instanceBoneBufferOffset, 6); // bone palette (VS buffer(6))
 
         var instBuf = instanceBuffer ?? IdentityInstanceBuffer;
         enc.SetVertexBuffer(instBuf, instanceBufferOffset, 2);
@@ -885,13 +908,13 @@ internal static class Pipeline
         enc.SetVertexBuffer(primitiveVertexBuffer, 0, 0); // VB slot 0
         enc.SetVertexBuffer(matrixBuffer, 0, 1);          // b1 Matrices
         BindView(enc, MainViewBuffer);                    // b11 ViewConstants (shadow does not read view/proj, placeholder kept)
-        enc.SetVertexBuffer(boneBuffer, 0, 3);            // b3 BoneMatrices
+        enc.SetVertexBuffer(boneBuffer, 0, 3);            // slot 3: retired b3 placeholder
         if (bindMaterial)
         {
             enc.SetVertexBuffer(materialBuffer, 0, 4);    // b2 MaterialParams (VS reads the deformation flag)
             enc.SetVertexBuffer(morphBuffer, 0, 5);       // b4 MorphDeltas
         }
-        enc.SetVertexBuffer(instanceBoneBuffer, 0, 6);    // b5 InstanceBoneMatrices
+        enc.SetVertexBuffer(instanceBoneBuffer, 0, 6);    // bone palette (VS buffer(6))
 
         enc.SetVertexBuffer(instanceBuffer, instanceBufferOffset, 2);
 
@@ -1166,10 +1189,6 @@ struct ViewConstants {
     float4 reserved0;
 };
 
-struct BoneMatrices {
-    float4x4 boneMatrices[100];
-};
-
 // 1-2 lighting system:
 // unified light structure, 64 bytes, byte-aligned with C# GpuLight.
 // The all-float4 layout naturally avoids the float3-alignment slip in MSL constant space, the same root cause as the old padding0 issue.
@@ -1273,7 +1292,7 @@ struct MaterialParams {
     float alphaCutoff;
     uint alphaMode;
     uint renderMode;
-    float padding1;
+    uint tintMode;              // offset 72: 0=ignore per-instance color, 1=multiply the PBR albedo by it (retired pxRange slot)
     uint isInstanced;
     uint isSkinned;
     uint bonePaletteStride;
@@ -1295,6 +1314,12 @@ struct TextDrawParams {
     float textPxRange;
     float textGlobalAlpha;
     float4 textBaseColor;
+};
+
+// One slot of the generic per-instance extras stream (buffer 12), byte-identical to DX's t20 record and VK's binding 26.
+struct InstanceExtras {
+    float4 color;
+    float4 extra;
 };
 
 struct VertexIn {
@@ -1372,7 +1397,6 @@ vertex VertexOut vertex_main(
     uint instanceId                 [[instance_id]],
     constant Matrices& mat           [[buffer(1)]],
     constant ViewConstants& viewc    [[buffer(11)]],
-    constant BoneMatrices& bones     [[buffer(3)]],
     constant MaterialParams& mparams [[buffer(4)]],
     const device float* morphDeltas  [[buffer(5)]],
     // P2 L1: row instanceSlot doubles as that instance's pose-pool tag (see the decode below), so a pooled palette addresses
@@ -1396,6 +1420,14 @@ vertex VertexOut vertex_main(
     // Regular and shadow variants neither declare nor bind them, so runtime cost stays zero.
     , const device float4* prevInstanceStream    [[buffer(9)]]
     , const device float4x4* prevBoneMatrices    [[buffer(10)]]
+#endif
+#if !SHADOW_PASS
+    // Generic per-instance extras (buffer 12), indexed by the same compacted slot as the instance matrices:
+    // instance_id on a direct draw, the index gather's M14 stamp on an A7 indirect draw. Kept out of the 80-byte instance
+    // stream on purpose - that stream is the A7 cull input and what the text path reinterprets, so growing it would move
+    // culling, gather and text together. color is the per-instance tint; extra is reserved, which is why the stride is 32 bytes.
+    // The shadow variant binds no extras, so it declares none.
+    , const device InstanceExtras* instanceExtras [[buffer(12)]]
 #endif
     )
 {
@@ -1477,11 +1509,7 @@ vertex VertexOut vertex_main(
             if (w > 0.0) {
                 int idx = int(vin.inJoints[i]);
                 uint boneIndex = mparams.isInstanced == 1u ? boneBase + uint(idx) : uint(idx);
-                float4x4 B;
-                if (mparams.isInstanced == 1u)
-                    B = instanceBoneMatrices[boneIndex];
-                else
-                    B = bones.boneMatrices[idx];
+                float4x4 B = instanceBoneMatrices[boneIndex];
                 float3x3 B3 = float3x3(B[0].xyz, B[1].xyz, B[2].xyz);
                 skinnedPos    += (localPos * B) * w;
                 skinnedNormal += (normal * B3) * w;
@@ -1604,11 +1632,7 @@ vertex VertexOut vertex_main(
                 if (w > 0.0) {
                     int idx = int(vin.inJoints[i]);
                     uint boneIndex = mparams.isInstanced == 1u ? prevBoneBase + uint(idx) : uint(idx);
-                    float4x4 Bp;
-                    if (mparams.isInstanced == 1u)
-                        Bp = instanceBoneMatrices[boneIndex];
-                    else
-                        Bp = bones.boneMatrices[idx];
+                    float4x4 Bp = instanceBoneMatrices[boneIndex];
                     if (mparams.hasPrevBones != 0u) {
                         float4x4 Bh = prevBoneMatrices[boneIndex];
                         if (Bh[3][3] != 0.0)
@@ -1649,6 +1673,9 @@ vertex VertexOut vertex_main(
     // Glyph data reuses buffer(5) morphDeltas.
     // Each instance stores 12 floats, uvRect(4), glyphColor(4), and metrics(4).
     float4 textColor_ = float4(1.0);
+    // Per-instance tint from the generic extras slot. Read only on the instanced non-text path: the text path numbers its
+    // slots against the glyph stream, not the instance stream, so a read there would fetch the wrong element.
+    float4 tintColor_ = float4(1.0);
     if (mparams.renderMode == 2u && mparams.isInstanced == 1u) {
         uint tBase = instanceSlot * 12u;
         float4 uvRect = float4(
@@ -1665,8 +1692,12 @@ vertex VertexOut vertex_main(
         o.vUV = uvRect.xy + vin.inUV * uvRect.zw;
     } else {
         o.vUV = vin.inUV;
+#if !SHADOW_PASS
+        if (mparams.isInstanced == 1u)
+            tintColor_ = instanceExtras[instanceSlot].color;
+#endif
     }
-    o.vInstanceColor = textColor_;
+    o.vInstanceColor = textColor_ * tintColor_;
 
     float3x3 W3 = float3x3(worldMatrix[0].xyz, worldMatrix[1].xyz, worldMatrix[2].xyz);
     o.vNormal = normalize(normal * W3);
@@ -2594,7 +2625,7 @@ fragment SEASON_FS_OUT fragment_main(
     // pxRange and atlasSize both come from TextDrawParams, and every pass has DefaultTextDrawParamsBuffer as fallback binding.
     // Color multiplies by vInstanceColor.
     // The VS supplies float4(1) for non-instanced draws, matching DX VS textColor semantics.
-    // The old per-glyph path, where mat.padding1 carried pxRange and atlas size was reverse-queried from the texture,
+    // The old per-glyph path, where the offset-72 slot carried pxRange and atlas size was reverse-queried from the texture,
     // has been removed because DX and VK never branch on isInstanced in the fragment shader.
     // The dynamic TextMsdf path in MTLSprite2D, renderMode 2 plus IsInstanced 0, stays fully symmetric with DXSprite2D
     // and remains compatible with the single-branch semantics.
@@ -2622,6 +2653,12 @@ fragment SEASON_FS_OUT fragment_main(
 #endif
         SEASON_RETURN_COLOR(float4(colorI, alpha * in.vInstanceColor.a * textParams.textGlobalAlpha * coverageI));
     }
+
+    // Per-instance tint: applied here, after the text branch has already returned, so there is exactly one multiply site.
+    // tintMode is a per-primitive material flag, which is what lets a hull keep its authored look while the sail beside it
+    // in the same instance cycles through seven hues.
+    if (mat.tintMode != 0u)
+        albedo *= in.vInstanceColor.rgb;
 
     // 2-5 procedural sky:
     // reconstruct Sky-View LUT uv from the world view direction and deliberately ignore the vertex uv.

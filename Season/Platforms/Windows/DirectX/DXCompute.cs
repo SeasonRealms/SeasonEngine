@@ -335,7 +335,7 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
         if (usage == Season.Rendering.StorageBufferUsage.ComputeAndVertexShaderRead)
             CreateVertexSrv(Math.Max(1u, alignedSize / (uint)Season.Rendering.StorageBuffer.VertexShaderReadElementBytes));
 
-        UavDescriptorID = Device.DescriptorAllocator.Allocate();
+        UavDescriptorID = Device.DescriptorAllocator.Allocate(DescriptorKind.Compute);
         UavGpuHandle = Device.SrvHeapManager.GetGpuHandle(UavDescriptorID);
         var uavDesc = new UnorderedAccessViewDesc
         {
@@ -357,7 +357,7 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
     /// who owns the resource and how many elements are addressable, not in the view type the kernels expect.</summary>
     void CreateSrv(uint numElements)
     {
-        SrvDescriptorID = Device.DescriptorAllocator.Allocate();
+        SrvDescriptorID = Device.DescriptorAllocator.Allocate(DescriptorKind.Compute);
         SrvGpuHandle = Device.SrvHeapManager.GetGpuHandle(SrvDescriptorID);
         const uint DefaultShader4ComponentMapping = 0x00001688;
         var srvDesc = new ShaderResourceViewDesc
@@ -384,7 +384,7 @@ internal sealed unsafe class DXStorageBuffer : Season.Rendering.StorageBuffer
     /// </summary>
     void CreateVertexSrv(uint numElements)
     {
-        VertexSrvDescriptorID = Device.DescriptorAllocator.Allocate();
+        VertexSrvDescriptorID = Device.DescriptorAllocator.Allocate(DescriptorKind.Compute);
         VertexSrvGpuHandle = Device.SrvHeapManager.GetGpuHandle(VertexSrvDescriptorID);
         const uint DefaultShader4ComponentMapping = 0x00001688;
         var srvDesc = new ShaderResourceViewDesc

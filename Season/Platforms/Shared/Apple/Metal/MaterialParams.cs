@@ -36,7 +36,7 @@ internal struct MaterialParams
     [FieldOffset(60)] public float AlphaCutoff;
     [FieldOffset(64)] public uint AlphaMode;
     [FieldOffset(68)] public uint RenderMode;     // 0=Sprite2D, 1=Pbr3D, 2=TextMsdf, 3=ProceduralSky
-    [FieldOffset(72)] public float Padding1;         // Reused by the text and MSDF path.
+    [FieldOffset(72)] public uint TintMode;          // 0=ignore the per-instance color, 1=multiply the PBR albedo by it. Doubles as the retired pxRange alignment slot.
     [FieldOffset(76)] public uint IsInstanced;       // 0 = regular draw, 1 = GPU instancing.
     [FieldOffset(80)] public uint IsSkinned;         // 0 = static, 1 = skeletal skinning.
     [FieldOffset(84)] public uint BonePaletteStride; // Instanced skinning: per-instance bone-palette stride.
@@ -155,6 +155,17 @@ internal sealed class PrimitiveData : IDisposable
 
     /// <summary>The original Surface BaseColor captured during Load. It is the multiplicative base for SyncColorTint, where rgb is multiplied by tint and W stays unchanged.</summary>
     public Vector4 OriginalBaseColor = Vector4.One;
+
+    /// <summary>glTF material name of the part this primitive draws; null when the asset has no material. This is the primary
+    /// key <c>Model.SetPartColor</c> resolves against.</summary>
+    public string? PartName;
+
+    /// <summary>Name of the node that owns this primitive, the fallback key for <c>Model.SetPartColor</c>.</summary>
+    public string? PartNodeName;
+
+    /// <summary>BaseColor.rgb as loaded (after the MaterialColor tint, before any part override). It is what SyncPartColors
+    /// restores when a part override is cleared, so an absolute override never needs to re-derive the authored value.</summary>
+    public Vector3 PartBaseColor = Vector3.One;
 
     /// <summary>
     /// The original glTF material AlphaCutoff.

@@ -195,7 +195,6 @@ internal unsafe class VKSprite2D : VKSpriteQuad
         bool flipX, flipY;
         Vector4 color;
         Season.Controls.TextureType textureType;
-        float factor;
 
         if (SpriteRef != null)
         {
@@ -212,7 +211,6 @@ internal unsafe class VKSprite2D : VKSpriteQuad
             flipY = SpriteRef.FlipY;
             color = SpriteRef.Color;
             textureType = SpriteRef.TextureType;
-            factor = SpriteRef.Factor;
         }
         else
         {
@@ -230,7 +228,6 @@ internal unsafe class VKSprite2D : VKSpriteQuad
             flipY = Texture.FlipY;
             color = Texture.Color;
             textureType = Texture.TextureType;
-            factor = Texture.Factor;
         }
 
         // alpha == 0 or size not ready yet (Shape null -> 0):
@@ -273,8 +270,7 @@ internal unsafe class VKSprite2D : VKSpriteQuad
             UseEmissiveMap = EmissiveMap != null ? 1u : 0u,
             AlphaCutoff = 0.5f,
             AlphaMode = 2u,   // BLEND (Sprite uses the Transparent PSO)
-            RenderMode = renderMode,
-            Padding1 = factor
+            RenderMode = renderMode
         };
 
         // Matrix UBO: 2D orthographic path using NDC directly

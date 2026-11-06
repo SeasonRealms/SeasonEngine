@@ -22,6 +22,15 @@ namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 /// </summary>
 internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
 {
+    /// <summary>
+    /// 3B/B2: the binding numbers the set-0 writes below cover, ascending. The Sprite path shares set 0's layout with the
+    /// 3D path, so this list must equal <c>Pipeline.SceneSetBindings</c>; the Vulkan harness checks exactly that.
+    /// </summary>
+    internal static readonly uint[] SpriteSetBindings =
+    {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 21, 26,
+    };
+
     // Sprite identifier (usually the main-texture path, used for cache keys and logs)
     internal string Name = string.Empty;
 
@@ -70,38 +79,10 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
     // handles are heap pointers and are very likely to reuse the same value after recreation.
     ulong _cachedViewVersion;
 
-    // 1-7: per-frame-slot cache, aligned with _descriptorSets,
-    // recording which cube view is currently written to binding 16.
+    // 1-7: per-frame-slot cache, aligned with _descriptorSets, recording which cube view is currently written to binding 16.
     // Like _cachedViewVersion, compare ViewVersion instead of handles.
-    // This must remain per-slot because when an environment map finishes loading,
-    // only the current frame slot can be safely rewritten
-    // (other slots may still be in flight).
-    ulong[] _cachedEnvCubeViewVersions = Array.Empty<ulong>();
-
-    // 2-4 clause 10: per-frame-slot cache, aligned with _descriptorSets,
-    // recording which DDGI atlas view is currently written to binding 17.
-    // Semantics and per-slot reasoning match _cachedEnvCubeViewVersions.
-    ulong[] _cachedDdgiAtlasViewVersions = Array.Empty<ulong>();
-
-    // 2-4 Step 3: per-frame-slot cache, aligned with _descriptorSets,
-    // recording which DDGI depth-atlas view is currently written to binding 18.
-    // Semantics match _cachedDdgiAtlasViewVersions.
-    ulong[] _cachedDdgiDepthViewVersions = Array.Empty<ulong>();
-
-    // 2-5 Step C: per-frame-slot cache, aligned with _descriptorSets,
-    // recording which cloud-noise view is currently written to binding 19.
-    // Semantics match _cachedDdgiAtlasViewVersions.
-    ulong[] _cachedCloudNoiseViewVersions = Array.Empty<ulong>();
-
-    // 2-5 Step E: per-frame-slot cache, aligned with _descriptorSets,
-    // recording which AP-volume view is currently written to binding 20.
-    // Semantics match _cachedDdgiAtlasViewVersions.
-    ulong[] _cachedAerialLutViewVersions = Array.Empty<ulong>();
-
-    // 2-7 P0: per-frame-slot cache, aligned with _descriptorSets,
-    // recording which Sky-View LUT view is currently written to binding 25.
-    // Semantics match _cachedDdgiAtlasViewVersions.
-    ulong[] _cachedSkyViewViewVersions = Array.Empty<ulong>();
+    // 3B: the six frame-level lighting inputs no longer live in this set at all -- they moved to the per-view globals
+    // set 3 (Pipeline.PrepareViewGlobals), so every per-sprite version cache is gone.
 
     // ============================================================
     // Instance UBO creation / release
@@ -241,34 +222,7 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         }
 
         // 1-7: per-slot version cache for binding 16
-        // (WriteDescriptorSet stores the cube version written this time)
-        if (_cachedEnvCubeViewVersions.Length != n)
-            _cachedEnvCubeViewVersions = new ulong[n];
-
-        // 2-4 clause 10: per-slot version cache for binding 17
-        // (same semantics).
-        if (_cachedDdgiAtlasViewVersions.Length != n)
-            _cachedDdgiAtlasViewVersions = new ulong[n];
-
-        // 2-4 Step 3: per-slot version cache for binding 18 depth atlas
-        // (same semantics).
-        if (_cachedDdgiDepthViewVersions.Length != n)
-            _cachedDdgiDepthViewVersions = new ulong[n];
-
-        // 2-5 Step C: per-slot version cache for binding 19 cloud noise
-        // (same semantics).
-        if (_cachedCloudNoiseViewVersions.Length != n)
-            _cachedCloudNoiseViewVersions = new ulong[n];
-
-        // 2-5 Step E: per-slot version cache for binding 20 AP volume
-        // (same semantics).
-        if (_cachedAerialLutViewVersions.Length != n)
-            _cachedAerialLutViewVersions = new ulong[n];
-
-        // 2-7 P0: per-slot version cache for binding 25 Sky-View LUT
-        // (same semantics).
-        if (_cachedSkyViewViewVersions.Length != n)
-            _cachedSkyViewViewVersions = new ulong[n];
+        // 3B: gone with the move to set 3; no per-sprite lighting-input state remains.
 
         for (int fi = 0; fi < n; fi++)
             WriteDescriptorSet(fi);
@@ -289,8 +243,8 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         { Buffer = VKPrimitiveGroup.LightConstantBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize };
         var materialInfo = new DescriptorBufferInfo
         { Buffer = _materialBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize };
-        var boneInfo = new DescriptorBufferInfo
-        { Buffer = VKPrimitiveGroup.IdentityBoneBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize };
+        var placeholderInfo = new DescriptorBufferInfo
+        { Buffer = Pipeline.DefaultTextDrawParamsBuffer.Buffer, Offset = 0, Range = Vk.WholeSize };
         // bindings 9/10/11 are statically declared in the global SetLayout
         // (all shaders reference them statically),
         // so even though the Sprite path does not use them, valid placeholder resources must still be written.
@@ -315,11 +269,14 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         { ImageView = (EmissiveMap ?? fallback).View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
 
         var set = _descriptorSets[fi];
-        var writes = stackalloc WriteDescriptorSet[26];
+        // 3B: 18 writes -- the 16 prefix bindings plus 21 and the per-instance extras table. The six lighting
+        // inputs that used to be 16..20/25 now live in set 3, so neither the descriptor write nor the version cache is
+        // per-sprite any more.
+        var writes = stackalloc WriteDescriptorSet[18];
         writes[0] = MakeBufferWrite(set, 0, DescriptorType.UniformBuffer, &matrixInfo);
         writes[1] = MakeBufferWrite(set, 1, DescriptorType.UniformBuffer, &lightInfo);
         writes[2] = MakeBufferWrite(set, 2, DescriptorType.UniformBuffer, &materialInfo);
-        writes[3] = MakeBufferWrite(set, 3, DescriptorType.UniformBuffer, &boneInfo);
+        writes[3] = MakeBufferWrite(set, 3, DescriptorType.UniformBuffer, &placeholderInfo);
         for (int i = 0; i < 5; i++)
             writes[4 + i] = MakeImageWrite(set, (uint)(4 + i), imgInfos + i);
         writes[9] = MakeBufferWrite(set, 9, DescriptorType.StorageBuffer, &instanceBoneInfo);
@@ -359,118 +316,27 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
         writes[14] = MakeBufferWrite(set, 14, DescriptorType.StorageBuffer, &prevInstanceWorldInfo);
         writes[15] = MakeBufferWrite(set, 15, DescriptorType.StorageBuffer, &prevMorphWeightsInfo);
 
-        // 1-7: binding 16 environment radiance cube.
-        // The Sprite path shares SetLayout / FS with the 3D path,
-        // so a valid descriptor must still be written here as well
-        // (Pipeline.Init already prebuilds DummyBlack, and Bound is never null).
-        var envCube = VKTextureCube.Bound;
-        var envCubeInfo = new DescriptorImageInfo
-        { ImageView = envCube.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
-        writes[16] = MakeImageWrite(set, VKTextureCube.EnvCubeBinding, &envCubeInfo);
-        if (fi < _cachedEnvCubeViewVersions.Length)
-            _cachedEnvCubeViewVersions[fi] = envCube.ViewVersion;
-
-        // 2-4 clause 10: binding 17 DDGI irradiance atlas.
-        // The Sprite path shares SetLayout / FS with the 3D path,
-        // so a valid descriptor must still be written
-        // (DdgiAtlasBound falls back to White and is never null).
-        var ddgiAtlas = VKPrimitiveGroup.DdgiAtlasBound;
-        var ddgiInfo = new DescriptorImageInfo
-        { ImageView = ddgiAtlas.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
-        writes[17] = MakeImageWrite(set, VKPrimitiveGroup.DdgiAtlasBinding, &ddgiInfo);
-        if (fi < _cachedDdgiAtlasViewVersions.Length)
-            _cachedDdgiAtlasViewVersions[fi] = ddgiAtlas.ViewVersion;
-
-        // 2-4 Step 3: binding 18 DDGI depth-moment atlas.
-        // Same pattern as binding 17
-        // (DdgiDepthBound falls back to White and is never null).
-        var ddgiDepth = VKPrimitiveGroup.DdgiDepthBound;
-        var ddgiDepthInfo = new DescriptorImageInfo
-        { ImageView = ddgiDepth.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
-        writes[18] = MakeImageWrite(set, VKPrimitiveGroup.DdgiDepthBinding, &ddgiDepthInfo);
-        if (fi < _cachedDdgiDepthViewVersions.Length)
-            _cachedDdgiDepthViewVersions[fi] = ddgiDepth.ViewVersion;
-
-        // 2-5 Step C: binding 19 cloud noise.
-        // Same pattern as binding 17
-        // (CloudNoiseBound falls back to White and is never null);
-        // actual sampling is runtime-gated by cloudParams0.w (layer count).
-        var cloudNoise = VKPrimitiveGroup.CloudNoiseBound;
-        var cloudNoiseInfo = new DescriptorImageInfo
-        { ImageView = cloudNoise.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
-        writes[19] = MakeImageWrite(set, VKPrimitiveGroup.CloudNoiseBinding, &cloudNoiseInfo);
-        if (fi < _cachedCloudNoiseViewVersions.Length)
-            _cachedCloudNoiseViewVersions[fi] = cloudNoise.ViewVersion;
-
-        // 2-5 Step E: binding 20 aerial-perspective 3D LUT.
-        // Same pattern as binding 17
-        // (AerialLutBound falls back to DummyBlack and is never null);
-        // actual sampling is runtime-gated by apParams0.x (sampling is simply skipped).
-        var aerialLut = VKPrimitiveGroup.AerialLutBound;
-        var aerialLutInfo = new DescriptorImageInfo
-        { ImageView = aerialLut.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
-        writes[20] = MakeImageWrite(set, VKPrimitiveGroup.AerialLutBinding, &aerialLutInfo);
-        if (fi < _cachedAerialLutViewVersions.Length)
-            _cachedAerialLutViewVersions[fi] = aerialLut.ViewVersion;
-
-        // 2-7 P0: binding 25 Sky-View LUT.
-        // The Sprite path shares SetLayout / FS with the 3D path, so a valid descriptor must still be written
-        // (SkyViewBound falls back to White and is never null);
-        // actual sampling is gated by skyParams0.w in a uniform branch.
-        var skyView = VKPrimitiveGroup.SkyViewBound;
-        var skyViewInfo = new DescriptorImageInfo
-        { ImageView = skyView.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
-        writes[25] = MakeImageWrite(set, VKPrimitiveGroup.SkyViewBinding, &skyViewInfo);
-        if (fi < _cachedSkyViewViewVersions.Length)
-            _cachedSkyViewViewVersions[fi] = skyView.ViewVersion;
-
         // 1-5 clause 15: binding 21 is the shadow view again, reached through the immutable
         // point sampler for the blocker search. The Sprite path shares the layout / FS
         // with the 3D path, so it must supply the same pair (12 uses the comparison sampler).
-        writes[21] = MakeImageWrite(set, 21, &shadowInfo);
+        writes[16] = MakeImageWrite(set, 21, &shadowInfo);
 
-        // The three fog sampling stages (22/23/24):
-        // 22 is a frame constant UBO, so first write a zero-filled placeholder; the real contents
-        // rotate per frame slot and the transparent phase only re-pushes the constants.
-        // 23/24 are two volume textures, and collection cannot obtain this frame's output, so use the
-        // AP volume as a placeholder first (DummyBlack landed, already in ShaderReadOnlyOptimal),
-        // to be rewritten by the transparent phase before binding.
-        var fogFrameInfo = new DescriptorBufferInfo
-        { Buffer = Pipeline.DefaultFogFrameBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize };
-        writes[22] = MakeBufferWrite(set, Pipeline.SceneFogFrameBinding, DescriptorType.StorageBuffer, &fogFrameInfo);
-        var fogVolumeInfo = new DescriptorImageInfo
-        { ImageView = aerialLut.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
-        writes[23] = MakeImageWrite(set, Pipeline.SceneFogIntegratedBinding, &fogVolumeInfo);
-        writes[24] = MakeImageWrite(set, Pipeline.SceneFogLocalBinding, &fogVolumeInfo);
+        // B2: the 22/23/24 fog placeholders are gone. The transparent stage reads the fog trio from its own set 1, and no
+        // shader declares 22/23/24 in set 0, so the previous three writes bound nothing.
 
-        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 26, writes, 0, null);
+        // Generic per-instance extras (binding 26): the VS declares the table in every variant, so the Sprite path must
+        // still write it, with the shared white record. isInstanced is 0 here, so nothing ever reads it.
+        var extrasInfo = new DescriptorBufferInfo
+        { Buffer = Pipeline.DefaultInstanceExtrasBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize };
+        writes[17] = MakeBufferWrite(set, Pipeline.InstanceExtrasBinding, DescriptorType.StorageBuffer, &extrasInfo);
+
+        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 18, writes, 0, null);
     }
 
-    /// <summary>
-    /// Refresh this frame slot's bindings 16-20 (environment cube, DDGI atlas and depth, cloud noise, AP volume).
-    /// These are per-frame frame-level inputs, and a descriptor set cannot be rewritten once it has
-    /// been bound by a command buffer that is being recorded, so this method is called before drawing
-    /// and also by the frame-start pre-refresh before the command buffer begins; when the version is
-    /// unchanged each Refresh*Binding skips itself, so repeated calls have no side effects.
-    /// </summary>
-    internal void RefreshSceneBindings(int fi)
-    {
-        if (_descriptorSets == null || fi >= _descriptorSets.Length || fi >= _cachedEnvCubeViewVersions.Length)
-            return;
+    // 3B: RefreshSceneBindings(fi) is gone. The six frame-level lighting inputs are written once per view into
+    // the globals set 3 by Pipeline.PrepareViewGlobals, which cannot invalidate a recording command buffer:
+    // each view owns its own set per frame slot, and the previous owner of that slot retired frameCount frames ago.
 
-        // 1-7: binding 16, the environment radiance cube.
-        VKTextureCube.RefreshBinding(_descriptorSets[fi], ref _cachedEnvCubeViewVersions[fi]);
-        // 2-4 clause 10: binding 17, this frame's DDGI atlas.
-        VKPrimitiveGroup.RefreshDdgiBinding(_descriptorSets[fi], ref _cachedDdgiAtlasViewVersions[fi]);
-        // 2-4 Step 3: binding 18, the DDGI depth atlas.
-        VKPrimitiveGroup.RefreshDdgiDepthBinding(_descriptorSets[fi], ref _cachedDdgiDepthViewVersions[fi]);
-        // 2-5 Step C: binding 19, cloud noise (baked once, converges after the first frame).
-        VKPrimitiveGroup.RefreshCloudNoiseBinding(_descriptorSets[fi], ref _cachedCloudNoiseViewVersions[fi]);
-        // 2-5 Step E: binding 20, the AP volume.
-        VKPrimitiveGroup.RefreshAerialLutBinding(_descriptorSets[fi], ref _cachedAerialLutViewVersions[fi]);
-        // 2-7 P0: binding 25, the Sky-View LUT.
-        VKPrimitiveGroup.RefreshSkyViewBinding(_descriptorSets[fi], ref _cachedSkyViewViewVersions[fi]);
-    }
 
     static WriteDescriptorSet MakeBufferWrite(DescriptorSet set, uint binding, DescriptorType descriptorType, DescriptorBufferInfo* info)
     {
@@ -608,15 +474,6 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
 
         int fi = (int)Device.FrameIndex;
 
-        // Record the sprites drawn this frame for the next frame's frame-start pre-refresh (see Pipeline.RefreshSceneBindingsForFrameStart).
-        VKSceneDrawCollection.NoteQuadDrawn(this);
-
-        // 1-7: refresh binding 16 of the current frame slot to the environment radiance cube
-        // active for this frame (compare ViewVersion, not handles).
-        // Only this slot is touched - completion of its previous submission
-        // is guaranteed by the same-slot fence waited at the end of AfterRender.
-        RefreshSceneBindings(fi);
-
         var set = _descriptorSets[fi];
 
         // Collection phase: the descriptor set is ready, so just record the handle and the world matrix; the actual draw happens in the transparent pass.
@@ -636,7 +493,9 @@ internal unsafe abstract class VKSpriteQuad : ITextureHolder, IDisposable
 
         vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics,
             Pipeline.PipelineLayout, 0, 1, in set, 0, null);
-        Pipeline.BindViewSet(cmd, ScreenSpaceView ? Pipeline.ScreenViewSet : Pipeline.ActiveViewSet);
+        Pipeline.BindViewSets(cmd,
+            ScreenSpaceView ? Pipeline.ScreenViewSet : Pipeline.ActiveViewSet,
+            ScreenSpaceView ? Pipeline.ScreenViewGlobals : Pipeline.ActiveViewGlobals);
         // The fog sampling trio lives in its own set 1, for the same reason as DrawPrimitiveCore: the transparent variant statically references it.
         Pipeline.BindFogSet(cmd);
 

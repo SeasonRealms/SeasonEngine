@@ -101,6 +101,30 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     protected int _instanceWorldCapacity;
 
     // ============================================================
+    // Generic per-instance extras (t20): Color / Extra per compacted slot
+    // ============================================================
+    // One stream per group per frame slot, sized to the compacted instance count and indexed by exactly the slot the
+    // instance matrices and every other per-instance SB use. Kept apart from the 80-byte InstanceTransformData on
+    // purpose: that stream is bit-identical to the A7 cull input and the IA instance buffer, and the text path also
+    // reinterprets it, so growing its stride would touch culling, gather and text at once. This one costs one extra
+    // vertex-stage storage read and nothing else.
+    //
+    // It is uploaded every frame, white included. Measuring it as "zero when unused" would be a false saving: the
+    // CPU array is rebuilt by the same loop that rebuilds the matrices, so skipping the copy would still leave the
+    // rebuild, and a group that does use colors would then need a change-detection path of its own. 32 bytes per
+    // instance is 40% of the 80 the matrix stream already moves.
+    protected InstanceExtras[] _instanceExtras = Array.Empty<InstanceExtras>();
+    protected ID3D12Resource*[] _instanceExtrasBuffers = EmptyResourceRing;
+    protected byte*[] _mappedInstanceExtrasBuffers = EmptyMappedRing;
+    protected GpuDescriptorHandle[] _instanceExtrasSrvHandles = Array.Empty<GpuDescriptorHandle>();
+    protected int[] _instanceExtrasDescriptorIds = Array.Empty<int>();
+    protected int _instanceExtrasCapacity;
+
+    /// <summary>This frame slot's extras SRV, or default when the ring has not been sized yet.</summary>
+    protected GpuDescriptorHandle GetInstanceExtrasSrvHandle()
+        => (uint)FrameSlot < (uint)_instanceExtrasSrvHandles.Length ? _instanceExtrasSrvHandles[FrameSlot] : default;
+
+    // ============================================================
     // A7 per-instance GPU culling
     // ============================================================
     // The culling resources are allocated and released together; capacity is aligned to 64 and only grows. When the owning ones are
@@ -318,21 +342,45 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     /// frame already signalled, because up to two frames in flight are still reading these slots. Releasing eagerly
     /// here is what the old single-slot code did, and D3D12 only reports the consequence through DRED after the fact.
     /// </summary>
-    protected static void ReleaseRingDeferred(ID3D12Resource*[] ring)
+    /// <param name="mapped">
+    /// The ring's persistent-mapping array, or null when the ring holds no live mapping. Only the persistent-mapping
+    /// rings - bone / morph / world / extras, mapped at creation and written through the stored pointer - may be
+    /// unmapped here. The IA streams built by CreateVertexBuffer are written through balanced Map/Unmap pairs and
+    /// have no live mapping, and unmapping those raises RESOURCE_MANIPULATION #310 (resource is not mapped), which
+    /// the debug layer turns into a hard break and the shutdown path then reports as an SEHException. Both arrays are
+    /// cleared as they are retired, so retiring the same ring twice is a no-op instead of a second Unmap.
+    /// </param>
+    protected static void ReleaseRingDeferred(ID3D12Resource*[] ring, byte*[]? mapped = null)
     {
         if (ring == null || ring.Length == 0)
             return;
 
-        foreach (var resource in ring)
+        // Detach before anything else: the deferred Release below captures this copy, so a repeated call on the same
+        // ring finds it empty, and a caller that swaps its field afterwards cannot make the release see new slots.
+        var retired = new ID3D12Resource*[ring.Length];
+        Array.Copy(ring, retired, ring.Length);
+        Array.Clear(ring, 0, ring.Length);
+
+        if (mapped != null)
         {
-            if (resource != null)
-                resource->Unmap(0, null);
+            int slots = Math.Min(mapped.Length, retired.Length);
+            for (int i = 0; i < slots; i++)
+            {
+                // A cleared mapping means this slot was already retired; a null resource means the two arrays
+                // disagree, and the Unmap is skipped rather than aimed at whatever resource happens to sit there.
+                if (mapped[i] == null) continue;
+                if (retired[i] != null) retired[i]->Unmap(0, null);
+                mapped[i] = null;
+            }
+            // A mapping longer than the ring must not keep a dangling pointer past the length it shared.
+            for (int i = slots; i < mapped.Length; i++)
+                mapped[i] = null;
         }
 
         ulong fence = Device.GetCurrentRetireFenceValue();
         Device.EnqueueDeferredRelease(fence, () =>
         {
-            foreach (var resource in ring)
+            foreach (var resource in retired)
             {
                 if (resource != null)
                     resource->Release();
@@ -374,6 +422,78 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     /// </summary>
     protected void EnsureInstanceWorldCapacity(int count) => EnsureInstanceWorldRingCapacity(count);
 
+    /// <summary>
+    /// Grows/shrinks the extras ring to <paramref name="count"/> records per frame slot. Same policy as the
+    /// instance-world ring: exact count, reallocated on a change, deferred release, one SRV per slot.
+    /// </summary>
+    protected void EnsureInstanceExtrasRingCapacity(int count)
+    {
+        if (count <= 0)
+            return;
+        if (_instanceExtrasCapacity == count && _instanceExtrasBuffers.Length == FrameSlotCount)
+            return;
+
+        ReleaseRingDeferred(_instanceExtrasBuffers, _mappedInstanceExtrasBuffers);
+        foreach (int id in _instanceExtrasDescriptorIds)
+        {
+            if (id >= 0)
+                Device.DescriptorAllocator.Free(id);
+        }
+
+        int slots = FrameSlotCount;
+        ulong bufferSize = (ulong)(count * sizeof(InstanceExtras));
+        var buffers = new ID3D12Resource*[slots];
+        var mapped = new byte*[slots];
+        var handles = new GpuDescriptorHandle[slots];
+        var descriptorIds = new int[slots];
+
+        for (int slot = 0; slot < slots; slot++)
+        {
+            var buffer = Device.ResourceManager.CreateBuffer(HeapType.Upload, bufferSize, ResourceStates.GenericRead);
+            void* pData;
+            buffer->Map(0, null, &pData);
+            mapped[slot] = (byte*)pData;
+            // White, not zero: a slot that is never written this frame must read as "no tint" rather than black.
+            var initial = new Span<InstanceExtras>((void*)mapped[slot], count);
+            for (int i = 0; i < count; i++)
+                initial[i] = new InstanceExtras { Color = Vector4.One, Extra = Vector4.Zero };
+
+            descriptorIds[slot] = Device.DescriptorAllocator.Allocate(DescriptorKind.InstanceRing);
+            var srvDesc = new ShaderResourceViewDesc
+            {
+                Format = Silk.NET.DXGI.Format.FormatUnknown,
+                ViewDimension = Silk.NET.Direct3D12.SrvDimension.Buffer,
+                Shader4ComponentMapping = 0x00001688u,
+                Buffer = new BufferSrv
+                {
+                    FirstElement = 0,
+                    NumElements = (uint)count,
+                    StructureByteStride = (uint)sizeof(InstanceExtras),
+                    Flags = BufferSrvFlags.None
+                }
+            };
+            Device.D3dDevice->CreateShaderResourceView(buffer, &srvDesc, Device.SrvHeapManager.GetCpuHandle(descriptorIds[slot]));
+            handles[slot] = Device.SrvHeapManager.GetGpuHandle(descriptorIds[slot]);
+            buffers[slot] = buffer;
+        }
+
+        _instanceExtrasBuffers = buffers;
+        _mappedInstanceExtrasBuffers = mapped;
+        _instanceExtrasSrvHandles = handles;
+        _instanceExtrasDescriptorIds = descriptorIds;
+        _instanceExtrasCapacity = count;
+    }
+
+    /// <summary>Copies this frame's extras records into this frame slot's mapped page. The ring is already sized.</summary>
+    protected void UploadInstanceExtrasForFrame()
+    {
+        int slot = FrameSlot;
+        if ((uint)slot >= (uint)_mappedInstanceExtrasBuffers.Length || _instanceCount <= 0)
+            return;
+        var destination = new Span<byte>(_mappedInstanceExtrasBuffers[slot], _instanceCount * sizeof(InstanceExtras));
+        MemoryMarshal.AsBytes(_instanceExtras.AsSpan(0, _instanceCount)).CopyTo(destination);
+    }
+
     void EnsureInstanceWorldRingCapacity(int count)
     {
         if (count <= 0)
@@ -381,7 +501,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         if (_instanceWorldCapacity == count && _instanceWorldBuffers.Length == FrameSlotCount)
             return;
 
-        ReleaseRingDeferred(_instanceWorldBuffers);
+        ReleaseRingDeferred(_instanceWorldBuffers, _mappedInstanceWorldBuffers);
         foreach (int id in _instanceWorldDescriptorIds)
         {
             if (id >= 0)
@@ -405,7 +525,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             // unwritten slot read as "no previous frame" instead of as whatever the driver handed back.
             new Span<byte>(mapped[slot], count * sizeof(Matrix4x4)).Clear();
 
-            descriptorIds[slot] = Device.DescriptorAllocator.Allocate();
+            descriptorIds[slot] = Device.DescriptorAllocator.Allocate(DescriptorKind.InstanceRing);
             var srvDesc = new ShaderResourceViewDesc
             {
                 Format = Silk.NET.DXGI.Format.FormatUnknown,
@@ -479,9 +599,11 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         {
             _instanceWorlds = new Matrix4x4[_instanceCount];
             _instanceData = new InstanceTransformData[_instanceCount];
+            _instanceExtras = new InstanceExtras[_instanceCount];
         }
 
         EnsureInstanceBufferCapacity(_instanceCount);
+        EnsureInstanceExtrasRingCapacity(_instanceCount);
 
         int writeIndex = 0;
 
@@ -516,6 +638,10 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
                 }
             }
             _instanceData[writeIndex] = instanceData;
+            // Generic per-instance extras: the color is whatever the control set, and white (the default) keeps this
+            // instance bit-identical to the pre-extras render. Color.W stays in the record even though nothing reads it
+            // yet: alpha stays with the material and the control's own Alpha chain.
+            _instanceExtras[writeIndex] = new InstanceExtras { Color = instance.Color, Extra = Vector4.Zero };
 
             // Unified highlighting (per-instance bounds box): use pooled boxes by
             // compressed writeIndex, growing lazily. The draw list is rebuilt
@@ -576,6 +702,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         // 2-3 Step C (tier C-a): publish this frame's instance worlds into this frame's ring slot. The shader reads
         // the previous frame's worlds from the slot the previous frame wrote, so there is no copy between the two.
         UploadInstanceWorldsForFrame(_instanceWorlds, _instanceCount);
+        UploadInstanceExtrasForFrame();
 
         // A7: the culling kernel's input is the same bit-for-bit 80-byte matrix stream as the IA instance stream,
         // so reuse this CPU array directly -- no extra copy and no extra bounding-sphere computation (the sphere
@@ -674,8 +801,8 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     /// For skinned shells (IsSkinned=1), SV_InstanceID does not include
     /// StartInstanceLocation, so the slot base must be carried explicitly via
     /// the outlineMaskBoneBase root constant. The call order must be
-    /// SetPipeline -> OnBeforeDraw -> this write -> Draw because SetPipeline
-    /// resets OutlineMaskBoneBase. Non-skinned shells skip this write and keep
+    /// SetPipeline -> this write -> Draw because SetPipeline resets
+    /// OutlineMaskBoneBase. Non-skinned shells skip this write and keep
     /// boneBase = 0.</summary>
     protected void DrawInstanceShellBox(HighlightBox box, ID3D12Resource* lightCB, ID3D12Resource* instanceBuffer, VertexBufferView instanceVB, uint startInstanceLocation)
     {
@@ -687,26 +814,23 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         if (box.FaceAlpha > 0f)
         {
             Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Front);
-            OnBeforeDraw();
             if (skinnedShell)
                 Pipeline.SetOutlineMaskBoneBase(startInstanceLocation);
             Pipeline.DrawPrimitive(box.Face, lightCB, _matrixBuffers[fi], vb, 1, startInstanceLocation,
-                GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer);
+                GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer, instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
 
             Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Back);
-            OnBeforeDraw();
             if (skinnedShell)
                 Pipeline.SetOutlineMaskBoneBase(startInstanceLocation);
             Pipeline.DrawPrimitive(box.Face, lightCB, _matrixBuffers[fi], vb, 1, startInstanceLocation,
-                GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer);
+                GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer, instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
         }
 
         Pipeline.SetPipeline(PipelineMode.Opaque, PipelineCullVariant.None, depthWrite: true);
-        OnBeforeDraw();
         if (skinnedShell)
             Pipeline.SetOutlineMaskBoneBase(startInstanceLocation);
         Pipeline.DrawPrimitive(box.Edges, lightCB, _matrixBuffers[fi], vb, 1, startInstanceLocation,
-            GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer);
+            GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer, instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
     }
 
     /// <summary>Unified highlighting for instancing: draws all instance shell
@@ -762,11 +886,11 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             {
                 var primitive = _opaquePrimitives[i];
                 Pipeline.SetPipeline(PipelineMode.Opaque, primitive.DoubleSided);
-                OnBeforeDraw();
                 Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fiMain], &segment, 0, 0,
                     GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(),
                     sortedResource, argsResource,
-                    Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i), CurrentInstanceBuffer);
+                    Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i), CurrentInstanceBuffer,
+                    instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
                 Season.Rendering.InstanceCull.MainViewDraws++;
             }
         }
@@ -776,7 +900,6 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             {
                 var primitive = _opaquePrimitives[i];
                 Pipeline.SetPipeline(forceFadeByAlpha ? PipelineMode.Fade : PipelineMode.Opaque, primitive.DoubleSided);
-                OnBeforeDraw();
                 DrawPrimitiveInstances(primitive, lightCB, (uint)_instanceCount, 0);
             }
         }
@@ -793,12 +916,10 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
                 if (primitive.DoubleSided)
                 {
                     Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Front);
-                    OnBeforeDraw();
                     DrawPrimitiveInstances(primitive, lightCB, 1, (uint)instanceIndex);
                 }
 
                 Pipeline.SetPipeline(PipelineMode.Transparent, primitive.DoubleSided ? PipelineCullVariant.Back : PipelineCullVariant.Back);
-                OnBeforeDraw();
                 DrawPrimitiveInstances(primitive, lightCB, 1, (uint)instanceIndex);
             }
         }
@@ -841,7 +962,8 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         var instanceVBValue = CurrentInstanceBufferView;
         VertexBufferView* instanceVB = &instanceVBValue;
         Pipeline.DrawPrimitive(primitiveData, lightConstantBuffer, _matrixBuffers[fi], instanceVB, instanceCount, startInstanceLocation,
-            GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), CurrentInstanceBuffer);
+            GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), CurrentInstanceBuffer,
+            instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
     }
 
     /// <summary>
@@ -923,8 +1045,6 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         if (!_transformInitialized || _instanceCount == 0)
             return;
 
-        OnBeforeDraw();
-
         Pipeline.SetShadowGroupBindings(GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(),
             GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle());
 
@@ -990,11 +1110,10 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             var p = _opaquePrimitives[i];
             Pipeline.SetPipeline(PipelineMode.Opaque,
                 p.DoubleSided ? PipelineCullVariant.None : PipelineCullVariant.Back, depthWrite: false);
-            OnBeforeDraw();
             if (_outline2DHostActive)
             {
                 Pipeline.DrawPrimitive(p, lightCB, _matrixBuffers[fi], instanceVB, (uint)_instanceCount, 0,
-                    GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer);
+                    GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer, instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
             }
             else
             {
@@ -1004,7 +1123,7 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
                     if ((uint)idx >= (uint)_instanceCount)
                         continue;
                     Pipeline.DrawPrimitive(p, lightCB, _matrixBuffers[fi], instanceVB, 1, (uint)idx,
-                        GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer);
+                        GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer, instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
                 }
             }
         }

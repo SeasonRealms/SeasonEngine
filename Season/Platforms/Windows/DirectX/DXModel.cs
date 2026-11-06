@@ -20,8 +20,8 @@ internal class GLTFNode : GltfNodeBase
 /// DX12 backend for glTF models. Inherits DXPrimitiveGroup to reuse
 /// Matrix/Material CB creation, SyncAlpha, and the three-bucket draw flow, and
 /// composes GltfAsset for node-tree / animation / skin loading.
-/// This type only carries glTF-specific pieces: the bone-matrix CB
-/// (bound to slot 8 in OnBeforeDraw), animation ticking, recursive primitive
+/// This type only carries glTF-specific pieces: the instance bone palette
+/// (t6/t8 StructuredBuffers), animation ticking, recursive primitive
 /// collection through the node tree, and ProcessMaterial for the five PBR textures.
 /// </summary>
 internal unsafe class DXModel : DXPrimitiveGroup
@@ -30,9 +30,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
     // through composition, so single inheritance does not get consumed by GltfAsset.
     internal readonly GltfAsset _asset = new GltfAsset();
 
-    // Bone-matrix buffers (N-buffered)
-    private ID3D12Resource*[] _boneMatrixBuffers;
-    private byte*[] _mappedBoneMatrixBuffers;
+    // Instance bone palette (t6/t8 StructuredBuffers)
     private int _bonePaletteStride = 1;
     private ID3D12Resource* _bonePaletteBuffer;
     private byte* _mappedBonePaletteBuffer;
@@ -150,7 +148,6 @@ internal unsafe class DXModel : DXPrimitiveGroup
         _asset.PlayAnimation();
 
         InitializeBonePaletteResources();
-        CreateBoneMatrixBuffer();
 
         _asset.ValidateSkinData();
 
@@ -251,7 +248,6 @@ internal unsafe class DXModel : DXPrimitiveGroup
         // control, matching the semantics of the direct-load Load path.
         model.Asset = instance._asset;
         instance.InitializeBonePaletteResources();
-        instance.CreateBoneMatrixBuffer();
 
         // P1: the three bake tables are a function of the rest pose and the curves, both of which are identical here and on the
         // template, so the template builds them once and every clone references that one set. Without this a scene holding fifty
@@ -350,6 +346,9 @@ internal unsafe class DXModel : DXPrimitiveGroup
             MaterialParams = source.MaterialParams,
             OriginalBaseColorAlpha = source.OriginalBaseColorAlpha,
             OriginalAlphaCutoff = source.OriginalAlphaCutoff,
+            PartName = source.PartName,
+            PartNodeName = source.PartNodeName,
+            PartBaseColor = source.PartBaseColor,
             IsTransparent = source.IsTransparent,
         };
 
@@ -371,6 +370,11 @@ internal unsafe class DXModel : DXPrimitiveGroup
         }
 
         ApplyInstanceMaterialOverrides(clone, model);
+
+        // The clone's own baseline is the template's BaseColor with this model's MaterialColor folded in, so a part
+        // override that is later cleared restores what this control would draw without one.
+        clone.PartBaseColor = new Vector3(clone.MaterialParams.BaseColor.X, clone.MaterialParams.BaseColor.Y, clone.MaterialParams.BaseColor.Z);
+        ApplyPartColorOverride(clone, model);
 
         clone.VertexBuffer = Device.CreateVertexBuffer(clone.Vertices.ToArray(), out clone.VertexBufferView);
         clone.IndexBuffer = Device.CreateIndexBuffer(clone.Indices, out clone.IndexBufferView);
@@ -407,6 +411,56 @@ internal unsafe class DXModel : DXPrimitiveGroup
         primitiveData.MaterialParams.IsSkinned = primitiveData.OwnerNode?.Skin != null ? 1u : 0u;
         primitiveData.MaterialParams.BonePaletteStride = 1;
         primitiveData.OriginalBaseColorAlpha = primitiveData.MaterialParams.BaseColor.W;
+    }
+
+    /// <summary>
+    /// Replaces one primitive's RGB with the override the model holds for its part, if any. Absolute rather than
+    /// multiplicative - see <see cref="Season.Controls.Model.SetPartColor"/> for why a tint cannot recolor a saturated
+    /// material. W is left untouched because the alpha chain belongs to SyncAlpha.
+    /// </summary>
+    static void ApplyPartColorOverride(PrimitiveData primitiveData, Season.Controls.Model model)
+    {
+        if (!model.TryGetPartColor(primitiveData.PartName, primitiveData.PartNodeName, out var color))
+            return;
+
+        var baseColor = primitiveData.MaterialParams.BaseColor;
+        primitiveData.MaterialParams.BaseColor = new Vector4(color.X, color.Y, color.Z, baseColor.W);
+    }
+
+    /// <summary>
+    /// Pushes <c>Model.SetPartColor</c> into every primitive's material CB: RGB becomes the override, or the load-time
+    /// baseline when the override was cleared. Gated on <see cref="Season.Controls.Model.PartColorVersion"/>, so a steady
+    /// frame pays one integer compare; when it does move, all N-buffered frames are written, the same stale-frame rule
+    /// SyncAlpha follows. The canonical <c>MaterialParams</c> struct is updated too, so anything that rewrites the CBs from
+    /// it later (the skinning sync, a clone) sees the same colors this frame drew.
+    /// </summary>
+    void SyncPartColors(Season.Controls.Model model)
+    {
+        if (_appliedPartColorVersion == model.PartColorVersion)
+            return;
+        _appliedPartColorVersion = model.PartColorVersion;
+
+        int n = (int)Device.frameCount;
+        var primitives = new List<PrimitiveData>();
+        CollectAllPrimitives(primitives);
+
+        foreach (var primitive in primitives)
+        {
+            var rgb = model.TryGetPartColor(primitive.PartName, primitive.PartNodeName, out var color)
+                ? new Vector3(color.X, color.Y, color.Z)
+                : primitive.PartBaseColor;
+
+            var canonical = primitive.MaterialParams;
+            canonical.BaseColor = new Vector4(rgb.X, rgb.Y, rgb.Z, canonical.BaseColor.W);
+            primitive.MaterialParams = canonical;
+
+            for (int i = 0; i < n; i++)
+            {
+                var materialParams = Unsafe.Read<MaterialParams>(primitive.MappedMaterialBuffers[i]);
+                materialParams.BaseColor = new Vector4(rgb.X, rgb.Y, rgb.Z, materialParams.BaseColor.W);
+                Unsafe.Write(primitive.MappedMaterialBuffers[i], materialParams);
+            }
+        }
     }
 
     internal static List<GLTFAnimation> CloneAnimations(List<GLTFAnimation> sourceAnimations, Dictionary<GltfNodeBase, GltfNodeBase> nodeMap)
@@ -469,19 +523,6 @@ internal unsafe class DXModel : DXPrimitiveGroup
         return gltfNode;
     }
 
-    // Bone-matrix buffer creation
-    void CreateBoneMatrixBuffer()
-    {
-        int n = (int)Device.frameCount;
-        _boneMatrixBuffers = new ID3D12Resource*[n];
-        _mappedBoneMatrixBuffers = new byte*[n];
-        uint matrixCount = (uint)Math.Max(1, _bonePaletteStride);
-        for (int i = 0; i < n; i++)
-            _boneMatrixBuffers[i] = Device.ResourceManager.CreateConstantBuffer(
-                (uint)(Unsafe.SizeOf<System.Numerics.Matrix4x4>() * matrixCount),
-                out _mappedBoneMatrixBuffers[i]);
-    }
-
     void InitializeBonePaletteResources()
     {
         _bonePaletteStride = Math.Max(1, _asset.GetAllSkins().Sum(static skin => skin.Joints.Count));
@@ -494,7 +535,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
         _bonePaletteBuffer->Map(0, null, &pData);
         _mappedBonePaletteBuffer = (byte*)pData;
 
-        _bonePaletteDescriptorId = Device.DescriptorAllocator.Allocate();
+        _bonePaletteDescriptorId = Device.DescriptorAllocator.Allocate(DescriptorKind.ModelData);
         var cpuHandle = Device.SrvHeapManager.GetCpuHandle(_bonePaletteDescriptorId);
         var srvDesc = new ShaderResourceViewDesc
         {
@@ -521,7 +562,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
         _mappedPrevBonePaletteBuffer = (byte*)pPrevData;
         new Span<byte>(_mappedPrevBonePaletteBuffer, (int)bufferSize).Clear();
 
-        _prevBonePaletteDescriptorId = Device.DescriptorAllocator.Allocate();
+        _prevBonePaletteDescriptorId = Device.DescriptorAllocator.Allocate(DescriptorKind.ModelData);
         var prevCpuHandle = Device.SrvHeapManager.GetCpuHandle(_prevBonePaletteDescriptorId);
         var prevSrvDesc = new ShaderResourceViewDesc
         {
@@ -702,7 +743,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
             _mappedPrevMorphWeightsBuffer = (float*)pData;
             new Span<byte>(pData, 16).Clear();
 
-            _prevMorphWeightsDescriptorId = Device.DescriptorAllocator.Allocate();
+            _prevMorphWeightsDescriptorId = Device.DescriptorAllocator.Allocate(DescriptorKind.ModelData);
             var cpuHandle = Device.SrvHeapManager.GetCpuHandle(_prevMorphWeightsDescriptorId);
             var srvDesc = new ShaderResourceViewDesc
             {
@@ -758,6 +799,11 @@ internal unsafe class DXModel : DXPrimitiveGroup
     {
         var modelRoot = primitive.LogicalParent.LogicalParent;
         var (gLTFMaterial1, images) = GLTFTools.LoadMaterial(modelRoot, primitive);
+
+        // Part identity: the material name is the primary key Model.SetPartColor resolves against, the owning node name the
+        // fallback for material-less primitives. Recorded before the colors below so the override can use it in this same call.
+        primitiveData.PartName = primitive.Material?.Name;
+        primitiveData.PartNodeName = primitiveData.OwnerNode?.Name;
 
         primitiveData.MaterialParams = new MaterialParams { RenderMode = _asset.Model.Unlit ? 0u : 1u };   // 0: Unlit, 1: Pbr3D
 
@@ -918,6 +964,15 @@ internal unsafe class DXModel : DXPrimitiveGroup
         // multiplication stays stable
         primitiveData.OriginalBaseColorAlpha = primitiveData.MaterialParams.BaseColor.W;
 
+        // Part colors: the load-time RGB baseline (with the MaterialColor tint already folded in) is what a cleared
+        // override returns to, and a set override replaces the RGB outright. Direct-load path only: the shared-template
+        // path bakes the requesting model's overrides in ClonePrimitiveData instead, where they are actually known.
+        primitiveData.PartBaseColor = new Vector3(
+            primitiveData.MaterialParams.BaseColor.X,
+            primitiveData.MaterialParams.BaseColor.Y,
+            primitiveData.MaterialParams.BaseColor.Z);
+        ApplyPartColorOverride(primitiveData, _asset.Model);
+
         // Record the original glTF AlphaCutoff so SyncAlpha can scale it in
         // proportion to Model.Alpha and avoid clipping away the entire MASK
         // material at low Model.Alpha.
@@ -936,11 +991,13 @@ internal unsafe class DXModel : DXPrimitiveGroup
         _asset._animationPlayer.UpdateBoneMatrices(_asset.GetAllSkins());
         var boneMatrices = _asset._animationPlayer.GetBoneMatricesArray();
 
-        if (boneMatrices.Length > 0 && _mappedBoneMatrixBuffers != null)
+        if (boneMatrices.Length > 0 && _mappedBonePaletteBuffer != null)
         {
             int matrixSize = Unsafe.SizeOf<System.Numerics.Matrix4x4>();
-            int totalSize = matrixSize * boneMatrices.Length;
-            int fi = (int)Device.FrameIndex;
+            // Clamp to the palette capacity: the upload ring and the palette share one allocation sized by the
+            // summed joint count, so a player reporting more matrices would otherwise copy past its end.
+            int rows = Math.Min(boneMatrices.Length, _bonePaletteStride);
+            int totalSize = matrixSize * rows;
 
             fixed (void* matricesPtr = boneMatrices)
             {
@@ -948,12 +1005,10 @@ internal unsafe class DXModel : DXPrimitiveGroup
                 // the current bone palette into the mapped previous-SB region.
                 // On the first frame, the current side is all zero, so the
                 // previous side stays zero and the sentinel semantics remain correct.
-                if (_mappedPrevBonePaletteBuffer != null && _mappedBonePaletteBuffer != null)
+                if (_mappedPrevBonePaletteBuffer != null)
                     Unsafe.CopyBlock((void*)_mappedPrevBonePaletteBuffer, (void*)_mappedBonePaletteBuffer, (uint)totalSize);
 
-                Unsafe.CopyBlock(_mappedBoneMatrixBuffers[fi], matricesPtr, (uint)totalSize);
-                if (_mappedBonePaletteBuffer != null)
-                    Unsafe.CopyBlock(_mappedBonePaletteBuffer, matricesPtr, (uint)totalSize);
+                Unsafe.CopyBlock(_mappedBonePaletteBuffer, matricesPtr, (uint)totalSize);
             }
         }
 
@@ -1045,6 +1100,13 @@ internal unsafe class DXModel : DXPrimitiveGroup
             ApplyUserTransformToNodeTree(child, userTransform);
         }
     }
+
+    /// <summary>
+    /// Latch of <see cref="Season.Controls.Model.PartColorVersion"/> this group's material CBs currently hold. Starts at a
+    /// value no model can report, so the first Update always syncs - which also bakes in a set that was made between the
+    /// load-time ProcessMaterial/ClonePrimitiveData pass and the first frame.
+    /// </summary>
+    int _appliedPartColorVersion = int.MinValue;
 
     public void Update(Season.Controls.Model model, float time)
     {
@@ -1188,6 +1250,10 @@ internal unsafe class DXModel : DXPrimitiveGroup
         // Sync Model.Alpha to all primitive material buffers
         // (written only when it changes; the base class handles the check)
         SyncAlpha(model.Alpha);
+
+        // Per-part base colors follow the alpha sync: the two write different channels of the same CB (RGB vs W), and the
+        // sync is version-gated, so this costs one compare on every frame that did not change the part-color set.
+        SyncPartColors(model);
 
         // Unified highlighting: sync the wireframe bit
         // (runtime on/off is supported) and lazily build per-primitive shell
@@ -1457,23 +1523,6 @@ internal unsafe class DXModel : DXPrimitiveGroup
             if (node != null)
                 result.AddRange(node.Primitives);
             CollectPrimitivesRecursive(nodeBase.Children, result);
-        }
-    }
-
-    /// <summary>Binds the bone-matrix CB before Draw, at root-signature slot 8.</summary>
-    protected override void OnBeforeDraw()
-    {
-        if (DXSceneDrawCollection.Active is { } collection)
-        {
-            if (_boneMatrixBuffers != null)
-                collection.State.Bones = DXSceneDrawCollection.ConstantRef(_boneMatrixBuffers[Device.FrameIndex]);
-            return;
-        }
-        if (_boneMatrixBuffers != null)
-        {
-            int fi = (int)Device.FrameIndex;
-            Device.GraphicsCommandList->SetGraphicsRootConstantBufferView(
-                8, _boneMatrixBuffers[fi]->GetGPUVirtualAddress());
         }
     }
 

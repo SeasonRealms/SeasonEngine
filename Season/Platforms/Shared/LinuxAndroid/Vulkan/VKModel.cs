@@ -23,7 +23,7 @@ internal class GLTFNode : GltfNodeBase
 /// SyncAlpha, and three-bucket grouped drawing;
 /// uses composition with GltfAsset to load the node tree, animation, and skinning data.
 /// It only carries glTF-specific responsibilities:
-/// N-buffered bone-matrix UBOs (written in OnBeforeDraw), animation ticking,
+/// N-buffered palette ring at binding 9 (refreshed in OnBeforeDraw), animation ticking,
 /// recursive primitive collection from the node tree,
 /// and ProcessMaterial (five PBR textures).
 /// </summary>
@@ -35,16 +35,13 @@ internal unsafe class VKModel : VKPrimitiveGroup
 
     internal GltfAsset Asset => _asset;
 
-    // Bone-matrix buffers (N-buffered)
-    BufferResource[] _boneMatrixBuffers = null!;
-
-    byte*[] _mappedBoneMatrixBuffers = null!;
+    // Skinning palettes: binding-9 storage ring (current) plus the previous-frame ring
     int _bonePaletteStride = 1;
     BufferResource[] _instanceBoneBuffers = null!;
     byte*[] _mappedInstanceBoneBuffers = null!;
 
     // 2-3 Step C (track B): prev bone palette SSBO
-    // (same capacity as _boneMatrixBuffers, one Matrix4x4 per entry).
+    // (same capacity as the MaxBones headroom, one Matrix4x4 per entry).
     // Before each frame upload, memcpy the current mapped region to the prev mapped region,
     // so the GPU always holds the bone palette from the previous frame.
     // Before the first frame, the content is all zero (sentinel _m33 == 0),
@@ -52,7 +49,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
     BufferResource[] _prevBonePaletteBuffers = null!;
     byte*[] _mappedPrevBonePaletteBuffers = null!;
     /// <summary>CPU copy of the bone palette this model uploaded last frame. The prev SSBO is filled from here
-    /// rather than from <c>_mappedBoneMatrixBuffers[fi]</c>: that slot holds the palette of the frame that last used
+    /// rather than from the current frame's mapped region: that slot holds the palette of the frame that last used
     /// fi, which with N frames in flight is N frames old, not one.</summary>
     Matrix4x4[] _prevBonePaletteCpu = Array.Empty<Matrix4x4>();
 
@@ -111,9 +108,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
         _asset.Load(model);
         _asset.PlayAnimation();
 
-        // Create the bone-matrix buffers
-        // (same as DX: N UBOs with 100 matrices each)
-        CreateBoneMatrixBuffer();
+        // Create the binding-9 skinning palette ring
         CreateInstanceBoneBuffers();
         // 2-3 Step C (tracks B/C-b completion): create prev bone + prev morph-weights SSBOs
         CreatePrevBonePaletteBuffer();
@@ -129,9 +124,9 @@ internal unsafe class VKModel : VKPrimitiveGroup
 
         _asset.ValidateSkinData();
 
-        // After all resources are fully ready, including the bone UBO,
+        // After all resources are fully ready, including the binding-9 palette ring,
         // fill back the DescriptorSet for all PrimitiveData.
-        // ProcessPrimitive is called before _boneMatrixBuffers is created,
+        // ProcessPrimitive is called before that ring is created,
         // so this is deferred until the end of Load.
         var all = new List<PrimitiveData>();
         CollectPrimitives(all);
@@ -163,7 +158,6 @@ internal unsafe class VKModel : VKPrimitiveGroup
         instance._transformInitialized = false;
         instance._asset.Model = model;
         instance._asset._nodeTransforms = new Dictionary<GltfNodeBase, Matrix4x4>();
-        instance.CreateBoneMatrixBuffer();
         // 2-3 Step C (tracks B/C-b completion): create prev bone + prev morph-weights SSBOs
         instance.CreatePrevBonePaletteBuffer();
         instance.CreatePrevMorphWeightsBuffer();
@@ -332,6 +326,9 @@ internal unsafe class VKModel : VKPrimitiveGroup
             MaterialParams = source.MaterialParams,
             OriginalBaseColorAlpha = source.OriginalBaseColorAlpha,
             OriginalAlphaCutoff = source.OriginalAlphaCutoff,
+            PartName = source.PartName,
+            PartNodeName = source.PartNodeName,
+            PartBaseColor = source.PartBaseColor,
             IsTransparent = source.IsTransparent,
         };
 
@@ -352,6 +349,11 @@ internal unsafe class VKModel : VKPrimitiveGroup
         }
 
         ApplyInstanceMaterialOverrides(clone, model);
+
+        // The clone's own baseline is the template's BaseColor with this model's MaterialColor folded in, so a part
+        // override that is later cleared restores what this control would draw without one.
+        clone.PartBaseColor = new Vector3(clone.MaterialParams.BaseColor.X, clone.MaterialParams.BaseColor.Y, clone.MaterialParams.BaseColor.Z);
+        ApplyPartColorOverride(clone, model);
 
         clone.VertexBuffer = Device.ResourceManager.CreateVertexBuffer(clone.Vertices.ToArray());
         clone.IndexBuffer = Device.ResourceManager.CreateIndexBuffer(clone.Indices);
@@ -382,6 +384,56 @@ internal unsafe class VKModel : VKPrimitiveGroup
         primitive.MaterialParams.IsSkinned = primitive.OwnerNode?.Skin != null ? 1u : 0u;
         primitive.MaterialParams.BonePaletteStride = 1;
         primitive.OriginalBaseColorAlpha = primitive.MaterialParams.BaseColor.W;
+    }
+
+    /// <summary>
+    /// Replaces one primitive's RGB with the override the model holds for its part, if any. Absolute rather than
+    /// multiplicative - see <see cref="Season.Controls.Model.SetPartColor"/> for why a tint cannot recolor a saturated
+    /// material. W is left untouched because the alpha chain belongs to SyncAlpha.
+    /// </summary>
+    static void ApplyPartColorOverride(PrimitiveData primitive, Season.Controls.Model model)
+    {
+        if (!model.TryGetPartColor(primitive.PartName, primitive.PartNodeName, out var color))
+            return;
+
+        var baseColor = primitive.MaterialParams.BaseColor;
+        primitive.MaterialParams.BaseColor = new Vector4(color.X, color.Y, color.Z, baseColor.W);
+    }
+
+    /// <summary>
+    /// Pushes <c>Model.SetPartColor</c> into every primitive's material UBO: RGB becomes the override, or the load-time
+    /// baseline when the override was cleared. Gated on <see cref="Season.Controls.Model.PartColorVersion"/>, so a steady
+    /// frame pays one integer compare; when it does move, all N-buffered frames are written, the same stale-frame rule
+    /// SyncAlpha follows. The canonical <c>MaterialParams</c> struct is updated too, so anything that rewrites the UBOs from
+    /// it later (the skinning sync, a clone) sees the same colors this frame drew.
+    /// </summary>
+    void SyncPartColors(Season.Controls.Model model)
+    {
+        if (_appliedPartColorVersion == model.PartColorVersion)
+            return;
+        _appliedPartColorVersion = model.PartColorVersion;
+
+        int n = (int)Device.frameCount;
+        var primitives = new List<PrimitiveData>();
+        CollectAllPrimitives(primitives);
+
+        foreach (var primitive in primitives)
+        {
+            var rgb = model.TryGetPartColor(primitive.PartName, primitive.PartNodeName, out var color)
+                ? new Vector3(color.X, color.Y, color.Z)
+                : primitive.PartBaseColor;
+
+            var canonical = primitive.MaterialParams;
+            canonical.BaseColor = new Vector4(rgb.X, rgb.Y, rgb.Z, canonical.BaseColor.W);
+            primitive.MaterialParams = canonical;
+
+            for (int i = 0; i < n; i++)
+            {
+                var materialParams = Unsafe.Read<MaterialParams>(primitive.MappedMaterialBuffers[i]);
+                materialParams.BaseColor = new Vector4(rgb.X, rgb.Y, rgb.Z, materialParams.BaseColor.W);
+                Unsafe.Write(primitive.MappedMaterialBuffers[i], materialParams);
+            }
+        }
     }
 
     static List<GLTFAnimation> CloneAnimations(List<GLTFAnimation> sourceAnimations, Dictionary<GltfNodeBase, GltfNodeBase> nodeMap)
@@ -429,9 +481,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
         return result;
     }
 
-    /// <summary>VKModel's BoneMatrixBuffers points to its own N-buffered UBOs,
-    /// overriding the base class's default IdentityBoneBuffers.</summary>
-    protected override BufferResource[] BoneMatrixBuffers => _boneMatrixBuffers;
+    /// <summary>VKModel supplies its own binding-9 storage ring, overriding the base class's default.</summary>
     protected override BufferResource[] InstanceBoneBuffers
         => _boneStorageRing
             ?? (_instanceBoneBuffers != null && _instanceBoneBuffers.Length > 0
@@ -449,25 +499,6 @@ internal unsafe class VKModel : VKPrimitiveGroup
             IsJoint = node.IsSkinJoint,
             JointIndex = node.IsSkinJoint ? _asset.GetJointIndex(node) : -1
         };
-    }
-
-    void CreateBoneMatrixBuffer()
-    {
-        int n = (int)Device.frameCount;
-        _boneMatrixBuffers = new BufferResource[n];
-        _mappedBoneMatrixBuffers = new byte*[n];
-        ulong size = (ulong)(Unsafe.SizeOf<Matrix4x4>() * MaxBones);
-
-        var identity = Matrix4x4.Identity;
-        for (int i = 0; i < n; i++)
-        {
-            _boneMatrixBuffers[i] = Device.ResourceManager.CreateConstantBuffer(
-                (uint)size, out _mappedBoneMatrixBuffers[i]);
-            // Fill with Identity by default to avoid reading garbage
-            // when animation is not playing yet
-            for (int j = 0; j < MaxBones; j++)
-                Unsafe.Write(_mappedBoneMatrixBuffers[i] + j * sizeof(float) * 16, identity);
-        }
     }
 
     void CreateInstanceBoneBuffers()
@@ -498,7 +529,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
     }
 
     // 2-3 Step C (track B): create the prev bone-palette SSBO
-    // (same capacity as _boneMatrixBuffers)
+    // (same capacity as the current ring: MaxBones rows)
     void CreatePrevBonePaletteBuffer()
     {
         int n = (int)Device.frameCount;
@@ -792,7 +823,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
             Unsafe.Write(p.MappedMatrixBuffers[i], matrices);
 
         // Note: the DescriptorSet is allocated uniformly at the end of Load,
-        // because _boneMatrixBuffers must already exist
+        // because the binding-9 palette ring must already exist
         return p;
     }
 
@@ -895,6 +926,11 @@ internal unsafe class VKModel : VKPrimitiveGroup
     {
         var modelRoot = primitive.LogicalParent.LogicalParent;
         var (gLTFMaterial1, images) = GLTFTools.LoadMaterial(modelRoot, primitive);
+
+        // Part identity: the material name is the primary key Model.SetPartColor resolves against, the owning node name the
+        // fallback for material-less primitives. Recorded before the colors below so the override can use it in this same call.
+        p.PartName = primitive.Material?.Name;
+        p.PartNodeName = p.OwnerNode?.Name;
 
         p.MaterialParams = new MaterialParams { RenderMode = _asset.Model.Unlit ? 0u : 1u };
         p.MaterialParams.IsSkinned = p.OwnerNode?.Skin != null ? 1u : 0u;
@@ -1035,6 +1071,15 @@ internal unsafe class VKModel : VKPrimitiveGroup
         // so later Model.Alpha multiplication can be applied correctly
         p.OriginalBaseColorAlpha = p.MaterialParams.BaseColor.W;
 
+        // Part colors: the load-time RGB baseline (with the MaterialColor tint already folded in) is what a cleared
+        // override returns to, and a set override replaces the RGB outright. Direct-load path only: the shared-template
+        // path bakes the requesting model's overrides in ClonePrimitiveData instead, where they are actually known.
+        p.PartBaseColor = new Vector3(
+            p.MaterialParams.BaseColor.X,
+            p.MaterialParams.BaseColor.Y,
+            p.MaterialParams.BaseColor.Z);
+        ApplyPartColorOverride(p, _asset.Model);
+
         // Record the original glTF AlphaCutoff
         // so SyncAlpha can scale it proportionally with Model.Alpha
         p.OriginalAlphaCutoff = p.MaterialParams.AlphaCutoff;
@@ -1048,8 +1093,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
     // 1-3: bounding-box calculation is unified through the shared
     // Season.Rendering.Bounds3D.FromVertices path (same source across all four backends)
 
-    /// <summary>Compute bone matrices and write them into the current frame's bone UBO
-    /// and dynamic storage buffer.</summary>
+    /// <summary>Compute bone matrices and write them into the current frame's dynamic storage buffer.</summary>
     void UploadBoneMatricesToGpu()
     {
         // The GPU route's whole saving is this early exit: the kernel produced the palette and the ring it wrote is what the
@@ -1060,10 +1104,9 @@ internal unsafe class VKModel : VKPrimitiveGroup
         _asset._animationPlayer.UpdateBoneMatrices(_asset.GetAllSkins());
         var boneMatrices = _asset._animationPlayer.GetBoneMatricesArray();
 
-        if (boneMatrices.Length == 0 || _mappedBoneMatrixBuffers == null) return;
+        if (boneMatrices.Length == 0 || _mappedInstanceBoneBuffers == null) return;
 
         int matrixSize = Unsafe.SizeOf<Matrix4x4>();
-        int totalSize = matrixSize * Math.Min(boneMatrices.Length, MaxBones);
         int fi = (int)Device.FrameIndex;
 
         // 2-3 Step C (track B): publish the PREVIOUS frame's palette (CPU shadow) into this frame's prev SSBO slot
@@ -1079,8 +1122,7 @@ internal unsafe class VKModel : VKPrimitiveGroup
 
         fixed (void* matricesPtr = boneMatrices)
         {
-            Unsafe.CopyBlock(_mappedBoneMatrixBuffers[fi], matricesPtr, (uint)totalSize);
-            if (_mappedInstanceBoneBuffers != null && fi < _mappedInstanceBoneBuffers.Length && _mappedInstanceBoneBuffers[fi] != null)
+            if (fi < _mappedInstanceBoneBuffers.Length && _mappedInstanceBoneBuffers[fi] != null)
             {
                 int dynamicSize = matrixSize * Math.Min(boneMatrices.Length, _bonePaletteStride);
                 Unsafe.CopyBlock(_mappedInstanceBoneBuffers[fi], matricesPtr, (uint)dynamicSize);
@@ -1125,6 +1167,13 @@ internal unsafe class VKModel : VKPrimitiveGroup
             ApplyUserTransformToNodeTree(child, userTransform);
         }
     }
+
+    /// <summary>
+    /// Latch of <see cref="Season.Controls.Model.PartColorVersion"/> this group's material UBOs currently hold. Starts at a
+    /// value no model can report, so the first Update always syncs - which also bakes in a set that was made between the
+    /// load-time ProcessMaterial/ClonePrimitiveData pass and the first frame.
+    /// </summary>
+    int _appliedPartColorVersion = int.MinValue;
 
     public void Update(Season.Controls.Model model, float time)
     {
@@ -1195,6 +1244,10 @@ internal unsafe class VKModel : VKPrimitiveGroup
         // Sync Model.Alpha to the material buffer of all primitives
         // (written only when changed, as determined by the base class)
         SyncAlpha(model.Alpha);
+
+        // Per-part base colors follow the alpha sync: the two write different channels of the same UBO (RGB vs W), and the
+        // sync is version-gated, so this costs one compare on every frame that did not change the part-color set.
+        SyncPartColors(model);
 
         // Unified highlighting: synchronize the wireframe flag
         // (can be toggled at runtime) + lazily build per-primitive shell geometry.
@@ -1316,8 +1369,8 @@ internal unsafe class VKModel : VKPrimitiveGroup
 
     /// <summary>
     /// Before recording the current frame's draw calls,
-    /// ensure the bone UBO for the current FrameIndex has already been written
-    /// with the latest bone matrices.
+    /// ensure the binding-9 palette ring for the current FrameIndex already holds
+    /// the latest bone matrices.
     /// This avoids reading previous-frame or identity data when Update and Draw land in different frame slots.
     /// </summary>
     protected override void OnBeforeDraw()
@@ -1350,17 +1403,6 @@ internal unsafe class VKModel : VKPrimitiveGroup
         var vk = Device.Vk;
         var d = Device.LogicalDevice;
         var rm = Device.ResourceManager;
-        if (_boneMatrixBuffers != null)
-        {
-            for (int i = 0; i < _boneMatrixBuffers.Length; i++)
-            {
-                if (_boneMatrixBuffers[i].Memory.Handle != 0)
-                    vk.UnmapMemory(d, _boneMatrixBuffers[i].Memory);
-                rm?.DestroyBuffer(_boneMatrixBuffers[i]);
-            }
-            _boneMatrixBuffers = null!;
-            _mappedBoneMatrixBuffers = null!;
-        }
 
         if (_instanceBoneBuffers != null)
         {

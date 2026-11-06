@@ -23,7 +23,7 @@ internal class GLTFNode : GltfNodeBase
 /// SyncAlpha, and three-bucket grouped drawing,
 /// while composing GltfAsset to load the node tree, animation data, and skins.
 /// Its own responsibilities are glTF-specific:
-/// N-buffered bone-matrix UBOs written directly during Update,
+/// N-buffered CPU bone palette written directly during Update and bound at VS buffer(6),
 /// animation ticking,
 /// recursive primitive collection from the node tree,
 /// and ProcessMaterial for the five PBR textures.
@@ -34,10 +34,10 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
     // avoiding conflicts with single inheritance.
     readonly GltfAsset _asset = new();
 
-    // Bone-matrix buffers, N-buffered.
-    IMTLBuffer[] _boneMatrixBuffers = null!;
+    // CPU bone palette, N-buffered. It is the slot-6 palette on the single-model route; there is no b3 UBO any more.
+    IMTLBuffer[] _bonePaletteBuffers = null!;
 
-    // Contract clause 8(b) of 2-3: warmup for the bone-UBO frame ring.
+    // Contract clause 8(b) of 2-3: warmup for the palette frame ring.
     // The frame ring is initialized with Identity rather than all zeros,
     // so bm[3][3] == 0 cannot be used to detect an unwritten cold slot.
     // The shader may use slot [fi-1] as the previous palette only after the ring has been fully written once.
@@ -48,7 +48,7 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
     //
     // The same kernel, parameter row and frame latch the instanced path uses, filled with exactly one row. Metal needs the least
     // glue of the four backends: the palette is bound per draw through setVertexBuffer rather than through a descriptor set, so a
-    // compute-written storage buffer can stand in for the mapped bone UBO by swapping the handle this class hands the group - no
+    // compute-written storage buffer can stand in for the mapped bone palette by swapping the handle this class hands the group - no
     // rewrite step, no binding table.
 
     /// <summary>The shared target implementation, one instance wide. Registered at load, unregistered by Dispose.</summary>
@@ -66,7 +66,7 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
     /// <summary>The palette ring this class creates because the GPU route needs a compute-written palette. Owned here, disposed here.</summary>
     Season.Rendering.InstanceBoneStorage? _gpuPalette;
 
-    /// <summary>The ring flattened to the frame-indexed shape <see cref="BoneMatrixBuffers"/> returns, rebuilt only when a slot's
+    /// <summary>The ring flattened to the frame-indexed shape <see cref="BonePaletteBuffers"/> returns, rebuilt only when a slot's
     /// buffer is replaced. Null on the CPU route, which is what makes that property fall through to the mapped ring.</summary>
     IMTLBuffer[]? _boneStorageRing;
 
@@ -92,8 +92,8 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
 
         _asset.Load(model);
 
-        // Create the bone-matrix buffers, matching DX and VK with N UBOs for 100 bones each.
-        CreateBoneMatrixBuffer();
+        // Create the CPU bone palette, N-buffered like DX and VK. The shader reads it at VS buffer(6), not the retired b3 slot.
+        CreateBonePaletteBuffer();
 
         // Single-model GPU skinning: the palette ring and the bake are created lazily by the first BeginSkinningFrame, because
         // whether either is wanted is a property of the control (SkinningMode, possibly overridden per process) and this call may
@@ -128,7 +128,7 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         instance._transformInitialized = false;
         instance._asset.Model = model;
         instance._asset._nodeTransforms = new Dictionary<GltfNodeBase, Matrix4x4>();
-        instance.CreateBoneMatrixBuffer();
+        instance.CreateBonePaletteBuffer();
 
         var nodeMap = new Dictionary<GltfNodeBase, GltfNodeBase>();
         foreach (var nodeBase in _asset.gltfNodes)
@@ -293,6 +293,9 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
             MaterialParams = source.MaterialParams,
             OriginalBaseColorAlpha = source.OriginalBaseColorAlpha,
             OriginalAlphaCutoff = source.OriginalAlphaCutoff,
+            PartName = source.PartName,
+            PartNodeName = source.PartNodeName,
+            PartBaseColor = source.PartBaseColor,
             IsTransparent = source.IsTransparent,
         };
 
@@ -317,6 +320,11 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         }
 
         ApplyInstanceMaterialOverrides(clone, model);
+
+        // The clone's own baseline is the template's BaseColor with this model's MaterialColor folded in, so a part
+        // override that is later cleared restores what this control would draw without one.
+        clone.PartBaseColor = new Vector3(clone.MaterialParams.BaseColor.X, clone.MaterialParams.BaseColor.Y, clone.MaterialParams.BaseColor.Z);
+        ApplyPartColorOverride(clone, model);
 
         clone.VertexBuffer = Device.ResourceManager.CreateVertexBuffer(clone.Vertices.ToArray());
         clone.IndexBuffer = Device.ResourceManager.CreateIndexBuffer(clone.Indices);
@@ -346,6 +354,56 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         primitive.MaterialParams.IsSkinned = primitive.OwnerNode?.Skin != null ? 1u : 0u;
         primitive.MaterialParams.BonePaletteStride = 1u;
         primitive.OriginalBaseColorAlpha = primitive.MaterialParams.BaseColor.W;
+    }
+
+    /// <summary>
+    /// Replaces one primitive's RGB with the override the model holds for its part, if any. Absolute rather than
+    /// multiplicative - see <see cref="Season.Controls.Model.SetPartColor"/> for why a tint cannot recolor a saturated
+    /// material. W is left untouched because the alpha chain belongs to SyncAlpha.
+    /// </summary>
+    static void ApplyPartColorOverride(PrimitiveData primitive, Season.Controls.Model model)
+    {
+        if (!model.TryGetPartColor(primitive.PartName, primitive.PartNodeName, out var color))
+            return;
+
+        var baseColor = primitive.MaterialParams.BaseColor;
+        primitive.MaterialParams.BaseColor = new Vector4(color.X, color.Y, color.Z, baseColor.W);
+    }
+
+    /// <summary>
+    /// Pushes <c>Model.SetPartColor</c> into every primitive's material UBO: RGB becomes the override, or the load-time
+    /// baseline when the override was cleared. Gated on <see cref="Season.Controls.Model.PartColorVersion"/>, so a steady
+    /// frame pays one integer compare; when it does move, all N-buffered frames are written, the same stale-frame rule
+    /// SyncAlpha follows. The canonical <c>MaterialParams</c> struct is updated too, so anything that rewrites the UBOs from
+    /// it later (the skinning sync, a clone) sees the same colors this frame drew.
+    /// </summary>
+    void SyncPartColors(Season.Controls.Model model)
+    {
+        if (_appliedPartColorVersion == model.PartColorVersion)
+            return;
+        _appliedPartColorVersion = model.PartColorVersion;
+
+        int n = Device.frameCount;
+        var primitives = new List<PrimitiveData>();
+        CollectAllPrimitives(primitives);
+
+        foreach (var primitive in primitives)
+        {
+            var rgb = model.TryGetPartColor(primitive.PartName, primitive.PartNodeName, out var color)
+                ? new Vector3(color.X, color.Y, color.Z)
+                : primitive.PartBaseColor;
+
+            var canonical = primitive.MaterialParams;
+            canonical.BaseColor = new Vector4(rgb.X, rgb.Y, rgb.Z, canonical.BaseColor.W);
+            primitive.MaterialParams = canonical;
+
+            for (int i = 0; i < n; i++)
+            {
+                var materialParams = ReadStruct<MaterialParams>(primitive.MaterialBuffers[i]);
+                materialParams.BaseColor = new Vector4(rgb.X, rgb.Y, rgb.Z, materialParams.BaseColor.W);
+                WriteStruct(primitive.MaterialBuffers[i], materialParams);
+            }
+        }
     }
 
     static List<GLTFAnimation> CloneAnimations(List<GLTFAnimation> sourceAnimations, Dictionary<GltfNodeBase, GltfNodeBase> nodeMap)
@@ -393,11 +451,11 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         return result;
     }
 
-    /// <summary>MTLModel points BoneMatrixBuffers to its own N-buffered UBOs, overriding the base-class default IdentityBoneBuffers.
+    /// <summary>MTLModel points BonePaletteBuffers at its own N-buffered CPU palette, overriding the base-class default IdentityBoneBuffers.
     /// On the GPU route it points at the storage ring instead: the vertex stage addresses joint <c>idx</c> from row zero when
-    /// <c>isInstanced</c> is false, which is the kernel's instance-0 block, so the same per-draw binding carries the palette with no
-    /// shader change at all.</summary>
-    protected override IMTLBuffer[] BoneMatrixBuffers => _boneStorageRing ?? _boneMatrixBuffers;
+    /// <c>isInstanced</c> is false, which is the kernel's instance-0 block, so the same VS buffer(6) binding carries the palette
+    /// with no shader branch.</summary>
+    protected override IMTLBuffer[] BonePaletteBuffers => _boneStorageRing ?? _bonePaletteBuffers;
 
     GltfNodeBase CreateGLTFNode(SharpGLTF.Schema2.Node node)
     {
@@ -412,18 +470,20 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         };
     }
 
-    void CreateBoneMatrixBuffer()
+    /// <summary>Allocates the CPU palette ring bound at VS buffer(6). Rows are seeded with Identity so a primitive drawn
+    /// before its animation ever played reads a neutral pose rather than leftover memory.</summary>
+    void CreateBonePaletteBuffer()
     {
         int n = Device.frameCount;
-        _boneMatrixBuffers = new IMTLBuffer[n];
+        _bonePaletteBuffers = new IMTLBuffer[n];
         nuint size = (nuint)(Unsafe.SizeOf<Matrix4x4>() * MaxBones);
 
         var identity = Matrix4x4.Identity;
         for (int i = 0; i < n; i++)
         {
-            _boneMatrixBuffers[i] = Device.ResourceManager.CreateConstantBuffer(size);
+            _bonePaletteBuffers[i] = Device.ResourceManager.CreateConstantBuffer(size);
             // Fill with Identity by default so non-playing animations never read garbage values.
-            byte* basePtr = (byte*)_boneMatrixBuffers[i].Contents;
+            byte* basePtr = (byte*)_bonePaletteBuffers[i].Contents;
             for (int j = 0; j < MaxBones; j++)
                 *(Matrix4x4*)(basePtr + j * sizeof(float) * 16) = identity;
         }
@@ -590,6 +650,11 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         var modelRoot = primitive.LogicalParent.LogicalParent;
         var (gLTFMaterial1, images) = GLTFTools.LoadMaterial(modelRoot, primitive);
 
+        // Part identity: the material name is the primary key Model.SetPartColor resolves against, the owning node name the
+        // fallback for material-less primitives. Recorded before the colors below so the override can use it in this same call.
+        p.PartName = primitive.Material?.Name;
+        p.PartNodeName = p.OwnerNode?.Name;
+
         p.MaterialParams = new MaterialParams
         {
             RenderMode = _asset.Model.Unlit ? 0u : 1u,
@@ -731,6 +796,15 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         // Record the original glTF BaseColor.W so Model.Alpha can be applied later as an additional multiplier.
         p.OriginalBaseColorAlpha = p.MaterialParams.BaseColor.W;
 
+        // Part colors: the load-time RGB baseline (with the MaterialColor tint already folded in) is what a cleared
+        // override returns to, and a set override replaces the RGB outright. Direct-load path only: the shared-template
+        // path bakes the requesting model's overrides in ClonePrimitiveData instead, where they are actually known.
+        p.PartBaseColor = new Vector3(
+            p.MaterialParams.BaseColor.X,
+            p.MaterialParams.BaseColor.Y,
+            p.MaterialParams.BaseColor.Z);
+        ApplyPartColorOverride(p, _asset.Model);
+
         // Record the original glTF AlphaCutoff so SyncAlpha can scale it proportionally with Model.Alpha.
         p.OriginalAlphaCutoff = p.MaterialParams.AlphaCutoff;
 
@@ -741,7 +815,7 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
 
     // For 1-3, bounds calculation is unified through the shared Season.Rendering.Bounds3D.FromVertices helper on all four backends.
 
-    /// <summary>Computes bone matrices and writes them into the current-frame bone UBO by writing directly into Contents memory.</summary>
+    /// <summary>Computes bone matrices and writes them into the current-frame palette row by writing directly into Contents memory.</summary>
     void UploadBoneMatricesToGpu()
     {
         // The GPU route's whole saving is this early exit: the kernel produced the palette and the ring it wrote is what the group
@@ -751,15 +825,16 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         _asset._animationPlayer.UpdateBoneMatrices(_asset.GetAllSkins());
         var boneMatrices = _asset._animationPlayer.GetBoneMatricesArray();
 
-        if (boneMatrices.Length == 0 || _boneMatrixBuffers == null) return;
+        if (boneMatrices.Length == 0 || _bonePaletteBuffers == null) return;
 
         int matrixSize = Unsafe.SizeOf<Matrix4x4>();
+        // Clamp to the palette capacity: a joint count past MaxBones would otherwise copy past the allocation.
         int totalSize = matrixSize * Math.Min(boneMatrices.Length, MaxBones);
         int fi = Device.FrameIndex;
 
         fixed (void* matricesPtr = boneMatrices)
         {
-            Unsafe.CopyBlock((void*)_boneMatrixBuffers[fi].Contents, matricesPtr, (uint)totalSize);
+            Unsafe.CopyBlock((void*)_bonePaletteBuffers[fi].Contents, matricesPtr, (uint)totalSize);
         }
 
         // Once the frame ring has been filled for one full cycle, slot [fi-1] is guaranteed to be the previous-frame palette,
@@ -899,7 +974,7 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         {
             // A slot without a storage buffer can only be a ring that failed to allocate, which PreparePalette already rejects;
             // falling back to the mapped ring per slot keeps a broken frame drawable rather than binding null.
-            var buffer = ring.Slots[i] is MTLStorageBuffer slot ? slot.Buffer : _boneMatrixBuffers[i];
+            var buffer = ring.Slots[i] is MTLStorageBuffer slot ? slot.Buffer : _bonePaletteBuffers[i];
             if (!ReferenceEquals(_boneStorageRing[i], buffer))
                 _boneStorageRing[i] = buffer;
         }
@@ -937,6 +1012,13 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
             ApplyUserTransformToNodeTree(child, userTransform);
         }
     }
+
+    /// <summary>
+    /// Latch of <see cref="Season.Controls.Model.PartColorVersion"/> this group's material UBOs currently hold. Starts at a
+    /// value no model can report, so the first Update always syncs - which also bakes in a set that was made between the
+    /// load-time ProcessMaterial/ClonePrimitiveData pass and the first frame.
+    /// </summary>
+    int _appliedPartColorVersion = int.MinValue;
 
     public void Update(Season.Controls.Model model, float time)
     {
@@ -1003,6 +1085,10 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         // Sync Model.Alpha into every primitive material buffer.
         // The base class writes only when the value actually changes.
         SyncAlpha(model.Alpha);
+
+        // Per-part base colors follow the alpha sync: the two write different channels of the same UBO (RGB vs W), and the
+        // sync is version-gated, so this costs one compare on every frame that did not change the part-color set.
+        SyncPartColors(model);
 
         // Unified highlighting:
         // sync the wireframe flag, which can be toggled at runtime,
@@ -1078,13 +1164,6 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         }
     }
 
-    /// <summary>
-    /// On the Metal backend, OnBeforeDraw is empty by default.
-    /// Bone UBO contents are already written into the current frame during Update through Contents,
-    /// so DrawPrimitive can read BoneMatrixBuffers[fi] directly with no extra root binding during command recording.
-    /// </summary>
-    protected override void OnBeforeDraw() { }
-
     public override void Dispose()
     {
         // Leave the scheduler before the buffers it points at go away, and release the compute-side parameter and scratch blocks
@@ -1106,11 +1185,11 @@ internal sealed unsafe class MTLModel : MTLPrimitiveGroup
         // Unified highlighting: release the highlight pool for the host Bounds box.
         DisposeHighlights();
 
-        if (_boneMatrixBuffers != null)
+        if (_bonePaletteBuffers != null)
         {
-            for (int i = 0; i < _boneMatrixBuffers.Length; i++)
-                _boneMatrixBuffers[i]?.Dispose();
-            _boneMatrixBuffers = null!;
+            for (int i = 0; i < _bonePaletteBuffers.Length; i++)
+                _bonePaletteBuffers[i]?.Dispose();
+            _bonePaletteBuffers = null!;
         }
     }
 }

@@ -142,6 +142,120 @@ public class Model : Mesh3DBase
     /// <summary>Override the Emissive color as RGB intensity. Automatically reset to null after consumption.</summary>
     public Vector4? EmissiveFactorOverride { get; set; }
 
+    // -- Per-part base-color overrides. Unlike the overrides above these are not consumed by UpdateModel:
+    //    they are a live, persistent set that survives every frame, keyed by part name. --
+
+    /// <summary>
+    /// Part name to base-color map. Keys are compared case-insensitively against the glTF material name first and the
+    /// owning node name second, so an asset can be addressed by whichever of the two is stable for it.
+    /// </summary>
+    readonly Dictionary<string, Vector4> _partColors = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Increments on every change to <see cref="SetPartColor"/>. A backend re-applies the whole set only when this moves,
+    /// which makes the steady-state per-frame cost one integer compare - the same change-gated contract
+    /// <see cref="Mesh3D.ColorTint"/> follows through SyncColorTint.
+    /// </summary>
+    internal int PartColorVersion { get; private set; }
+
+    /// <summary>
+    /// Overrides the base color of one part of the model. <paramref name="part"/> is matched case-insensitively against
+    /// the glTF material name and, failing that, against the name of the node that owns the primitive.
+    ///
+    /// <para><b>RGB is replaced, not multiplied.</b> A part keeps its own base-color factor from the asset otherwise, and
+    /// that factor can already be saturated - the sailing boat's sail is pure yellow (0.97, 0.93, 0.0003), so no
+    /// multiplication can ever make it blue, only redder or darker. The override is therefore the absolute albedo a
+    /// tinted material would multiply its texture by, and any base-color texture still multiplies it.</para>
+    ///
+    /// <para>W is ignored: alpha belongs to <see cref="Control.Alpha"/> and the SyncAlpha chain that scales it, so a color
+    /// passed here can never change an object's opacity. <see cref="SetPartColor(string, Vector3)"/> is the same call for
+    /// callers that only carry an RGB value.</para>
+    ///
+    /// <para>Safe to call before the model is loaded: the value is baked in during load and re-applied on the next frame.
+    /// Returns whether the set actually changed.</para>
+    /// </summary>
+    public bool SetPartColor(string part, Vector4 color)
+    {
+        if (part.IsNullOrWhiteSpace())
+            return false;
+
+        if (_partColors.TryGetValue(part, out var existing) && existing == color)
+            return false;
+
+        _partColors[part] = color;
+        PartColorVersion++;
+        return true;
+    }
+
+    /// <summary>RGB overload of <see cref="SetPartColor(string, Vector4)"/>; alpha is not part of the part-color channel.</summary>
+    public bool SetPartColor(string part, Vector3 color) => SetPartColor(part, new Vector4(color, 1f));
+
+    /// <summary>Removes one part's override, so it goes back to the base color the asset was loaded with. Returns whether an override was removed.</summary>
+    public bool ClearPartColor(string part)
+    {
+        if (part.IsNullOrWhiteSpace() || !_partColors.Remove(part))
+            return false;
+
+        PartColorVersion++;
+        return true;
+    }
+
+    /// <summary>Removes every part override, returning the whole model to its authored colors.</summary>
+    public void ClearPartColors()
+    {
+        if (_partColors.Count == 0)
+            return;
+
+        _partColors.Clear();
+        PartColorVersion++;
+    }
+
+    /// <summary>
+    /// Part names this model can address, i.e. the distinct glTF material names in the loaded asset. Material-less
+    /// primitives are addressable by their node name instead, which is why this list can be shorter than the draw count.
+    /// Empty before the asset is loaded.
+    /// </summary>
+    public IReadOnlyList<string> GetPartNames()
+    {
+        if (Asset == null)
+            return Array.Empty<string>();
+
+        var names = new List<string>();
+        foreach (var node in Asset.gltfNodes)
+        {
+            if (node.Mesh == null)
+                continue;
+
+            foreach (var primitive in node.Mesh.Primitives)
+            {
+                var name = primitive.Material?.Name;
+                if (!name.IsNullOrWhiteSpace() && !names.Contains(name, StringComparer.OrdinalIgnoreCase))
+                    names.Add(name);
+            }
+        }
+
+        return names;
+    }
+
+    /// <summary>Resolves the override for one primitive: material name first, node name second. Called by the backends' SyncPartColors.</summary>
+    internal bool TryGetPartColor(string? materialName, string? nodeName, out Vector4 color)
+    {
+        if (_partColors.Count == 0)
+        {
+            color = default;
+            return false;
+        }
+
+        if (!materialName.IsNullOrWhiteSpace() && _partColors.TryGetValue(materialName, out color))
+            return true;
+
+        if (!nodeName.IsNullOrWhiteSpace() && _partColors.TryGetValue(nodeName, out color))
+            return true;
+
+        color = default;
+        return false;
+    }
+
     public override async Task<bool> Load()
     {
         await Graphics.Instance.LoadModel(this);

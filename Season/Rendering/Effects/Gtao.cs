@@ -54,7 +54,8 @@ public sealed class GtaoEffect : ComputeEffect
     /// <summary>Registered prefix for chain textures; raw, blurx, and ao can all be attached directly to Sprite2D for debugging, following the Bloom precedent.</summary>
     public const string TextureNamePrefix = "compute://gtao/";
 
-    /// <summary>Registered name of the final output (after blurY); also written to FrameSchedule.AoTexture after successful Initialize.</summary>
+    /// <summary>Registered name of the final output (after blurY); scoped per view through <see cref="ViewTargets.Scope"/>
+    /// when the chain is allocated, and published on that view's <see cref="ViewTargets.AoOutput"/>.</summary>
     public const string TextureName = TextureNamePrefix + "ao";
 
     const string RawName = TextureNamePrefix + "raw";
@@ -64,23 +65,21 @@ public sealed class GtaoEffect : ComputeEffect
     ComputeKernel? _main;
     ComputeKernel? _blur;
 
-    // Half-resolution size. Set during Initialize and updated in place on resize.
-    uint _width;
-    uint _height;
-
-    // Resource reference arrays used by each dispatch. Built during Initialize and reused
-    // every frame with zero allocations. They cannot use stackalloc because they contain
-    // reference types; see ComputeDispatchArgs summary.
-    ComputeResourceRef[]? _mainRes;
-    ComputeResourceRef[]? _blurXRes;
-    ComputeResourceRef[]? _blurYRes;
+    /// <summary>Per-view chain: scoped names, half-resolution size and cached dispatch references.</summary>
+    sealed class GtaoViewState
+    {
+        public string? RawName, BlurXName, AoName;
+        public uint Width, Height;
+        public ComputeResourceRef[]? MainRes, BlurXRes, BlurYRes;
+    }
 
     public override string Name => "gtao";
 
     public override ComputePhase Phase => ComputePhase.AfterOpaque;
 
-    /// <summary>Per view: occlusion is computed from one view's depth and consumed by that view's composite.
-    /// <see cref="FrameSchedule.AoReady"/> stays app-level, so a second view would need per-view AO names first.</summary>
+    /// <summary>Per view: occlusion is computed from one view's depth and consumed by that view's composite. The chain
+    /// textures and the published output name are scoped per view, so two views in one frame never overwrite each
+    /// other's AO.</summary>
     public override ComputeScope Scope => ComputeScope.View;
     public override ViewFeature RequiredFeature => ViewFeature.AmbientOcclusion;
 
@@ -133,47 +132,74 @@ public sealed class GtaoEffect : ComputeEffect
             return false;
         }
 
-        // Half resolution (minimum side clamped to >= 8, same behavior as Bloom).
-        var res = DeviceServices.BaseApp.DeviceResolution;
-        _width = Math.Max(8u, (uint)res.X / 2);
-        _height = Math.Max(8u, (uint)res.Y / 2);
-
-        g.CreateComputeTexture(RawName, _width, _height);
-        g.CreateComputeTexture(BlurXName, _width, _height);
-        g.CreateComputeTexture(TextureName, _width, _height);
-
-        _mainRes = new ComputeResourceRef[] { FrameSchedule.SceneDepth, RawName };
-        _blurXRes = new ComputeResourceRef[] { RawName, BlurXName };
-        _blurYRes = new ComputeResourceRef[] { BlurXName, TextureName };
-
-        FrameSchedule.AoTexture = TextureName;
+        // Half resolution (minimum side clamped to >= 8, same behavior as Bloom). The main view's chain is
+        // allocated here so a failing backend registration leaves no residue; secondary views allocate their
+        // own scoped chain lazily on their first Record.
+        EnsureState(g, FrameSchedule.PrimaryTargets);
         return true;
     }
 
-    public override void OnResize(IGraphics g)
+    static void Measure(out uint width, out uint height)
     {
-        // Recreate the three chain textures in place at half resolution
-        // (minimum side clamped to >= 8, same behavior as Bloom).
         var res = DeviceServices.BaseApp.DeviceResolution;
-        _width = Math.Max(8u, (uint)res.X / 2);
-        _height = Math.Max(8u, (uint)res.Y / 2);
-        g.CreateComputeTexture(RawName, _width, _height);
-        g.CreateComputeTexture(BlurXName, _width, _height);
-        g.CreateComputeTexture(TextureName, _width, _height);
-        // Resource reference arrays do not depend on size because the names stay fixed.
+        width = Math.Max(8u, (uint)res.X / 2);
+        height = Math.Max(8u, (uint)res.Y / 2);
+    }
+
+    /// <summary>Creates this view's scoped chain textures and cached dispatch references on first use.</summary>
+    GtaoViewState EnsureState(IGraphics g, ViewTargets targets)
+    {
+        var state = ViewState<GtaoViewState>(targets);
+        if (state.AoName != null) return state;
+
+        state.RawName = targets.Scope(RawName);
+        state.BlurXName = targets.Scope(BlurXName);
+        state.AoName = targets.Scope(TextureName);
+        Measure(out state.Width, out state.Height);
+        g.CreateComputeTexture(state.RawName, state.Width, state.Height);
+        g.CreateComputeTexture(state.BlurXName, state.Width, state.Height);
+        g.CreateComputeTexture(state.AoName, state.Width, state.Height);
+
+        state.MainRes = new ComputeResourceRef[] { targets.SceneDepth!, state.RawName };
+        state.BlurXRes = new ComputeResourceRef[] { state.RawName, state.BlurXName };
+        state.BlurYRes = new ComputeResourceRef[] { state.BlurXName, state.AoName };
+        targets.AoOutput = state.AoName;
+        return state;
+    }
+
+    public override void OnViewResize(IGraphics g, ViewTargets targets)
+    {
+        // Recreate this view's chain in place. CreateComputeTexture keeps the name and the C# texture object
+        // identity, so the cached resource arrays stay valid. A view that never rendered has no chain yet and
+        // allocates it lazily on its first frame.
+        var state = ViewState<GtaoViewState>(targets);
+        if (state.AoName == null) return;
+        Measure(out uint w, out uint h);
+        if (w == state.Width && h == state.Height) return;
+        g.CreateComputeTexture(state.RawName!, w, h);
+        g.CreateComputeTexture(state.BlurXName!, w, h);
+        g.CreateComputeTexture(state.AoName, w, h);
+        state.Width = w;
+        state.Height = h;
     }
 
     public override void Record(IGraphics g)
     {
-        FrameSchedule.AoReady = false;
+        var targets = FrameSchedule.ActiveTargets;
+        targets.AoReady = false;
         var resolution = DeviceServices.BaseApp.DeviceResolution;
-        if (RenderQuality.Current.AmbientOcclusion != AoMode.Gtao || FrameSchedule.SceneDepth == null
-            || _width != Math.Max(8u, (uint)resolution.X / 2)
-            || _height != Math.Max(8u, (uint)resolution.Y / 2))
+        if (RenderQuality.Current.AmbientOcclusion != AoMode.Gtao || targets.SceneDepth == null)
             return;
+        // The chain is sized from the device resolution. A missed resize callback makes the sizes disagree, and the
+        // view then falls back to no AO for the frame instead of sampling a stale chain.
+        uint w = Math.Max(8u, (uint)resolution.X / 2);
+        uint h = Math.Max(8u, (uint)resolution.Y / 2);
+        var state = ViewState<GtaoViewState>(targets);
+        if (state.AoName == null) EnsureState(g, targets);
+        if (state.Width != w || state.Height != h) return;
         var camera = RenderView.Current.Camera;
-        uint gx = (_width + 7) / 8;
-        uint gy = (_height + 7) / 8;
+        uint gx = (state.Width + 7) / 8;
+        uint gy = (state.Height + 7) / 8;
 
         // 1) gtaoMain: SceneDepth -> raw.
         // Reconstruction parameters are uploaded from Camera3D every frame. If aspect is
@@ -183,17 +209,17 @@ public sealed class GtaoEffect : ComputeEffect
         p[0] = camera.Near;
         p[1] = camera.Far;
         p[2] = MathF.Tan(camera.FovY * 0.5f);
-        p[3] = camera.Aspect > 0f ? camera.Aspect : (float)_width / _height;
+        p[3] = camera.Aspect > 0f ? camera.Aspect : (float)state.Width / state.Height;
         p[4] = RenderQuality.Current.AoRadius;
-        p[5] = _width;
-        p[6] = _height;
+        p[5] = state.Width;
+        p[6] = state.Height;
         p[7] = 0;
-        _mainRes![0] = FrameSchedule.SceneDepth;
+        state.MainRes![0] = targets.SceneDepth;
         if (!g.TryDispatchCompute(new ComputeDispatchArgs
         {
             Kernel = _main!,
             Params = MemoryMarshal.AsBytes(p),
-            Resources = _mainRes,
+            Resources = state.MainRes,
             GroupsX = gx,
             GroupsY = gy,
             GroupsZ = 1,
@@ -202,15 +228,15 @@ public sealed class GtaoEffect : ComputeEffect
         // 2) gtaoBlur X/Y passes: raw -> blurx -> ao.
         // Depth-aware separable Gaussian blur, with direction supplied through Params.
         Span<float> b = stackalloc float[4];
-        b[0] = _width;
-        b[1] = _height;
+        b[0] = state.Width;
+        b[1] = state.Height;
         b[2] = 1f;
         b[3] = 0f;
         if (!g.TryDispatchCompute(new ComputeDispatchArgs
         {
             Kernel = _blur!,
             Params = MemoryMarshal.AsBytes(b),
-            Resources = _blurXRes,
+            Resources = state.BlurXRes,
             GroupsX = gx,
             GroupsY = gy,
             GroupsZ = 1,
@@ -222,12 +248,12 @@ public sealed class GtaoEffect : ComputeEffect
         {
             Kernel = _blur!,
             Params = MemoryMarshal.AsBytes(b),
-            Resources = _blurYRes,
+            Resources = state.BlurYRes,
             GroupsX = gx,
             GroupsY = gy,
             GroupsZ = 1,
         })) return;
-        FrameSchedule.AoReady = true;
+        targets.AoReady = true;
     }
 
     public void Dispose()
@@ -236,11 +262,13 @@ public sealed class GtaoEffect : ComputeEffect
         _main = null;
         _blur?.Dispose();
         _blur = null;
-        if (FrameSchedule.AoTexture == TextureName)
+        // Revoke every view's publication, not just whichever view happens to be active when the effect retires.
+        ForEachViewState((targets, _) =>
         {
-            FrameSchedule.AoTexture = null;
-            FrameSchedule.AoReady = false;
-        }
+            targets.AoOutput = null;
+            targets.AoReady = false;
+        });
+        ClearViewStates();
     }
 
     // Shader sources (single source of truth; slots follow the class-level binding

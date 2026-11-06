@@ -21,7 +21,55 @@ internal unsafe static class Device
 
     internal static ID3D12Device* D3dDevice;
 
-    internal static DescriptorAllocator DescriptorAllocator { get; } = new(2048);
+    // 8192 rather than 2048: the pool is shared by every long-lived SRV (one per texture, one per model palette,
+    // one per per-instance ring slot) and by the three in-flight draw-snapshot arenas, each of which keeps its own
+    // high-water mark of the per-frame view count for the life of the process. A scene reaches two thousand once
+    // its texture count passes roughly four hundred, which is why the old 2048 ran out in the middle of a draw
+    // rather than during loading. A shader-visible CBV/SRV/UAV heap tops out at 1,048,576 descriptors, so the
+    // whole headroom costs 8192 * 32 B = 256 KB.
+    internal const int DescriptorCapacity = 8192;
+
+    internal static DescriptorAllocator DescriptorAllocator { get; } = new(DescriptorCapacity);
+
+    /// <summary>
+    /// Appends the per-frame draw-snapshot arena sizes to a descriptor-exhaustion report. The arenas are the one
+    /// consumer whose footprint is invisible from the pool: each FrameContext retains a private high-water mark
+    /// that is only returned when the context itself dies. Must stay side-effect free - it runs while the allocator
+    /// holds its lock, and <see cref="FrameContext.DrawSnapshots"/> begins a frame, so the read-only count is used.
+    /// </summary>
+    static string DescribeDrawSnapshotPressure()
+    {
+        var contexts = FrameContexts;
+        if (contexts == null) return string.Empty;
+        var report = new System.Text.StringBuilder(64);
+        report.Append("draw-snapshot descriptors:");
+        for (int i = 0; i < contexts.Length; i++)
+            report.Append(" frame").Append(i).Append('=').Append(contexts[i].DrawSnapshotDescriptorCount);
+        return report.ToString();
+    }
+
+    /// <summary>
+    /// Writes the pool's lifetime figures to the log before shutdown tears anything down. A mid-run exhaustion
+    /// already reports the same numbers through its exception; this line exists for the ordinary session that never
+    /// reached the limit, which is where the next capacity decision has to come from. Diagnostics must never turn a
+    /// clean exit into a failure, hence the swallow around a log target that may already be gone.
+    /// </summary>
+    internal static void LogDescriptorSummary()
+    {
+        var app = DeviceServices.BaseApp;
+        if (app == null) return;
+        var pool = DescriptorAllocator;
+        try
+        {
+            app.AddLog(LogType.Backend,
+                $"{DateTime.UtcNow} [DX] descriptor pool: capacity={pool.Capacity} live={pool.LiveCount} "
+                + $"high-water={pool.HighWater} rejected-frees={pool.InvalidFreeCount} | {DescribeDrawSnapshotPressure()}");
+        }
+        catch (Exception)
+        {
+            // The session is already ending; a missing log target is not worth a second exception.
+        }
+    }
 
     /// <summary>
     /// A0.2: command signature for indirect compute dispatch. A device-level singleton - the signature only describes "a 12-byte Dispatch record",
@@ -356,6 +404,9 @@ internal unsafe static class Device
         {
             FrameContexts[i] = new FrameContext(d3dDevice);
         }
+
+        // The pool cannot see frame state; hand it the one report that explains a mid-draw exhaustion.
+        DescriptorAllocator.ExtraDiagnostics = DescribeDrawSnapshotPressure;
 
         ID3D12CommandAllocator* copyCommandAllocator;
 
@@ -1860,7 +1911,7 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         {
             Desc = desc,
             OwnsResource = true,
-            SrvIndex = DescriptorAllocator.Allocate(),
+            SrvIndex = DescriptorAllocator.Allocate(DescriptorKind.RenderTarget),
         };
         if (hasColor)
             rt.ColorNativeFormat = ToNativeColorFormat(desc.ColorFormat);

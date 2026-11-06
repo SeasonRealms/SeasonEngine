@@ -29,6 +29,29 @@ internal struct InstanceTransformData
     }
 }
 
+/// <summary>
+/// One slot of the generic per-instance extras stream (t20), addressed by the same <b>compacted</b> slot as the
+/// instance matrices: <c>boneBase + SV_InstanceID</c> on a direct draw, the index gather stamps into M14 on an A7
+/// indirect draw.
+/// <para>
+/// It lives outside the 80-byte <see cref="InstanceTransformData"/> on purpose. That stream is bit-identical to the
+/// A7 cull input and to the IA instance buffer, and it is also what the text path reinterprets, so growing its stride
+/// would change culling, gather and text at once. A separate stream costs one vertex-stage storage read instead.
+/// </para>
+/// <para>
+/// <see cref="Color"/> is the per-instance tint the PBR path multiplies its albedo by, gated per primitive through
+/// <c>MaterialParams.TintMode</c> so a hull sharing an instance with a tinted sail keeps its authored look.
+/// <see cref="Extra"/> is unused today and is the reason this type is 32 bytes: a later per-instance scalar (wind
+/// weight, decal index, morph bias) then costs no new binding and no root DWORD, of which DX has exactly two left.
+/// </para>
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct InstanceExtras
+{
+    public Vector4 Color;
+    public Vector4 Extra;
+}
+
 internal unsafe class DXInstancedMesh3D : DXInstancedPrimitiveGroup
 {
     public DXInstancedMesh3D(string name) : base(name)

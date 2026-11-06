@@ -24,7 +24,7 @@ internal enum PipelineMode
 
 /// <summary>
 /// Vulkan pipeline set equivalent to DX12 DXPipeline:
-///   - one PipelineLayout, the DX RootSignature equivalent, with 4 UBOs, b0 through b3, plus 5 sampled images, t0 through t4
+///   - one PipelineLayout, the DX RootSignature equivalent: three live UBOs (b0, b1, b2) plus the reserved binding-3 slot, plus 5 sampled images, t0 through t4
 ///   - one immutable Sampler, the DX static sampler s0 equivalent, using Linear plus Clamp
 ///   - three VkPipeline variants reusing the same GLSL source, with inline VS and FS
 ///
@@ -135,28 +135,48 @@ public static VkPipeline TransparentBackFacePipelineState;
     public static Sampler WrapSampler;
 
     /// <summary>
-    /// Work package C: fog sampling descriptor indices, mapping one-to-one to DX's FogFrameRoot / FogIntegratedRoot / FogLocalRoot.
-    /// 22 is this frame's fog constants (a vec4 array, std430 storage buffer), 23/24 are two 3D volumetric textures (integrated column / local column).
-    /// In the transparent phase, every draw item must rewrite these three bindings in its own slot's descriptor set:
-    /// the volumetric textures are resources produced only in this frame's fog composite phase, and their handles are not available during collection.
-    /// </summary>
-    internal const uint SceneFogFrameBinding = 22;
-
-    internal const uint SceneFogIntegratedBinding = 23;
-
-    internal const uint SceneFogLocalBinding = 24;
-
-    /// <summary>
-    /// 2-7 P0: the procedural sky's Sky-View LUT (binding 25, GLSL `sampler2D skyView`), the environment specular source for PBR.
-    /// It runs in parallel with binding 16's envCube rather than replacing it: the two are mutually exclusive, chosen by skyParams0.w in a uniform branch,
-    /// so both textures must have valid descriptors (bind Device.White when not ready).
+    /// 2-7 P0: the procedural sky's Sky-View LUT (binding 25 of the globals set 3, GLSL `sampler2D skyView`), the environment
+    /// specular source for PBR. It runs in parallel with the environment cube rather than replacing it: the two are mutually
+    /// exclusive, chosen by skyParams0.w in a uniform branch, so both textures must have valid descriptors
+    /// (bind Device.White when not ready).
     /// </summary>
     internal const uint SkyViewBinding = 25;
 
-    // The fog trio has moved to an independent set 1: 22/23/24 in set 0 are still in the layout (harmless redundant bindings),
-    // but the shader now takes them from set 1. The reason is that in the same frame the shadow pass binds set 0 while the transparent phase needs to
-    // rewrite the fog bindings for every item; the two collide on the same set, and a binding that does not declare UPDATE_AFTER_BIND would invalidate the whole
-    // command buffer if rewritten. After splitting into two sets, the shadow only binds set 0 and the transparent phase only rebinds set 1, so the conflict disappears structurally.
+    /// <summary>
+    /// Generic per-instance extras (set 0, binding 26, GLSL <c>readonly buffer InstanceExtras</c>): one 32-byte record
+    /// per compacted instance slot - <c>color</c> plus a reserved <c>extra</c> vector. Addressed by the same slot as the
+    /// instance matrices, so the VS can read it on the direct and the A7 indirect draw alike.
+    /// <para>
+    /// It sits beside the 80-byte instance stream instead of inside it: that stream is bit-identical to the A7 cull input
+    /// and to the IA instance buffer, and the text path reinterprets it as glyph data, so a wider stride would move
+    /// culling, gather and text together. Every descriptor set - instanced and not - must write this binding, because the
+    /// shader references it statically and an unwritten slot is stack garbage the driver aborts on.
+    /// </para>
+    /// </summary>
+    internal const uint InstanceExtrasBinding = 26;
+
+    /// <summary>
+    /// 3B/B2: every binding number set 0 must contain, ascending. This is the contract that the layout below and all three
+    /// writers (<see cref="VKPrimitiveGroup"/>, <see cref="VKSpriteQuad"/>, <c>Graphics.AllocateTextDescriptorSets</c>) are
+    /// held to: 0..15 the object/material prefix, 21 the point-sampled shadow view, 26 the per-instance extras table.
+    /// The lighting inputs (16..20, 25) live in set 3 and the fog trio in set 1, so their absence here is the point.
+    /// <para>
+    /// The layout build compares itself against this list once, and the Vulkan harness compares each writer's own list
+    /// against it. That is the guard against "the layout gained a binding nobody writes", which is exactly the shape of
+    /// the Text path's missing binding 26.
+    /// </para>
+    /// </summary>
+    internal static readonly uint[] SceneSetBindings =
+    {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 21, 26,
+    };
+
+    // The fog trio lives in an independent set 1. The reason is that in the same frame the shadow pass binds set 0 while
+    // the transparent phase needs to rewrite the fog bindings for every item; the two collide on the same set, and a binding
+    // that does not declare UPDATE_AFTER_BIND would invalidate the whole command buffer if rewritten. After splitting into
+    // two sets, the shadow only binds set 0 and the transparent phase only rebinds set 1, so the conflict disappears
+    // structurally. B2 removed the leftover 22/23/24 declarations from set 0's layout: the shader never declared them there,
+    // so they were three writes per set paid for nothing.
     /// <summary>The binding number of the fog frame constants within set 1.</summary>
     internal const uint FogSetFrameBinding = 0;
 
@@ -175,6 +195,14 @@ public static VkPipeline TransparentBackFacePipelineState;
     /// </summary>
     public static DescriptorSetLayout ViewSetLayout;
 
+    /// <summary>
+    /// 3B: layout of the frame/view-level globals set 3 -- the six lighting inputs that used to sit in set 0:
+    /// binding 16 environment cube, 17 DDGI irradiance atlas, 18 DDGI depth atlas, 19 cloud noise,
+    /// 20 aerial-perspective LUT and 25 Sky-View LUT. The binding numbers are carried over unchanged so the shader
+    /// declarations only gain <c>set = 3</c>; the sampler objects match set 0 (all immutable).
+    /// </summary>
+    public static DescriptorSetLayout GlobalsSetLayout;
+
     /// <summary>View slot limit, from the same source as the shared scheduler's <see cref="Season.Rendering.FrameSchedule.MaxViews"/>.</summary>
     internal const int MaxViews = Season.Rendering.FrameSchedule.MaxViews;
 
@@ -187,12 +215,29 @@ public static VkPipeline TransparentBackFacePipelineState;
     static byte*[][] _mappedViewBuffers = null!;
     static DescriptorSet[][] _viewSets = null!;
 
+    /// <summary>
+    /// 3B: frame/view-level globals (view slot × frame slot), one set 3 per view and frame slot, mirroring <see cref="_viewSets"/>.
+    /// Written by <see cref="PrepareViewGlobals"/> when that view's turn comes around, so a set the current command buffer
+    /// may reference is never rewritten: the only other user of the slot is the submission from frameCount frames back,
+    /// which <see cref="Device.WaitForFrameSlot"/> has already retired.
+    /// </summary>
+    static DescriptorSet[][] _globalsSets = null!;
+
     /// <summary>Screen-space view (identity View/Projection, no history), used by 2D sprites and text, not rewritten after creation.</summary>
     static BufferResource _screenViewBuffer;
     public static DescriptorSet ScreenViewSet;
 
+    /// <summary>3B: the screen-space pair's set 3, written once at creation; 2D paths do not depend on view-level lighting inputs.</summary>
+    static DescriptorSet _screenGlobalsSet;
+
     /// <summary>The main view set 2 for this frame slot.</summary>
     internal static DescriptorSet MainViewSet => _viewSets[0][Device.FrameIndex];
+
+    /// <summary>The main view's globals set 3 for this frame slot (shadow pass binding).</summary>
+    internal static DescriptorSet MainViewGlobals => _globalsSets[0][Device.FrameIndex];
+
+    /// <summary>3B: the screen-space pair's globals set 3 (2D sprites / text).</summary>
+    internal static DescriptorSet ScreenViewGlobals => _screenGlobalsSet;
 
     /// <summary>
     /// The view slot currently being collected/replayed. Set by <see cref="SetActiveView"/> before that view's draw collection,
@@ -203,6 +248,9 @@ public static VkPipeline TransparentBackFacePipelineState;
 
     /// <summary>The current view slot's set 2: this is the handle 3D draw items record at collection time.</summary>
     internal static DescriptorSet ActiveViewSet => _viewSets[ActiveViewIndex][Device.FrameIndex];
+
+    /// <summary>3B: the current view slot's globals set 3, recorded alongside <see cref="ActiveViewSet"/>.</summary>
+    internal static DescriptorSet ActiveViewGlobals => _globalsSets[ActiveViewIndex][Device.FrameIndex];
 
     /// <summary>Selects the view slot for subsequent drawing; out-of-range falls back to the main view.</summary>
     internal static void SetActiveView(int index)
@@ -278,6 +326,13 @@ public static VkPipeline TransparentBackFacePipelineState;
     public static BufferResource[] DefaultPrevInstanceWorldBuffers = null!;
     public static BufferResource[] DefaultPrevMorphWeightsBuffers = null!;
 
+    /// <summary>
+    /// One white InstanceExtras record per frame slot: the placeholder for binding 26 on every non-instanced path (a Model,
+    /// a Mesh3D, a Sprite2D, a text glyph run, a highlight box). Those paths never read it - the VS gates the read on
+    /// isInstanced - but the binding still has to hold a valid buffer.
+    /// </summary>
+    public static BufferResource[] DefaultInstanceExtrasBuffers = null!;
+
     // -- Shared resources for Text GPU Instancing --
     /// <summary>Unit-quad VB shared by all Texts controls, with 4 vertices, positions at +/-0.5 and UVs in 0..1.</summary>
     public static BufferResource UnitQuadVertexBuffer;
@@ -333,6 +388,7 @@ public static VkPipeline TransparentBackFacePipelineState;
         CreateIdentityInstanceBoneBuffers();
         CreateDefaultMorphDeltasBuffers();
         CreateDefaultPrevSSBOs();
+        CreateDefaultInstanceExtrasBuffers();
         CreateDefaultFogFrameBuffers();
 
         // From the same source as DX's _fogSamplingEnabled in CreateRootSignature:
@@ -368,6 +424,8 @@ public static VkPipeline TransparentBackFacePipelineState;
         // and the default set and per-slot sets must be in place before PSO baking.
         FogSetLayout = CreateFogSetLayout();
         ViewSetLayout = CreateViewSetLayout();
+        // 3B: the globals set 3 layout must exist before PipelineLayout, which now declares four sets.
+        GlobalsSetLayout = CreateGlobalsSetLayout();
         PipelineLayout = CreatePipelineLayout();
         CreateFogSets();
         CreateViewSets();
@@ -478,6 +536,7 @@ public static VkPipeline TransparentBackFacePipelineState;
         if (SetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(d, SetLayout, null);
         if (FogSetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(d, FogSetLayout, null);
         if (ViewSetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(d, ViewSetLayout, null);
+        if (GlobalsSetLayout.Handle != 0) vk.DestroyDescriptorSetLayout(d, GlobalsSetLayout, null);
         if (StaticSampler.Handle != 0) vk.DestroySampler(d, StaticSampler, null);
         if (StaticPointSampler.Handle != 0) vk.DestroySampler(d, StaticPointSampler, null);
         if (ShadowComparisonSampler.Handle != 0) vk.DestroySampler(d, ShadowComparisonSampler, null);
@@ -505,12 +564,15 @@ public static VkPipeline TransparentBackFacePipelineState;
         SetLayout = default;
         FogSetLayout = default;
         ViewSetLayout = default;
+        GlobalsSetLayout = default;
         // Descriptor sets are destroyed wholesale with the descriptor pool, so only the handles are dropped here.
         DefaultFogSet = default;
         CurrentFogSet = default;
         _fogSets = null!;
         ScreenViewSet = default;
+        _screenGlobalsSet = default;
         _viewSets = null!;
+        _globalsSets = null!;
         if (_viewBuffers != null)
         {
             for (int v = 0; v < _viewBuffers.Length; v++)
@@ -610,6 +672,13 @@ public static VkPipeline TransparentBackFacePipelineState;
                 if (DefaultPrevMorphWeightsBuffers[i].Memory.Handle != 0)
                     rm.DestroyBuffer(DefaultPrevMorphWeightsBuffers[i]);
             DefaultPrevMorphWeightsBuffers = null!;
+        }
+        if (DefaultInstanceExtrasBuffers != null)
+        {
+            for (int i = 0; i < DefaultInstanceExtrasBuffers.Length; i++)
+                if (DefaultInstanceExtrasBuffers[i].Memory.Handle != 0)
+                    rm.DestroyBuffer(DefaultInstanceExtrasBuffers[i]);
+            DefaultInstanceExtrasBuffers = null!;
         }
         if (DefaultFogFrameBuffers != null)
         {
@@ -719,6 +788,30 @@ public static VkPipeline TransparentBackFacePipelineState;
     }
 
     /// <summary>
+    /// Creates the white placeholder record binding 26 falls back to on every non-instanced path: 32 bytes, color = (1,1,1,1)
+    /// and extra = 0, so a multiply by it is a no-op even if a shader ever did read it outside the isInstanced gate.
+    /// </summary>
+    static void CreateDefaultInstanceExtrasBuffers()
+    {
+        int n = (int)Device.frameCount;
+        var usageFlags = BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferDstBit;
+        var memFlags = MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit;
+
+        DefaultInstanceExtrasBuffers = new BufferResource[n];
+        for (int i = 0; i < n; i++)
+        {
+            ulong size = 32;
+            DefaultInstanceExtrasBuffers[i] = Device.ResourceManager.CreateBuffer(size, usageFlags, memFlags);
+            void* mapped;
+            if (Device.Vk.MapMemory(Device.LogicalDevice, DefaultInstanceExtrasBuffers[i].Memory, 0, size, 0, &mapped) != Result.Success)
+                throw new Exception("vkMapMemory (DefaultInstanceExtrasBuffers) failed");
+            *(Vector4*)mapped = Vector4.One;
+            *((Vector4*)mapped + 1) = Vector4.Zero;
+            Device.Vk.UnmapMemory(Device.LogicalDevice, DefaultInstanceExtrasBuffers[i].Memory);
+        }
+    }
+
+    /// <summary>
     /// Work package C: creates the zero-frame constants used when fog sampling is off.
     /// The size exactly matches VolumetricFogEffect.FrameVectorCount:
     /// binding 22 is statically referenced by the shader, the descriptor gives a WholeSize range; the zero content guarantees that even if it is read, it is the identity element.
@@ -789,19 +882,117 @@ public static VkPipeline TransparentBackFacePipelineState;
         _viewBuffers = new BufferResource[MaxViews][];
         _mappedViewBuffers = new byte*[MaxViews][];
         _viewSets = new DescriptorSet[MaxViews][];
+        _globalsSets = new DescriptorSet[MaxViews][];
         for (int v = 0; v < MaxViews; v++)
         {
             _viewBuffers[v] = new BufferResource[n];
             _mappedViewBuffers[v] = new byte*[n];
             _viewSets[v] = new DescriptorSet[n];
+            _globalsSets[v] = new DescriptorSet[n];
             for (int i = 0; i < n; i++)
             {
                 _viewBuffers[v][i] = Device.ResourceManager.CreateConstantBuffer(size, out _mappedViewBuffers[v][i]);
                 Unsafe.Write(_mappedViewBuffers[v][i], initial);
                 _viewSets[v][i] = Device.DescriptorAllocator.AllocateSet(ViewSetLayout);
                 WriteViewSet(_viewSets[v][i], _viewBuffers[v][i].Buffer, size);
+                // 3B: the globals set is allocated here but written later by WriteInitialSceneGlobals: every fallback
+                // handle it needs (Device.White above all) is created after Pipeline.Init, so writing here would null-ref.
+                _globalsSets[v][i] = Device.DescriptorAllocator.AllocateSet(GlobalsSetLayout);
             }
         }
+
+        // The screen-space pair used by sprites and text: set 3 is filled in by WriteInitialSceneGlobals as well.
+        _screenGlobalsSet = Device.DescriptorAllocator.AllocateSet(GlobalsSetLayout);
+    }
+
+    /// <summary>
+    /// 3B: writes every globals set 3 once, with the placeholder handles that exist before the first frame.
+    /// Called from the backend's Graphics.Init, which is the first point where <see cref="Device.White"/> exists
+    /// (Pipeline.Init runs before the white texture is uploaded). Writing them here means any later bind - the shadow
+    /// pass of the very first frame included - already sees valid descriptors instead of unwritten memory.
+    /// </summary>
+    internal static void WriteInitialSceneGlobals()
+    {
+        if (Device.White == null || _globalsSets == null)
+            return;
+        for (int v = 0; v < _globalsSets.Length; v++)
+        {
+            var slots = _globalsSets[v];
+            if (slots == null) continue;
+            for (int i = 0; i < slots.Length; i++)
+                WriteSceneGlobals(slots[i]);
+        }
+        if (_screenGlobalsSet.Handle != 0)
+            WriteSceneGlobals(_screenGlobalsSet);
+    }
+
+    /// <summary>
+    /// 3B: rewrites this view's frame-slot globals set 3 to the six frame-level lighting inputs.
+    /// Called once per view per frame from the view preparation hook, before that view records any draw.
+    /// <para>
+    /// This is what replaces the per-primitive <c>RefreshSceneBindings</c> chain: the previous owner of the slot is the
+    /// submission from frameCount frames back, so the wait below is a fence compare that has already completed, while the
+    /// set the current command buffer will bind is still untouched.
+    /// </para>
+    /// </summary>
+    internal static void PrepareViewGlobals(int viewIndex)
+    {
+        // Before Graphics.Init has run there is no white texture to fall back to; the initial write covers this.
+        if (Device.White == null || _globalsSets == null)
+            return;
+        if ((uint)viewIndex >= MaxViews) viewIndex = 0;
+        int fi = (int)Device.FrameIndex;
+        Device.WaitForFrameSlot(fi);
+        WriteSceneGlobals(_globalsSets[viewIndex][fi]);
+    }
+
+    /// <summary>
+    /// 3B: writes the six frame-level lighting inputs into one globals set.
+    /// Every source is a <c>Bound</c> property that falls back to a placeholder (White / DummyBlack), so the set always
+    /// holds six valid descriptors even on the first frame or with the feature disabled - a wild descriptor would make
+    /// the WSL/Android drivers abort rather than merely render wrong.
+    /// </summary>
+    static void WriteSceneGlobals(DescriptorSet set)
+    {
+        var envCube = VKTextureCube.Bound;
+        var ddgiAtlas = SceneFrameInputs.DdgiAtlasBound;
+        var ddgiDepth = SceneFrameInputs.DdgiDepthBound;
+        var cloudNoise = SceneFrameInputs.CloudNoiseBound;
+        var aerialLut = SceneFrameInputs.AerialLutBound;
+        var skyView = SceneFrameInputs.SkyViewBound;
+
+        var infos = stackalloc DescriptorImageInfo[6];
+        infos[0] = new DescriptorImageInfo { ImageView = envCube.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
+        infos[1] = new DescriptorImageInfo { ImageView = ddgiAtlas.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
+        infos[2] = new DescriptorImageInfo { ImageView = ddgiDepth.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
+        infos[3] = new DescriptorImageInfo { ImageView = cloudNoise.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
+        infos[4] = new DescriptorImageInfo { ImageView = aerialLut.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
+        infos[5] = new DescriptorImageInfo { ImageView = skyView.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
+
+        uint* bindingNumbers = stackalloc uint[6]
+        {
+            SceneFrameInputs.EnvCubeBinding,
+            SceneFrameInputs.DdgiAtlasBinding,
+            SceneFrameInputs.DdgiDepthBinding,
+            SceneFrameInputs.CloudNoiseBinding,
+            SceneFrameInputs.AerialLutBinding,
+            SceneFrameInputs.SkyViewBinding,
+        };
+        var writes = stackalloc WriteDescriptorSet[6];
+        for (int i = 0; i < 6; i++)
+        {
+            writes[i] = new WriteDescriptorSet
+            {
+                SType = StructureType.WriteDescriptorSet,
+                DstSet = set,
+                DstBinding = bindingNumbers[i],
+                DstArrayElement = 0,
+                DescriptorCount = 1,
+                DescriptorType = DescriptorType.CombinedImageSampler,
+                PImageInfo = infos + i
+            };
+        }
+        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 6, writes, 0, null);
     }
 
     static void WriteViewSet(DescriptorSet set, Silk.NET.Vulkan.Buffer buffer, ulong range)
@@ -829,9 +1020,16 @@ public static VkPipeline TransparentBackFacePipelineState;
         Unsafe.Write(_mappedViewBuffers[index][Device.FrameIndex], constants.Transposed());
     }
 
-    /// <summary>Binds view set 2. Like set 0, it is bound per draw: other pipeline layouts interleaved in between disturb the higher-indexed sets.</summary>
-    internal static void BindViewSet(CommandBuffer cmd, DescriptorSet set)
-        => Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 2, 1, &set, 0, null);
+    /// <summary>
+    /// Binds view set 2 and globals set 3 as one contiguous range: both are per-view state, and a single
+    /// <c>vkCmdBindDescriptorSets</c> call for the pair costs exactly what binding set 2 alone used to.
+    /// Like set 0 it is bound per draw: other pipeline layouts interleaved in between disturb the higher-indexed sets.
+    /// </summary>
+    internal static void BindViewSets(CommandBuffer cmd, DescriptorSet viewSet, DescriptorSet globalsSet)
+    {
+        var sets = stackalloc DescriptorSet[2] { viewSet, globalsSet };
+        Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 2, 2, sets, 0, null);
+    }
 
     /// <summary>Writes three descriptors into the fog sampling set. The caller guarantees that this set is not referenced by any command buffer currently being recorded.</summary>
     static void WriteFogSet(DescriptorSet set, Silk.NET.Vulkan.Buffer frame, ulong frameRange,
@@ -1068,104 +1266,24 @@ public static VkPipeline TransparentBackFacePipelineState;
     }
 
     /// <summary>
-    /// Texture readiness and descriptor refresh before drawing.
+    /// Texture readiness before drawing.
     /// Extracted separately because the collection phase must complete them: collection happens outside all render passes,
     /// and only then is a layout transition legal (inside a render pass only delayed transitions are allowed, while sampling already happens later in that same pass).
     /// On replay, pass prepared: true to skip this section.
+    /// <para>
+    /// 3B: this no longer touches descriptors. The six frame-level lighting inputs moved to the per-view globals set 3
+    /// (<see cref="PrepareViewGlobals"/>), so a primitive's set 0 is purely material/geometry state and is never rewritten
+    /// to follow a frame-level ping-pong. What remains here are the five material textures' layout transitions.
+    /// </para>
     /// </summary>
     internal static void PreparePrimitive(CommandBuffer cmd, PrimitiveData primitiveData, DescriptorSet descriptorSet)
     {
-        int fi = (int)Device.FrameIndex;
-
         // Ensure textures are ready for rendering.
         primitiveData.BaseColorTexture?.EnsureReadyForRendering(cmd);
         primitiveData.NormalTexture?.EnsureReadyForRendering(cmd);
         primitiveData.MetallicRoughnessTexture?.EnsureReadyForRendering(cmd);
         primitiveData.OcclusionTexture?.EnsureReadyForRendering(cmd);
         primitiveData.EmissiveTexture?.EnsureReadyForRendering(cmd);
-
-        RefreshSceneBindings(descriptorSet,
-            ref primitiveData.EnvCubeViewVersions[fi],
-            ref primitiveData.DdgiAtlasViewVersions[fi],
-            ref primitiveData.DdgiDepthViewVersions[fi],
-            ref primitiveData.CloudNoiseViewVersions[fi],
-            ref primitiveData.AerialLutViewVersions[fi],
-            ref primitiveData.SkyViewViewVersions[fi]);
-    }
-
-    /// <summary>
-    /// Refreshes the descriptors for scene-level lighting inputs (binding 16-20).
-    /// The environment cube map, the DDGI atlas (irradiance + depth moments), the cloud noise, and the AP volume are all frame-level resources,
-    /// which may only become ready after the first frame and may ping-pong every frame, so compare by ViewVersion rather than by handle.
-    /// Only the current frame slot's descriptor set is touched: other slots may still be in flight and get refreshed when their turn comes around.
-    /// These transitions are already done in their respective upload/compute stages, so no barrier is introduced here--
-    /// layout transitions are forbidden inside a render pass, while descriptor writes themselves are legal.
-    /// </summary>
-    internal static void RefreshSceneBindings(DescriptorSet descriptorSet,
-        ref ulong envCubeVersion, ref ulong ddgiAtlasVersion, ref ulong ddgiDepthVersion,
-        ref ulong cloudNoiseVersion, ref ulong aerialLutVersion, ref ulong skyViewVersion)
-    {
-        // These rewrites bypass WriteDescriptorSet, so they need their own check: the scene sets are also reached
-        // from the shadow pass pre-refresh in VKPrimitiveGroup.DrawShadow, and from the background loading thread
-        // through VKModel.CreateInstance.
-        Device.AssertGpuGateHeld("Pipeline.RefreshSceneBindings");
-
-        VKTextureCube.RefreshBinding(descriptorSet, ref envCubeVersion);
-        VKPrimitiveGroup.RefreshDdgiBinding(descriptorSet, ref ddgiAtlasVersion);
-        VKPrimitiveGroup.RefreshDdgiDepthBinding(descriptorSet, ref ddgiDepthVersion);
-        VKPrimitiveGroup.RefreshCloudNoiseBinding(descriptorSet, ref cloudNoiseVersion);
-        VKPrimitiveGroup.RefreshAerialLutBinding(descriptorSet, ref aerialLutVersion);
-        VKPrimitiveGroup.RefreshSkyViewBinding(descriptorSet, ref skyViewVersion);
-    }
-
-    /// <summary>
-    /// Frame-start refresh of binding 16-20 for every scene set drawn in the previous frame.
-    ///
-    /// The scene sets are rewritten in place, and a set another recording command buffer already
-    /// references must not be updated without UPDATE_AFTER_BIND. The validation layer answers that by
-    /// putting the command buffer into an invalid state, after which every following command reports
-    /// VUID-vkEndCommandBuffer-commandBuffer-00059 and, worse, validation for the rest of the frame is
-    /// silenced. Collecting happens after the command buffer is begun, so the in-frame refresh inside
-    /// PreparePrimitive can never be early enough for a set that this frame will bind; the only window
-    /// that is always safe is between the command-buffer reset and its begin.
-    ///
-    /// That window has no knowledge of this frame's draw list, so this pass walks the primitives the
-    /// previous frame actually drew. For a steady scene those are exactly the sets about to be bound
-    /// again, and the version caches make the call a no-op once a binding has converged. A primitive
-    /// drawn for the first time is still stale here and falls back to PreparePrimitive; from its second
-    /// frame on it is covered.
-    /// </summary>
-    internal static void RefreshSceneBindingsForFrameStart()
-    {
-        var primitives = VKSceneDrawCollection.PreviousFramePrimitives;
-        var quads = VKSceneDrawCollection.PreviousFrameQuads;
-        if (primitives.Count == 0 && quads.Count == 0)
-            return;
-
-        Device.AssertGpuGateHeld("Pipeline.RefreshSceneBindingsForFrameStart");
-
-        int fi = (int)Device.FrameIndex;
-        foreach (var primitive in primitives)
-        {
-            // Dispose nulls DescriptorSets and hands them back to the allocator, so a primitive that a
-            // loading thread released since the last frame must be skipped rather than written through.
-            // FreeSet and this pass both run under the GPU gate, so the pair cannot interleave.
-            var sets = primitive.DescriptorSets;
-            if (sets == null)
-                continue;
-
-            RefreshSceneBindings(sets[fi],
-                ref primitive.EnvCubeViewVersions[fi],
-                ref primitive.DdgiAtlasViewVersions[fi],
-                ref primitive.DdgiDepthViewVersions[fi],
-                ref primitive.CloudNoiseViewVersions[fi],
-                ref primitive.AerialLutViewVersions[fi],
-                ref primitive.SkyViewViewVersions[fi]);
-        }
-
-        // Sprites use their own descriptor set and version cache, and must likewise be aligned before begin.
-        foreach (var quad in quads)
-            quad.RefreshSceneBindings(fi);
     }
 
     /// <summary>
@@ -1199,7 +1317,7 @@ public static VkPipeline TransparentBackFacePipelineState;
         Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 1, 1, &set, 0, null);
     }
 
-    /// <summary>Shared draw body for replay/direct draw; when prepared is true, texture readiness and descriptor refresh are skipped.</summary>
+    /// <summary>Shared draw body for replay/direct draw; when prepared is true, texture readiness is skipped.</summary>
     internal static void DrawPrimitiveCore(
         CommandBuffer cmd,
         PrimitiveData primitiveData,
@@ -1212,6 +1330,7 @@ public static VkPipeline TransparentBackFacePipelineState;
         uint firstInstance,
         bool prepared,
         DescriptorSet viewSet = default,
+        DescriptorSet globalsSet = default,
         VkBuffer indirectBuffer = default,
         ulong indirectOffset = 0,
         ulong instanceOffset = 0)
@@ -1249,7 +1368,9 @@ public static VkPipeline TransparentBackFacePipelineState;
         var set = descriptorSet;
         var pipelineLayout = PipelineLayout;
         vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, pipelineLayout, 0, 1, &set, 0, null);
-        BindViewSet(cmd, viewSet.Handle != 0 ? viewSet : ActiveViewSet);
+        // 3B: the view pair is two contiguous sets, so the view constants and the frame/view globals still cost a single bind.
+        BindViewSets(cmd, viewSet.Handle != 0 ? viewSet : ActiveViewSet,
+            globalsSet.Handle != 0 ? globalsSet : ActiveViewGlobals);
 
         if (indirectBuffer.Handle != 0)
         {
@@ -1357,8 +1478,9 @@ public static VkPipeline TransparentBackFacePipelineState;
 
         var set = descriptorSet;
         vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 0, 1, &set, 0, null);
-        // The shadow VS does not read the view matrix (the light-space matrix comes via push constant), but set 2 is statically declared by the same VS source.
-        BindViewSet(cmd, MainViewSet);
+        // The shadow VS does not read the view matrix (the light-space matrix comes via push constant), but set 2 and the
+        // 3B globals set 3 are statically declared by the same VS source.
+        BindViewSets(cmd, MainViewSet, MainViewGlobals);
 
         vk.CmdDrawIndexed(cmd, indexCount, instanceCount, 0, 0, firstInstance);
     }
@@ -1398,7 +1520,7 @@ public static VkPipeline TransparentBackFacePipelineState;
 
         var set = descriptorSet;
         vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, PipelineLayout, 0, 1, &set, 0, null);
-        BindViewSet(cmd, MainViewSet);
+        BindViewSets(cmd, MainViewSet, MainViewGlobals);
 
         vk.CmdDrawIndexedIndirect(cmd, indirectBuffer, indirectOffset, 1,
             Season.Rendering.IndirectDrawIndexedArgs.SizeInBytes);
@@ -1530,21 +1652,18 @@ public static VkPipeline TransparentBackFacePipelineState;
         // binding 9 and 10: storage buffers for instance bones and morph deltas.
         // binding 12, 1-5: shadow-atlas CombinedImageSampler with an immutable comparison sampler.
         // binding 13, 14, and 15, step C of 2-3: previous-frame data SSBOs, prev bones, prev instanceWorld, and prev morphWeights.
-        // binding 16, 1-7: environment radiance cube CombinedImageSampler with the immutable StaticSampler.
-        // binding 17, clause 10 of 2-4: DDGI irradiance atlas.
-        // binding 18, step 3 of 2-4: DDGI depth-moment atlas.
-        // binding 19, step C of 2-5: cloud noise with the immutable wrap sampler.
-        // binding 20, step E of 2-5: AP 3D LUT with linear clamp.
         // binding 21, 1-5 clause 15: the shadow atlas a second time, as a plain sampler2D with the immutable point sampler.
         //   Unavoidably a second descriptor rather than a second sampler on the same one: GLSL's sampler2DShadow is a
         //   combined type whose comparison is baked in, so the one at binding 12 can only ever answer pass/fail and the
         //   stored depth contact hardening needs is unreachable through it. The image view is identical, so the cost is a
         //   descriptor slot and a per-frame write, not memory.
+        // 3B: bindings 16/17/18/19/20/25 are no longer declared here -- the environment cube, the two DDGI atlases, cloud
+        // noise, the AP 3D LUT and the Sky-View LUT all moved to the per-view globals set 3. Set 0 now holds only
+        // object/material state, so it is written once at allocation and never touched again.
         var sampler = StaticSampler;
         var pointSampler = StaticPointSampler;
         var shadowSampler = ShadowComparisonSampler;
-        var wrapSampler = WrapSampler;
-        var bindings = stackalloc DescriptorSetLayoutBinding[26];
+        var bindings = stackalloc DescriptorSetLayoutBinding[SceneSetBindings.Length];
 
         bindings[0] = new DescriptorSetLayoutBinding
         {
@@ -1569,6 +1688,8 @@ public static VkPipeline TransparentBackFacePipelineState;
         };
         bindings[3] = new DescriptorSetLayoutBinding
         {
+            // Reserved placeholder: the vertex stage no longer reads b3 (the skinning palette lives at binding 9),
+            // but every descriptor set still writes it as part of one fixed prefix, so the slot stays declared.
             Binding = 3,
             DescriptorType = DescriptorType.UniformBuffer,
             DescriptorCount = 1,
@@ -1640,82 +1761,15 @@ public static VkPipeline TransparentBackFacePipelineState;
             DescriptorCount = 1,
             StageFlags = ShaderStageFlags.VertexBit
         };
-        // 1-7:
-        // environment radiance cube on binding 16, reusing the immutable StaticSampler from binding 4..8,
-        // linear plus repeat.
-        // Seamless cross-face cube sampling is handled by the driver, so addressMode does not participate.
-        // When no environment map exists, bind VKTextureCube.DummyBlack, so this descriptor always stays valid.
-        bindings[16] = new DescriptorSetLayoutBinding
-        {
-            Binding = VKTextureCube.EnvCubeBinding,
-            DescriptorType = DescriptorType.CombinedImageSampler,
-            DescriptorCount = 1,
-            StageFlags = ShaderStageFlags.FragmentBit,
-            PImmutableSamplers = &sampler
-        };
-
-        // Clause 10 of 2-4:
-        // DDGI irradiance atlas on binding 17, reusing the immutable linear StaticSampler from binding 4..8 and 16.
-        // Octahedral tile UVs are computed in shader, while boundaries rely on the 1-pixel gutter and bilinear overflow.
-        // When not ready, VKPrimitiveGroup.DdgiAtlasBound falls back to Device.White, so this descriptor always stays valid.
-        bindings[17] = new DescriptorSetLayoutBinding
-        {
-            Binding = VKPrimitiveGroup.DdgiAtlasBinding,
-            DescriptorType = DescriptorType.CombinedImageSampler,
-            DescriptorCount = 1,
-            StageFlags = ShaderStageFlags.FragmentBit,
-            PImmutableSamplers = &sampler
-        };
-
-        // Step 3 of 2-4:
-        // DDGI depth-moment atlas on binding 18, rg16float, reusing the same immutable linear StaticSampler.
-        // This follows the same pattern as binding 17:
-        // when not ready, VKPrimitiveGroup.DdgiDepthBound falls back to Device.White, so the descriptor always remains valid.
-        bindings[18] = new DescriptorSetLayoutBinding
-        {
-            Binding = VKPrimitiveGroup.DdgiDepthBinding,
-            DescriptorType = DescriptorType.CombinedImageSampler,
-            DescriptorCount = 1,
-            StageFlags = ShaderStageFlags.FragmentBit,
-            PImmutableSamplers = &sampler
-        };
-
-        // Step C of 2-5:
-        // cloud noise on binding 19, rgba8unorm.
-        // The sampler must wrap, see the WrapSampler note,
-        // so the clamp StaticSampler cannot be reused.
-        // When not ready, VKPrimitiveGroup.CloudNoiseBound falls back to Device.White.
-        // Actual sampling is gated at runtime by cloudParams0.w, the layer count,
-        // so this descriptor always remains valid.
-        bindings[19] = new DescriptorSetLayoutBinding
-        {
-            Binding = VKPrimitiveGroup.CloudNoiseBinding,
-            DescriptorType = DescriptorType.CombinedImageSampler,
-            DescriptorCount = 1,
-            StageFlags = ShaderStageFlags.FragmentBit,
-            PImmutableSamplers = &wrapSampler
-        };
-
-        // Step E of 2-5:
-        // aerial-perspective 3D LUT on binding 20, rgba16float.
-        // Three-axis Clamp plus trilinear sampling reuse the StaticSampler, linear clamp, just as DX uses s0 everywhere.
-        // When not ready, VKPrimitiveGroup.AerialLutBound falls back to a 1x1x1 all-zero dummy,
-        // which is the identity element of the composition formula.
-        // Actual sampling is gated at runtime by apParams0.x.
-        bindings[20] = new DescriptorSetLayoutBinding
-        {
-            Binding = VKPrimitiveGroup.AerialLutBinding,
-            DescriptorType = DescriptorType.CombinedImageSampler,
-            DescriptorCount = 1,
-            StageFlags = ShaderStageFlags.FragmentBit,
-            PImmutableSamplers = &sampler
-        };
+        // 3B/B2: bindings 16-20/25 (the six view/frame-level lighting inputs) and 22/23/24 (the fog trio's old set-0 home)
+        // are all gone from this layout. The lighting inputs live in the per-view globals set 3, the fog trio in its own
+        // set 1, so set 0 is pure object/material state: nothing in it follows a frame-level ping-pong any more.
 
         // 1-5 clause 15: the same shadow-atlas view on binding 21, read as ordinary depth for the blocker search.
         // Filtering must be Nearest, which StaticPointSampler already is: averaging two depths across a silhouette gives a
         // value lying on no surface at all, and a blocker distance derived from it would be fiction. When shadows are off,
         // VKPrimitiveGroup writes the same White placeholder here that binding 12 gets, so the descriptor is never garbage.
-        bindings[21] = new DescriptorSetLayoutBinding
+        bindings[16] = new DescriptorSetLayoutBinding
         {
             Binding = 21,
             DescriptorType = DescriptorType.CombinedImageSampler,
@@ -1724,55 +1778,31 @@ public static VkPipeline TransparentBackFacePipelineState;
             PImmutableSamplers = &pointSampler
         };
 
-        // Work package C: the transparent-stage fog sampling trio, corresponding to GLSL's fogFrame / fogIntegrated / fogLocal.
-        // Binding 22 is a std430 storage buffer (a vec4 array; each column is integrated first, then XY is interpolated), the same content as binding 0 of the fog composition pass,
-        // but here it is attached to the primitive's own descriptor set, because the transparent stage must bind per item (it cannot push the constants to the root descriptor like a single composition).
-        // Bindings 23/24 are two rgba16float 3D volume textures, reusing the linear Clamp immutable sampler of bindings 4..8:
-        // the volume texture's XY interpolation is done by hand in the shader with 4 texelFetch calls, and the sampler only participates in the depth direction of the local columns.
-        // All three must have valid writes in any descriptor set (see VKPrimitiveGroup / VKSpriteQuad / AllocateTextDescriptorSets),
-        // and when off they are written with the zero frame constants and a 1x1x1 black placeholder, with the push constant gate guaranteeing they are never actually sampled.
-        bindings[22] = new DescriptorSetLayoutBinding
+        // Generic per-instance extras on binding 26, read by the VS only (see the GLSL InstanceExtras block). It is
+        // declared in every variant, so every descriptor set has to write it: an unwritten slot of a set whose shader
+        // references the binding is stack garbage, which the WSL driver treats as an invalid descriptor and aborts on.
+        bindings[17] = new DescriptorSetLayoutBinding
         {
-            Binding = SceneFogFrameBinding,
+            Binding = InstanceExtrasBinding,
             DescriptorType = DescriptorType.StorageBuffer,
             DescriptorCount = 1,
-            StageFlags = ShaderStageFlags.FragmentBit
-        };
-        bindings[23] = new DescriptorSetLayoutBinding
-        {
-            Binding = SceneFogIntegratedBinding,
-            DescriptorType = DescriptorType.CombinedImageSampler,
-            DescriptorCount = 1,
-            StageFlags = ShaderStageFlags.FragmentBit,
-            PImmutableSamplers = &sampler
-        };
-        bindings[24] = new DescriptorSetLayoutBinding
-        {
-            Binding = SceneFogLocalBinding,
-            DescriptorType = DescriptorType.CombinedImageSampler,
-            DescriptorCount = 1,
-            StageFlags = ShaderStageFlags.FragmentBit,
-            PImmutableSamplers = &sampler
+            StageFlags = ShaderStageFlags.VertexBit
         };
 
-        // 2-7 P0: the procedural sky's Sky-View LUT is attached at binding 25, reusing the linear Clamp immutable sampler of bindings 4..8.
-        // The LUT has no mip, the shader side only does textureLod(...,0.0), and the sampler only provides normalized bilinear filtering;
-        // the derivatives on either side of the u seam are meaningless, so implicit LOD cannot be used.
-        // When not ready, VKPrimitiveGroup.SkyViewBound falls back to Device.White, so the descriptor is always valid;
-        // on the consumer side, skyParams0.w gates it out in the uniform branch, and the StaticCube tier never samples the white placeholder.
-        bindings[25] = new DescriptorSetLayoutBinding
+        // One-time guard: the literal Binding values above must match SceneSetBindings index for index. A mismatch means
+        // someone edited one side only, and either a slot the shader reads is missing or a dead one is carried -- neither
+        // shows up until a driver aborts on the set.
+        for (int i = 0; i < SceneSetBindings.Length; i++)
         {
-            Binding = SkyViewBinding,
-            DescriptorType = DescriptorType.CombinedImageSampler,
-            DescriptorCount = 1,
-            StageFlags = ShaderStageFlags.FragmentBit,
-            PImmutableSamplers = &sampler
-        };
+            if (bindings[i].Binding != SceneSetBindings[i])
+                throw new InvalidOperationException(
+                    $"set 0 布局与 SceneSetBindings 不一致：索引 {i} 为 {bindings[i].Binding}，期望 {SceneSetBindings[i]}。");
+        }
 
         var info = new DescriptorSetLayoutCreateInfo
         {
             SType = StructureType.DescriptorSetLayoutCreateInfo,
-            BindingCount = 26,
+            BindingCount = (uint)SceneSetBindings.Length,
             PBindings = bindings
         };
 
@@ -1844,6 +1874,81 @@ public static VkPipeline TransparentBackFacePipelineState;
         return layout;
     }
 
+    /// <summary>
+    /// 3B: layout of the globals set 3. The six frame/view-level lighting inputs keep their set-0 binding numbers
+    /// (16/17/18/19/20/25) so the GLSL declarations only gain <c>set = 3</c> and every C# binding constant stays valid.
+    /// Binding numbers are labels, so the gaps cost pool slots but nothing else; each set has exactly six descriptors.
+    /// </summary>
+    static DescriptorSetLayout CreateGlobalsSetLayout()
+    {
+        var sampler = StaticSampler;
+        var wrapSampler = WrapSampler;
+        var bindings = stackalloc DescriptorSetLayoutBinding[6];
+        // 1-7: environment radiance cube, linear clamp (the same immutable sampler as the material textures).
+        bindings[0] = new DescriptorSetLayoutBinding
+        {
+            Binding = SceneFrameInputs.EnvCubeBinding,
+            DescriptorType = DescriptorType.CombinedImageSampler,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.FragmentBit,
+            PImmutableSamplers = &sampler
+        };
+        // 2-4 clause 10 and step 3: DDGI irradiance atlas and depth-moment atlas, both non-filterable only in name;
+        // the shader does its own bilinear/octahedral reconstruction, so the same linear clamp sampler is correct.
+        bindings[1] = new DescriptorSetLayoutBinding
+        {
+            Binding = SceneFrameInputs.DdgiAtlasBinding,
+            DescriptorType = DescriptorType.CombinedImageSampler,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.FragmentBit,
+            PImmutableSamplers = &sampler
+        };
+        bindings[2] = new DescriptorSetLayoutBinding
+        {
+            Binding = SceneFrameInputs.DdgiDepthBinding,
+            DescriptorType = DescriptorType.CombinedImageSampler,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.FragmentBit,
+            PImmutableSamplers = &sampler
+        };
+        // 2-5 step C: cloud noise must wrap, so it takes the dedicated wrap sampler.
+        bindings[3] = new DescriptorSetLayoutBinding
+        {
+            Binding = SceneFrameInputs.CloudNoiseBinding,
+            DescriptorType = DescriptorType.CombinedImageSampler,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.FragmentBit,
+            PImmutableSamplers = &wrapSampler
+        };
+        // 2-5 step E: aerial-perspective 3D LUT, three-axis clamp plus trilinear, same clamp sampler.
+        bindings[4] = new DescriptorSetLayoutBinding
+        {
+            Binding = SceneFrameInputs.AerialLutBinding,
+            DescriptorType = DescriptorType.CombinedImageSampler,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.FragmentBit,
+            PImmutableSamplers = &sampler
+        };
+        // 2-7 P0: Sky-View LUT, sampled with textureLod(..., 0.0), so linear clamp is all it needs.
+        bindings[5] = new DescriptorSetLayoutBinding
+        {
+            Binding = SceneFrameInputs.SkyViewBinding,
+            DescriptorType = DescriptorType.CombinedImageSampler,
+            DescriptorCount = 1,
+            StageFlags = ShaderStageFlags.FragmentBit,
+            PImmutableSamplers = &sampler
+        };
+        var info = new DescriptorSetLayoutCreateInfo
+        {
+            SType = StructureType.DescriptorSetLayoutCreateInfo,
+            BindingCount = 6,
+            PBindings = bindings
+        };
+        if (Device.Vk.CreateDescriptorSetLayout(Device.LogicalDevice, in info, null, out var layout) != Result.Success)
+            throw new Exception("vkCreateDescriptorSetLayout (globals set) failed");
+        return layout;
+    }
+
     static PipelineLayout CreatePipelineLayout()
     {
         // set 0 = scene set, set 1 = fog sampling set. Splitting into two sets is not a style choice but a hard requirement:
@@ -1851,7 +1956,8 @@ public static VkPipeline TransparentBackFacePipelineState;
         // a set without UPDATE_AFTER_BIND cannot be rewritten once referenced by a command buffer being recorded,
         // so if both landed on the same set, the entire command buffer would inevitably be invalidated. Once split, the shadow pass only touches set 0 and the transparent stage only touches set 1.
         // set 2 = per-view constants (View/Projection/history VP, etc.), decoupled from the object-level set 0.
-        var setLayouts = stackalloc DescriptorSetLayout[3] { SetLayout, FogSetLayout, ViewSetLayout };
+        // set 3 = frame/view-level globals (environment cube, DDGI atlases, cloud noise, AP LUT, Sky-View LUT), 3B.
+        var setLayouts = stackalloc DescriptorSetLayout[4] { SetLayout, FogSetLayout, ViewSetLayout, GlobalsSetLayout };
 
         // 1-5:
         // VS push constant, 64 bytes, holding light-space ViewProj and written per quadrant in the shadow pass.
@@ -1879,7 +1985,7 @@ public static VkPipeline TransparentBackFacePipelineState;
         var info = new PipelineLayoutCreateInfo
         {
             SType = StructureType.PipelineLayoutCreateInfo,
-            SetLayoutCount = 3,
+            SetLayoutCount = 4,
             PSetLayouts = setLayouts,
             PushConstantRangeCount = 2,
             PPushConstantRanges = pushRanges
@@ -2251,7 +2357,7 @@ layout(location = 0) out vec3 vWorldPos;
 layout(location = 1) out vec2 vUV;
 layout(location = 2) out vec3 vNormal;
 layout(location = 3) out vec4 vTangent;
-layout(location = 4) out vec4 vInstanceColor;  // per-instance text color (renderMode==2)
+layout(location = 4) out vec4 vInstanceColor;  // per-instance tint (or text color when renderMode==2)
 layout(location = 5) out float vViewDepth;     // 1-5: view-space depth, used for cascade selection, always 0 in the shadow pass
 #if VELOCITY_OUTPUT
 layout(location = 6) out vec4 vPrevClip;       // 2-3: previous-frame non-jittered clip-space position, used by the PS to compute velocity
@@ -2289,7 +2395,7 @@ layout(std140, binding = 2) uniform MaterialParams {
     float alphaCutoff;
     uint alphaMode;
     uint renderMode;
-    float padding1;
+    uint tintMode;   // offset 72: 0=ignore per-instance color, 1=multiply the PBR albedo by it (retired pxRange slot)
     uint isInstanced;
     uint isSkinned;
     uint bonePaletteStride;
@@ -2303,10 +2409,6 @@ layout(std140, binding = 2) uniform MaterialParams {
     // Vertex swell (currently only the sea writes it): x = half peak-to-trough amplitude in meters (0 = off),
     // y = current phase, z = previous-frame phase, w = fade radius in meters. See SwellEvaluate below.
     vec4 vertexWave;
-};
-
-layout(std140, binding = 3) uniform BoneMatrices {
-    mat4 boneMatrices[100];
 };
 
 // P2 L1: row instanceSlot doubles as that instance's pose-pool tag (see the decode in main), so a pooled palette addresses
@@ -2330,6 +2432,19 @@ layout(std430, binding = 14) readonly buffer PrevInstanceWorlds {
 };
 layout(std430, binding = 15) readonly buffer PrevMorphWeights {
     vec4 prevMorphWeights[];
+};
+
+// Generic per-instance extras (binding 26), addressed by the same compacted slot as the instance matrices: boneBase +
+// gl_InstanceIndex on a direct draw, the index gather's M14 stamp on an A7 indirect draw. Kept out of the 80-byte instance
+// stream on purpose - that stream is the A7 cull input and what the text path reinterprets, so growing it would move
+// culling, gather and text together. color is the per-instance tint; extra is reserved, which is why the stride is 32 bytes.
+// Read by the vertex stage only, and never in the shadow variant (see main): a shadow pass binds no extras table.
+struct InstanceExtras {
+    vec4 color;
+    vec4 extra;
+};
+layout(std430, binding = 26) readonly buffer InstanceExtrasBuffer {
+    InstanceExtras instanceExtras[];
 };
 
 layout(std140, binding = 11) uniform TextDrawParams {
@@ -2582,9 +2697,9 @@ void main() {
                 if (hasPrevBones != 0u) {
                     bm = prevBoneMatrices[baseIdx];
                     if (bm[3][3] == 0.0)
-                        bm = isInstanced == 1u ? instanceBoneMatrices[baseIdx] : boneMatrices[idx];
+                        bm = instanceBoneMatrices[baseIdx];
                 } else {
-                    bm = isInstanced == 1u ? instanceBoneMatrices[baseIdx] : boneMatrices[idx];
+                    bm = instanceBoneMatrices[baseIdx];
                 }
                 prevSkinnedPos += (prevLocalPos * bm) * w;
             }
@@ -2616,6 +2731,9 @@ void main() {
 
     // ── Text GPU Instancing: remap unit quad UV → atlas sub-rect ──
     vec4 textColor_ = vec4(1.0);
+    // Per-instance tint from the generic extras slot. Read only on the instanced non-text path: the text path numbers its
+    // slots against the glyph stream, not the instance stream, so reading here would fetch the wrong element (or past the end).
+    vec4 tintColor_ = vec4(1.0);
     if (renderMode == 2u && isInstanced == 1u) {
         uint tBase = instanceSlot * 12u;
         vec4 uvRect = vec4(
@@ -2631,8 +2749,13 @@ void main() {
         vUV = uvRect.xy + inUV * uvRect.zw;
     } else {
         vUV = inUV;
+#if !SHADOW_PASS
+        // Shadow variants bind no extras table, so this read is compiled out with the declaration above.
+        if (isInstanced == 1u)
+            tintColor_ = instanceExtras[instanceSlot].color;
+#endif
     }
-    vInstanceColor = textColor_;
+    vInstanceColor = textColor_ * tintColor_;
     vNormal = normalize(normal * mat3(worldMatrix));
 #if !SHADOW_PASS
     // The swell is a height field added on top of the baked relief, and over that relief the normal is always
@@ -2788,7 +2911,7 @@ layout(std140, binding = 2) uniform MaterialParams {
     float alphaCutoff;
     uint alphaMode;
     uint renderMode;
-    float padding1;
+    uint tintMode;   // offset 72: 0=ignore per-instance color, 1=multiply the PBR albedo by it (retired pxRange slot)
     uint isInstanced;
     uint isSkinned;
     uint bonePaletteStride;
@@ -2823,23 +2946,26 @@ layout(binding = 8) uniform sampler2D emissiveMap;
 // those atlases carry TextureMipPolicy.None today, which makes the distinction free rather than a cost - but it is
 // written out so that giving one a chain later cannot silently change glyph coverage.
 
+// 3B: the six view/frame-level lighting inputs below live in descriptor set 3 (the per-view globals set),
+// with the binding numbers kept as they were so C# constants (VKTextureCube.EnvCubeBinding and friends) stay valid.
+// They are written once per view by Pipeline.PrepareViewGlobals instead of per primitive per frame.
 // 1-7:
 // environment radiance cube on binding 16, single mip.
 // When no environment texture exists, bind a 1x1 all-black dummy,
 // so this path is always sampleable and envParams.w acts as the switch.
-layout(binding = 16) uniform samplerCube envCube;
+layout(set = 3, binding = 16) uniform samplerCube envCube;
 
 // Clause 10 of 2-4:
 // DDGI irradiance probe atlas on binding 17, rgba16float.
 // When not ready, bind 1x1 White.
 // Actual sampling is gated by DDGI_ENABLED plus giParams, and compile-time stripping removes it entirely when disabled.
-layout(binding = 17) uniform sampler2D ddgiAtlas;
+layout(set = 3, binding = 17) uniform sampler2D ddgiAtlas;
 
 // Step 3 of 2-4:
 // DDGI depth-moment atlas on binding 18, rg16float, where x=mean and y=mean^2.
 // When not ready, bind 1x1 White.
 // Chebyshev visibility testing is gated at runtime by giParams2.y and does not sample when disabled.
-layout(binding = 18) uniform sampler2D ddgiDepth;
+layout(set = 3, binding = 18) uniform sampler2D ddgiDepth;
 
 // Step C of 2-5:
 // pre-baked cloud noise on binding 19, rgba8unorm:
@@ -2850,10 +2976,10 @@ layout(binding = 18) uniform sampler2D ddgiDepth;
 // The sampler is immutable wrap:
 // noise tiles at a fixed period, while wind offsets can push uv outside [0,1].
 // Clamp would stretch the outermost column into a motionless stripe across the sky, just like DX s2 wrapSampler avoids.
-layout(binding = 19) uniform sampler2D cloudNoise;
+layout(set = 3, binding = 19) uniform sampler2D cloudNoise;
 // 2-7 P0: the procedural sky's Sky-View LUT (binding 25). No mip, only textureLod(...,0.0).
 // When not ready, a 1x1 white placeholder is bound, and the consumer side gates it out in the uniform branch via skyParams0.w, so it is never sampled.
-layout(binding = 25) uniform sampler2D skyView;
+layout(set = 3, binding = 25) uniform sampler2D skyView;
 vec4 WeatherH(int i) { return i==0?weatherParams0:weatherParams1; }
 vec4 WeatherR(int i,int row) { return weatherRegions[i*8+row]; }
 vec4 WeatherFlash() { return weatherFlash; }
@@ -2896,7 +3022,7 @@ vec4 ApplySceneFog(vec4 color, vec3 worldPos) {
 // Since a stores opacity rather than transmittance, all-zero is exactly the identity element of the composition formula.
 // The apParams0.x gate only saves the sampling cost.
 // Three-axis Clamp plus trilinear filtering are provided by the immutable linear-clamp sampler.
-layout(binding = 20) uniform sampler3D aerialLut;
+layout(set = 3, binding = 20) uniform sampler3D aerialLut;
 
 layout(std140, binding = 11) uniform TextDrawParams {
     vec2 textAtlasSize;
@@ -3714,6 +3840,12 @@ void main() {
         outColor = ApplySceneFog(vec4(color, alpha * vInstanceColor.a * textGlobalAlpha * coverage), vWorldPos);
         return;
     }
+
+    // Per-instance tint: applied here, after the text branch has already returned, so there is exactly one multiply site.
+    // tintMode is a per-primitive material flag, which is what lets a hull keep its authored look while the sail beside it
+    // in the same instance cycles through seven hues.
+    if (tintMode != 0u)
+        albedo *= vInstanceColor.rgb;
 
     // Procedural sky for 2-5:
     // reconstruct Sky-View LUT uv from the world view direction, explicitly ignoring vertex uv.

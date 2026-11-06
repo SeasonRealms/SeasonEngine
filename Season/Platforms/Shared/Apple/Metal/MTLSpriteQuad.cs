@@ -242,7 +242,7 @@ internal abstract class MTLSpriteQuad : ITextureHolder, IDisposable
         var fallback = Device.White;
 
         // VS buffer slots:
-        // 0 = vertex stream, 1 = Matrices(b0), 2 = Instance(buff2), 3 = BoneMatrices(b3 using shared IdentityBone).
+        // 0 = vertex stream, 1 = Matrices(b0), 2 = Instance(buff2), 3 = retired b3 placeholder (shared IdentityBone).
         enc.SetVertexBuffer(vb, 0, 0);
         enc.SetVertexBuffer(_matrixBuffers[fi], 0, 1);
         Pipeline.BindView(enc, ViewBuffer);

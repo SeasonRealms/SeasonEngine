@@ -48,6 +48,8 @@ internal struct MTLSceneDrawCommand : ISceneDrawCommand
     internal IMTLBuffer? Instances;
     internal IMTLBuffer? PrevInstances;
     internal IMTLBuffer? PrevBones;
+    // Generic per-instance extras (VS buffer(12)): the group's ring slot for an instanced draw, the shared white record otherwise.
+    internal IMTLBuffer? InstanceExtras;
     internal MTLTexture? Albedo;
     internal MTLTexture? Normal;
     internal MTLTexture? Metallic;
@@ -108,7 +110,7 @@ internal struct MTLSceneDrawCommand : ISceneDrawCommand
                 Pipeline.DrawPrimitive(enc, Primitive!, Vertex!, IndexBuffer!, Matrix!, Material!, Light!, Bones!,
                     Morph!, InstanceBones!, MTLPrimitiveType.Triangle, IndexCount, IndexKind, IndexBufferOffset,
                     Instances, InstanceBufferOffset, InstanceCount, InstanceBoneOffset, PrevInstances, PrevBones, PrevBoneOffset, View,
-                    IndirectArgs, IndirectOffset);
+                    IndirectArgs, IndirectOffset, InstanceExtras);
                 break;
 
             case MTLSceneDrawKind.Quad:
@@ -280,7 +282,7 @@ internal sealed class MTLSceneDrawCollection
         IMTLBuffer instanceBones, MTLIndexType indexKind, nuint indexCount, nuint indexBufferOffset,
         IMTLBuffer? instances, nuint instanceBufferOffset, nuint instanceCount, nuint instanceBoneOffset,
         IMTLBuffer? prevInstances, IMTLBuffer? prevBones, nuint prevBoneOffset, IMTLBuffer view,
-        IMTLBuffer? indirectArgs = null, nuint indirectOffset = 0)
+        IMTLBuffer? indirectArgs = null, nuint indirectOffset = 0, IMTLBuffer? instanceExtras = null)
     {
         if (indexCount == 0) return;
         var draw = State;
@@ -298,6 +300,8 @@ internal sealed class MTLSceneDrawCollection
         draw.Instances = instances ?? Pipeline.IdentityInstanceBuffer;
         draw.PrevInstances = prevInstances ?? draw.Instances;
         draw.PrevBones = prevBones ?? bones;
+        // A non-instanced command still binds the white record, since the MSL argument is declared unconditionally.
+        draw.InstanceExtras = instanceExtras ?? Pipeline.DefaultInstanceExtrasBuffer;
         draw.IndexKind = indexKind;
         draw.IndexCount = indexCount;
         draw.IndexBufferOffset = indexBufferOffset;
@@ -318,6 +322,7 @@ internal sealed class MTLSceneDrawCollection
         _arena.Retain(primitive);
         _arena.Retain(vertex); _arena.Retain(index); _arena.Retain(matrix); _arena.Retain(material);
         _arena.Retain(bones); _arena.Retain(morph); _arena.Retain(instanceBones);
+        _arena.Retain(draw.InstanceExtras);
         _arena.Retain(draw.Albedo); _arena.Retain(draw.Normal); _arena.Retain(draw.Metallic);
         _arena.Retain(draw.Occlusion); _arena.Retain(draw.Emissive);
         Add(draw, State.Mode != PipelineMode.Opaque);

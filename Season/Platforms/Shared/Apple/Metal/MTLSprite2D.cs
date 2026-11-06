@@ -198,7 +198,6 @@ internal sealed class MTLSprite2D : MTLSpriteQuad
         bool flipX, flipY;
         Vector4 color;
         Season.Controls.TextureType textureType;
-        float factor;
 
         if (SpriteRef != null)
         {
@@ -215,7 +214,6 @@ internal sealed class MTLSprite2D : MTLSpriteQuad
             flipY = SpriteRef.FlipY;
             color = SpriteRef.Color;
             textureType = SpriteRef.TextureType;
-            factor = SpriteRef.Factor;
         }
         else
         {
@@ -233,7 +231,6 @@ internal sealed class MTLSprite2D : MTLSpriteQuad
             flipY = Texture.FlipY;
             color = Texture.Color;
             textureType = Texture.TextureType;
-            factor = Texture.Factor;
         }
 
         // When alpha is zero or size is not ready, such as Shape null becoming 0,
@@ -276,8 +273,7 @@ internal sealed class MTLSprite2D : MTLSpriteQuad
             UseEmissiveMap = EmissiveMap != null ? 1u : 0u,
             AlphaCutoff = 0.5f,
             AlphaMode = 2u,   // BLEND. Sprites use the Transparent PSO.
-            RenderMode = renderMode,
-            Padding1 = factor
+            RenderMode = renderMode
         };
 
         // Matrix UBO: 2D orthographic path using NDC directly

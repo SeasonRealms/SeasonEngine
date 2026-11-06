@@ -30,10 +30,18 @@ public sealed class ViewTargets
         ArgumentOutOfRangeException.ThrowIfNegative(index);
         Index = index;
         Name = string.IsNullOrEmpty(name) ? $"view{index}" : name;
+        Textures = new FrameTextureTable(index);
     }
 
     /// <summary>View slot index; 0 is the main view. Matches <see cref="RenderView.Index"/>.</summary>
     public int Index { get; }
+
+    /// <summary>
+    /// Slot table of this view's published intermediates (bloom / AO / TAA resolve / fog volumes).
+    /// Declared in stage 2B: producers and consumers name a <see cref="FrameTextureSlot"/>, never a raw
+    /// string, and a rebuild advances the generation instead of leaving a byte-identical name behind.
+    /// </summary>
+    public FrameTextureTable Textures { get; }
 
     /// <summary>Diagnostic name, used in logs and backend debug markers.</summary>
     public string Name { get; }
@@ -63,16 +71,39 @@ public sealed class ViewTargets
     public StorageBuffer? FogFrameBuffer;
 
     /// <summary>Scoped name of this view's integrated 3D volume; null = not yet allocated.</summary>
-    public string? FogIntegratedName;
+    public string? FogIntegratedName
+    {
+        get => Textures.NameOf(FrameTextureSlot.FogIntegrated);
+        set => Textures.Publish(FrameTextureSlot.FogIntegrated, value);
+    }
 
     /// <summary>Scoped name of this view's local (filtered) 3D volume (current history-write slot); null = not yet allocated.</summary>
-    public string? FogLocalName;
+    public string? FogLocalName
+    {
+        get => Textures.NameOf(FrameTextureSlot.FogLocal);
+        set => Textures.Publish(FrameTextureSlot.FogLocal, value);
+    }
 
     /// <summary>Scoped name of this view's injection 3D volume.</summary>
-    public string? FogInjectionName;
+    public string? FogInjectionName
+    {
+        get => Textures.NameOf(FrameTextureSlot.FogInjection);
+        set => Textures.Publish(FrameTextureSlot.FogInjection, value);
+    }
 
-    /// <summary>Scoped name pair for this view's temporal history ping-pong volumes.</summary>
-    public string? FogHistory0Name, FogHistory1Name;
+    /// <summary>Scoped name of this view's temporal history ping slot 0.</summary>
+    public string? FogHistory0Name
+    {
+        get => Textures.NameOf(FrameTextureSlot.FogHistory0);
+        set => Textures.Publish(FrameTextureSlot.FogHistory0, value);
+    }
+
+    /// <summary>Scoped name of this view's temporal history ping slot 1.</summary>
+    public string? FogHistory1Name
+    {
+        get => Textures.NameOf(FrameTextureSlot.FogHistory1);
+        set => Textures.Publish(FrameTextureSlot.FogHistory1, value);
+    }
 
     /// <summary>Per-view ping index (0 or 1); swaps after each successful fog Record.</summary>
     public int FogPing;
@@ -189,7 +220,36 @@ public sealed class ViewTargets
     public RenderTarget? CompleteSceneColor;
 
     /// <summary>Texture-dictionary name that replaces the scene source downstream (TAA resolve output).</summary>
-    public string? SceneColorOverride;
+    public string? SceneColorOverride
+    {
+        get => Textures.NameOf(FrameTextureSlot.SceneColorResolve);
+        set => Textures.Publish(FrameTextureSlot.SceneColorResolve, value);
+    }
+
+    /// <summary>
+    /// Scoped texture-dictionary name of this view's bloom-chain output; null = this view records no bloom.
+    /// Bloom is a <see cref="ComputeScope.View"/> effect built from this view's resolved scene color, so the name
+    /// goes through <see cref="Scope"/> and two views in one frame own separate chains and outputs. Written when the
+    /// effect first allocates this view's chain, revoked when the effect is disposed.
+    /// </summary>
+    public string? BloomOutput
+    {
+        get => Textures.NameOf(FrameTextureSlot.Bloom);
+        set => Textures.Publish(FrameTextureSlot.Bloom, value);
+    }
+
+    /// <summary>Scoped texture-dictionary name of this view's GTAO output; null = this view records no AO.</summary>
+    public string? AoOutput
+    {
+        get => Textures.NameOf(FrameTextureSlot.Ao);
+        set => Textures.Publish(FrameTextureSlot.Ao, value);
+    }
+
+    /// <summary>This view's GTAO chain produced its output this frame.</summary>
+    public bool AoReady;
+
+    /// <summary>This view's AO already entered its HDR composite this frame, so its final blit must not multiply it again.</summary>
+    public bool AoComposited;
 
     /// <summary>Set once this frame's fog injection, filtering and integration all completed.</summary>
     public bool FogOutputReady;
@@ -203,7 +263,8 @@ public sealed class ViewTargets
     /// <summary>Only after this frame's rain composite succeeded do transparent materials sample weather transmission.</summary>
     public bool WeatherComposited;
 
-    /// <summary>This frame chose the opaque/transparent split route for this view.</summary>
+    /// <summary>This frame inserted the fog/weather-style full-screen composites between the opaque and transparent stages for
+    /// this view. The geometry split itself is unconditional; this flag gates only the effects that publish through a composite.</summary>
     public bool SceneSegmented;
 
     /// <summary>
@@ -253,6 +314,8 @@ public sealed class ViewTargets
     {
         CompleteSceneColor = null;
         SceneColorOverride = null;
+        AoReady = false;
+        AoComposited = false;
         FogOutputReady = false;
         WeatherOutputReady = false;
         SsrOutputReady = false;
@@ -268,6 +331,7 @@ public sealed class ViewTargets
         if (!ReferenceEquals(CompleteSceneColor, target)) return;
         CompleteSceneColor = null;
         SceneColorOverride = null;
+        AoComposited = false;
     }
 
     public override string ToString() => $"ViewTargets[{Index}:{Name}]";

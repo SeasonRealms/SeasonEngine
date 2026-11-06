@@ -11,7 +11,6 @@ namespace Season.Platforms.Windows.DirectX;
 /// the Pbr3D path.
 /// Derived classes (DXModel / DXMesh3D) mainly differ in:
 ///   - geometry / material source (glTF node tree vs Mesh3D.Surfaces)
-///   - whether bones exist (DXModel overrides OnBeforeDraw to bind b3 BoneMatrices)
 ///   - how primitives are collected (derived CollectPrimitives implementation)
 ///
 /// Shared responsibilities:
@@ -484,7 +483,7 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     /// and is not rebuilt or released when toggled at runtime.
     /// Each primitive gets its own box, and skinning parameters
     /// (IsSkinned / BonePaletteStride) are inherited from the source primitive,
-    /// so skinned models stay aligned through the same b3/t6 bone-transform path.
+    /// so skinned models stay aligned through the same t6/t8 palette path.
     /// Morph-target primitives also build shells: shell delta buffers are
     /// expanded to the shell-vertex layout, with shell-vertex to source-vertex
     /// mappings recorded during construction
@@ -764,14 +763,6 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     protected abstract void CollectPrimitives(List<PrimitiveData> result);
 
     /// <summary>
-    /// Additional root-signature binding hook before Draw.
-    /// DXModel overrides this to bind slot 8 (b3 BoneMatrices).
-    /// The default implementation is empty because DXMesh3D and other
-    /// non-skinned primitive groups need nothing extra here.
-    /// </summary>
-    protected virtual void OnBeforeDraw() { }
-
-    /// <summary>
     /// Derived classes may override this to return the bone StructuredBuffer
     /// SRV handle. Both regular DXModel and DXInstancedModel use the same
     /// dynamic bone-palette path.
@@ -982,7 +973,7 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         }
 
         // Allocate SRV descriptor
-        primitiveData.MorphDescriptorId = Device.DescriptorAllocator.Allocate();
+        primitiveData.MorphDescriptorId = Device.DescriptorAllocator.Allocate(DescriptorKind.ModelData);
         var cpuHandle = Device.SrvHeapManager.GetCpuHandle(primitiveData.MorphDescriptorId);
         var srvDesc = new ShaderResourceViewDesc
         {
@@ -1232,18 +1223,15 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         if (box.FaceAlpha > 0f)
         {
             Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Front);
-            OnBeforeDraw();
             Pipeline.DrawPrimitive(face, lightCB, face.MatrixBuffers[fi], null, 1, 0,
                 GetBoneSrvHandle(), GetPrevBoneSrvHandle(), default, GetPrevMorphSrvHandle());
 
             Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Back);
-            OnBeforeDraw();
             Pipeline.DrawPrimitive(face, lightCB, face.MatrixBuffers[fi], null, 1, 0,
                 GetBoneSrvHandle(), GetPrevBoneSrvHandle(), default, GetPrevMorphSrvHandle());
         }
 
         Pipeline.SetPipeline(PipelineMode.Opaque, PipelineCullVariant.None, depthWrite: true);
-        OnBeforeDraw();
         Pipeline.DrawPrimitive(edges, lightCB, edges.MatrixBuffers[fi], null, 1, 0,
             GetBoneSrvHandle(), GetPrevBoneSrvHandle(), default, GetPrevMorphSrvHandle());
     }
@@ -1496,12 +1484,6 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
                 {
                     Pipeline.SetPipeline(PipelineMode.Opaque,
                         p.DoubleSided ? PipelineCullVariant.None : PipelineCullVariant.Back, depthWrite);
-                    // Important fix: OnBeforeDraw must be called after
-                    // SetPipeline. When the root signature changes,
-                    // SetPipeline calls SetGraphicsRootSignature internally,
-                    // which clears all currently bound parameters including
-                    // slot 8 BoneMatrices. Rebinding afterward is required.
-                    OnBeforeDraw();
                     pipelineSet = true;
                     currentDoubleSided = p.DoubleSided;
                     currentDepthWrite = depthWrite;
@@ -1527,7 +1509,6 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
                 {
                     Pipeline.SetPipeline(PipelineMode.Fade,
                         p.DoubleSided ? PipelineCullVariant.None : PipelineCullVariant.Back, depthWrite);
-                    OnBeforeDraw();
                     pipelineSet = true;
                     currentDoubleSided = p.DoubleSided;
                     currentDepthWrite = depthWrite;
@@ -1564,7 +1545,6 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
             if (!pipelineSet || currentDoubleSided)
             {
                 Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Back);
-                OnBeforeDraw();
                 pipelineSet = true;
                 currentDoubleSided = false;
             }
@@ -1579,11 +1559,9 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
             if (p.DoubleSided)
             {
                 Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Front);
-                OnBeforeDraw();
                 DrawPrimitive(p, lightCB);
 
                 Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Back);
-                OnBeforeDraw();
                 pipelineSet = true;
                 currentDoubleSided = false;
                 DrawPrimitive(p, lightCB);
@@ -1650,7 +1628,6 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
             {
                 Pipeline.SetPipeline(PipelineMode.Opaque,
                     p.DoubleSided ? PipelineCullVariant.None : PipelineCullVariant.Back, depthWrite: false);
-                OnBeforeDraw();
                 pipelineSet = true;
                 currentDoubleSided = p.DoubleSided;
             }
@@ -1723,8 +1700,8 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     /// culling: all opaque primitives are drawn, and true BLEND materials are
     /// skipped because primitives that do not write depth should not cast
     /// shadows. The shadow-pass entry has already set the PSO and root
-    /// signature. This method only supplies OnBeforeDraw (b3 bone CBV),
-    /// group-invariant bindings, and per-primitive draws.
+    /// signature. This method only supplies group-invariant bindings and
+    /// per-primitive draws.
     ///
     /// The primitive list is cached per pass using <see cref="CascadedShadow.Epoch"/>.
     /// RenderShadowPass calls this method repeatedly for atlas quadrants
@@ -1748,8 +1725,6 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
 
         if (_shadowDrawList.Count == 0)
             return;
-
-        OnBeforeDraw();
 
         // Group-invariant t6/t8/t9/t10 are bound once for the group.
         // This class has no instance stream, so t9 always uses the default zero-value SB.

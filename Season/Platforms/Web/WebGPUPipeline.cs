@@ -325,6 +325,16 @@ fn WeatherNoise(uv: vec2f) -> vec4f { return textureSampleLevel(uCloudNoise,uWra
 // The white texture is never sampled: the precondition for writing skyParams0.w is precisely that SkyViewTexture is non-null.
 // Like uAerialLut, it reuses uSampler at binding 1 (linear Clamp) and does not take an extra sampler slot.
 @group(0) @binding(23) var uSkyView: texture_2d<f32>;
+// Generic per-instance extras (binding 24), 32B per compacted instance slot:
+// .color is the per-instance tint the PBR path multiplies its albedo by, gated per primitive through the
+// flags.w TintInstanced bit so a hull sharing an instance with a tinted sail keeps its authored look.
+// .extra is unused today and is why the record is 32B: a later per-instance scalar (wind weight, decal index,
+// morph bias) then costs no new binding and no new buffer.
+// It lives outside the instance stream on purpose: that stream is bit-identical to the A7 cull input and to what
+// the text path reinterprets, so growing its stride would move culling, gather and text at once.
+// Referenced statically by vs_main only, but WGSL does not constant-fold, so the shadow layout declares it too.
+struct InstanceExtras { color: vec4f, extra: vec4f };
+@group(0) @binding(24) var<storage, read> uInstanceExtras: array<InstanceExtras>;
 
 // 2-7 P0: sample the Sky-View LUT to get radiance along the reflection direction.
 // The parameterization is byte-aligned with the renderMode == 3 sky sphere and the inverse solve of the skyView compute kernel:
@@ -660,6 +670,12 @@ fn vs_main(input: VertexInput, @builtin(instance_index) instanceIndex: u32, @bui
             instanceColor = vec4f(uMorphValues[gBase + 4u], uMorphValues[gBase + 5u],
                                   uMorphValues[gBase + 6u], uMorphValues[gBase + 7u]);
         }
+    }
+    else if ((u.flags.w & 16) != 0) {
+        // Generic per-instance tint: only the non-text instanced path takes this branch, so the text path keeps its
+        // baseColor / per-glyph color contract and the 2D paths keep baseColor. PS multiplies albedo by it where the
+        // primitive's TintInstanced bit is set.
+        instanceColor = uInstanceExtras[instanceSlot].color;
     }
     output.instanceColor = instanceColor;
     return output;
@@ -1413,6 +1429,13 @@ fn shade(input: ShadeInput) -> vec4f {
             return vec4f(textHdr, textAlpha * coverage);
         }
         return vec4f(textColor, textAlpha * coverage);
+    }
+
+    // Per-instance tint: applied here, after the text branch has already returned, so there is exactly one multiply
+    // site and a glyph never reaches it. The gate is a per-primitive flag, which is what lets a hull keep its authored
+    // look while the sail beside it in the same instance cycles through seven hues.
+    if ((u.flags.w & 256) != 0) {
+        albedo = albedo * input.instanceColor.rgb;
     }
 
     // 2-5 procedural sky: reconstruct Sky-View LUT UVs from the world-space view direction,

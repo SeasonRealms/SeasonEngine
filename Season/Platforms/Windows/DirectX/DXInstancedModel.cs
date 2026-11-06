@@ -219,6 +219,37 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
     }
 
     /// <summary>
+    /// Applies <see cref="Season.Controls.InstancedModel.InstanceTintParts"/> to the cloned primitives: matching ones get
+    /// <c>TintMode = 1</c> and their authored RGB rewritten to white.
+    /// <para>
+    /// The white rewrite is not cosmetic. The per-instance color multiplies the albedo, so a saturated authored factor
+    /// (this asset's sail is 0.97/0.93/0.0003) could only ever be darkened toward black, never turned green or blue.
+    /// Setting RGB to 1 turns the same multiply into a replacement, which is what lets one geometry pass through all
+    /// seven hues. Alpha is untouched: opacity stays with the material and the control's own Alpha chain.
+    /// </para>
+    /// <para>
+    /// Called once after <see cref="Load"/>, while no draw can see the material yet.
+    /// </para>
+    /// </summary>
+    internal void ApplyInstanceTint(Season.Controls.InstancedModel owner)
+    {
+        if (owner.InstanceTintParts.Count == 0)
+            return;
+
+        for (int i = 0; i < _primitives.Count; i++)
+        {
+            var primitive = _primitives[i];
+            if (!owner.IsInstanceTintPart(primitive.PartName, primitive.PartNodeName))
+                continue;
+
+            primitive.MaterialParams.TintMode = 1u;
+            primitive.MaterialParams.BaseColor = new Vector4(1f, 1f, 1f, primitive.MaterialParams.BaseColor.W);
+            for (int f = 0; f < Device.frameCount; f++)
+                Unsafe.Write(primitive.MappedMaterialBuffers[f], primitive.MaterialParams);
+        }
+    }
+
+    /// <summary>
     /// Clones a template primitive for instanced rendering:
     /// - VB / IB / textures -> shared pointer references, with no new GPU resources;
     /// - Material CB -> its own N-buffered allocation, because Alpha may differ;
@@ -252,6 +283,11 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
 
             // Copy material parameters and apply model-level overrides
             MaterialParams = source.MaterialParams,
+            // Part identity travels with the clone: the owner's InstanceTintParts resolves against exactly these two
+            // names after loading, the same way Model.SetPartColor resolves against them on the non-instanced path.
+            PartName = source.PartName,
+            PartNodeName = source.PartNodeName,
+            PartBaseColor = source.PartBaseColor,
             OriginalBaseColorAlpha = source.OriginalBaseColorAlpha,
             OriginalAlphaCutoff = source.OriginalAlphaCutoff,
             IsTransparent = source.IsTransparent,
@@ -538,7 +574,7 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         if (capacity <= _instanceBoneCapacity && _instanceBoneBuffers.Length == FrameSlotCount)
             return;
 
-        ReleaseBoneRingDeferred(_instanceBoneBuffers, _instanceBoneDescriptorIds);
+        ReleaseBoneRingDeferred(_instanceBoneBuffers, _instanceBoneDescriptorIds, _mappedInstanceBoneBuffers);
 
         int slots = FrameSlotCount;
         ulong bufferSize = (ulong)(_bonePaletteStride * capacity * sizeof(Matrix4x4));
@@ -557,7 +593,7 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
             // history yet fall back to this frame's bones instead of reading whatever the driver handed back.
             new Span<byte>(mapped[slot], (int)bufferSize).Clear();
 
-            descriptorIds[slot] = Device.DescriptorAllocator.Allocate();
+            descriptorIds[slot] = Device.DescriptorAllocator.Allocate(DescriptorKind.InstanceRing);
             var srvDesc = new ShaderResourceViewDesc
             {
                 Format = Silk.NET.DXGI.Format.FormatUnknown,
@@ -589,7 +625,7 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         if (count <= _instanceMorphWeightsCapacity && _instanceMorphWeightsBuffers.Length == FrameSlotCount)
             return;
 
-        ReleaseBoneRingDeferred(_instanceMorphWeightsBuffers, _instanceMorphWeightsDescriptorIds);
+        ReleaseBoneRingDeferred(_instanceMorphWeightsBuffers, _instanceMorphWeightsDescriptorIds, _mappedMorphWeightsBuffers);
 
         int slots = FrameSlotCount;
         ulong bufferSize = (ulong)(count * sizeof(Vector4));
@@ -606,7 +642,7 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
             mapped[slot] = (byte*)pData;
             new Span<byte>(mapped[slot], (int)bufferSize).Clear();
 
-            descriptorIds[slot] = Device.DescriptorAllocator.Allocate();
+            descriptorIds[slot] = Device.DescriptorAllocator.Allocate(DescriptorKind.InstanceRing);
             var srvDesc = new ShaderResourceViewDesc
             {
                 Format = Silk.NET.DXGI.Format.FormatUnknown,
@@ -638,16 +674,25 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
     }
 
     /// <summary>Retires a ring together with its SRV descriptors. Both halves have to wait for the fence: a frame in
-    /// flight may still be reading through the descriptor and from the resource behind it.</summary>
-    static void ReleaseBoneRingDeferred(ID3D12Resource*[] ring, int[] descriptorIds)
+    /// flight may still be reading through the descriptor and from the resource behind it. <paramref name="mapped"/> is
+    /// forwarded to <see cref="ReleaseRingDeferred"/> so only a live mapping is ever unmapped, and both the ring and the
+    /// id array are detached first, which makes a repeated retirement (shutdown after a failed grow) a no-op instead of
+    /// a second Unmap or a second Free.</summary>
+    static void ReleaseBoneRingDeferred(ID3D12Resource*[] ring, int[] descriptorIds, byte*[]? mapped = null)
     {
-        ReleaseRingDeferred(ring);
+        ReleaseRingDeferred(ring, mapped);
         if (descriptorIds == null || descriptorIds.Length == 0)
             return;
+
+        // -1 rather than 0 marks the retired entries, because 0 is a valid descriptor index.
+        var retiredIds = new int[descriptorIds.Length];
+        Array.Copy(descriptorIds, retiredIds, descriptorIds.Length);
+        Array.Fill(descriptorIds, -1);
+
         ulong fence = Device.GetCurrentRetireFenceValue();
         Device.EnqueueDeferredRelease(fence, () =>
         {
-            foreach (int id in descriptorIds)
+            foreach (int id in retiredIds)
             {
                 if (id >= 0)
                     Device.DescriptorAllocator.Free(id);
@@ -889,6 +934,14 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         if (_instanceData.Length != _instanceCount)
             _instanceData = new InstanceTransformData[_instanceCount];
 
+        // Generic per-instance extras travel with the same compacted slot as the root world above. This class replays its
+        // own streams instead of going through UpdateInstanceData, so the ring has to be sized, filled and uploaded here
+        // too. Without it every opaque draw binds the one-record white fallback and slots past it read as zero, which
+        // shows up as one white instance and the rest black, with the colors never following the control.
+        if (_instanceExtras.Length != _instanceCount)
+            _instanceExtras = new InstanceExtras[_instanceCount];
+        EnsureInstanceExtrasRingCapacity(_instanceCount);
+
         bool hasAnimation = _asset._animations.Count > 0;
         bool hasSkin = _skins.Count > 0;
         float deltaTime = Math.Max(time, 0f);
@@ -927,6 +980,9 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
             // BuildInstanceMatrix (anchor pivot, see InstancedMesh3DBase)
             var instanceWorld = model.InstanceWorld(i);
             _instanceData[writeIndex] = InstanceTransformData.FromWorld(instanceWorld);
+            // The color is whatever the control set; white (the default) is the identity, so an instance that never
+            // sets one renders exactly as it did before the extras slot existed.
+            _instanceExtras[writeIndex] = new InstanceExtras { Color = instance.Color, Extra = Vector4.Zero };
 
             // P2: the CPU cull decision is made once per instance in the control's Update; this is where it reaches the replay.
             bool instanceCulled = model.IsInstanceAnimationCulled(i);
@@ -1212,6 +1268,9 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         if (frameWorlds != null)
             UploadInstanceWorldsForFrame(frameWorlds, _instanceCount);
 
+        // Same frame slot as the worlds above: the vertex stage indexes this table by the compacted instance slot.
+        UploadInstanceExtrasForFrame();
+
         // P2: instances that just came back into view get one frame of zero velocity; see WriteHistoryResets.
         WriteHistoryResets(frameWorlds);
 
@@ -1310,7 +1369,8 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
                 Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], &segment, 0, 0,
                     GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(),
                     sortedResource, argsResource,
-                    Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i), streamBuffer);
+                    Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i), streamBuffer,
+                    instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
                 Season.Rendering.InstanceCull.MainViewDraws++;
                 continue;
             }
@@ -1319,7 +1379,8 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
             var instanceVBValue = stream.ViewAt(FrameSlot);
             VertexBufferView* instanceVB = &instanceVBValue;
             Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, (uint)_instanceCount, 0,
-                GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), streamBuffer);
+                GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), streamBuffer,
+                instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
         }
 
         for (int i = 0; i < _transparentPrimitives.Count; i++)
@@ -1351,12 +1412,14 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
                 {
                     Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Front);
                     Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, 1, (uint)instanceIndex,
-                        GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), transparentBuffer);
+                        GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), transparentBuffer,
+                        instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
                 }
 
                 Pipeline.SetPipeline(PipelineMode.Transparent, primitive.DoubleSided ? PipelineCullVariant.Back : PipelineCullVariant.Back);
                 Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, 1, (uint)instanceIndex,
-                    GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), transparentBuffer);
+                    GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), transparentBuffer,
+                    instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
             }
         }
 
@@ -1397,8 +1460,6 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
     {
         if (!_transformInitialized || _instanceCount == 0)
             return;
-
-        OnBeforeDraw();
 
         // Group-invariant t6/t8/t9/t10 are bound once per group.
         // This class changes only VB/IB/matrix CB per primitive.
@@ -1473,13 +1534,13 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
 
             Pipeline.SetPipeline(PipelineMode.Opaque,
                 primitive.DoubleSided ? PipelineCullVariant.None : PipelineCullVariant.Back, depthWrite: false);
-            OnBeforeDraw();
             var maskVBValue = stream.ViewAt(FrameSlot);
             VertexBufferView* instanceVB = &maskVBValue;
             if (_outline2DHostActive)
             {
                 Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, (uint)_instanceCount, 0,
-                    boneSrv, prevBoneSrv, prevWorldSrv, prevMorphSrv);
+                    boneSrv, prevBoneSrv, prevWorldSrv, prevMorphSrv,
+                    instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
             }
             else
             {
@@ -1496,7 +1557,8 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
                     // mask carries them per pixel.
                     Pipeline.SetOutlineMaskColor(_outline2DInstanceColors[k], (uint)idx);
                     Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], instanceVB, 1, (uint)idx,
-                        boneSrv, prevBoneSrv, prevWorldSrv, prevMorphSrv);
+                        boneSrv, prevBoneSrv, prevWorldSrv, prevMorphSrv,
+                        instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
                 }
             }
         }
@@ -1566,14 +1628,14 @@ internal unsafe class DXInstancedModel : DXInstancedPrimitiveGroup
         _primitiveInstanceStreams = Array.Empty<PrimitiveInstanceStream>();
         _animationStates = Array.Empty<InstanceAnimationState>();
 
-        ReleaseBoneRingDeferred(_instanceBoneBuffers, _instanceBoneDescriptorIds);
+        ReleaseBoneRingDeferred(_instanceBoneBuffers, _instanceBoneDescriptorIds, _mappedInstanceBoneBuffers);
         _instanceBoneBuffers = EmptyResourceRing;
         _mappedInstanceBoneBuffers = EmptyMappedRing;
         _instanceBoneSrvHandles = Array.Empty<GpuDescriptorHandle>();
         _instanceBoneDescriptorIds = Array.Empty<int>();
         _instanceBoneCapacity = 0;
 
-        ReleaseBoneRingDeferred(_instanceMorphWeightsBuffers, _instanceMorphWeightsDescriptorIds);
+        ReleaseBoneRingDeferred(_instanceMorphWeightsBuffers, _instanceMorphWeightsDescriptorIds, _mappedMorphWeightsBuffers);
         _instanceMorphWeightsBuffers = EmptyResourceRing;
         _mappedMorphWeightsBuffers = EmptyMappedRing;
         _instanceMorphWeightsSrvHandles = Array.Empty<GpuDescriptorHandle>();

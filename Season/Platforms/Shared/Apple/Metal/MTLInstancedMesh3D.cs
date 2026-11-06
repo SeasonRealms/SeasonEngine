@@ -149,9 +149,11 @@ internal sealed class MTLInstancedMesh3D : MTLInstancedPrimitiveGroup
         {
             _instanceWorlds = new Matrix4x4[_instanceCount];
             _instanceData = new InstanceTransformData[_instanceCount];
+            _instanceExtras = new InstanceExtras[_instanceCount];
         }
 
         EnsureInstanceBufferCapacity(_instanceCount);
+        EnsureInstanceExtrasCapacity(_instanceCount);
 
         int writeIndex = 0;
         for (int i = 0; i < mesh.Instances.Count; i++)
@@ -166,6 +168,7 @@ internal sealed class MTLInstancedMesh3D : MTLInstancedPrimitiveGroup
 
             _instanceWorlds[writeIndex] = world;
             _instanceData[writeIndex] = InstanceTransformData.FromWorld(world);
+            _instanceExtras[writeIndex] = new InstanceExtras { Color = instance.Color, Extra = Vector4.Zero };
 
             // Outline2D when activated per instance:
             // record the writeIndex slot and the per-instance outline color so per-slot masks can fetch colors by slot.
@@ -240,6 +243,7 @@ internal sealed class MTLInstancedMesh3D : MTLInstancedPrimitiveGroup
             anyInstanceOutline ? _outline2DInstanceWidth : mesh.Highlight.OutlineWidth);
 
         UploadInstanceStream(_instanceData, _instanceCount);
+        UploadInstanceExtras(_instanceCount);
 
         // A7: the cull input is bit-for-bit identical to the IA instance stream, so this array is reused directly without storing an extra copy.
         // Only this class wires it up: MTLInstancedModel's instance stream is split per surface and does not go through the base class _instanceBuffer,

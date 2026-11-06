@@ -22,6 +22,9 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
     WGPUModel? _runtimeModel;
     readonly List<WGPUPrimitiveData> _primitives = new();
     readonly Dictionary<WGPUPrimitiveData, PrimitiveInstanceStream> _primitiveStreams = new();
+    /// <summary>Primitives named by <see cref="Season.Controls.InstancedModel.InstanceTintParts"/>, i.e. the ones whose uniform
+    /// carries <see cref="WebGPUTextureFlags.TintInstanced"/>. Built once after Load, never rebuilt.</summary>
+    readonly HashSet<WGPUPrimitiveData> _tintPrimitives = new();
     readonly List<GLTFSkin> _skins = new();
 
     List<GltfNodeBase> _workNodes = new();
@@ -91,6 +94,10 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
 
 
     public int EnabledInstanceCount { get; private set; }
+    /// <summary>Generic per-instance extras (binding 24): 32B per compacted slot, <c>.color</c> = that slot's
+    /// <c>InstanceSpec.Color</c>. Rebuilt every Update in the same order as the instance streams, so it lines up with the
+    /// compacted slot the VS decodes (direct draw: instance_id, A7: the gather's M14 stamp).</summary>
+    public byte[] InstanceExtrasBytes { get; private set; } = Array.Empty<byte>();
     public float ModelAlpha { get; set; } = 1f;
     public bool TransformInitialized { get; set; }
     /// <summary>2-3 Step C: the bone palette has been ready for two consecutive frames, mirroring VK's SetPrevBonesReady.
@@ -265,6 +272,37 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
         Season.Rendering.InstanceSkinning.Register(_skinning);
     }
 
+    /// <summary>
+    /// Applies <see cref="Season.Controls.InstancedModel.InstanceTintParts"/> to the primitives: matching ones are flagged for
+    /// the tint gate and their authored RGB is rewritten to white.
+    /// <para>
+    /// The white rewrite is not cosmetic. The per-instance colour multiplies the albedo, so a saturated authored factor
+    /// (this asset's sail is 0.97/0.93/0.0003) could only ever be darkened toward black, never turned green or blue.
+    /// Setting RGB to 1 turns the same multiply into a replacement, which is what lets one geometry pass through all
+    /// seven hues. Alpha is untouched: opacity stays with the material and the control's own Alpha chain.
+    /// </para>
+    /// <para>Called once after <see cref="Load"/>, while no draw can see the primitive yet.</para>
+    /// </summary>
+    internal void ApplyInstanceTint(Season.Controls.InstancedModel owner)
+    {
+        if (owner.InstanceTintParts.Count == 0)
+            return;
+
+        for (int i = 0; i < _primitives.Count; i++)
+        {
+            var primitive = _primitives[i];
+            if (!owner.IsInstanceTintPart(primitive.PartName, primitive.PartNodeName))
+                continue;
+
+            _tintPrimitives.Add(primitive);
+            primitive.BaseColor = new Vector4(1f, 1f, 1f, primitive.BaseColor.W);
+            primitive.PartBaseColor = Vector3.One;
+        }
+    }
+
+    /// <summary>Whether this primitive's uniform should carry <see cref="WebGPUTextureFlags.TintInstanced"/>.</summary>
+    internal bool IsTintPrimitive(WGPUPrimitiveData primitive) => _tintPrimitives.Contains(primitive);
+
     public IReadOnlyList<string> GetAnimationNames()
     {
         return _runtimeModel?.Asset.GetAnimationNames() ?? Array.Empty<string>();
@@ -373,6 +411,7 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
                 stream.PrevReady = false;
             }
             BoneMatricesBytes = Array.Empty<byte>();
+            InstanceExtrasBytes = Array.Empty<byte>();
             // No instance draws this frame, so nothing reads the ring either: release the binding so the next upload refills the CPU side.
             UnbindBoneStorageFromJs();
             TransformInitialized = true;
@@ -434,6 +473,13 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
             _cullSourceBytes = new byte[cullSourceBytes];
         var cullRoots = MemoryMarshal.Cast<byte, float>(_cullSourceBytes.AsSpan());
 
+        // Generic per-instance extras: 32B per compacted slot, filled in the same loop and addressed by the same writeIndex as
+        // every primitive's matrix rows, so a disabled instance cannot shift the two streams apart.
+        int extrasByteLength = EnabledInstanceCount * WGPUInstanceExtras.BytesPerInstance;
+        if (InstanceExtrasBytes.Length != extrasByteLength)
+            InstanceExtrasBytes = new byte[extrasByteLength];
+        var extrasData = MemoryMarshal.Cast<byte, float>(InstanceExtrasBytes.AsSpan());
+
         int writeIndex = 0;
 
         // P3 L2: the pool lives for exactly one replay, like P3a's dedup table it is keyed against. A pool block addressed by a
@@ -456,6 +502,17 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
             // Unified transform pattern: converge on BuildInstanceMatrix (anchor-pivot semantics, see InstancedMesh3DBase).
             var instanceWorld = model.InstanceWorld(i);
             WriteCullRoot(cullRoots, writeIndex, instanceWorld);
+
+            int extrasBase = writeIndex * WGPUInstanceExtras.FloatsPerInstance;
+            extrasData[extrasBase] = instance.Color.X;
+            extrasData[extrasBase + 1] = instance.Color.Y;
+            extrasData[extrasBase + 2] = instance.Color.Z;
+            extrasData[extrasBase + 3] = instance.Color.W;
+            // The reserved scalar is cleared every frame rather than on allocation: the array is reused when the count holds.
+            extrasData[extrasBase + 4] = 0f;
+            extrasData[extrasBase + 5] = 0f;
+            extrasData[extrasBase + 6] = 0f;
+            extrasData[extrasBase + 7] = 0f;
 
             // P2: the CPU cull decision is made once per instance in the control's Update; this is where it reaches the replay.
             bool instanceCulled = model.IsInstanceAnimationCulled(i);

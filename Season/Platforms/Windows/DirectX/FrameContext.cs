@@ -78,6 +78,13 @@ internal unsafe class FrameContext
         }
     }
 
+    /// <summary>
+    /// How many descriptors this context's draw-snapshot arena currently holds, read without the frame-beginning
+    /// side effect of <see cref="DrawSnapshots"/>. Diagnostic only: it is what a descriptor-exhaustion report needs
+    /// in order to say how much of the pool the three in-flight arenas are holding.
+    /// </summary>
+    internal int DrawSnapshotDescriptorCount => _drawSnapshots?.DescriptorCount ?? 0;
+
     public FrameContext(ID3D12Device* device)
     {
         _device = device;
@@ -345,7 +352,7 @@ internal unsafe sealed class DXDrawSnapshotArena : IDisposable
         if (resource == null) throw new ArgumentNullException(nameof(resource));
         var key = new ViewKey((nint)resource, in desc);
         if (_views.TryGetValue(key, out var captured)) return captured;
-        if (_descriptorCursor == _descriptors.Count) _descriptors.Add(Device.DescriptorAllocator.Allocate());
+        if (_descriptorCursor == _descriptors.Count) _descriptors.Add(Device.DescriptorAllocator.Allocate(DescriptorKind.Snapshot));
         int id = _descriptors[_descriptorCursor++];
         resource->AddRef();
         _retained.Add((nint)resource);

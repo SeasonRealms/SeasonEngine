@@ -46,7 +46,7 @@ internal unsafe sealed class TextGlyphBufferPool
             }
         }
 
-        int descriptorId = Device.DescriptorAllocator.Allocate();
+        int descriptorId = Device.DescriptorAllocator.Allocate(DescriptorKind.Compute);
         var buffer = Device.ResourceManager.CreateBuffer(
             HeapType.Upload,
             (ulong)(capacity * Unsafe.SizeOf<TextGlyphData>()),

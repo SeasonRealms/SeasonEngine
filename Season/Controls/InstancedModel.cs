@@ -75,6 +75,45 @@ public partial class InstancedModel : InstancedMesh3DBase
     public InstanceSkinningMode SkinningMode { get; set; } = InstanceSkinningMode.Cpu;
 
     /// <summary>
+    /// Part keys whose primitives take <see cref="MeshInstanceTransform.Color"/> as a multiplicative tint. A key matches a
+    /// glTF material name first and the owning node name second, case-insensitively -- the same rule
+    /// <see cref="Model.SetPartColor"/> uses.
+    /// <para>
+    /// Two things happen for a matching primitive at load, and both are required for the color to be usable. First, its
+    /// authored base-color RGB is rewritten to white, because the tint multiplies: a saturated authored factor (this
+    /// asset's sail is 0.97/0.93/0.0003) can only be darkened by a multiply, never turned to another hue. Second, the
+    /// primitive's material constant carries <c>TintMode = 1</c>, which is what lets the pixel shader apply the color
+    /// there and nowhere else -- the hull, glass, steel and deck paint of the same instance keep their authored look.
+    /// </para>
+    /// <para>
+    /// Empty by default, so an existing InstancedModel is untouched: every primitive keeps <c>TintMode = 0</c> and the
+    /// pixel shader never reads the per-instance color.
+    /// </para>
+    /// </summary>
+    public IReadOnlyList<string> InstanceTintParts { get; init; } = Array.Empty<string>();
+
+    /// <summary>
+    /// Whether <paramref name="partName"/> / <paramref name="nodeName"/> names a part in <see cref="InstanceTintParts"/>.
+    /// The material name wins, the node name is the fallback, and both are compared case-insensitively -- the same
+    /// precedence <see cref="Model.TryGetPartColor"/> resolves with, so one asset can be described by either key.
+    /// </summary>
+    internal bool IsInstanceTintPart(string? partName, string? nodeName)
+    {
+        var keys = InstanceTintParts;
+        for (int i = 0; i < keys.Count; i++)
+        {
+            string key = keys[i];
+            if (string.IsNullOrEmpty(key))
+                continue;
+            if (string.Equals(key, partName, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(key, nodeName, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Whether this model may take the GPU route this frame. Three things have to agree: the backend compiled the kernel
     /// (<see cref="InstanceSkinning.Enabled"/>), the effective mode asks for it, and the asset actually produced a bake. The last one
     /// is where "every animated node is a joint" and the table size ceiling are enforced, once, at load time.
@@ -98,6 +137,20 @@ public partial class InstancedModel : InstancedMesh3DBase
     {
         get => _templateCullBounds.Extents == Vector3.Zero ? TemplateLocalBounds : _templateCullBounds;
         set => _templateCullBounds = value;
+    }
+
+    /// <summary>
+    /// Load-time handoff of the three template boxes every backend consumes. Each platform used to repeat the same
+    /// three assignments (carrying the same 1-3 comment); they live here so the contract has one source of truth.
+    /// <paramref name="cullBounds"/> is the caller's clip-union expansion over
+    /// <c>templateAsset.Model.LocalBounds</c> (see <see cref="Season.Models.GltfAsset.ComputeClipUnionBounds"/>), which
+    /// has to be computed from the instance's own asset because it samples poses on it.
+    /// </summary>
+    internal void AdoptTemplateBounds(Season.Models.GltfAsset templateAsset, Bounds3D cullBounds)
+    {
+        TemplateLocalBounds = templateAsset.Model.LocalBounds;
+        TemplateLocalBoundsRaw = templateAsset.Model.LocalBoundsRaw;
+        TemplateCullBounds = cullBounds;
     }
 
     public override async Task<bool> Load()

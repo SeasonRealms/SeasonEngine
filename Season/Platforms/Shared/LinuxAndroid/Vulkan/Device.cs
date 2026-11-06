@@ -1463,18 +1463,16 @@ internal unsafe static class Device
         // reset the backbuffer-written flag so the first pass clears and later passes load.
         _backbufferWrittenThisFrame = false;
 
-        // 3) Refresh binding 16-20 of every scene set the previous frame drew.
-        // This must precede frame.Reset(): a set the command buffer already references may not be
-        // rewritten after begin without UPDATE_AFTER_BIND, and the whole buffer would be invalidated.
-        // See Pipeline.RefreshSceneBindingsForFrameStart.
-        Pipeline.RefreshSceneBindingsForFrameStart();
+        // 3B: the frame-start refresh of bindings 16-20/25 is gone. Those six view/frame-level lighting inputs now
+        // live in the per-view globals set 3, which Pipeline.PrepareViewGlobals writes for the current frame slot
+        // (that slot's previous submission is already retired, so no in-flight command buffer is ever rewritten).
 
-        // 4) Reset cmd pool + begin cmd buffer
+        // 3) Reset cmd pool + begin cmd buffer
         frame.Reset();
         GraphicsCommandBuffer = frame.CommandList;
         IsRecording = true;
 
-        // 4.5) Drain deferred texture layout transitions.
+        // 3.5) Drain deferred texture layout transitions.
         // This must happen outside passes before any CmdBeginRenderPass.
         if (_pendingTextureTransitions.Count > 0)
         {

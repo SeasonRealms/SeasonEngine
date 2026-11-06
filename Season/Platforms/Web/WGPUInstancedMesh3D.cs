@@ -23,6 +23,11 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
     public Matrix4x4[] InstanceWorlds { get; private set; } = Array.Empty<Matrix4x4>();
     public byte[] InstanceBytes { get; private set; } = Array.Empty<byte>();
 
+    /// <summary>Generic per-instance extras (binding 24): 32B per compacted slot, <c>.color</c> = that slot's
+    /// <c>InstanceSpec.Color</c>. Uploaded with the matrix stream every frame; a surface consumes it only when its
+    /// TintInstanced flag is set, so this array is the generic slot rather than a colour-only channel.</summary>
+    public byte[] InstanceExtrasBytes { get; private set; } = Array.Empty<byte>();
+
     // 2-3 Step C (contract clauses 6 + 8(b)): the other side of the double buffer for instance byte streams
     // (5 vec4 values per instance; this class has no morph path, so the 5th one is always zero).
     // A non-empty PrevInstanceBytes means the stream has been ready for two consecutive frames.
@@ -130,6 +135,7 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
         {
             InstanceWorlds = Array.Empty<Matrix4x4>();
             InstanceBytes = Array.Empty<byte>();
+            InstanceExtrasBytes = Array.Empty<byte>();
             // 2-3 Step C: all instances are disabled, so previous-frame history is discarded.
             PrevInstanceBytes = Array.Empty<byte>();
             TransformInitialized = true;
@@ -152,6 +158,13 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
             ShellPrevWorlds = new Matrix4x4[EnabledInstanceCount];
         }
 
+        // Generic per-instance extras: 32B per compacted slot, addressed by the same writeIndex as the matrix rows, so the
+        // two streams cannot drift apart when instances are disabled.
+        int extrasByteLength = EnabledInstanceCount * WGPUInstanceExtras.BytesPerInstance;
+        if (InstanceExtrasBytes.Length != extrasByteLength)
+            InstanceExtrasBytes = new byte[extrasByteLength];
+        var extrasData = MemoryMarshal.Cast<byte, float>(InstanceExtrasBytes.AsSpan());
+
         int writeIndex = 0;
         for (int i = 0; i < mesh.Instances.Count; i++)
         {
@@ -171,6 +184,17 @@ internal sealed class WGPUInstancedMesh3D : Season.Rendering.IInstanceCullTarget
                 ? InstanceWorlds[writeIndex]
                 : default;
             InstanceWorlds[writeIndex] = instanceWorld;
+
+            int extrasBase = writeIndex * WGPUInstanceExtras.FloatsPerInstance;
+            extrasData[extrasBase] = instance.Color.X;
+            extrasData[extrasBase + 1] = instance.Color.Y;
+            extrasData[extrasBase + 2] = instance.Color.Z;
+            extrasData[extrasBase + 3] = instance.Color.W;
+            // The reserved scalar is cleared every frame rather than on allocation: the array is reused when the count holds.
+            extrasData[extrasBase + 4] = 0f;
+            extrasData[extrasBase + 5] = 0f;
+            extrasData[extrasBase + 6] = 0f;
+            extrasData[extrasBase + 7] = 0f;
 
             // Outline2D (per-instance active): record the writeIndex slot and per-instance outline color
             // (per-slot mask uses per-slot color), and also capture the frame-level composited color/width from the first active instance

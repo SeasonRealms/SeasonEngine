@@ -162,6 +162,12 @@ public static class WebGPUTextureFlags
     /// The Scene pass disables depth writes through the Nd pipeline variant, so SceneDepth keeps the clear value and the GTAO sky/empty branch exempts it.
     /// WGSL checks only the existing bits (HasTexture / instancing / skinned / morph), so this new bit is harmless to the shader.</summary>
     public const int NoDepthWrite = 128;
+
+    /// <summary>Bit 8 (256): the primitive consumes the generic per-instance extras at binding 24 as a multiplicative tint
+    /// (the Web counterpart of <c>MaterialParams.TintMode</c> on DX / VK / Metal).
+    /// Set only for primitives named by <c>InstancedModel.InstanceTintParts</c>, which is what lets a hull keep its authored
+    /// look while the sail beside it cycles through colours in the same instance.</summary>
+    public const int TintInstanced = 256;
 }
 
 /// <summary>

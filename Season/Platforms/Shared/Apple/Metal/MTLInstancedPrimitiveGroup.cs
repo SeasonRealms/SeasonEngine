@@ -30,6 +30,29 @@ internal struct InstanceTransformData
 }
 
 /// <summary>
+/// One slot of the generic per-instance extras stream (VS buffer 12), byte-identical to DX's t20 record and VK's binding 26,
+/// addressed by the same <b>compacted</b> slot as the instance matrices: <c>instance_id</c> on a direct draw, the index
+/// gather's M14 stamp on an A7 indirect draw.
+/// <para>
+/// It lives outside the 80-byte <see cref="InstanceTransformData"/> on purpose. That stream is bit-identical to the A7 cull
+/// input and to the instance buffer the vertex descriptor feeds, and it is also what the text path reinterprets, so growing
+/// its stride would move culling, gather and text at once. A separate stream costs one vertex-stage read instead.
+/// </para>
+/// <para>
+/// <see cref="Color"/> is the per-instance tint the PBR path multiplies its albedo by, gated per primitive through
+/// <c>MaterialParams.TintMode</c> so a hull sharing an instance with a tinted sail keeps its authored look.
+/// <see cref="Extra"/> is unused today and is the reason this type is 32 bytes: a later per-instance scalar (wind weight,
+/// decal index, morph bias) then costs no new binding and no new buffer.
+/// </para>
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct InstanceExtras
+{
+    public Vector4 Color;
+    public Vector4 Extra;
+}
+
+/// <summary>
 /// Base class for GPU-instanced primitive groups on Metal.
 /// It centralizes instance-buffer management, transparent sorting, and three-bucket grouped rendering.
 /// Derived types include MTLInstancedModel for glTF template cloning
@@ -266,6 +289,68 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
         Device.ResourceManager.UpdateBuffer(_instanceBuffer, new ReadOnlySpan<InstanceTransformData>(data, 0, count));
     }
 
+    // ============================================================
+    // Generic per-instance extras (VS buffer 12)
+    // ============================================================
+
+    /// <summary>This frame's extras records, one per compacted instance slot, filled by the derived Update alongside
+    /// <see cref="_instanceData"/>.</summary>
+    protected InstanceExtras[] _instanceExtras = Array.Empty<InstanceExtras>();
+    IMTLBuffer[] _instanceExtrasBuffers = Array.Empty<IMTLBuffer>();
+    int _instanceExtrasCapacity;
+
+    /// <summary>
+    /// This frame's extras buffer, or null before the first Update. Metal binds per draw rather than through a descriptor
+    /// set, so nothing has to be republished when the ring is rebuilt - a stale handle cannot outlive the frame that
+    /// recorded it, because <see cref="Pipeline.DrawPrimitive"/> hands the handle to the replay queue.
+    /// </summary>
+    protected IMTLBuffer? CurrentInstanceExtras
+    {
+        get
+        {
+            int slot = InstanceFrameSlot;
+            return (uint)slot < (uint)_instanceExtrasBuffers.Length ? _instanceExtrasBuffers[slot] : null;
+        }
+    }
+
+    protected void EnsureInstanceExtrasCapacity(int count)
+    {
+        if (count <= 0 || count == _instanceExtrasCapacity)
+            return;
+
+        nuint size = (nuint)(Unsafe.SizeOf<InstanceExtras>() * count);
+        var previous = _instanceExtrasBuffers;
+        var buffers = new IMTLBuffer[Device.frameCount];
+        for (int i = 0; i < buffers.Length; i++)
+        {
+            if ((uint)i < (uint)previous.Length)
+                previous[i]?.Dispose();
+            buffers[i] = Device.ResourceManager.CreateBuffer(size);
+            // White, not zero: a slot no instance claimed this frame must multiply to itself, and a zeroed record would
+            // turn every tinted part of it black for one frame instead.
+            unsafe
+            {
+                var records = (InstanceExtras*)buffers[i].Contents;
+                for (int r = 0; r < count; r++)
+                    records[r] = new InstanceExtras { Color = Vector4.One, Extra = Vector4.Zero };
+            }
+        }
+
+        _instanceExtrasBuffers = buffers;
+        _instanceExtrasCapacity = count;
+    }
+
+    /// <summary>Copies this frame's extras records into this frame's ring slot. Not a vertex buffer like the instance
+    /// stream: it is only ever read through buffer(12).</summary>
+    protected void UploadInstanceExtras(int count)
+    {
+        var buffer = CurrentInstanceExtras;
+        if (buffer == null || count <= 0 || count > _instanceExtras.Length)
+            return;
+
+        Device.ResourceManager.UpdateBuffer(buffer, new ReadOnlySpan<InstanceExtras>(_instanceExtras, 0, count));
+    }
+
     /// <summary>Whether this group owns a previous-frame per-instance bone palette. Model-only: the generated-geometry path
     /// carries no skeletons, so its bit stays off and the shader never looks for a palette.</summary>
     protected virtual bool HasPrevBoneHistory => false;
@@ -335,7 +420,8 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
                     sortedBuffer, segmentOffset, 0, 0,
                     PrevInstanceBuffer,
                     indirectBuffer: argsBuffer,
-                    indirectOffset: Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i));
+                    indirectOffset: Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i),
+                    instanceExtrasBuffer: CurrentInstanceExtras);
                 Season.Rendering.InstanceCull.MainViewDraws++;
             }
         }
@@ -351,7 +437,7 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
                     MTLPrimitiveType.Triangle, (nuint)primitive.Indices.Length,
                         primitive.Use32BitIndices ? MTLIndexType.UInt32 : MTLIndexType.UInt16, 0,
                         _instanceBuffer, 0, (nuint)_instanceCount, 0,
-                        PrevInstanceBuffer);
+                        PrevInstanceBuffer, instanceExtrasBuffer: CurrentInstanceExtras);
             }
         }
 
@@ -375,7 +461,7 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
                         MTLPrimitiveType.Triangle, (nuint)primitive.Indices.Length,
                         primitive.Use32BitIndices ? MTLIndexType.UInt32 : MTLIndexType.UInt16, 0,
                         _instanceBuffer, instOffset, 1, 0,
-                        PrevInstanceBuffer);
+                        PrevInstanceBuffer, instanceExtrasBuffer: CurrentInstanceExtras);
                 }
 
                 Pipeline.SetPipeline(enc, PipelineMode.Transparent, false);
@@ -555,7 +641,7 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
                         MTLPrimitiveType.Triangle, (nuint)primitive.Indices.Length,
                         primitive.Use32BitIndices ? MTLIndexType.UInt32 : MTLIndexType.UInt16, 0,
                         _instanceBuffer, instOffset, 1, 0,
-                        PrevInstanceBuffer);
+                        PrevInstanceBuffer, instanceExtrasBuffer: CurrentInstanceExtras);
                 }
             }
         }
@@ -876,5 +962,14 @@ internal abstract class MTLInstancedPrimitiveGroup : MTLPrimitiveGroup, Season.R
         }
 
         _instanceBuffer = null!;
+
+        for (int i = 0; i < _instanceExtrasBuffers.Length; i++)
+        {
+            _instanceExtrasBuffers[i]?.Dispose();
+            _instanceExtrasBuffers[i] = null!;
+        }
+
+        _instanceExtrasBuffers = Array.Empty<IMTLBuffer>();
+        _instanceExtrasCapacity = 0;
     }
 }

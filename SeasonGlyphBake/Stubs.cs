@@ -54,18 +54,28 @@ namespace Season.Fonts
     {
     }
 
+    /// <summary>Compile-only stand-in for the budget exception the real atlas raises when stable pages run out.</summary>
+    internal sealed class GlyphPrewarmBudgetException : Exception
+    {
+    }
+
     /// <summary>
     /// Compile-only stand-in for the platform glyph atlas. The bake tool never pre-warms and
-    /// never instantiates this type; it exists solely so GlyphPrewarm compiles.
+    /// never instantiates this type; it exists solely so GlyphPrewarm compiles. Its surface has to
+    /// track the real GlyphAtlasManager signature, or the link breaks whenever GlyphPack changes.
     /// </summary>
     internal sealed class GlyphAtlasManager<TTexture> : IDisposable
     {
-        public bool TryEnsureStableGlyph(Font font, int size, int codePoint, out GlyphAtlasEntry entry, out TTexture texture)
+        public bool TryEnsureStableGlyph(Font font, int size, int codePoint, out GlyphAtlasEntry entry, out TTexture texture,
+            bool prewarm = false)
         {
             entry = default;
             texture = default!;
             return false;
         }
+
+        /// <summary>The bake tool allocates no stable pages, so the budget footprint stays at zero.</summary>
+        public long EstimatedStableBytes => 0;
 
         public void Dispose()
         {

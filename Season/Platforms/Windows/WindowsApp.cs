@@ -1111,6 +1111,10 @@ public static class WindowsApp
             },
             () =>
             {
+                // Before the forced releases below change these figures: the peak this session reached is what the
+                // next descriptor-capacity decision needs, and a run that never exhausted the pool reports nothing
+                // else anywhere.
+                DirectX.Device.LogDescriptorSummary();
                 if (!DirectX.Device.CanWaitForGpu()) return;
                 // WaitForGpu 在设备已移除时直接返回：栅栏不会再完成，但驱动在移除瞬间已丢弃所有记录中的
                 // 引用，因此这里可以按 GPU 空闲处理，让下面的强释放把资源真正回收，而不是泄漏到退出。

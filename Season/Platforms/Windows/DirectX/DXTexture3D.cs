@@ -111,7 +111,7 @@ internal unsafe sealed class DXTexture3D : IDisposable
                     Depth = 1,
                     _format = Format.FormatR16G16B16A16Float,
                 };
-                tex.DescriptorID = Device.DescriptorAllocator.Allocate();
+                tex.DescriptorID = Device.DescriptorAllocator.Allocate(DescriptorKind.Texture);
                 tex.CpuDescriptorHandle = Device.SrvHeapManager.GetCpuHandle(tex.DescriptorID);
                 tex.GpuDescriptorHandle = Device.SrvHeapManager.GetGpuHandle(tex.DescriptorID);
                 tex.CreateResource();
@@ -181,11 +181,11 @@ internal unsafe sealed class DXTexture3D : IDisposable
                 _format = nativeFormat,
             };
 
-            tex.DescriptorID = Device.DescriptorAllocator.Allocate();
+            tex.DescriptorID = Device.DescriptorAllocator.Allocate(DescriptorKind.Texture);
             tex.CpuDescriptorHandle = Device.SrvHeapManager.GetCpuHandle(tex.DescriptorID);
             tex.GpuDescriptorHandle = Device.SrvHeapManager.GetGpuHandle(tex.DescriptorID);
 
-            tex.UavDescriptorID = Device.DescriptorAllocator.Allocate();
+            tex.UavDescriptorID = Device.DescriptorAllocator.Allocate(DescriptorKind.Texture);
             tex.UavGpuDescriptorHandle = Device.SrvHeapManager.GetGpuHandle(tex.UavDescriptorID);
 
             tex.CreateResource();

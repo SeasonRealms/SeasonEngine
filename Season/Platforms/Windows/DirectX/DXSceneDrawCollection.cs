@@ -9,10 +9,12 @@ namespace Season.Platforms.Windows.DirectX;
 /// <summary>Stores only this frame's immutable addresses/views, not controls, primitives, or a delegate to replay Draw.</summary>
 internal unsafe struct DXSceneDrawCommand : ISceneDrawCommand
 {
-    // 29 rather than 23: the Sky-View LUT of 2-7 P0 is attached at root parameter 28 (see Pipeline.SkyViewRoot).
+    // 30 rather than 23: the Sky-View LUT of 2-7 P0 is attached at root parameter 28 and the generic per-instance
+    // extras stream at 29 (see Pipeline.SkyViewRoot / Pipeline.InstanceExtrasRoot).
     // 23..27 are not descriptor tables in the root signature (t16 is a root SRV, b6/b7 are root constants, b8 is a CBV),
-    // so the replay loop only goes up to 22, and index 28 is bound separately.
-    [System.Runtime.CompilerServices.InlineArray(29)]
+    // so the replay loop only goes up to 22, and indices 28 and 29 are bound separately. 28 is a per-pass table (bound
+    // once per replay batch); 29 is per-draw, because two instanced groups in the same batch read different streams.
+    [System.Runtime.CompilerServices.InlineArray(30)]
     internal struct Views { GpuDescriptorHandle _first; }
     internal Views Textures;
     internal PipelineMode Mode;
@@ -20,7 +22,7 @@ internal unsafe struct DXSceneDrawCommand : ISceneDrawCommand
     internal bool DepthWrite, Indexed;
     internal VertexBufferView Vertex, Instances;
     internal IndexBufferView Indices;
-    internal ulong Matrix, View, Light, Material, Bones, Text;
+    internal ulong Matrix, View, Light, Material, Text;
     internal uint Count, InstanceCount, StartInstance, BoneBase;
     // A7 main-view draw: non-null means the five draw parameters come from this GPU-written record rather than
     // Count / InstanceCount / StartInstance. Only the reference is retained -- the record does not exist on the CPU to copy.
@@ -29,8 +31,19 @@ internal unsafe struct DXSceneDrawCommand : ISceneDrawCommand
 
     public void Draw()
     {
-        Pipeline.SetPipeline(Mode, Cull, DepthWrite);
-        Pipeline.SetOutlineMaskBoneBase(BoneBase);
+        // 3A: the replay batch already owns the root signature, the b3 placeholder CBV and the seven
+        // frame/view descriptor tables -- DXSceneDrawCollection.BindPassTextures set all of them before the
+        // first command of this batch. No replayed command switches the graphics root signature in between
+        // (the fog binding writes roots of the same signature), so neither the signature set nor those eight
+        // root parameters (the b3 placeholder CBV plus seven tables) repeat per draw.
+        Pipeline.SetPipeline(Mode, Cull, DepthWrite, sceneSignatureBound: true);
+        Pipeline.SceneReplayDrawCount++;
+        // 3A micro accounting: SetPipeline always rewrites the b6 boneBase half (one root-constant call);
+        // this command then adds five CBVs and one table per non-zero texture slot.
+        int roots = 1;
+        // SetPipeline has just reset outlineMaskBoneBase to 0, which is already the value every non-mask
+        // command wants; only mask-slot renders still need the extra root-constant write.
+        if (BoneBase != 0) { Pipeline.SetOutlineMaskBoneBase(BoneBase); roots++; }
         var cmd = Device.GraphicsCommandList;
         var vertices = stackalloc VertexBufferView[2] { Vertex, Instances };
         cmd->IASetVertexBuffers(0, 2, vertices);
@@ -38,12 +51,16 @@ internal unsafe struct DXSceneDrawCommand : ISceneDrawCommand
         cmd->SetGraphicsRootConstantBufferView(Pipeline.ViewConstantsRoot, View);
         cmd->SetGraphicsRootConstantBufferView(1, Light);
         cmd->SetGraphicsRootConstantBufferView(2, Material);
-        cmd->SetGraphicsRootConstantBufferView(8, Bones);
         cmd->SetGraphicsRootConstantBufferView(11, Text);
+        roots += 5;
         for (uint root = 3; root < 23; root++)
-            if (Textures[(int)root].Ptr != 0) cmd->SetGraphicsRootDescriptorTable(root, Textures[(int)root]);
-        if (Textures[(int)Pipeline.SkyViewRoot].Ptr != 0)
-            cmd->SetGraphicsRootDescriptorTable(Pipeline.SkyViewRoot, Textures[(int)Pipeline.SkyViewRoot]);
+            if (!Pipeline.IsScenePassRoot(root) && Textures[(int)root].Ptr != 0)
+            { cmd->SetGraphicsRootDescriptorTable(root, Textures[(int)root]); roots++; }
+        // Per-instance extras (t20): per-draw rather than per-pass -- two instanced groups in one batch bind different
+        // streams -- so it is outside the table run above and written for every command that carries one.
+        if (Textures[(int)Pipeline.InstanceExtrasRoot].Ptr != 0)
+        { cmd->SetGraphicsRootDescriptorTable(Pipeline.InstanceExtrasRoot, Textures[(int)Pipeline.InstanceExtrasRoot]); roots++; }
+        Pipeline.SceneDrawRootCalls += roots;
         if (Args != null)
         {
             // The capture side only takes this path once the signature exists, so null here would be a lifetime bug, not a fallback case.
@@ -130,10 +147,24 @@ internal unsafe sealed class DXSceneDrawCollection
             throw new InvalidOperationException("Scene draw items can only be consumed in the same frame they were collected.");
     }
 
+    /// <summary>
+    /// 3A: the one pass-level bind every command in this batch shares -- root signature, the b3 placeholder CBV
+    /// and the seven frame/view descriptor tables. The handles come from this batch's own capture template, so a
+    /// view that resolved a different shadow atlas / environment cube / DDGI atlas than the previous view still
+    /// binds its own set; <see cref="Begin"/> re-captures the template per view. A batch that captured nothing has
+    /// no template and binds nothing, which is correct because such a batch replays nothing either.
+    /// </summary>
+    void BindPassTextures()
+    {
+        if (_sceneCaptured) Pipeline.BindScenePassTextures(ref _sceneTemplate);
+    }
+
     internal void DrawOpaque()
     {
         Validate();
         if (Device.ActivePassId != RenderPassId.SceneOpaque) throw new InvalidOperationException("Invalid Pass for the opaque queue.");
+        // Always bound after the empty check: an empty bucket submits no draw and must not pay for nine roots.
+        if (OpaqueCount != 0) BindPassTextures();
         _queue.DrawOpaque();
     }
 
@@ -141,6 +172,7 @@ internal unsafe sealed class DXSceneDrawCollection
     {
         Validate();
         if (Device.ActivePassId != RenderPassId.SceneOpaque) throw new InvalidOperationException("Invalid Pass for the opaque queue.");
+        // No draw is submitted, so the pass-level scene tables are not needed; the transparent stage binds its own.
         _queue.DiscardOpaque();
     }
 
@@ -149,7 +181,11 @@ internal unsafe sealed class DXSceneDrawCollection
         Validate();
         if (Device.ActivePassId != RenderPassId.SceneTransparent) throw new InvalidOperationException("Invalid Pass for the transparent queue.");
         ViewHasFog = sampleFog;
-        try { _queue.DrawTransparent(); }
+        try
+        {
+            if (TransparentCount != 0) BindPassTextures();
+            _queue.DrawTransparent();
+        }
         finally { ViewHasFog = false; }
     }
 
@@ -163,7 +199,7 @@ internal unsafe sealed class DXSceneDrawCollection
     internal void SetPipeline(PipelineMode mode, PipelineCullVariant cull, bool depthWrite)
     {
         State = new DXSceneDrawCommand { Mode = mode, Cull = cull, DepthWrite = depthWrite,
-            Bones = Pipeline.DefaultTextDrawParamsGpuAddress, Text = Pipeline.DefaultTextDrawParamsGpuAddress };
+            Text = Pipeline.DefaultTextDrawParamsGpuAddress };
     }
 
     internal static T ReadBuffer<T>(ID3D12Resource* source, ulong offset = 0) where T : unmanaged
@@ -200,6 +236,26 @@ internal unsafe sealed class DXSceneDrawCollection
         texture ??= Device.White;
         texture.EnsureReadyForRendering(Device.GraphicsCommandList);
         var resource = texture._textureResource;
+
+        // Reuse the texture's permanent SRV slot instead of capturing a copy of it into the frame arena.
+        // CreateSRV builds that slot with the same desc this method used to rebuild every frame (Texture2D,
+        // resource format, MostDetailedMip 0, and _mipLevels - the resource itself is created with
+        // MipLevels = _mipLevels), and both RecreateComputeStorage and UploadPixels keep the slot and its GPU
+        // handle while swapping or refreshing the resource behind it. Capturing a view therefore only re-derived
+        // an identical descriptor three times per texture, one per in-flight frame. The batch scene tables in
+        // Pipeline.BindSceneTextures have always bound permanent handles this way (White, shadow atlas, DDGI /
+        // cloud / sky LUTs); per-draw textures now follow the same contract. DXTexture.Dispose releases the slot
+        // on the deferred queue for the matching reason: an in-flight frame that already sampled this handle must
+        // not observe it blanked or recycled into another texture.
+        if (texture.Ready && resource != null)
+        {
+            Arena.Retain(resource);
+            return texture.GpuDescriptorHandle;
+        }
+
+        // Not uploaded yet. Keep the previous path, which captures whatever resource is current. Ready is
+        // published only after CreateSRV (see TextureUploadBatch), so the branch above can never hand out a slot
+        // that has not been filled in yet.
         var native = resource->GetDesc();
         return Arena.CaptureView(resource, new ShaderResourceViewDesc {
             Format = native.Format, ViewDimension = SrvDimension.Texture2D, Shader4ComponentMapping = 0x1688,
@@ -222,7 +278,8 @@ internal unsafe sealed class DXSceneDrawCollection
     internal void CapturePrimitive(PrimitiveData primitive, ID3D12Resource* light, ID3D12Resource* matrix,
         VertexBufferView* instanceView, ID3D12Resource* instanceResource, uint count, uint start,
         GpuDescriptorHandle bones, GpuDescriptorHandle prevBones, GpuDescriptorHandle prevWorld, GpuDescriptorHandle prevMorph,
-        ID3D12Resource* args = null, uint argsOffset = 0, ID3D12Resource* depthSource = null)
+        ID3D12Resource* args = null, uint argsOffset = 0, ID3D12Resource* depthSource = null,
+        GpuDescriptorHandle extras = default)
     {
         if (count == 0 && args == null) return;
         var draw = State;
@@ -254,6 +311,7 @@ internal unsafe sealed class DXSceneDrawCollection
         draw.Textures[14] = prevBones.Ptr != 0 ? prevBones : Pipeline.DefaultPrevBoneSrvHandle;
         draw.Textures[15] = prevWorld.Ptr != 0 ? prevWorld : Pipeline.DefaultPrevInstanceWorldSrvHandle;
         draw.Textures[16] = prevMorph.Ptr != 0 ? prevMorph : Pipeline.DefaultPrevMorphWeightsSrvHandle;
+        draw.Textures[(int)Pipeline.InstanceExtrasRoot] = extras.Ptr != 0 ? extras : Pipeline.DefaultInstanceExtrasSrvHandle;
         CaptureSceneTextures(ref draw);
         var world = Matrix4x4.Transpose(ReadBuffer<MatrixBuffer>(matrix).World);
         if (args != null && instanceView != null)
@@ -297,7 +355,7 @@ internal unsafe sealed class DXSceneDrawCollection
             Matrix = Constant(matrix, (uint)sizeof(MatrixBuffer)), Material = Constant(material, (uint)sizeof(MaterialParams)),
             View = screenSpace ? Pipeline.ScreenViewGpuAddress : ConstantRef(Pipeline.ActiveViewConstantBuffer),
             Light = Constant(DXPrimitiveGroup.lightConstantBuffers[Device.FrameIndex], (uint)sizeof(SceneLightParams)),
-            Bones = Pipeline.DefaultTextDrawParamsGpuAddress, Text = Pipeline.DefaultTextDrawParamsGpuAddress,
+            Text = Pipeline.DefaultTextDrawParamsGpuAddress,
             Vertex = Vertex(vertex, view), Instances = Pipeline.IdentityInstanceBufferView, Count = 6, InstanceCount = 1 };
         draw.Textures[3] = Texture(albedo); draw.Textures[4] = Texture(normal); draw.Textures[5] = Texture(metallic);
         draw.Textures[6] = Texture(occlusion); draw.Textures[7] = Texture(emissive);
@@ -312,7 +370,6 @@ internal unsafe sealed class DXSceneDrawCollection
             Matrix = Constant(matrix, (uint)sizeof(MatrixBuffer)), Material = Pipeline.DefaultTextMaterialGpuAddress,
             View = Pipeline.ScreenViewGpuAddress,
             Light = Constant(DXPrimitiveGroup.lightConstantBuffers[Device.FrameIndex], (uint)sizeof(SceneLightParams)),
-            Bones = Pipeline.DefaultTextDrawParamsGpuAddress,
             Text = Arena.CaptureBytes(MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref Unsafe.AsRef(in parameters), 1))).GpuAddress,
             Vertex = Pipeline.UnitQuadVertexBufferView, Instances = Vertex(instances, view), Indices = Pipeline.UnitQuadIndexBufferView,
             Indexed = true, Count = 6, InstanceCount = count };
@@ -330,6 +387,7 @@ internal unsafe sealed class DXSceneDrawCollection
         draw.Textures[14] = Pipeline.DefaultPrevBoneSrvHandle;
         draw.Textures[15] = Pipeline.DefaultPrevInstanceWorldSrvHandle;
         draw.Textures[16] = Pipeline.DefaultPrevMorphWeightsSrvHandle;
+        draw.Textures[(int)Pipeline.InstanceExtrasRoot] = Pipeline.DefaultInstanceExtrasSrvHandle;
         CaptureSceneTextures(ref draw);
     }
 }

@@ -158,6 +158,37 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
     }
 
     /// <summary>
+    /// Applies <see cref="Season.Controls.InstancedModel.InstanceTintParts"/> to the cloned primitives: matching ones get
+    /// <c>TintMode = 1</c> and their authored RGB rewritten to white.
+    /// <para>
+    /// The white rewrite is not cosmetic. The per-instance color multiplies the albedo, so a saturated authored factor
+    /// (this asset's sail is 0.97/0.93/0.0003) could only ever be darkened toward black, never turned green or blue.
+    /// Setting RGB to 1 turns the same multiply into a replacement, which is what lets one geometry pass through all
+    /// seven hues. Alpha is untouched: opacity stays with the material and the control's own Alpha chain.
+    /// </para>
+    /// <para>
+    /// Called once after <see cref="Load"/>, while no draw can see the material yet.
+    /// </para>
+    /// </summary>
+    internal void ApplyInstanceTint(Season.Controls.InstancedModel owner)
+    {
+        if (owner.InstanceTintParts.Count == 0)
+            return;
+
+        for (int i = 0; i < _primitives.Count; i++)
+        {
+            var primitive = _primitives[i];
+            if (!owner.IsInstanceTintPart(primitive.PartName, primitive.PartNodeName))
+                continue;
+
+            primitive.MaterialParams.TintMode = 1u;
+            primitive.MaterialParams.BaseColor = new Vector4(1f, 1f, 1f, primitive.MaterialParams.BaseColor.W);
+            for (int f = 0; f < Device.frameCount; f++)
+                Unsafe.Write(primitive.MappedMaterialBuffers[f], primitive.MaterialParams);
+        }
+    }
+
+    /// <summary>
     /// Clone a template primitive for instanced rendering:
     /// - VB / IB / textures -> shared references (no new GPU resources)
     /// - Matrix UBO -> created locally (World = Identity, instance transform comes from the instance buffer)
@@ -191,6 +222,11 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
 
             // Copy material parameters and apply model-level overrides
             MaterialParams = source.MaterialParams,
+            // Part identity travels with the clone: the owner's InstanceTintParts resolves against exactly these two names
+            // after loading, the same way Model.SetPartColor resolves against them on the non-instanced path.
+            PartName = source.PartName,
+            PartNodeName = source.PartNodeName,
+            PartBaseColor = source.PartBaseColor,
             OriginalBaseColorAlpha = source.OriginalBaseColorAlpha,
             OriginalAlphaCutoff = source.OriginalAlphaCutoff,
             IsTransparent = source.IsTransparent,
@@ -931,12 +967,18 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         // 2-3 Step C: create or grow the prev SSBOs
         EnsurePrevInstanceWorldCapacity(_instanceCount);
         EnsurePrevMorphWeightsCapacity(_instanceCount);
+        // Generic per-instance extras: a separate stream from the 80-byte instance data, so the cull input and the text
+        // reinterpretation of that stream stay untouched.
+        EnsureInstanceExtrasCapacity(_instanceCount);
 
         // A7 cull input: one root instance world per enabled instance, in write order. The per-primitive streams below hold
         // "node world × instance world", which differs per primitive, so none of them can stand in for the instance as a whole;
         // the cull box (model.TemplateCullBounds) is in the same model space as this root world.
         if (_instanceData.Length != _instanceCount)
+        {
             _instanceData = new InstanceTransformData[_instanceCount];
+            _instanceExtras = new InstanceExtras[_instanceCount];
+        }
 
         bool hasAnimation = _asset._animations.Count > 0;
         bool hasSkin = _skins.Count > 0;
@@ -998,6 +1040,9 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
             // (anchor pivot, see InstancedMesh3DBase)
             var instanceWorld = model.InstanceWorld(i);
             _instanceData[writeIndex] = InstanceTransformData.FromWorld(instanceWorld);
+            // The extras record rides the same compacted slot as the matrix, including on the A7 indirect path, so the VS
+            // indexes both streams with one decoded index.
+            _instanceExtras[writeIndex] = new InstanceExtras { Color = instance.Color, Extra = Vector4.Zero };
 
             // P2: the CPU cull decision is made once per instance in the control's Update; this is where it reaches the replay.
             bool instanceCulled = model.IsInstanceAnimationCulled(i);
@@ -1264,6 +1309,8 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
                 Device.ResourceManager.UpdateBuffer(stream.Buffer, stream.Data);
         }
 
+        UploadInstanceExtras(_instanceCount);
+
         // P2: instances that just came back into view get one frame of zero velocity; see WriteHistoryResets.
         WriteHistoryResets();
 
@@ -1422,25 +1469,9 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         var cmd = Device.GraphicsCommandBuffer;
         int fi = (int)Device.FrameIndex;
 
-        // Keeps the same contract as VKPrimitiveGroup.DrawShadow: a descriptor set that does not declare UPDATE_AFTER_BIND,
-        // once referenced by a command buffer being recorded, can no longer be rewritten, or the entire command buffer enters an invalid state. So bindings 16-20
-        // must be aligned before this frame's first bind — here all primitives to be projected are flushed first, and only then is the subsequent bind safe.
-        // The benefit is that the main pass's PreparePrimitive will be skipped because the ViewVersion is the same, and will not write back to the same batch of sets.
-        // The instanced model's drawing does not go through scene collection, and the main pass will not register it either, so here it also hands the primitives it has drawn to the next frame's frame-start pre-refresh.
-        for (int i = 0; i < _opaquePrimitives.Count; i++)
-        {
-            var primitive = _opaquePrimitives[i];
-            if (GetPrimitiveInstanceStream(primitive) == null)
-                continue;
-            VKSceneDrawCollection.NotePrimitiveDrawn(primitive);
-            Pipeline.RefreshSceneBindings(primitive.DescriptorSets[fi],
-                ref primitive.EnvCubeViewVersions[fi],
-                ref primitive.DdgiAtlasViewVersions[fi],
-                ref primitive.DdgiDepthViewVersions[fi],
-                ref primitive.CloudNoiseViewVersions[fi],
-                ref primitive.AerialLutViewVersions[fi],
-                ref primitive.SkyViewViewVersions[fi]);
-        }
+        // 3B: the pre-flush of bindings 16-20/25 is gone. Those six lighting inputs live in the per-view globals
+        // set 3 now, written before this view's pass chain starts, so no set this loop touches can need a rewrite
+        // after the first bind of the frame.
 
         for (int i = 0; i < _opaquePrimitives.Count; i++)
         {

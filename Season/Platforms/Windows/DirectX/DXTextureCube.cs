@@ -174,7 +174,7 @@ internal unsafe sealed class DXTextureCube : IDisposable
 
     void AllocateDescriptor()
     {
-        DescriptorID = Device.DescriptorAllocator.Allocate();
+        DescriptorID = Device.DescriptorAllocator.Allocate(DescriptorKind.Texture);
         CpuDescriptorHandle = Device.SrvHeapManager.GetCpuHandle(DescriptorID);
         GpuDescriptorHandle = Device.SrvHeapManager.GetGpuHandle(DescriptorID);
     }

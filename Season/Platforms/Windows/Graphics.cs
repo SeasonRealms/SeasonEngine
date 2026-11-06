@@ -1855,7 +1855,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             // t6: default instance bones
             cmdList->SetGraphicsRootDescriptorTable(10, Pipeline.DefaultInstanceBoneSrvHandle);
 
-            // b3: bone CBV (text does not use it, but it must still be bound to satisfy D3D12 validation)
+            // b3: retired bone CBV slot; text never reads it, but D3D12 validation requires a valid CBV here
             cmdList->SetGraphicsRootConstantBufferView(8, _textMatrixBuffer->GetGPUVirtualAddress());
 
             // Single instanced draw: glyph data is indexed directly from the current Texts t5 SRV by instanceID.
@@ -2797,6 +2797,11 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             var dxInstancedModel = new DXInstancedModel(model.ModelName);
             dxInstancedModel.Load(template, wrapperModel, model.SkinningMode);
 
+            // Opted-in parts take the per-instance tint and give up their authored RGB, which is what turns the
+            // multiply into a replacement. Done here rather than inside Load because only the control knows which
+            // parts asked for it, and no draw can see this material yet.
+            dxInstancedModel.ApplyInstanceTint(model);
+
             // A7: replay the clips on the instance's own runtime asset before it is published through model.Asset (picking reads
             // its node tree), since sampling poses it; nothing else holds it yet. The shared template's player is never touched.
             var cullBounds = dxInstancedModel._asset.ComputeClipUnionBounds(template._asset.Model.LocalBounds);
@@ -2804,14 +2809,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             // v2 picking: inject the instantiated GltfAsset so the node tree, animation, and bone
             // palette share the same source as instanced rendering.
             model.Asset = dxInstancedModel._asset;
-
-            // 1-3: backfill the control with the shared template local box
-            // (instance-level sphere quick-reject data, once at load time).
-            model.TemplateLocalBounds = template._asset.Model.LocalBounds;
-            // Unified placement convention: likewise backfill the original box
-            // (data source for instance anchors and per-axis scaling, before animation expansion).
-            model.TemplateLocalBoundsRaw = template._asset.Model.LocalBoundsRaw;
-            model.TemplateCullBounds = cullBounds;
+            model.AdoptTemplateBounds(template._asset, cullBounds);
 
             // Fill animation metadata.
             var animNames = dxInstancedModel.GetAnimationNames();
@@ -3273,10 +3271,10 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         => DirectX.Device.RenderPostUber(sceneColor, ResolveBloomTexture(), ResolveAoTexture(),
             ResolveSceneOverrideTexture());
 
-    /// <summary>Resolves bloom-chain output from the instance dictionary through FrameSchedule.BloomTexture (null = no bloom).</summary>
+    /// <summary>Resolves bloom-chain output from the instance dictionary through the view's <see cref="Season.Rendering.FrameTextureSlot.Bloom"/> slot (null = no bloom).</summary>
     DXTexture ResolveBloomTexture()
     {
-        var bloomName = Season.Rendering.FrameSchedule.BloomTexture;
+        var bloomName = Season.Rendering.FrameSchedule.TextureName(Season.Rendering.FrameTextureSlot.Bloom);
         if (bloomName == null)
             return null;
         lock (DictionaryDXTexture)
@@ -3300,11 +3298,11 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     }
 
     /// <summary>2-3 Contract clause 12: resolves TAA resolve output from the instance dictionary
-    /// through FrameSchedule.SceneColorOverride
+    /// through the view's <see cref="Season.Rendering.FrameTextureSlot.SceneColorResolve"/> slot
     /// (null = no override, and the Device falls back to the SceneColor RT with no residue).</summary>
     DXTexture ResolveSceneOverrideTexture()
     {
-        var sceneName = Season.Rendering.FrameSchedule.SceneColorOverride;
+        var sceneName = Season.Rendering.FrameSchedule.TextureName(Season.Rendering.FrameTextureSlot.SceneColorResolve);
         if (sceneName == null)
             return null;
         lock (DictionaryDXTexture)

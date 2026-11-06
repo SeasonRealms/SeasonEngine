@@ -87,6 +87,15 @@ internal class WGPUPrimitiveData
     public Vector4 BaseColor;
     public float OriginalBaseColorAlpha;
     public float AlphaCutoff;
+
+    /// <summary>glTF material name: the primary key <c>Model.SetPartColor</c> resolves against.</summary>
+    public string? PartName;
+
+    /// <summary>Owning node name: the fallback key for primitives that carry no material.</summary>
+    public string? PartNodeName;
+
+    /// <summary>Load-time RGB baseline (MaterialColor already folded in) restored when a part override is cleared.</summary>
+    public Vector3 PartBaseColor = Vector3.One;
     public uint AlphaMode;
     public bool IsTransparent;
     public uint RenderMode;
@@ -141,6 +150,23 @@ internal class WGPUPrimitiveData
     public string LastMRTextureName;
     public string LastAOTextureName;
     public string LastEmissiveTextureName;
+}
+
+/// <summary>
+/// Layout of one generic per-instance extras record (storage binding 24): <c>color</c> vec4 + <c>extra</c> vec4, 32B,
+/// byte-identical to DX's t20 record, VK's binding 26 struct and Metal's buffer 12 struct. It is addressed by the same
+/// <b>compacted</b> instance slot as the instance matrices, and deliberately lives outside the 80B instance stream: that stream
+/// is bit-identical to the A7 cull input and to what the text path reinterprets, so growing its stride would move all three.
+/// <para>
+/// <c>color</c> is the per-instance tint, applied only where the primitive's <see cref="WebGPUTextureFlags.TintInstanced"/> bit
+/// is set. <c>extra</c> is unused today and is the reason the record is 32B: a later per-instance scalar (wind weight, decal
+/// index, morph bias) then costs no new binding, no new buffer and no new stride.
+/// </para>
+/// </summary>
+internal static class WGPUInstanceExtras
+{
+    public const int BytesPerInstance = 32;
+    public const int FloatsPerInstance = 8;
 }
 
 sealed class PendingStaticMeshUpload

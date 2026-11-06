@@ -171,7 +171,6 @@ internal unsafe class DXSprite2D : DXSpriteQuad
         bool flipX, flipY;
         Vector4 color;
         Season.Controls.TextureType textureType;
-        float factor;
 
         if (SpriteRef != null)
         {
@@ -188,7 +187,6 @@ internal unsafe class DXSprite2D : DXSpriteQuad
             flipY = SpriteRef.FlipY;
             color = SpriteRef.Color;
             textureType = SpriteRef.TextureType;
-            factor = SpriteRef.Factor;
             sourceWidth = SpriteRef.SourceWidth;
             sourceHeight = SpriteRef.SourceHeight;
         }
@@ -206,7 +204,6 @@ internal unsafe class DXSprite2D : DXSpriteQuad
             flipY = t.FlipY;
             color = t.Color;
             textureType = t.TextureType;
-            factor = t.Factor;
             sourceWidth = t.SourceWidth;
             sourceHeight = t.SourceHeight;
         }
@@ -257,8 +254,7 @@ internal unsafe class DXSprite2D : DXSpriteQuad
             UseMetallicRoughnessMap = MetallicRoughnessMap != null ? 1u : 0u,
             UseOcclusionMap = OcclusionMap != null ? 1u : 0u,
             UseEmissiveMap = EmissiveMap != null ? 1u : 0u,
-            RenderMode = renderMode,
-            Padding1 = factor,
+            RenderMode = renderMode
         };
 
         var scaleMatrix = Matrix4x4.CreateScale(scaleVec);

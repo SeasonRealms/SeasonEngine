@@ -6,12 +6,13 @@ namespace Season.Rendering;
 
 /// <summary>
 /// Fixed pass slots. The enum order is the execution order (no Frame Graph).
-/// Scene is always active; Shadow/Post are optional slots (wired in Step 3, populated by 1-5/later post effects), and empty slots are zero-cost.
+/// The scene is always active (as SceneOpaque then SceneTransparent); Shadow/Post are optional slots (wired in Step 3,
+/// populated by 1-5/later post effects), and empty slots are zero-cost.
 /// </summary>
 public enum RenderPassId
 {
     Shadow,     // Enabled in 1-5 (depth-only)
-    Scene,      // Main scene (all content for now; outputs linear HDR RT in 1-4 HDR mode, see RenderQuality)
+    Scene,      // Legacy single scene pass: the scheduler no longer opens it (the scene always runs as SceneOpaque/SceneTransparent). The value is kept for pass-ABI compatibility.
     Post,       // Optional post-process slot (2-1 clause 4 / 2-3 clause 17: the tonemap(+bloom+AO) uber composite outputs LDR PostColor)
     OutlineMask, // Windows DX only: Outline2D object mask pass
     FinalBlit,  // Off-screen -> backbuffer (enabled in Step 2; HDR sources use the tonemap(+bloom) variant, and degrade to an LDR resolve when Post is active - see PostResolve and the RenderQuality 1-4 contract revision 1)
@@ -162,18 +163,22 @@ public struct PassDesc
 /// </summary>
 public static class FrameSchedule
 {
+    // Stage 2A: everything that belongs to one frame lives on this instance. The static members below stay as
+    // forwarders, so the ~250 existing readers keep working unchanged while the storage becomes per-frame/per-view.
+    static readonly FrameState Frame = new();
+
     /// <summary>Target set of the main view. Backends write the scene targets onto the static members below
     /// during initialization, and those members forward here, so every existing registration site keeps working.</summary>
-    public static ViewTargets PrimaryTargets { get; } = new(0, "main");
+    public static ViewTargets PrimaryTargets => Frame.Main;
 
     /// <summary>The view currently being executed. Every static target member in this class forwards onto it,
     /// which is what lets the same pass chain run twice in one frame without touching the ~250 existing readers.</summary>
-    public static ViewTargets ActiveTargets { get; private set; } = PrimaryTargets;
+    public static ViewTargets ActiveTargets => Frame.Active;
 
     /// <summary>Views rendered after the main view (minimap, rear mirror, XR second eye). Empty by default, i.e. the
     /// single-view shape: the backend prepares the main view before the frame and <see cref="PrimaryTargets"/> is the
     /// only target set. Registering a view here is what turns the frame loop multi-view.</summary>
-    public static readonly List<ViewSlot> Views = new();
+    public static List<ViewSlot> Views => Frame.Views;
 
     /// <summary>Hard limit on view slots, main view included. Backends size their per-view constant-buffer pools from
     /// this number, so it is the single source of truth: raising it here is what raises the limit everywhere.</summary>
@@ -221,7 +226,7 @@ public static class FrameSchedule
 
     /// <summary>Frames rendered so far. Owned by the scheduler because per-view pacing
     /// (<see cref="RenderView.UpdateInterval"/>) has to agree on what "this frame" means; backends only read it.</summary>
-    public static ulong FrameIndex { get; private set; }
+    public static ulong FrameIndex => Frame.Index;
 
     /// <summary>
     /// Resets the frame index to zero. The only caller is the pixel-by-pixel A/B forensics hook.
@@ -232,15 +237,15 @@ public static class FrameSchedule
     /// then drawn with a different noise pattern, and the pixel-by-pixel comparison is drowned in this "meaningless
     /// difference". The normal path never calls it.
     /// </summary>
-    public static void ResetFrameIndex() => FrameIndex = 0;
+    public static void ResetFrameIndex() => Frame.Index = 0;
 
     /// <summary>Feature flags of the view being executed right now. Read by <see cref="RecordPhase"/> so a compute
     /// effect that a view switched off is never even recorded.</summary>
-    public static ViewFeature ActiveFeatures { get; private set; } = ViewFeature.All;
+    public static ViewFeature ActiveFeatures => Frame.ActiveFeatures;
 
     /// <summary>Shadow policy of the view being executed right now. Read by the backends at shadow-binding time, which
     /// happens while the view's draws are collected, i.e. after the scheduler set this.</summary>
-    public static ViewShadowPolicy ActiveShadowPolicy { get; private set; } = ViewShadowPolicy.Shared;
+    public static ViewShadowPolicy ActiveShadowPolicy => Frame.ActiveShadowPolicy;
 
     /// <summary>Invoked once after the last view of the frame, before the Overlay pass. Backends use it to restore
     /// frame-wide state that the per-view loop left bound (on DX: which view's constant buffer is active).</summary>
@@ -418,7 +423,7 @@ public static class FrameSchedule
 
     /// <summary>A0.1 particle indirect-draw entry. Prepare hands over the parameters and resolves resources outside the scene
     /// pass, and returning false means this frame gives up submission; Submit submits once at the end of the scene's transparent
-    /// stage (right after the full Scene draw when not segmented), adding neither a pass nor an attachment.
+    /// stage, adding neither a pass nor an attachment.
     /// Particles therefore always land after all transparent primitives, an accepted sorting compromise: interleaving with
     /// SceneDrawQueue would require reading back the GPU-determined instance count in advance.
     ///
@@ -429,18 +434,18 @@ public static class FrameSchedule
 
     // The subset that prepared successfully this frame. Prepare is outside the pass and Submit is inside it, with
     // BeginPass in between, so "who handed over successfully" has to be recorded: asking again inside the pass would
-    // break Prepare's one-shot semantics.
-    static readonly List<IParticleSubmitter> _preparedParticles = new();
+    // break Prepare's one-shot semantics. Owned by FrameState because it is hand-off state of one view, not a global.
 
     /// <summary>Hands over the registered particle systems one by one, returning whether at least one must submit inside this
     /// pass. Called by the frame loop before BeginPass; the acceptance project uses it to drive a single frame.</summary>
     public static bool PrepareParticles(IGraphics g, RenderTarget? color)
     {
-        _preparedParticles.Clear();
+        var prepared = Frame.PreparedParticles;
+        prepared.Clear();
         if (color == null) return false;
         for (int i = 0; i < ParticleSubmitters.Count; i++)
-            if (ParticleSubmitters[i].Prepare(g, color)) _preparedParticles.Add(ParticleSubmitters[i]);
-        return _preparedParticles.Count > 0;
+            if (ParticleSubmitters[i].Prepare(g, color)) prepared.Add(ParticleSubmitters[i]);
+        return prepared.Count > 0;
     }
 
     /// <summary>Submits the particle systems handed over successfully this frame and clears the table immediately, so each
@@ -449,16 +454,25 @@ public static class FrameSchedule
     /// its own state transitions on failure, and this only aggregates.</summary>
     public static int SubmitParticles(IGraphics g)
     {
+        var prepared = Frame.PreparedParticles;
         int drawn = 0;
-        for (int i = 0; i < _preparedParticles.Count; i++)
-            if (_preparedParticles[i].Submit(g)) drawn++;
-        _preparedParticles.Clear();
+        for (int i = 0; i < prepared.Count; i++)
+            if (prepared[i].Submit(g)) drawn++;
+        prepared.Clear();
         return drawn;
     }
 
-    public static bool SceneCollectionActive { get; private set; }
+    public static bool SceneCollectionActive => Frame.CollectionActive;
+
+    /// <summary>
+    /// Opens or closes the scene-collection window outside <see cref="ExecutePasses"/>. Production opens it at the
+    /// start of the segmented route, and every backend collector (plus <c>Panel</c>) reads the flag before capturing
+    /// a draw; the setter is exposed so diagnostics and acceptance harnesses that drive collection directly can
+    /// mirror the scheduler instead of reflecting into private state.
+    /// </summary>
+    public static void SetSceneCollectionActive(bool active) => Frame.CollectionActive = active;
     /// <summary>Hierarchical sort context for segmented collection; primitive commands capture Current and must not keep control references.</summary>
-    public static SceneDrawOrderContext SceneDrawOrder { get; } = new();
+    public static SceneDrawOrderContext SceneDrawOrder => Frame.DrawOrder;
 
     /// <summary>This frame has chosen the opaque/transparent split; the fog compute publishes its output only on this route.</summary>
     public static bool SceneSegmented => ActiveTargets.SceneSegmented;
@@ -466,9 +480,14 @@ public static class FrameSchedule
     /// <summary>Consumers after TAA use this entry; TAA itself only reads EffectiveSceneColor.</summary>
     public static ComputeResourceRef EffectiveSceneSource => ActiveTargets.EffectiveSceneSource;
 
-    /// <summary>AO enters final post-processing only when it was generated this frame and has not yet been consumed in the HDR composite.</summary>
-    public static bool AoReady { get; internal set; }
-    public static bool AoComposited { get; private set; }
+    /// <summary>AO enters final post-processing only when this view generated it this frame and has not yet consumed it in the HDR composite.</summary>
+    public static bool AoReady
+    {
+        get => ActiveTargets.AoReady;
+        internal set => ActiveTargets.AoReady = value;
+    }
+
+    public static bool AoComposited => ActiveTargets.AoComposited;
     public static string? PostAoTexture => AoReady && !AoComposited ? AoTexture : null;
 
     /// <summary>Must be published after the independent HDR target has finished writing; the input target must not be used as the composite output.</summary>
@@ -484,66 +503,51 @@ public static class FrameSchedule
         if (consumedAo && !AoReady)
             throw new InvalidOperationException("Cannot consume AO that has not been generated yet this frame.");
         ActiveTargets.CompleteSceneColor = target;
-        AoComposited |= consumedAo;
+        ActiveTargets.AoComposited |= consumedAo;
     }
 
     /// <summary>When an effect retires or rebuilds its target, immediately revoke the effective color source pointing at the old target (every view must be cleared).</summary>
     internal static void ForgetSceneComposite(RenderTarget target)
     {
-        bool live = Retire(PrimaryTargets);
-        for (int i = 0; i < Views.Count; i++) live |= Retire(Views[i].Targets);
-        if (live) AoComposited = false;
-
-        bool Retire(ViewTargets targets)
-        {
-            bool hadComposite = ReferenceEquals(targets.CompleteSceneColor, target);
-            targets.ForgetSceneComposite(target);
-            return hadComposite;
-        }
+        PrimaryTargets.ForgetSceneComposite(target);
+        for (int i = 0; i < Views.Count; i++) Views[i].Targets.ForgetSceneComposite(target);
     }
 
-    static SceneLightParams _pendingLights, _frameLights;
-    static Matrix4x4 _pendingView, _pendingProjection, _pendingUnjitteredViewProjection;
-    static BaseApp? _pendingLightingApp;
-    static bool _lightingPending;
+    /// <summary>The lighting copy finally uploaded by the backend for the view being executed, containing that view's
+    /// light order, CSM, spot, ambient and cloud parameters. Backends capture it once per view (PrepareView), so two
+    /// views in one frame never read each other's matrices.</summary>
+    public static ref readonly SceneLightParams LightingSnapshot => ref Frame.ActiveSnapshot.Lights;
+    public static bool LightingSnapshotValid => Frame.ActiveSnapshot.Valid;
+    public static Matrix4x4 RenderView => Frame.ActiveSnapshot.View;
+    public static Matrix4x4 RenderProjection => Frame.ActiveSnapshot.Projection;
+    public static Matrix4x4 UnjitteredRenderViewProjection => Frame.ActiveSnapshot.UnjitteredViewProjection;
 
-    /// <summary>The lighting copy finally uploaded by the backend, containing this frame's light order, CSM, spot, ambient and cloud parameters.</summary>
-    public static ref readonly SceneLightParams LightingSnapshot => ref _frameLights;
-    public static bool LightingSnapshotValid { get; private set; }
-    public static Matrix4x4 RenderView { get; private set; }
-    public static Matrix4x4 RenderProjection { get; private set; }
-    public static Matrix4x4 UnjitteredRenderViewProjection { get; private set; }
+    /// <summary>Snapshot slot of one view, by reference. Production reads it through the four forwarders above; the
+    /// reference is exposed so diagnostics and the acceptance harness can pose a view's camera terms, or inspect a
+    /// secondary view's snapshot, without running a backend lighting upload.</summary>
+    public static ref FrameState.ViewSnapshot ViewSnapshotOf(int viewIndex) => ref Frame.Snapshot(viewIndex);
 
     /// <summary>Called by the backend only at the final lighting upload point; does not modify the shared light UBO.</summary>
     public static void CaptureLighting(in SceneLightParams lights, in Matrix4x4 view,
         in Matrix4x4 projection, in Matrix4x4 unjitteredViewProjection)
-    {
-        _pendingLights = lights;
-        _pendingView = view;
-        _pendingProjection = projection;
-        _pendingUnjitteredViewProjection = unjitteredViewProjection;
-        _pendingLightingApp = DeviceServices.BaseApp;
-        _lightingPending = true;
-    }
+        => Frame.Capture(lights, view, projection, unjitteredViewProjection);
 
     static void BeginSceneFrame(BaseApp app)
     {
-        // Per-view state is reset by ViewTargets.BeginFrame inside ExecuteView; here only the frame-level (view-independent) state is reset.
-        AoReady = false;
-        AoComposited = false;
-        SceneCollectionActive = false;
-        ActiveTargets = PrimaryTargets;
+        // Per-view state is reset by ViewTargets.BeginFrame inside ExecuteView; here the frame-level state is reset:
+        // every view's snapshot expires, then the main view's capture (made at the camera update point, before the
+        // frame) is promoted. A secondary view promotes its own capture inside ExecuteView, after PrepareView.
+        Frame.BeginFrame();
+        Frame.Activate(Frame.Main);
+        // AO publication is per view; reset the main slot here as well, because a frame may run without entering
+        // ExecuteView (diagnostics, tests) and then no ViewTargets.BeginFrame would clear it.
+        Frame.Main.AoReady = false;
+        Frame.Main.AoComposited = false;
         // Outside a view the whole layer set is visible: the shadow atlas is frame-wide, and diagnostics/tests that
         // draw without entering a view must never be culled by whichever mask ran last.
         Season.Rendering.RenderView.CurrentLayerMask = uint.MaxValue;
-        ActiveShadowPolicy = ViewShadowPolicy.Shared;
-        LightingSnapshotValid = _lightingPending && ReferenceEquals(_pendingLightingApp, app);
-        _frameLights = LightingSnapshotValid ? _pendingLights : default;
-        RenderView = LightingSnapshotValid ? _pendingView : default;
-        RenderProjection = LightingSnapshotValid ? _pendingProjection : default;
-        UnjitteredRenderViewProjection = LightingSnapshotValid ? _pendingUnjitteredViewProjection : default;
-        _lightingPending = false;
-        _pendingLightingApp = null;
+        Frame.ActiveShadowPolicy = ViewShadowPolicy.Shared;
+        Frame.Promote(0, app);
     }
 
     /// <summary>Explicit depth target for the Scene pass (2-2 contract clause 2: full-size depth-only D32Float, registered by the backend
@@ -606,14 +610,25 @@ public static class FrameSchedule
 
     /// <summary>2-1 Step B: backend texture-dictionary registration name of the bloom-chain output texture (null = no bloom, so FinalBlit uses the existing variant with zero leftovers).
     /// Written after BloomEffect.Initialize succeeds and cleared on Dispose; backend FinalBlit (the tonemap variant side) resolves it by name and adds it in linear space before ACES
-    /// (scene + bloom x RenderQuality.BloomIntensity, see the RenderQuality 2-1 contract).</summary>
-    public static string? BloomTexture;
+    /// (scene + bloom x RenderQuality.BloomIntensity, see the RenderQuality 2-1 contract).
+    /// Per-view: the chain is built from the active view's resolved scene color and scoped by <see cref="ViewTargets.Scope"/>, so the value forwards to <see cref="ActiveTargets"/>.
+    /// Stage 2B: the value itself lives in that view's <see cref="FrameTextureTable"/> under <see cref="FrameTextureSlot.Bloom"/>.</summary>
+    public static string? BloomTexture
+    {
+        get => TextureName(FrameTextureSlot.Bloom);
+        set => ActiveTargets.BloomOutput = value;
+    }
 
     /// <summary>2-2 Step B (contract clause 5): backend texture-dictionary registration name of the GTAO-chain output texture (null = no AO,
     /// so the composite path uses the existing variant with zero leftovers, same shape as BloomTexture). Written after GtaoEffect.Initialize succeeds
     /// and cleared on Dispose; the backend resolves it by name at the final HDR->LDR composite point before presentation and multiplies it in linear space before ACES
-    /// (scene x lerp(1, ao, RenderQuality.AoIntensity), see the RenderQuality 2-2 contract).</summary>
-    public static string? AoTexture;
+    /// (scene x lerp(1, ao, RenderQuality.AoIntensity), see the RenderQuality 2-2 contract).
+    /// Per-view: same forwarding rule as <see cref="BloomTexture"/>; stage 2B stores it under <see cref="FrameTextureSlot.Ao"/>.</summary>
+    public static string? AoTexture
+    {
+        get => TextureName(FrameTextureSlot.Ao);
+        set => ActiveTargets.AoOutput = value;
+    }
 
     /// <summary>2-3 contract clause 12: downstream scene-source override (backend texture-dictionary registration name, same shape as BloomTexture).
     /// When non-null, the scene source for both bloom input and the final HDR->LDR composite point before presentation
@@ -622,11 +637,45 @@ public static class FrameSchedule
     /// (so Execute in this class does not need to change either pass scheduling or blitSource selection, and the override is resolved by name at the backend composite entry).
     /// Written every frame by TaaEffect (the ping-pong writer for the current frame, see clause 11), and set to null when bypassed or disposed;
     /// null = the whole chain falls back to SceneColor, with zero leftovers.
-    /// Per-view: stored on <see cref="ViewTargets"/>, so two views in one frame keep separate resolved sources.</summary>
+    /// Per-view: stored on <see cref="ViewTargets"/>, so two views in one frame keep separate resolved sources; stage 2B stores it under
+    /// <see cref="FrameTextureSlot.SceneColorResolve"/>.</summary>
     public static string? SceneColorOverride
     {
-        get => ActiveTargets.SceneColorOverride;
+        get => TextureName(FrameTextureSlot.SceneColorResolve);
         set => ActiveTargets.SceneColorOverride = value;
+    }
+
+    /// <summary>
+    /// Stage 2B: the single read entry for a published intermediate. View-scoped slots resolve against
+    /// <see cref="ActiveTargets"/>; frame-global slots against <see cref="FrameState.Textures"/>. Consumers never
+    /// touch the raw string fields, so "which view owns this" is decided in one place
+    /// (<see cref="FrameTextureScopeRules.IsGlobal"/>) instead of once per backend.
+    /// </summary>
+    public static string? TextureName(FrameTextureSlot slot)
+        => FrameTextureScopeRules.IsGlobal(slot)
+            ? Frame.Textures.NameOf(slot)
+            : ActiveTargets.Textures.NameOf(slot);
+
+    /// <summary>Slot handle of the current view (or of the frame for a global slot). Stale-checked by <see cref="TryResolveTexture"/>.</summary>
+    public static FrameTextureHandle TextureHandle(FrameTextureSlot slot)
+        => FrameTextureScopeRules.IsGlobal(slot)
+            ? Frame.Textures.Handle(slot)
+            : ActiveTargets.Textures.Handle(slot);
+
+    /// <summary>
+    /// Resolves a handle taken earlier. False means the entry was rebuilt or revoked in between (generation
+    /// moved on) or the owning view has retired - the case plain strings could not distinguish, because a rebuild
+    /// keeps the same name. Diagnostics and backends that cache bindings use this to decide whether to re-resolve.
+    /// </summary>
+    public static bool TryResolveTexture(in FrameTextureHandle handle, out string? name)
+    {
+        if (handle.View < 0) return Frame.Textures.TryResolve(handle, out name);
+        if (handle.View == 0) return PrimaryTargets.Textures.TryResolve(handle, out name);
+        for (int i = 0; i < Views.Count; i++)
+            if (Views[i].Targets.Index == handle.View)
+                return Views[i].Targets.Textures.TryResolve(handle, out name);
+        name = null;
+        return false;
     }
 
     /// <summary>2-3 contract clauses 14/15: whether TAA resolve is actually active for this frame (set every frame by TaaEffect).
@@ -642,29 +691,48 @@ public static class FrameSchedule
     /// <summary>The view whose matrices the scene is currently being prepared / drawn with. Set by each backend right
     /// after it prepares the view at its per-frame camera update point; read through <see cref="Season.Rendering.RenderView.Current"/>.
     /// Null before the first prepared frame (Current then falls back to the main view).</summary>
-    public static Season.Rendering.RenderView? CurrentView { get; set; }
+    public static Season.Rendering.RenderView? CurrentView
+    {
+        get => Frame.CurrentView;
+        set => Frame.CurrentView = value;
+    }
 
     /// <summary>2-5 Step A: backend texture-dictionary registration name of the procedural-sky Sky-View LUT (null = the procedural tier is not active,
     /// so the app-side skybox falls back to static cube textures, with zero leftovers; same shape as BloomTexture). Written after SkyAtmosphereEffect.Initialize
     /// succeeds and cleared on Dispose; this is the **only criterion** for whether procedural sky is available, so the app layer uses it during construction to decide
     /// whether the skybox faces should use the LUT (Surface.ProceduralSky=true, PS renderMode==3 reconstructs LUT uv from world view direction)
-    /// or static face textures. Therefore the backend degrades automatically when shader sources are missing, compute is unsupported, or the quality tier is StaticCube.</summary>
-    public static string? SkyViewTexture;
+    /// or static face textures. Therefore the backend degrades automatically when shader sources are missing, compute is unsupported, or the quality tier is StaticCube.
+    /// Stage 2B: frame-global slot <see cref="FrameTextureSlot.SkyView"/>.</summary>
+    public static string? SkyViewTexture
+    {
+        get => Frame.Textures.NameOf(FrameTextureSlot.SkyView);
+        set => Frame.Textures.Publish(FrameTextureSlot.SkyView, value);
+    }
 
     /// <summary>2-5 Step C: backend texture-dictionary registration name of the prebaked cloud-noise texture (same shape as <see cref="SkyViewTexture"/>).
     /// This is the **only criterion** for whether procedural clouds are available: <c>SkyLighting.Apply</c> only uploads cloud parameters when it is non-null;
     /// otherwise <c>CloudParams0.w</c> (layer count) stays 0 so the consumer side skips everything.
     /// This gate is required and cannot rely on layer count alone: DX must bind t14 on every draw, and the fallback texture before readiness is 1x1 white;
-    /// feeding white noise into density remapping is equivalent to maxing out density, which produces a solid dead-gray fake overcast sky.</summary>
-    public static string? CloudNoiseTexture;
+    /// feeding white noise into density remapping is equivalent to maxing out density, which produces a solid dead-gray fake overcast sky.
+    /// Stage 2B: frame-global slot <see cref="FrameTextureSlot.CloudNoise"/>.</summary>
+    public static string? CloudNoiseTexture
+    {
+        get => Frame.Textures.NameOf(FrameTextureSlot.CloudNoise);
+        set => Frame.Textures.Publish(FrameTextureSlot.CloudNoise, value);
+    }
 
     /// <summary>2-5 Step E: backend **3D** texture-dictionary registration name of the aerial-perspective 3D LUT (same shape as the two entries above,
     /// but it points into the 3D dictionary, so backends must not resolve it from the 2D dictionary; see 1-8).
     /// This is the **only criterion** for whether aerial perspective is available: <c>SkyLighting.ApplyAerial</c> only uploads <c>ApParams0</c> when it is non-null;
     /// otherwise it explicitly writes zeros so the consumer side skips everything.
     /// Unlike cloud noise, this gate is **not required for correctness** (the DX fallback is a 1x1x1 zero-filled volume, which is the identity element in the composite formula);
-    /// it only saves one meaningless trilinear sample.</summary>
-    public static string? AerialLutTexture;
+    /// it only saves one meaningless trilinear sample.
+    /// Stage 2B: frame-global slot <see cref="FrameTextureSlot.AerialLut"/>.</summary>
+    public static string? AerialLutTexture
+    {
+        get => Frame.Textures.NameOf(FrameTextureSlot.AerialLut);
+        set => Frame.Textures.Publish(FrameTextureSlot.AerialLut, value);
+    }
 
     // -- 1-6 compute-phase registry: kernel registration model (no "main shader", all kernels are peers), and effects attach to fixed points in the frame;
     // an empty table is zero-cost (for iteration with no enumerator allocation); registration/unregistration is restricted to the frame-loop thread, matching the callback contract in this class. --
@@ -948,7 +1016,7 @@ public static class FrameSchedule
     static void ExecuteFrame(IGraphics g, BaseApp app, in Vector4 clearColor)
     {
         BeginSceneFrame(app);
-        FrameIndex++;
+        Frame.AdvanceFrame();
 
         // Contract 1-9: every platform reaches a frame through this one method, so it is where the shared statistics are
         // sampled. It must stay before any draw: a frame that throws still counts as a frame the engine tried to present.
@@ -1061,7 +1129,7 @@ public static class FrameSchedule
         }
 
         // Restore the default so post-frame readers (diagnostics, tests, the next frame's setup) see the main view.
-        ActiveTargets = PrimaryTargets;
+        Frame.Activate(Frame.Main);
         CurrentView = app.MainView;
         Season.Rendering.RenderView.CurrentLayerMask = uint.MaxValue;
         AfterViews?.Invoke(g);
@@ -1091,11 +1159,15 @@ public static class FrameSchedule
     }
 
     /// <summary>
-    /// Executes the complete pass chain of one view: scene (possibly split into opaque/transparent with the fog and
-    /// weather composites in between), the per-view compute phases, the Post slot and finally the present blit.
+    /// Executes the complete pass chain of one view: the scene (always collected and replayed as opaque then transparent,
+    /// with the fog/weather/water composites optionally in between), the per-view compute phases, the Post slot and
+    /// finally the present blit.
     ///
     /// <para>Every static target member read below is routed to <paramref name="targets"/> through
     /// <see cref="ActiveTargets"/>, so the same code path serves the main view and any additional view.</para>
+    ///
+    /// <para><paramref name="g"/> must implement <see cref="ISegmentedSceneGraphics"/>: the scene is always collected and then
+    /// replayed as an opaque and a transparent bucket, and a backend without that contract is rejected before this view starts.</para>
     ///
     /// <para><paramref name="view"/> is null only in the single-view shape; the view whose constants are active is then
     /// <see cref="CurrentView"/>, which <see cref="PrepareView"/> receives as well, so both shapes upload exactly once.
@@ -1111,22 +1183,35 @@ public static class FrameSchedule
             view.Targets = targets;
             CurrentView = view;
         }
-        ActiveTargets = targets;
+        Frame.Activate(targets);
         targets.BeginFrame();
 
         // P3 per-view policy. The main view keeps the pre-P3 defaults, so nothing changes unless an app opts out.
         var activeView = view ?? Season.Rendering.RenderView.Current;
         var features = activeView.Features;
-        ActiveFeatures = features;
-        ActiveShadowPolicy = activeView.ShadowPolicy;
+        Frame.ActiveFeatures = features;
+        Frame.ActiveShadowPolicy = activeView.ShadowPolicy;
         Season.Rendering.RenderView.CurrentLayerMask = activeView.LayerMask;
 
         PrepareView?.Invoke(g, activeView);
 
+        // Stage 2A: the lighting/camera snapshot belongs to the view that was just prepared. Backends capture it at
+        // their final lighting upload point inside PrepareView; the main view uploads at the camera update point
+        // instead (already promoted by BeginSceneFrame), and a backend without a per-view upload point gets the camera
+        // terms derived from the view itself. Either way the next view cannot overwrite this one's snapshot.
+        if (!Frame.Promote(targets.Index, app) && !Frame.ActiveSnapshot.Valid)
+            Frame.Derive(targets.Index, activeView);
+
         // View-scope effects that prepare inputs for this view only (per-view culling, per-view procedural input).
         RecordPhase(g, ComputePhase.FrameStart, ComputeScope.View);
 
-        var segmented = g as ISegmentedSceneGraphics;
+        // Stage 1: there is exactly one scene draw path. Every backend implements the segmented contract, so a graphics
+        // that cannot collect and replay is a host that never ran a frame, not a second supported shape (Roadmap: no
+        // fallback rendering paths; capability reporting instead). Throwing here keeps the failure before any pass or
+        // compute job of this view is recorded.
+        var segmented = g as ISegmentedSceneGraphics
+            ?? throw new InvalidOperationException(
+                "The frame scheduler requires ISegmentedSceneGraphics: the scene is always collected and replayed as opaque/transparent.");
         bool opaque = (features & ViewFeature.Opaque) != 0;
         bool transparent = (features & ViewFeature.Transparent) != 0;
         bool particleSubmit = (features & ViewFeature.Particles) != 0;
@@ -1139,24 +1224,25 @@ public static class FrameSchedule
             && FogCompositeTarget.Desc.Height == SceneColor?.Desc.Height
             && !ReferenceEquals(FogCompositeTarget, SceneColor);
         bool fogLazyAllowed = ActiveTargets.Index != 0 && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float, Desc.SampleCount: <= 1 };
-        bool fogSplit = segmented != null && (features & ViewFeature.Fog) != 0 && app.Fog.Enabled && g.ComputeSupported
+        bool fogSplit = (features & ViewFeature.Fog) != 0 && app.Fog.Enabled && g.ComputeSupported
             && RenderQuality.Current.VolumetricFog != FogQuality.Off
             && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float }
             && SceneColor.Desc.SampleCount <= 1 && SceneDepth != null
             && (fogTargetReady || fogLazyAllowed) && RenderFogComposite != null;
-        bool weatherSplit = segmented != null && (features & ViewFeature.Weather) != 0
-            && LightingSnapshotValid && _frameLights.WeatherParams1.W > 0
+        bool weatherSplit = (features & ViewFeature.Weather) != 0
+            && LightingSnapshotValid && LightingSnapshot.WeatherParams1.W > 0
             && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float, Desc.SampleCount: <= 1 }
             && SceneDepth != null && WeatherCompositeTarget is { Desc.ColorFormat: RtFormat.Rgba16Float, Desc.SampleCount: <= 1 }
             && SceneColor.Desc.Width == WeatherCompositeTarget.Desc.Width && SceneColor.Desc.Height == WeatherCompositeTarget.Desc.Height
             && !ReferenceEquals(SceneColor, WeatherCompositeTarget) && RenderWeatherComposite != null;
-        // D1: decals must use the segmented route. Without segmentation the full Scene pass already drew the transparent
-        // primitives, and decals would land right on top of water and particles; decals have no "this frame's output not
+        // D1: decals run as their own pass between the opaque segment and the composites: they sample SceneDepth and write
+        // SceneColor, so they cannot live inside SceneOpaque (depth is an attachment there) and they must land before the
+        // fog/rain-curtain stages, which copy the result into their own targets. Decals have no "this frame's output not
         // ready" fallback like fog, so whenever the view has opacity on and the scene has active decals, split unconditionally.
-        bool decalSplit = segmented != null && DecalRenderer != null && opaque && (features & ViewFeature.Decals) != 0
+        bool decalSplit = DecalRenderer != null && opaque && (features & ViewFeature.Decals) != 0
             && SceneColor != null && SceneDepth != null && app.Decals.ActiveCount > 0;
-        // P2: the water surface must likewise be segmented - without segmentation the full Scene pass already drew the
-        // transparent primitives, and the water would cover transparent objects that should be above it. The refraction
+        // P2: the water surface is a standalone pass between decals and transparency: it needs a SceneColor snapshot as its
+        // refraction source, and the same resource cannot be the color attachment and the sampling source in one pass. The
         // snapshot must have the same shape as the scene color, otherwise it is better not to draw at all. The snapshot
         // lives on the view, so a secondary view has none until its first water frame and allocates it just before the
         // pass (the same lazy rule the fog composite follows); the route is therefore also allowed while it is missing.
@@ -1166,18 +1252,18 @@ public static class FrameSchedule
             && waterSnapshot.Desc.Height == SceneColor?.Desc.Height;
         bool waterLazyAllowed = ActiveTargets.Index != 0
             && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float, Desc.SampleCount: <= 1 };
-        bool waterSplit = segmented != null && WaterRenderer != null && opaque && (features & ViewFeature.Water) != 0
+        bool waterSplit = WaterRenderer != null && opaque && (features & ViewFeature.Water) != 0
             && SceneColor is not null && SceneDepth != null && app.Waters.ActiveCount > 0
             && (waterSnapshotReady || waterLazyAllowed);
-        // P1 curtain: like the water surface it must be segmented (otherwise the full Scene draw has already drawn the
-        // transparent primitives and the curtain would cover them). It does not sample a scene-color snapshot, so there are
-        // only two gates, shape and data: single-sampled HDR color + active curtains in the scene.
-        bool waterfallSplit = segmented != null && WaterfallRenderer != null && opaque && (features & ViewFeature.Waterfalls) != 0
+        // P1 curtain: a standalone pass after the water surface and before transparency, because at the impact point it has to
+        // cover the pool edge (water writes no depth, so only pass order decides who covers whom). It does not sample a
+        // scene-color snapshot, so there are only two gates, shape and data: single-sampled HDR color + active curtains in the scene.
+        bool waterfallSplit = WaterfallRenderer != null && opaque && (features & ViewFeature.Waterfalls) != 0
             && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float, Desc.SampleCount: 1 }
             && SceneDepth != null && app.Waterfalls.ActiveCount > 0;
         // P1 river ribbon: identical gates to the curtain, because it is the same Pass with a flat band shader. Ordered after the
         // curtain in the frame, so at the mouth the sea/pool water and the foam near the impact point are already in place.
-        bool riverSplit = segmented != null && RiverRenderer != null && opaque && (features & ViewFeature.Waterfalls) != 0
+        bool riverSplit = RiverRenderer != null && opaque && (features & ViewFeature.Waterfalls) != 0
             && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float, Desc.SampleCount: 1 }
             && SceneDepth != null && app.Rivers.ActiveCount > 0;
         // P0 SSR: reflections need to read the "already-drawn opaque scene color", but that rendering passes it as the color
@@ -1189,41 +1275,35 @@ public static class FrameSchedule
             && opaque && (features & ViewFeature.Reflections) != 0
             && SceneColor is { Desc.ColorFormat: RtFormat.Rgba16Float } && SceneDepth != null;
         bool split = fogSplit || weatherSplit || decalSplit || waterSplit || waterfallSplit || riverSplit || ssrSplit;
-        // S4: a non-segmented view must also run the two stages "collect -> opaque -> transparent". Without segmentation the
-        // full Scene pass mixes the transparent primitives into the opaque ones in scene order, so ViewFeature.Transparent is
-        // effectively a no-op (a minimap that requests only Opaque still draws light beams) and transparent geometry loses the
-        // "depth already finished" precondition. The backend hard-binds its queue to the two pass ids SceneOpaque /
-        // SceneTransparent, so we cannot keep using the Scene pass here and can only align the structure with the segmented route.
-        bool deferredScene = !split && segmented != null && opaque;
+        // Stage 1: the scene always runs the two stages "collect -> opaque -> transparent"; `split` only decides whether the
+        // fog/weather/water/SSR composite stages are inserted between them. This is the single shape that makes
+        // ViewFeature.Opaque/Transparent mean the same thing everywhere (the old full Scene pass mixed both buckets in scene
+        // order, so a view that switched Transparent off still drew light beams) and it is the base that sorting, multi-view
+        // and GPU culling hook into. The backend hard-binds its queue to SceneOpaque/SceneTransparent, so the scheduler no
+        // longer opens RenderPassId.Scene.
         // SceneSegmented keeps its original meaning (whether the fog/weather-style full-screen composite segmentation was done):
-        // both VolumetricFog and WeatherCurtain require it to publish output, whereas deferredScene merely splits the geometry
-        // draws into two stages without introducing those two composite stages.
+        // both VolumetricFog and WeatherCurtain require it to publish output, whereas the unconditional two-stage geometry split
+        // introduces no composite stage.
         targets.SceneSegmented = split;
 
         try
         {
-            // Without segmentation particles submit along with the full Scene draw, and the handover must happen before BeginPass; with segmentation it is deferred until just before the transparent stage opens.
-            bool particles = false;
-            if (split || deferredScene)
-            {
-                SceneDrawOrder.BeginCollection();
-                SceneCollectionActive = true;
-                segmented!.BeginSceneCollection();
-                app.DrawScene();
-                SceneDrawOrder.Seal();
-                segmented.SealSceneCollection();
-                SceneCollectionActive = false;
-            }
-            else if (particleSubmit && SceneColor != null)
-                particles = PrepareParticles(g, SceneColor);
+            // Collect first, submit later: no GPU draw may be issued while the queue is open, so the whole scene graph is
+            // traversed once here and replayed in the two buckets below. This also runs when ViewFeature.Opaque is off - the
+            // transparent bucket and the pass structure have to stay identical, and the opaque bucket is merely discarded.
+            SceneDrawOrder.BeginCollection();
+            Frame.CollectionActive = true;
+            segmented.BeginSceneCollection();
+            app.DrawScene();
+            SceneDrawOrder.Seal();
+            segmented.SealSceneCollection();
+            Frame.CollectionActive = false;
 
-            var scenePassId = split || deferredScene ? RenderPassId.SceneOpaque : RenderPassId.Scene;
-
-            FrameProfiler.BeginPass(scenePassId, ActiveTargets.Index);
+            FrameProfiler.BeginPass(RenderPassId.SceneOpaque, ActiveTargets.Index);
 
             g.BeginPass(new PassDesc
             {
-                Id = scenePassId,
+                Id = RenderPassId.SceneOpaque,
                 ColorTarget = SceneColor,
                 DepthTarget = SceneDepth,
                 VelocityTarget = SceneVelocity,
@@ -1238,16 +1318,8 @@ public static class FrameSchedule
                 // ViewFeature.Opaque off still collects (the transparent bucket and the pass structure must stay identical), so the
                 // collected opaque bucket is consumed without a replay here. Skipping that consumption outright breaks the queue
                 // contract on the first frame - the transparent queue is only allowed to follow an opaque consumption.
-                if (split || deferredScene)
-                {
-                    if (opaque) segmented!.DrawCollectedOpaque();
-                    else segmented!.DiscardCollectedOpaque();
-                }
-                else if (opaque)
-                {
-                    app.DrawScene();
-                    if (particles) SubmitParticles(g);
-                }
+                if (opaque) segmented.DrawCollectedOpaque();
+                else segmented.DiscardCollectedOpaque();
             }
             finally { g.EndPass(); FrameProfiler.EndPass(); }
 
@@ -1298,9 +1370,9 @@ public static class FrameSchedule
                 finally { g.EndPass(); FrameProfiler.EndPass(); }
             }
 
+            bool composited = false;
             if (split)
             {
-                bool composited = false;
                 if (weatherSplit && WeatherOutputReady && (PrepareWeatherComposite?.Invoke(g) ?? false))
                 {
                     FrameProfiler.BeginPass(RenderPassId.WeatherComposite, ActiveTargets.Index);
@@ -1400,40 +1472,16 @@ public static class FrameSchedule
                     try { RiverRenderer!.Draw(g); }
                     finally { g.EndPass(); FrameProfiler.EndPass(); }
                 }
-
-                // Transparent geometry is the second half of the scene; a view that switched it off still gets the
-                // fog/weather composites above, because those blend over the whole image rather than over geometry.
-                if (transparent)
-                {
-                    var transparentColor = EffectiveSceneColor;
-                    particles = particleSubmit && PrepareParticles(g, transparentColor);
-                    FrameProfiler.BeginPass(RenderPassId.SceneTransparent, ActiveTargets.Index);
-
-                    g.BeginPass(new PassDesc
-                    {
-                        Id = RenderPassId.SceneTransparent,
-                        ColorTarget = EffectiveSceneColor,
-                        DepthTarget = SceneDepth,
-                        VelocityTarget = SceneVelocity,
-                        NormalTarget = SceneNormal,
-                        ClearColorEnable = false,
-                        ClearDepthEnable = false,
-                        StoreDepth = true,
-                    });
-                    try
-                    {
-                        segmented!.DrawCollectedTransparent(composited);
-                        if (particles) SubmitParticles(g);
-                    }
-                    finally { g.EndPass(); FrameProfiler.EndPass(); }
-                }
             }
-            else if (deferredScene && transparent)
+
+            // Transparent geometry is the second half of the scene; a view that switched it off still gets the
+            // fog/weather composites above, because those blend over the whole image rather than over geometry.
+            // sampleFog is this frame's composite result: when nothing was composited, EffectiveSceneColor is still
+            // SceneColor and the backend keeps the volumetric trio at zero gating instead of the previous frame's leftovers.
+            if (transparent)
             {
-                // S4: the transparent stage of a non-segmented view. There is no fog/weather composite here, so EffectiveSceneColor
-                // is still SceneColor; sampleFog is passed false - the view did not request Fog, and the backend uses this to keep the
-                // volumetric trio at zero gating rather than the previous frame's leftovers.
-                particles = particleSubmit && PrepareParticles(g, EffectiveSceneColor);
+                var transparentColor = EffectiveSceneColor;
+                bool particles = particleSubmit && PrepareParticles(g, transparentColor);
                 FrameProfiler.BeginPass(RenderPassId.SceneTransparent, ActiveTargets.Index);
 
                 g.BeginPass(new PassDesc
@@ -1449,7 +1497,7 @@ public static class FrameSchedule
                 });
                 try
                 {
-                    segmented!.DrawCollectedTransparent(false);
+                    segmented.DrawCollectedTransparent(composited);
                     if (particles) SubmitParticles(g);
                 }
                 finally { g.EndPass(); FrameProfiler.EndPass(); }
@@ -1457,15 +1505,14 @@ public static class FrameSchedule
         }
         finally
         {
-            SceneCollectionActive = false;
+            Frame.CollectionActive = false;
             // An exception thrown inside the pass body skips SubmitParticles, so the handover record must be dropped here:
             // carrying it into the next frame would not misdraw (Prepare clears the table at the start) but would let residue persist across frames.
-            _preparedParticles.Clear();
-            if (split || deferredScene)
-            {
-                try { segmented!.ReleaseSceneCollection(); }
-                finally { SceneDrawOrder.Reset(); }
-            }
+            Frame.PreparedParticles.Clear();
+            // Unconditional for the same reason the collection is: an exception thrown by BeginSceneCollection has already
+            // opened the backend queue's collection flag, and only Release hands it back for the next frame.
+            try { segmented.ReleaseSceneCollection(); }
+            finally { SceneDrawOrder.Reset(); }
         }
 
         // AfterScene phase: dispatch after Scene writes complete and before Post (bloom downsampling/SSAO and similar

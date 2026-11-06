@@ -12,6 +12,9 @@ internal class WGPUModel
     readonly WebGltfAsset _asset = new();
 
     bool _transformInitialized;
+    /// <summary>Last <c>Model.PartColorVersion</c> folded into <c>WGPUPrimitiveData.BaseColor</c>. Starts at int.MinValue so the
+    /// first Update always synchronizes, matching the native backends' change gate.</summary>
+    int _appliedPartColorVersion = int.MinValue;
     // 2-3 Step C (mirroring VK's SetPrevBonesReady / SetPrevMorphReady): history for the bone palette and morph weights
     // has been ready for two consecutive frames. It stays false after the first Update and becomes true starting on the second frame,
     // at which point the JS-side previous-bone shadow copy must already exist
@@ -291,6 +294,9 @@ internal class WGPUModel
             SourceBaseColor = source.SourceBaseColor,
             BaseColor = source.BaseColor,
             OriginalBaseColorAlpha = source.OriginalBaseColorAlpha,
+            PartName = source.PartName,
+            PartNodeName = source.PartNodeName,
+            PartBaseColor = source.PartBaseColor,
             AlphaCutoff = source.AlphaCutoff,
             AlphaMode = source.AlphaMode,
             IsTransparent = source.IsTransparent,
@@ -324,6 +330,11 @@ internal class WGPUModel
         };
 
         ApplyInstanceMaterialOverrides(clone, model);
+
+        // The clone's own baseline is the template's BaseColor with this model's MaterialColor folded in, so a part
+        // override that is later cleared restores what this control would draw without one.
+        clone.PartBaseColor = new Vector3(clone.BaseColor.X, clone.BaseColor.Y, clone.BaseColor.Z);
+        ApplyPartColorOverride(clone, model);
         return clone;
     }
 
@@ -382,6 +393,41 @@ internal class WGPUModel
         primData.CurrentAlphaCutoff = primData.AlphaMode == 1u
             ? primData.AlphaCutoff * model.Alpha
             : primData.AlphaCutoff;
+    }
+
+    /// <summary>
+    /// Replaces one primitive's RGB with the override the model holds for its part, if any. Absolute rather than
+    /// multiplicative - see <see cref="Season.Controls.Model.SetPartColor"/> for why a tint cannot recolor a saturated
+    /// material. W is left untouched because the alpha chain belongs to SyncAlpha.
+    /// </summary>
+    static void ApplyPartColorOverride(WGPUPrimitiveData primData, Season.Controls.Model model)
+    {
+        if (!model.TryGetPartColor(primData.PartName, primData.PartNodeName, out var color))
+            return;
+
+        primData.BaseColor = new Vector4(color.X, color.Y, color.Z, primData.BaseColor.W);
+    }
+
+    /// <summary>
+    /// Pushes <c>Model.SetPartColor</c> into every primitive's RGB: the override when one is set, otherwise the load-time
+    /// baseline. Gated on <see cref="Season.Controls.Model.PartColorVersion"/>, so a steady frame pays one integer compare.
+    /// Unlike the native backends there is no N-buffered constant buffer to refill: DrawPrimitive reads <c>BaseColor</c>
+    /// into the uniform scratch every frame, so updating the field is the whole synchronization.
+    /// </summary>
+    void SyncPartColors(Season.Controls.Model model)
+    {
+        if (_appliedPartColorVersion == model.PartColorVersion)
+            return;
+        _appliedPartColorVersion = model.PartColorVersion;
+
+        foreach (var primitive in GetAllPrimitives())
+        {
+            var rgb = model.TryGetPartColor(primitive.PartName, primitive.PartNodeName, out var color)
+                ? new Vector3(color.X, color.Y, color.Z)
+                : primitive.PartBaseColor;
+
+            primitive.BaseColor = new Vector4(rgb.X, rgb.Y, rgb.Z, primitive.BaseColor.W);
+        }
     }
 
     WGPUGLTFNode CreateGLTFNode(SharpGLTF.Schema2.Node node)
@@ -575,6 +621,11 @@ internal class WGPUModel
 
     void ProcessMaterial(SharpGLTF.Schema2.MeshPrimitive primitive, WGPUPrimitiveData primData)
     {
+        // Part identity: the material name is the primary key Model.SetPartColor resolves against, the owning node name the
+        // fallback for material-less primitives. Recorded before the colors below so the override can use it in this same call.
+        primData.PartName = primitive.Material?.Name;
+        primData.PartNodeName = primData.OwnerNode?.Name;
+
         var modelRoot = primitive.LogicalParent.LogicalParent;
         var (gltfMaterial, images) = GLTFTools.LoadMaterial(modelRoot, primitive);
 
@@ -598,6 +649,13 @@ internal class WGPUModel
 
         primData.SourceBaseColor = gltfMaterial?.BaseColorFactor ?? Vector4.One;
         ApplyInstanceMaterialOverrides(primData, _asset.Model);
+
+        // Part colors: the load-time RGB baseline (with the MaterialColor tint already folded in) is what a cleared
+        // override returns to, and a set override replaces the RGB outright. Direct-load path only: the shared-template
+        // path bakes the requesting model's overrides in ClonePrimitiveData instead, where they are actually known.
+        primData.PartBaseColor = new Vector3(primData.BaseColor.X, primData.BaseColor.Y, primData.BaseColor.Z);
+        ApplyPartColorOverride(primData, _asset.Model);
+
         primData.DoubleSided = gltfMaterial?.DoubleSided ?? false;
 
         if (gltfMaterial != null)
@@ -730,6 +788,7 @@ internal class WGPUModel
         _prevDeformReady = wasInitialized;
 
         SyncAlpha(model.Alpha);
+        SyncPartColors(model);
 
         // Unified highlight: synchronize the bounds box
         // (box geometry is built lazily on the first enabled frame; face/edge colors are independent from the model alpha chain and are written every frame;

@@ -214,7 +214,7 @@ public unsafe class DXTexture : IDisposable
 
     void ProcessDecoder(INativeImageDecoder decoder, TextureMipPolicy mipPolicy)
     {
-        DescriptorID = Device.DescriptorAllocator.Allocate();
+        DescriptorID = Device.DescriptorAllocator.Allocate(DescriptorKind.Texture);
         CpuDescriptorHandle = Device.SrvHeapManager.GetCpuHandle(DescriptorID);
         GpuDescriptorHandle = Device.SrvHeapManager.GetGpuHandle(DescriptorID);
 
@@ -269,7 +269,7 @@ public unsafe class DXTexture : IDisposable
             Name = name ?? string.Empty
         };
 
-        tex.DescriptorID = Device.DescriptorAllocator.Allocate();
+        tex.DescriptorID = Device.DescriptorAllocator.Allocate(DescriptorKind.Texture);
         tex.CpuDescriptorHandle = Device.SrvHeapManager.GetCpuHandle(tex.DescriptorID);
         tex.GpuDescriptorHandle = Device.SrvHeapManager.GetGpuHandle(tex.DescriptorID);
         tex.Width = (uint)width;
@@ -321,14 +321,14 @@ public unsafe class DXTexture : IDisposable
             _format = nativeFormat,
         };
 
-        tex.DescriptorID = Device.DescriptorAllocator.Allocate();
+        tex.DescriptorID = Device.DescriptorAllocator.Allocate(DescriptorKind.Texture);
         tex.CpuDescriptorHandle = Device.SrvHeapManager.GetCpuHandle(tex.DescriptorID);
         tex.GpuDescriptorHandle = Device.SrvHeapManager.GetGpuHandle(tex.DescriptorID);
 
         tex.CreateTextureResource(ResourceFlags.AllowUnorderedAccess);
         tex.CreateSRV();
 
-        tex.UavDescriptorID = Device.DescriptorAllocator.Allocate();
+        tex.UavDescriptorID = Device.DescriptorAllocator.Allocate(DescriptorKind.Texture);
         tex.UavGpuDescriptorHandle = Device.SrvHeapManager.GetGpuHandle(tex.UavDescriptorID);
 
         var uavDesc = new UnorderedAccessViewDesc
@@ -356,6 +356,13 @@ public unsafe class DXTexture : IDisposable
     {
         // Release the old ID3D12Resource via COM Release.
         // Descriptor slots are reused in place, without Free or re-Allocate.
+        //
+        // This is the one rebuild path that mutates a slot while frames may still be in flight: per-draw views
+        // hand out GpuDescriptorHandle directly (see DXSceneDrawCollection.Texture), so a draw recorded earlier in
+        // this frame resolves the live slot and sees the new resource instead of the old one. Callers reach this
+        // only from CreateComputeTexture after a size change, and the arena has already AddRef'd the old resource,
+        // so nothing dangles - but a caller that resizes inside a frame can show one frame of the new content in
+        // draws that were meant to sample the old. Resize between frames to avoid it.
         if (_textureResource != null)
         {
             _textureResource->Release();
@@ -977,47 +984,68 @@ public unsafe class DXTexture : IDisposable
             return;
         }
 
-        if (_textureResource != null)
-        {
-            // Overwrite the SRV descriptor with a null descriptor first, so the
-            // D3D12 Debug Layer does not detect a live descriptor still pointing
-            // to the resource during Release and throw SEHException.
-            const uint DefaultShader4ComponentMapping = 0x00001688;
-            var nullSrvDesc = new ShaderResourceViewDesc
-            {
-                Format = Format.FormatR8G8B8A8Unorm,
-                ViewDimension = SrvDimension.Texture2D,
-                Shader4ComponentMapping = DefaultShader4ComponentMapping,
-                Texture2D = new Tex2DSrv { MipLevels = 1, MostDetailedMip = 0 }
-            };
-            Device.D3dDevice->CreateShaderResourceView(null, &nullSrvDesc, CpuDescriptorHandle);
+        // Detach every CPU-side handle first, so a second teardown is a no-op, then let the GPU-side work wait
+        // for the retire fence. Per-draw views now hand out this texture's permanent SRV slot directly (see
+        // DXSceneDrawCollection.Texture), so blanking the descriptor or recycling the slot right here would make an
+        // in-flight frame that already sampled this handle read a null view - or whatever texture allocates the slot
+        // next. Waiting is done by the same fence the draw-snapshot arena uses for the resources it captures.
+        var resource = _textureResource;
+        _textureResource = null;
+        var uploadHeap = _textureUploadHeap;
+        _textureUploadHeap = null;
+        int srvId = DescriptorID;
+        DescriptorID = -1;
+        int uavId = UavDescriptorID;
+        UavDescriptorID = -1;
+        var srvHandle = CpuDescriptorHandle;
 
-            // For compute storage textures, overwrite the UAV descriptor with a
-            // null descriptor as well before returning the slot.
-            if (UavDescriptorID >= 0)
+        if (resource == null && uploadHeap == null && srvId < 0 && uavId < 0)
+            return;
+
+        // The action captures locals only, never `this`: the texture object stays collectable while the queue
+        // holds this entry, and everything it needs (resource pointer, handles, ids) has already been detached.
+        Device.EnqueueDeferredRelease(Device.GetCurrentRetireFenceValue(), () =>
+        {
+            // Blank the SRV/UAV descriptors before releasing the resource, so the D3D12 Debug Layer does not detect
+            // a live descriptor still pointing to it and throw SEHException. A removed device services none of
+            // this: the driver already dropped the descriptors with the device, and every call would break.
+            if (!Device.IsDeviceGone())
             {
-                var nullUavDesc = new UnorderedAccessViewDesc
+                if (srvId >= 0)
                 {
-                    Format = Format.FormatR8G8B8A8Unorm,
-                    ViewDimension = UavDimension.Texture2D,
-                    Texture2D = new Tex2DUav { MipSlice = 0 },
-                };
-                Device.D3dDevice->CreateUnorderedAccessView(null, null, &nullUavDesc, Device.SrvHeapManager.GetCpuHandle(UavDescriptorID));
-                Device.DescriptorAllocator.Free(UavDescriptorID);
-                UavDescriptorID = -1;
+                    const uint DefaultShader4ComponentMapping = 0x00001688;
+                    var nullSrvDesc = new ShaderResourceViewDesc
+                    {
+                        Format = Format.FormatR8G8B8A8Unorm,
+                        ViewDimension = SrvDimension.Texture2D,
+                        Shader4ComponentMapping = DefaultShader4ComponentMapping,
+                        Texture2D = new Tex2DSrv { MipLevels = 1, MostDetailedMip = 0 }
+                    };
+                    Device.D3dDevice->CreateShaderResourceView(null, &nullSrvDesc, srvHandle);
+                }
+
+                // For compute storage textures, blank the UAV descriptor as well before returning the slot.
+                if (uavId >= 0)
+                {
+                    var nullUavDesc = new UnorderedAccessViewDesc
+                    {
+                        Format = Format.FormatR8G8B8A8Unorm,
+                        ViewDimension = UavDimension.Texture2D,
+                        Texture2D = new Tex2DUav { MipSlice = 0 },
+                    };
+                    Device.D3dDevice->CreateUnorderedAccessView(null, null, &nullUavDesc,
+                        Device.SrvHeapManager.GetCpuHandle(uavId));
+                }
             }
 
-            _textureResource->Release();
-            _textureResource = null;
-        }
+            if (resource != null) resource->Release();
+            if (uploadHeap != null) uploadHeap->Release();
 
-        if (_textureUploadHeap != null)
-        {
-            _textureUploadHeap->Release();
-            _textureUploadHeap = null;
-        }
-
-        Device.DescriptorAllocator.Free(DescriptorID);
+            // Guarded ids: a wrapped-target teardown cleared them already, and -1 must never reach the free list,
+            // where it would sit until Allocate hands it out as a handle far outside the heap.
+            if (srvId >= 0) Device.DescriptorAllocator.Free(srvId);
+            if (uavId >= 0) Device.DescriptorAllocator.Free(uavId);
+        });
     }
 
     // ──────── Adapter: ImageResult → INativeImageDecoder (compatibility) ────────

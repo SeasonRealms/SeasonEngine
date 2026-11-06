@@ -438,45 +438,8 @@ internal unsafe sealed class VKTextureCube : IDisposable
         _currentLayout = newLayout;
     }
 
-    /// <summary>
-    /// Refresh binding 16 of <paramref name="set"/> to the current <see cref="Bound"/> view.
-    /// This updates only when ViewVersion changes
-    /// (compare version rather than handle; see <see cref="ViewVersion"/>).
-    ///
-    /// Only this single binding is updated and the other 16 descriptors remain untouched.
-    /// Environment maps load asynchronously, so they inevitably become ready after early models
-    /// have already had their descriptor sets written.
-    /// A full rewrite would require reassembling all buffer handles again,
-    /// which adds unnecessary cost and risk.
-    ///
-    /// <paramref name="cachedVersion"/> must be cached per frame slot:
-    /// only the set for the current FrameIndex is updated,
-    /// and the remaining slots are refreshed when their own frame arrives.
-    /// The previous submission for this slot is already guaranteed complete
-    /// by the same-slot fence waited at the end of AfterRender,
-    /// so vkUpdateDescriptorSets is safe against in-flight command buffers here.
-    /// </summary>
-    internal static void RefreshBinding(DescriptorSet set, ref ulong cachedVersion)
-    {
-        var cube = Bound;
-        if (cube.ViewVersion == cachedVersion)
-            return;
-
-        var info = new DescriptorImageInfo
-        { ImageView = cube.View, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
-        var write = new WriteDescriptorSet
-        {
-            SType = StructureType.WriteDescriptorSet,
-            DstSet = set,
-            DstBinding = EnvCubeBinding,
-            DstArrayElement = 0,
-            DescriptorCount = 1,
-            DescriptorType = DescriptorType.CombinedImageSampler,
-            PImageInfo = &info
-        };
-        Device.Vk.UpdateDescriptorSets(Device.LogicalDevice, 1, &write, 0, null);
-        cachedVersion = cube.ViewVersion;
-    }
+    // 3B: RefreshBinding is gone. Binding 16 now lives in the per-view globals set 3 and is written once per view
+    // by Pipeline.PrepareViewGlobals, so no per-primitive descriptor rewrite is needed when the cube becomes ready.
 
     /// <summary>1-7: descriptor binding index of the environment radiance cube
     /// (GLSL <c>samplerCube envCube</c>).</summary>

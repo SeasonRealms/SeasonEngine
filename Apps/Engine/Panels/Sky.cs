@@ -72,9 +72,10 @@ internal class Sky : Panel
         BuildSkyboxSurfaces(skybox, _celestial.ProceduralSkyTexture);
         AddControl(skybox);
 
-        // [SkyDebug] Log the construction-time mode snapshot once to help investigate missing stars or disk rendering.
+        // One-shot construction-time mode snapshot: "which sky tier did this panel get" is the first question
+        // whenever a scene shows no analytic stars or disks.
         DeviceServices.BaseApp.AddLog(LogType.Backend,
-            $"[SkyDebug] Sample Sky ctor: _skyViewTexture={_celestial.ProceduralSkyTexture ?? "null"} → " +
+            $"[Sky] Sample Sky ctor: _skyViewTexture={_celestial.ProceduralSkyTexture ?? "null"} → " +
             (_celestial.IsProceduralSky
                 ? "procedural mode (Sky-View LUT on all six faces, analytic disks and star path, no marker spheres)"
                 : "StaticCube fallback (cloudtop textures plus marker-sphere sun and moon, no analytic stars)"));

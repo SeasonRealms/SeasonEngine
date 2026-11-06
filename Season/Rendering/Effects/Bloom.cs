@@ -22,9 +22,10 @@ namespace Season.Rendering.Effects;
 /// Each frame records 2N-1 dispatches (11 when N=6), all in the AfterScene phase
 /// (after Scene finishes writing, before Post/FinalBlit).
 ///
-/// Output: up[0] (half-resolution rgba16float linear HDR highlights). After successful Initialize,
-/// it is written into FrameSchedule.BloomTexture, and the FinalBlit tonemap+bloom variant composes
-/// it by name (added in linear space before ACES).
+/// Output: up[0] (half-resolution rgba16float linear HDR highlights). After successful Initialize, the main view's
+/// chain is published on its <see cref="ViewTargets.BloomOutput"/>, and the FinalBlit tonemap+bloom variant
+/// composes it by name (added in linear space before ACES). Secondary views get their own scoped chain and name
+/// the first time they render, so two views in one frame never share a bloom image.
 /// Chain textures are created during initialization using the then-current half-resolution
 /// backbuffer size, and are not rebuilt on resize (contract clause 2).
 ///
@@ -48,20 +49,17 @@ public sealed class BloomEffect : ComputeEffect
     ComputeKernel? _downsample;
     ComputeKernel? _upsample;
 
-    // Level count and per-level sizes (level i = half resolution >> i), fixed after Initialize
-    // and not rebuilt on resize.
-    int _levels;
-    uint[]? _w;
-    uint[]? _h;
-
-    // Resource reference arrays for each dispatch, built during Initialize and reused every frame
-    // with zero allocation. They contain reference types, so stackalloc is not allowed;
-    // see the ComputeDispatchArgs summary.
-    ComputeResourceRef[]? _prefilterRes;
-    ComputeResourceRef[][]? _downRes;
-    ComputeResourceRef[][]? _upRes;
-
-    string? _outputName;
+    // Level count, per-level sizes, scoped names and resource reference arrays per view. The arrays contain
+    // reference types, so stackalloc is not allowed; see the ComputeDispatchArgs summary. Every array is built
+    // once per view and reused every frame with zero allocation.
+    sealed class BloomViewState
+    {
+        public int Levels;
+        public uint[] W = [], H = [];
+        public ComputeResourceRef[]? PrefilterRes;
+        public ComputeResourceRef[][] DownRes = [], UpRes = [];
+        public string? OutputName;
+    }
 
     public override string Name => "bloom";
 
@@ -150,139 +148,143 @@ public sealed class BloomEffect : ComputeEffect
 
         // Chain sizes: level 0 is half of the current backbuffer resolution, then halves each level;
         // clamp the level count so the minimum dimension stays >= 8 (contract clause 2).
-        var res = DeviceServices.BaseApp.DeviceResolution;
-        uint w0 = Math.Max(8u, (uint)res.X / 2);
-        uint h0 = Math.Max(8u, (uint)res.Y / 2);
-        _levels = 1;
-        while (_levels < RenderQuality.Current.BloomMipCount && Math.Min(w0 >> _levels, h0 >> _levels) >= 8)
-            _levels++;
-
-        _w = new uint[_levels];
-        _h = new uint[_levels];
-        for (int i = 0; i < _levels; i++)
-        {
-            _w[i] = w0 >> i;
-            _h[i] = h0 >> i;
-            g.CreateComputeTexture(DownName(i), _w[i], _h[i], ComputeStorageFormat.Rgba16Float);
-            if (i < _levels - 1)
-                g.CreateComputeTexture(UpName(i), _w[i], _h[i], ComputeStorageFormat.Rgba16Float);
-        }
-
-        // Slot 0 is re-resolved each frame by Record (2-3 clause 13); initialize it with a seed value here.
-        _prefilterRes = new ComputeResourceRef[] { FrameSchedule.SceneColor, DownName(0) };
-
-        _downRes = new ComputeResourceRef[_levels - 1][];
-        _upRes = new ComputeResourceRef[_levels - 1][];
-        for (int i = 0; i < _levels - 1; i++)
-        {
-            _downRes[i] = new ComputeResourceRef[] { DownName(i), DownName(i + 1) };
-            // Tent source for up[i]: use down[N-1] at the deepest level, otherwise use up[i+1].
-            string small = i == _levels - 2 ? DownName(_levels - 1) : UpName(i + 1);
-            _upRes[i] = new ComputeResourceRef[] { small, DownName(i), UpName(i) };
-        }
-
-        // Single-level shape (extremely small backbuffer): no up chain, composition reads down[0] directly.
-        _outputName = _levels >= 2 ? UpName(0) : DownName(0);
-        FrameSchedule.BloomTexture = _outputName;
+        // The main view's chain is allocated here so a failing backend registration leaves no residue;
+        // secondary views allocate their own scoped chain lazily on their first Record.
+        EnsureState(g, FrameSchedule.PrimaryTargets);
         return true;
     }
 
-    public override void OnResize(IGraphics g)
+    static int MeasureLevels()
     {
-        // Recompute the chain level count and per-level sizes
-        // (level 0 = half resolution, then halve per level; keep minimum dimension >= 8).
         var res = DeviceServices.BaseApp.DeviceResolution;
         uint w0 = Math.Max(8u, (uint)res.X / 2);
         uint h0 = Math.Max(8u, (uint)res.Y / 2);
-        int newLevels = 1;
-        while (newLevels < RenderQuality.Current.BloomMipCount && Math.Min(w0 >> newLevels, h0 >> newLevels) >= 8)
-            newLevels++;
+        int levels = 1;
+        while (levels < RenderQuality.Current.BloomMipCount && Math.Min(w0 >> levels, h0 >> levels) >= 8)
+            levels++;
+        return levels;
+    }
 
-        _levels = newLevels;
-        _w = new uint[_levels];
-        _h = new uint[_levels];
-        for (int i = 0; i < _levels; i++)
+    static bool SizeMatches(BloomViewState state)
+    {
+        var res = DeviceServices.BaseApp.DeviceResolution;
+        return state.W.Length != 0 && state.W[0] == Math.Max(8u, (uint)res.X / 2)
+            && state.H[0] == Math.Max(8u, (uint)res.Y / 2);
+    }
+
+    /// <summary>Creates (or recreates in place) this view's scoped chain textures and cached dispatch references.</summary>
+    BloomViewState Configure(IGraphics g, ViewTargets targets, BloomViewState state)
+    {
+        var res = DeviceServices.BaseApp.DeviceResolution;
+        uint w0 = Math.Max(8u, (uint)res.X / 2);
+        uint h0 = Math.Max(8u, (uint)res.Y / 2);
+        int levels = MeasureLevels();
+        state.Levels = levels;
+        state.W = new uint[levels];
+        state.H = new uint[levels];
+        for (int i = 0; i < levels; i++)
         {
-            _w[i] = w0 >> i;
-            _h[i] = h0 >> i;
-            g.CreateComputeTexture(DownName(i), _w[i], _h[i], ComputeStorageFormat.Rgba16Float);
-            if (i < _levels - 1)
-                g.CreateComputeTexture(UpName(i), _w[i], _h[i], ComputeStorageFormat.Rgba16Float);
+            state.W[i] = w0 >> i;
+            state.H[i] = h0 >> i;
+            g.CreateComputeTexture(targets.Scope(DownName(i)), state.W[i], state.H[i], ComputeStorageFormat.Rgba16Float);
+            if (i < levels - 1)
+                g.CreateComputeTexture(targets.Scope(UpName(i)), state.W[i], state.H[i], ComputeStorageFormat.Rgba16Float);
         }
 
-        // Rebuild resource reference arrays because the number of levels may have changed.
-        _prefilterRes = new ComputeResourceRef[] { FrameSchedule.SceneColor!, DownName(0) };
-        _downRes = new ComputeResourceRef[_levels - 1][];
-        _upRes = new ComputeResourceRef[_levels - 1][];
-        for (int i = 0; i < _levels - 1; i++)
+        state.PrefilterRes = new ComputeResourceRef[] { targets.SceneColor!, targets.Scope(DownName(0)) };
+        state.DownRes = new ComputeResourceRef[levels - 1][];
+        state.UpRes = new ComputeResourceRef[levels - 1][];
+        for (int i = 0; i < levels - 1; i++)
         {
-            _downRes[i] = new ComputeResourceRef[] { DownName(i), DownName(i + 1) };
-            string small = i == _levels - 2 ? DownName(_levels - 1) : UpName(i + 1);
-            _upRes[i] = new ComputeResourceRef[] { small, DownName(i), UpName(i) };
+            state.DownRes[i] = new ComputeResourceRef[] { targets.Scope(DownName(i)), targets.Scope(DownName(i + 1)) };
+            string small = i == levels - 2 ? targets.Scope(DownName(levels - 1)) : targets.Scope(UpName(i + 1));
+            state.UpRes[i] = new ComputeResourceRef[] { small, targets.Scope(DownName(i)), targets.Scope(UpName(i)) };
         }
-        _outputName = _levels >= 2 ? UpName(0) : DownName(0);
-        FrameSchedule.BloomTexture = _outputName;
+
+        // Single-level shape (extremely small backbuffer): no up chain, composition reads down[0] directly.
+        state.OutputName = levels >= 2 ? targets.Scope(UpName(0)) : targets.Scope(DownName(0));
+        targets.BloomOutput = state.OutputName;
+        return state;
+    }
+
+    BloomViewState EnsureState(IGraphics g, ViewTargets targets)
+    {
+        var state = ViewState<BloomViewState>(targets);
+        return state.OutputName != null ? state : Configure(g, targets, state);
+    }
+
+    public override void OnViewResize(IGraphics g, ViewTargets targets)
+    {
+        // Recreate this view's chain in place after a resize. CreateComputeTexture keeps the name and the C#
+        // texture object identity, so the cached references stay valid. A view that never rendered has no
+        // chain yet and allocates it lazily on its first frame.
+        var state = ViewState<BloomViewState>(targets);
+        if (state.OutputName == null || (MeasureLevels() == state.Levels && SizeMatches(state))) return;
+        Configure(g, targets, state);
     }
 
     public override void Record(IGraphics g)
     {
+        var targets = FrameSchedule.ActiveTargets;
+        if (targets.SceneColor == null) return;
+        var state = EnsureState(g, targets);
         Span<float> p = stackalloc float[4];
 
         // 2-3 contract clause 13: rewrite the cached resource slot in place
         // (ComputeResourceRef is a value type, so this stays allocation-free).
         // TaaEffect registers earlier than this effect, so SceneColorOverride for the current frame
         // has already been published by its Record call.
-        _prefilterRes![0] = FrameSchedule.EffectiveSceneSource;
+        state.PrefilterRes![0] = FrameSchedule.EffectiveSceneSource;
 
         // 1) prefilter: scene source -> down[0]
         // (soft-threshold highlights, with threshold/knee runtime knobs uploaded every frame).
-        p[0] = _w![0];
-        p[1] = _h![0];
+        p[0] = state.W[0];
+        p[1] = state.H[0];
         p[2] = RenderQuality.Current.BloomThreshold;
         p[3] = RenderQuality.Current.BloomKnee;
         g.DispatchCompute(new ComputeDispatchArgs
         {
             Kernel = _prefilter!,
             Params = MemoryMarshal.AsBytes(p),
-            Resources = _prefilterRes,
-            GroupsX = (_w[0] + 7) / 8,
-            GroupsY = (_h[0] + 7) / 8,
+            Resources = state.PrefilterRes,
+            GroupsX = (state.W[0] + 7) / 8,
+            GroupsY = (state.H[0] + 7) / 8,
             GroupsZ = 1,
         });
 
         // 2) down chain: down[i] -> down[i+1] (srcTexel provides offsets for the 4-tap box filter).
-        for (int i = 0; i < _levels - 1; i++)
+        for (int i = 0; i < state.Levels - 1; i++)
         {
-            p[0] = _w[i + 1];
-            p[1] = _h[i + 1];
-            p[2] = 1f / _w[i];
-            p[3] = 1f / _h[i];
+            p[0] = state.W[i + 1];
+            p[1] = state.H[i + 1];
+            p[2] = 1f / state.W[i];
+            p[3] = 1f / state.H[i];
             g.DispatchCompute(new ComputeDispatchArgs
             {
                 Kernel = _downsample!,
                 Params = MemoryMarshal.AsBytes(p),
-                Resources = _downRes![i],
-                GroupsX = (_w[i + 1] + 7) / 8,
-                GroupsY = (_h[i + 1] + 7) / 8,
+                Resources = state.DownRes[i],
+                GroupsX = (state.W[i + 1] + 7) / 8,
+                GroupsY = (state.H[i + 1] + 7) / 8,
                 GroupsZ = 1,
             });
         }
 
         // 3) up chain (deep -> shallow): up[i] = tent3x3(small-chain source) + down[i]
         // (smallTexel provides offsets for the tent filter).
-        for (int i = _levels - 2; i >= 0; i--)
+        for (int i = state.Levels - 2; i >= 0; i--)
         {
-            p[0] = _w[i];
-            p[1] = _h[i];
-            p[2] = 1f / _w[i + 1];
-            p[3] = 1f / _h[i + 1];
+            p[0] = state.W[i];
+            p[1] = state.H[i];
+            p[2] = 1f / state.W[i + 1];
+            p[3] = 1f / state.H[i + 1];
             g.DispatchCompute(new ComputeDispatchArgs
             {
                 Kernel = _upsample!,
                 Params = MemoryMarshal.AsBytes(p),
-                Resources = _upRes![i],
-                GroupsX = (_w[i] + 7) / 8,
-                GroupsY = (_h[i] + 7) / 8,
+                Resources = state.UpRes[i],
+                GroupsX = (state.W[i] + 7) / 8,
+                GroupsY = (state.H[i] + 7) / 8,
                 GroupsZ = 1,
             });
         }
@@ -290,15 +292,15 @@ public sealed class BloomEffect : ComputeEffect
 
     public void Dispose()
     {
-        if (_outputName != null && FrameSchedule.BloomTexture == _outputName)
-            FrameSchedule.BloomTexture = null;
-        _outputName = null;
         _prefilter?.Dispose();
         _prefilter = null;
         _downsample?.Dispose();
         _downsample = null;
         _upsample?.Dispose();
         _upsample = null;
+        // Revoke every view's publication, not just whichever view happens to be active when the effect retires.
+        ForEachViewState((targets, _) => targets.BloomOutput = null);
+        ClearViewStates();
     }
 
     // ── Shader sources (single source of truth; slots follow the binding layout contract in the

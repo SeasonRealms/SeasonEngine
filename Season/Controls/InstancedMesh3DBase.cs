@@ -42,6 +42,25 @@ public class MeshInstanceTransform
     public bool Enable { get; set; } = true;
 
     /// <summary>
+    /// Per-instance color of the generic per-instance extras slot: x/y/z is the tint, w is reserved for alpha and stays 1
+    /// unless a caller wants the shader to fade this instance on its own.
+    /// <para>
+    /// It is <b>multiplicative</b>, not a replacement, and only primitives that opted into it read it (see
+    /// <see cref="InstancedModel.InstanceTintParts"/>). A primitive whose authored factor is saturated cannot be tinted
+    /// toward another hue: multiplying saturated yellow by blue gives near-black. That is why the opt-in list also
+    /// rewrites the matching primitives' authored RGB to white at load, which turns the same multiply into a replacement
+    /// and lets one geometry pass through every hue.
+    /// </para>
+    /// <para>
+    /// White is the identity, so an instance that never sets a color renders exactly as before. Indexing is by the
+    /// <b>compacted</b> slot -- the Nth enabled instance -- on both the direct and the A7 indirect path, so toggling
+    /// another instance's <see cref="Enable"/> renumbers every later color exactly the way it renumbers matrices and
+    /// history; nothing on this side has to track it.
+    /// </para>
+    /// </summary>
+    public Vector4 Color { get; set; } = Vector4.One;
+
+    /// <summary>
     /// Click-selection state, driven uniformly by ObjectPicker and aligned semantically with
     /// <see cref="Mesh3DBase.Selected"/>. A successful click hit sets it to true and locks it
     /// until a click outside the bounding box results in no hit, which clears it back to false.
@@ -270,14 +289,20 @@ public abstract class InstancedMesh3DBase : Control
 
     /// <summary>
     /// Unified positioning model for the instance world matrix, mapping template space to world space:
-    /// CreateScale(per-axis scale) x CreateTranslation(-anchor) x Rotation x CreateTranslation(PosX, PosY, PosZ).
-    /// The rotation pivot is fixed at the anchor, that is, the geometric center of the template box.
-    /// Matrix computation across all four backend instance paths converges to this method.
+    /// CreateTranslation(-anchor) x CreateScale(per-axis scale) x Rotation x CreateTranslation(PosX, PosY, PosZ).
+    /// Under the row-vector convention (p * M) this evaluates to ((p - A) * S) * R + Pos, so the anchor A lands
+    /// exactly on the instance position and the rotation pivot is fixed at the template-box center.
+    /// S must come after the -A translation, exactly as in Mesh3DBase.BuildWorldMatrix. Scaling first evaluates
+    /// to (p * S - A) * R + Pos and shifts the world center by A * (1 - S), which is invisible while the instance
+    /// size equals the template size but drops every non-unit instance by the template's raw center offset:
+    /// sailing_boat.glb spans y in [0, 459.75], so a 13-unit-high fleet instance sank about 220 m under the sea.
+    /// Matrix computation across all four backend instance paths converges to this method, and the 1-3 culling
+    /// predicate in <see cref="IsCulledBy"/> already uses this order, so rendering, picking and culling agree only here.
     /// </summary>
     public Matrix4x4 BuildInstanceMatrix(MeshInstanceTransform instance)
     {
-        return Matrix4x4.CreateScale(InstanceComputedScale(instance))
-             * Matrix4x4.CreateTranslation(-TemplateAnchorLocal)
+        return Matrix4x4.CreateTranslation(-TemplateAnchorLocal)
+             * Matrix4x4.CreateScale(InstanceComputedScale(instance))
              * Matrix4x4.CreateFromQuaternion(instance.Rotation)
              * Matrix4x4.CreateTranslation(instance.PosX, instance.PosY, instance.PosZ);
     }

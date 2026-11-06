@@ -70,7 +70,7 @@ internal unsafe class TextInstanceRingBuffer
 
         for (int i = 0; i < frameCount; i++)
         {
-            _descriptorIds[i] = Device.DescriptorAllocator.Allocate();
+            _descriptorIds[i] = Device.DescriptorAllocator.Allocate(DescriptorKind.Compute);
             _buffers[i] = Device.ResourceManager.CreateBuffer(
                 HeapType.Upload,
                 (ulong)(totalFloats * sizeof(float)),

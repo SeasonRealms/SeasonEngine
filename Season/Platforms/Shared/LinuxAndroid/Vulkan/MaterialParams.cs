@@ -38,7 +38,7 @@ internal struct MaterialParams
     [FieldOffset(60)] public float AlphaCutoff;
     [FieldOffset(64)] public uint AlphaMode;
     [FieldOffset(68)] public uint RenderMode;     // 0=Sprite2D, 1=Pbr3D, 2=TextMsdf reserved.
-    [FieldOffset(72)] public float Padding1;         // Reused by the Text and MSDF path.
+    [FieldOffset(72)] public uint TintMode;         // 0=ignore the per-instance color, 1=multiply the PBR albedo by it. Doubles as the retired pxRange alignment slot.
     [FieldOffset(76)] public uint IsInstanced;       // 0=regular draw using the b0 world matrix, 1=GPU instancing using a per-instance matrix.
     [FieldOffset(80)] public uint IsSkinned;         // 0=static, 1=skeletal skinning.
     [FieldOffset(84)] public uint BonePaletteStride; // Instanced skinning: stride of the bone palette per instance.
@@ -125,41 +125,10 @@ internal unsafe class PrimitiveData : IDisposable
     /// <summary>N-buffered DescriptorSet, one per frame, to avoid conflicts across in-flight frames.</summary>
     public DescriptorSet[] DescriptorSets = null!;
 
-    /// <summary>
-    /// 1-7:
-    /// same length as <see cref="DescriptorSets"/>, recording per frame slot which cube view is currently written into binding 16 of that set,
-    /// stored as VKTextureCube.ViewVersion, with 0 meaning not written yet.
-    /// This must be tracked per slot rather than by a single scalar.
-    /// vkUpdateDescriptorSets can safely modify only sets in already retired slots,
-    /// and refreshing every slot at once would collide with command buffers still in flight.
-    /// </summary>
-    public ulong[] EnvCubeViewVersions = null!;
-
-    /// <summary>Clause 10 of 2-4:
-    /// same length as <see cref="DescriptorSets"/>, recording per frame slot which DDGI atlas view is currently written into binding 17 of that set,
-    /// stored as Texture.ViewVersion, with 0 meaning not written yet.
-    /// The reason for per-slot tracking is the same as <see cref="EnvCubeViewVersions"/>.</summary>
-    public ulong[] DdgiAtlasViewVersions = null!;
-
-    /// <summary>Step 3 of 2-4:
-    /// same length as <see cref="DescriptorSets"/>, recording per frame slot which DDGI depth-atlas view is currently written into binding 18 of that set,
-    /// with the same semantics as <see cref="DdgiAtlasViewVersions"/>.</summary>
-    public ulong[] DdgiDepthViewVersions = null!;
-
-    /// <summary>Step C of 2-5:
-    /// same length as <see cref="DescriptorSets"/>, recording per frame slot which cloud-noise view is currently written into binding 19 of that set,
-    /// with the same semantics as <see cref="DdgiAtlasViewVersions"/>.</summary>
-    public ulong[] CloudNoiseViewVersions = null!;
-
-    /// <summary>Step E of 2-5:
-    /// same length as <see cref="DescriptorSets"/>, recording per frame slot which AP volume view is currently written into binding 20 of that set,
-    /// with the same semantics as <see cref="DdgiAtlasViewVersions"/>.</summary>
-    public ulong[] AerialLutViewVersions = null!;
-
-    /// <summary>2-7 P0:
-    /// Same length as <see cref="DescriptorSets"/>, recording per frame slot which Sky-View LUT view is currently written into binding 25,
-    /// with exactly the same semantics as <see cref="DdgiAtlasViewVersions"/>.</summary>
-    public ulong[] SkyViewViewVersions = null!;
+    // 3B: the six per-slot view-version caches (envCube / DDGI atlas / DDGI depth / cloud noise / AP LUT / Sky-View)
+    // are gone together with the frame-start refresh pass. Those six lighting inputs now live in the per-view globals
+    // set 3, which is written once per view by Pipeline.PrepareViewGlobals, so a primitive's set 0 never changes again
+    // after allocation and needs no version bookkeeping.
 
     public Texture BaseColorTexture = null!;
 
@@ -190,6 +159,17 @@ internal unsafe class PrimitiveData : IDisposable
 
     /// <summary>Original Surface BaseColor captured during Load. Used as the multiplicative base for SyncColorTint, where rgb is multiplied by tint and W stays untouched.</summary>
     public Vector4 OriginalBaseColor = Vector4.One;
+
+    /// <summary>glTF material name of the part this primitive draws; null when the asset has no material. This is the primary
+    /// key <c>Model.SetPartColor</c> resolves against.</summary>
+    public string? PartName;
+
+    /// <summary>Name of the node that owns this primitive, the fallback key for <c>Model.SetPartColor</c>.</summary>
+    public string? PartNodeName;
+
+    /// <summary>BaseColor.rgb as loaded (after the MaterialColor tint, before any part override). It is what SyncPartColors
+    /// restores when a part override is cleared, so an absolute override never needs to re-derive the authored value.</summary>
+    public Vector3 PartBaseColor = Vector3.One;
 
     /// <summary>
     /// Original AlphaCutoff from the glTF material.

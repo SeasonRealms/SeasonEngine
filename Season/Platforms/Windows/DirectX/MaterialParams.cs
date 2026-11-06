@@ -32,7 +32,6 @@ internal struct MaterialParams
     [FieldOffset(64)] public uint AlphaMode;
     [FieldOffset(68)] public uint RenderMode;     // 0=Sprite2D, 1=Pbr3D, 2=TextMsdf (reserved)
     [FieldOffset(72)] public uint BonePaletteStride; // Instanced skinning: stride of the per-instance bone palette
-    [FieldOffset(72)] public float Padding1;         // Backward compatibility: legacy Sprite2D/Text paths still use this slot as a generic float
     [FieldOffset(76)] public uint IsInstanced;  // 0=regular draw (uses b0 world matrix), 1=GPU instancing (uses per-instance matrix)
     // Phase 2: skeletal skinning
     [FieldOffset(80)] public uint IsSkinned;       // 0=static, 1=skinned, so shaders can skip unrelated paths
@@ -49,7 +48,7 @@ internal struct MaterialParams
     [FieldOffset(112)] public uint HasPrevBones;          // 0/1, whether the previous bone SB is valid
     [FieldOffset(116)] public uint HasPrevInstanceWorld;  // 0/1, whether the previous instanceWorld SB is valid
     [FieldOffset(120)] public uint HasPrevMorph;          // 0/1, whether the previous morphWeights SB is valid
-    [FieldOffset(124)] public uint _Padding2;             // 16-byte alignment padding
+    [FieldOffset(124)] public uint TintMode;              // 0=ignore the per-instance color, 1=multiply the PBR albedo by it (a per-part gate; also the 16-byte alignment slot)
     // Vertex swell (currently only the sea uses it): x = half peak-to-trough amplitude in meters (0 = off),
     // y = current phase, z = previous-frame phase for the velocity path, w = fade-out radius in meters.
     // The amplitude is what the vertex shader branches on, so a zero here costs one compare per vertex.
@@ -147,6 +146,17 @@ internal unsafe class PrimitiveData
     /// <summary>Original Surface BaseColor frozen at load time, used as the
     /// multiplicative baseline for SyncColorTint. RGB is tinted while W stays untouched.</summary>
     public Vector4 OriginalBaseColor = Vector4.One;
+
+    /// <summary>glTF material name of the part this primitive draws; null when the asset has no material. This is the primary
+    /// key <c>Model.SetPartColor</c> resolves against.</summary>
+    public string? PartName;
+
+    /// <summary>Name of the node that owns this primitive, the fallback key for <c>Model.SetPartColor</c>.</summary>
+    public string? PartNodeName;
+
+    /// <summary>BaseColor.rgb as loaded (after the MaterialColor tint, before any part override). It is what SyncPartColors
+    /// restores when a part override is cleared, so an absolute override never needs to re-derive the authored value.</summary>
+    public Vector3 PartBaseColor = Vector3.One;
     
     /// <summary>
     /// Original glTF material AlphaCutoff. When Model.Alpha < 1, this is scaled

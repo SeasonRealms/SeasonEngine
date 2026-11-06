@@ -154,11 +154,14 @@ internal unsafe class VKInstancedMesh3D : VKInstancedPrimitiveGroup
         {
             _instanceWorlds = new Matrix4x4[_instanceCount];
             _instanceData = new InstanceTransformData[_instanceCount];
+            _instanceExtras = new InstanceExtras[_instanceCount];
         }
 
         EnsureInstanceBufferCapacity(_instanceCount);
         // 2-3 Step C: create or grow the prev instance world SSBO
         EnsurePrevInstanceWorldCapacity(_instanceCount);
+        // Generic per-instance extras: its own stream, so the 80-byte instance data (cull input, text glyph view) stays as is.
+        EnsureInstanceExtrasCapacity(_instanceCount);
 
         bool wasInitialized = _transformInitialized;
 
@@ -190,6 +193,8 @@ internal unsafe class VKInstancedMesh3D : VKInstancedPrimitiveGroup
 
             _instanceWorlds[writeIndex] = world;
             _instanceData[writeIndex] = InstanceTransformData.FromWorld(world);
+            // Same compacted slot as the matrix, on the direct and the A7 indirect draw alike.
+            _instanceExtras[writeIndex] = new InstanceExtras { Color = instance.Color, Extra = Vector4.Zero };
 
             // Outline2D (per-instance activation): record the writeIndex slot and the
             // per-instance outline color (per-slot mask fetches color per slot).
@@ -264,6 +269,7 @@ internal unsafe class VKInstancedMesh3D : VKInstancedPrimitiveGroup
             anyInstanceOutline ? _outline2DInstanceWidth : mesh.Highlight.OutlineWidth);
 
         UploadInstanceStream(_instanceData, _instanceCount);
+        UploadInstanceExtras(_instanceCount);
 
         // A7: the culling input is bit-for-bit identical to the IA instance stream, so this array is reused directly rather than storing a second copy.
         UpdateCullUpload(mesh);

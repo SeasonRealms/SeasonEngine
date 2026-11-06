@@ -4,8 +4,6 @@
 
 using Microsoft.JSInterop;
 using Season.Fonts;
-// [SkyDebug] Diagnostic use of Unsafe.SizeOf<SceneLightParams> (for invisible-starfield investigation; remove after the issue is resolved)
-using System.Runtime.CompilerServices;
 
 namespace Season.Platforms.Web;
 
@@ -1022,7 +1020,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         }
     }
 
-    /// <summary>2-3 Contract Clause 12: resolve the TAA output from FrameSchedule.SceneColorOverride into
+    /// <summary>2-3 Contract Clause 12: resolve the TAA output from the view's <see cref="Season.Rendering.FrameTextureSlot.SceneColorResolve"/> slot into
     /// a JS-side texture name and forward it (this backend uses name-as-handle, with the real view stored in
     /// JS <c>_textureViews[name]</c>). This mirrors Windows/Graphics.cs ResolveSceneOverrideTexture, but
     /// there is no C# texture object to hand over here, so this side only validates registration and then
@@ -1030,7 +1028,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     /// with no residue.</summary>
     string? ResolveSceneOverrideName()
     {
-        var sceneName = Season.Rendering.FrameSchedule.SceneColorOverride;
+        var sceneName = Season.Rendering.FrameSchedule.TextureName(Season.Rendering.FrameTextureSlot.SceneColorResolve);
         if (sceneName == null) return null;
         lock (DictionaryWGPUTexture)
             return DictionaryWGPUTexture.ContainsKey(sceneName) ? sceneName : null;
@@ -1080,7 +1078,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         WebGPUInterop.BlitToBackbuffer(
             ((WGPURenderTarget)src).Name,
             RenderQuality.Current.HdrExposure,
-            Season.Rendering.FrameSchedule.BloomTexture,
+            Season.Rendering.FrameSchedule.TextureName(Season.Rendering.FrameTextureSlot.Bloom),
             RenderQuality.Current.BloomIntensity,
             resolve: (int)Season.Rendering.PostResolve.Copy,
             sharpness: 0f,
@@ -1103,7 +1101,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         WebGPUInterop.RenderPost(
             ((WGPURenderTarget)sceneColor).Name,
             RenderQuality.Current.HdrExposure,
-            Season.Rendering.FrameSchedule.BloomTexture,
+            Season.Rendering.FrameSchedule.TextureName(Season.Rendering.FrameTextureSlot.Bloom),
             RenderQuality.Current.BloomIntensity,
             Season.Rendering.FrameSchedule.PostAoTexture,
             RenderQuality.Current.AoIntensity,
@@ -2579,10 +2577,6 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
 
     static int _drawModelLogCount = 0;
 
-    // [SkyDebug] Temporary diagnostic counters for invisible-starfield investigation
-    // (LogType.Backend; remove this block after the issue is resolved)
-    static int _skyDebugUploadFrame;
-    static bool _skyDebugBoxLogged;
     public void DrawModel(Model model)
     {
         if (model.Name.IsNullOrWhiteSpace() || model.Alpha == 0 || !_initialized)
@@ -3203,15 +3197,6 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             textureFlags: textureFlags,
             isInstanced: isInstanced,
             prevDataFlags: prevDataFlags);
-
-        // [SkyDebug] Invisible-starfield investigation: log render mode and material color on the first skybox surface draw.
-        if (surface.ProceduralSky && !_skyDebugBoxLogged)
-        {
-            _skyDebugBoxLogged = true;
-            DeviceServices.BaseApp.AddLog(LogType.Backend,
-                $"[SkyDebug] Web skybox surface draw: ProceduralSky=true renderMode=3 " +
-                $"baseColor=({baseColor.X:F3},{baseColor.Y:F3},{baseColor.Z:F3},{baseColor.W:F3}) alpha={finalAlpha:F3} texFlags={textureFlags}");
-        }
     }
 
     static float ComputeTransparentDepth(Matrix4x4 world, Vector3 localCenter)
@@ -3793,7 +3778,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
                 _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3DIndirect",
                     cache.CacheKey, uniformData, mainSortedId, mainVertexOffset, (long)mainSlotBytes, mainArgsId,
                     (long)Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, mainPrimitive),
-                    prevInstanceBytes);
+                    prevInstanceBytes, null, wgpuMesh.InstanceExtrasBytes);
                 mainPrimitive++;
                 Season.Rendering.InstanceCull.MainViewDraws++;
             }
@@ -3805,12 +3790,12 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
                 foreach (var instanceIndex in orderedInstances)
                 {
                     _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3D", cache.CacheKey, uniformData,
-                        wgpuMesh.InstanceBytes, 1, null, prevInstanceBytes, instanceIndex);
+                        wgpuMesh.InstanceBytes, 1, null, prevInstanceBytes, instanceIndex, wgpuMesh.InstanceExtrasBytes);
                 }
             }
             else
             {
-                _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3D", cache.CacheKey, uniformData, wgpuMesh.InstanceBytes, wgpuMesh.EnabledInstanceCount, null, prevInstanceBytes);
+                _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3D", cache.CacheKey, uniformData, wgpuMesh.InstanceBytes, wgpuMesh.EnabledInstanceCount, null, prevInstanceBytes, 0, wgpuMesh.InstanceExtrasBytes);
             }
         }
 
@@ -3868,6 +3853,9 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
 
         var wgpuInstancedModel = new WGPUInstancedModel(model.ModelName);
         wgpuInstancedModel.Load(template, model);
+        // Per-instance tint is a property of the primitives themselves (flag bit + white authored RGB), so it is applied once here,
+        // while model.Asset has not been published yet and no draw can observe a half-configured primitive.
+        wgpuInstancedModel.ApplyInstanceTint(model);
 
         // A7: replay the clips on the instance's own runtime asset before it is published through model.Asset (picking reads
         // its node tree), since sampling poses it; nothing else holds it yet. The shared template's player is never touched.
@@ -3878,14 +3866,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         // The template Asset's player is never evaluated, and narrow-phase skinning would otherwise skip
         // everything because of empty bones.
         model.Asset = wgpuInstancedModel.Asset;
-
-        // 1-3: copy the shared-template local bounds back to the control
-        // as the per-instance sphere broad-phase source, once during load.
-        model.TemplateLocalBounds = template.Asset.Model.LocalBounds;
-        // Unified transform convention: likewise copy back the raw bounds
-        // for instance anchors / per-axis scaling before animation expansion.
-        model.TemplateLocalBoundsRaw = template.Asset.Model.LocalBoundsRaw;
-        model.TemplateCullBounds = cullBounds;
+        model.AdoptTemplateBounds(template.Asset, cullBounds);
         model.AnimationNames = wgpuInstancedModel.GetAnimationNames();
         model.AnimationClipCount = model.AnimationNames.Count;
 
@@ -3987,7 +3968,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             if (isSkinned && wgpuModel.PrevBonesReady)
                 prevDataFlags |= WebGPUPrevDataFlags.PrevBones;
 
-            var uniformData = BuildModelPrimitiveUniform(matrixData, prim, modelAlpha, isSkinned, prevDataFlags);
+            var uniformData = BuildModelPrimitiveUniform(matrixData, prim, modelAlpha, isSkinned, prevDataFlags, wgpuModel.IsTintPrimitive(prim));
             // 2-3 Contract Clause 8(d): instanced models keep PrevWorld all-zero, and per-instance history
             // travels through binding 14.
             WritePrevMatrices(uniformData);
@@ -4004,12 +3985,12 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
                 _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3DIndirect",
                     prim.CacheKey, uniformData, mainSortedId, mainVertexOffset, (long)mainSlotBytes, mainArgsId,
                     (long)Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, mainEntry),
-                    prevInstanceBytes, wgpuModel.SkinKey);
+                    prevInstanceBytes, wgpuModel.SkinKey, wgpuModel.InstanceExtrasBytes);
                 Season.Rendering.InstanceCull.MainViewDraws++;
                 continue;
             }
 
-            _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3D", prim.CacheKey, uniformData, instanceBytes, wgpuModel.EnabledInstanceCount, wgpuModel.SkinKey, prevInstanceBytes);
+            _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3D", prim.CacheKey, uniformData, instanceBytes, wgpuModel.EnabledInstanceCount, wgpuModel.SkinKey, prevInstanceBytes, 0, wgpuModel.InstanceExtrasBytes);
         }
 
         // 2. Transparent: draw one instance at a time after depth sorting.
@@ -4018,7 +3999,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             if (!wgpuModel.TryGetPrimitiveInstanceData(prim, out var instanceWorlds, out var instanceBytes) || instanceWorlds.Length == 0)
                 continue;
 
-            var uniformData = BuildModelPrimitiveUniform(matrixData, prim, modelAlpha, isSkinned);
+            var uniformData = BuildModelPrimitiveUniform(matrixData, prim, modelAlpha, isSkinned, tint: wgpuModel.IsTintPrimitive(prim));
             // 2-3 Contract Clause 8(d): same rule as above
             // (transparent primitives are split into per-instance draws while sharing one uniform).
             WritePrevMatrices(uniformData);
@@ -4029,7 +4010,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             foreach (var instanceIndex in orderedInstances)
             {
                 _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3D", prim.CacheKey, uniformData,
-                    instanceBytes, 1, wgpuModel.SkinKey, null, instanceIndex);
+                    instanceBytes, 1, wgpuModel.SkinKey, null, instanceIndex, wgpuModel.InstanceExtrasBytes);
             }
         }
 
@@ -4045,21 +4026,28 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     }
 
     /// <summary>Build the primitive uniform data used for instanced drawing.</summary>
-    static float[] BuildModelPrimitiveUniform(float[] matrixData, WGPUPrimitiveData prim, float modelAlpha, bool isSkinned = false, int prevDataFlags = 0)
+    static float[] BuildModelPrimitiveUniform(float[] matrixData, WGPUPrimitiveData prim, float modelAlpha, bool isSkinned = false, int prevDataFlags = 0, bool tint = false)
     {
         var uniformData = new float[WebGPUUniformLayout.TotalFloats];
         Array.Copy(matrixData, 0, uniformData, WebGPUUniformLayout.World, WebGPUUniformLayout.WorldFloats);
         Array.Clear(uniformData, WebGPUUniformLayout.PrevWorld, WebGPUUniformLayout.TotalFloats - WebGPUUniformLayout.PrevWorld);
 
         float finalAlpha = prim.OriginalBaseColorAlpha * modelAlpha;
+        // Per-instance tint: RGB steps aside so the instance colour at binding 24 replaces it rather than multiplying it.
+        // ApplyInstanceTint already rewrote the authored RGB to white; restating it here keeps the invariant local to the uniform
+        // builder as well. Alpha is taken from the primitive so the opacity chain is untouched.
+        var baseColor = tint
+            ? new Vector4(1f, 1f, 1f, prim.BaseColor.W)
+            : new Vector4(prim.BaseColor.X, prim.BaseColor.Y, prim.BaseColor.Z, prim.BaseColor.W);
         var w = new WebGPUUniformWriter(uniformData);
-        w.SetBaseColor(new Vector4(prim.BaseColor.X, prim.BaseColor.Y, prim.BaseColor.Z, prim.BaseColor.W));
+        w.SetBaseColor(baseColor);
 
         int textureFlags = 0;
         if (!string.IsNullOrEmpty(prim.MetallicRoughnessTextureName)) textureFlags |= WebGPUTextureFlags.MetallicRoughness;
         if (!string.IsNullOrEmpty(prim.NormalTextureName)) textureFlags |= WebGPUTextureFlags.Normal;
         if (!string.IsNullOrEmpty(prim.OcclusionTextureName)) textureFlags |= WebGPUTextureFlags.Occlusion;
         if (!string.IsNullOrEmpty(prim.EmissiveTextureName)) textureFlags |= WebGPUTextureFlags.Emissive;
+        if (tint) textureFlags |= WebGPUTextureFlags.TintInstanced;
 
         float alphaCutoff = prim.AlphaMode == 1u ? prim.AlphaCutoff * modelAlpha : prim.AlphaCutoff;
 
@@ -4785,15 +4773,6 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             view.RenderViewProjection);
         Light3D = sceneLights;
         WebGPUInterop.UpdateSceneLights(MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref sceneLights, 1)));
-
-        // [SkyDebug] Invisible-starfield investigation: log the injected values before the Web-side full-block upload every 180 frames.
-        _skyDebugUploadFrame++;
-        if (_skyDebugUploadFrame % 180 == 0)
-            DeviceServices.BaseApp.AddLog(LogType.Backend,
-                $"[SkyDebug] Web upload f={_skyDebugUploadFrame} uboBytes={Unsafe.SizeOf<Season.Rendering.SceneLightParams>()} " +
-                $"SkyP0.w={sceneLights.SkyParams0.W:F5} SkyP1.w={sceneLights.SkyParams1.W:F4} " +
-                $"SkyP2.w={sceneLights.SkyParams2.W:F5} SkyP3.w={sceneLights.SkyParams3.W:F3} " +
-                $"SkyViewTex={Season.Rendering.FrameSchedule.SkyViewTexture ?? "null"}");
     }
 
     /// <summary>Staging block for one <see cref="ViewConstants"/> upload (256B, exactly one slot).</summary>

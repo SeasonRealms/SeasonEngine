@@ -464,8 +464,7 @@ public static class WebApp
                 PollInput(app);
 
                 // Update the 3D camera (same semantics as DXPrimitiveGroup.Update, and it must run before BaseApp.Update).
-                // 1-2: switch to passing EffectiveSceneLights
-                // (dual-track UseSceneLights ? SceneLights : FromLegacy, with zero required changes for old apps).
+                // EffectiveSceneLights is the single lighting aggregation point every backend consumes.
                 // Skipped in immediate-2D mode, where the 3D camera/lighting UBO is never consumed because
                 // the pass chain reduces to the Overlay pass only.
                 if (!Season.Rendering.Immediate2DMode.Enabled)

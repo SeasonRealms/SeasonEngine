@@ -213,6 +213,10 @@ internal class App : BaseApp
     // 可行水域（水池 / 支流 / 主河道 / 桥下 / 海口 / 海面 / 瀑布潭）见 Boat.cs。
     internal Boat boat;
 
+    // 东岸岩石外的帆船：只有一个 Model，高度随 Sea.SurfaceY 起伏，帆面颜色每 5 秒换一次（红橙黄绿青蓝紫，35 秒一轮）。
+    // 它是"按部件改基色"的第一处用例，见 SailingBoats.cs。
+    internal SailingBoats sailingBoats;
+
     internal Robots robots;
 
     internal Birds birds;
@@ -833,6 +837,10 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         rocks = new Rocks();
         AddPanel(rocks);
         DeviceServices.BaseApp?.RequestLoad(rocks);   // Queue the whole panel so Load can extract in the background.
+
+        // 岩石外的帆船：排在 sea 与 rocks 之后，它的吃水线直接取自 Sea.SurfaceY。
+        sailingBoats = new SailingBoats(sea);
+        AddPanel(sailingBoats);
 
         forest = new Forest();
         AddPanel(forest);
@@ -1548,6 +1556,9 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
 
         // Sea uses static geometry; each frame only synchronizes transforms and materials.
         sea?.Update(time);
+
+        // 帆船要在 sea 之后：它的吃水线读的是本帧的海面采样（Sea.SurfaceY）。
+        sailingBoats?.Update(time);
 
         // Beach uses static instances; each frame only synchronizes instance matrices and materials.
         beach?.Update(time);

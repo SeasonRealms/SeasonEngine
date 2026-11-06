@@ -126,6 +126,8 @@ window.seasonWebGPU = (() => {
     // binding the same read-only storage buffer to multiple bindings is legal
     // and saves one permanently resident memory block.
     let _defaultPrevInstanceBuffer = null;
+    // Generic per-instance extras (binding 24): one white 32B record, bound whenever a draw has no ring of its own.
+    let _defaultInstanceExtrasBuffer = null;
     const MAX_SKINNED_BONES = 100, BYTES_PER_MATRIX4X4 = 16 * 4, MIN_SKINNED_BONE_BUFFER_BYTES = MAX_SKINNED_BONES * BYTES_PER_MATRIX4X4;
 
     const _textures = {}, _textureMeta = {}, _textureViews = {}, _samplers = {};
@@ -1026,6 +1028,10 @@ window.seasonWebGPU = (() => {
         // (one instance = 5 vec4 = 80B, all zeros)
         _defaultPrevInstanceBuffer = _device.createBuffer({ size: 80, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
         _device.queue.writeBuffer(_defaultPrevInstanceBuffer, 0, new Float32Array(20));
+        // Generic per-instance extras (binding 24): one 32B record, colour = white so a tint multiply is the identity.
+        // Zeroing it instead would blacken every tinted surface for the frame a draw falls back here.
+        _defaultInstanceExtrasBuffer = _device.createBuffer({ size: 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        _device.queue.writeBuffer(_defaultInstanceExtrasBuffer, 0, new Float32Array([1, 1, 1, 1, 0, 0, 0, 0]));
 
         _attachInputHandlers();
         window.addEventListener('resize', _onWindowResize);
@@ -1718,6 +1724,10 @@ window.seasonWebGPU = (() => {
                 // because skyParams0.w is only written when FrameSchedule.SkyViewTexture is non-null.
                 // _shadowBindGroupLayout is not expanded for it, since the shadow pipeline has no fragment stage.
                 { binding: 23, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+                // Generic per-instance extras (24): 32B per compacted instance slot, .color = the tint, .extra a reserved
+                // scalar. Read by vs_main only, and only in the non-text instanced branch, but WGSL static-reference
+                // analysis sees it regardless, so _shadowBindGroupLayout must declare it too (same reason as 13/14).
+                { binding: 24, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
             ]
         });
 
@@ -1851,6 +1861,9 @@ window.seasonWebGPU = (() => {
                 // P2: same reason as 13/14 - vs_main references the per-view UBO through a global const path, so
                 // the vertex-only shadow layout has to declare it too.
                 { binding: 22, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 256 } },
+                // Generic per-instance extras (binding 24), for the same static-reference reason as 13/14/22. The depth
+                // pass has no fragment stage, so the records it reads are never used - it binds the white default.
+                { binding: 24, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
             ]
         });
         _shadowPipeline = _device.createRenderPipeline({
@@ -3187,7 +3200,7 @@ window.seasonWebGPU = (() => {
     // viewSlot pins the per-view UBO (binding 22). 2D sprite / text call sites pass SCREEN_SPACE_VIEW_SLOT;
     // everything derived from a RenderView passes _currentViewSlot, which setViewConstants established before the
     // pass chain started.
-    function _createMeshBindGroup(layout, viewSlot, uniformBuffer, texView, normalView, mrView, aoView, emissiveView, boneBuffer, morphMetaBuffer, morphDataBuffer, prevBoneBuffer, prevInstanceBuffer) {
+    function _createMeshBindGroup(layout, viewSlot, uniformBuffer, texView, normalView, mrView, aoView, emissiveView, boneBuffer, morphMetaBuffer, morphDataBuffer, prevBoneBuffer, prevInstanceBuffer, instanceExtrasBuffer) {
         return _device.createBindGroup({
             layout,
             entries: [
@@ -3247,6 +3260,9 @@ window.seasonWebGPU = (() => {
                 // falling back to 1x1 White when unregistered / not built.
                 // Sampling is gated by WGSL skyParams0.w, so the fallback value is never used.
                 { binding: 23, resource: _getSkyView() },
+                // Generic per-instance extras: the caller's ring when it has one, otherwise the white default, so a
+                // non-instanced draw still has a valid binding for a slot it never reads.
+                { binding: 24, resource: { buffer: instanceExtrasBuffer || _defaultInstanceExtrasBuffer } },
             ]
         });
     }
@@ -3365,6 +3381,8 @@ window.seasonWebGPU = (() => {
                 { binding: 13, resource: { buffer: _defaultBoneBuffer } },
                 { binding: 14, resource: { buffer: _defaultPrevInstanceBuffer } },
                 { binding: 22, resource: { buffer: _ensureViewSlotBuffer(), offset: _currentViewSlot * VIEW_SLOT_BYTES, size: VIEW_SLOT_BYTES } },
+                // Same white default as the main table: the depth-only pass never uses the tint.
+                { binding: 24, resource: { buffer: _defaultInstanceExtrasBuffer } },
             ]
         });
     }
@@ -3903,7 +3921,7 @@ window.seasonWebGPU = (() => {
 // skinKey (InstancedModel): bone palette of a skinned instanced model, resolved exactly as drawInstancedMesh3D does. The palette
 // is laid out by original instance (slot x 100 + joint), which the VS addresses through the same decoded tag as the prev stream,
 // so the compacted rows need nothing else; null keeps the default bones of a rigid mesh.
-function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffset, vertexBytes, argsId, argsOffset, prevInstanceBytes = null, skinKey = null) {
+function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffset, vertexBytes, argsId, argsOffset, prevInstanceBytes = null, skinKey = null, extrasBytes = null) {
     if (!_frameStarted || (!_passEncoder && !_isSceneCollecting())) return;
 
     const mesh = _staticMeshes[cacheKey];
@@ -3954,6 +3972,18 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
 
     const whiteView = _textureViews['White'];
     const texView = _textureViews[mesh.textureName] || whiteView;
+
+    // Generic per-instance extras, the same ring shape as the direct entry: read at binding 24, addressed by the
+    // same decoded slot as the instance matrices, which the gather stamped into row 0 .w.
+    let instanceExtrasBuffer = null;
+    if (extrasBytes) {
+        const extrasView = _interopToU8(extrasBytes);
+        if (extrasView && extrasView.byteLength > 0) {
+            instanceExtrasBuffer = _acquireBuffer('storage', extrasView.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+            _device.queue.writeBuffer(instanceExtrasBuffer, 0, extrasView);
+        }
+    }
+
     const bindGroup = _createMeshBindGroup(
         _mesh3DPipeline.bindGroupLayout,
         _currentViewSlot,
@@ -3967,7 +3997,8 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         mesh.morphMetaBuffer,
         mesh.morphDataBuffer,
         prevBoneBuffer,
-        prevInstanceBuffer);
+        prevInstanceBuffer,
+        instanceExtrasBuffer);
 
     // Opaque collection order ignores depth (_compareSceneDraws), and the compacted rows are not on the CPU anyway, so 0.
     _submitSceneDraw(modeKey, mesh.doubleSided, bindGroup, sortedBuffer, mesh.vBuffer, mesh.iBuffer,
@@ -3976,7 +4007,7 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
 }
 
 
-    function drawInstancedMesh3D(cacheKey, uniformData, instanceBytes, instanceCount, skinKey, prevInstanceBytes = null, firstInstance = 0) {
+    function drawInstancedMesh3D(cacheKey, uniformData, instanceBytes, instanceCount, skinKey, prevInstanceBytes = null, firstInstance = 0, extrasBytes = null) {
         if (!_frameStarted || (!_passEncoder && !_isSceneCollecting()) || !instanceCount || instanceCount <= 0) return;
 
         const boneBuffer = skinKey ? (_skinnedBoneBuffers[skinKey] || _defaultBoneBuffer) : _defaultBoneBuffer;
@@ -4012,6 +4043,17 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
 
         const instanceBuffer = _acquireBuffer('vertex', instanceBytes.byteLength, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
         _device.queue.writeBuffer(instanceBuffer, 0, instanceBytes);
+
+        // Generic per-instance extras: one 32B record per compacted slot, read at binding 24 by the non-text branch.
+        // The depth pass has no fragment stage, so it keeps the white default instead of paying for the upload.
+        let instanceExtrasBuffer = null;
+        if (extrasBytes && !_passDepthOnly) {
+            const extrasView = _interopToU8(extrasBytes);
+            if (extrasView && extrasView.byteLength > 0) {
+                instanceExtrasBuffer = _acquireBuffer('storage', extrasView.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+                _device.queue.writeBuffer(instanceExtrasBuffer, 0, extrasView);
+            }
+        }
 
         // 2-3 Step C: prev-instance bytes use the storage pool and bind at binding 14.
         // One buffer cannot be both VERTEX and STORAGE,
@@ -4067,7 +4109,9 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
                 boneBuffer,
                 mesh.morphMetaBuffer,
                 mesh.morphDataBuffer,
-                prevBoneBuffer);
+                prevBoneBuffer,
+                null,
+                instanceExtrasBuffer);
             _passEncoder.setPipeline(mesh.doubleSided ? _maskPipelineDoubleSided : _maskPipeline);
             _passEncoder.setVertexBuffer(0, instanceBuffer);
             _setSceneVertexBuffer(1, mesh.vBuffer);
@@ -4090,7 +4134,8 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
             mesh.morphMetaBuffer,
             mesh.morphDataBuffer,
             prevBoneBuffer,
-            prevInstanceBuffer);
+            prevInstanceBuffer,
+            instanceExtrasBuffer);
 
         const modeKey = _isTransparentMode(uniformData) ? 'transparent' : _selectPipelineMode(uniformData[46], _getUniformI32View(uniformData)[50], _getUniformI32View(uniformData)[51]);
         _instancedDiag.lastModeKey = modeKey;

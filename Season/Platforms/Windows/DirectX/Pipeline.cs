@@ -35,6 +35,24 @@ internal enum PipelineCullVariant
 internal static unsafe class Pipeline
 {
     internal static ID3D12RootSignature* RootSignature;
+
+    /// <summary>
+    /// DX: the four factors the transparent and fade PSO state is built from, in the order
+    /// (colour source, colour destination, alpha source, alpha destination).
+    ///
+    /// The acceptance host asserts this quadruple as a *state fact* before it expands the "over" formula, instead of
+    /// restating the mathematical result. Changing the PSO blend state therefore turns the host red at the assertion,
+    /// where the message says the host expectation has to be updated -- previously it silently kept validating the old
+    /// world, because the formula had been written from the old result rather than from this state.
+    /// </summary>
+    internal static readonly Blend[] TransparentBlend =
+    [
+        Blend.SrcAlpha,     // [0] colour source
+        Blend.InvSrcAlpha,  // [1] colour destination
+        Blend.One,          // [2] alpha source
+        Blend.InvSrcAlpha,  // [3] alpha destination
+    ];
+
     internal const uint FogFrameRoot = 23, FogIntegratedRoot = 24, FogLocalRoot = 25, FogParamsRoot = 26;
     /// <summary>Per-view constants (b8, <see cref="ViewConstants"/>): View / Projection / history ViewProjection of
     /// the view being drawn. Split out of the per-object b0 so one set of object buffers can be drawn into several
@@ -44,11 +62,21 @@ internal static unsafe class Pipeline
     /// <summary>
     /// 2-7 P0: descriptor table of the procedural-sky Sky-View LUT (t19), sampled by the PBR pixel shader
     /// as the environment **specular** source. It gets its own root index instead of a slot inside the
-    /// 3..22 table run because every index in that range is already taken: 8 is the b3 bone CBV, 11 the
+    /// 3..22 table run because every index in that range is already taken: 8 is the retired b3 CBV placeholder, 11 the
     /// b4 text CBV, and 13 the b5 shadow root constants, so the layout up to 27 is fully occupied.
     /// 28 keeps the existing table run byte-identical and costs one more root-table DWORD.
     /// </summary>
     internal const uint SkyViewRoot = 28;
+
+    /// <summary>
+    /// Generic per-instance extras (t20): one structured buffer of <see cref="InstanceExtras"/> per instanced group,
+    /// indexed by the compacted instance slot. Out of line like <see cref="SkyViewRoot"/> because the 3..22 run is
+    /// fully occupied. It differs from 28 in one decisive way: it is a <b>per-draw</b> binding, not a per-pass one,
+    /// because two instanced groups inside one replay batch bind different streams, so DXSceneDrawCommand.Draw writes
+    /// it itself and it is deliberately absent from <see cref="IsScenePassRoot"/>.
+    /// A descriptor table costs one DWORD: 61 -> 62, leaving two.
+    /// </summary>
+    internal const uint InstanceExtrasRoot = 29;
     static bool _fogSamplingEnabled;
 
     // Per-view constants: one CB per view slot per frame slot, rewritten by WriteViewConstants (N-buffered like every
@@ -161,6 +189,13 @@ internal static unsafe class Pipeline
     internal static GpuDescriptorHandle DefaultPrevMorphWeightsSrvHandle;
     static int DefaultPrevMorphWeightsDescriptorId = -1;
 
+    // Generic per-instance extras (t20): one all-white record, the placeholder for every draw without an extras stream
+    // (non-instanced geometry, sprites). White is the multiplicative identity, so even a read that should not happen
+    // leaves the material untouched instead of blackening it.
+    static ID3D12Resource* DefaultInstanceExtrasBuffer;
+    internal static GpuDescriptorHandle DefaultInstanceExtrasSrvHandle;
+    static int DefaultInstanceExtrasDescriptorId = -1;
+
     // -- Shared resources for Text GPU instancing --
     // All Texts controls share one unit-quad VB + IB (UV 0..1, position +-0.5)
     internal static ID3D12Resource* UnitQuadVertexBuffer;
@@ -266,7 +301,7 @@ internal static unsafe class Pipeline
         // Create the default morph delta buffer (1 vertex x 9 floats, all zero),
         // used as the slot 9 (t5) placeholder for static models without morph targets.
         var defaultMorphData = new float[9];
-        DefaultMorphDescriptorId = Device.DescriptorAllocator.Allocate();
+        DefaultMorphDescriptorId = Device.DescriptorAllocator.Allocate(DescriptorKind.Placeholder);
         DefaultMorphDeltasBuffer = Device.ResourceManager.CreateBuffer(
             HeapType.Upload, (ulong)(defaultMorphData.Length * sizeof(float)),
             ResourceStates.GenericRead);
@@ -297,7 +332,7 @@ internal static unsafe class Pipeline
         // Create the default per-instance bone StructuredBuffer (one identity float4x4),
         // used as the slot 10 (t6) placeholder for non-instanced draws.
         var defaultBoneData = new Matrix4x4[1] { Matrix4x4.Identity };
-        DefaultInstanceBoneDescriptorId = Device.DescriptorAllocator.Allocate();
+        DefaultInstanceBoneDescriptorId = Device.DescriptorAllocator.Allocate(DescriptorKind.Placeholder);
         DefaultInstanceBoneBuffer = Device.ResourceManager.CreateBuffer(
             HeapType.Upload, (ulong)(defaultBoneData.Length * sizeof(Matrix4x4)),
             ResourceStates.GenericRead);
@@ -330,7 +365,7 @@ internal static unsafe class Pipeline
         // t8: prev bone (one all-zero float4x4; shader-side _m33==0 triggers fallback)
         {
             var zeroBone = new Matrix4x4[1] { default };
-            DefaultPrevBoneDescriptorId = Device.DescriptorAllocator.Allocate();
+            DefaultPrevBoneDescriptorId = Device.DescriptorAllocator.Allocate(DescriptorKind.Placeholder);
             DefaultPrevBoneBuffer = Device.ResourceManager.CreateBuffer(
                 HeapType.Upload, (ulong)(zeroBone.Length * sizeof(Matrix4x4)),
                 ResourceStates.GenericRead);
@@ -355,7 +390,7 @@ internal static unsafe class Pipeline
         // t9: prev instanceWorld (one all-zero float4x4)
         {
             var zeroWorld = new Matrix4x4[1] { default };
-            DefaultPrevInstanceWorldDescriptorId = Device.DescriptorAllocator.Allocate();
+            DefaultPrevInstanceWorldDescriptorId = Device.DescriptorAllocator.Allocate(DescriptorKind.Placeholder);
             DefaultPrevInstanceWorldBuffer = Device.ResourceManager.CreateBuffer(
                 HeapType.Upload, (ulong)(zeroWorld.Length * sizeof(Matrix4x4)),
                 ResourceStates.GenericRead);
@@ -380,7 +415,7 @@ internal static unsafe class Pipeline
         // t10: prev morphWeights (one all-zero float4)
         {
             var zeroWeights = new Vector4[1] { Vector4.Zero };
-            DefaultPrevMorphWeightsDescriptorId = Device.DescriptorAllocator.Allocate();
+            DefaultPrevMorphWeightsDescriptorId = Device.DescriptorAllocator.Allocate(DescriptorKind.Placeholder);
             DefaultPrevMorphWeightsBuffer = Device.ResourceManager.CreateBuffer(
                 HeapType.Upload, (ulong)(zeroWeights.Length * sizeof(Vector4)),
                 ResourceStates.GenericRead);
@@ -402,6 +437,32 @@ internal static unsafe class Pipeline
             Device.D3dDevice->CreateShaderResourceView(DefaultPrevMorphWeightsBuffer, &prevMorphSrv, prevMorphCpu);
             DefaultPrevMorphWeightsSrvHandle = Device.SrvHeapManager.GetGpuHandle(DefaultPrevMorphWeightsDescriptorId);
         }
+        // t20: generic per-instance extras (one all-white record)
+        {
+            DefaultInstanceExtrasDescriptorId = Device.DescriptorAllocator.Allocate(DescriptorKind.Placeholder);
+            DefaultInstanceExtrasBuffer = Device.ResourceManager.CreateBuffer(
+                HeapType.Upload, (ulong)sizeof(InstanceExtras), ResourceStates.GenericRead);
+            void* extrasData;
+            DefaultInstanceExtrasBuffer->Map(0, null, &extrasData);
+            Unsafe.Write(extrasData, new InstanceExtras { Color = Vector4.One, Extra = Vector4.Zero });
+            DefaultInstanceExtrasBuffer->Unmap(0, null);
+            var extrasSrv = new ShaderResourceViewDesc
+            {
+                Format = Silk.NET.DXGI.Format.FormatUnknown,
+                ViewDimension = Silk.NET.Direct3D12.SrvDimension.Buffer,
+                Shader4ComponentMapping = 0x00001688u,
+                Buffer = new BufferSrv
+                {
+                    FirstElement = 0,
+                    NumElements = 1,
+                    StructureByteStride = (uint)sizeof(InstanceExtras),
+                    Flags = BufferSrvFlags.None
+                }
+            };
+            var extrasCpu = Device.SrvHeapManager.GetCpuHandle(DefaultInstanceExtrasDescriptorId);
+            Device.D3dDevice->CreateShaderResourceView(DefaultInstanceExtrasBuffer, &extrasSrv, extrasCpu);
+            DefaultInstanceExtrasSrvHandle = Device.SrvHeapManager.GetGpuHandle(DefaultInstanceExtrasDescriptorId);
+        }
 
         // -- Text GPU instancing: create the shared unit-quad VB + IB --
         //   VB: 4 vertices forming a unit square (position +-0.5, UV 0..1)
@@ -418,7 +479,7 @@ internal static unsafe class Pipeline
         UnitQuadIndexBuffer = Device.ResourceManager.CreateIndexBuffer(quadIndices, out UnitQuadIndexBufferView);
 
         // -- Default TextGlyphData buffer (one empty glyph, used as the t5 placeholder for non-text draws) --
-        DefaultTextInstancesDescriptorId = Device.DescriptorAllocator.Allocate();
+        DefaultTextInstancesDescriptorId = Device.DescriptorAllocator.Allocate(DescriptorKind.Placeholder);
         DefaultTextInstancesBuffer = Device.ResourceManager.CreateBuffer(
             HeapType.Upload, (ulong)Unsafe.SizeOf<TextGlyphData>(),
             ResourceStates.GenericRead);
@@ -509,9 +570,10 @@ internal static unsafe class Pipeline
         // The added standalone fog binding occupies 8 DWORDs, for a total of 58, without rewriting the already-submitted lighting CBV.
         // The per-view constant b8 occupies another 2 DWORDs, for a total of 60 (limit 64).
         // 2-7 P0 adds one more t19 descriptor table, for a total of 61 (limit 64), leaving 3 DWORDs.
+        // Per-instance extras adds one t20 descriptor table, for a total of 62 (limit 64), leaving 2 DWORDs.
         _fogSamplingEnabled = RenderQuality.Current.RequiresAtmosphereSceneDepth(
             Device.HdrSceneColor, true, Immediate2DMode.Enabled);
-        var rootParameters = new RootParameter[29];
+        var rootParameters = new RootParameter[30];
 
         // Constant buffer (b0)
         rootParameters[0] = new RootParameter
@@ -547,7 +609,7 @@ internal static unsafe class Pipeline
         // prev bone / prev instance world / prev morph weights / env cube / DdgiAtlas / DdgiDepth /
         // CloudNoise / AerialLut (from t0 to t15)
         // Put on the stack to ensure each table pointer remains valid during later serialization.
-        Span<DescriptorRange> descriptorRanges = stackalloc DescriptorRange[19];
+        Span<DescriptorRange> descriptorRanges = stackalloc DescriptorRange[20];
         for (int i = 0; i < 5; i++)
         {
             descriptorRanges[i] = new DescriptorRange
@@ -650,6 +712,8 @@ internal static unsafe class Pipeline
         descriptorRanges[17] = new() { RangeType = DescriptorRangeType.Srv, NumDescriptors = 1, BaseShaderRegister = 18 };
         // 2-7 P0: t19 = procedural sky's Sky-View LUT, the PBR environment specular source
         descriptorRanges[18] = new() { RangeType = DescriptorRangeType.Srv, NumDescriptors = 1, BaseShaderRegister = 19 };
+        // Generic per-instance extras (t20): the per-instance Color/Extra stream, read by the vertex stage
+        descriptorRanges[19] = new() { RangeType = DescriptorRangeType.Srv, NumDescriptors = 1, BaseShaderRegister = 20 };
 
         // Pin the descriptorRanges array with a fixed block
         fixed (DescriptorRange* pDescriptorRanges = descriptorRanges)
@@ -837,9 +901,24 @@ internal static unsafe class Pipeline
                 },
                 ShaderVisibility = ShaderVisibility.Pixel
             };
+
+            // Generic per-instance extras (t20), read by the vertex stage. Vertex-only visibility keeps the PS from
+            // paying for a table it never reads; the colour reaches it through the existing COLOR0 interpolator, which
+            // the text path already carries, so this binding adds no interpolator and no pixel-stage bandwidth.
+            rootParameters[InstanceExtrasRoot] = new RootParameter
+            {
+                ParameterType = RootParameterType.TypeDescriptorTable,
+                DescriptorTable = new RootDescriptorTable
+                {
+                    NumDescriptorRanges = 1,
+                    PDescriptorRanges = pDescriptorRanges + 19
+                },
+                ShaderVisibility = ShaderVisibility.Vertex
+            };
         }
 
-        // Added: bone-matrix buffer
+        // Slot 8: generic CBV placeholder (b3). No shader reads it since the skinning palette moved to t6/t8;
+        // keeping the slot reserved is what lets every draw bind one fixed address at index 8.
         rootParameters[8] = new RootParameter
         {
             ParameterType = RootParameterType.TypeCbv,
@@ -1059,12 +1138,6 @@ cbuffer ViewConstants : register(b8)
     float4 viewReserved0;
 };
 
-// Legacy bone-matrix CBV (kept for compatibility binding; both regular and instanced skinned paths now use t6 StructuredBuffer)
-cbuffer BoneMatrices : register(b3)
-{
-    float4x4 boneMatrices[100]; // Up to 100 bones
-};
-
 // 1-2 lighting system: unified light structure (64B, byte-for-byte aligned with C# GpuLight;
 // see RenderQuality section 1-2 for the contract)
 struct GpuLight
@@ -1190,7 +1263,7 @@ cbuffer MaterialParams : register(b2)
     uint hasPrevBones;          // 0/1, whether the prev bone SB is valid
     uint hasPrevInstanceWorld;  // 0/1, whether the prev instanceWorld SB is valid
     uint hasPrevMorph;          // 0/1, whether the prev morphWeights SB is valid
-    uint _padMat;               // 16B alignment padding
+    uint tintMode;              // 0=ignore per-instance color, 1=multiply the PBR albedo by it (per-part gate; also 16B alignment)
     // Vertex swell (currently only the sea writes it): x = half peak-to-trough amplitude in meters (0 = off),
     // y = current phase, z = previous-frame phase, w = fade radius in meters. See SwellEvaluate below.
     float4 vertexWave;
@@ -1253,6 +1326,25 @@ StructuredBuffer<float4x4> g_InstanceBoneMatrices : register(t6);
 StructuredBuffer<float4x4> g_PrevInstanceBoneMatrices : register(t8);
 StructuredBuffer<float4x4> g_PrevInstanceWorlds : register(t9);
 StructuredBuffer<float4> g_PrevMorphWeights : register(t10);
+
+#if !SHADOW_PASS
+// Generic per-instance extras (t20), indexed by the same compacted slot as the instance matrices: boneBase +
+// SV_InstanceID on a direct draw, the index gather wrote into M14 on an A7 indirect draw. Kept out of the 80-byte
+// instance stream on purpose -- that stream is the A7 cull input and what the text path reinterprets, so growing it
+// would move culling, gather and text together. This costs the vertex stage one extra storage read instead.
+//
+// color is the per-instance tint; extra is unused and reserved, which is the whole reason the stride is 32 bytes:
+// a later per-instance scalar (wind weight, decal index, morph bias) needs no new binding and no root DWORD.
+// Only the vertex stage reads it, and only on the non-text instance path (see VSMain): the text path numbers its
+// slots against the glyph stream, so reading here with a glyph index would be an out-of-bounds fetch.
+struct InstanceExtras
+{
+    float4 color;
+    float4 extra;
+};
+
+StructuredBuffer<InstanceExtras> g_InstanceExtras : register(t20);
+#endif
 
 // -- Vertex swell: the stylized moving sea, evaluated entirely in the vertex stage --
 //
@@ -1439,20 +1531,15 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
             {
                 int jointIndex = (int)input.jointIndices[i];
                 
-                // Both regular models and GPU-instanced draws read from the dynamic bone StructuredBuffer.
+                // Both regular models and GPU-instanced draws read the same dynamic bone StructuredBuffer;
+                // the regular path is just the zero-based case of the instanced one. When isSkinned == 0 the
+                // CPU writes no joint weights, so there is no skinning to apply for this primitive.
                 if (isSkinned)
                 {
                     int baseIdx = isInstanced ? boneBase + jointIndex : jointIndex;
                     float4x4 boneMatrix = g_InstanceBoneMatrices[baseIdx];
                     skinnedPosition += mul(localPosition, boneMatrix) * weight;
                     float3x3 boneMatrix3x3 = (float3x3)boneMatrix;
-                    skinnedNormal += mul(localNormal, boneMatrix3x3) * weight;
-                    skinnedTangent += mul(localTangentXYZ, boneMatrix3x3) * weight;
-                }
-                else
-                {
-                    skinnedPosition += mul(localPosition, boneMatrices[jointIndex]) * weight;
-                    float3x3 boneMatrix3x3 = (float3x3)boneMatrices[jointIndex];
                     skinnedNormal += mul(localNormal, boneMatrix3x3) * weight;
                     skinnedTangent += mul(localTangentXYZ, boneMatrix3x3) * weight;
                 }
@@ -1597,11 +1684,11 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
                 {
                     bm = g_PrevInstanceBoneMatrices[idx];
                     if (bm._m33 == 0.0)
-                        bm = isInstanced != 0 ? g_InstanceBoneMatrices[idx] : boneMatrices[j];
+                        bm = g_InstanceBoneMatrices[idx];
                 }
                 else
                 {
-                    bm = isInstanced != 0 ? g_InstanceBoneMatrices[idx] : boneMatrices[j];
+                    bm = g_InstanceBoneMatrices[idx];
                 }
                 skinnedPos += mul(prevLocalPos, bm) * w;
             }
@@ -1637,6 +1724,10 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
 
     // -- Text GPU instancing: remap the unit-quad UV to the atlas sub-rect --
     float4 textColor = float4(1, 1, 1, 1);
+    // Per-instance tint from the generic extras slot. Read only on the instanced non-text path: the text path carries
+    // its colour in the glyph stream and numbers its slots against that stream, not against the instance stream, so a
+    // read there would index the wrong buffer (and could run past its end).
+    float4 tintColor = float4(1, 1, 1, 1);
     if (renderMode == 2 && isInstanced)
     {
         TextGlyphData glyph = LoadTextGlyph(instanceSlot);
@@ -1648,8 +1739,13 @@ PSInput VSMain(VSInput input, uint vertexId : SV_VertexID, uint instanceID : SV_
     else
     {
         output.texCoord = input.texCoord;
+#if !SHADOW_PASS
+        // Shadow variants bind no extras table, so the declaration is compiled out with this read.
+        if (isInstanced)
+            tintColor = g_InstanceExtras[instanceSlot].color;
+#endif
     }
-    output.instanceColor = textColor;
+    output.instanceColor = textColor * tintColor;
     output.normal = normalize(mul(localNormal, (float3x3)worldMatrix));
 #if !SHADOW_PASS
     // The swell is a height field added on top of the baked relief, and over that relief the normal is always
@@ -2638,6 +2734,12 @@ float4 PSMain(PSInput input) : SV_TARGET
 #endif
     }
 
+    // Per-instance tint: applied here, after the text branch has already returned, so there is exactly one multiply
+    // site. tintMode is a per-primitive material flag, which is what lets a hull keep its authored look while the sail
+    // beside it in the same instance cycles through seven hues.
+    if (tintMode != 0u)
+        albedo *= input.instanceColor.rgb;
+
     // 2-5 procedural sky: reconstruct the Sky-View LUT UV from the world-space view direction
     // (**ignoring vertex UVs**), so this must run before the useAlbedoMap sampling block below.
     // Otherwise albedo would be polluted by an earlier sample at input.texCoord.
@@ -3128,11 +3230,11 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         {
             BlendEnable = 1,
             LogicOpEnable = 0,
-            SrcBlend = Blend.SrcAlpha,
-            DestBlend = Blend.InvSrcAlpha,
+            SrcBlend = TransparentBlend[0],
+            DestBlend = TransparentBlend[1],
             BlendOp = BlendOp.Add,
-            SrcBlendAlpha = Blend.One,
-            DestBlendAlpha = Blend.InvSrcAlpha,
+            SrcBlendAlpha = TransparentBlend[2],
+            DestBlendAlpha = TransparentBlend[3],
             BlendOpAlpha = BlendOp.Add,
             LogicOp = LogicOp.Noop,
             RenderTargetWriteMask = (byte)ColorWriteEnable.All
@@ -3311,8 +3413,16 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
     /// (only Opaque/Fade have dedicated PSOs; Transparent already does not write depth and therefore falls back to
     /// the regular variant).
     /// Overlay pass (Device.ActivePassId == Overlay) always routes to the dedicated no-depth / single-sample /
-    /// backbuffer-format variants and ignores depthWrite because overlay variants are already depthless.</summary>
-    internal static void SetPipeline(PipelineMode mode, PipelineCullVariant cullVariant, bool depthWrite)
+    /// backbuffer-format variants and ignores depthWrite because overlay variants are already depthless.
+    /// <param name="sceneSignatureBound">
+    /// 3A: true only from <see cref="DXSceneDrawCommand.Draw"/>, where the replay batch has already bound
+    /// <see cref="RootSignature"/> and nothing between commands switches to another graphics root signature
+    /// (the fog composite writes scene-signature roots, it does not swap the signature). Every other caller must
+    /// leave this false: the command list may still carry a composition pipeline's signature.
+    /// </param>
+    /// </summary>
+    internal static void SetPipeline(PipelineMode mode, PipelineCullVariant cullVariant, bool depthWrite,
+        bool sceneSignatureBound = false)
     {
         if (DXSceneDrawCollection.Active is { } collection)
         {
@@ -3320,7 +3430,7 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
             return;
         }
         // Set the dedicated RootSignature
-        DirectX.Device.GraphicsCommandList->SetGraphicsRootSignature(RootSignature);
+        if (!sceneSignatureBound) DirectX.Device.GraphicsCommandList->SetGraphicsRootSignature(RootSignature);
 
         // Reset b6 boneBase: regular draw bone addressing always uses (0 + instanceID) * stride as the base.
         // Mask draws write boneBase separately in SetOutlineMaskColor for per-slot rendering.
@@ -3424,13 +3534,14 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         ID3D12Resource* instanceResource = null,
         ID3D12Resource* argsResource = null,
         uint argsOffset = 0,
-        ID3D12Resource* depthSource = null)
+        ID3D12Resource* depthSource = null,
+        GpuDescriptorHandle instanceExtrasSrvHandle = default)
     {
         if (DXSceneDrawCollection.Active is { } collection)
         {
             collection.CapturePrimitive(primitiveData, lightConstantBuffer, matrixBuffer, instanceBufferView,
                 instanceResource, instanceCount, startInstanceLocation, instanceBoneSrvHandle, prevBoneSrvHandle,
-                prevInstanceWorldSrvHandle, prevMorphSrvHandle, argsResource, argsOffset, depthSource);
+                prevInstanceWorldSrvHandle, prevMorphSrvHandle, argsResource, argsOffset, depthSource, instanceExtrasSrvHandle);
             return;
         }
         var cmdList = Device.GraphicsCommandList;
@@ -3487,6 +3598,10 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         cmdList->SetGraphicsRootDescriptorTable(16,
             prevMorphSrvHandle.Ptr != 0 ? prevMorphSrvHandle : DefaultPrevMorphWeightsSrvHandle);
 
+        // Generic per-instance extras (t20). Non-instanced draws index slot 0 of the all-white default.
+        cmdList->SetGraphicsRootDescriptorTable(InstanceExtrasRoot,
+            instanceExtrasSrvHandle.Ptr != 0 ? instanceExtrasSrvHandle : DefaultInstanceExtrasSrvHandle);
+
         BindSceneTextures();
         if (indirectSignature != null)
         {
@@ -3514,6 +3629,10 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         command->SetGraphicsRootDescriptorTable(14, DefaultPrevBoneSrvHandle);
         command->SetGraphicsRootDescriptorTable(15, DefaultPrevInstanceWorldSrvHandle);
         command->SetGraphicsRootDescriptorTable(16, DefaultPrevMorphWeightsSrvHandle);
+        // t20: per-instance extras. The vertex stage references this table statically even on the non-instanced quad
+        // paths (sprite / text), so every immediate draw must bind it; the all-white default is the identity.
+        // DrawPrimitive does the same for the 3D immediate path.
+        command->SetGraphicsRootDescriptorTable(InstanceExtrasRoot, DefaultInstanceExtrasSrvHandle);
         BindSceneTextures();
     }
 
@@ -3611,6 +3730,51 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         var skyView = SkyViewActive ?? Device.White;
         skyView.EnsureReadyForRendering(cmdList);
         cmdList->SetGraphicsRootDescriptorTable(SkyViewRoot, skyView.GpuDescriptorHandle);
+    }
+
+    // ============================================================
+    // 3A: pass-level scene tables
+    // ============================================================
+
+    /// <summary>
+    /// 3A micro counters, read back by the DX test host. One pass-level bind covers one CBV plus seven tables;
+    /// one replayed draw covers four CBVs that change per primitive, b4, and the ten tables that change per
+    /// material / primitive / group. <see cref="SceneDrawRootCalls"/> additionally sums every root-parameter
+    /// write a replayed command issued, so the per-draw average can be reported instead of estimated.
+    /// Diagnostic only: nothing in the pipeline reads them.
+    /// </summary>
+    internal static long ScenePassBindCount, SceneReplayDrawCount, SceneDrawRootCalls;
+
+    /// <summary>
+    /// True for every root parameter whose content depends on the frame or the view only, never on the primitive:
+    /// the shadow atlas (12), environment cubemap (17), DDGI irradiance (18) and depth (19), cloud noise (21),
+    /// aerial LUT (22) and the Sky-View LUT (28). <see cref="BindScenePassTextures"/> owns them for a whole replay
+    /// batch, so <see cref="DXSceneDrawCommand.Draw"/> skips them; everything else still binds per draw.
+    /// </summary>
+    internal static bool IsScenePassRoot(uint root)
+        => root is 12 or 17 or 18 or 19 or 21 or 22 or SkyViewRoot;
+
+    /// <summary>
+    /// 3A: binds the frame/view-level scene tables once per replay batch instead of once per draw. The handles
+    /// come from that batch's own capture, where <see cref="CaptureSceneTextures"/> already ran every transition
+    /// and copy-fence wait; the set is constant for the batch by construction, because one collection belongs to
+    /// one view and <see cref="DXSceneDrawCollection.Begin"/> re-captures the template per view.
+    /// </summary>
+    internal static void BindScenePassTextures(ref DXSceneDrawCommand draw)
+    {
+        var cmdList = Device.GraphicsCommandList;
+        // The batch owns the signature from here on: Draw() relies on it and skips the redundant per-draw set.
+        cmdList->SetGraphicsRootSignature(RootSignature);
+        // b3 generic CBV placeholder: identical for every replayed command.
+        cmdList->SetGraphicsRootConstantBufferView(8, DefaultTextDrawParamsGpuAddress);
+        cmdList->SetGraphicsRootDescriptorTable(12, draw.Textures[12]);
+        cmdList->SetGraphicsRootDescriptorTable(17, draw.Textures[17]);
+        cmdList->SetGraphicsRootDescriptorTable(18, draw.Textures[18]);
+        cmdList->SetGraphicsRootDescriptorTable(19, draw.Textures[19]);
+        cmdList->SetGraphicsRootDescriptorTable(21, draw.Textures[21]);
+        cmdList->SetGraphicsRootDescriptorTable(22, draw.Textures[22]);
+        cmdList->SetGraphicsRootDescriptorTable(SkyViewRoot, draw.Textures[(int)SkyViewRoot]);
+        ScenePassBindCount++;
     }
 
     // ============================================================
@@ -3735,7 +3899,7 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
     /// The other loop-invariant bindings have already been hoisted:
     /// b4 placeholder -> once per pass in <see cref="SetShadowPipeline"/>;
     /// t6/t8/t9/t10 -> once per group in <see cref="SetShadowGroupBindings"/>;
-    /// b3 (legacy bone CBV) is bound by the caller in OnBeforeDraw, and b5 is written per quadrant by SetShadowViewProj.
+    /// the slot-8 placeholder CBV is set with the rest of the root state, and b5 is written per quadrant by SetShadowViewProj.
     /// </summary>
     /// <param name="bindMaterial">
     /// false = reuse the b2/t5 bindings already active on the command list and skip rebinding them.

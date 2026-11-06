@@ -193,9 +193,10 @@ public sealed class SkyAtmosphereEffect : ComputeEffect
         // Quality-level gate. Under StaticCube mode, do not build any resources at all.
         if (RenderQuality.Current.Sky != SkyMode.Procedural)
         {
-            // [SkyDebug] Troubleshooting invisible stars: do not build the procedural sky when the quality mode is not Procedural.
+            // The procedural tier was not selected, so nothing is built and the app keeps the StaticCube preset.
+            // Logged once at initialize time: this is the first thing to check when a scene shows no analytic stars.
             DeviceServices.BaseApp.AddLog(LogType.Backend,
-                $"[SkyDebug] SkyAtmosphere Initialize SKIP: SkyMode={RenderQuality.Current.Sky} (non-Procedural -> StaticCube mode, no star field)");
+                $"[Sky] SkyAtmosphere Initialize SKIP: SkyMode={RenderQuality.Current.Sky} (non-Procedural -> StaticCube mode, no star field)");
             return false;
         }
 
@@ -236,9 +237,9 @@ public sealed class SkyAtmosphereEffect : ComputeEffect
         });
         if (_transmittance == null || _multiScatter == null || _skyView == null)
         {
-            // [SkyDebug] If any of the first three kernels fails to build, fall back entirely to StaticCube (texture + marker sphere, no star field).
+            // Any of the three core kernels failing to build drops the whole tier to StaticCube (texture + marker sphere).
             DeviceServices.BaseApp.AddLog(LogType.Error,
-                $"[SkyDebug] SkyAtmosphere Initialize FAILED: trans={_transmittance != null} multi={_multiScatter != null} skyView={_skyView != null} -> fallback to StaticCube (no star field)");
+                $"[Sky] SkyAtmosphere Initialize FAILED: trans={_transmittance != null} multi={_multiScatter != null} skyView={_skyView != null} -> fallback to StaticCube (no star field)");
             Dispose();
             return false;
         }
@@ -311,9 +312,9 @@ public sealed class SkyAtmosphereEffect : ComputeEffect
             FrameSchedule.AerialLutTexture = AerialLutTextureName;
         }
 
-        // [SkyDebug] Procedural mode activated successfully: log the state of the three core kernels and the optional add-ons in one place.
+        // Procedural mode activated: record the three core kernels and the optional add-ons in one line.
         DeviceServices.BaseApp.AddLog(LogType.Backend,
-            $"[SkyDebug] SkyAtmosphere Initialize OK: trans/multi/skyView built, cloudNoise={_cloudNoise != null} aerial={_aerial != null}, " +
+            $"[Sky] SkyAtmosphere Initialize OK: trans/multi/skyView built, cloudNoise={_cloudNoise != null} aerial={_aerial != null}, " +
             $"SkyViewTexture={FrameSchedule.SkyViewTexture}, cloudNoiseTex={FrameSchedule.CloudNoiseTexture ?? "null"}, lut={_lutW}x{_lutH}");
 
         return true;

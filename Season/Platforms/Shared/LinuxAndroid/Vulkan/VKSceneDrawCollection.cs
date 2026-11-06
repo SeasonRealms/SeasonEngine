@@ -40,6 +40,8 @@ internal unsafe struct VKSceneDrawCommand : ISceneDrawCommand
     internal DescriptorSet Set;
     // View set 2 (main view frame slot set or screen space set), determined at collection time.
     internal DescriptorSet View;
+    // 3B: globals set 3 paired with View (frame/view-level lighting inputs), also fixed at collection time.
+    internal DescriptorSet ViewGlobals;
     internal VkBuffer Vertex;
     internal VkBuffer Index;
     internal VkBuffer Instances;
@@ -65,7 +67,7 @@ internal unsafe struct VKSceneDrawCommand : ISceneDrawCommand
                 // Texture readiness and descriptor refresh are already done in the collection phase:
                 // those operations include layout transitions and can only be called outside the render pass.
                 Pipeline.DrawPrimitiveCore(cmd, Primitive!, Vertex, Index, Set, IndexCount,
-                    Instances, InstanceCount, FirstInstance, prepared: true, View,
+                    Instances, InstanceCount, FirstInstance, prepared: true, View, ViewGlobals,
                     IndirectArgs, IndirectOffset, InstanceOffset);
                 break;
 
@@ -76,7 +78,7 @@ internal unsafe struct VKSceneDrawCommand : ISceneDrawCommand
                 Device.Vk.CmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
                 var set = Set;
                 Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, Pipeline.PipelineLayout, 0, 1, &set, 0, null);
-                Pipeline.BindViewSet(cmd, View);
+                Pipeline.BindViewSets(cmd, View, ViewGlobals);
                 if (Pipeline.SceneFogSamplingBaked && Mode != PipelineMode.Opaque)
                 {
                     Pipeline.PushSceneFog(cmd);
@@ -96,7 +98,7 @@ internal unsafe struct VKSceneDrawCommand : ISceneDrawCommand
                 Device.Vk.CmdBindIndexBuffer(cmd, Index, 0, IndexKind);
                 var set = Set;
                 Device.Vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, Pipeline.PipelineLayout, 0, 1, &set, 0, null);
-                Pipeline.BindViewSet(cmd, View);
+                Pipeline.BindViewSets(cmd, View, ViewGlobals);
                 if (Pipeline.SceneFogSamplingBaked && Mode != PipelineMode.Opaque)
                 {
                     Pipeline.PushSceneFog(cmd);
@@ -127,31 +129,6 @@ internal sealed unsafe class VKSceneDrawCollection
 
     /// <summary>The collection being collected; null outside the collection period, and replay will not be captured by itself again.</summary>
     internal static VKSceneDrawCollection? Active { get; private set; }
-
-    // Primitives actually drawn this frame/last frame, deduplicated by reference.
-    // binding 16-20 are only safe to rewrite before the command buffer begins (otherwise the validation layer judges the whole command buffer as invalid),
-    // but scene collection happens after begin, so the frame-start pre-refresh can only be based on the previous frame's draw collection.
-    // See Pipeline.RefreshSceneBindingsForFrameStart.
-    static HashSet<PrimitiveData> _drawnThisFrame = new();
-    static HashSet<PrimitiveData> _drawnLastFrame = new();
-    static HashSet<VKSpriteQuad> _quadThisFrame = new();
-    static HashSet<VKSpriteQuad> _quadLastFrame = new();
-
-    /// <summary>The set of primitives actually drawn last frame, for the frame-start pre-refresh to iterate.</summary>
-    internal static IReadOnlyCollection<PrimitiveData> PreviousFramePrimitives => _drawnLastFrame;
-
-    /// <summary>The set of sprites actually drawn last frame, also for the frame-start pre-refresh to iterate.</summary>
-    internal static IReadOnlyCollection<VKSpriteQuad> PreviousFrameQuads => _quadLastFrame;
-
-    /// <summary>
-    /// Records a primitive rendered this frame, as the basis for the next frame's frame-start pre-refresh.
-    /// Both the main pass collection and the shadow pass call it: the shadow's draw collection is its own culling result and may not be fully covered by the main pass,
-    /// while both refresh the same set of descriptor sets. Calling it outside the collection period is also safe.
-    /// </summary>
-    internal static void NotePrimitiveDrawn(PrimitiveData primitive) => _drawnThisFrame.Add(primitive);
-
-    /// <summary>Records a sprite drawn this frame, with the same purpose as <see cref="NotePrimitiveDrawn"/>.</summary>
-    internal static void NoteQuadDrawn(VKSpriteQuad quad) => _quadThisFrame.Add(quad);
 
     // The fog sampling switch only logs one line when the state flips, making it convenient to confirm on a real device "whether the transparent phase actually samples fog".
     static bool? _reportedFog;
@@ -259,11 +236,6 @@ internal sealed unsafe class VKSceneDrawCollection
         finally
         {
             _live = false; State = default;
-            // Swap rather than copy: this frame's draw collection becomes the basis for the next frame's frame-start pre-refresh.
-            (_drawnThisFrame, _drawnLastFrame) = (_drawnLastFrame, _drawnThisFrame);
-            _drawnThisFrame.Clear();
-            (_quadThisFrame, _quadLastFrame) = (_quadLastFrame, _quadThisFrame);
-            _quadThisFrame.Clear();
         }
     }
 
@@ -305,10 +277,9 @@ internal sealed unsafe class VKSceneDrawCollection
         bool indirect = indirectArgs.Handle != 0;
         if (indexCount == 0 || (instanceCount == 0 && !indirect)) return;
 
-        // Texture readiness and the refresh of bindings 16-20 must be done outside the pass, see the notes on PreparePrimitive.
+        // Texture readiness and the five material texture transitions must be done outside the pass, see the notes on PreparePrimitive.
         Pipeline.PreparePrimitive(cmd, primitive, set);
         _arena.Retain(primitive);
-        _drawnThisFrame.Add(primitive);
 
         var draw = State;
         draw.Kind = VKSceneDrawKind.Primitive;
@@ -316,6 +287,7 @@ internal sealed unsafe class VKSceneDrawCollection
         draw.Set = set;
         // The view slot was already chosen by FrameSchedule.PrepareView during collection, so what is recorded here is this view's set 2.
         draw.View = Pipeline.ActiveViewSet;
+        draw.ViewGlobals = Pipeline.ActiveViewGlobals;
         draw.Vertex = vertex;
         draw.Index = index;
         draw.Instances = instanceBuffer;
@@ -365,6 +337,7 @@ internal sealed unsafe class VKSceneDrawCollection
             DepthWrite = false,
             Set = set,
             View = screenSpace ? Pipeline.ScreenViewSet : Pipeline.ActiveViewSet,
+            ViewGlobals = screenSpace ? Pipeline.ScreenViewGlobals : Pipeline.ActiveViewGlobals,
             Vertex = vertex,
             IndexCount = 6,
             InstanceCount = 1,
@@ -384,6 +357,7 @@ internal sealed unsafe class VKSceneDrawCollection
             DepthWrite = false,
             Set = set,
             View = Pipeline.ScreenViewSet,
+            ViewGlobals = Pipeline.ScreenViewGlobals,
             Vertex = vertex,
             Index = index,
             Instances = instances,

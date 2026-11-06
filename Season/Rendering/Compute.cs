@@ -282,7 +282,8 @@ public enum ComputePhase
     FrameStart,
     AfterScene,
 
-    /// <summary>After the opaque scene ends and before the transparent scene begins; when there is no segmentation, it runs immediately after the full Scene pass.</summary>
+    /// <summary>After the opaque scene ends and before the transparent scene begins; it always sits between SceneOpaque and
+    /// SceneTransparent - after the opaque bucket, decals and SSR, but before the fog/weather/water composites.</summary>
     AfterOpaque,
 }
 
@@ -367,6 +368,18 @@ public abstract class ComputeEffect
 
     /// <summary>Drops every per-view state slot; call from Dispose so a re-registered effect starts from a clean history.</summary>
     protected void ClearViewStates() => _viewStates = null;
+
+    /// <summary>
+    /// Visits every per-view state slot. Effects that own per-view backend resources (scoped compute textures,
+    /// buffers) or publish per-view output names override Dispose and use this to revoke them for every view,
+    /// not just whichever one happens to be active when the effect retires.
+    /// </summary>
+    protected void ForEachViewState(Action<ViewTargets, object> visit)
+    {
+        ArgumentNullException.ThrowIfNull(visit);
+        if (_viewStates == null) return;
+        foreach (var pair in _viewStates) visit(pair.Key, pair.Value);
+    }
 
     /// <summary>Notifies the effect after it is removed from the registry so it can revoke the frame routing it attached; by default the original manual-disposal contract is retained.</summary>
     public virtual void OnUnregistered() { }

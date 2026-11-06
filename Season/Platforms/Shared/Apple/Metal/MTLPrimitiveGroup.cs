@@ -16,7 +16,7 @@ namespace Season.Platforms.Shared.Apple.Metal;
 ///
 /// Derived differences:
 /// - Geometry and material sources, where MTLModel uses a glTF node tree and MTLMesh3D uses Mesh3D.Surfaces.
-/// - Whether bones exist, where MTLModel overrides BoneMatrixBuffers and uploads bone matrices in OnBeforeDraw.
+/// - Whether bones exist, where MTLModel overrides the VS buffer(6) palette ring and writes it during Update.
 ///
 /// Simplifications relative to Vulkan:
 /// - No DescriptorSet objects are needed because DrawPrimitive binds directly through SetVertexBuffer, SetFragmentBuffer, and SetFragmentTexture.
@@ -25,13 +25,15 @@ namespace Season.Platforms.Shared.Apple.Metal;
 /// </summary>
 internal abstract class MTLPrimitiveGroup : IDisposable
 {
-    /// <summary>Each bone matrix occupies 64 bytes. Matching DX and VK, the UBO holds up to 100 bones.</summary>
+    /// <summary>Bones per palette block. It sizes the shared identity ring (the retired b3 slot's placeholder and the
+    /// non-skinned fallback at VS buffer(6)) and the single-model CPU palette; GPU palettes are sized by the joint count.</summary>
     public const int MaxBones = 100;
 
     // === Globally shared lighting UBOs, N-buffered at FS slot 1 ===
     internal static IMTLBuffer[] LightConstantBuffers = null!;
 
-    // === Globally shared identity-bone UBO for primitive groups without skinning, used as the dummy binding at VS slot 3 ===
+    // === Globally shared identity-bone UBO. It backs the retired b3 slot's placeholder at VS slot 3 and the
+    //     non-skinned fallback at VS slot 6; no shader reads skinning from slot 3 any more. ===
     internal static IMTLBuffer[] IdentityBoneBuffers = null!;
 
     // === Globally shared placeholder instance-bone buffer with one identity matrix, used as the dummy binding at VS slot 5 ===
@@ -419,8 +421,8 @@ internal abstract class MTLPrimitiveGroup : IDisposable
             primitiveData.MaterialBuffers[i] = Device.ResourceManager.CreateConstantBuffer((nuint)Unsafe.SizeOf<MaterialParams>());
     }
 
-    /// <summary>Derived override that returns the bone-UBO frame ring used by this primitive group. The default is the global Identity ring.</summary>
-    protected virtual IMTLBuffer[] BoneMatrixBuffers => IdentityBoneBuffers;
+    /// <summary>Derived override that returns the palette ring this group binds at VS buffer(6), indexed by frame. The default is the global Identity ring; the retired b3 slot no longer carries skinning.</summary>
+    protected virtual IMTLBuffer[] BonePaletteBuffers => IdentityBoneBuffers;
 
     /// <summary>Derived override that returns the current-frame per-instance bone buffer used by shell rendering at VS buffer(6). The default is the global Identity buffer.</summary>
     protected virtual IMTLBuffer InstanceBoneBufferForDraw(int fi) => IdentityInstanceBoneBuffers[fi];
@@ -678,13 +680,6 @@ internal abstract class MTLPrimitiveGroup : IDisposable
     /// <summary>Implemented by derived classes to append all PrimitiveData objects that should be drawn in the current frame into result.</summary>
     protected abstract void CollectPrimitives(List<PrimitiveData> result);
 
-    /// <summary>
-    /// Extra hook that runs before Draw.
-    /// MTLModel overrides it to upload bone matrices into the current-frame bone UBO.
-    /// The default implementation is empty because MTLMesh3D and other non-skinned primitive groups need no extra work.
-    /// </summary>
-    protected virtual void OnBeforeDraw() { }
-
     // ============================================================
     // Unified highlighting: highlight boxes with separate face and edge primitives, lazily built with no extra PSO families, using Transparent for faces and Opaque for edges
     // ============================================================
@@ -866,7 +861,7 @@ internal abstract class MTLPrimitiveGroup : IDisposable
     /// drawing faces Front then Back.
     /// Zero means edge-only rendering and skips faces automatically.
     /// Edges use the Opaque path with CullNone and depth writes, so solid thin strips cover the faces and any interior geometry.
-    /// Bones and morph data are bound directly through SetVertexBuffer and do not require OnBeforeDraw.</summary>
+    /// Bones and morph data are bound directly through SetVertexBuffer, with the palette at VS buffer(6).</summary>
     protected void DrawHighlightBox(HighlightBox box)
     {
         var face = box.Face;
@@ -1497,8 +1492,6 @@ internal abstract class MTLPrimitiveGroup : IDisposable
         if (!_transformInitialized)
             return;
 
-        OnBeforeDraw();
-
         _drawList.Clear();
         CollectPrimitives(_drawList);
         if (_drawList.Count == 0)
@@ -1679,8 +1672,6 @@ internal abstract class MTLPrimitiveGroup : IDisposable
         if (_shadowDrawList.Count == 0)
             return;
 
-        OnBeforeDraw();
-
         // When material and morph state are identical within the group,
         // bind them only for the first primitive and let later primitives reuse the encoder state already in effect.
         // Otherwise fall back to per-primitive binding.
@@ -1703,28 +1694,29 @@ internal abstract class MTLPrimitiveGroup : IDisposable
     {
         int fi = Device.FrameIndex;
         Pipeline.DrawShadowPrimitive(enc, p, p.VertexBuffer, p.IndexBuffer,
-            p.MatrixBuffers[fi], p.MaterialBuffers[fi], BoneMatrixBuffers[fi],
-            p.MorphDeltasBuffer ?? DefaultMorphDeltasBuffers[fi], IdentityInstanceBoneBuffers[fi],
+            p.MatrixBuffers[fi], p.MaterialBuffers[fi], IdentityBoneBuffers[fi],
+            p.MorphDeltasBuffer ?? DefaultMorphDeltasBuffers[fi], BonePaletteBuffers[fi],
             (nuint)p.Indices.Length, p.Use32BitIndices ? MTLIndexType.UInt32 : MTLIndexType.UInt16,
             null, 0, 1, 0, bindMaterial);
     }
 
     /// <summary>
     /// The unified exit for primitive drawing; after work package D it delegates directly to <see cref="Pipeline.DrawPrimitive"/>.
-    /// The parameters are item-by-item equivalent to the old per-line bindings: slot 2/9 use the identity instance stream, slot 10 uses the previous frame's bone ring (PrevFrameIndex),
-    /// and the index type and offset are unchanged.
+    /// Slot 3 stays on the shared identity placeholder now that no shader declares b3; the group palette goes to slot 6,
+    /// where the non-instanced route addresses joint i from row zero, and slot 10 carries the previous-frame ring.
+    /// Slot 2/9 use the identity instance stream, and the index type and offset are unchanged.
     /// This way the collection phase only needs to intercept at one place, Pipeline.DrawPrimitive, and all 3D draws of non-instanced models (including the highlight shell and shell box) enter the segmented queue.
     /// </summary>
     void DrawPrimitive(IMTLRenderCommandEncoder enc, PrimitiveData p)
     {
         int fi = Device.FrameIndex;
-        var bones = BoneMatrixBuffers;
+        var palette = BonePaletteBuffers;
         Pipeline.DrawPrimitive(enc, p, p.VertexBuffer, p.IndexBuffer,
-            p.MatrixBuffers[fi], p.MaterialBuffers[fi], LightConstantBuffers[fi], bones[fi],
-            p.MorphDeltasBuffer ?? DefaultMorphDeltasBuffers[fi], IdentityInstanceBoneBuffers[fi],
+            p.MatrixBuffers[fi], p.MaterialBuffers[fi], LightConstantBuffers[fi], IdentityBoneBuffers[fi],
+            p.MorphDeltasBuffer ?? DefaultMorphDeltasBuffers[fi], palette[fi],
             MTLPrimitiveType.Triangle, (nuint)p.Indices.Length,
             p.Use32BitIndices ? MTLIndexType.UInt32 : MTLIndexType.UInt16, 0,
-            null, 0, 1, 0, null, bones[PrevFrameIndex], 0);
+            null, 0, 1, 0, null, palette[PrevFrameIndex], 0);
     }
 
     // ============================================================
@@ -1739,8 +1731,8 @@ internal abstract class MTLPrimitiveGroup : IDisposable
     /// Culling follows DoubleSided,
     /// and DSS uses the dedicated mask variant with no depth write plus LessEqual,
     /// mirroring DX and VK with depthWrite = false.
-    /// OnBeforeDraw is applied per primitive to provide b3 bone UBO binding,
-    /// and drawing proceeds primitive by primitive.
+    /// Each primitive binds the group palette at VS buffer(6) and draws immediately,
+    /// with slot 3 left on the shared placeholder.
     /// This mirrors DX and VK DrawOutlineMask one to one.
     /// </summary>
     public virtual void DrawOutlineMask()
@@ -1767,7 +1759,6 @@ internal abstract class MTLPrimitiveGroup : IDisposable
             // then draw primitive by primitive.
             Pipeline.SetPipeline(enc, PipelineMode.Opaque, p.DoubleSided);
             enc.SetDepthStencilState(Pipeline.OutlineMaskDepthState);
-            OnBeforeDraw();
             DrawPrimitive(enc, p);
         }
     }

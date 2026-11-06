@@ -31,6 +31,29 @@ internal struct InstanceTransformData
 }
 
 /// <summary>
+/// One slot of the generic per-instance extras stream (set 0, binding 26), addressed by the same <b>compacted</b> slot as
+/// the instance matrices: <c>boneBase + gl_InstanceIndex</c> on a direct draw, the index gather's M14 stamp on an A7
+/// indirect draw.
+/// <para>
+/// It lives outside the 80-byte <see cref="InstanceTransformData"/> on purpose. That stream is bit-identical to the A7 cull
+/// input and to the IA instance buffer, and it is also what the text path reinterprets, so growing its stride would move
+/// culling, gather and text at once. A separate stream costs one vertex-stage storage read instead.
+/// </para>
+/// <para>
+/// <see cref="Color"/> is the per-instance tint the PBR path multiplies its albedo by, gated per primitive through
+/// <c>MaterialParams.TintMode</c> so a hull sharing an instance with a tinted sail keeps its authored look.
+/// <see cref="Extra"/> is unused today and is the reason this type is 32 bytes: a later per-instance scalar (wind weight,
+/// decal index, morph bias) then costs no new binding and no new descriptor.
+/// </para>
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct InstanceExtras
+{
+    public Vector4 Color;
+    public Vector4 Extra;
+}
+
+/// <summary>
 /// Base class for GPU-instanced primitive groups (Vulkan).
 /// Unifies instance-buffer management, transparent sorting,
 /// and three-bucket grouped drawing.
@@ -255,6 +278,99 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
         Device.ResourceManager.UpdateBuffer(_instanceBuffer, data);
     }
 
+    // ============================================================
+    // Generic per-instance extras (binding 26)
+    // ============================================================
+
+    /// <summary>This frame's extras records, one per compacted instance slot, filled by the derived Update alongside
+    /// <see cref="_instanceData"/>.</summary>
+    protected InstanceExtras[] _instanceExtras = Array.Empty<InstanceExtras>();
+    BufferResource[] _instanceExtrasBuffers = Array.Empty<BufferResource>();
+    // Pointer-sized handles, not byte*: a pointer cannot be a generic argument, so the mapped addresses are stored
+    // as IntPtr and cast where they are written.
+    IntPtr[] _mappedInstanceExtrasBuffers = Array.Empty<IntPtr>();
+    int _instanceExtrasCapacity;
+
+    /// <summary>
+    /// Closes the loop between the descriptor set and the extras ring: the sets are written at load, when the instance
+    /// count is still unknown, so they start out on the shared white record. Whenever the ring is (re)created this
+    /// republishes every set, exactly as a bone-capacity growth does, because a set still pointing at the 1-element
+    /// placeholder would be read out of bounds at slot 1 and beyond.
+    /// </summary>
+    protected void EnsureInstanceExtrasCapacity(int count)
+    {
+        if (count <= 0 || count <= _instanceExtrasCapacity)
+            return;
+
+        for (int i = 0; i < _instanceExtrasBuffers.Length; i++)
+        {
+            var retired = _instanceExtrasBuffers[i];
+            if (retired.Memory.Handle == 0)
+                continue;
+            if (i < _mappedInstanceExtrasBuffers.Length && _mappedInstanceExtrasBuffers[i] != IntPtr.Zero)
+                Device.Vk.UnmapMemory(Device.LogicalDevice, retired.Memory);
+            // Same rule as the instance stream: a frame in flight may still read the old buffer through binding 26.
+            Device.EnqueueDeferredRelease(() => Device.ResourceManager.DestroyBuffer(retired));
+        }
+
+        int n = (int)Device.frameCount;
+        ulong size = (ulong)(count * Unsafe.SizeOf<InstanceExtras>());
+        var buffers = new BufferResource[n];
+        var mapped = new IntPtr[n];
+
+        for (int i = 0; i < n; i++)
+        {
+            buffers[i] = Device.ResourceManager.CreateBuffer(
+                size,
+                BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferDstBit,
+                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit);
+
+            void* ptr;
+            if (Device.Vk.MapMemory(Device.LogicalDevice, buffers[i].Memory, 0, size, 0, &ptr) != Result.Success)
+                throw new Exception("vkMapMemory (InstanceExtras) failed");
+            mapped[i] = (IntPtr)ptr;
+
+            // White, not zero: a slot no instance claimed this frame must multiply to itself, and a zeroed record would
+            // turn every tinted part of it black for one frame instead.
+            var records = (InstanceExtras*)ptr;
+            for (int r = 0; r < count; r++)
+                records[r] = new InstanceExtras { Color = Vector4.One, Extra = Vector4.Zero };
+        }
+
+        _instanceExtrasBuffers = buffers;
+        _mappedInstanceExtrasBuffers = mapped;
+        _instanceExtrasCapacity = count;
+
+        for (int i = 0; i < _primitives.Count; i++)
+            RewriteDescriptorSets(_primitives[i]);
+        RewriteShellDescriptorSets();
+    }
+
+    /// <summary>Copies this frame's extras records into this frame's ring slot. Contrast with the instance stream, this
+    /// one is not a vertex buffer: it is only ever read through binding 26.</summary>
+    protected void UploadInstanceExtras(int count)
+    {
+        int slot = InstanceFrameSlot;
+        if (count <= 0 || (uint)slot >= (uint)_mappedInstanceExtrasBuffers.Length)
+            return;
+        if (_mappedInstanceExtrasBuffers[slot] == IntPtr.Zero || count > _instanceExtras.Length)
+            return;
+
+        fixed (InstanceExtras* src = _instanceExtras)
+            Unsafe.CopyBlock((byte*)_mappedInstanceExtrasBuffers[slot], src, (uint)(count * Unsafe.SizeOf<InstanceExtras>()));
+    }
+
+    /// <summary>Whether binding 26 for this frame slot points at the group's own ring (false means the white placeholder).</summary>
+    protected override DescriptorBufferInfo GetInstanceExtrasBufferInfo(int fi)
+    {
+        if (_instanceExtrasCapacity > 0 && (uint)fi < (uint)_instanceExtrasBuffers.Length
+            && _instanceExtrasBuffers[fi].Buffer.Handle != 0)
+            return new DescriptorBufferInfo
+            { Buffer = _instanceExtrasBuffers[fi].Buffer, Offset = 0, Range = Vk.WholeSize };
+
+        return base.GetInstanceExtrasBufferInfo(fi);
+    }
+
     public new void Draw()
     {
         if (!_transformInitialized || _instanceCount == 0)
@@ -408,24 +524,8 @@ internal unsafe abstract class VKInstancedPrimitiveGroup : VKPrimitiveGroup, Sea
         var cmd = Device.GraphicsCommandBuffer;
         int fi = (int)Device.FrameIndex;
 
-        // Same contract as VKPrimitiveGroup / VKInstancedModel.DrawShadow: bindings 16-20 must be
-        // aligned before the first bind of this frame, otherwise the main pass's PreparePrimitive
-        // patches a set already recorded this frame, and sets without UPDATE_AFTER_BIND declared
-        // then invalidate the entire command buffer.
-        // Instanced groups bypass scene collection and the main pass will not register them either,
-        // so here we also hand the drawn primitives to the next frame's frame-start pre-refresh.
-        for (int i = 0; i < _opaquePrimitives.Count; i++)
-        {
-            var primitive = _opaquePrimitives[i];
-            VKSceneDrawCollection.NotePrimitiveDrawn(primitive);
-            Pipeline.RefreshSceneBindings(primitive.DescriptorSets[fi],
-                ref primitive.EnvCubeViewVersions[fi],
-                ref primitive.DdgiAtlasViewVersions[fi],
-                ref primitive.DdgiDepthViewVersions[fi],
-                ref primitive.CloudNoiseViewVersions[fi],
-                ref primitive.AerialLutViewVersions[fi],
-                ref primitive.SkyViewViewVersions[fi]);
-        }
+        // 3B: the pre-flush of bindings 16-20/25 is gone. Those six lighting inputs live in the per-view globals
+        // set 3 now, written before this view's pass chain starts, so no primitive set 0 is rewritten mid-frame.
 
         // A7: when this frame's cull chain is ready, the instance stream instead reads this slot's reordered segment, with index count and instance count supplied by the indirect args.
         if (TryGetShadowSegment(0, out var sortedBuffer, out ulong instanceOffset, out var argsBuffer, out int slot))

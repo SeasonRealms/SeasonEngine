@@ -33,10 +33,6 @@ namespace Season.Rendering;
 /// </summary>
 public static class SkyLighting
 {
-    // [SkyDebug] Temporary diagnostic counters for missing-star debugging (LogType.Backend). Remove after investigation.
-    static int _skyDebugFrame;
-    static int _skyDebugEarlyExitCount;
-
     // -- CPU coarse-LUT specification. Changes here only affect CPU-side precision and rebake cost, not GPU behavior. --
 
     /// <summary>CPU transmittance LUT width in the mu direction. GPU side uses 256.</summary>
@@ -355,16 +351,10 @@ public static class SkyLighting
         FrameSchedule.WeatherVisuals?.Apply(ref lightParams, RenderQuality.Current.RegionalWeather,
             FrameSchedule.SkyViewTexture != null && FrameSchedule.CloudNoiseTexture != null);
 
+        // A missing Sky-View LUT means the procedural sky is not active, so there is no analytic sun/moon disk
+        // or starfield to feed. StaticCube is the expected tier for apps that never enable it: fall back silently.
         if (FrameSchedule.SkyViewTexture == null)
-        {
-            // [SkyDebug] Fallback-preset diagnostic: SkyViewTexture=null means the procedural sky is not active (no analytic sun/moon disks or starfield).
-            // StaticCube is the expected tier for apps that never enable the procedural sky, so log the
-            // fallback once for diagnosis and stay silent afterwards; per-frame logs are pure noise.
-            if (_skyDebugEarlyExitCount++ == 0)
-                DeviceServices.BaseApp.AddLog(LogType.Backend,
-                    $"[SkyDebug] Apply EARLY-EXIT SkyViewTexture=null -> StaticCube preset (cubemap + marker sphere, no starfield) cnt={_skyDebugEarlyExitCount - 1}");
             return;
-        }
 
         const float deg2Rad = MathF.PI / 180f;
 
@@ -404,15 +394,6 @@ public static class SkyLighting
         // always derives from the same parameter set in the same frame; letting consumers derive it from Atmosphere themselves would desync
         // it from sunT's two-slot memoization, yielding contradictions like an orange sky over a still-white ground at sunset.
         lightParams.ReflectionParams0 = new Vector4(ReflectionGroundRadiance(), ReflectionGroundHeight);
-
-        // [SkyDebug] Starfield-visibility diagnosis: log injected values every 90 frames in deep night (starVis>0.3) and every 900 frames otherwise.
-        _skyDebugFrame++;
-        if (_skyDebugFrame % (starVisibility > 0.3f ? 90 : 900) == 0)
-            DeviceServices.BaseApp.AddLog(LogType.Backend,
-                $"[SkyDebug] Apply f={_skyDebugFrame} sunElev={sunElevDeg:F2}° starVis={starVisibility:F3} " +
-                $"SkyP0.w={lightParams.SkyParams0.W:F5} SkyP1.w={lightParams.SkyParams1.W:F4} " +
-                $"starRot={lightParams.SkyParams3.W:F3} pole=({lightParams.SkyParams4.X:F3},{lightParams.SkyParams4.Y:F3},{lightParams.SkyParams4.Z:F3}) " +
-                $"viewR={lightParams.SkyParams4.W:F0}");
 
         ApplyClouds(ref lightParams, sunDir, moonDir);
     }

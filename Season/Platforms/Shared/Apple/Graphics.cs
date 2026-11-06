@@ -1231,7 +1231,7 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             Pipeline.SetPipeline(enc, PipelineMode.Transparent, doubleSided: true);
 
             // VS slots:
-            // 0=unit quad, 1=identity Matrices, 2=instance stream, 3=IdentityBone,
+            // 0=unit quad, 1=identity Matrices, 2=instance stream, 3=retired b3 placeholder,
             // 4=text material, 5=glyph data reusing morphDeltas, 6=InstanceBone placeholder, 7=TextDrawParams,
             // 11=screen-space ViewConstants (identity View/Projection).
             enc.SetVertexBuffer(_textQuadVertexBuffer, 0, 0);
@@ -1510,10 +1510,10 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         BlitPipeline.DrawUber(enc, rt, ResolveBloomTexture(), ResolveAoTexture(), ResolveSceneOverrideTexture());
     }
 
-    /// <summary>Resolve bloom-chain output from the instance dictionary through FrameSchedule.BloomTexture. Null means no bloom.</summary>
+    /// <summary>Resolve bloom-chain output from the instance dictionary through the view's <see cref="Season.Rendering.FrameTextureSlot.Bloom"/> slot. Null means no bloom.</summary>
     MTLTexture? ResolveBloomTexture()
     {
-        var bloomName = Season.Rendering.FrameSchedule.BloomTexture;
+        var bloomName = Season.Rendering.FrameSchedule.TextureName(Season.Rendering.FrameTextureSlot.Bloom);
         if (bloomName == null)
             return null;
         lock (DictionaryMtlTexture)
@@ -1536,11 +1536,12 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         }
     }
 
-    /// <summary>Contract clause 12 of 2-3: resolve TAA output from the instance dictionary through FrameSchedule.SceneColorOverride.
+    /// <summary>Contract clause 12 of 2-3: resolve TAA output from the instance dictionary through the view's
+    /// <see cref="Season.Rendering.FrameTextureSlot.SceneColorResolve"/> slot.
     /// Null means no override, and BlitPipeline falls back to the SceneColor RT with zero residual state.</summary>
     MTLTexture? ResolveSceneOverrideTexture()
     {
-        var sceneName = Season.Rendering.FrameSchedule.SceneColorOverride;
+        var sceneName = Season.Rendering.FrameSchedule.TextureName(Season.Rendering.FrameTextureSlot.SceneColorResolve);
         if (sceneName == null)
             return null;
         lock (DictionaryMtlTexture)
@@ -2593,6 +2594,7 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
 
             var mtlInstancedModel = new MTLInstancedModel(model.ModelName);
             mtlInstancedModel.Load(template, wrapperModel, model.SkinningMode);
+            mtlInstancedModel.ApplyInstanceTint(model);
 
             // A7: replay the clips on the instance's own runtime asset before it is published through model.Asset (picking reads
             // its node tree), since sampling poses it; nothing else holds it yet. The shared template's player is never touched.
@@ -2601,15 +2603,7 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             // v2 picking:
             // inject the instanced GltfAsset so the node tree, animation, and bone palette stay aligned with instanced rendering.
             model.Asset = mtlInstancedModel.Asset;
-
-            // 1-3:
-            // write shared-template local bounds back into the control once during loading,
-            // providing the instance-level sphere quick-cull data source.
-            model.TemplateLocalBounds = template.Asset.Model.LocalBounds;
-            // Follow the same unified positioning convention for the raw bounds as well,
-            // providing the data source for instance anchors and per-axis scaling before animation enlargement.
-            model.TemplateLocalBoundsRaw = template.Asset.Model.LocalBoundsRaw;
-            model.TemplateCullBounds = cullBounds;
+            model.AdoptTemplateBounds(template.Asset, cullBounds);
 
             var animNames = mtlInstancedModel.GetAnimationNames();
             model.AnimationClipCount = animNames.Count;

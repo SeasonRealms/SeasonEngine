@@ -286,6 +286,10 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         // (Vulkan requires a valid ImageView for every binding)
         _whiteTexture = Vulkan.Device.White;
 
+        // 3B: now that the white fallback exists, fill every per-view globals set 3 with its placeholders once, so the
+        // very first frame's shadow pass already binds valid descriptors (Pipeline.Init runs before this point).
+        Vulkan.Pipeline.WriteInitialSceneGlobals();
+
         // P3: per-view constants are uploaded through the frame scheduler's hook, which runs for the main view as
         // well. Registering it is what turns the single-view shape into the multi-view one; without it every draw
         // keeps binding the main view's set 2, which is exactly the pre-P3 behaviour.
@@ -1125,8 +1129,8 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             var pipelineLayout = Pipeline.PipelineLayout;
 
             Vulkan.Device.Vk.CmdBindDescriptorSets(cmd, VkPipelineBindPoint.Graphics, pipelineLayout, 0, 1, &set, 0, null);
-            // Text uses the screen-space view set 2 (identity View/Projection).
-            Pipeline.BindViewSet(cmd, Pipeline.ScreenViewSet);
+            // Text uses the screen-space view set 2 (identity View/Projection) paired with the screen-space globals set 3.
+            Pipeline.BindViewSets(cmd, Pipeline.ScreenViewSet, Pipeline.ScreenViewGlobals);
             // The fog sampling trio is in a separate set 1: the text variant shares the same FS with Sprite2D and statically references it,
             // and set 1 participates in layout compatibility checks, so a missing binding is reported as unbound by the validation layer.
             Pipeline.BindFogSet(cmd);
@@ -1440,7 +1444,18 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     ///   binding 9: default instance bone storage buffer[fi]
     ///   binding 10: per-Texts glyph storage buffer[fi] (N-buffered per frame)
     ///   binding 11: per-Texts text draw params UBO[fi]
+    ///   binding 12: shadow atlas (or White when shadows are off), comparison sampler
+    ///   binding 13-15: previous-frame bone/instanceWorld/morph tables, zero placeholders
+    ///   binding 21: the same shadow view through the point sampler
+    ///   binding 26: the white per-instance extras record (isInstanced is 0 here, so it is never read)
+    /// The lighting inputs (16-20, 25) are bound through the globals set 3 and the fog trio (22-24) through set 1, so
+    /// neither appears in this set.
     /// </summary>
+    internal static readonly uint[] TextSetBindings =
+    {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 21, 26,
+    };
+
     void AllocateTextDescriptorSets(ref VKTextInstanceState state, VkTexture atlasTexture, int frameCount)
     {
         var whiteView = _whiteTexture.View;
@@ -1465,8 +1480,8 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             // UBO infos (per frame)
             var lightInfo = new VkDescriptorBufferInfo
             { Buffer = VKPrimitiveGroup.LightConstantBuffers[fi].Buffer, Offset = 0, Range = SVk.WholeSize };
-            var boneInfo = new VkDescriptorBufferInfo
-            { Buffer = VKPrimitiveGroup.IdentityBoneBuffers[fi].Buffer, Offset = 0, Range = SVk.WholeSize };
+            var placeholderInfo = new VkDescriptorBufferInfo
+            { Buffer = Pipeline.DefaultTextDrawParamsBuffer.Buffer, Offset = 0, Range = SVk.WholeSize };
             var instanceBoneInfo = new VkDescriptorBufferInfo
             { Buffer = Pipeline.IdentityInstanceBoneBuffers[fi].Buffer, Offset = 0, Range = SVk.WholeSize };
             var drawParamsInfo = new VkDescriptorBufferInfo
@@ -1480,14 +1495,15 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
                 imgInfos[i] = new VkDescriptorImageInfo
                 { ImageView = whiteView, ImageLayout = VkImageLayout.ShaderReadOnlyOptimal };
 
-            // Write 25 bindings (prefix submission, no holes allowed in between)
-            // (2-3 Step C adds default zero placeholders for previous-frame SSBO data at bindings 13/14/15;
-            //  work package C added the raw shadow depth at 21 and the fog sampling placeholders at 22/23/24)
-            var writes = stackalloc VkWriteDescriptorSet[25];
+            // 3B/B2: 18 writes -- bindings 0..15 plus 21 and 26. The six view/frame-level lighting inputs
+            // (16/17/18/19/20/25) moved to the per-view globals set 3, which the text draw path binds right after
+            // this set; the fog trio moved to set 1. Nothing here depends on this frame's lighting state any more.
+            // stackalloc is not zero-initialized, so the array must hold exactly the writes performed: no holes.
+            var writes = stackalloc VkWriteDescriptorSet[18];
             writes[0] = MakeTextWrite(set, 0, VkDescriptorType.UniformBuffer, &matrixInfo);
             writes[1] = MakeTextWrite(set, 1, VkDescriptorType.UniformBuffer, &lightInfo);
             writes[2] = MakeTextWrite(set, 2, VkDescriptorType.UniformBuffer, &materialInfo);
-            writes[3] = MakeTextWrite(set, 3, VkDescriptorType.UniformBuffer, &boneInfo);
+            writes[3] = MakeTextWrite(set, 3, VkDescriptorType.UniformBuffer, &placeholderInfo);
             for (int i = 0; i < 5; i++)
                 writes[4 + i] = MakeTextImageWrite(set, (uint)(4 + i), imgInfos + i);
             writes[9] = MakeTextWrite(set, 9, VkDescriptorType.StorageBuffer, &instanceBoneInfo);
@@ -1528,45 +1544,20 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
             // 1-5 clause 15: binding 21 is the same shadow depth,
             // but goes through a point sampler to read raw depth for masked search (paired with the comparison sampler at 12).
-            //
-            // 16-20 must be written: the text drawIndexed binds exactly this set, and the text variant
-            // shares the same FS with Sprite2D / sky; SPIR-V statically declares the five samplers envCube/ddgiAtlas/
-            // ddgiDepth/cloudNoise/aerialLut, and an unwritten binding is a null descriptor,
-            // which the validation layer reports as imageView=0 under VUID-vkCmdDrawIndexed-None-08114.
-            // Placeholders always use each binding's in-frame Bound fallback value (white / DummyBlack), guaranteeing samplability.
-            var envCube = VKTextureCube.Bound;
-            var envCubeInfo = new VkDescriptorImageInfo
-            { ImageView = envCube.View, ImageLayout = VkImageLayout.ShaderReadOnlyOptimal };
-            writes[16] = MakeTextImageWrite(set, 16, &envCubeInfo);
-            var ddgiAtlas = VKPrimitiveGroup.DdgiAtlasBound;
-            var ddgiInfo = new VkDescriptorImageInfo
-            { ImageView = ddgiAtlas.View, ImageLayout = VkImageLayout.ShaderReadOnlyOptimal };
-            writes[17] = MakeTextImageWrite(set, 17, &ddgiInfo);
-            var ddgiDepth = VKPrimitiveGroup.DdgiDepthBound;
-            var ddgiDepthInfo = new VkDescriptorImageInfo
-            { ImageView = ddgiDepth.View, ImageLayout = VkImageLayout.ShaderReadOnlyOptimal };
-            writes[18] = MakeTextImageWrite(set, 18, &ddgiDepthInfo);
-            var cloudNoise = VKPrimitiveGroup.CloudNoiseBound;
-            var cloudInfo = new VkDescriptorImageInfo
-            { ImageView = cloudNoise.View, ImageLayout = VkImageLayout.ShaderReadOnlyOptimal };
-            writes[19] = MakeTextImageWrite(set, 19, &cloudInfo);
-            var aerialLut = VKPrimitiveGroup.AerialLutBound;
-            var aerialInfo = new VkDescriptorImageInfo
-            { ImageView = aerialLut.View, ImageLayout = VkImageLayout.ShaderReadOnlyOptimal };
-            writes[20] = MakeTextImageWrite(set, VKPrimitiveGroup.AerialLutBinding, &aerialInfo);
-            writes[21] = MakeTextImageWrite(set, 21, &shadowInfo);
+            // The text drawIndexed binds exactly this set, so the descriptor must exist (index 16 in the write array).
+            writes[16] = MakeTextImageWrite(set, 21, &shadowInfo);
 
-            // The three fog sampling slots (22/23/24): the text entry point statically references them in the transparent variant,
-            // so an unwritten descriptor is garbage and placeholders must be written first.
-            // 22 is the frame constant storage buffer, whose real contents are provided by the fog composite;
-            // 23/24 first use the AP volume placeholder and are rewritten into this frame's volume products by the transparent Pass before binding.
-            var fogFrameInfo = new VkDescriptorBufferInfo
-            { Buffer = Pipeline.DefaultFogFrameBuffers[fi].Buffer, Offset = 0, Range = SVk.WholeSize };
-            writes[22] = MakeTextWrite(set, Pipeline.SceneFogFrameBinding, VkDescriptorType.StorageBuffer, &fogFrameInfo);
-            writes[23] = MakeTextImageWrite(set, Pipeline.SceneFogIntegratedBinding, &aerialInfo);
-            writes[24] = MakeTextImageWrite(set, Pipeline.SceneFogLocalBinding, &aerialInfo);
+            // B2: the 22/23/24 fog placeholders are gone. The text draw binds the fog trio from its own set 1
+            // (Pipeline.BindFogSet / BindViewSets), and no shader declares 22/23/24 in set 0.
 
-            Vulkan.Device.Vk.UpdateDescriptorSets(Vulkan.Device.LogicalDevice, 25, writes, 0, null);
+            // Binding 26 (InstanceExtras): the text draw binds this set with the shared transparent PSO, and that VS
+            // statically declares the table, so an unwritten slot would be stack garbage the driver aborts on.
+            // isInstanced is 0 for text, so the read is gated off; the white placeholder record is never consumed.
+            var extrasInfo = new VkDescriptorBufferInfo
+            { Buffer = Pipeline.DefaultInstanceExtrasBuffers[fi].Buffer, Offset = 0, Range = SVk.WholeSize };
+            writes[17] = MakeTextWrite(set, Pipeline.InstanceExtrasBinding, VkDescriptorType.StorageBuffer, &extrasInfo);
+
+            Vulkan.Device.Vk.UpdateDescriptorSets(Vulkan.Device.LogicalDevice, 18, writes, 0, null);
         }
     }
 
@@ -2481,6 +2472,11 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             var vkInstancedModel = new VKInstancedModel(model.ModelName);
             vkInstancedModel.Load(template, wrapperModel, model.SkinningMode);
 
+            // Opted-in parts take the per-instance tint and give up their authored RGB, which is what turns the
+            // multiply into a replacement. Done here rather than inside Load because only the control knows which
+            // parts asked for it, and no draw can see this material yet.
+            vkInstancedModel.ApplyInstanceTint(model);
+
             // A7: replay the clips on the instance's own runtime asset before it is published through model.Asset (picking reads
             // its node tree), since sampling poses it; nothing else holds it yet. The shared template's player is never touched.
             var cullBounds = vkInstancedModel.Asset.ComputeClipUnionBounds(template.Asset.Model.LocalBounds);
@@ -2488,14 +2484,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             // v2 picking: inject the instanced GltfAsset
             // so the node tree / animation / bone palette share the same source as instanced rendering
             model.Asset = vkInstancedModel.Asset;
-
-            // 1-3: copy the shared-template local bounds back to the control
-            // as the data source for instance-level sphere quick culling, once during load
-            model.TemplateLocalBounds = template.Asset.Model.LocalBounds;
-            // Unified transform convention: likewise copy back the raw bounds
-            // as the data source for instance anchors / per-axis scaling, before animation expansion
-            model.TemplateLocalBoundsRaw = template.Asset.Model.LocalBoundsRaw;
-            model.TemplateCullBounds = cullBounds;
+            model.AdoptTemplateBounds(template.Asset, cullBounds);
 
             var animNames = vkInstancedModel.GetAnimationNames();
             model.AnimationClipCount = animNames.Count;
@@ -3004,6 +2993,12 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         if (g is not Graphics) return;
 
         Vulkan.Pipeline.SetActiveView(view.Index);
+        // 3B: the per-view globals set 3 (envCube / DDGI atlas + depth / cloud noise / AP LUT / Sky-View) is written
+        // here, once per view per frame. All six handles were already resolved for this frame by
+        // VKPrimitiveGroup.SetLighting during Update, and the slot's previous submission retired frameCount frames
+        // back (PrepareViewGlobals waits on it), so this cannot rewrite a set the recording buffer references.
+        // The main view is covered too: its branch below returns early.
+        Vulkan.Pipeline.PrepareViewGlobals(view.Index);
         if (view.Index == 0)
         {
             // The main view was already prepared (and its constants written) at the camera update point, before the
@@ -3077,11 +3072,11 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         => Vulkan.Device.RenderPostUber(sceneColor, ResolveBloomTexture(), ResolveAoTexture(),
             ResolveSceneOverrideTexture());
 
-    /// <summary>Resolve the bloom-chain output from the instance dictionary through
-    /// FrameSchedule.BloomTexture (null means no bloom).</summary>
+    /// <summary>Resolve the bloom-chain output from the instance dictionary through the view's
+    /// <see cref="Season.Rendering.FrameTextureSlot.Bloom"/> slot (null means no bloom).</summary>
     VkTexture? ResolveBloomTexture()
     {
-        var bloomName = Season.Rendering.FrameSchedule.BloomTexture;
+        var bloomName = Season.Rendering.FrameSchedule.TextureName(Season.Rendering.FrameTextureSlot.Bloom);
         if (bloomName == null)
             return null;
         lock (DictionaryVKTexture)
@@ -3106,11 +3101,11 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     }
 
     /// <summary>2-3 contract clause 12: resolve the TAA resolve output from the instance dictionary
-    /// through FrameSchedule.SceneColorOverride
+    /// through the view's <see cref="Season.Rendering.FrameTextureSlot.SceneColorResolve"/> slot
     /// (null means no override, and Device falls back to the SceneColor RT with zero residue).</summary>
     VkTexture? ResolveSceneOverrideTexture()
     {
-        var sceneName = Season.Rendering.FrameSchedule.SceneColorOverride;
+        var sceneName = Season.Rendering.FrameSchedule.TextureName(Season.Rendering.FrameTextureSlot.SceneColorResolve);
         if (sceneName == null)
             return null;
         lock (DictionaryVKTexture)
