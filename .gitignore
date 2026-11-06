@@ -63,3 +63,4 @@ nunit-*.xml
 /Apps/Engine/.dbg/_river_bin
 /Season/.dbg/_river_bin
 /.dbg
+/_s3trace
