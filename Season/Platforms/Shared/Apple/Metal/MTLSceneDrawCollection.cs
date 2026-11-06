@@ -100,7 +100,9 @@ internal struct MTLSceneDrawCommand : ISceneDrawCommand
         // so both the PSO and DSS are actually bound here; the collection phase only records the mode.
         Pipeline.SetPipeline(enc, Mode, doubleSided: Cull == MTLCullMode.None, DepthWrite);
         // In the two-pass double-sided scheme, the front-face pass uses Front culling, while SetPipeline only expresses the None/Back states, so it is filled in here.
-        enc.SetCullMode(Cull);
+        // Routed through Pipeline.SetCullMode rather than straight to the encoder: during collection that is the call
+        // that records the value, and at replay it is the one place that also feeds the S0 draw trace.
+        Pipeline.SetCullMode(enc, Cull);
         // The transparent stage's gating and fog-sampling resources: carried by the whole command itself, not depending on encoder state left by the previous command.
         Pipeline.BindSceneFog(enc);
 

@@ -155,14 +155,14 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
     Dictionary<(Season.Controls.ShapeType, int, int, int), MTLTexture> DictionaryShapeTexture = new();
     Dictionary<(Season.Controls.ShapeType, long), MTLSprite2D> DictionaryShape = new();
 
-    Dictionary<(string, long), MTLModel> DictionaryModel = new();
+    readonly DrawableTable<(string, long), MTLModel> _modelTable = new();
     Dictionary<string, Task<MTLModel>> DictionaryModelResource = new();
 
-    Dictionary<(string, long), MTLSprite3D> DictionarySprite3D = new();
+    readonly DrawableTable<(string, long), MTLSprite3D> _sprite3DTable = new();
 
-    Dictionary<(string, long), MTLMesh3D> DictionaryMesh3D = new();
-    Dictionary<(string, long), MTLInstancedMesh3D> DictionaryInstancedMesh3D = new();
-    Dictionary<(string, long), MTLInstancedModel> DictionaryInstancedModel = new();
+    readonly DrawableTable<(string, long), MTLMesh3D> _mesh3DTable = new();
+    readonly DrawableTable<(string, long), MTLInstancedMesh3D> _instancedMesh3DTable = new();
+    readonly DrawableTable<(string, long), MTLInstancedModel> _instancedModelTable = new();
 
     // -- Phase 4: Outline2D mask path, mirrored with DX and VK --
 
@@ -1397,32 +1397,32 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
 
         var drawGroups = new List<MTLPrimitiveGroup>();
 
-        lock (DictionaryModel)
+        lock (_modelTable.Gate)
         {
-            foreach (var pair in DictionaryModel)
+            foreach (var pair in _modelTable)
                 if (TryAccumulateOutline2D(pair.Value))
                     drawGroups.Add(pair.Value);
         }
 
-        lock (DictionaryMesh3D)
+        lock (_mesh3DTable.Gate)
         {
-            foreach (var pair in DictionaryMesh3D)
+            foreach (var pair in _mesh3DTable)
                 if (TryAccumulateOutline2D(pair.Value))
                     drawGroups.Add(pair.Value);
         }
 
         // Instanced controls, InstancedMesh3D and InstancedModel, also support per-instance Outline2D masks.
         // Activation state is aggregated during the platform Update phase from each instance or host Highlight.Outline2D through MTLInstancedPrimitiveGroup.
-        lock (DictionaryInstancedMesh3D)
+        lock (_instancedMesh3DTable.Gate)
         {
-            foreach (var pair in DictionaryInstancedMesh3D)
+            foreach (var pair in _instancedMesh3DTable)
                 if (TryAccumulateOutline2D(pair.Value))
                     drawGroups.Add(pair.Value);
         }
 
-        lock (DictionaryInstancedModel)
+        lock (_instancedModelTable.Gate)
         {
-            foreach (var pair in DictionaryInstancedModel)
+            foreach (var pair in _instancedModelTable)
                 if (TryAccumulateOutline2D(pair.Value))
                     drawGroups.Add(pair.Value);
         }
@@ -1795,13 +1795,8 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
 
     public async Task<bool> LoadModel(Season.Controls.Model model)
     {
-        lock (DictionaryModel)
-        {
-            if (DictionaryModel.ContainsKey((model.Name, model.ID)))
-            {
-                return true;
-            }
-        }
+        if (_modelTable.Contains((model.Name, model.ID)))
+            return true;
 
         GetOrCreateSharedModelAsync(model.Name).ContinueWith(task =>
         {
@@ -1818,13 +1813,8 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
                 ExecuteUpload();
             }
 
-            lock (DictionaryModel)
-            {
-                if (!DictionaryModel.ContainsKey((model.Name, model.ID)))
-                    DictionaryModel.Add((model.Name, model.ID), mtlModel);
-                else
-                    mtlModel.Dispose();
-            }
+            if (!_modelTable.TryAdd((model.Name, model.ID), mtlModel))
+                mtlModel.Dispose();
         });
 
         return true;
@@ -1875,16 +1865,13 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
     {
         MTLModel mtlModel = null!;
 
-        lock (DictionaryModel)
+        // Material overrides are consumed before the animation update, and the pair stays inside the gate:
+        // a concurrent dispose unregisters the model and retires it, so both have to run against a live entry.
+        _modelTable.With((model.Name, model.ID), (self: this, model, time), static (native, args) =>
         {
-            if (DictionaryModel.TryGetValue((model.Name, model.ID), out mtlModel!))
-            {
-                // -- Material overrides, newly added. --
-                ProcessModelOverrides(model, mtlModel);
-
-                mtlModel.Update(model, time);
-            }
-        }
+            args.self.ProcessModelOverrides(args.model, native);
+            native.Update(args.model, args.time);
+        });
     }
 
     /// <summary>Consume all material-override properties on Model and reset them to null or default after processing.</summary>
@@ -1923,34 +1910,9 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
     public void DrawModel(Model model)
     {
         if (model.Name.IsNullOrWhiteSpace() || model.Alpha == 0)
-        {
+            return;
 
-        }
-        else
-        {
-            MTLModel mtlModel3D = null!;
-
-            lock (DictionaryModel)
-            {
-                if (DictionaryModel.TryGetValue((model.Name, model.ID), out mtlModel3D!))
-                {
-
-                }
-                else
-                {
-                    //texture.Changed = true;
-                }
-            }
-
-            if (mtlModel3D == null)
-            {
-
-            }
-            else
-            {
-                mtlModel3D.Draw();
-            }
-        }
+        _modelTable.With((model.Name, model.ID), static native => native.Draw());
     }
 
     // ============================================================
@@ -1960,40 +1922,28 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
     public void DrawModelShadow(Model model)
     {
         MTLModel mtlModel = null!;
-        lock (DictionaryModel)
-        {
-            DictionaryModel.TryGetValue((model.Name, model.ID), out mtlModel!);
-        }
+        _modelTable.TryGet((model.Name, model.ID), out mtlModel);
         mtlModel?.DrawShadow();
     }
 
     public void DrawMesh3DShadow(Season.Controls.Mesh3D mesh)
     {
         MTLMesh3D mtlMesh = null!;
-        lock (DictionaryMesh3D)
-        {
-            DictionaryMesh3D.TryGetValue((mesh.Name, mesh.ID), out mtlMesh!);
-        }
+        _mesh3DTable.TryGet((mesh.Name, mesh.ID), out mtlMesh);
         mtlMesh?.DrawShadow();
     }
 
     public void DrawInstancedModelShadow(InstancedModel model)
     {
         MTLInstancedModel mtlModel = null!;
-        lock (DictionaryInstancedModel)
-        {
-            DictionaryInstancedModel.TryGetValue((model.ModelName, model.ID), out mtlModel!);
-        }
+        _instancedModelTable.TryGet((model.ModelName, model.ID), out mtlModel);
         mtlModel?.DrawShadow();
     }
 
     public void DrawInstancedMesh3DShadow(InstancedMesh3D mesh)
     {
         MTLInstancedMesh3D mtlMesh = null!;
-        lock (DictionaryInstancedMesh3D)
-        {
-            DictionaryInstancedMesh3D.TryGetValue((mesh.Name, mesh.ID), out mtlMesh!);
-        }
+        _instancedMesh3DTable.TryGet((mesh.Name, mesh.ID), out mtlMesh);
         mtlMesh?.DrawShadow();
     }
 
@@ -2045,11 +1995,8 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
 
     public async Task<bool> LoadSprite3D(Sprite3D sprite)
     {
-        lock (DictionarySprite3D)
-        {
-            if (DictionarySprite3D.ContainsKey((sprite.Name, sprite.ID)))
-                return true;
-        }
+        if (_sprite3DTable.Contains((sprite.Name, sprite.ID)))
+            return true;
 
         MTLTexture view = null!;
         lock (DictionaryMtlTexture)
@@ -2098,44 +2045,37 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
 
         var mtlSprite3D = new MTLSprite3D(view);
 
-        lock (DictionarySprite3D)
-        {
-            if (!DictionarySprite3D.ContainsKey((sprite.Name, sprite.ID)))
-                DictionarySprite3D.Add((sprite.Name, sprite.ID), mtlSprite3D);
-        }
+        _sprite3DTable.TryAdd((sprite.Name, sprite.ID), mtlSprite3D);
 
         return true;
     }
 
     public void UpdateSprite3D(Sprite3D sprite, float time)
     {
-        MTLSprite3D mtlSprite3D = null!;
-        lock (DictionarySprite3D)
+        _sprite3DTable.With((sprite.Name, sprite.ID), (self: this, sprite), static (native, args) =>
         {
-            if (DictionarySprite3D.TryGetValue((sprite.Name, sprite.ID), out mtlSprite3D!))
+            var sprite = args.sprite;
+            // Texture replacement
+            if (sprite.TextureOverride.HasValue)
             {
-                // -- Texture replacement, newly added. --
-                if (sprite.TextureOverride.HasValue)
-                {
-                    var source = sprite.TextureOverride;
-                    sprite.TextureOverride = default;
-                    ReplaceSpriteTexture(sprite.Name, mtlSprite3D, source);
-                }
-
-                // Billboard orientation must be built from the view actually being rendered (not the legacy
-                // camera mirror), so a second view billboards toward its own camera.
-                var view = Season.Rendering.RenderView.Current;
-                mtlSprite3D.Update(
-                    new Vector3(sprite.PosX, sprite.PosY, sprite.PosZ),
-                    new Vector2(sprite.Width ?? 1f, sprite.Height ?? 1f),
-                    sprite.Rotation,
-                    view.View,
-                    view.RenderProjection,
-                    sprite.Mode,
-                    sprite.Color,
-                    sprite.Alpha);
+                var source = sprite.TextureOverride;
+                sprite.TextureOverride = default;
+                args.self.ReplaceSpriteTexture(sprite.Name, native, source);
             }
-        }
+
+            // Billboard orientation must be built from the view actually being rendered (not the legacy
+            // camera mirror), so a second view billboards toward its own camera.
+            var view = Season.Rendering.RenderView.Current;
+            native.Update(
+                new Vector3(sprite.PosX, sprite.PosY, sprite.PosZ),
+                new Vector2(sprite.Width ?? 1f, sprite.Height ?? 1f),
+                sprite.Rotation,
+                view.View,
+                view.RenderProjection,
+                sprite.Mode,
+                sprite.Color,
+                sprite.Alpha);
+        });
     }
 
     public void DrawSprite3D(Sprite3D sprite)
@@ -2144,26 +2084,18 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             return;
 
         MTLSprite3D mtlSprite3D = null!;
-        lock (DictionarySprite3D)
-        {
-            DictionarySprite3D.TryGetValue((sprite.Name, sprite.ID), out mtlSprite3D!);
-        }
+        _sprite3DTable.TryGet((sprite.Name, sprite.ID), out mtlSprite3D);
         mtlSprite3D?.Draw();
     }
 
     public void DisposeSprite3D(Sprite3D sprite)
     {
         MTLSprite3D mtlSprite3D = null!;
-        lock (DictionarySprite3D)
-        {
-            var key = (sprite.Name, sprite.ID);
-            if (DictionarySprite3D.TryGetValue(key, out mtlSprite3D!))
-                DictionarySprite3D.Remove(key);
-        }
+        _sprite3DTable.Remove((sprite.Name, sprite.ID), out mtlSprite3D);
         mtlSprite3D?.Dispose();
 
         // Give back the texture reference only when this Sprite3D actually held one: LoadSprite3D takes it in the same
-        // step that registers the DictionarySprite3D entry, so a missing entry means it never loaded, or was already
+        // step that registers the sprite table entry, so a missing entry means it never loaded, or was already
         // disposed. Releasing regardless would decrement whatever else answers to this name - the guard DisposeSprite2D
         // already has.
         if (mtlSprite3D != null)
@@ -2413,11 +2345,8 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
 
     public async Task<bool> LoadMesh3D(Season.Controls.Mesh3D mesh)
     {
-        lock (DictionaryMesh3D)
-        {
-            if (DictionaryMesh3D.ContainsKey((mesh.Name, mesh.ID)))
-                return true;
-        }
+        if (_mesh3DTable.Contains((mesh.Name, mesh.ID)))
+            return true;
 
         // 1. Pre-resolve every texture source referenced by all Surfaces.
         //    Pixel sources upload directly to the GPU through CreateFromDecoder with no temp files,
@@ -2433,11 +2362,7 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         foreach (var surface in mesh.Surfaces)
             ClearSurfaceOverrides(surface);
 
-        lock (DictionaryMesh3D)
-        {
-            if (!DictionaryMesh3D.ContainsKey((mesh.Name, mesh.ID)))
-                DictionaryMesh3D.Add((mesh.Name, mesh.ID), mtlMesh);
-        }
+        _mesh3DTable.TryAdd((mesh.Name, mesh.ID), mtlMesh);
 
         return true;
     }
@@ -2445,10 +2370,7 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
     public void UpdateMesh3D(Season.Controls.Mesh3D mesh, float time)
     {
         MTLMesh3D mtlMesh = null!;
-        lock (DictionaryMesh3D)
-        {
-            DictionaryMesh3D.TryGetValue((mesh.Name, mesh.ID), out mtlMesh!);
-        }
+        _mesh3DTable.TryGet((mesh.Name, mesh.ID), out mtlMesh);
         mtlMesh?.Update(mesh, time);
     }
 
@@ -2458,22 +2380,14 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             return;
 
         MTLMesh3D mtlMesh = null!;
-        lock (DictionaryMesh3D)
-        {
-            DictionaryMesh3D.TryGetValue((mesh.Name, mesh.ID), out mtlMesh!);
-        }
+        _mesh3DTable.TryGet((mesh.Name, mesh.ID), out mtlMesh);
         mtlMesh?.Draw();
     }
 
     public void DisposeMesh3D(Season.Controls.Mesh3D mesh)
     {
         MTLMesh3D mtlMesh = null!;
-        lock (DictionaryMesh3D)
-        {
-            var key = (mesh.Name, mesh.ID);
-            if (DictionaryMesh3D.TryGetValue(key, out mtlMesh!))
-                DictionaryMesh3D.Remove(key);
-        }
+        _mesh3DTable.Remove((mesh.Name, mesh.ID), out mtlMesh);
 
         // Metal command buffers retain references to in-flight resources, see Device rule 5.
         // Releasing the C# wrapper immediately is safe,
@@ -2493,11 +2407,8 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
 
     public async Task<bool> LoadInstancedMesh3D(InstancedMesh3D mesh)
     {
-        lock (DictionaryInstancedMesh3D)
-        {
-            if (DictionaryInstancedMesh3D.ContainsKey((mesh.Name, mesh.ID)))
-                return true;
-        }
+        if (_instancedMesh3DTable.Contains((mesh.Name, mesh.ID)))
+            return true;
 
         // 1. Pre-resolve every texture source referenced by all Surfaces.
         //    Pixel sources upload directly to the GPU with no temp files, while path sources reuse EnsureMtlTexture.
@@ -2512,13 +2423,8 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         foreach (var surface in mesh.Surfaces)
             ClearSurfaceOverrides(surface);
 
-        lock (DictionaryInstancedMesh3D)
-        {
-            if (!DictionaryInstancedMesh3D.ContainsKey((mesh.Name, mesh.ID)))
-                DictionaryInstancedMesh3D.Add((mesh.Name, mesh.ID), mtlMesh);
-            else
-                mtlMesh.Dispose();
-        }
+        if (!_instancedMesh3DTable.TryAdd((mesh.Name, mesh.ID), mtlMesh))
+            mtlMesh.Dispose();
 
         return true;
     }
@@ -2526,10 +2432,7 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
     public void UpdateInstancedMesh3D(InstancedMesh3D mesh, float time)
     {
         MTLInstancedMesh3D mtlMesh = null!;
-        lock (DictionaryInstancedMesh3D)
-        {
-            DictionaryInstancedMesh3D.TryGetValue((mesh.Name, mesh.ID), out mtlMesh!);
-        }
+        _instancedMesh3DTable.TryGet((mesh.Name, mesh.ID), out mtlMesh);
         mtlMesh?.Update(mesh, time);
     }
 
@@ -2539,22 +2442,14 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             return;
 
         MTLInstancedMesh3D mtlMesh = null!;
-        lock (DictionaryInstancedMesh3D)
-        {
-            DictionaryInstancedMesh3D.TryGetValue((mesh.Name, mesh.ID), out mtlMesh!);
-        }
+        _instancedMesh3DTable.TryGet((mesh.Name, mesh.ID), out mtlMesh);
         mtlMesh?.Draw();
     }
 
     public void DisposeInstancedMesh3D(InstancedMesh3D mesh)
     {
         MTLInstancedMesh3D mtlMesh = null!;
-        lock (DictionaryInstancedMesh3D)
-        {
-            var key = (mesh.Name, mesh.ID);
-            if (DictionaryInstancedMesh3D.TryGetValue(key, out mtlMesh!))
-                DictionaryInstancedMesh3D.Remove(key);
-        }
+        _instancedMesh3DTable.Remove((mesh.Name, mesh.ID), out mtlMesh);
         mtlMesh?.Dispose();
 
         // 2-7: give back exactly the references EnsureSurfaceTextures took - all five slots of every Surface, each
@@ -2572,13 +2467,8 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
 
     public async Task<bool> LoadInstancedModel(InstancedModel model)
     {
-        lock (DictionaryInstancedModel)
-        {
-            if (DictionaryInstancedModel.ContainsKey((model.ModelName, model.ID)))
-            {
-                return true;
-            }
-        }
+        if (_instancedModelTable.Contains((model.ModelName, model.ID)))
+            return true;
 
         GetOrCreateSharedModelAsync(model.ModelName).ContinueWith(task =>
         {
@@ -2609,13 +2499,8 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             model.AnimationClipCount = animNames.Count;
             model.AnimationNames = animNames;
 
-            lock (DictionaryInstancedModel)
-            {
-                if (!DictionaryInstancedModel.ContainsKey((model.ModelName, model.ID)))
-                    DictionaryInstancedModel.Add((model.ModelName, model.ID), mtlInstancedModel);
-                else
-                    mtlInstancedModel.Dispose();
-            }
+            if (!_instancedModelTable.TryAdd((model.ModelName, model.ID), mtlInstancedModel))
+                mtlInstancedModel.Dispose();
         });
 
         return true;
@@ -2624,10 +2509,7 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
     public void UpdateInstancedModel(InstancedModel model, float time)
     {
         MTLInstancedModel mtlModel = null!;
-        lock (DictionaryInstancedModel)
-        {
-            DictionaryInstancedModel.TryGetValue((model.ModelName, model.ID), out mtlModel!);
-        }
+        _instancedModelTable.TryGet((model.ModelName, model.ID), out mtlModel);
         mtlModel?.Update(model, time);
     }
 
@@ -2637,34 +2519,21 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
             return;
 
         MTLInstancedModel mtlModel = null!;
-        lock (DictionaryInstancedModel)
-        {
-            DictionaryInstancedModel.TryGetValue((model.ModelName, model.ID), out mtlModel!);
-        }
+        _instancedModelTable.TryGet((model.ModelName, model.ID), out mtlModel);
         mtlModel?.Draw();
     }
 
     public void DisposeInstancedModel(InstancedModel model)
     {
         MTLInstancedModel mtlModel = null!;
-        lock (DictionaryInstancedModel)
-        {
-            var key = (model.ModelName, model.ID);
-            if (DictionaryInstancedModel.TryGetValue(key, out mtlModel!))
-                DictionaryInstancedModel.Remove(key);
-        }
+        _instancedModelTable.Remove((model.ModelName, model.ID), out mtlModel);
         mtlModel?.Dispose();
     }
 
     public void DisposeModel(Model model)
     {
         MTLModel mtlModel = null!;
-        lock (DictionaryModel)
-        {
-            var key = (model.Name, model.ID);
-            if (DictionaryModel.TryGetValue(key, out mtlModel!))
-                DictionaryModel.Remove(key);
-        }
+        _modelTable.Remove((model.Name, model.ID), out mtlModel);
         mtlModel?.Dispose();
 
         // The shared template cache, DictionaryModelResource, is reused by all Model controls with the same name.

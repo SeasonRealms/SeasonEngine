@@ -1491,17 +1491,7 @@ internal sealed class WGPUInstancedModel : Season.Rendering.IInstanceCullTarget
             _instanceBoneMatrices[baseIndex + i] = Matrix4x4.Identity;
     }
 
-    static Vector4 ExtractMorphWeights(GltfNodeBase? node)
-    {
-        if (node == null || node.Weights.Length == 0)
-            return Vector4.Zero;
-
-        return new Vector4(
-            node.Weights.Length > 0 ? node.Weights[0] : 0f,
-            node.Weights.Length > 1 ? node.Weights[1] : 0f,
-            node.Weights.Length > 2 ? node.Weights[2] : 0f,
-            node.Weights.Length > 3 ? node.Weights[3] : 0f);
-    }
+    static Vector4 ExtractMorphWeights(GltfNodeBase? node) => MorphDelta.ExtractWeights(node);
 
     /// <summary>
     /// P2: republishes this frame's 80-byte record for every slot that just came back into view into the previous-frame byte side,

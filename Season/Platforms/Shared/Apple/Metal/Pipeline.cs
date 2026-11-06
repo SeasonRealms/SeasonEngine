@@ -553,6 +553,22 @@ internal static class Pipeline
     /// </summary>
     public static void SetPipeline(IMTLRenderCommandEncoder enc, PipelineMode mode, bool doubleSided = false, bool depthWrite = true)
     {
+        // S0 baseline: one line per PSO switch, tagged with whether it came from collection or from replay.
+        // The enumeration order of PipelineMode differs between the three backends (Opaque/Transparent/Fade here,
+        // Opaque/Fade/Transparent in the trace), so the mapping is an explicit switch and never a cast.
+        // The cull value printed here is the one this method is about to bind; the front-face pass of the two-pass
+        // double-sided scheme overrides it through SetCullMode, which prints its own C line.
+        if (DrawTrace.On)
+            DrawTrace.State("mtl",
+                mode switch
+                {
+                    PipelineMode.Opaque => DrawTrace.ModeOpaque,
+                    PipelineMode.Fade => DrawTrace.ModeFade,
+                    _ => DrawTrace.ModeTransparent,
+                },
+                doubleSided ? DrawTrace.CullNone : DrawTrace.CullBack,
+                depthWrite, MTLSceneDrawCollection.Active != null);
+
         // Work package D: during collection no encoder exists at all (Metal only has an encoder after BeginPass),
         // so only the state is recorded here; the PSO and DSS are determined by the Pass where replay happens (main scene / velocity MRT / Overlay / OutlineMask).
         if (MTLSceneDrawCollection.Active is { } collecting)
@@ -640,6 +656,17 @@ internal static class Pipeline
     /// </summary>
     internal static void SetCullMode(IMTLRenderCommandEncoder enc, MTLCullMode cull)
     {
+        // S0 baseline: Metal keeps face culling outside the PSO, so it gets its own event kind.
+        if (DrawTrace.On)
+            DrawTrace.Cull("mtl",
+                cull switch
+                {
+                    MTLCullMode.None => DrawTrace.CullNone,
+                    MTLCullMode.Front => DrawTrace.CullFront,
+                    _ => DrawTrace.CullBack,
+                },
+                MTLSceneDrawCollection.Active != null);
+
         if (MTLSceneDrawCollection.Active is { } collecting)
         {
             collecting.RecordCull(cull);
@@ -712,6 +739,14 @@ internal static class Pipeline
         nuint indirectOffset = 0,
         IMTLBuffer? instanceExtrasBuffer = null)
     {
+        // S0 baseline: this is the single entry for scene geometry on both halves -- the collection phase records
+        // here and the replay queue draws through the very same method, so one tap covers both.
+        if (DrawTrace.On)
+            DrawTrace.Draw("mtl", "scene", primitiveData.DoubleSided, primitiveData.AoExempt,
+                (uint)indexCount, (uint)instanceCount, (uint)instanceBufferOffset,
+                MTLSceneDrawCollection.Active != null,
+                primitiveData.PartName ?? primitiveData.PartNodeName);
+
         // Work package D: this is the single exit for all 3D paths (model / instanced model / instanced mesh / highlight shell / sprite shell box),
         // so intercepting once covers all PrimitiveData draws. The collection phase submits no draw; it only hands immutable handles to the replay queue.
         // C1: slot 0 is resolved before the capture, because the replay queue reuses the handle recorded here verbatim.
@@ -852,6 +887,12 @@ internal static class Pipeline
         nuint instanceBoneBufferOffset,
         bool bindMaterial = true)
     {
+        // S0 baseline: the shadow pass has no collection half on this backend, so every line is a real submission.
+        if (DrawTrace.On)
+            DrawTrace.Draw("mtl", "shadow", primitiveData.DoubleSided, primitiveData.AoExempt,
+                (uint)indexCount, (uint)instanceCount, (uint)instanceBufferOffset, collecting: false,
+                primitiveData.PartName ?? primitiveData.PartNodeName);
+
         // C1: the shadow pass must rasterise the same sheet the scene shows, so it resolves slot 0 through the same call.
         primitiveVertexBuffer = primitiveData.ResolveVertexBuffer(primitiveVertexBuffer);
 

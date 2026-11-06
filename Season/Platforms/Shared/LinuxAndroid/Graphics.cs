@@ -173,14 +173,14 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     Dictionary<(Season.Controls.ShapeType, int, int, int), VkTexture> DictionaryShapeTexture = new();
     Dictionary<(Season.Controls.ShapeType, long), VKSprite2D> DictionaryShape = new();
 
-    Dictionary<(string, long), VKModel> DictionaryModel = new();
+    readonly DrawableTable<(string, long), VKModel> _modelTable = new();
     Dictionary<string, Task<VKModel>> DictionaryModelResource = new();
 
-    Dictionary<(string, long), VKSprite3D> DictionarySprite3D = new();
+    readonly DrawableTable<(string, long), VKSprite3D> _sprite3DTable = new();
 
-    Dictionary<(string, long), VKMesh3D> DictionaryMesh3D = new();
-    Dictionary<(string, long), VKInstancedMesh3D> DictionaryInstancedMesh3D = new();
-    Dictionary<(string, long), VKInstancedModel> DictionaryInstancedModel = new();
+    readonly DrawableTable<(string, long), VKMesh3D> _mesh3DTable = new();
+    readonly DrawableTable<(string, long), VKInstancedMesh3D> _instancedMesh3DTable = new();
+    readonly DrawableTable<(string, long), VKInstancedModel> _instancedModelTable = new();
 
     // Phase 4: frame-level state for the Outline2D mask pass
     // collected by RenderOutlineMask and consumed by BlitToBackbuffer
@@ -1624,13 +1624,8 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
     public async Task<bool> LoadModel(Season.Controls.Model model)
     {
-        lock (DictionaryModel)
-        {
-            if (DictionaryModel.ContainsKey((model.Name, model.ID)))
-            {
-                return true;
-            }
-        }
+        if (_modelTable.Contains((model.Name, model.ID)))
+            return true;
 
         GetOrCreateSharedModelAsync(model.Name).ContinueWith(task =>
         {
@@ -1647,13 +1642,8 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
                 ExecuteUpload();
             }
 
-            lock (DictionaryModel)
-            {
-                if (!DictionaryModel.ContainsKey((model.Name, model.ID)))
-                    DictionaryModel.Add((model.Name, model.ID), vkModel);
-                else
-                    vkModel.Dispose();
-            }
+            if (!_modelTable.TryAdd((model.Name, model.ID), vkModel))
+                vkModel.Dispose();
         });
 
         return true;
@@ -1704,16 +1694,13 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     {
         VKModel vkModel = null!;
 
-        lock (DictionaryModel)
+        // Material overrides are consumed before the animation update, and the pair stays inside the gate:
+        // a concurrent dispose unregisters the model and retires it, so both have to run against a live entry.
+        _modelTable.With((model.Name, model.ID), (self: this, model, time), static (native, args) =>
         {
-            if (DictionaryModel.TryGetValue((model.Name, model.ID), out vkModel!))
-            {
-                // Material overrides
-                ProcessModelOverrides(model, vkModel);
-
-                vkModel.Update(model, time);
-            }
-        }
+            args.self.ProcessModelOverrides(args.model, native);
+            native.Update(args.model, args.time);
+        });
     }
 
     void ProcessModelOverrides(Model model, VKPrimitiveGroup vkGroup)
@@ -1751,34 +1738,9 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public void DrawModel(Model model)
     {
         if (model.Name.IsNullOrWhiteSpace() || model.Alpha == 0)
-        {
+            return;
 
-        }
-        else
-        {
-            VKModel vkModel3D = null!;
-
-            lock (DictionaryModel)
-            {
-                if (DictionaryModel.TryGetValue((model.Name, model.ID), out vkModel3D!))
-                {
-
-                }
-                else
-                {
-                    //texture.Changed = true;
-                }
-            }
-
-            if (vkModel3D == null)
-            {
-
-            }
-            else
-            {
-                vkModel3D.Draw();
-            }
-        }
+        _modelTable.With((model.Name, model.ID), static native => native.Draw());
     }
 
     // ============================================================
@@ -1789,40 +1751,28 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public void DrawModelShadow(Model model)
     {
         VKModel vkModel = null!;
-        lock (DictionaryModel)
-        {
-            DictionaryModel.TryGetValue((model.Name, model.ID), out vkModel!);
-        }
+        _modelTable.TryGet((model.Name, model.ID), out vkModel);
         vkModel?.DrawShadow();
     }
 
     public void DrawMesh3DShadow(Season.Controls.Mesh3D mesh)
     {
         VKMesh3D vkMesh = null!;
-        lock (DictionaryMesh3D)
-        {
-            DictionaryMesh3D.TryGetValue((mesh.Name, mesh.ID), out vkMesh!);
-        }
+        _mesh3DTable.TryGet((mesh.Name, mesh.ID), out vkMesh);
         vkMesh?.DrawShadow();
     }
 
     public void DrawInstancedModelShadow(InstancedModel model)
     {
         VKInstancedModel vkModel = null!;
-        lock (DictionaryInstancedModel)
-        {
-            DictionaryInstancedModel.TryGetValue((model.ModelName, model.ID), out vkModel!);
-        }
+        _instancedModelTable.TryGet((model.ModelName, model.ID), out vkModel);
         vkModel?.DrawShadow();
     }
 
     public void DrawInstancedMesh3DShadow(InstancedMesh3D mesh)
     {
         VKInstancedMesh3D vkMesh = null!;
-        lock (DictionaryInstancedMesh3D)
-        {
-            DictionaryInstancedMesh3D.TryGetValue((mesh.Name, mesh.ID), out vkMesh!);
-        }
+        _instancedMesh3DTable.TryGet((mesh.Name, mesh.ID), out vkMesh);
         vkMesh?.DrawShadow();
     }
 
@@ -1878,11 +1828,8 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     {
         try
         {
-            lock (DictionarySprite3D)
-            {
-                if (DictionarySprite3D.ContainsKey((sprite.Name, sprite.ID)))
-                    return true;
-            }
+            if (_sprite3DTable.Contains((sprite.Name, sprite.ID)))
+                return true;
 
             VkTexture view = null!;
             bool created = false;
@@ -1937,11 +1884,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
             var vkSprite3D = new VKSprite3D(view);
 
-            lock (DictionarySprite3D)
-            {
-                if (!DictionarySprite3D.ContainsKey((sprite.Name, sprite.ID)))
-                    DictionarySprite3D.Add((sprite.Name, sprite.ID), vkSprite3D);
-            }
+            _sprite3DTable.TryAdd((sprite.Name, sprite.ID), vkSprite3D);
         }
         catch (Exception ex)
         {
@@ -1953,27 +1896,27 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
     public void UpdateSprite3D(Sprite3D sprite, float time)
     {
-        VKSprite3D vkSprite3D = null!;
-        // Same reason as UpdateSprite2D: the replacement uploads, so it runs after the dictionary lock is released.
-        TextureUpdateSource pendingSource = default;
-        bool replacePending = false;
-
-        lock (DictionarySprite3D)
-        {
-            if (DictionarySprite3D.TryGetValue((sprite.Name, sprite.ID), out vkSprite3D!))
+        // Same reason as UpdateSprite2D: the replacement uploads, so it runs after the table's gate is released.
+        // The body therefore hands the pending source back out through the result instead of a captured local.
+        var state = _sprite3DTable.With((sprite.Name, sprite.ID), (self: this, sprite),
+            static (native, args) =>
             {
+                var sprite = args.sprite;
+                TextureUpdateSource source = default;
+                bool replace = false;
+
                 // Texture replacement
                 if (sprite.TextureOverride.HasValue)
                 {
-                    pendingSource = sprite.TextureOverride;
+                    source = sprite.TextureOverride;
                     sprite.TextureOverride = default;
-                    replacePending = true;
+                    replace = true;
                 }
 
                 // Billboard orientation must be built from the view actually being rendered (not the legacy
                 // camera mirror), so a second view billboards toward its own camera.
                 var view = Season.Rendering.RenderView.Current;
-                vkSprite3D.Update(
+                native.Update(
                     new Vector3(sprite.PosX, sprite.PosY, sprite.PosZ),
                     new Vector2(sprite.Width ?? 1f, sprite.Height ?? 1f),
                     sprite.Rotation,
@@ -1982,11 +1925,13 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
                     sprite.Mode,
                     sprite.Color,
                     sprite.Alpha);
-            }
-        }
 
-        if (replacePending)
-            ReplaceSpriteTexture(sprite.Name, vkSprite3D, pendingSource);
+                return (native, source, replace);
+            },
+            default((VKSprite3D, TextureUpdateSource, bool)));
+
+        if (state.Item3)
+            ReplaceSpriteTexture(sprite.Name, state.Item1, state.Item2);
     }
 
     public void DrawSprite3D(Sprite3D sprite)
@@ -1995,26 +1940,18 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             return;
 
         VKSprite3D vkSprite3D = null!;
-        lock (DictionarySprite3D)
-        {
-            DictionarySprite3D.TryGetValue((sprite.Name, sprite.ID), out vkSprite3D!);
-        }
+        _sprite3DTable.TryGet((sprite.Name, sprite.ID), out vkSprite3D);
         vkSprite3D?.Draw();
     }
 
     public void DisposeSprite3D(Sprite3D sprite)
     {
         VKSprite3D vkSprite3D = null!;
-        lock (DictionarySprite3D)
-        {
-            var key = (sprite.Name, sprite.ID);
-            if (DictionarySprite3D.TryGetValue(key, out vkSprite3D!))
-                DictionarySprite3D.Remove(key);
-        }
+        _sprite3DTable.Remove((sprite.Name, sprite.ID), out vkSprite3D);
         vkSprite3D?.Dispose();
 
         // Give back the texture reference only when this Sprite3D actually held one: LoadSprite3D takes it in the same
-        // step that registers the DictionarySprite3D entry, so a missing entry means it never loaded, or was already
+        // step that registers the sprite table entry, so a missing entry means it never loaded, or was already
         // disposed. Releasing regardless would decrement whatever else answers to this name - the guard DisposeSprite2D
         // already has.
         if (vkSprite3D != null)
@@ -2276,11 +2213,8 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
     public async Task<bool> LoadMesh3D(Season.Controls.Mesh3D mesh)
     {
-        lock (DictionaryMesh3D)
-        {
-            if (DictionaryMesh3D.ContainsKey((mesh.Name, mesh.ID)))
-                return true;
-        }
+        if (_mesh3DTable.Contains((mesh.Name, mesh.ID)))
+            return true;
 
         // 1. Pre-resolve every texture source referenced by all Surfaces:
         //    procedural pixel sources are uploaded directly to the GPU through CreateFromDecoder
@@ -2300,11 +2234,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         foreach (var surface in mesh.Surfaces)
             ClearSurfaceOverrides(surface);
 
-        lock (DictionaryMesh3D)
-        {
-            if (!DictionaryMesh3D.ContainsKey((mesh.Name, mesh.ID)))
-                DictionaryMesh3D.Add((mesh.Name, mesh.ID), vkMesh);
-        }
+        _mesh3DTable.TryAdd((mesh.Name, mesh.ID), vkMesh);
 
         return true;
     }
@@ -2312,10 +2242,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public void UpdateMesh3D(Season.Controls.Mesh3D mesh, float time)
     {
         VKMesh3D vkMesh = null!;
-        lock (DictionaryMesh3D)
-        {
-            DictionaryMesh3D.TryGetValue((mesh.Name, mesh.ID), out vkMesh!);
-        }
+        _mesh3DTable.TryGet((mesh.Name, mesh.ID), out vkMesh);
         vkMesh?.Update(mesh, time);
     }
 
@@ -2325,22 +2252,14 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             return;
 
         VKMesh3D vkMesh = null!;
-        lock (DictionaryMesh3D)
-        {
-            DictionaryMesh3D.TryGetValue((mesh.Name, mesh.ID), out vkMesh!);
-        }
+        _mesh3DTable.TryGet((mesh.Name, mesh.ID), out vkMesh);
         vkMesh?.Draw();
     }
 
     public void DisposeMesh3D(Season.Controls.Mesh3D mesh)
     {
         VKMesh3D vkMesh = null!;
-        lock (DictionaryMesh3D)
-        {
-            var key = (mesh.Name, mesh.ID);
-            if (DictionaryMesh3D.TryGetValue(key, out vkMesh!))
-                DictionaryMesh3D.Remove(key);
-        }
+        _mesh3DTable.Remove((mesh.Name, mesh.ID), out vkMesh);
 
         // In-flight command buffers may still reference VB/IB/CB,
         // so release must go through timeline-gated deferred destruction
@@ -2362,11 +2281,8 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
     public async Task<bool> LoadInstancedMesh3D(InstancedMesh3D mesh)
     {
-        lock (DictionaryInstancedMesh3D)
-        {
-            if (DictionaryInstancedMesh3D.ContainsKey((mesh.Name, mesh.ID)))
-                return true;
-        }
+        if (_instancedMesh3DTable.Contains((mesh.Name, mesh.ID)))
+            return true;
 
         // 1. Pre-resolve all texture sources referenced by Surfaces
         //    (procedural pixel sources upload directly to the GPU with no disk writes;
@@ -2384,13 +2300,8 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         foreach (var surface in mesh.Surfaces)
             ClearSurfaceOverrides(surface);
 
-        lock (DictionaryInstancedMesh3D)
-        {
-            if (!DictionaryInstancedMesh3D.ContainsKey((mesh.Name, mesh.ID)))
-                DictionaryInstancedMesh3D.Add((mesh.Name, mesh.ID), vkMesh);
-            else
-                vkMesh.Dispose();
-        }
+        if (!_instancedMesh3DTable.TryAdd((mesh.Name, mesh.ID), vkMesh))
+            vkMesh.Dispose();
 
         return true;
     }
@@ -2398,10 +2309,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public void UpdateInstancedMesh3D(InstancedMesh3D mesh, float time)
     {
         VKInstancedMesh3D vkMesh = null!;
-        lock (DictionaryInstancedMesh3D)
-        {
-            DictionaryInstancedMesh3D.TryGetValue((mesh.Name, mesh.ID), out vkMesh!);
-        }
+        _instancedMesh3DTable.TryGet((mesh.Name, mesh.ID), out vkMesh);
         vkMesh?.Update(mesh, time);
     }
 
@@ -2411,22 +2319,14 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             return;
 
         VKInstancedMesh3D vkMesh = null!;
-        lock (DictionaryInstancedMesh3D)
-        {
-            DictionaryInstancedMesh3D.TryGetValue((mesh.Name, mesh.ID), out vkMesh!);
-        }
+        _instancedMesh3DTable.TryGet((mesh.Name, mesh.ID), out vkMesh);
         vkMesh?.Draw();
     }
 
     public void DisposeInstancedMesh3D(InstancedMesh3D mesh)
     {
         VKInstancedMesh3D vkMesh = null!;
-        lock (DictionaryInstancedMesh3D)
-        {
-            var key = (mesh.Name, mesh.ID);
-            if (DictionaryInstancedMesh3D.TryGetValue(key, out vkMesh!))
-                DictionaryInstancedMesh3D.Remove(key);
-        }
+        _instancedMesh3DTable.Remove((mesh.Name, mesh.ID), out vkMesh);
 
         // Same contract as DisposeMesh3D:
         // instance buffers may still be referenced by in-flight command buffers,
@@ -2449,13 +2349,8 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
     public async Task<bool> LoadInstancedModel(InstancedModel model)
     {
-        lock (DictionaryInstancedModel)
-        {
-            if (DictionaryInstancedModel.ContainsKey((model.ModelName, model.ID)))
-            {
-                return true;
-            }
-        }
+        if (_instancedModelTable.Contains((model.ModelName, model.ID)))
+            return true;
 
         GetOrCreateSharedModelAsync(model.ModelName).ContinueWith(task =>
         {
@@ -2490,14 +2385,11 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             model.AnimationClipCount = animNames.Count;
             model.AnimationNames = animNames;
 
-            lock (DictionaryInstancedModel)
+            if (!_instancedModelTable.TryAdd((model.ModelName, model.ID), vkInstancedModel))
             {
-                if (!DictionaryInstancedModel.ContainsKey((model.ModelName, model.ID)))
-                    DictionaryInstancedModel.Add((model.ModelName, model.ID), vkInstancedModel);
-                else
-                    // Same contract as DisposeInstancedModel:
-                    // newly created GPU resources may still be in flight, so release them deferred
-                    Vulkan.Device.EnqueueDeferredRelease(vkInstancedModel.Dispose);
+                // Same contract as DisposeInstancedModel:
+                // newly created GPU resources may still be in flight, so release them deferred
+                Vulkan.Device.EnqueueDeferredRelease(vkInstancedModel.Dispose);
             }
         });
 
@@ -2507,10 +2399,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public void UpdateInstancedModel(InstancedModel model, float time)
     {
         VKInstancedModel vkModel = null!;
-        lock (DictionaryInstancedModel)
-        {
-            DictionaryInstancedModel.TryGetValue((model.ModelName, model.ID), out vkModel!);
-        }
+        _instancedModelTable.TryGet((model.ModelName, model.ID), out vkModel);
         vkModel?.Update(model, time);
     }
 
@@ -2520,10 +2409,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             return;
 
         VKInstancedModel vkModel = null!;
-        lock (DictionaryInstancedModel)
-        {
-            DictionaryInstancedModel.TryGetValue((model.ModelName, model.ID), out vkModel!);
-        }
+        _instancedModelTable.TryGet((model.ModelName, model.ID), out vkModel);
         if (vkModel == null)
         {
 
@@ -2534,12 +2420,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public void DisposeInstancedModel(InstancedModel model)
     {
         VKInstancedModel vkModel = null!;
-        lock (DictionaryInstancedModel)
-        {
-            var key = (model.ModelName, model.ID);
-            if (DictionaryInstancedModel.TryGetValue(key, out vkModel!))
-                DictionaryInstancedModel.Remove(key);
-        }
+        _instancedModelTable.Remove((model.ModelName, model.ID), out vkModel);
 
         // Same contract as DisposeMesh3D:
         // resources may still be referenced by in-flight command buffers,
@@ -2551,12 +2432,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
     public void DisposeModel(Model model)
     {
         VKModel vkModel = null!;
-        lock (DictionaryModel)
-        {
-            var key = (model.Name, model.ID);
-            if (DictionaryModel.TryGetValue(key, out vkModel!))
-                DictionaryModel.Remove(key);
-        }
+        _modelTable.Remove((model.Name, model.ID), out vkModel);
 
         // Same contract as DisposeMesh3D:
         // resources may still be referenced by in-flight command buffers,
@@ -2622,7 +2498,7 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         // Debug.Assert is stripped in Release, matching the rest of the gate diagnostics.
         System.Diagnostics.Debug.Assert(
             !System.Threading.Monitor.IsEntered(DictionarySprite)
-            && !System.Threading.Monitor.IsEntered(DictionarySprite3D)
+            && !System.Threading.Monitor.IsEntered(_sprite3DTable.Gate)
             && !System.Threading.Monitor.IsEntered(DictionaryVKTexture)
             && !System.Threading.Monitor.IsEntered(DictionaryShape)
             && !System.Threading.Monitor.IsEntered(DictionaryShapeTexture),
@@ -2860,18 +2736,18 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
         var drawGroups = new List<VKPrimitiveGroup>();
 
-        lock (DictionaryModel)
+        lock (_modelTable.Gate)
         {
-            foreach (var pair in DictionaryModel)
+            foreach (var pair in _modelTable)
             {
                 if (TryAccumulateOutline2D(pair.Value))
                     drawGroups.Add(pair.Value);
             }
         }
 
-        lock (DictionaryMesh3D)
+        lock (_mesh3DTable.Gate)
         {
-            foreach (var pair in DictionaryMesh3D)
+            foreach (var pair in _mesh3DTable)
             {
                 if (TryAccumulateOutline2D(pair.Value))
                     drawGroups.Add(pair.Value);
@@ -2882,18 +2758,18 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         // Outline2D also supports per-instance masks.
         // Active state is aggregated during the platform Update phase
         // from each instance / host Highlight.Outline2D by VKInstancedPrimitiveGroup.
-        lock (DictionaryInstancedMesh3D)
+        lock (_instancedMesh3DTable.Gate)
         {
-            foreach (var pair in DictionaryInstancedMesh3D)
+            foreach (var pair in _instancedMesh3DTable)
             {
                 if (TryAccumulateOutline2D(pair.Value))
                     drawGroups.Add(pair.Value);
             }
         }
 
-        lock (DictionaryInstancedModel)
+        lock (_instancedModelTable.Gate)
         {
-            foreach (var pair in DictionaryInstancedModel)
+            foreach (var pair in _instancedModelTable)
             {
                 if (TryAccumulateOutline2D(pair.Value))
                     drawGroups.Add(pair.Value);

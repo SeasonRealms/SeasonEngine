@@ -7,15 +7,9 @@ using VkBuffer = Silk.NET.Vulkan.Buffer;
 
 namespace Season.Platforms.Shared.LinuxAndroid.Vulkan;
 
-/// <summary>PBR texture-slot indices aligned with shader binding numbers set=0 binding=3 through 7.</summary>
-internal enum TextureSlot
-{
-    BaseColor = 0,
-    Normal = 1,
-    MetallicRoughness = 2,
-    Occlusion = 3,
-    Emissive = 4
-}
+// PBR texture-slot indices aligned with shader binding numbers set=0 binding=3 through 7. The canonical
+// definition is the shared Season.Rendering.Drawables.TextureSlot; this alias keeps every call site unchanged.
+using TextureSlot = Season.Rendering.Drawables.TextureSlot;
 
 /// <summary>
 /// Material constant buffer, UBO b2, aligned one to one with the std140 byte layout of Pipeline GLSL MaterialParams.
@@ -24,7 +18,7 @@ internal enum TextureSlot
 /// but morphWeights must live at offset 112, after 8 bytes of padding, instead of DX offset 96.
 /// </summary>
 [StructLayout(LayoutKind.Explicit, Size = 144)]
-internal struct MaterialParams
+internal partial struct MaterialParams
 {
     [FieldOffset(0)] public Vector4 BaseColor;
     [FieldOffset(16)] public Vector4 EmissiveFactor;
@@ -67,25 +61,10 @@ internal struct MaterialParams
 /// Content updates are made by directly writing mapped host-coherent memory through pointers,
 /// equivalent to persistent Map on DX12 plus N-buffered frame-index switching.
 /// </summary>
-internal unsafe class PrimitiveData : IDisposable
+// Geometry, material constants, textures and part keys live in the shared PrimitiveCpuData; only the Vulkan buffers,
+// descriptor sets and the vertex-stream resolution below are Vulkan's own.
+internal unsafe class PrimitiveData : PrimitiveCpuData<MaterialParams, Texture>, IDisposable
 {
-    public int InstanceStreamIndex = -1;
-    public List<Vertex> Vertices = null!;
-    public Vertex[]? BaseVertices;
-    public List<GLTFMorphTarget>? MorphTargets;
-    public GltfNodeBase? OwnerNode;
-    public uint LastAppliedWeightsVersion;
-
-    public uint[] Indices = null!;
-    public bool Use32BitIndices;
-    public bool DoubleSided;
-
-    /// <summary>Contract clause 7 of 2-2: GTAO exemption, synchronized with Mesh3D.ExcludeFromAo. Draw buckets use it to choose the NoDepth PSO.</summary>
-    public bool AoExempt;
-    public Vector3 LocalBoundsCenter;
-    /// <summary>1-3: half extents of the primitive-local AABB, paired with LocalBoundsCenter for primitive-level and instance-level culling.</summary>
-    public Vector3 LocalBoundsExtents;
-
     public BufferResource VertexBuffer;
 
     /// <summary>
@@ -130,61 +109,8 @@ internal unsafe class PrimitiveData : IDisposable
     // set 3, which is written once per view by Pipeline.PrepareViewGlobals, so a primitive's set 0 never changes again
     // after allocation and needs no version bookkeeping.
 
-    public Texture BaseColorTexture = null!;
-
-    public Texture NormalTexture = null!;
-
-    public Texture MetallicRoughnessTexture = null!;
-
-    public Texture OcclusionTexture = null!;
-
-    public Texture EmissiveTexture = null!;
-
     public BufferResource MorphDeltasBuffer;
     public bool OwnsMorphDeltasBuffer;
-
-    public MaterialParams MaterialParams;
-
-    /// <summary>
-    /// Contract clause 6 of 2-3:
-    /// CPU shadow copy of the previous frame's world matrix, not transposed.
-    /// MatrixBuffers are N-buffered and live in an UPLOAD heap, so historical frames must never be read back from them.
-    /// History therefore has to come from this field.
-    /// All-zero means no history exists yet, the first frame, and shader code falls back to the current world matrix.
-    /// </summary>
-    public System.Numerics.Matrix4x4 PrevWorldMatrix;
-
-    /// <summary>Original BaseColor.W, alpha, from the glTF material. Combined with Model.Alpha as the final transparency multiplier.</summary>
-    public float OriginalBaseColorAlpha = 1.0f;
-
-    /// <summary>Original Surface BaseColor captured during Load. Used as the multiplicative base for SyncColorTint, where rgb is multiplied by tint and W stays untouched.</summary>
-    public Vector4 OriginalBaseColor = Vector4.One;
-
-    /// <summary>glTF material name of the part this primitive draws; null when the asset has no material. This is the primary
-    /// key <c>Model.SetPartColor</c> resolves against.</summary>
-    public string? PartName;
-
-    /// <summary>Name of the node that owns this primitive, the fallback key for <c>Model.SetPartColor</c>.</summary>
-    public string? PartNodeName;
-
-    /// <summary>BaseColor.rgb as loaded (after the MaterialColor tint, before any part override). It is what SyncPartColors
-    /// restores when a part override is cleared, so an absolute override never needs to re-derive the authored value.</summary>
-    public Vector3 PartBaseColor = Vector3.One;
-
-    /// <summary>
-    /// Original AlphaCutoff from the glTF material.
-    /// When Model.Alpha is less than 1, this is scaled proportionally with alpha
-    /// to prevent MASK materials from being clipped away entirely at low Model.Alpha by clip(alpha - alphaCutoff).
-    /// </summary>
-    public float OriginalAlphaCutoff = 0.5f;
-
-    /// <summary>
-    /// Whether the material is transparent, determined from glTF AlphaMode:
-    /// BLEND is transparent and uses the Transparent PSO,
-    /// MASK uses the Opaque PSO plus shader discard,
-    /// and OPAQUE uses the Opaque PSO.
-    /// </summary>
-    public bool IsTransparent;
 
     public void Dispose()
     {

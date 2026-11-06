@@ -1,0 +1,4446 @@
+# season-draw-trace v1 at=900 frames=1 openedAt=900
+F	900
+G	dx	shadow	Assets/3DGodotRobot.glb	10
+D	dx	shadow	.	1	0	1068	1	0	Material
+D	dx	shadow	.	1	0	984	1	0	Material
+D	dx	shadow	.	1	0	1596	1	0	Material
+D	dx	shadow	.	1	0	264	1	0	Material.002
+D	dx	shadow	.	1	0	14304	1	0	Material
+D	dx	shadow	.	1	0	1068	1	0	Material
+D	dx	shadow	.	1	0	984	1	0	Material
+D	dx	shadow	.	1	0	1596	1	0	Material
+D	dx	shadow	.	1	0	264	1	0	Material.002
+D	dx	shadow	.	1	0	14304	1	0	Material
+G	dx	shadow	Assets/Torch.glb	1
+D	dx	shadow	.	0	0	56424	1	0	Node_0
+G	dx	shadow	Assets/MorphStressTest.glb	2
+D	dx	shadow	.	1	0	36	1	0	Base
+D	dx	shadow	.	1	0	7200	1	0	TestMaterial
+G	dx	shadow	RoomRoof	4
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	3	1	0	
+D	dx	shadow	.	0	0	3	1	0	
+G	dx	shadow	RoomFloor	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomCeiling	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomDoorLintel	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomDoorJambNegX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomDoorJambPosX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomWallPosZ	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomWallNegX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomWallPosX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomStair1	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomStair2	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomStair3	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	PondStair3	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	PondStair2	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	PondStair1	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	BridgeStairs	1
+D	dx	shadow	.	0	0	936	1	0	
+G	dx	shadow	Assets/low_poly_viking_boat_2.glb	6
+D	dx	shadow	.	1	0	2646	1	0	PALETA
+D	dx	shadow	.	1	0	28674	1	0	PALETA
+D	dx	shadow	.	1	0	28674	1	0	PALETA
+D	dx	shadow	.	1	0	28674	1	0	PALETA
+D	dx	shadow	.	1	0	28674	1	0	PALETA
+D	dx	shadow	.	1	0	28674	1	0	PALETA
+G	dx	shadow	TowerShaft	1
+D	dx	shadow	.	0	0	72	1	0	
+G	dx	shadow	TowerCornice	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerDeck	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerStair0	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerStair1	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerStair2	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerStair3	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerParapetPosZ	1
+D	dx	shadow	.	0	0	2880	1	0	
+G	dx	shadow	TowerParapetNegZ	1
+D	dx	shadow	.	0	0	2880	1	0	
+G	dx	shadow	TowerRailPosZ	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerRailNegZ	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerRailPosX	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerBeaconMast	1
+D	dx	shadow	.	0	0	360	1	0	
+G	dx	shadow	TowerBeaconLamp	1
+D	dx	shadow	.	0	0	180	1	0	
+G	dx	shadow	SeaStair1	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	SeaStair2	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	SeaStair3	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	FlagpolePlatform	1
+D	dx	shadow	.	0	0	288	1	0	
+G	dx	shadow	FlagpolePole	1
+D	dx	shadow	.	0	0	216	1	0	
+G	dx	shadow	FlagpoleButtonCollar	1
+D	dx	shadow	.	0	0	216	1	0	
+G	dx	shadow	FlagpoleButton	1
+D	dx	shadow	.	0	0	216	1	0	
+G	dx	shadow	FlagpoleFlag	3
+D	dx	shadow	.	0	0	2304	1	0	
+D	dx	shadow	.	0	0	2304	1	0	
+D	dx	shadow	.	0	0	480	1	0	
+G	dx	shadow	Assets/plane.glb	5
+D	dx	shadow	.	1	0	88689	1	0	material0_0
+D	dx	shadow	.	1	0	88689	1	0	material0_0
+D	dx	shadow	.	1	0	88689	1	0	material0_0
+D	dx	shadow	.	1	0	88689	1	0	material0_0
+D	dx	shadow	.	1	0	88689	1	0	material0_0
+G	dx	shadow	Assets/3DGodotRobot.glb	10
+D	dx	shadow	.	1	0	1068	1	0	Material
+D	dx	shadow	.	1	0	984	1	0	Material
+D	dx	shadow	.	1	0	1596	1	0	Material
+D	dx	shadow	.	1	0	264	1	0	Material.002
+D	dx	shadow	.	1	0	14304	1	0	Material
+D	dx	shadow	.	1	0	1068	1	0	Material
+D	dx	shadow	.	1	0	984	1	0	Material
+D	dx	shadow	.	1	0	1596	1	0	Material
+D	dx	shadow	.	1	0	264	1	0	Material.002
+D	dx	shadow	.	1	0	14304	1	0	Material
+G	dx	shadow	Assets/Torch.glb	1
+D	dx	shadow	.	0	0	56424	1	0	Node_0
+G	dx	shadow	Assets/street_lights.glb	4
+D	dx	shadow	.	1	0	19680	1	0	StreetLamp
+D	dx	shadow	.	1	0	19680	1	0	StreetLamp
+D	dx	shadow	.	1	0	19680	1	0	StreetLamp
+D	dx	shadow	.	1	0	19680	1	0	StreetLamp
+G	dx	shadow	SphereRow	7
+D	dx	shadow	.	0	0	3072	1	0	
+D	dx	shadow	.	0	0	3072	1	0	
+D	dx	shadow	.	0	0	3072	1	0	
+D	dx	shadow	.	0	0	3072	1	0	
+D	dx	shadow	.	0	0	3072	1	0	
+D	dx	shadow	.	0	0	3072	1	0	
+D	dx	shadow	.	0	0	3072	1	0	
+G	dx	shadow	Assets/Sun.glb	1
+D	dx	shadow	.	0	0	2880	1	0	球体
+G	dx	shadow	Assets/MorphStressTest.glb	2
+D	dx	shadow	.	1	0	36	1	0	Base
+D	dx	shadow	.	1	0	7200	1	0	TestMaterial
+G	dx	shadow	RoomRoof	4
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	3	1	0	
+D	dx	shadow	.	0	0	3	1	0	
+G	dx	shadow	RoomFloor	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomCeiling	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomDoorLintel	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomDoorJambNegX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomDoorJambPosX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomWallPosZ	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomWallNegX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomWallPosX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomStair1	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomStair2	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomStair3	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	PondStair3	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	PondStair2	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	PondStair1	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	BridgeStairs	1
+D	dx	shadow	.	0	0	936	1	0	
+G	dx	shadow	Assets/low_poly_viking_boat_2.glb	6
+D	dx	shadow	.	1	0	2646	1	0	PALETA
+D	dx	shadow	.	1	0	28674	1	0	PALETA
+D	dx	shadow	.	1	0	28674	1	0	PALETA
+D	dx	shadow	.	1	0	28674	1	0	PALETA
+D	dx	shadow	.	1	0	28674	1	0	PALETA
+D	dx	shadow	.	1	0	28674	1	0	PALETA
+G	dx	shadow	TowerShaft	1
+D	dx	shadow	.	0	0	72	1	0	
+G	dx	shadow	TowerCornice	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerDeck	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerStair0	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerStair1	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerStair2	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerStair3	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerParapetPosZ	1
+D	dx	shadow	.	0	0	2880	1	0	
+G	dx	shadow	TowerParapetNegZ	1
+D	dx	shadow	.	0	0	2880	1	0	
+G	dx	shadow	TowerRailPosZ	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerRailNegZ	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerRailPosX	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerBeaconMast	1
+D	dx	shadow	.	0	0	360	1	0	
+G	dx	shadow	TowerBeaconLamp	1
+D	dx	shadow	.	0	0	180	1	0	
+G	dx	shadow	SeaStair1	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	SeaStair2	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	SeaStair3	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	FlagpolePlatform	1
+D	dx	shadow	.	0	0	288	1	0	
+G	dx	shadow	FlagpolePole	1
+D	dx	shadow	.	0	0	216	1	0	
+G	dx	shadow	FlagpoleButtonCollar	1
+D	dx	shadow	.	0	0	216	1	0	
+G	dx	shadow	FlagpoleButton	1
+D	dx	shadow	.	0	0	216	1	0	
+G	dx	shadow	FlagpoleFlag	3
+D	dx	shadow	.	0	0	2304	1	0	
+D	dx	shadow	.	0	0	2304	1	0	
+D	dx	shadow	.	0	0	480	1	0	
+G	dx	shadow	Assets/plane.glb	5
+D	dx	shadow	.	1	0	88689	1	0	material0_0
+D	dx	shadow	.	1	0	88689	1	0	material0_0
+D	dx	shadow	.	1	0	88689	1	0	material0_0
+D	dx	shadow	.	1	0	88689	1	0	material0_0
+D	dx	shadow	.	1	0	88689	1	0	material0_0
+G	dx	shadow	rock1	1
+G	dx	shadow	rock2	1
+G	dx	shadow	rock3	1
+G	dx	shadow	rock4	1
+G	dx	shadow	rock5	1
+G	dx	shadow	rock6	1
+G	dx	shadow	rock7	1
+G	dx	shadow	rock8	1
+G	dx	shadow	rock9	1
+G	dx	shadow	rock10	1
+G	dx	shadow	rock11	1
+G	dx	shadow	rock12	1
+G	dx	shadow	rock13	1
+G	dx	shadow	rock14	1
+G	dx	shadow	rock15	1
+G	dx	shadow	Assets/3DGodotRobot.glb	10
+D	dx	shadow	.	1	0	1068	1	0	Material
+D	dx	shadow	.	1	0	984	1	0	Material
+D	dx	shadow	.	1	0	1596	1	0	Material
+D	dx	shadow	.	1	0	264	1	0	Material.002
+D	dx	shadow	.	1	0	14304	1	0	Material
+D	dx	shadow	.	1	0	1068	1	0	Material
+D	dx	shadow	.	1	0	984	1	0	Material
+D	dx	shadow	.	1	0	1596	1	0	Material
+D	dx	shadow	.	1	0	264	1	0	Material.002
+D	dx	shadow	.	1	0	14304	1	0	Material
+G	dx	shadow	Assets/Torch.glb	1
+D	dx	shadow	.	0	0	56424	1	0	Node_0
+G	dx	shadow	Assets/street_lights.glb	4
+D	dx	shadow	.	1	0	19680	1	0	StreetLamp
+D	dx	shadow	.	1	0	19680	1	0	StreetLamp
+D	dx	shadow	.	1	0	19680	1	0	StreetLamp
+D	dx	shadow	.	1	0	19680	1	0	StreetLamp
+G	dx	shadow	Assets/halloween_haunted_house_merged.glb	1
+D	dx	shadow	.	1	0	55194	1	0	HauntedHouse_Atlas
+G	dx	shadow	Assets/hot_air_balloon_merged.glb	8
+D	dx	shadow	.	1	0	105036	1	0	material0_1
+D	dx	shadow	.	1	0	105036	1	0	material0_1
+D	dx	shadow	.	1	0	105036	1	0	material0_1
+D	dx	shadow	.	1	0	105036	1	0	material0_1
+D	dx	shadow	.	1	0	105036	1	0	material0_1
+D	dx	shadow	.	1	0	105036	1	0	material0_1
+D	dx	shadow	.	1	0	105036	1	0	material0_1
+D	dx	shadow	.	1	0	30660	1	0	BalloonCrew_Shared
+G	dx	shadow	SphereRow	7
+D	dx	shadow	.	0	0	3072	1	0	
+D	dx	shadow	.	0	0	3072	1	0	
+D	dx	shadow	.	0	0	3072	1	0	
+D	dx	shadow	.	0	0	3072	1	0	
+D	dx	shadow	.	0	0	3072	1	0	
+D	dx	shadow	.	0	0	3072	1	0	
+D	dx	shadow	.	0	0	3072	1	0	
+G	dx	shadow	Assets/Sun.glb	1
+D	dx	shadow	.	0	0	2880	1	0	球体
+G	dx	shadow	Assets/MorphStressTest.glb	2
+D	dx	shadow	.	1	0	36	1	0	Base
+D	dx	shadow	.	1	0	7200	1	0	TestMaterial
+G	dx	shadow	RoomRoof	4
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	3	1	0	
+D	dx	shadow	.	0	0	3	1	0	
+G	dx	shadow	RoomFloor	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomCeiling	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomDoorLintel	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomDoorJambNegX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomDoorJambPosX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomWallPosZ	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomWallNegX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomWallPosX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomStair1	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomStair2	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomStair3	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	Assets/WaterBottle.glb	1
+D	dx	shadow	.	0	0	13530	1	0	BottleMat
+G	dx	shadow	PondStair3	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	PondStair2	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	PondStair1	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	BridgeStairs	1
+D	dx	shadow	.	0	0	936	1	0	
+G	dx	shadow	Assets/low_poly_viking_boat_2.glb	6
+D	dx	shadow	.	1	0	2646	1	0	PALETA
+D	dx	shadow	.	1	0	28674	1	0	PALETA
+D	dx	shadow	.	1	0	28674	1	0	PALETA
+D	dx	shadow	.	1	0	28674	1	0	PALETA
+D	dx	shadow	.	1	0	28674	1	0	PALETA
+D	dx	shadow	.	1	0	28674	1	0	PALETA
+G	dx	shadow	TowerShaft	1
+D	dx	shadow	.	0	0	72	1	0	
+G	dx	shadow	TowerCornice	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerDeck	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerStair0	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerStair1	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerStair2	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerStair3	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerParapetPosZ	1
+D	dx	shadow	.	0	0	2880	1	0	
+G	dx	shadow	TowerParapetNegZ	1
+D	dx	shadow	.	0	0	2880	1	0	
+G	dx	shadow	TowerRailPosZ	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerRailNegZ	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerRailPosX	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerBeaconMast	1
+D	dx	shadow	.	0	0	360	1	0	
+G	dx	shadow	TowerBeaconLamp	1
+D	dx	shadow	.	0	0	180	1	0	
+G	dx	shadow	SeaStair1	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	SeaStair2	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	SeaStair3	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	FlagpolePlatform	1
+D	dx	shadow	.	0	0	288	1	0	
+G	dx	shadow	FlagpolePole	1
+D	dx	shadow	.	0	0	216	1	0	
+G	dx	shadow	FlagpoleButtonCollar	1
+D	dx	shadow	.	0	0	216	1	0	
+G	dx	shadow	FlagpoleButton	1
+D	dx	shadow	.	0	0	216	1	0	
+G	dx	shadow	FlagpoleFlag	3
+D	dx	shadow	.	0	0	2304	1	0	
+D	dx	shadow	.	0	0	2304	1	0	
+D	dx	shadow	.	0	0	480	1	0	
+G	dx	shadow	Assets/plane.glb	5
+D	dx	shadow	.	1	0	88689	1	0	material0_0
+D	dx	shadow	.	1	0	88689	1	0	material0_0
+D	dx	shadow	.	1	0	88689	1	0	material0_0
+D	dx	shadow	.	1	0	88689	1	0	material0_0
+D	dx	shadow	.	1	0	88689	1	0	material0_0
+G	dx	shadow	RoomRoof	4
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	3	1	0	
+D	dx	shadow	.	0	0	3	1	0	
+G	dx	shadow	RoomFloor	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomCeiling	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomDoorLintel	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomDoorJambNegX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomDoorJambPosX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomWallPosZ	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomWallNegX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomWallPosX	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomStair1	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomStair2	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	RoomStair3	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	PondStair3	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	PondStair2	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	PondStair1	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	BridgeStairs	1
+D	dx	shadow	.	0	0	936	1	0	
+G	dx	shadow	TowerShaft	1
+D	dx	shadow	.	0	0	72	1	0	
+G	dx	shadow	TowerCornice	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerDeck	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerStair0	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerStair1	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerStair2	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerStair3	1
+D	dx	shadow	.	0	0	720	1	0	
+G	dx	shadow	TowerParapetPosZ	1
+D	dx	shadow	.	0	0	2880	1	0	
+G	dx	shadow	TowerParapetNegZ	1
+D	dx	shadow	.	0	0	2880	1	0	
+G	dx	shadow	TowerRailPosZ	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerRailNegZ	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerRailPosX	1
+D	dx	shadow	.	0	0	36	1	0	
+G	dx	shadow	TowerBeaconMast	1
+D	dx	shadow	.	0	0	360	1	0	
+G	dx	shadow	TowerBeaconLamp	1
+D	dx	shadow	.	0	0	180	1	0	
+G	dx	shadow	SeaStair1	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	SeaStair2	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	SeaStair3	6
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+D	dx	shadow	.	0	0	6	1	0	
+G	dx	shadow	FlagpolePlatform	1
+D	dx	shadow	.	0	0	288	1	0	
+G	dx	shadow	FlagpolePole	1
+D	dx	shadow	.	0	0	216	1	0	
+G	dx	shadow	FlagpoleButtonCollar	1
+D	dx	shadow	.	0	0	216	1	0	
+G	dx	shadow	FlagpoleButton	1
+D	dx	shadow	.	0	0	216	1	0	
+G	dx	shadow	FlagpoleFlag	3
+D	dx	shadow	.	0	0	2304	1	0	
+D	dx	shadow	.	0	0	2304	1	0	
+D	dx	shadow	.	0	0	480	1	0	
+G	dx	main	Assets/Skybox	6
+S	dx	c	0	1	0
+D	dx	scene	c	0	1	6	1	0	
+D	dx	scene	c	0	1	6	1	0	
+D	dx	scene	c	0	1	6	1	0	
+D	dx	scene	c	0	1	6	1	0	
+D	dx	scene	c	0	1	6	1	0	
+D	dx	scene	c	0	1	6	1	0	
+G	dx	main	Assets/warcraft_3_style_pbr_grass.glb	3
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	54	1	0	material_0
+D	dx	scene	c	1	0	54	1	0	material_0
+D	dx	scene	c	1	0	54	1	0	material_0
+G	dx	main	Road	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	180	1	0	
+G	dx	main	Sea	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	387096	1	0	
+G	dx	main	rock1	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	210	2	0	
+G	dx	main	rock2	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	228	2	0	
+G	dx	main	rock3	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	228	2	0	
+G	dx	main	rock4	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	210	2	0	
+G	dx	main	rock12	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	228	6	0	
+G	dx	main	rock13	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	234	6	0	
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	195	7	0	Paint_Gloss_Blue
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	195	7	0	Paint_Gloss_Blue
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	42	7	0	Paint_Matte_Orange
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	42	7	0	Paint_Matte_Orange
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	615	7	0	Hard_Shiny_Plastic_Grey
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	615	7	0	Hard_Shiny_Plastic_Grey
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	60	7	0	Steel_Rough
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	60	7	0	Steel_Rough
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	48	7	0	Hard_Textured_Plastic_White
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	48	7	0	Hard_Textured_Plastic_White
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	195	7	0	Paint_Gloss_Blue
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	42	7	0	Paint_Matte_Orange
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	615	7	0	Hard_Shiny_Plastic_Grey
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	60	7	0	Steel_Rough
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	48	7	0	Hard_Textured_Plastic_White
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	195	7	0	Paint_Gloss_Blue
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	42	7	0	Paint_Matte_Orange
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	615	7	0	Hard_Shiny_Plastic_Grey
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	60	7	0	Steel_Rough
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	48	7	0	Hard_Textured_Plastic_White
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	195	7	0	Paint_Gloss_Blue
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	42	7	0	Paint_Matte_Orange
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	615	7	0	Hard_Shiny_Plastic_Grey
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	60	7	0	Steel_Rough
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	48	7	0	Hard_Textured_Plastic_White
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	195	7	0	Paint_Gloss_Blue
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	42	7	0	Paint_Matte_Orange
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	615	7	0	Hard_Shiny_Plastic_Grey
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	60	7	0	Steel_Rough
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	48	7	0	Hard_Textured_Plastic_White
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	195	7	0	Paint_Gloss_Blue
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	42	7	0	Paint_Matte_Orange
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	615	7	0	Hard_Shiny_Plastic_Grey
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	60	7	0	Steel_Rough
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	48	7	0	Hard_Textured_Plastic_White
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	195	7	0	Paint_Gloss_Blue
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	42	7	0	Paint_Matte_Orange
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	615	7	0	Hard_Shiny_Plastic_Grey
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	60	7	0	Steel_Rough
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	48	7	0	Hard_Textured_Plastic_White
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	1	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	2	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	3	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	4	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	5	Glass_Basic_Grey
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	6	Glass_Basic_Grey
+G	dx	main	mountain1	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	984	4	0	
+G	dx	main	mountain2	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	843	4	0	
+G	dx	main	mountain3	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	834	4	0	
+G	dx	main	mountain4	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	1110	3	0	
+G	dx	main	Assets/3DGodotRobot.glb	10
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	1068	1	0	Material
+D	dx	scene	c	1	0	984	1	0	Material
+D	dx	scene	c	1	0	1596	1	0	Material
+D	dx	scene	c	1	0	264	1	0	Material.002
+D	dx	scene	c	1	0	14304	1	0	Material
+D	dx	scene	c	1	0	1068	1	0	Material
+D	dx	scene	c	1	0	984	1	0	Material
+D	dx	scene	c	1	0	1596	1	0	Material
+D	dx	scene	c	1	0	264	1	0	Material.002
+D	dx	scene	c	1	0	14304	1	0	Material
+G	dx	main	Assets/Torch.glb	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	56424	1	0	Node_0
+G	dx	main	Assets/Sun.glb	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	2880	1	0	球体
+G	dx	main	Assets/street_lights.glb	4
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	19680	1	0	StreetLamp
+D	dx	scene	c	1	0	19680	1	0	StreetLamp
+D	dx	scene	c	1	0	19680	1	0	StreetLamp
+D	dx	scene	c	1	0	19680	1	0	StreetLamp
+G	dx	main	Assets/Sun.glb	1
+S	dx	c	1	1	1
+D	dx	scene	c	0	0	2880	1	0	球体
+G	dx	main	Assets/halloween_haunted_house_merged.glb	1
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	55194	1	0	HauntedHouse_Atlas
+G	dx	main	SphereRow	7
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	3072	1	0	
+D	dx	scene	c	0	0	3072	1	0	
+D	dx	scene	c	0	0	3072	1	0	
+D	dx	scene	c	0	0	3072	1	0	
+D	dx	scene	c	0	0	3072	1	0	
+D	dx	scene	c	0	0	3072	1	0	
+D	dx	scene	c	0	0	3072	1	0	
+G	dx	main	Assets/Sun.glb	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	2880	1	0	球体
+G	dx	main	Assets/MorphStressTest.glb	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	36	1	0	Base
+D	dx	scene	c	1	0	7200	1	0	TestMaterial
+G	dx	main	RoomRoof	4
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	3	1	0	
+D	dx	scene	c	0	0	3	1	0	
+G	dx	main	RoomFloor	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomCeiling	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomDoorLintel	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomDoorJambNegX	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomDoorJambPosX	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomWallPosZ	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomWallNegX	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomWallPosX	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomStair1	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomStair2	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomStair3	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	Assets/celling_lights.glb	20
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	2970	1	0	black
+D	dx	scene	c	1	0	90	1	0	light
+D	dx	scene	c	1	0	2970	1	0	black
+D	dx	scene	c	1	0	90	1	0	light
+D	dx	scene	c	1	0	282	1	0	Material.001
+D	dx	scene	c	1	0	282	1	0	Material.001
+D	dx	scene	c	1	0	90	1	0	Material.001
+D	dx	scene	c	1	0	90	1	0	Material.001
+D	dx	scene	c	1	0	2970	1	0	black
+D	dx	scene	c	1	0	90	1	0	light
+D	dx	scene	c	1	0	282	1	0	Material.001
+D	dx	scene	c	1	0	90	1	0	Material.001
+D	dx	scene	c	1	0	2970	1	0	black
+D	dx	scene	c	1	0	90	1	0	light
+D	dx	scene	c	1	0	282	1	0	Material.001
+D	dx	scene	c	1	0	90	1	0	Material.001
+D	dx	scene	c	1	0	2970	1	0	black
+D	dx	scene	c	1	0	90	1	0	light
+D	dx	scene	c	1	0	282	1	0	Material.001
+D	dx	scene	c	1	0	90	1	0	Material.001
+G	dx	main	Assets/celling_lights.glb	20
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	2970	1	0	black
+D	dx	scene	c	1	0	90	1	0	light
+D	dx	scene	c	1	0	2970	1	0	black
+D	dx	scene	c	1	0	90	1	0	light
+D	dx	scene	c	1	0	282	1	0	Material.001
+D	dx	scene	c	1	0	282	1	0	Material.001
+D	dx	scene	c	1	0	90	1	0	Material.001
+D	dx	scene	c	1	0	90	1	0	Material.001
+D	dx	scene	c	1	0	2970	1	0	black
+D	dx	scene	c	1	0	90	1	0	light
+D	dx	scene	c	1	0	282	1	0	Material.001
+D	dx	scene	c	1	0	90	1	0	Material.001
+D	dx	scene	c	1	0	2970	1	0	black
+D	dx	scene	c	1	0	90	1	0	light
+D	dx	scene	c	1	0	282	1	0	Material.001
+D	dx	scene	c	1	0	90	1	0	Material.001
+D	dx	scene	c	1	0	2970	1	0	black
+D	dx	scene	c	1	0	90	1	0	light
+D	dx	scene	c	1	0	282	1	0	Material.001
+D	dx	scene	c	1	0	90	1	0	Material.001
+G	dx	main	Assets/celling_lights.glb	20
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	2970	1	0	black
+D	dx	scene	c	1	0	90	1	0	light
+D	dx	scene	c	1	0	2970	1	0	black
+D	dx	scene	c	1	0	90	1	0	light
+D	dx	scene	c	1	0	282	1	0	Material.001
+D	dx	scene	c	1	0	282	1	0	Material.001
+D	dx	scene	c	1	0	90	1	0	Material.001
+D	dx	scene	c	1	0	90	1	0	Material.001
+D	dx	scene	c	1	0	2970	1	0	black
+D	dx	scene	c	1	0	90	1	0	light
+D	dx	scene	c	1	0	282	1	0	Material.001
+D	dx	scene	c	1	0	90	1	0	Material.001
+D	dx	scene	c	1	0	2970	1	0	black
+D	dx	scene	c	1	0	90	1	0	light
+D	dx	scene	c	1	0	282	1	0	Material.001
+D	dx	scene	c	1	0	90	1	0	Material.001
+D	dx	scene	c	1	0	2970	1	0	black
+D	dx	scene	c	1	0	90	1	0	light
+D	dx	scene	c	1	0	282	1	0	Material.001
+D	dx	scene	c	1	0	90	1	0	Material.001
+G	dx	main	Assets/WaterBottle.glb	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	13530	1	0	BottleMat
+G	dx	main	Assets/busterDrone.glb	390
+S	dx	c	1	1	1
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	858	1	0	body_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	858	1	0	body_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	36	1	0	body_albedo
+D	dx	scene	c	0	0	324	1	0	body_albedo
+D	dx	scene	c	0	0	36	1	0	body_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	6768	1	0	body_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	6768	1	0	body_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	6642	1	0	body_albedo
+D	dx	scene	c	0	0	858	1	0	body_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	858	1	0	body_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	324	1	0	body_albedo
+D	dx	scene	c	0	0	36	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	6768	1	0	body_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	6768	1	0	body_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	6642	1	0	body_albedo
+D	dx	scene	c	0	0	858	1	0	body_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	858	1	0	body_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	324	1	0	body_albedo
+D	dx	scene	c	0	0	36	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	6768	1	0	body_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	6768	1	0	body_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	6642	1	0	body_albedo
+D	dx	scene	c	0	0	858	1	0	body_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	858	1	0	body_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	324	1	0	body_albedo
+D	dx	scene	c	0	0	36	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	6768	1	0	body_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	6768	1	0	body_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	6642	1	0	body_albedo
+D	dx	scene	c	0	0	858	1	0	body_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	858	1	0	body_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	324	1	0	body_albedo
+D	dx	scene	c	0	0	36	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	6768	1	0	body_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	6768	1	0	body_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	6642	1	0	body_albedo
+D	dx	scene	c	0	0	858	1	0	body_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	858	1	0	body_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	324	1	0	body_albedo
+D	dx	scene	c	0	0	36	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	6768	1	0	body_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	6768	1	0	body_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	6642	1	0	body_albedo
+D	dx	scene	c	0	0	858	1	0	body_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	858	1	0	body_albedo
+D	dx	scene	c	0	0	684	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	324	1	0	body_albedo
+D	dx	scene	c	0	0	36	1	0	body_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4872	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	4128	1	0	leg_albedo
+D	dx	scene	c	0	0	192	1	0	leg_albedo
+D	dx	scene	c	0	0	2736	1	0	leg_albedo
+D	dx	scene	c	0	0	3792	1	0	leg_albedo
+D	dx	scene	c	0	0	6768	1	0	body_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	6768	1	0	body_albedo
+D	dx	scene	c	0	0	4896	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+D	dx	scene	c	0	0	198	1	0	body_albedo
+S	dx	c	2	1	1
+D	dx	scene	c	0	0	18	1	0	concrete_044_basecolor
+D	dx	scene	c	0	0	18	1	0	concrete_044_basecolor
+D	dx	scene	c	0	0	18	1	0	concrete_044_basecolor
+D	dx	scene	c	0	0	18	1	0	concrete_044_basecolor
+G	dx	main	PondStair3	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	PondStair2	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	PondStair1	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	5826	16	0	Node_0
+G	dx	main	RiverStraightPool	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	192	1	0	
+D	dx	scene	c	1	0	144	1	0	
+G	dx	main	RiverBendWest	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	144	1	0	
+D	dx	scene	c	1	0	108	1	0	
+G	dx	main	RiverStraightFord	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	120	1	0	
+D	dx	scene	c	1	0	132	1	0	
+G	dx	main	RiverBendMeadow	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	144	1	0	
+D	dx	scene	c	1	0	108	1	0	
+G	dx	main	RiverStraightEast	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	144	1	0	
+D	dx	scene	c	1	0	108	1	0	
+G	dx	main	RiverEstuary	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	144	1	0	
+D	dx	scene	c	1	0	108	1	0	
+G	dx	main	RiverBranchSpring	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	420	1	0	
+D	dx	scene	c	1	0	336	1	0	
+G	dx	main	RiverBranchSink	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	180	1	0	
+D	dx	scene	c	1	0	156	1	0	
+G	dx	main	BridgeStairs	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	936	1	0	
+G	dx	main	Assets/low_poly_viking_boat_2.glb	6
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	2646	1	0	PALETA
+D	dx	scene	c	1	0	28674	1	0	PALETA
+D	dx	scene	c	1	0	28674	1	0	PALETA
+D	dx	scene	c	1	0	28674	1	0	PALETA
+D	dx	scene	c	1	0	28674	1	0	PALETA
+D	dx	scene	c	1	0	28674	1	0	PALETA
+G	dx	main	TowerShaft	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	72	1	0	
+G	dx	main	TowerCornice	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	36	1	0	
+G	dx	main	TowerDeck	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	36	1	0	
+G	dx	main	TowerStair0	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	720	1	0	
+G	dx	main	TowerStair1	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	720	1	0	
+G	dx	main	TowerStair2	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	720	1	0	
+G	dx	main	TowerStair3	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	720	1	0	
+G	dx	main	TowerParapetPosZ	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	2880	1	0	
+G	dx	main	TowerParapetNegZ	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	2880	1	0	
+G	dx	main	TowerRailPosZ	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	36	1	0	
+G	dx	main	TowerRailNegZ	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	36	1	0	
+G	dx	main	TowerRailPosX	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	36	1	0	
+G	dx	main	TowerBeaconMast	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	360	1	0	
+G	dx	main	TowerBeaconLamp	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	180	1	0	
+G	dx	main	TowerBeaconBeam	1
+S	dx	c	2	2	1
+D	dx	scene	c	1	1	144	1	0	
+S	dx	c	2	1	1
+D	dx	scene	c	1	1	144	1	0	
+G	dx	main	SeaStair1	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	SeaStair2	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	SeaStair3	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	SeaRoad	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	162	1	0	
+G	dx	main	FlagpolePlatform	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	288	1	0	
+G	dx	main	FlagpolePole	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	216	1	0	
+G	dx	main	FlagpoleButtonCollar	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	216	1	0	
+G	dx	main	FlagpoleButton	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	216	1	0	
+G	dx	main	FlagpoleFlag	3
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	2304	1	0	
+D	dx	scene	c	0	0	2304	1	0	
+D	dx	scene	c	0	0	480	1	0	
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	1068	20	0	Material
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	984	20	0	Material
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	1596	20	0	Material
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	264	20	0	Material.002
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	14304	20	0	Material
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	1068	20	0	Material
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	984	20	0	Material
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	1596	20	0	Material
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	264	20	0	Material.002
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	14304	20	0	Material
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	3522	20	0	Seagull_Atlas
+S	dx	.	0	1	0
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	0
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	0
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	0
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	0
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	0
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	54	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	54	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	54	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	180	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	387096	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	210	2	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	228	2	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	228	2	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	210	2	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	228	6	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	234	6	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	195	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	195	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	42	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	42	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	615	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	615	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	60	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	60	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	48	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	48	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	195	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	42	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	615	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	60	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	48	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	195	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	42	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	615	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	60	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	48	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	195	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	42	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	615	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	60	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	48	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	195	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	42	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	615	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	60	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	48	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	195	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	42	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	615	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	60	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	48	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	195	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	42	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	615	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	60	7	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	48	7	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	984	4	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	843	4	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	834	4	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	1110	3	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	1068	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	984	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	1596	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	264	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	14304	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	1068	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	984	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	1596	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	264	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	14304	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	56424	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	2880	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	19680	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	19680	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	19680	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	19680	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	55194	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	3072	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	3072	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	3072	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	3072	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	3072	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	3072	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	3072	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	2880	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	36	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	7200	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	3	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	3	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2970	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2970	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	282	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	282	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2970	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	282	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2970	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	282	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2970	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	282	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2970	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2970	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	282	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	282	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2970	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	282	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2970	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	282	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2970	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	282	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2970	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2970	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	282	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	282	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2970	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	282	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2970	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	282	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2970	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	282	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	90	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	13530	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	5826	16	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	192	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	144	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	144	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	108	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	120	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	132	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	144	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	108	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	144	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	108	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	144	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	108	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	420	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	336	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	180	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	156	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	936	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	2646	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	28674	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	28674	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	28674	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	28674	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	28674	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	72	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	720	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	720	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	720	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	720	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	2880	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	2880	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	360	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	180	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	162	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	288	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	216	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	216	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	216	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	2304	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	2304	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	480	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	1068	20	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	984	20	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	1596	20	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	264	20	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	14304	20	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	1068	20	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	984	20	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	1596	20	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	264	20	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	14304	20	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	3522	20	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	6	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	5	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	4	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	3	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	18	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	18	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	18	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	18	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	684	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	858	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	858	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	858	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	858	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	858	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	858	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	858	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	858	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	858	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	858	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	858	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	858	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	858	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	858	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6768	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6768	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6768	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6768	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6768	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6768	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6768	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6768	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6768	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6768	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6768	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6768	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6768	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6768	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4896	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	198	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6642	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6642	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6642	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6642	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6642	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	6642	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	3792	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4872	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	192	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2736	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	4128	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	324	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	324	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	324	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	324	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	324	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	324	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	324	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	1	1	1
+D	dx	replay	.	0	0	2880	1	0	
+S	dx	.	2	1	0
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	2	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	1	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	144	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	144	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+G	dx	main	Waterfall P1	1
+S	dx	c	1	0	0
+D	dx	scene	c	1	1	1452	1	0	
+G	dx	main	Assets/Skybox	6
+S	dx	c	0	1	0
+D	dx	scene	c	0	1	6	1	0	
+D	dx	scene	c	0	1	6	1	0	
+D	dx	scene	c	0	1	6	1	0	
+D	dx	scene	c	0	1	6	1	0	
+D	dx	scene	c	0	1	6	1	0	
+D	dx	scene	c	0	1	6	1	0	
+G	dx	main	Assets/warcraft_3_style_pbr_grass.glb	3
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	54	1	0	material_0
+D	dx	scene	c	1	0	54	1	0	material_0
+D	dx	scene	c	1	0	54	1	0	material_0
+G	dx	main	Road	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	180	1	0	
+G	dx	main	Sea	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	387096	1	0	
+G	dx	main	rock11	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	186	6	0	
+G	dx	main	rock12	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	228	6	0	
+G	dx	main	rock13	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	234	6	0	
+G	dx	main	rock14	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	204	6	0	
+G	dx	main	rock15	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	198	6	0	
+G	dx	main	mountain1	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	984	4	0	
+G	dx	main	mountain2	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	843	4	0	
+G	dx	main	mountain3	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	834	4	0	
+G	dx	main	mountain4	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	1110	3	0	
+G	dx	main	Assets/little_house_game_ready_merged.glb	22
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	24	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	2394	1	0	generic_map
+S	dx	c	2	2	1
+D	dx	scene	c	1	0	23076	1	0	generic_map
+S	dx	c	2	1	1
+D	dx	scene	c	1	0	23076	1	0	generic_map
+G	dx	main	RoomRoof	4
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	3	1	0	
+D	dx	scene	c	0	0	3	1	0	
+G	dx	main	RoomFloor	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomCeiling	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomDoorLintel	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomDoorJambNegX	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomDoorJambPosX	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomWallPosZ	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomWallNegX	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomWallPosX	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomStair1	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomStair2	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	RoomStair3	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	PondStair3	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	PondStair2	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	PondStair1	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	5826	16	0	Node_0
+G	dx	main	WaterfallMist	1
+S	dx	c	1	0	0
+D	dx	scene	c	1	1	36	1	0	
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	5826	123	0	Node_0
+G	dx	main	RiverStraightPool	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	192	1	0	
+D	dx	scene	c	1	0	144	1	0	
+G	dx	main	RiverBendWest	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	144	1	0	
+D	dx	scene	c	1	0	108	1	0	
+G	dx	main	RiverStraightFord	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	120	1	0	
+D	dx	scene	c	1	0	132	1	0	
+G	dx	main	RiverBendMeadow	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	144	1	0	
+D	dx	scene	c	1	0	108	1	0	
+G	dx	main	RiverStraightEast	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	144	1	0	
+D	dx	scene	c	1	0	108	1	0	
+G	dx	main	RiverEstuary	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	144	1	0	
+D	dx	scene	c	1	0	108	1	0	
+G	dx	main	RiverBranchSpring	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	420	1	0	
+D	dx	scene	c	1	0	336	1	0	
+G	dx	main	RiverBranchSink	2
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	180	1	0	
+D	dx	scene	c	1	0	156	1	0	
+G	dx	main	Assets/Bridge.glb	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	23844	1	0	Node_0
+G	dx	main	BridgeStairs	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	936	1	0	
+G	dx	main	TowerShaft	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	72	1	0	
+G	dx	main	TowerCornice	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	36	1	0	
+G	dx	main	TowerDeck	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	36	1	0	
+G	dx	main	TowerStair0	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	720	1	0	
+G	dx	main	TowerStair1	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	720	1	0	
+G	dx	main	TowerStair2	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	720	1	0	
+G	dx	main	TowerStair3	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	720	1	0	
+G	dx	main	TowerParapetPosZ	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	2880	1	0	
+G	dx	main	TowerParapetNegZ	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	2880	1	0	
+G	dx	main	TowerRailPosZ	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	36	1	0	
+G	dx	main	TowerRailNegZ	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	36	1	0	
+G	dx	main	TowerRailPosX	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	36	1	0	
+G	dx	main	TowerBeaconMast	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	360	1	0	
+G	dx	main	TowerBeaconLamp	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	180	1	0	
+G	dx	main	TowerBeaconBeam	1
+S	dx	c	2	2	1
+D	dx	scene	c	1	1	144	1	0	
+S	dx	c	2	1	1
+D	dx	scene	c	1	1	144	1	0	
+G	dx	main	SeaStair1	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	SeaStair2	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	SeaStair3	6
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+D	dx	scene	c	0	0	6	1	0	
+G	dx	main	SeaRoad	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	162	1	0	
+G	dx	main	FlagpolePlatform	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	288	1	0	
+G	dx	main	FlagpolePole	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	216	1	0	
+G	dx	main	FlagpoleButtonCollar	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	216	1	0	
+G	dx	main	FlagpoleButton	1
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	216	1	0	
+G	dx	main	FlagpoleFlag	3
+S	dx	c	0	1	1
+D	dx	scene	c	0	0	2304	1	0	
+D	dx	scene	c	0	0	2304	1	0	
+D	dx	scene	c	0	0	480	1	0	
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	3522	20	0	Seagull_Atlas
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	88689	10	0	material0_0
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	88689	10	0	material0_0
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	88689	10	0	material0_0
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	88689	10	0	material0_0
+S	dx	c	0	0	1
+D	dx	scene	c	1	0	88689	10	0	material0_0
+S	dx	.	0	1	0
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	0
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	0
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	0
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	0
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	0
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	54	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	54	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	54	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	180	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	387096	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	186	6	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	228	6	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	234	6	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	204	6	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	198	6	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	984	4	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	843	4	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	834	4	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	1110	3	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	3	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	3	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	5826	16	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	5826	123	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	192	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	144	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	144	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	108	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	120	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	132	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	144	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	108	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	144	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	108	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	144	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	108	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	420	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	336	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	180	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	156	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	23844	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	936	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	72	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	720	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	720	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	720	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	720	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	2880	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	2880	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	36	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	360	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	180	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	162	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	288	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	216	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	216	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	216	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	2304	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	2304	1	0	
+S	dx	.	0	1	1
+D	dx	replay	.	0	0	480	1	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	3522	20	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	88689	10	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	88689	10	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	88689	10	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	88689	10	0	
+S	dx	.	0	0	1
+D	dx	replay	.	1	0	88689	10	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	144	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	144	1	0	
+S	dx	.	1	0	0
+D	dx	replay	.	1	0	1452	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	23076	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	23076	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	24	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	2	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	2	1	1
+D	dx	replay	.	0	0	2394	1	0	
+S	dx	.	1	0	0
+D	dx	replay	.	1	0	36	1	0	
+S	dx	.	2	1	0
+D	dx	replay	.	0	0	6	1	0	
+S	dx	.	2	1	1
+S	dx	.	2	0	1
+S	dx	.	2	1	1
+S	dx	.	2	1	1
+S	dx	.	2	1	1
+S	dx	.	2	1	1
+S	dx	.	2	0	1
+S	dx	.	2	1	1
+S	dx	.	2	1	1
+S	dx	.	2	1	1
+S	dx	.	2	1	1
+S	dx	.	2	1	1

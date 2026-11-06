@@ -612,12 +612,12 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     // ── Shape (procedural geometry) ──
     Dictionary<(Season.Controls.ShapeType, int, int, int), WGPUTexture> DictionaryShapeTexture = new();
     Dictionary<(Season.Controls.ShapeType, long), WGPUSprite2D> DictionaryShape = new();
-    Dictionary<(string, long), WGPUModel> DictionaryModel = new();
+    readonly DrawableTable<(string, long), WGPUModel> _modelTable = new();
     Dictionary<string, Task<WGPUModel>> DictionaryModelResource = new();
-    Dictionary<(string, long), WGPUSprite3D> DictionarySprite3D = new();
-    Dictionary<(string, long), WGPUMesh3D> DictionaryMesh3D = new();
-    Dictionary<(string, long), WGPUInstancedMesh3D> DictionaryInstancedMesh3D = new();
-    Dictionary<(string, long), WGPUInstancedModel> DictionaryInstancedModel = new();
+    readonly DrawableTable<(string, long), WGPUSprite3D> _sprite3DTable = new();
+    readonly DrawableTable<(string, long), WGPUMesh3D> _mesh3DTable = new();
+    readonly DrawableTable<(string, long), WGPUInstancedMesh3D> _instancedMesh3DTable = new();
+    readonly DrawableTable<(string, long), WGPUInstancedModel> _instancedModelTable = new();
     readonly HashSet<WGPURenderTarget> _renderTargets = new();
     // P3: names published through RegisterViewSurface, mapped to the target that owns them. Kept apart from
     // DictionaryWGPUTexture so UnregisterViewSurface can never remove a real texture's entry.
@@ -2193,13 +2193,8 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
 
     public async Task<bool> LoadModel(Model model)
     {
-        lock (DictionaryModel)
-        {
-            if (DictionaryModel.ContainsKey((model.Name, model.ID)))
-            {
-                return true;
-            }
-        }
+        if (_modelTable.Contains((model.Name, model.ID)))
+            return true;
 
         WGPUModel wgpuModel;
         try
@@ -2213,11 +2208,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             wgpuModel = new WGPUModel(model.Name);
         }
 
-        lock (DictionaryModel)
-        {
-            if (!DictionaryModel.ContainsKey((model.Name, model.ID)))
-                DictionaryModel.Add((model.Name, model.ID), wgpuModel);
-        }
+        _modelTable.TryAdd((model.Name, model.ID), wgpuModel);
 
         return true;
     }
@@ -2475,10 +2466,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     public void UpdateModel(Model model, float time)
     {
         WGPUModel wgpuModel = null;
-        lock (DictionaryModel)
-        {
-            DictionaryModel.TryGetValue((model.Name, model.ID), out wgpuModel);
-        }
+        _modelTable.TryGet((model.Name, model.ID), out wgpuModel);
 
         if (wgpuModel == null) return;
 
@@ -2518,8 +2506,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     List<WGPUPrimitiveData> GetModelPrimitives(Model model)
     {
         WGPUModel? wgpuModel = null;
-        lock (DictionaryModel)
-            DictionaryModel.TryGetValue((model.Name, model.ID), out wgpuModel);
+        _modelTable.TryGet((model.Name, model.ID), out wgpuModel);
         return wgpuModel?.GetAllPrimitives() ?? new List<WGPUPrimitiveData>();
     }
 
@@ -2590,10 +2577,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         }
 
         WGPUModel wgpuModel = null;
-        lock (DictionaryModel)
-        {
-            DictionaryModel.TryGetValue((model.Name, model.ID), out wgpuModel);
-        }
+        _modelTable.TryGet((model.Name, model.ID), out wgpuModel);
 
         if (wgpuModel == null || !wgpuModel.TransformInitialized)
         {
@@ -2618,21 +2602,14 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
 
     public async Task<bool> LoadSprite3D(Sprite3D sprite)
     {
-        lock (DictionarySprite3D)
-        {
-            if (DictionarySprite3D.ContainsKey((sprite.Name, sprite.ID)))
-                return true;
-        }
+        if (_sprite3DTable.Contains((sprite.Name, sprite.ID)))
+            return true;
 
         await LoadTextureAsync(sprite.Name);
 
         var wgpuSprite3D = new WGPUSprite3D { TextureName = sprite.Name };
 
-        lock (DictionarySprite3D)
-        {
-            if (!DictionarySprite3D.ContainsKey((sprite.Name, sprite.ID)))
-                DictionarySprite3D.Add((sprite.Name, sprite.ID), wgpuSprite3D);
-        }
+        _sprite3DTable.TryAdd((sprite.Name, sprite.ID), wgpuSprite3D);
 
         return true;
     }
@@ -2640,10 +2617,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     public void UpdateSprite3D(Sprite3D sprite, float time)
     {
         WGPUSprite3D wgpuSprite3D = null;
-        lock (DictionarySprite3D)
-        {
-            DictionarySprite3D.TryGetValue((sprite.Name, sprite.ID), out wgpuSprite3D);
-        }
+        _sprite3DTable.TryGet((sprite.Name, sprite.ID), out wgpuSprite3D);
 
         if (wgpuSprite3D == null) return;
 
@@ -2703,10 +2677,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         }
 
         WGPUSprite3D wgpuSprite3D = null;
-        lock (DictionarySprite3D)
-        {
-            DictionarySprite3D.TryGetValue((sprite.Name, sprite.ID), out wgpuSprite3D);
-        }
+        _sprite3DTable.TryGet((sprite.Name, sprite.ID), out wgpuSprite3D);
 
         if (wgpuSprite3D == null || !wgpuSprite3D.TransformInitialized)
         {
@@ -2740,12 +2711,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
 
     public void DisposeSprite3D(Sprite3D sprite)
     {
-        var key = (sprite.Name, sprite.ID);
-        lock (DictionarySprite3D)
-        {
-            if (DictionarySprite3D.TryGetValue(key, out var wgpuSprite3D))
-                DictionarySprite3D.Remove(key);
-        }
+        _sprite3DTable.Remove((sprite.Name, sprite.ID));
         sprite.Ready = false;
     }
 
@@ -2869,11 +2835,8 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
 
     public async Task<bool> LoadMesh3D(Mesh3D mesh)
     {
-        lock (DictionaryMesh3D)
-        {
-            if (DictionaryMesh3D.ContainsKey((mesh.Name, mesh.ID)))
-                return true;
-        }
+        if (_mesh3DTable.Contains((mesh.Name, mesh.ID)))
+            return true;
 
         var wgpuMesh = new WGPUMesh3D(mesh.Name, mesh);
 
@@ -2886,11 +2849,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         foreach (var surface in mesh.Surfaces)
             ClearSurfaceOverrides(surface);
 
-        lock (DictionaryMesh3D)
-        {
-            if (!DictionaryMesh3D.ContainsKey((mesh.Name, mesh.ID)))
-                DictionaryMesh3D.Add((mesh.Name, mesh.ID), wgpuMesh);
-        }
+        _mesh3DTable.TryAdd((mesh.Name, mesh.ID), wgpuMesh);
 
         return true;
     }
@@ -2898,10 +2857,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     public void UpdateMesh3D(Mesh3D mesh, float time)
     {
         WGPUMesh3D wgpuMesh = null;
-        lock (DictionaryMesh3D)
-        {
-            DictionaryMesh3D.TryGetValue((mesh.Name, mesh.ID), out wgpuMesh);
-        }
+        _mesh3DTable.TryGet((mesh.Name, mesh.ID), out wgpuMesh);
 
         if (wgpuMesh == null) return;
 
@@ -2985,10 +2941,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         }
 
         WGPUMesh3D wgpuMesh = null;
-        lock (DictionaryMesh3D)
-        {
-            DictionaryMesh3D.TryGetValue((mesh.Name, mesh.ID), out wgpuMesh);
-        }
+        _mesh3DTable.TryGet((mesh.Name, mesh.ID), out wgpuMesh);
 
         if (wgpuMesh == null || !wgpuMesh.TransformInitialized)
         {
@@ -3157,6 +3110,8 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         Array.Clear(uniformData, WebGPUUniformLayout.PrevWorld, WebGPUUniformLayout.TotalFloats - WebGPUUniformLayout.PrevWorld);
         Array.Copy(matrixData, 0, uniformData, WebGPUUniformLayout.World, WebGPUUniformLayout.WorldFloats);
 
+        // The surface path carries a third factor (Surface.Alpha) and keeps the authored cutoff as the non-mask default,
+        // so it is not the primitive chain that MaterialOps owns; only the primitive path below is shared.
         float finalAlpha = surface.BaseColor.W * surface.Alpha * meshAlpha;
         // Mesh-level color multiplier: multiply RGB component-wise into BaseColor.
         // Leave W untouched so the alpha chain is unaffected. default(0) means no tint.
@@ -3623,12 +3578,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
 
     public void DisposeMesh3D(Mesh3D mesh)
     {
-        var key = (mesh.Name, mesh.ID);
-        lock (DictionaryMesh3D)
-        {
-            if (DictionaryMesh3D.TryGetValue(key, out var wgpuMesh))
-                DictionaryMesh3D.Remove(key);
-        }
+        _mesh3DTable.Remove((mesh.Name, mesh.ID));
 
         // wgpuMesh is only a C# bookkeeping wrapper. GPU resources are owned by JS-side GC, and the browser
         // already delays reclaiming references that are still in flight at destroy time, so no fence-gated
@@ -3646,11 +3596,8 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
 
     async Task<bool> LoadInstancedMesh3DCore(InstancedMesh3D mesh)
     {
-        lock (DictionaryInstancedMesh3D)
-        {
-            if (DictionaryInstancedMesh3D.ContainsKey((mesh.Name, mesh.ID)))
-                return true;
-        }
+        if (_instancedMesh3DTable.Contains((mesh.Name, mesh.ID)))
+            return true;
 
         var wgpuMesh = new WGPUInstancedMesh3D(mesh.Name);
 
@@ -3663,11 +3610,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         foreach (var surface in mesh.Surfaces)
             ClearSurfaceOverrides(surface);
 
-        lock (DictionaryInstancedMesh3D)
-        {
-            if (!DictionaryInstancedMesh3D.ContainsKey((mesh.Name, mesh.ID)))
-                DictionaryInstancedMesh3D.Add((mesh.Name, mesh.ID), wgpuMesh);
-        }
+        _instancedMesh3DTable.TryAdd((mesh.Name, mesh.ID), wgpuMesh);
 
         return true;
     }
@@ -3675,10 +3618,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     public void UpdateInstancedMesh3D(InstancedMesh3D mesh, float time)
     {
         WGPUInstancedMesh3D wgpuMesh = null;
-        lock (DictionaryInstancedMesh3D)
-        {
-            DictionaryInstancedMesh3D.TryGetValue((mesh.Name, mesh.ID), out wgpuMesh);
-        }
+        _instancedMesh3DTable.TryGet((mesh.Name, mesh.ID), out wgpuMesh);
 
         wgpuMesh?.Update(mesh);
     }
@@ -3689,10 +3629,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             return;
 
         WGPUInstancedMesh3D wgpuMesh = null;
-        lock (DictionaryInstancedMesh3D)
-        {
-            DictionaryInstancedMesh3D.TryGetValue((mesh.Name, mesh.ID), out wgpuMesh);
-        }
+        _instancedMesh3DTable.TryGet((mesh.Name, mesh.ID), out wgpuMesh);
 
         if (wgpuMesh == null || !wgpuMesh.TransformInitialized || wgpuMesh.EnabledInstanceCount <= 0)
             return;
@@ -3814,11 +3751,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     {
         var key = (mesh.Name, mesh.ID);
         WGPUInstancedMesh3D? dropped = null;
-        lock (DictionaryInstancedMesh3D)
-        {
-            if (DictionaryInstancedMesh3D.TryGetValue(key, out dropped))
-                DictionaryInstancedMesh3D.Remove(key);
-        }
+        _instancedMesh3DTable.Remove(key, out dropped);
         // A7: remove the cull target from the shared layer; otherwise the list would keep references pointing to a dead JS handle.
         dropped?.Dispose();
 
@@ -3832,13 +3765,8 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
 
     public async Task<bool> LoadInstancedModel(InstancedModel model)
     {
-        lock (DictionaryInstancedModel)
-        {
-            if (DictionaryInstancedModel.ContainsKey((model.ModelName, model.ID)))
-            {
-                return true;
-            }
-        }
+        if (_instancedModelTable.Contains((model.ModelName, model.ID)))
+            return true;
 
         WGPUModel? template;
         try
@@ -3870,11 +3798,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         model.AnimationNames = wgpuInstancedModel.GetAnimationNames();
         model.AnimationClipCount = model.AnimationNames.Count;
 
-        lock (DictionaryInstancedModel)
-        {
-            if (!DictionaryInstancedModel.ContainsKey((model.ModelName, model.ID)))
-                DictionaryInstancedModel.Add((model.ModelName, model.ID), wgpuInstancedModel);
-        }
+        _instancedModelTable.TryAdd((model.ModelName, model.ID), wgpuInstancedModel);
 
         return true;
     }
@@ -3882,10 +3806,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     public void UpdateInstancedModel(InstancedModel model, float time)
     {
         WGPUInstancedModel? wgpuModel = null;
-        lock (DictionaryInstancedModel)
-        {
-            DictionaryInstancedModel.TryGetValue((model.ModelName, model.ID), out wgpuModel);
-        }
+        _instancedModelTable.TryGet((model.ModelName, model.ID), out wgpuModel);
 
         wgpuModel?.Update(model, time);
     }
@@ -3896,10 +3817,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             return;
 
         WGPUInstancedModel? wgpuModel = null;
-        lock (DictionaryInstancedModel)
-        {
-            DictionaryInstancedModel.TryGetValue((model.ModelName, model.ID), out wgpuModel);
-        }
+        _instancedModelTable.TryGet((model.ModelName, model.ID), out wgpuModel);
 
         if (wgpuModel == null || !wgpuModel.TransformInitialized || wgpuModel.EnabledInstanceCount <= 0)
             return;
@@ -3979,7 +3897,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             // split back to front), so it keeps the direct draw even inside an opaque model; collection also hands transparent
             // primitives through this loop, and those have no record.
             if (mainIndirect && !prim.IsTransparent
-                && prim.OriginalBaseColorAlpha * modelAlpha >= 0.999f
+                && MaterialOps.CombineAlpha(prim.OriginalBaseColorAlpha, modelAlpha) >= 0.999f
                 && wgpuModel.TryGetCullStream(prim, out var mainSortedId, out int mainEntry))
             {
                 _jsRuntime.InvokeVoid("seasonWebGPU.drawInstancedMesh3DIndirect",
@@ -4032,7 +3950,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         Array.Copy(matrixData, 0, uniformData, WebGPUUniformLayout.World, WebGPUUniformLayout.WorldFloats);
         Array.Clear(uniformData, WebGPUUniformLayout.PrevWorld, WebGPUUniformLayout.TotalFloats - WebGPUUniformLayout.PrevWorld);
 
-        float finalAlpha = prim.OriginalBaseColorAlpha * modelAlpha;
+        float finalAlpha = MaterialOps.CombineAlpha(prim.OriginalBaseColorAlpha, modelAlpha);
         // Per-instance tint: RGB steps aside so the instance colour at binding 24 replaces it rather than multiplying it.
         // ApplyInstanceTint already rewrote the authored RGB to white; restating it here keeps the invariant local to the uniform
         // builder as well. Alpha is taken from the primitive so the opacity chain is untouched.
@@ -4049,7 +3967,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         if (!string.IsNullOrEmpty(prim.EmissiveTextureName)) textureFlags |= WebGPUTextureFlags.Emissive;
         if (tint) textureFlags |= WebGPUTextureFlags.TintInstanced;
 
-        float alphaCutoff = prim.AlphaMode == 1u ? prim.AlphaCutoff * modelAlpha : prim.AlphaCutoff;
+        float alphaCutoff = MaterialOps.CombineCutoff(prim.AlphaMode, prim.AlphaCutoff, modelAlpha);
 
         WriteLightUniform(
             uniformData,
@@ -4135,11 +4053,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     {
         var key = (model.ModelName, model.ID);
         WGPUInstancedModel? dropped = null;
-        lock (DictionaryInstancedModel)
-        {
-            if (DictionaryInstancedModel.TryGetValue(key, out dropped))
-                DictionaryInstancedModel.Remove(key);
-        }
+        _instancedModelTable.Remove(key, out dropped);
 
         // A7: leave the shared cull registry, which would otherwise keep dispatching for dead JS handles.
         dropped?.Dispose();
@@ -4150,12 +4064,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     public void DisposeModel(Model model)
     {
         WGPUModel wgpuModel = null;
-        lock (DictionaryModel)
-        {
-            var key = (model.Name, model.ID);
-            if (DictionaryModel.TryGetValue(key, out wgpuModel))
-                DictionaryModel.Remove(key);
-        }
+        _modelTable.Remove((model.Name, model.ID), out wgpuModel);
 
         // WGPUModel.Dispose only clears the nodeMap cloned for this instance.
         // Shared templates (DictionaryModelResource) are unaffected.
@@ -4174,10 +4083,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     public void DrawModelShadow(Model model)
     {
         WGPUModel? wgpuModel = null;
-        lock (DictionaryModel)
-        {
-            DictionaryModel.TryGetValue((model.Name, model.ID), out wgpuModel);
-        }
+        _modelTable.TryGet((model.Name, model.ID), out wgpuModel);
         wgpuModel?.DrawShadow(this);
     }
 
@@ -4187,10 +4093,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             return;
 
         WGPUMesh3D wgpuMesh = null;
-        lock (DictionaryMesh3D)
-        {
-            DictionaryMesh3D.TryGetValue((mesh.Name, mesh.ID), out wgpuMesh);
-        }
+        _mesh3DTable.TryGet((mesh.Name, mesh.ID), out wgpuMesh);
 
         if (wgpuMesh == null || !wgpuMesh.TransformInitialized)
             return;
@@ -4224,10 +4127,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             return;
 
         WGPUInstancedMesh3D wgpuMesh = null;
-        lock (DictionaryInstancedMesh3D)
-        {
-            DictionaryInstancedMesh3D.TryGetValue((mesh.Name, mesh.ID), out wgpuMesh);
-        }
+        _instancedMesh3DTable.TryGet((mesh.Name, mesh.ID), out wgpuMesh);
 
         if (wgpuMesh == null || !wgpuMesh.TransformInitialized || wgpuMesh.EnabledInstanceCount <= 0)
             return;
@@ -4303,10 +4203,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             return;
 
         WGPUInstancedModel? wgpuModel = null;
-        lock (DictionaryInstancedModel)
-        {
-            DictionaryInstancedModel.TryGetValue((model.ModelName, model.ID), out wgpuModel);
-        }
+        _instancedModelTable.TryGet((model.ModelName, model.ID), out wgpuModel);
 
         if (wgpuModel == null || !wgpuModel.TransformInitialized || wgpuModel.EnabledInstanceCount <= 0)
             return;
@@ -4463,18 +4360,18 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
 
         var drawList = new List<object>();
 
-        lock (DictionaryModel)
+        lock (_modelTable.Gate)
         {
-            foreach (var pair in DictionaryModel)
+            foreach (var pair in _modelTable)
             {
                 if (pair.Value != null && AccumulateOutline2D(pair.Value.Outline2DActive, pair.Value.Outline2DMaskWidth))
                     drawList.Add(pair.Value);
             }
         }
 
-        lock (DictionaryMesh3D)
+        lock (_mesh3DTable.Gate)
         {
-            foreach (var pair in DictionaryMesh3D)
+            foreach (var pair in _mesh3DTable)
             {
                 if (pair.Value != null && AccumulateOutline2D(pair.Value.Outline2DActive, pair.Value.Outline2DMaskWidth))
                     drawList.Add(pair.Value);
@@ -4483,18 +4380,18 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
 
         // Instanced controls (InstancedMesh3D / InstancedModel): Outline2D also supports per-instance masks.
         // Activation state is aggregated from each instance / host Highlight.Outline2D during platform Update.
-        lock (DictionaryInstancedMesh3D)
+        lock (_instancedMesh3DTable.Gate)
         {
-            foreach (var pair in DictionaryInstancedMesh3D)
+            foreach (var pair in _instancedMesh3DTable)
             {
                 if (pair.Value != null && AccumulateOutline2D(pair.Value.Outline2DActive, pair.Value.Outline2DMaskWidth))
                     drawList.Add(pair.Value);
             }
         }
 
-        lock (DictionaryInstancedModel)
+        lock (_instancedModelTable.Gate)
         {
-            foreach (var pair in DictionaryInstancedModel)
+            foreach (var pair in _instancedModelTable)
             {
                 if (pair.Value != null && AccumulateOutline2D(pair.Value.Outline2DActive, pair.Value.Outline2DMaskWidth))
                     drawList.Add(pair.Value);
@@ -4690,59 +4587,21 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         Season.Rendering.FrameSchedule.CurrentView = view;
         var camera3D = view.Camera;
 
-        // 1-5: shadow-matrix chain (mirrors MTLPrimitiveGroup.Update):
-        // BeginFrame reset → directional/spot light computation → Apply writes shadow fields into
-        // SceneLightParams at a single point. The full 1152B block is then uploaded, so Contract 8 adds no new UBO.
-        // Shadow sources are now selected by the indices stored in Params0.Z/W (written by the authorized bake layer).
-        if (RenderQuality.Current.ShadowsEnabled)
-        {
-            Season.Rendering.CascadedShadow.BeginFrame();
-            int dirIdx = (int)sceneLights.Params0.Z;
-            if (dirIdx >= 0 && dirIdx < sceneLights.LightCount)
-            {
-                var dirType = sceneLights.Lights[dirIdx].DirType;
-                Season.Rendering.CascadedShadow.ComputeSun(camera3D, new Vector3(dirType.X, dirType.Y, dirType.Z));
-            }
-            int spotIdx = (int)sceneLights.Params0.W;
-            if (spotIdx >= 0 && spotIdx < sceneLights.LightCount
-                && sceneLights.Lights[spotIdx].DirType.W == GpuLight.TypeSpot)
-                Season.Rendering.CascadedShadow.ComputeSpot(in sceneLights.Lights[spotIdx]);
-            Season.Rendering.CascadedShadow.Apply(ref sceneLights);
-        }
+        // 1-5: shadow-matrix chain, shared with DX/VK/Metal (a new shadow input must not land on three of four
+        // backends). BeginFrame reset → directional/spot computation → Apply writes the shadow fields at a single
+        // point; the full 1152B block is uploaded below, so Contract 8 still adds no new UBO.
+        SceneFrameSetup.ApplyShadowChain(ref sceneLights, camera3D);
 
-        // 1-2 Contract 7: inject exposure once into Params0.Y
-        // (same semantics as SetLighting on DX/VK/Metal; app-side writes are ineffective),
-        // then upload the whole block into the shared lighting UBO at JS binding(10) once per frame (Contract 8).
-        sceneLights.Params0.Y = RenderQuality.Current.HdrExposure;
+        // 1-2 Contract 7 / 2-3 Clause 6 / 1-7 Clause 4 / 2-4 Clause 10 / 2-5 Step B, in the shared order: exposure
+        // reaches Params0.Y here and nowhere else, then the velocity reconstruction params, the environment tail
+        // (EnvParams/IrradianceSH9 sit at the end of the same block, so they must be written before the upload
+        // below), the DDGI GiParams and the sky inputs.
+        SceneFrameSetup.PrepareLighting(ref sceneLights, RenderQuality.Current.HdrExposure);
 
-        // 2-3 Contract Clause 6: same one-point injection rule as exposure
-        // with xy = current-frame jitter in NDC and zw = 1 / screen size. The fragment shader uses it to
-        // reconstruct NDC from @builtin(position). When disabled, JitterNdc stays zero, and writing it is harmless
-        // because shaders with VELOCITY_OUTPUT=false do not read the field. App-side writes are ineffective.
-        var jitter = view.JitterNdc;
-        sceneLights.VelocityParams = new Vector4(
-            jitter.X, jitter.Y,
-            res.X > 0 ? 1f / res.X : 0f,
-            res.Y > 0 ? 1f / res.Y : 0f);
-
-        // 1-7 Contract Clause 4: inject environment parameters and resolve the current-frame radiance cube
-        // once per frame, so draw paths avoid doing per-draw lookups. This is equivalent to the same-named
-        // block in MTLPrimitiveGroup.Update. If SceneEnvironment is null, EnvParams stay all-zero, so the
-        // shader falls back per pixel to the 1-2 constant ambient light, and SetEnvCube(null) makes binding 15
-        // fall back to the all-black cube. This must be written before the full block upload below because
-        // EnvParams/IrradianceSH9 occupy the tail of the same 1136B UBO.
-        var env = DeviceServices.BaseApp.SceneEnvironment;
-        env?.Apply(ref sceneLights);
-        WebGPUInterop.SetEnvCube(env?.RadianceName);
-
-        // 2-4 Clause 10: one-point injection of DDGI GiParams0/1/2
-        // (leave untouched when not ready and let the consumer side fall back).
-        Season.Rendering.Effects.DdgiEffect.Apply(ref sceneLights);
-
-        // 2-5 Step B (b11): resolve sun disk / moon disk + starfield into a one-point injection of SkyParams0..3.
-        // The StaticCube tier early-outs as a whole, leaving all four fields at zero, so the pixel shader's
-        // skyParams0.w > 0 gate stays false with no residue.
-        Season.Rendering.SkyLighting.Apply(ref sceneLights);
+        // 1-7 Contract Clause 4: resolving the radiance cube stays backend-side because it is a binding, not math.
+        // SetEnvCube(null) makes binding 15 fall back to the all-black cube, which is the same visual result the
+        // shader gets from all-zero EnvParams.
+        WebGPUInterop.SetEnvCube(DeviceServices.BaseApp.SceneEnvironment?.RadianceName);
 
         // 2-4 Clause 10: push this frame's DDGI irradiance-atlas name using the same pattern as SetEnvCube.
         // Pass null when not ready so binding 16 falls back to a 1×1 White texture; real sampling is gated by

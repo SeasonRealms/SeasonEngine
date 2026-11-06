@@ -108,7 +108,7 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
     public void Load(VKModel template, Season.Controls.Model model, InstanceSkinningMode skinningMode = InstanceSkinningMode.Cpu)
     {
         var nodeMap = new Dictionary<GltfNodeBase, GltfNodeBase>();
-        CloneAnimationData(template.Asset, nodeMap);
+        GltfInstanceData.CloneTemplateForInstance(template.Asset, _asset, nodeMap);
         _asset._animationPlayer.Initialize(_asset._animations);
         SaveRestPoseSnapshot();
 
@@ -266,171 +266,15 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         return clone;
     }
 
-    void CloneAnimationData(GltfAsset templateAsset, Dictionary<GltfNodeBase, GltfNodeBase> nodeMap)
-    {
-        foreach (var sourceNode in templateAsset.gltfNodes)
-        {
-            var clone = new GltfNodeBase
-            {
-                Name = sourceNode.Name,
-                LogicalIndex = sourceNode.LogicalIndex,
-                Mesh = sourceNode.Mesh,
-                Translation = sourceNode.Translation,
-                Rotation = sourceNode.Rotation,
-                Scale = sourceNode.Scale,
-                InitialTranslation = sourceNode.InitialTranslation,
-                InitialRotation = sourceNode.InitialRotation,
-                InitialScale = sourceNode.InitialScale,
-                Weights = sourceNode.Weights.ToArray(),
-                InitialWeights = sourceNode.InitialWeights.ToArray(),
-                WeightsVersion = sourceNode.WeightsVersion,
-                IsJoint = sourceNode.IsJoint,
-                JointIndex = sourceNode.JointIndex,
-                WorldTransform = sourceNode.WorldTransform,
-                // v2 picking: PickMesh is immutable after loading, so share it by reference
-                // (no deep copy; NodeIndex remains consistent on both sides)
-                PickMeshes = sourceNode.PickMeshes,
-            };
-            nodeMap[sourceNode] = clone;
-            _asset.gltfNodes.Add(clone);
-        }
-
-        foreach (var sourceNode in templateAsset.gltfNodes)
-        {
-            var clone = nodeMap[sourceNode];
-            foreach (var child in sourceNode.Children)
-            {
-                if (nodeMap.TryGetValue(child, out var clonedChild))
-                    clone.Children.Add(clonedChild);
-            }
-        }
-
-        var skinMap = new Dictionary<GLTFSkin, GLTFSkin>();
-        foreach (var sourceSkin in templateAsset.GetAllSkins())
-        {
-            var clonedSkin = new GLTFSkin
-            {
-                Name = sourceSkin.Name,
-                InverseBindMatrices = new List<Matrix4x4>(sourceSkin.InverseBindMatrices),
-                Joints = new List<GltfNodeBase>(),
-            };
-            skinMap[sourceSkin] = clonedSkin;
-
-            foreach (var joint in sourceSkin.Joints)
-            {
-                if (nodeMap.TryGetValue(joint, out var clonedJoint))
-                {
-                    clonedSkin.Joints.Add(clonedJoint);
-                    clonedJoint.Skin = clonedSkin;
-                }
-            }
-
-            if (sourceSkin.SkeletonRoot != null && nodeMap.TryGetValue(sourceSkin.SkeletonRoot, out var clonedRoot))
-                clonedSkin.SkeletonRoot = clonedRoot;
-
-            if (sourceSkin.BindNode != null && nodeMap.TryGetValue(sourceSkin.BindNode, out var clonedBindNode))
-                clonedSkin.BindNode = clonedBindNode;
-            else
-                clonedSkin.BindNode = clonedSkin.SkeletonRoot ?? (clonedSkin.Joints.Count > 0 ? clonedSkin.Joints[0] : null);
-        }
-
-        foreach (var sourceNode in templateAsset.gltfNodes)
-        {
-            if (sourceNode.Skin != null
-                && nodeMap.TryGetValue(sourceNode, out var clonedNode)
-                && skinMap.TryGetValue(sourceNode.Skin, out var clonedSkin))
-            {
-                clonedNode.Skin = clonedSkin;
-            }
-        }
-
-        _asset._animations = CloneAnimations(templateAsset._animations, nodeMap);
-    }
-
-    static List<GLTFAnimation> CloneAnimations(List<GLTFAnimation> sourceAnimations, Dictionary<GltfNodeBase, GltfNodeBase> nodeMap)
-    {
-        var result = new List<GLTFAnimation>(sourceAnimations.Count);
-        foreach (var sourceAnimation in sourceAnimations)
-        {
-            var clonedAnimation = new GLTFAnimation
-            {
-                Name = sourceAnimation.Name,
-            };
-
-            foreach (var sourceChannel in sourceAnimation.Channels)
-            {
-                var clonedSampler = new AnimationSampler
-                {
-                    Inputs = new List<float>(sourceChannel.Sampler?.Inputs ?? new List<float>()),
-                    Values = new List<float>(sourceChannel.Sampler?.Values ?? new List<float>()),
-                    InTangents = sourceChannel.Sampler?.InTangents != null ? new List<float>(sourceChannel.Sampler.InTangents) : null,
-                    OutTangents = sourceChannel.Sampler?.OutTangents != null ? new List<float>(sourceChannel.Sampler.OutTangents) : null,
-                    OutputElementCount = sourceChannel.Sampler?.OutputElementCount ?? 4,
-                    Interpolation = sourceChannel.Sampler?.Interpolation ?? AnimationInterpolationMode.Linear,
-                };
-
-                var clonedChannel = new Season.Models.AnimationChannel
-                {
-                    Sampler = clonedSampler,
-                    Target = sourceChannel.Target == null
-                        ? null
-                        : new AnimationChannelTarget
-                        {
-                            Node = sourceChannel.Target.Node != null ? nodeMap[sourceChannel.Target.Node] : null,
-                            Path = sourceChannel.Target.Path,
-                        }
-                };
-
-                clonedAnimation.Samplers.Add(clonedSampler);
-                if (clonedChannel.Target != null)
-                    clonedAnimation.Channels.Add(clonedChannel);
-            }
-
-            result.Add(clonedAnimation);
-        }
-
-        return result;
-    }
-
     void SaveRestPoseSnapshot()
     {
-        _restPoseSnapshot = new (Vector3, Quaternion, Vector3, float[])[_asset.gltfNodes.Count];
-        for (int i = 0; i < _asset.gltfNodes.Count; i++)
-        {
-            var node = _asset.gltfNodes[i];
-            _restPoseSnapshot[i] = (
-                node.InitialTranslation,
-                node.InitialRotation,
-                node.InitialScale,
-                node.InitialWeights.Length > 0 ? (float[])node.InitialWeights.Clone() : Array.Empty<float>()
-            );
-        }
-
+        _restPoseSnapshot = GltfInstanceData.CaptureRestPose(_asset.gltfNodes);
         _workNodes = _asset.gltfNodes;
     }
 
     void RestoreNodesToRestPose()
     {
-        for (int i = 0; i < _workNodes.Count; i++)
-        {
-            var node = _workNodes[i];
-            var snap = _restPoseSnapshot[i];
-            node.Translation = snap.Translation;
-            node.Rotation = snap.Rotation;
-            node.Scale = snap.Scale;
-            node.WeightsVersion = 0;
-
-            if (snap.Weights.Length == 0)
-            {
-                node.Weights = Array.Empty<float>();
-                continue;
-            }
-
-            if (node.Weights.Length != snap.Weights.Length)
-                node.Weights = (float[])snap.Weights.Clone();
-            else
-                Array.Copy(snap.Weights, node.Weights, snap.Weights.Length);
-        }
+        GltfInstanceData.RestoreRestPose(_workNodes, _restPoseSnapshot);
     }
 
     void EnsureAnimationStateCapacity(int count)
@@ -487,18 +331,7 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         }
     }
 
-    static Vector4 ExtractMorphWeights(GltfNodeBase? node)
-    {
-        if (node == null || node.Weights.Length == 0)
-            return Vector4.Zero;
-
-        var weights = node.Weights;
-        return new Vector4(
-            weights.Length > 0 ? weights[0] : 0f,
-            weights.Length > 1 ? weights[1] : 0f,
-            weights.Length > 2 ? weights[2] : 0f,
-            weights.Length > 3 ? weights[3] : 0f);
-    }
+    static Vector4 ExtractMorphWeights(GltfNodeBase? node) => MorphDelta.ExtractWeights(node);
 
     PrimitiveInstanceStream? GetPrimitiveInstanceStream(PrimitiveData primitive)
     {
@@ -728,7 +561,7 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         _instanceBoneCapacity = capacity;
     }
 
-    void UploadInstanceBoneMatrices(int instanceIndex, Matrix4x4[] boneMatrices)
+    protected override void UploadInstanceBoneMatrices(int instanceIndex, Matrix4x4[] boneMatrices)
     {
         if (boneMatrices.Length == 0 || _mappedInstanceBoneBuffers == null)
             return;
@@ -749,6 +582,23 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
             + (long)(_bonePaletteStride - InstanceSkinning.PoseTagRows) * Unsafe.SizeOf<Matrix4x4>();
         *(uint*)(tagRow + InstanceSkinning.PoseTagCurrentOffset) = 0;
         *(uint*)(tagRow + InstanceSkinning.PoseTagPreviousOffset) = 0;
+    }
+
+    /// <summary>
+    /// P1: the pose-cache row holds the pose this instance was last sampled at. A sampled frame replays the skeleton and
+    /// overwrites the row; a throttled frame hands the row back untouched, and that is the pose the instance is drawn with,
+    /// because it is the one the previous upload sent.
+    /// </summary>
+    protected override Matrix4x4[] ResolveInstancePalette(int cacheRow, bool samplePose)
+    {
+        var row = _poseCache.Bones[cacheRow];
+        if (!samplePose)
+            return row;
+
+        _asset._animationPlayer.UpdateBoneMatrices(_skins);
+        var palette = _asset._animationPlayer.GetBoneMatricesArray();
+        Array.Copy(palette, row, Math.Min(palette.Length, row.Length));
+        return row;
     }
 
     // 2-3 Step C (track C-a): create or grow the prev per-instance world SSBO
@@ -1104,17 +954,7 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
             }
 
             if (hasSkin && !_gpuSkin)
-            {
-                if (samplePose)
-                {
-                    _asset._animationPlayer.UpdateBoneMatrices(_skins);
-                    var palette = _asset._animationPlayer.GetBoneMatricesArray();
-                    Array.Copy(palette, _poseCache.Bones[i], Math.Min(palette.Length, _poseCache.Bones[i].Length));
-                }
-
-                // P1: a throttled frame re-uploads the palette it sampled last, which is the pose its instance is drawn with.
-                UploadInstanceBoneMatrices(writeIndex, _poseCache.Bones[i]);
-            }
+                UploadInstancePalette(samplePose, i, writeIndex);
 
             // P1 GPU route: 16 bytes per instance, the clip index plus the time the clock just produced, already wrapped or clamped the
             // way the player would have done it. This is the entire per-frame CPU work the palette costs now.
@@ -1332,124 +1172,115 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
         foreach (var primitive in _primitives)
             Unsafe.Write(primitive.MappedMatrixBuffers[fi], matrices);
 
-        _transformInitialized = true;
-
         // 2-3 Step C: publishes whether the previous-frame streams may be read this frame. Not a one-shot call any more: the
         // history is addressed by the compacted instance slot, so it only lines up while the enabled order is unchanged
         // (see InstancedMesh3DBase.InstanceHistoryValid). The first frame after load has no history and passes false.
         // The DescriptorSet rewrite stays one-shot: it only switches bindings 13/14/15 to the real previous-frame SSBOs.
-        UpdatePrevStateFlags(wasInitialized && model.InstanceHistoryValid);
-        if (wasInitialized)
-        {
-            foreach (var primitive in _primitives)
-                RewriteDescriptorSets(primitive);
-            // Keep shell primitive descriptor sets in sync
-            // (switch bindings 13/14/15 from zero placeholders to the actual prev SSBOs)
-            RewriteShellDescriptorSets();
-        }
+        EndInstanceUpdateFrame(wasInitialized && model.InstanceHistoryValid, wasInitialized);
 
         SyncAlpha(model.Alpha);
     }
 
-    public new void Draw()
+    /// <summary>
+    /// The descriptor sets hold VkBuffer handles by value, so switching bindings 13/14/15 from the zero placeholders to
+    /// the real previous-frame SSBOs has to be republished. It stays one-shot: the first frame has nothing to switch to,
+    /// and the sets are keyed on the frame slot, so a ring that is reallocated later is covered by the per-frame bind.
+    /// </summary>
+    protected override void OnPrevStatePublished(bool hadPreviousFrame)
     {
-        if (!_transformInitialized || _instanceCount == 0)
+        if (!hadPreviousFrame)
             return;
 
+        foreach (var primitive in _primitives)
+            RewriteDescriptorSets(primitive);
+        // Keep shell primitive descriptor sets in sync
+        // (switch bindings 13/14/15 from zero placeholders to the actual prev SSBOs)
+        RewriteShellDescriptorSets();
+    }
+
+    /// <summary>
+    /// Main pass for one model. Overrides <see cref="VKInstancedPrimitiveGroup.Draw"/> rather than hiding it,
+    /// so a base-class reference dispatches here. The bucket walk, the fade decision and the two-pass
+    /// transparent split live in <c>PrimitiveGroupCore.DrawInstancedMainPass</c>; only the per-primitive
+    /// stream plumbing stays here.
+    /// </summary>
+    public override void Draw() => DrawInstancedMainPass();
+
+    protected override void OnBeginMainPass()
+    {
         // During collection, pin this model on the snapshot page: the instance stream and the primitive descriptor sets will still be referenced during replay.
         VKSceneDrawCollection.RetainOwner(this);
+    }
+
+    /// <summary>A glTF primitive keeps its own world array, so the transparent order sorts from the stream's.</summary>
+    protected override Matrix4x4[]? ResolveTransparentWorlds(PrimitiveData primitive)
+        => GetPrimitiveInstanceStream(primitive)?.Worlds;
+
+    protected override void DrawOpaqueInstances(PrimitiveData primitive, int streamIndex, bool fadeInsteadOfOpaque)
+    {
+        var stream = GetPrimitiveInstanceStream(primitive);
+        if (stream == null)
+            return;
 
         var cmd = Device.GraphicsCommandBuffer;
-        bool forceFadeByAlpha = _currentAlpha < 1.0f;
         int fi = (int)Device.FrameIndex;
 
         // A7 main view: each opaque primitive reads the main-view segment of its own reordered stream, with the instance count from
-        // the args entry (MainViewSlot, i). The bone / prev-bone / prev-world / prev-morph tables need no reordering of their own:
-        // the tag gather writes into each record IS the compacted instance slot the cull kernel numbered, which is exactly how those
-        // tables are laid out, so the reordered rows line up row for row and skinned / morphing models need nothing extra here.
+        // the args entry (MainViewSlot, streamIndex). The bone / prev-bone / prev-world / prev-morph tables need no reordering of their
+        // own: the tag gather writes into each record IS the compacted instance slot the cull kernel numbered, which is exactly how
+        // those tables are laid out, so the reordered rows line up row for row and skinned / morphing models need nothing extra here.
         // Fade stays direct for the same reason as the base class (per-instance back-to-front splitting).
-        for (int i = 0; i < _opaquePrimitives.Count; i++)
+        if (!fadeInsteadOfOpaque && TryGetMainViewSegment(streamIndex, out var sortedBuffer, out ulong segmentOffset, out var argsBuffer))
         {
-            var primitive = _opaquePrimitives[i];
-            var stream = GetPrimitiveInstanceStream(primitive);
-            if (stream == null || stream.Buffer.Buffer.Handle == 0)
-                continue;
-
-            if (!forceFadeByAlpha && TryGetMainViewSegment(i, out var sortedBuffer, out ulong segmentOffset, out var argsBuffer))
-            {
-                Pipeline.SetPipeline(cmd, PipelineMode.Opaque, primitive.DoubleSided);
-                Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
-                    primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
-                    sortedBuffer, 0, 0, float.NaN,
-                    argsBuffer, Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i),
-                    segmentOffset);
-                Season.Rendering.InstanceCull.MainViewDraws++;
-                continue;
-            }
-
-            Pipeline.SetPipeline(cmd, forceFadeByAlpha ? PipelineMode.Fade : PipelineMode.Opaque, primitive.DoubleSided);
+            Pipeline.SetPipeline(cmd, PipelineMode.Opaque, primitive.DoubleSided);
             Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
                 primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
-                stream.Buffer.Buffer, (uint)_instanceCount, 0);
+                sortedBuffer, 0, 0, float.NaN,
+                argsBuffer, Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, streamIndex),
+                segmentOffset);
+            Season.Rendering.InstanceCull.MainViewDraws++;
+            return;
         }
 
-        for (int i = 0; i < _transparentPrimitives.Count; i++)
+        Pipeline.SetPipeline(cmd, fadeInsteadOfOpaque ? PipelineMode.Fade : PipelineMode.Opaque, primitive.DoubleSided);
+        Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
+            primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
+            stream.Buffer.Buffer, (uint)_instanceCount, 0);
+    }
+
+    protected override void DrawTransparentInstance(PrimitiveData primitive, int instanceIndex, bool frontFace)
+    {
+        var stream = GetPrimitiveInstanceStream(primitive);
+        if (stream == null)
+            return;
+
+        var cmd = Device.GraphicsCommandBuffer;
+        int fi = (int)Device.FrameIndex;
+
+        // The instance world matrix exists only on the CPU side (stream.Worlds); the GPU-side instance stream cannot be read back,
+        // so the transparent sort depth must be provided here.
+        float depth = ComputeTransparentDepth(stream.Worlds[instanceIndex], primitive.LocalBoundsCenter);
+
+        Pipeline.SetPipeline(cmd, PipelineMode.Transparent, frontFace ? CullModeFlags.FrontBit : CullModeFlags.BackBit);
+        Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
+            primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
+            stream.Buffer.Buffer, 1, (uint)instanceIndex, depth);
+    }
+
+    // Unified highlighting: per-instance bounds boxes plus wireframe shell boxes, drawn after all surfaces.
+    // Shell-box matrices are addressed through the instance-stream slot; take the first per-primitive stream
+    // with a valid buffer (all streams share the same source content, so any stream works; multi-node assets
+    // are approximate here, matching documented DX behavior).
+    protected override void DrawInstanceBoundsBoxes() => DrawBoundsBoxes();
+
+    protected override void DrawInstanceShellBoxes()
+    {
+        foreach (var stream in _primitiveInstanceStreams)
         {
-            var primitive = _transparentPrimitives[i];
-            var stream = GetPrimitiveInstanceStream(primitive);
-            if (stream == null || stream.Buffer.Buffer.Handle == 0)
-                continue;
-
-            _transparentInstanceOrder.Clear();
-            for (int instanceIndex = 0; instanceIndex < _instanceCount; instanceIndex++)
-                _transparentInstanceOrder.Add(instanceIndex);
-
-            _transparentInstanceOrder.Sort((a, b) =>
+            if (stream != null && stream.Buffer.Buffer.Handle != 0)
             {
-                float depthA = ComputeTransparentDepth(stream.Worlds[a], primitive.LocalBoundsCenter);
-                float depthB = ComputeTransparentDepth(stream.Worlds[b], primitive.LocalBoundsCenter);
-                return depthB.CompareTo(depthA);
-            });
-
-            for (int orderIndex = 0; orderIndex < _transparentInstanceOrder.Count; orderIndex++)
-            {
-                uint instanceIndex = (uint)_transparentInstanceOrder[orderIndex];
-                // The instance world matrix exists only on the CPU side (stream.Worlds); the GPU-side instance stream cannot be read back,
-                // so the transparent sort depth must be provided here.
-                float depth = ComputeTransparentDepth(stream.Worlds[instanceIndex], primitive.LocalBoundsCenter);
-                if (primitive.DoubleSided)
-                {
-                    Pipeline.SetPipeline(cmd, PipelineMode.Transparent, CullModeFlags.FrontBit);
-                    Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
-                        primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
-                        stream.Buffer.Buffer, 1, instanceIndex, depth);
-                }
-
-                Pipeline.SetPipeline(cmd, PipelineMode.Transparent, CullModeFlags.BackBit);
-                Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
-                    primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
-                    stream.Buffer.Buffer, 1, instanceIndex, depth);
-            }
-        }
-
-        // Unified highlighting: per-instance Bounds boxes + Wireframe shell boxes
-        // (for instances enabled in this frame; transparent faces use 2-pass rendering
-        // plus opaque edges, finalized after all surfaces)
-        if (_boundsActive)
-            DrawBoundsBoxes();
-        if (_wireframeActive)
-        {
-            // Shell-box matrices are addressed through the instance-stream slot.
-            // Take the first per-primitive stream with a valid buffer
-            // (isomorphic to DX: all streams share the same source content, so any stream works;
-            // multi-node assets are approximate here, matching documented DX behavior)
-            foreach (var stream in _primitiveInstanceStreams)
-            {
-                if (stream != null && stream.Buffer.Buffer.Handle != 0)
-                {
-                    DrawShellBoxes(stream.Buffer);
-                    break;
-                }
+                DrawShellBoxes(stream.Buffer);
+                break;
             }
         }
     }
@@ -1461,41 +1292,38 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
     /// so this override goes through GetPrimitiveInstanceStream and shares the same source as Draw.
     /// Only opaque primitives are drawn; transparent primitives do not cast shadows.
     /// </summary>
-    public override void DrawShadow()
+    public override void DrawShadow() => DrawInstancedShadowPass();
+
+    protected override bool TryBeginInstancePrimitive(PrimitiveData primitive)
     {
-        if (!_transformInitialized || _instanceCount == 0)
+        var stream = GetPrimitiveInstanceStream(primitive);
+        return stream != null && stream.Buffer.Buffer.Handle != 0;
+    }
+
+    protected override void DrawShadowInstance(PrimitiveData primitive, int streamIndex, bool bindMaterial)
+    {
+        var stream = GetPrimitiveInstanceStream(primitive);
+        if (stream == null)
             return;
 
         var cmd = Device.GraphicsCommandBuffer;
         int fi = (int)Device.FrameIndex;
 
-        // 3B: the pre-flush of bindings 16-20/25 is gone. Those six lighting inputs live in the per-view globals
-        // set 3 now, written before this view's pass chain starts, so no set this loop touches can need a rewrite
-        // after the first bind of the frame.
-
-        for (int i = 0; i < _opaquePrimitives.Count; i++)
+        // A7: this slot's segment of primitive i's own reordered stream, instance count from args (slot, i). Decided per
+        // primitive, but every stream is built in the same PrepareCullDraw, so in practice the whole group goes one way.
+        if (TryGetShadowSegment(streamIndex, out var sortedBuffer, out ulong instanceOffset, out var argsBuffer, out int slot))
         {
-            var primitive = _opaquePrimitives[i];
-            var stream = GetPrimitiveInstanceStream(primitive);
-            if (stream == null || stream.Buffer.Buffer.Handle == 0)
-                continue;
-
-            // A7: this slot's segment of primitive i's own reordered stream, instance count from args (slot, i). Decided per
-            // primitive, but every stream is built in the same PrepareCullDraw, so in practice the whole group goes one way.
-            if (TryGetShadowSegment(i, out var sortedBuffer, out ulong instanceOffset, out var argsBuffer, out int slot))
-            {
-                Pipeline.DrawShadowPrimitiveIndirect(cmd, primitive,
-                    primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
-                    primitive.DescriptorSets[fi],
-                    sortedBuffer, instanceOffset,
-                    argsBuffer, Season.Rendering.InstanceCull.ArgsOffset(slot, i));
-                continue;
-            }
-
-            Pipeline.DrawShadowPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
-                primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
-                stream.Buffer.Buffer, (uint)_instanceCount, 0);
+            Pipeline.DrawShadowPrimitiveIndirect(cmd, primitive,
+                primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
+                primitive.DescriptorSets[fi],
+                sortedBuffer, instanceOffset,
+                argsBuffer, Season.Rendering.InstanceCull.ArgsOffset(slot, streamIndex));
+            return;
         }
+
+        Pipeline.DrawShadowPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
+            primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
+            stream.Buffer.Buffer, (uint)_instanceCount, 0);
     }
 
     /// <summary>
@@ -1506,47 +1334,51 @@ internal unsafe class VKInstancedModel : VKInstancedPrimitiveGroup
     /// Host activation uses the full instance batch; otherwise it draws enabled instances one by one
     /// (instanceCount = 1 + first-instance index).
     /// </summary>
-    public override void DrawOutlineMask()
+    public override void DrawOutlineMask() => DrawInstancedOutlineMask();
+
+    protected override void OnBeginOutlineMaskPass()
+        => Pipeline.SetOutlineMaskColor(Device.GraphicsCommandBuffer, _outline2DColor);
+
+    protected override bool TryBeginOutlineMaskPrimitive(PrimitiveData primitive)
     {
-        if (!_transformInitialized || _instanceCount == 0 || !Outline2DActive)
+        var stream = GetPrimitiveInstanceStream(primitive);
+        if (stream == null || stream.Buffer.Buffer.Handle == 0)
+            return false;
+
+        var cmd = Device.GraphicsCommandBuffer;
+        Pipeline.SetPipeline(cmd, PipelineMode.Opaque,
+            primitive.DoubleSided ? CullModeFlags.None : CullModeFlags.BackBit, depthWrite: false);
+        // Binding-9 palette refresh: the mask reads the same instance palette as the main pass.
+        OnBeforeDraw();
+        return true;
+    }
+
+    protected override void DrawOutlineMaskBatch(PrimitiveData primitive)
+    {
+        var stream = GetPrimitiveInstanceStream(primitive);
+        if (stream == null)
             return;
 
         var cmd = Device.GraphicsCommandBuffer;
-        Pipeline.SetOutlineMaskColor(cmd, _outline2DColor);
         int fi = (int)Device.FrameIndex;
+        Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
+            primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
+            stream.Buffer.Buffer, (uint)_instanceCount, 0);
+    }
 
-        for (int i = 0; i < _opaquePrimitives.Count; i++)
-        {
-            var primitive = _opaquePrimitives[i];
-            var stream = GetPrimitiveInstanceStream(primitive);
-            if (stream == null || stream.Buffer.Buffer.Handle == 0)
-                continue;
+    protected override void DrawOutlineMaskInstance(PrimitiveData primitive, int instanceIndex, int slot)
+    {
+        var stream = GetPrimitiveInstanceStream(primitive);
+        if (stream == null)
+            return;
 
-            Pipeline.SetPipeline(cmd, PipelineMode.Opaque,
-                primitive.DoubleSided ? CullModeFlags.None : CullModeFlags.BackBit, depthWrite: false);
-            OnBeforeDraw();
-            if (_outline2DHostActive)
-            {
-                Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
-                    primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
-                    stream.Buffer.Buffer, (uint)_instanceCount, 0);
-            }
-            else
-            {
-                for (int k = 0; k < _outline2DInstances.Count; k++)
-                {
-                    int idx = _outline2DInstances[k];
-                    if ((uint)idx >= (uint)_instanceCount)
-                        continue;
-                    // Write this instance's own OutlineColor slot by slot
-                    // (per-slot mask fetches color per slot)
-                    Pipeline.SetOutlineMaskColor(cmd, _outline2DInstanceColors[k]);
-                    Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
-                        primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
-                        stream.Buffer.Buffer, 1, (uint)idx);
-                }
-            }
-        }
+        var cmd = Device.GraphicsCommandBuffer;
+        int fi = (int)Device.FrameIndex;
+        // The per-slot mask fetches this instance's own OutlineColor.
+        Pipeline.SetOutlineMaskColor(cmd, _outline2DInstanceColors[slot]);
+        Pipeline.DrawPrimitive(cmd, primitive, primitive.VertexBuffer.Buffer, primitive.IndexBuffer.Buffer,
+            primitive.DescriptorSets[fi], (uint)primitive.Indices.Length,
+            stream.Buffer.Buffer, 1, (uint)instanceIndex);
     }
 
     /// <summary>

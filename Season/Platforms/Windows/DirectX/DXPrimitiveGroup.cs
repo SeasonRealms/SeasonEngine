@@ -19,7 +19,7 @@ namespace Season.Platforms.Windows.DirectX;
 ///   - per-instance: Matrix/Material CB creation, SyncAlpha, three-bucket Draw,
 ///     and DrawPrimitive
 /// </summary>
-internal unsafe abstract class DXPrimitiveGroup : IDisposable
+internal unsafe abstract class DXPrimitiveGroup : PrimitiveGroupCore<PrimitiveData, MaterialParams, DXTexture>, IDisposable
 {
     // === Globally shared: lighting CB (N-buffered) ===
     // The Pbr3D path and the DXSpriteQuad/Sprite family all read the same CB
@@ -27,129 +27,9 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     internal static ID3D12Resource*[] lightConstantBuffers;
     static byte*[] mappedLightConstantBuffers;
 
-    // === Common per-instance state ===
-    internal string Name;
-
-    /// <summary>Overall alpha last written into the material buffer, used to
-    /// drive the PSO three-bucket grouping.</summary>
-    protected float _currentAlpha = 1.0f;
-
-    /// <summary>Color multiplier last written into the material buffer, used
-    /// for Mesh3D.ColorTint sync and rewritten only on change.</summary>
-    protected Vector4 _currentColorTint = Vector4.One;
-
-    /// <summary>Unified highlighting: whether wireframe highlighting
-    /// (surface-fitted shell faces + edge strips) is enabled. Maintained by
-    /// derived Update methods. Geometry is built lazily on the first enabled
-    /// frame and stays resident afterward. It can be toggled at runtime, and
-    /// has zero memory and zero draw cost when fully disabled.</summary>
-    protected bool _wireframeEnabled;
-
-    /// <summary>Whether the first Update has completed. When false, Draw is
-    /// skipped to avoid rendering with the identity matrix.</summary>
-    protected bool _transformInitialized;
-
-    /// <summary>Reusable draw list to avoid per-frame List allocations and GC.</summary>
-    private readonly List<PrimitiveData> _drawList = new List<PrimitiveData>(64);
-    private readonly List<PrimitiveData> _singleSidedTransparentList = new List<PrimitiveData>(32);
-    private readonly List<PrimitiveData> _doubleSidedTransparentList = new List<PrimitiveData>(32);
-
-    /// <summary>1-5: projected primitive list for the shadow pass. It is
-    /// separate from the main-pass _drawList, so the two pipelines never
-    /// overwrite each other. The same list is replayed per atlas slot across
-    /// the four atlas quadrants and invalidated by
-    /// <see cref="CascadedShadow.Epoch"/>. See DrawShadow.</summary>
-    private readonly List<PrimitiveData> _shadowDrawList = new List<PrimitiveData>(64);
-
-    /// <summary>Epoch already collected into _shadowDrawList
-    /// (int.MinValue means never collected).</summary>
-    private int _shadowDrawListEpoch = int.MinValue;
-
-    // === Unified highlighting (dual-color primitive group: faces + edges,
-    // lazily built; no new PSO, faces use Transparent and edges use Opaque) ===
-    // Highlight primitives live outside CollectPrimitives, so SyncAlpha and
-    // SyncColorTint never touch their material CBs. Highlight alpha
-    // (SurfaceColor.W pulsing) is fully decoupled from the model's overall
-    // alpha, and DrawShadow naturally excludes them as well.
-    // Two styles exist: Bounds = world-space AABB box (faces + edges);
-    // Wireframe = surface-fitted shell faces + edge strips in model-local space,
-    // with the world matrix coming from the model / instance matrix. Vertices
-    // carry bone indices and weights so the same VS skinning path keeps them
-    // tightly aligned to animation.
-    // Both styles share the same color pair: faces use SurfaceColor
-    // (w=0 makes Wireframe edge-only and skips face drawing), edges use EdgeColor.
-    /// <summary>Whether the host Bounds box is enabled for this frame in the
-    /// non-instanced path. Written during Update and used as a zero-cost gate
-    /// during Draw.</summary>
-    protected bool _boundsActive;
-
-    /// <summary>Host Bounds box for the non-instanced path. Built lazily on the
-    /// first enabled frame and kept resident afterward.</summary>
-    protected HighlightBox _boundsBox = null!;
-
-    /// <summary>Per-instance Bounds-box pool indexed by compacted writeIndex.
-    /// Grows lazily and stays resident until the group is released.</summary>
-    protected readonly List<HighlightBox> _instanceBoundsBoxes = new();
-
-    /// <summary>Compacted instance indices whose Bounds boxes are enabled this
-    /// frame. Rebuilt every Update and drawn box by box during Draw.</summary>
-    protected readonly List<int> _boundsBoxDrawList = new();
-
-    /// <summary>Host Wireframe highlight boxes for the non-instanced path
-    /// (surface-fitted shell faces + edge strips, one group per primitive,
-    /// built lazily in CollectPrimitives order, with null placeholders for
-    /// primitives that have no valid triangles). Built lazily on the first
-    /// enabled frame and kept resident afterward.</summary>
-    protected List<HighlightBox>? _wireframeBoxes;
-
-    /// <summary>Shared shell geometry for instanced templates, combining all
-    /// non-skinned primitives. Per-instance boxes share its VB/IB and set
-    /// OwnsGeometry=false. Built once lazily on the first enabled frame and
-    /// kept resident afterward.</summary>
-    protected HighlightBox? _shellGeometry;
-
-    /// <summary>Shared skinned shell geometry for instanced templates,
-    /// combining all skinned primitives that share the same Skin.
-    /// With IsSkinned=1 it uses the per-instance bone-palette path and matches
-    /// animation through the same VS skinning path as the main pass.
-    /// Built once lazily on the first enabled frame and kept resident
-    /// afterward. Multi-skin assets, where each node has its own Skin, are
-    /// intentionally skipped in phase 1, so this stays null and is retried on
-    /// later frames.</summary>
-    protected HighlightBox? _skinnedShellGeometry;
-
-    /// <summary>Per-instance Wireframe highlight-box pool using shared
-    /// template shell geometry. Matrices are read through the instance-stream
-    /// writeIndex slot and drawn per instance.</summary>
-    protected readonly List<HighlightBox> _instanceShellBoxes = new();
-
-    /// <summary>Per-instance Wireframe highlight-box pool using shared skinned
-    /// template shell geometry. It shares the same index space as
-    /// _instanceShellBoxes; for mixed assets the same writeIndex can own one box
-    /// in each pool and draw both.</summary>
-    protected readonly List<HighlightBox> _skinnedInstanceShellBoxes = new();
-
-    /// <summary>Compacted instance indices whose Wireframe highlighting is
-    /// enabled this frame. Rebuilt every Update and drawn box by box during
-    /// Draw.</summary>
-    protected readonly List<int> _shellBoxDrawList = new();
-
-    /// <summary>Edge-strip width of the currently cached shell geometry
-    /// (per-primitive boxes or shared instanced templates). Recorded at build
-    /// time, and rebuilt when it no longer matches the host HighlightEdgeWidth
-    /// so runtime width changes take effect immediately.</summary>
-    protected float _builtShellEdgeWidth;
-
-    /// <summary>Whether the screen-space outline mask is enabled. Written
-    /// during Update and collected by Graphics in a separate pass.</summary>
-    protected bool _outline2DActive;
-
-    /// <summary>Outline2D color for the current object. In the first version,
-    /// a single shared color is used per frame and resolved by upper layers.</summary>
-    protected Vector4 _outline2DColor;
-
-    /// <summary>Outline2D width for the current object, in pixels.</summary>
-    protected float _outline2DWidth;
+    // === Per-instance state ===
+    // Group-level state (alpha, tint, transform, outline, the reusable draw list, the shadow-pass cache) and the
+    // highlight boxes all live in PrimitiveGroupCore. What stays here is D3D12 resource creation and submission.
 
     // ============================================================
     // Static: lighting-CB lifetime and global camera / lighting updates
@@ -206,36 +86,14 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     public static void SetLighting(SceneLightParams lightParams)
     {
         int fi = (int)Device.FrameIndex;
-        lightParams.Params0.Y = Device.HdrExposure;
 
-        // 2-3 contract rule 6: xy = this frame's jitter in NDC, zw = inverse
-        // screen size. The PS uses these to reconstruct NDC from SV_Position.
-        // When MotionVectors are off, JitterNdc stays zero, and writing it is
-        // harmless because shaders with VELOCITY_OUTPUT=0 do not read the field.
-        var res = DeviceServices.BaseApp.DeviceResolution;
-        var jitter = RenderView.Current.JitterNdc;
-        lightParams.VelocityParams = new Vector4(
-            jitter.X, jitter.Y,
-            res.X > 0 ? 1f / res.X : 0f,
-            res.Y > 0 ? 1f / res.Y : 0f);
+        // Exposure, velocity parameters, environment, DDGI and sky are resolved by the shared frame setup, so
+        // VK and Metal cannot drift from this backend.
+        SceneFrameSetup.PrepareLighting(ref lightParams, Device.HdrExposure);
 
-        // 1-7 contract rule 4: inject environment parameters and resolve this
-        // frame's radiance cube once per frame so DrawPrimitive does not need
-        // a per-draw lookup. When SceneEnvironment is null, EnvParams stays all
-        // zero and the shader falls back per pixel to the 1-2 constant ambient.
+        // 1-7 rule 4: resolve this frame's radiance cube once so DrawPrimitive does not look it up per draw.
         var env = DeviceServices.BaseApp.SceneEnvironment;
-        env?.Apply(ref lightParams);
         DXTextureCube.Active = env != null ? DXTextureCube.Find(env.RadianceName) : null;
-
-        // 2-4 rule 10: inject DDGI GiParams0/1/2 once here. When not ready,
-        // nothing is written and consumers fall back automatically.
-        Season.Rendering.Effects.DdgiEffect.Apply(ref lightParams);
-
-        // 2-5 Step B (b11): resolve sun / moon discs and starlight into
-        // SkyParams0..3 once here. On the StaticCube tier, the path exits early,
-        // all four fields stay zero, and the PS gate skyParams0.w > 0 remains
-        // false with no stale data.
-        Season.Rendering.SkyLighting.Apply(ref lightParams);
 
         // Resolve the irradiance atlas written this frame once per frame.
         // Compute 2D textures are registered in the Graphics instance's
@@ -340,27 +198,9 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         FrameSchedule.CurrentView = view;
         Pipeline.WriteMainView(view.Constants);
 
-        // 1-5: CPU shadow-matrix computation chain. It runs after the camera is
-        // updated and before the lighting CB is written. When shadows are off or
-        // no light is active, Apply writes zeros.
-        // Shadow sources are selected by the indices stored in Params0.Z/W
-        // (written by the authoring layer), and the light-type decision is
-        // centralized here.
-        if (RenderQuality.Current.ShadowsEnabled)
-        {
-            CascadedShadow.BeginFrame();
-            int dirIdx = (int)lightParams.Params0.Z;
-            if (dirIdx >= 0 && dirIdx < lightParams.LightCount)
-            {
-                var dirType = lightParams.Lights[dirIdx].DirType;
-                CascadedShadow.ComputeSun(view.Camera, new Vector3(dirType.X, dirType.Y, dirType.Z));
-            }
-            int spotIdx = (int)lightParams.Params0.W;
-            if (spotIdx >= 0 && spotIdx < lightParams.LightCount
-                && lightParams.Lights[spotIdx].DirType.W == GpuLight.TypeSpot)
-                CascadedShadow.ComputeSpot(in lightParams.Lights[spotIdx]);
-            CascadedShadow.Apply(ref lightParams);
-        }
+        // 1-5: the CPU shadow-matrix chain runs after the camera update and before the lighting CB is written.
+        // The rule itself is shared with VK and Metal; this call site only decides when to run it.
+        SceneFrameSetup.ApplyShadowChain(ref lightParams, view.Camera);
 
         // Must go through SetLighting because it injects HdrExposure.
         // Writing the CB directly would leave hdrExposure at 0 in the shader, so
@@ -396,297 +236,9 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     }
 
     // ============================================================
-    // Instance: alpha synchronization
-    // ============================================================
-
-    /// <summary>
-    /// Synchronizes overall alpha into the material buffer of every primitive:
-    ///   BaseColor.W = OriginalBaseColorAlpha x alpha
-    ///   AlphaCutoff = OriginalAlphaCutoff   x alpha
-    ///       (MASK scales proportionally to avoid clipping away the whole object
-    ///       at low alpha)
-    /// Called only when alpha changes. Writes every N-buffered frame to avoid
-    /// flicker from reading stale values.
-    /// </summary>
-    protected void SyncAlpha(float alpha)
-    {
-        if (_currentAlpha == alpha)
-            return;
-        _currentAlpha = alpha;
-
-        int n = (int)Device.frameCount;
-        _drawList.Clear();
-        CollectPrimitives(_drawList);
-
-        for (int i = 0; i < n; i++)
-        {
-            foreach (var primitive in _drawList)
-            {
-                var materialParams = Unsafe.Read<MaterialParams>(primitive.MappedMaterialBuffers[i]);
-                var baseColor = materialParams.BaseColor;
-                baseColor.W = primitive.OriginalBaseColorAlpha * alpha;
-                materialParams.BaseColor = baseColor;
-                materialParams.AlphaCutoff = primitive.OriginalAlphaCutoff * alpha;
-                Unsafe.Write(primitive.MappedMaterialBuffers[i], materialParams);
-            }
-        }
-    }
-
-    // ============================================================
-    // Instance: color-multiplier synchronization (Mesh3D.ColorTint)
-    // ============================================================
-
-    /// <summary>
-    /// Synchronizes the mesh-level color multiplier into the material buffer of
-    /// every primitive:
-    ///   BaseColor.rgb = OriginalBaseColor.rgb x tint.rgb
-    ///   (W is untouched; the alpha chain is owned exclusively by SyncAlpha)
-    /// Called only when tint changes. Writes every N-buffered frame to avoid
-    /// flicker from reading stale values.
-    /// </summary>
-    protected void SyncColorTint(Vector4 tint)
-    {
-        if (_currentColorTint == tint)
-            return;
-        _currentColorTint = tint;
-
-        int n = (int)Device.frameCount;
-        _drawList.Clear();
-        CollectPrimitives(_drawList);
-
-        for (int i = 0; i < n; i++)
-        {
-            foreach (var primitive in _drawList)
-            {
-                var materialParams = Unsafe.Read<MaterialParams>(primitive.MappedMaterialBuffers[i]);
-                var baseColor = materialParams.BaseColor;
-                baseColor.X = primitive.OriginalBaseColor.X * tint.X;
-                baseColor.Y = primitive.OriginalBaseColor.Y * tint.Y;
-                baseColor.Z = primitive.OriginalBaseColor.Z * tint.Z;
-                materialParams.BaseColor = baseColor;
-                Unsafe.Write(primitive.MappedMaterialBuffers[i], materialParams);
-            }
-        }
-    }
-
-    // ============================================================
-    // Unified highlighting: lazy shell-geometry construction for
-    // non-instanced Wireframe (shared by Mesh3D / Model)
-    // ============================================================
-
-    /// <summary>
-    /// Unified highlighting: lazily builds non-instanced Wireframe highlight
-    /// boxes at runtime. On the first frame that enables wireframe, all
-    /// primitives are processed one by one in CollectPrimitives order, with null
-    /// placeholders for primitives that have no valid triangles. When fully
-    /// disabled, this costs no memory. Once built, the geometry stays resident
-    /// and is not rebuilt or released when toggled at runtime.
-    /// Each primitive gets its own box, and skinning parameters
-    /// (IsSkinned / BonePaletteStride) are inherited from the source primitive,
-    /// so skinned models stay aligned through the same t6/t8 palette path.
-    /// Morph-target primitives also build shells: shell delta buffers are
-    /// expanded to the shell-vertex layout, with shell-vertex to source-vertex
-    /// mappings recorded during construction
-    /// (see <see cref="CreateShellBox"/>). Weights are synchronized from the
-    /// source every frame (see DXModel.ApplyMorphTargetsIfNeeded), so the same
-    /// VS morph path stays tightly aligned to animation.
-    /// edgeWidth comes from the host Highlight.EdgeWidth
-    /// (a model-size proportion), and localSizeMax is the host model's maximum
-    /// local dimension used as the scale baseline. The baked per-primitive local
-    /// thickness is h = edgeWidth x localSizeMax / node scale
-    /// (see <see cref="HighlightGeometry.NodeScaleOf"/>), giving a world-space
-    /// edge width of approximately edgeWidth x model world max dimension, which
-    /// stays consistent across assets. Rebuild when it no longer matches the host.
-    /// </summary>
-    protected void EnsureWireframeHighlights(float edgeWidth, float localSizeMax)
-    {
-        if (_wireframeBoxes != null)
-        {
-            if (_builtShellEdgeWidth == edgeWidth)
-                return;
-            // Edge width changed: release old shell geometry and rebuild with
-            // the new width so it takes effect immediately this frame.
-            foreach (var box in _wireframeBoxes)
-                DisposeHighlightBox(box);
-            _wireframeBoxes = null;
-        }
-        _drawList.Clear();
-        CollectPrimitives(_drawList);
-        if (_drawList.Count == 0)
-            return;
-        _wireframeBoxes = new List<HighlightBox>(_drawList.Count);
-        for (int i = 0; i < _drawList.Count; i++)
-        {
-            var source = _drawList[i];
-            _wireframeBoxes.Add(source.Indices.Length >= 3 && source.Vertices.Count > 0
-                ? CreateShellBox(source, HighlightGeometry.ComputeShellThickness(edgeWidth, localSizeMax, source.OwnerNode))
-                : null);
-            // Record the node reference on the box so WorldTransform can be
-            // fetched each frame from the same source as rendering. Cloned
-            // primitives are collected by CollectPrimitives and share the
-            // group's lifetime.
-            if (_wireframeBoxes[i] != null)
-                _wireframeBoxes[i].OwnerNode = source.OwnerNode;
-        }
-        _builtShellEdgeWidth = edgeWidth;
-    }
-
-    /// <summary>
-    /// Unified highlighting: lazily builds shared shell geometry for instanced
-    /// templates on the first frame that enables wireframe. It groups by source
-    /// and builds a rigid shell from merged non-skinned primitives, with
-    /// per-instance boxes sharing VB/IB, plus a skinned shell from merged
-    /// primitives that share the same Skin. The skinned shell inherits
-    /// IsSkinned=1 and BonePaletteStride from the source material and uses the
-    /// per-instance bone-palette path to stay tightly aligned to animation.
-    /// Mixed assets draw both shells, while assets that are purely skinned with a
-    /// single Skin only emit the skinned shell.
-    /// Morph-target primitives are skipped because morph weights are indexed per
-    /// instance and require shell-shape delta buffers that merged geometry cannot
-    /// express. This is documented behavior: for instanced models with morph,
-    /// Wireframe highlighting covers only the remaining parts, while Bounds
-    /// highlighting is unaffected.
-    /// Multi-skin assets, where each node has an independent Skin, skip the
-    /// skinned shell because the merged template cannot express per-skin palette
-    /// offsets. Phase 2 handles this with a one-time CPU fixup of per-vertex
-    /// palette offsets at build time. When no usable primitives exist, keep null
-    /// and retry on later frames.
-    /// edgeWidth comes from the host Highlight.EdgeWidth and localSizeMax is the
-    /// template's maximum local dimension. The per-primitive local thickness is
-    /// h = edgeWidth x localSizeMax / node scale
-    /// (see <see cref="HighlightGeometry.NodeScaleOf"/>), so world edge width is
-    /// approximately edgeWidth x instance world max dimension and stays
-    /// consistent across assets. Rebuild when it no longer matches the host.
-    /// </summary>
-    protected void EnsureShellGeometry(float edgeWidth, float localSizeMax)
-    {
-        if (_shellGeometry != null || _skinnedShellGeometry != null)
-        {
-            if (_builtShellEdgeWidth == edgeWidth)
-                return;
-            // Edge width changed: release all shared templates and instance
-            // shell-box pools, which share template geometry, and rebuild with
-            // the new width so it takes effect immediately this frame.
-            DisposeShellTemplatesAndPools();
-        }
-        _drawList.Clear();
-        CollectPrimitives(_drawList);
-        if (_drawList.Count == 0)
-            return;
-    
-        var rigidFaceVerts = new List<Vertex>();
-        var rigidFaceIndices = new List<uint>();
-        var rigidEdgeVerts = new List<Vertex>();
-        var rigidEdgeIndices = new List<uint>();
-        var skinFaceVerts = new List<Vertex>();
-        var skinFaceIndices = new List<uint>();
-        var skinEdgeVerts = new List<Vertex>();
-        var skinEdgeIndices = new List<uint>();
-        MaterialParams rigidParams = default;
-        MaterialParams skinParams = default;
-        bool anyRigid = false;
-        bool anySkinned = false;
-        bool multiSkin = false;
-        GLTFSkin? sharedSkin = null;
-    
-        for (int i = 0; i < _drawList.Count; i++)
-        {
-            var source = _drawList[i];
-            if (source.Indices.Length < 3 || source.Vertices.Count == 0)
-                continue;
-            if (source.MaterialParams.HasMorphTargets != 0)
-                continue; // Skip morph-target primitives because merged instanced
-                          // templates cannot express per-primitive morph sets.
-            float h = HighlightGeometry.ComputeShellThickness(edgeWidth, localSizeMax, source.OwnerNode);
-            if (source.MaterialParams.IsSkinned != 0)
-            {
-                if (multiSkin)
-                    continue; // Multi-skin already detected: skip the skinned shell entirely.
-                // For primitives sharing the same Skin, OwnerNode.Skin is mapped
-                // through the same skinMap to the same cloned reference, so
-                // ReferenceEquals is reliable here.
-                var skin = source.OwnerNode?.Skin;
-                if (skin == null)
-                    continue; // Defensive skip: marked skinned but has no Skin data.
-                if (sharedSkin == null)
-                {
-                    sharedSkin = skin;
-                }
-                else if (!ReferenceEquals(sharedSkin, skin))
-                {
-                    // Multi-skin asset: discard accumulated skinned data and
-                    // skip the skinned shell entirely (see the doc and plan risk 1).
-                    multiSkin = true;
-                    anySkinned = false;
-                    skinFaceVerts.Clear();
-                    skinFaceIndices.Clear();
-                    skinEdgeVerts.Clear();
-                    skinEdgeIndices.Clear();
-                    continue;
-                }
-                if (!anySkinned)
-                    skinParams = source.MaterialParams;
-                HighlightGeometry.AppendShellFace(skinFaceVerts, skinFaceIndices, source.Vertices, source.Indices, h);
-                HighlightGeometry.AppendShellEdges(skinEdgeVerts, skinEdgeIndices, source.Vertices, source.Indices, h);
-                anySkinned = true;
-            }
-            else
-            {
-                if (!anyRigid)
-                    rigidParams = source.MaterialParams;
-                HighlightGeometry.AppendShellFace(rigidFaceVerts, rigidFaceIndices, source.Vertices, source.Indices, h);
-                HighlightGeometry.AppendShellEdges(rigidEdgeVerts, rigidEdgeIndices, source.Vertices, source.Indices, h);
-                anyRigid = true;
-            }
-        }
-        if (!anyRigid && !anySkinned)
-            return; // No usable primitives: keep null and retry on later frames.
-    
-        if (anyRigid)
-        {
-            var shell = new HighlightBox();
-            shell.Face = InitShellPrimitive(rigidFaceVerts, rigidFaceIndices.ToArray(), rigidParams, isTransparent: true);
-            shell.Edges = InitShellPrimitive(rigidEdgeVerts, rigidEdgeIndices.ToArray(), rigidParams, isTransparent: false);
-            _shellGeometry = shell;
-        }
-        if (anySkinned)
-        {
-            var shell = new HighlightBox();
-            shell.Face = InitShellPrimitive(skinFaceVerts, skinFaceIndices.ToArray(), skinParams, isTransparent: true);
-            shell.Edges = InitShellPrimitive(skinEdgeVerts, skinEdgeIndices.ToArray(), skinParams, isTransparent: false);
-            _skinnedShellGeometry = shell;
-        }
-        _builtShellEdgeWidth = edgeWidth;
-    }
-
-    // ============================================================
     // Instance: material-texture replacement
     // (derived classes provide primitive lists through CollectPrimitives)
     // ============================================================
-
-    /// <summary>Gets the DXTexture reference from the specified PrimitiveData slot.</summary>
-    static DXTexture GetTextureBySlot(PrimitiveData p, TextureSlot slot) => slot switch
-    {
-        TextureSlot.BaseColor => p.BaseColorTexture,
-        TextureSlot.Normal => p.NormalTexture,
-        TextureSlot.MetallicRoughness => p.MetallicRoughnessTexture,
-        TextureSlot.Occlusion => p.OcclusionTexture,
-        TextureSlot.Emissive => p.EmissiveTexture,
-        _ => p.BaseColorTexture
-    };
-
-    /// <summary>Sets the DXTexture reference on the specified PrimitiveData slot.</summary>
-    static void SetTextureBySlot(PrimitiveData p, TextureSlot slot, DXTexture tex)
-    {
-        switch (slot)
-        {
-            case TextureSlot.BaseColor: p.BaseColorTexture = tex; break;
-            case TextureSlot.Normal: p.NormalTexture = tex; break;
-            case TextureSlot.MetallicRoughness: p.MetallicRoughnessTexture = tex; break;
-            case TextureSlot.Occlusion: p.OcclusionTexture = tex; break;
-            case TextureSlot.Emissive: p.EmissiveTexture = tex; break;
-        }
-    }
 
     /// <summary>
     /// 2-6 clause 1: mip policy implied by a material slot. Runtime replacement must resolve this the same way the
@@ -709,7 +261,7 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         CollectPrimitives(_drawList);
         if (_drawList.Count == 0) return;
 
-        var oldTex = GetTextureBySlot(_drawList[0], slot);
+        var oldTex = _drawList[0].Texture(slot);
         if (oldTex == null) return;
 
         bool sameSize = (uint)decoder.Width == oldTex.Width
@@ -726,31 +278,7 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         {
             var newTex = DXTexture.CreateFromDecoder(decoder, MipPolicyForSlot(slot));
             foreach (var primitive in _drawList)
-                SetTextureBySlot(primitive, slot, newTex);
-        }
-    }
-
-    /// <summary>
-    /// Writes material-parameter overrides into the N-buffered Material CB of
-    /// every primitive.
-    /// </summary>
-    internal void SyncMaterialParams(float? metallic, float? roughness, Vector4? emissive)
-    {
-        _drawList.Clear();
-        CollectPrimitives(_drawList);
-        if (_drawList.Count == 0) return;
-
-        int n = (int)Device.frameCount;
-        for (int i = 0; i < n; i++)
-        {
-            foreach (var primitive in _drawList)
-            {
-                var mp = Unsafe.Read<MaterialParams>(primitive.MappedMaterialBuffers[i]);
-                if (metallic.HasValue) mp.MetallicFactor = metallic.Value;
-                if (roughness.HasValue) mp.RoughnessFactor = roughness.Value;
-                if (emissive.HasValue) mp.EmissiveFactor = emissive.Value;
-                Unsafe.Write(primitive.MappedMaterialBuffers[i], mp);
-            }
+                primitive.Texture(slot) = newTex;
         }
     }
 
@@ -760,7 +288,7 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
 
     /// <summary>Derived classes append all PrimitiveData that should be drawn
     /// this frame into `result`.</summary>
-    protected abstract void CollectPrimitives(List<PrimitiveData> result);
+    protected abstract override void CollectPrimitives(List<PrimitiveData> result);
 
     /// <summary>
     /// Derived classes may override this to return the bone StructuredBuffer
@@ -780,118 +308,10 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     public abstract void Dispose();
 
     // ============================================================
-    // Unified highlighting: highlight boxes
-    // (dual-color primitive groups of faces + edges, lazily built, with no new
-    // PSO. Faces use Transparent, edges use Opaque.)
+    // Unified highlighting: D3D12 resources and draw hooks
+    // (the box lifetime, the shell geometry and the draw order live in
+    // PrimitiveGroupCore.Highlight; only GPU objects are built here)
     // ============================================================
-
-    /// <summary>
-    /// Unified highlighting: one highlight box consists of two PrimitiveData
-    /// instances, one for faces and one for edges.
-    /// Two geometry flavors exist:
-    /// Bounds = unit cube [-0.5,0.5]^3
-    ///   (world matrix = Scale(Extents*2) x Translate(Center));
-    /// Wireframe = surface-fitted shell faces + edge strips in model-local
-    ///   space, with the world matrix provided by the model / instance matrix.
-    ///   Vertices carry bone indices and weights, so they stay aligned to
-    ///   animation through the same VS skinning path as the source primitive.
-    /// Faces are blended semi-transparent geometry using the Transparent PSO.
-    /// Edges are solid thin strips using the Opaque PSO with depth writes.
-    /// PrevWorld comes from a CPU shadow copy because N-buffered CBs must never
-    /// be read back. It is used for the TAA / motion-vector velocity field.
-    /// </summary>
-    protected sealed class HighlightBox
-    {
-        public PrimitiveData Face;
-        public PrimitiveData Edges;
-
-        /// <summary>Face alpha for this frame, taken from SurfaceColor.W.
-        /// Faces are drawn only when it is &gt; 0. When it is 0, the box becomes
-        /// edge-only. Recorded every frame by the write hook.</summary>
-        public float FaceAlpha;
-
-        /// <summary>Box world matrix from the previous frame, stored as a CPU
-        /// shadow copy. On the first frame it is Identity, which acts as the
-        /// zero-velocity sentinel.</summary>
-        public Matrix4x4 PrevWorld = Matrix4x4.Identity;
-
-        /// <summary>Owner node of the shell source primitive. Recorded for
-        /// non-instanced per-primitive shell boxes. Each frame it supplies
-        /// WorldTransform x group world matrix from the same source as rendering,
-        /// keeping node hierarchy scaling, translation, and animation aligned.
-        /// Null means identity, which is used for Mesh3D procedural primitives
-        /// and instanced shared-template boxes.</summary>
-        public GltfNodeBase? OwnerNode;
-
-        /// <summary>Shell source primitive for non-instanced per-primitive
-        /// shell boxes. Used for morph-weight synchronization: when source
-        /// weights are written, the same set is propagated into the Material CBs
-        /// of both shell primitives. Shell delta buffers are expanded to the
-        /// shell-vertex layout, while weights are shared with the source.</summary>
-        public PrimitiveData? SourcePrimitive;
-    }
-
-    /// <summary>Unified highlighting: lazily builds the host Bounds box
-    /// (faces + edges). Called once on the first enabled frame and kept
-    /// resident afterward.</summary>
-    protected HighlightBox CreateBoundsBox()
-    {
-        var box = new HighlightBox();
-        box.Face = CreateBoxFacePrimitive();
-        box.Edges = CreateBoxEdgesPrimitive();
-        return box;
-    }
-
-    /// <summary>Unified highlighting: gets or creates the instance Bounds box
-    /// for the given compacted writeIndex. The pool grows lazily and stays
-    /// resident until the group is released.</summary>
-    protected HighlightBox AcquireBoundsBox(int index)
-    {
-        while (_instanceBoundsBoxes.Count <= index)
-            _instanceBoundsBoxes.Add(CreateBoundsBox());
-        return _instanceBoundsBoxes[index];
-    }
-
-
-    /// <summary>Unified highlighting: builds a Wireframe shell highlight box
-    /// for a single source primitive, consisting of shell faces and edge strips.
-    /// Source vertices are copied field by field, including bone indices and
-    /// weights, so skinned models stay aligned through the same VS skinning
-    /// path. Material parameters are copied from the source primitive and then
-    /// forced to Unlit plus transparent or opaque mode as needed, while
-    /// IsSkinned and BonePaletteStride are inherited.
-    /// For morph-target source primitives, shell delta buffers are expanded to
-    /// the shell-vertex layout, with the source-vertex index recorded per shell
-    /// vertex at build time. Weights are shared with the source and synced every
-    /// frame by DXModel, so the same VS morph path stays tightly aligned to morph
-    /// animation.
-    /// edgeWidth is the baked local thickness h =
-    /// Highlight.EdgeWidth x model max local dimension / node scale
-    /// (see <see cref="HighlightGeometry.NodeScaleOf"/>). Edge strips have a full
-    /// width of 2*h, and shell faces use the same outward expansion thickness.</summary>
-    protected HighlightBox CreateShellBox(PrimitiveData source, float edgeWidth)
-    {
-        var faceVerts = new List<Vertex>(source.Vertices.Count);
-        var faceIndices = new List<uint>(source.Indices.Length);
-        var faceSrcIdx = new List<int>(source.Vertices.Count);
-        HighlightGeometry.AppendShellFace(faceVerts, faceIndices, source.Vertices, source.Indices, edgeWidth, faceSrcIdx);
-
-        var edgeVerts = new List<Vertex>(source.Indices.Length * 2);
-        var edgeIndices = new List<uint>(source.Indices.Length * 2);
-        var edgeSrcIdx = new List<int>(source.Indices.Length * 2);
-        HighlightGeometry.AppendShellEdges(edgeVerts, edgeIndices, source.Vertices, source.Indices, edgeWidth, edgeSrcIdx);
-
-        var box = new HighlightBox();
-        box.Face = InitShellPrimitive(faceVerts, faceIndices.ToArray(), source.MaterialParams, isTransparent: true);
-        box.Edges = InitShellPrimitive(edgeVerts, edgeIndices.ToArray(), source.MaterialParams, isTransparent: false);
-        box.SourcePrimitive = source;
-        if (source.MaterialParams.HasMorphTargets != 0 && source.MorphTargets != null && source.MorphTargets.Count > 0)
-        {
-            AttachShellMorph(box.Face, source, faceSrcIdx);
-            AttachShellMorph(box.Edges, source, edgeSrcIdx);
-        }
-        return box;
-    }
 
     /// <summary>Unified highlighting: attaches the morph path to a shell
     /// primitive by expanding source deltas to the shell-vertex layout. The
@@ -900,7 +320,7 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     /// MorphVertexCount (= shell vertex count), then writes them back to the
     /// Material CB for all frames. Weights are shared with the source and synced
     /// every frame by DXModel.ApplyMorphTargetsIfNeeded.</summary>
-    void AttachShellMorph(PrimitiveData shell, PrimitiveData source, IReadOnlyList<int> sourceIndices)
+    protected override void AttachShellMorph(PrimitiveData shell, PrimitiveData source, IReadOnlyList<int> sourceIndices)
     {
         shell.MaterialParams.HasMorphTargets = 1;
         shell.MaterialParams.MorphTargetCount = source.MaterialParams.MorphTargetCount;
@@ -926,39 +346,9 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     /// </summary>
     protected static void CreateMorphDeltaBuffer(PrimitiveData primitiveData, Vertex[] baseVertices, List<GLTFMorphTarget> morphTargets, IReadOnlyList<int>? vertexMap = null)
     {
-        int vertexCount = vertexMap != null ? vertexMap.Count : baseVertices.Length;
-        int targetCount = morphTargets.Count;
-        int totalFloats = targetCount * vertexCount * 9;
-        var deltaData = new float[totalFloats];
-
-        for (int t = 0; t < targetCount; t++)
-        {
-            var target = morphTargets[t];
-            int targetBase = t * vertexCount * 9;
-            for (int v = 0; v < vertexCount; v++)
-            {
-                int srcIdx = vertexMap != null ? vertexMap[v] : v;
-                int baseIdx = targetBase + v * 9;
-                if (srcIdx < target.PositionDeltas.Length)
-                {
-                    deltaData[baseIdx    ] = target.PositionDeltas[srcIdx].X;
-                    deltaData[baseIdx + 1] = target.PositionDeltas[srcIdx].Y;
-                    deltaData[baseIdx + 2] = target.PositionDeltas[srcIdx].Z;
-                }
-                if (srcIdx < target.NormalDeltas.Length)
-                {
-                    deltaData[baseIdx + 3] = target.NormalDeltas[srcIdx].X;
-                    deltaData[baseIdx + 4] = target.NormalDeltas[srcIdx].Y;
-                    deltaData[baseIdx + 5] = target.NormalDeltas[srcIdx].Z;
-                }
-                if (srcIdx < target.TangentDeltas.Length)
-                {
-                    deltaData[baseIdx + 6] = target.TangentDeltas[srcIdx].X;
-                    deltaData[baseIdx + 7] = target.TangentDeltas[srcIdx].Y;
-                    deltaData[baseIdx + 8] = target.TangentDeltas[srcIdx].Z;
-                }
-            }
-        }
+        // The [target][vertex] × 9 layout, the sparse-target zero fill, and the shell vertex map all live in
+        // MorphDelta.Pack, shared with VK/Metal/Web. Only the upload below is backend-specific.
+        var deltaData = MorphDelta.Pack(baseVertices, morphTargets, vertexMap);
 
         // Create upload buffer
         primitiveData.MorphDeltasBuffer = Device.ResourceManager.CreateBuffer(
@@ -990,153 +380,6 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         };
         Device.D3dDevice->CreateShaderResourceView(primitiveData.MorphDeltasBuffer, &srvDesc, cpuHandle);
         primitiveData.MorphDeltasSrvHandle = Device.SrvHeapManager.GetGpuHandle(primitiveData.MorphDescriptorId);
-    }
-
-    /// <summary>Unified highlighting: gets or creates the instance Wireframe
-    /// shell box for the given compacted writeIndex using a lazily growing pool.
-    /// VB/IB are shared from the template _shellGeometry, so the box's own
-    /// VertexBuffer/IndexBuffer stay null. PrimitiveData.Dispose is null-safe,
-    /// so there is no double release. Only Material CBs are created locally;
-    /// matrices come from the group-level shared CB.
-    /// Returns null when the template is not ready because no non-skinned,
-    /// non-morph primitives exist, and callers should skip adding it to the draw
-    /// list. Empty slots created before the template is ready are patched up
-    /// automatically after it becomes available, which covers runtime asset
-    /// replacement followed by successful shell-template rebuild.</summary>
-    protected HighlightBox? AcquireShellBox(int index)
-    {
-        if (_shellGeometry == null)
-            return null;
-        while (_instanceShellBoxes.Count <= index)
-            _instanceShellBoxes.Add(CreateInstanceShellBox());
-        var box = _instanceShellBoxes[index];
-        if (box == null)
-        {
-            // Fill a previously empty slot. These are indices reserved while the
-            // template was not ready and are backfilled on first use after it becomes ready.
-            box = CreateInstanceShellBox();
-            _instanceShellBoxes[index] = box;
-        }
-        return box;
-    }
-
-    /// <summary>Unified highlighting: builds the per-instance shell box that
-    /// shares the template geometry. See AcquireShellBox.</summary>
-    HighlightBox? CreateInstanceShellBox()
-    {
-        if (_shellGeometry == null)
-            return null;
-        var box = new HighlightBox();
-        box.Face = CreateSharedShellPrimitive(_shellGeometry.Face);
-        box.Edges = CreateSharedShellPrimitive(_shellGeometry.Edges);
-        return box;
-    }
-
-    /// <summary>Unified highlighting: gets or creates the skinned instance
-    /// Wireframe shell box for the given compacted writeIndex, following the
-    /// same structure as AcquireShellBox. VB/IB are shared from the skinned
-    /// template _skinnedShellGeometry, and the shell uses the per-instance
-    /// bone-palette path.
-    /// Returns null when the template is not ready because there are no
-    /// single-Skin skinned primitives or the asset is multi-skin, and callers
-    /// should skip adding it to the draw list.</summary>
-    protected HighlightBox? AcquireSkinnedShellBox(int index)
-    {
-        if (_skinnedShellGeometry == null)
-            return null;
-        while (_skinnedInstanceShellBoxes.Count <= index)
-            _skinnedInstanceShellBoxes.Add(CreateSkinnedInstanceShellBox());
-        var box = _skinnedInstanceShellBoxes[index];
-        if (box == null)
-        {
-            // Fill a previously empty slot reserved while the template was not
-            // ready. It is backfilled on first use after the template becomes ready.
-            box = CreateSkinnedInstanceShellBox();
-            _skinnedInstanceShellBoxes[index] = box;
-        }
-        return box;
-    }
-
-    /// <summary>Unified highlighting: builds the per-instance shell box that
-    /// shares the skinned template geometry. See AcquireSkinnedShellBox.</summary>
-    HighlightBox? CreateSkinnedInstanceShellBox()
-    {
-        if (_skinnedShellGeometry == null)
-            return null;
-        var box = new HighlightBox();
-        box.Face = CreateSharedShellPrimitive(_skinnedShellGeometry.Face);
-        box.Edges = CreateSharedShellPrimitive(_skinnedShellGeometry.Edges);
-        return box;
-    }
-
-    /// <summary>Unified highlighting: releases shared shell templates
-    /// (rigid + skinned) and both instance shell-box pools, which share template
-    /// geometry. Used both by edge-width rebuilds and DisposeHighlights.</summary>
-    void DisposeShellTemplatesAndPools()
-    {
-        if (_shellGeometry != null)
-        {
-            DisposeHighlightBox(_shellGeometry);
-            _shellGeometry = null;
-        }
-        if (_skinnedShellGeometry != null)
-        {
-            DisposeHighlightBox(_skinnedShellGeometry);
-            _skinnedShellGeometry = null;
-        }
-        foreach (var box in _instanceShellBoxes)
-            DisposeHighlightBox(box);
-        _instanceShellBoxes.Clear();
-        foreach (var box in _skinnedInstanceShellBoxes)
-            DisposeHighlightBox(box);
-        _skinnedInstanceShellBoxes.Clear();
-        _shellBoxDrawList.Clear();
-    }
-
-    /// <summary>2-3 Step C: synchronizes previous-state flags for shell
-    /// primitives. HasPrevBones, HasPrevInstanceWorld, and HasPrevMorph on shell
-    /// Face/Edges must be enabled together with the main primitive, or the shell
-    /// loses its motion trail. This explicitly covers plan risk 2.
-    /// Both shared templates and both instance-box pools are covered, because a
-    /// pooled box may have been created before previous-state data became ready
-    /// and still carry stale flags, so each box may need patching.
-    /// With the changed guard and all-frame N-buffered writes, the per-frame
-    /// cost is negligible.</summary>
-    protected void SyncShellPrevFlags(bool hasPrevInstanceWorld, bool hasPrevBones, bool hasPrevMorph)
-    {
-        if (_shellGeometry != null)
-            SyncShellBoxPrevFlags(_shellGeometry, hasPrevInstanceWorld, hasPrevBones, hasPrevMorph);
-        if (_skinnedShellGeometry != null)
-            SyncShellBoxPrevFlags(_skinnedShellGeometry, hasPrevInstanceWorld, hasPrevBones, hasPrevMorph);
-        foreach (var box in _instanceShellBoxes)
-            SyncShellBoxPrevFlags(box, hasPrevInstanceWorld, hasPrevBones, hasPrevMorph);
-        foreach (var box in _skinnedInstanceShellBoxes)
-            SyncShellBoxPrevFlags(box, hasPrevInstanceWorld, hasPrevBones, hasPrevMorph);
-    }
-
-    static void SyncShellBoxPrevFlags(HighlightBox box, bool hasPrevInstanceWorld, bool hasPrevBones, bool hasPrevMorph)
-    {
-        SyncShellPrimPrevFlags(box.Face, hasPrevInstanceWorld, hasPrevBones, hasPrevMorph);
-        SyncShellPrimPrevFlags(box.Edges, hasPrevInstanceWorld, hasPrevBones, hasPrevMorph);
-    }
-
-    static void SyncShellPrimPrevFlags(PrimitiveData primitive, bool hasPrevInstanceWorld, bool hasPrevBones, bool hasPrevMorph)
-    {
-        // Set, not just raise: the caller is the single per-frame publisher of these three bits, and it has to be able to
-        // withdraw previous-frame data for a frame whose instance order changed (see DXInstancedPrimitiveGroup.UpdatePrevStateFlags).
-        uint prevWorld = hasPrevInstanceWorld ? 1u : 0u;
-        uint prevBones = hasPrevBones ? 1u : 0u;
-        uint prevMorph = hasPrevMorph ? 1u : 0u;
-        if (primitive.MaterialParams.HasPrevInstanceWorld == prevWorld
-            && primitive.MaterialParams.HasPrevBones == prevBones
-            && primitive.MaterialParams.HasPrevMorph == prevMorph)
-            return;
-
-        primitive.MaterialParams.HasPrevInstanceWorld = prevWorld;
-        primitive.MaterialParams.HasPrevBones = prevBones;
-        primitive.MaterialParams.HasPrevMorph = prevMorph;
-        for (int f = 0; f < Device.frameCount; f++)
-            Unsafe.Write(primitive.MappedMaterialBuffers[f], primitive.MaterialParams);
     }
 
     /// <summary>Unified highlighting: derives a shared-geometry box from a
@@ -1176,6 +419,11 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         return primitive;
     }
 
+    /// <summary>The core's template hook, typed to this backend's PrimitiveData. The factory keeps its own name
+    /// because the DirectX rendering tests reflect <see cref="CreateSharedShellPrimitive"/> by name.</summary>
+    protected override PrimitiveData CreateSharedGeometryPrimitive(PrimitiveData template)
+        => CreateSharedShellPrimitive(template);
+
     /// <summary>
     /// Unified highlighting: writes the box world matrix plus the dual face/edge
     /// colors into the box's own N-buffered CB every frame for the current fi.
@@ -1188,7 +436,7 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     /// for degenerate boxes;
     /// Wireframe = model / instance world matrix, which is always valid.
     /// </summary>
-    protected void WriteHighlightBox(HighlightBox box, Matrix4x4 world, Vector4 faceColor, Vector4 edgeColor)
+    protected override void WriteHighlightBox(HighlightBox box, Matrix4x4 world, Vector4 faceColor, Vector4 edgeColor)
     {
         int fi = (int)Device.FrameIndex;
         var matrices = new MatrixBuffer
@@ -1244,41 +492,6 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
             DrawHighlightBox(_instanceBoundsBoxes[_boundsBoxDrawList[i]], lightCB);
     }
 
-    /// <summary>Unified highlighting: releases all highlight GPU resources,
-    /// including the host Bounds box, the instance Bounds-box pool,
-    /// per-primitive Wireframe shell boxes, shared shell templates
-    /// (rigid / skinned), and Wireframe instance-box pools
-    /// (rigid / skinned).</summary>
-    protected void DisposeHighlights()
-    {
-        DisposeHighlightBox(_boundsBox);
-        _boundsBox = null;
-        foreach (var box in _instanceBoundsBoxes)
-            DisposeHighlightBox(box);
-        _instanceBoundsBoxes.Clear();
-        _boundsBoxDrawList.Clear();
-        _boundsActive = false;
-
-        if (_wireframeBoxes != null)
-        {
-            foreach (var box in _wireframeBoxes)
-                DisposeHighlightBox(box);
-            _wireframeBoxes = null;
-        }
-        DisposeShellTemplatesAndPools();
-        _wireframeEnabled = false;
-        _builtShellEdgeWidth = 0f;
-        _outline2DActive = false;
-    }
-
-    static void DisposeHighlightBox(HighlightBox? box)
-    {
-        if (box == null)
-            return;
-        box.Face?.Dispose();
-        box.Edges?.Dispose();
-    }
-
     /// <summary>
     /// Unified highlighting, Bounds-box geometry: face PrimitiveData.
     /// Eight corners are baked into [-0.5,0.5]^3, using bit-coded corner indices
@@ -1287,7 +500,7 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     /// the Transparent PSO. DoubleSided is enabled, and all five textures are
     /// White with Use*Map=0 because Unlit does not sample them.
     /// </summary>
-    PrimitiveData CreateBoxFacePrimitive()
+    protected override PrimitiveData CreateBoundsFacePrimitive()
     {
         var primitive = new PrimitiveData
         {
@@ -1319,7 +532,7 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     /// with depth writes and do not pulse with face alpha. EdgeColor stays
     /// semantically solid.
     /// </summary>
-    PrimitiveData CreateBoxEdgesPrimitive()
+    protected override PrimitiveData CreateBoundsEdgesPrimitive()
     {
         var indices = new List<uint>(12 * 36);
         var primitive = new PrimitiveData
@@ -1343,8 +556,6 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         return primitive;
     }
 
-
-
     /// <summary>Unified highlighting: builds a shell primitive from vertices and
     /// indices. Material settings are copied from the source primitive and then
     /// forced to Unlit plus transparent (BLEND) or opaque (OPAQUE). It uses
@@ -1355,7 +566,7 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     /// IsInstanced are inherited from the source material, which is critical for
     /// keeping non-instanced per-primitive shell boxes tightly aligned to
     /// animation.</summary>
-    PrimitiveData InitShellPrimitive(List<Vertex> vertices, uint[] indices, MaterialParams sourceParams, bool isTransparent)
+    protected override PrimitiveData CreateShellPrimitive(List<Vertex> vertices, uint[] indices, MaterialParams sourceParams, bool isTransparent)
     {
         var mp = sourceParams;
         mp.RenderMode = 0u;
@@ -1405,26 +616,8 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     }
 
     // ============================================================
-    // Unified highlighting: Outline2D state
-    // (mask channel, with active state collected by Graphics in a separate pass)
-    // ============================================================
-
-    protected void SetOutline2DState(bool active, Vector4 color, float width)
-    {
-        _outline2DActive = active;
-        _outline2DColor = color;
-        _outline2DWidth = width;
-    }
-
-    protected bool HasOutline2D => _outline2DActive;
-    protected Vector4 Outline2DColor => _outline2DColor;
-    protected float Outline2DWidth => _outline2DWidth;
-    internal bool Outline2DActive => _outline2DActive;
-    internal Vector4 Outline2DMaskColor => _outline2DColor;
-    internal float Outline2DMaskWidth => _outline2DWidth;
-
-    // ============================================================
-    // Instance: Draw (three-bucket grouping)
+    // Instance: main pass
+    // (the three-bucket flow lives in PrimitiveGroupCore; only the sort key is DX-specific)
     // ============================================================
 
     static float ComputeTransparentSortDepth(PrimitiveData primitiveData)
@@ -1441,154 +634,50 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         return center.Z;
     }
 
-    static int CompareTransparentPrimitives(PrimitiveData a, PrimitiveData b)
+    protected override string TraceBackend => "dx";
+
+    protected override int FrameCount => (int)Device.frameCount;
+
+    protected override ref MaterialParams MaterialSlot(PrimitiveData primitive, int frame)
+        => ref Unsafe.AsRef<MaterialParams>(primitive.MappedMaterialBuffers[frame]);
+
+    protected override TransparentOrder TransparentBucketOrder => TransparentOrder.SortedSplit;
+
+    /// <summary>While a scene draw collection is recording, the order it captures is replayed later, so sorting here
+    /// would produce an order the replay cannot reproduce.</summary>
+    protected override bool SortTransparentNow => DXSceneDrawCollection.Active == null;
+
+    protected override float TransparentSortDepth(PrimitiveData primitive)
+        => ComputeTransparentSortDepth(primitive);
+
+    protected override void ApplySurfaceState(in SurfaceState state)
     {
-        return ComputeTransparentSortDepth(b).CompareTo(ComputeTransparentSortDepth(a));
+        // Explicit switches, never casts: PipelineMode orders Opaque/Transparent/Fade while SurfaceMode orders
+        // Opaque/Fade/Transparent, so a cast would silently swap Fade and Transparent.
+        Pipeline.SetPipeline(
+            state.Mode switch
+            {
+                SurfaceMode.Opaque => PipelineMode.Opaque,
+                SurfaceMode.Fade => PipelineMode.Fade,
+                _ => PipelineMode.Transparent,
+            },
+            state.Cull switch
+            {
+                SurfaceCull.None => PipelineCullVariant.None,
+                SurfaceCull.Front => PipelineCullVariant.Front,
+                _ => PipelineCullVariant.Back,
+            },
+            state.DepthWrite);
     }
 
-    public virtual void Draw()
-    {
-        if (!_transformInitialized)
-            return;
+    protected override void DrawMainPrimitive(PrimitiveData primitive)
+        => DrawPrimitive(primitive, lightConstantBuffers[(int)Device.FrameIndex]);
 
-        // Collect all PrimitiveData for this frame, reusing the member list to avoid GC.
-        _drawList.Clear();
-        CollectPrimitives(_drawList);
-        if (_drawList.Count == 0)
-            return;
-
-        var lightCB = lightConstantBuffers[(int)Device.FrameIndex];
-
-        // Group into Opaque / Fade (forced when overall alpha < 1) /
-        // Transparent (true BLEND materials).
-        // Important fix: when Alpha < 1, non-BLEND materials use the Fade PSO
-        // (blending + depth writes) instead of the Transparent PSO. Depth
-        // writes prevent excessive transparency and internal-geometry bleed
-        // caused by sequential blending of overlapping mesh layers in complex models.
-        bool forceFadeByAlpha = _currentAlpha < 1.0f;
-
-        // 1. Opaque
-        // Writes depth. Under 2-2 rule 7, AoExempt primitives use the NoDepth
-        // variant and do not write depth.
-        bool pipelineSet = false;
-        bool currentDoubleSided = false;
-        bool currentDepthWrite = true;
-        if (!forceFadeByAlpha)
-        {
-            for (int i = 0; i < _drawList.Count; i++)
-            {
-                var p = _drawList[i];
-                if (p.IsTransparent) continue;
-                bool depthWrite = !p.AoExempt;
-                if (!pipelineSet || currentDoubleSided != p.DoubleSided || currentDepthWrite != depthWrite)
-                {
-                    Pipeline.SetPipeline(PipelineMode.Opaque,
-                        p.DoubleSided ? PipelineCullVariant.None : PipelineCullVariant.Back, depthWrite);
-                    pipelineSet = true;
-                    currentDoubleSided = p.DoubleSided;
-                    currentDepthWrite = depthWrite;
-                }
-                DrawPrimitive(p, lightCB);
-            }
-        }
-
-        // 2. Fade
-        // Enabled only when _currentAlpha < 1. Non-BLEND materials use the
-        // Fade PSO with blending and depth writes.
-        if (forceFadeByAlpha)
-        {
-            pipelineSet = false;
-            currentDoubleSided = false;
-            currentDepthWrite = true;
-            for (int i = 0; i < _drawList.Count; i++)
-            {
-                var p = _drawList[i];
-                if (p.IsTransparent) continue;
-                bool depthWrite = !p.AoExempt;
-                if (!pipelineSet || currentDoubleSided != p.DoubleSided || currentDepthWrite != depthWrite)
-                {
-                    Pipeline.SetPipeline(PipelineMode.Fade,
-                        p.DoubleSided ? PipelineCullVariant.None : PipelineCullVariant.Back, depthWrite);
-                    pipelineSet = true;
-                    currentDoubleSided = p.DoubleSided;
-                    currentDepthWrite = depthWrite;
-                }
-                DrawPrimitive(p, lightCB);
-            }
-        }
-
-        // 3. Transparent
-        // True BLEND materials. No depth writes.
-        _singleSidedTransparentList.Clear();
-        _doubleSidedTransparentList.Clear();
-        for (int i = 0; i < _drawList.Count; i++)
-        {
-            var p = _drawList[i];
-            if (!p.IsTransparent) continue;
-            if (p.DoubleSided)
-                _doubleSidedTransparentList.Add(p);
-            else
-                _singleSidedTransparentList.Add(p);
-        }
-
-        if (DXSceneDrawCollection.Active == null)
-        {
-            _singleSidedTransparentList.Sort(CompareTransparentPrimitives);
-            _doubleSidedTransparentList.Sort(CompareTransparentPrimitives);
-        }
-
-        pipelineSet = false;
-        currentDoubleSided = false;
-        for (int i = 0; i < _singleSidedTransparentList.Count; i++)
-        {
-            var p = _singleSidedTransparentList[i];
-            if (!pipelineSet || currentDoubleSided)
-            {
-                Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Back);
-                pipelineSet = true;
-                currentDoubleSided = false;
-            }
-            DrawPrimitive(p, lightCB);
-        }
-
-        pipelineSet = false;
-        currentDoubleSided = true;
-        for (int i = 0; i < _doubleSidedTransparentList.Count; i++)
-        {
-            var p = _doubleSidedTransparentList[i];
-            if (p.DoubleSided)
-            {
-                Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Front);
-                DrawPrimitive(p, lightCB);
-
-                Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Back);
-                pipelineSet = true;
-                currentDoubleSided = false;
-                DrawPrimitive(p, lightCB);
-                continue;
-            }
-        }
-
-        // Unified highlighting:
-        // lazily built face+edge primitive groups that live outside the
-        // CollectPrimitives / SyncAlpha chain. Faces use transparent 2-pass
-        // rendering, edges use Opaque with depth writes, and the dual-color
-        // highlight is drawn after all regular surfaces in the group.
-        // This covers the host Bounds box plus per-primitive Wireframe shell
-        // boxes. When SurfaceColor.w = 0, the shell becomes edge-only and face
-        // drawing is skipped through the FaceAlpha gate.
-        if (_boundsActive && _boundsBox != null)
-            DrawHighlightBox(_boundsBox, lightCB);
-        if (_wireframeEnabled && _wireframeBoxes != null)
-        {
-            for (int i = 0; i < _wireframeBoxes.Count; i++)
-            {
-                var highlight = _wireframeBoxes[i];
-                if (highlight != null)
-                    DrawHighlightBox(highlight, lightCB);
-            }
-        }
-    }
+    /// <summary>Unified highlighting: the core decides which boxes to draw and in what order; this binds the
+    /// frame's lighting block. Faces use transparent 2-pass rendering, edges use Opaque with depth writes, and a zero
+    /// SurfaceColor.w turns the box edge-only through the FaceAlpha gate.</summary>
+    protected override void DrawHighlightBox(HighlightBox box)
+        => DrawHighlightBox(box, lightConstantBuffers[(int)Device.FrameIndex]);
 
     void DrawPrimitive(PrimitiveData primitiveData, ID3D12Resource* lightConstantBuffer)
     {
@@ -1608,6 +697,8 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
         CollectPrimitives(_drawList);
         if (_drawList.Count == 0)
             return;
+
+        DrawTrace.Group("dx", "outline", Name, _drawList.Count);
 
         var lightCB = lightConstantBuffers[(int)Device.FrameIndex];
         bool pipelineSet = false;
@@ -1637,117 +728,26 @@ internal unsafe abstract class DXPrimitiveGroup : IDisposable
     }
 
     // ============================================================
-    // Instance: 1-5 shadow-pass rendering
+    // Instance: 1-5 shadow pass
+    // (the epoch cache and the primitive loop live in PrimitiveGroupCore)
     // ============================================================
 
-    /// <summary>
-    /// Determines whether shadow primitives in the same group can share one
-    /// b2 (root parameter 2) and one t5 (root parameter 9).
-    ///
-    /// The shadow VS only reads five fields from b2:
-    /// renderMode, isInstanced, isSkinned, bonePaletteStride, and
-    /// hasMorphTargets
-    /// (Pipeline.cs VSMain, L1041/1045/1085/1087/1114/1230).
-    /// Material color, alphaMode, alphaCutoff, and texture-enable flags are all
-    /// PS-side, and this pass uses an empty PS, so none of them are read.
-    /// When these five fields are identical across the group, the b2 bound by
-    /// the first primitive is byte-for-byte equivalent for the rest, so later
-    /// primitives can skip both the b2 and t5 bindings.
-    /// When hasMorphTargets==0, morphTargetCount, morphVertexCount, and
-    /// morphWeights all become dead code, and t5 is never sampled either, so
-    /// it can be skipped together with b2.
-    ///
-    /// Primitives with morph data are always treated as non-shareable.
-    /// The decision is based on the MorphTargets fixed at load time rather than
-    /// the per-frame MaterialParams.HasMorphTargets flag, so the conclusion does
-    /// not depend on whether the shadow pass runs before or after morph-weight writes.
-    /// isSkinned is node-level rather than model-level
-    /// (see DXModel.SyncSkinningMaterialParams), so it must be compared per primitive.
-    ///
-    /// Transparent primitives do not participate in this decision because the
-    /// shadow pass skips them anyway. Letting them disqualify the whole group
-    /// would waste the optimization.
-    /// </summary>
-    protected static bool CanShareShadowMaterial(List<PrimitiveData> primitives)
+    protected override void BeginShadowPass()
     {
-        PrimitiveData? first = null;
-        for (int i = 0; i < primitives.Count; i++)
-        {
-            var p = primitives[i];
-            if (p.IsTransparent)
-                continue;
-
-            if (p.MorphTargets != null && p.MorphTargets.Count > 0)
-                return false;
-
-            if (first == null)
-            {
-                first = p;
-                continue;
-            }
-
-            if (p.MaterialParams.RenderMode != first.MaterialParams.RenderMode
-                || p.MaterialParams.IsInstanced != first.MaterialParams.IsInstanced
-                || p.MaterialParams.IsSkinned != first.MaterialParams.IsSkinned
-                || p.MaterialParams.BonePaletteStride != first.MaterialParams.BonePaletteStride)
-                return false;
-        }
-        return true;
-    }
-
-    /// <summary>
-    /// Shadow-pass draw path. Under contract rule 7 it performs no frustum
-    /// culling: all opaque primitives are drawn, and true BLEND materials are
-    /// skipped because primitives that do not write depth should not cast
-    /// shadows. The shadow-pass entry has already set the PSO and root
-    /// signature. This method only supplies group-invariant bindings and
-    /// per-primitive draws.
-    ///
-    /// The primitive list is cached per pass using <see cref="CascadedShadow.Epoch"/>.
-    /// RenderShadowPass calls this method repeatedly for atlas quadrants
-    /// (three cascades plus spotlight). Between quadrants only the viewport and
-    /// light-space ViewProj change, while the primitive set stays the same, so
-    /// CollectPrimitives only runs once per pass. For DXModel it is a recursive
-    /// glTF node-tree walk plus AddRange, and for DXMesh3D it is AddRange only.
-    /// Both are side-effect free and safe to replay.
-    /// </summary>
-    public virtual void DrawShadow()
-    {
-        if (!_transformInitialized)
-            return;
-
-        if (_shadowDrawListEpoch != CascadedShadow.Epoch)
-        {
-            _shadowDrawList.Clear();
-            CollectPrimitives(_shadowDrawList);
-            _shadowDrawListEpoch = CascadedShadow.Epoch;
-        }
-
-        if (_shadowDrawList.Count == 0)
-            return;
-
         // Group-invariant t6/t8/t9/t10 are bound once for the group.
         // This class has no instance stream, so t9 always uses the default zero-value SB.
         Pipeline.SetShadowGroupBindings(
             GetBoneSrvHandle(), GetPrevBoneSrvHandle(), default, GetPrevMorphSrvHandle());
-
-        // When b2/t5 are identical within the group, only the first primitive
-        // binds them and the rest reuse the state. Otherwise binding falls back
-        // to per-primitive. The decision is a plain field comparison with no
-        // virtual dispatch, so it is recomputed every call instead of cached,
-        // avoiding stale-state windows.
-        bool shareMaterial = CanShareShadowMaterial(_shadowDrawList);
-        bool materialBound = false;
-
-        int fi = (int)Device.FrameIndex;
-        for (int i = 0; i < _shadowDrawList.Count; i++)
-        {
-            var p = _shadowDrawList[i];
-            if (p.IsTransparent)
-                continue;
-            Pipeline.DrawShadowPrimitive(p, p.MatrixBuffers[fi], null, 1, 0,
-                bindMaterial: !shareMaterial || !materialBound);
-            materialBound = true;
-        }
     }
+
+    protected override void DrawShadowPrimitive(PrimitiveData p, bool bindMaterial)
+        => Pipeline.DrawShadowPrimitive(p, p.MatrixBuffers[(int)Device.FrameIndex], null, 1, 0, bindMaterial);
+
+    /// <summary>
+    /// Whether the group can bind b2 (root parameter 2) and t5 (root parameter 9) once for the whole group
+    /// instead of per primitive. The rule itself and the list of shader fields it depends on live in
+    /// <see cref="ShadowMaterialSharing.CanShare"/>; this is only the DX-typed entry point.
+    /// </summary>
+    protected override bool CanShareShadowMaterial(List<PrimitiveData> primitives)
+        => ShadowMaterialSharing.CanShare(primitives);
 }

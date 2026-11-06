@@ -23,3 +23,4 @@ global using Season.Panels;
 global using Season.Models;
 global using Season.Entities;
 global using Season.Rendering;
+global using Season.Rendering.Drawables;

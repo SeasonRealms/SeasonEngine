@@ -3424,6 +3424,25 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
     internal static void SetPipeline(PipelineMode mode, PipelineCullVariant cullVariant, bool depthWrite,
         bool sceneSignatureBound = false)
     {
+        // S0 baseline: one line per PSO switch, tagged with whether it came from collection or from replay.
+        // The enumeration order of PipelineMode differs between the three backends (Opaque/Transparent/Fade here,
+        // Opaque/Fade/Transparent in the trace), so the mapping is an explicit switch and never a cast.
+        if (DrawTrace.On)
+            DrawTrace.State("dx",
+                mode switch
+                {
+                    PipelineMode.Opaque => DrawTrace.ModeOpaque,
+                    PipelineMode.Fade => DrawTrace.ModeFade,
+                    _ => DrawTrace.ModeTransparent,
+                },
+                cullVariant switch
+                {
+                    PipelineCullVariant.None => DrawTrace.CullNone,
+                    PipelineCullVariant.Front => DrawTrace.CullFront,
+                    _ => DrawTrace.CullBack,
+                },
+                depthWrite, DXSceneDrawCollection.Active != null);
+
         if (DXSceneDrawCollection.Active is { } collection)
         {
             collection.SetPipeline(mode, cullVariant, depthWrite);
@@ -3537,6 +3556,14 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         ID3D12Resource* depthSource = null,
         GpuDescriptorHandle instanceExtrasSrvHandle = default)
     {
+        // S0 baseline: logged before the collection early-out, so the trace holds the order the group code chose
+        // as well as the order the GPU finally received (see DXSceneDrawCommand.Draw).
+        if (DrawTrace.On)
+            DrawTrace.Draw("dx", "scene", primitiveData.DoubleSided, primitiveData.AoExempt,
+                (uint)primitiveData.Indices.Length, instanceCount, startInstanceLocation,
+                DXSceneDrawCollection.Active != null,
+                primitiveData.PartName ?? primitiveData.PartNodeName);
+
         if (DXSceneDrawCollection.Active is { } collection)
         {
             collection.CapturePrimitive(primitiveData, lightConstantBuffer, matrixBuffer, instanceBufferView,
@@ -3915,6 +3942,12 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         uint startInstanceLocation,
         bool bindMaterial = true)
     {
+        // S0 baseline: the shadow pass has no collection half on this backend, so every line is a real submission.
+        if (DrawTrace.On)
+            DrawTrace.Draw("dx", "shadow", primitiveData.DoubleSided, primitiveData.AoExempt,
+                (uint)primitiveData.Indices.Length, instanceCount, startInstanceLocation, collecting: false,
+                primitiveData.PartName ?? primitiveData.PartNodeName);
+
         var cmdList = Device.GraphicsCommandList;
 
         var vertexViews = stackalloc VertexBufferView[2];

@@ -6,18 +6,12 @@ using Silk.NET.Direct3D12;
 
 namespace Season.Platforms.Windows.DirectX;
 
-/// <summary>PBR texture-slot indices aligned with shader registers t0-t4.</summary>
-internal enum TextureSlot
-{
-    BaseColor = 0,
-    Normal = 1,
-    MetallicRoughness = 2,
-    Occlusion = 3,
-    Emissive = 4
-}
+// PBR texture-slot indices aligned with shader registers t0-t4. The canonical definition is the shared
+// Season.Rendering.Drawables.TextureSlot; this alias keeps every existing call site spelled the same way.
+using TextureSlot = Season.Rendering.Drawables.TextureSlot;
 
 [StructLayout(LayoutKind.Explicit, Size = 144)]
-internal struct MaterialParams
+internal partial struct MaterialParams
 {
     [FieldOffset(0)] public Vector4 BaseColor;
     [FieldOffset(16)] public Vector4 EmissiveFactor;
@@ -55,26 +49,10 @@ internal struct MaterialParams
     [FieldOffset(128)] public Vector4 VertexWave;
 }
 
-internal unsafe class PrimitiveData
+// Geometry, material constants, textures and part keys live in the shared PrimitiveCpuData; only the D3D12 handles
+// and the vertex-stream resolution below are DirectX's own.
+internal unsafe partial class PrimitiveData : PrimitiveCpuData<MaterialParams, DXTexture>, IDisposable
 {
-    public int InstanceStreamIndex = -1;
-    public List<Vertex> Vertices;
-    public Vertex[]? BaseVertices;
-    public List<GLTFMorphTarget>? MorphTargets;
-    public GltfNodeBase? OwnerNode;
-    public uint LastAppliedWeightsVersion;
-    public uint[] Indices;
-    public bool Use32BitIndices;
-    public bool DoubleSided;
-
-    /// <summary>2-2 contract rule 7: GTAO exemption, synced from
-    /// Mesh3D.ExcludeFromAo. Draw buckets use this to select the NoDepth PSO.</summary>
-    public bool AoExempt;
-    public Vector3 LocalBoundsCenter;
-    /// <summary>1-3: half extents of the primitive-local AABB, paired with
-    /// LocalBoundsCenter for primitive-level and instance-level culling.</summary>
-    public Vector3 LocalBoundsExtents;
-
     // The shared highlight shell does not own the VB/IB; during collection resources are taken from the template and kept alive (AddRef up to this frame's GPU safe point), the command does not retain the template.
     internal PrimitiveData? SharedGeometrySource;
     public ID3D12Resource* VertexBuffer;
@@ -121,60 +99,10 @@ internal unsafe class PrimitiveData
     public ID3D12Resource*[] MatrixBuffers;
     public byte*[] MappedMatrixBuffers;
 
-    /// <summary>
-    /// 2-3 contract rule 6: CPU shadow copy of the previous frame's world
-    /// matrix, stored without transpose.
-    /// MatrixBuffers are N-buffered upload-heap resources, so previous frames
-    /// must never be read back from them. History must come from this field.
-    /// All-zero means no history yet, which is the first-frame case, and the
-    /// shader falls back to the current world matrix.
-    /// </summary>
-    public System.Numerics.Matrix4x4 PrevWorldMatrix;
-
-    public DXTexture BaseColorTexture;
-    public DXTexture NormalTexture;
-    public DXTexture MetallicRoughnessTexture;
-    public DXTexture OcclusionTexture;
-    public DXTexture EmissiveTexture;
-
-    public MaterialParams MaterialParams;
-
-    /// <summary>Original glTF material BaseColor.W (alpha), multiplied with
-    /// Model.Alpha to produce the final opacity multiplier.</summary>
-    public float OriginalBaseColorAlpha = 1.0f;
-
-    /// <summary>Original Surface BaseColor frozen at load time, used as the
-    /// multiplicative baseline for SyncColorTint. RGB is tinted while W stays untouched.</summary>
-    public Vector4 OriginalBaseColor = Vector4.One;
-
-    /// <summary>glTF material name of the part this primitive draws; null when the asset has no material. This is the primary
-    /// key <c>Model.SetPartColor</c> resolves against.</summary>
-    public string? PartName;
-
-    /// <summary>Name of the node that owns this primitive, the fallback key for <c>Model.SetPartColor</c>.</summary>
-    public string? PartNodeName;
-
-    /// <summary>BaseColor.rgb as loaded (after the MaterialColor tint, before any part override). It is what SyncPartColors
-    /// restores when a part override is cleared, so an absolute override never needs to re-derive the authored value.</summary>
-    public Vector3 PartBaseColor = Vector3.One;
-    
-    /// <summary>
-    /// Original glTF material AlphaCutoff. When Model.Alpha < 1, this is scaled
-    /// proportionally by alpha to avoid clipping away the entire MASK material
-    /// through clip(alpha - alphaCutoff).
-    /// </summary>
-    public float OriginalAlphaCutoff = 0.5f;
-
     // Phase 3: Morph-target GPU data
     public ID3D12Resource* MorphDeltasBuffer;         // StructuredBuffer resource
     public GpuDescriptorHandle MorphDeltasSrvHandle;  // t5 SRV descriptor handle
     public int MorphDescriptorId = -1;                // Descriptor-heap ID used for release
-
-    /// <summary>
-    /// Whether the primitive is transparent, determined from the glTF material's AlphaMode.
-    /// BLEND and MASK are treated as transparent, while OPAQUE is not.
-    /// </summary>
-    public bool IsTransparent;
 
     public void Dispose()
     {

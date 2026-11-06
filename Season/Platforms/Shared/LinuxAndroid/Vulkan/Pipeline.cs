@@ -1129,6 +1129,25 @@ public static VkPipeline TransparentBackFacePipelineState;
     /// Transparent already skips depth writes, so it falls back to the regular variant.</summary>
     public static void SetPipeline(CommandBuffer cmd, PipelineMode mode, CullModeFlags cullMode, bool depthWrite)
     {
+        // S0 baseline: one line per PSO switch, tagged with whether it came from collection or from replay.
+        // The enumeration order of PipelineMode differs between the three backends (Opaque/Transparent/Fade here,
+        // Opaque/Fade/Transparent in the trace), so the mapping is an explicit switch and never a cast.
+        if (DrawTrace.On)
+            DrawTrace.State("vk",
+                mode switch
+                {
+                    PipelineMode.Opaque => DrawTrace.ModeOpaque,
+                    PipelineMode.Fade => DrawTrace.ModeFade,
+                    _ => DrawTrace.ModeTransparent,
+                },
+                cullMode switch
+                {
+                    CullModeFlags.None => DrawTrace.CullNone,
+                    CullModeFlags.FrontBit => DrawTrace.CullFront,
+                    _ => DrawTrace.CullBack,
+                },
+                depthWrite, VKSceneDrawCollection.Active != null);
+
         // Record the mode requested this time: the fog push constants happen in DrawPrimitive, which needs to know whether the bound variant is the opaque one.
         _boundMode = mode;
 
@@ -1246,6 +1265,13 @@ public static VkPipeline TransparentBackFacePipelineState;
         ulong indirectOffset = 0,
         ulong instanceOffset = 0)
     {
+        // S0 baseline: the collection half of the trace. A direct (non-collected) draw is logged by DrawPrimitiveCore
+        // instead, so every scene draw appears exactly once whichever path it took.
+        if (DrawTrace.On && VKSceneDrawCollection.Active != null)
+            DrawTrace.Draw("vk", "scene", primitiveData.DoubleSided, primitiveData.AoExempt,
+                indexCount, instanceCount, firstInstance, collecting: true,
+                primitiveData.PartName ?? primitiveData.PartNodeName);
+
         // Work package C: the scene segmented collection phase submits no draws; it just hands immutable handles to the replay queue.
         // This is the single exit for all 3D paths (model / instanced model / instanced mesh / outline shell),
         // so intercepting here once covers every PrimitiveData draw.
@@ -1335,6 +1361,13 @@ public static VkPipeline TransparentBackFacePipelineState;
         ulong indirectOffset = 0,
         ulong instanceOffset = 0)
     {
+        // S0 baseline: the submission half of the trace -- both the replay queue and the direct 2D/offline paths
+        // land here, so this is the one place that sees every scene draw the GPU is actually given.
+        if (DrawTrace.On)
+            DrawTrace.Draw("vk", "submit", primitiveData.DoubleSided, primitiveData.AoExempt,
+                indexCount, instanceCount, firstInstance, collecting: false,
+                primitiveData.PartName ?? primitiveData.PartNodeName);
+
         var vk = Device.Vk;
 
         // C1: resolving again here is idempotent and covers the direct callers that never go through DrawPrimitive.
@@ -1462,6 +1495,12 @@ public static VkPipeline TransparentBackFacePipelineState;
         uint instanceCount,
         uint firstInstance)
     {
+        // S0 baseline: the shadow pass has no collection half on this backend, so every line is a real submission.
+        if (DrawTrace.On)
+            DrawTrace.Draw("vk", "shadow", primitiveData.DoubleSided, primitiveData.AoExempt,
+                indexCount, instanceCount, firstInstance, collecting: false,
+                primitiveData.PartName ?? primitiveData.PartNodeName);
+
         var vk = Device.Vk;
 
         // C1: the shadow pass must rasterise the same sheet the scene shows, so it resolves slot 0 through the same call.

@@ -6,15 +6,9 @@ using Metal;
 
 namespace Season.Platforms.Shared.Apple.Metal;
 
-/// <summary>PBR texture-slot indices aligned with the shader binding numbers at texture(0..4).</summary>
-internal enum TextureSlot
-{
-    BaseColor = 0,
-    Normal = 1,
-    MetallicRoughness = 2,
-    Occlusion = 3,
-    Emissive = 4
-}
+// PBR texture-slot indices aligned with the shader binding numbers at texture(0..4). The canonical definition
+// is the shared Season.Rendering.Drawables.TextureSlot; this alias keeps every call site unchanged.
+using TextureSlot = Season.Rendering.Drawables.TextureSlot;
 
 /// <summary>
 /// Material constant buffer for fragment buffer slot 2, matching the MaterialParams byte layout in Pipeline.MetalShaderSource exactly.
@@ -22,7 +16,7 @@ internal enum TextureSlot
 /// Within this 80-byte region, the MSL constant-buffer layout for scalars and vectors matches std140 and cbuffer semantics.
 /// </summary>
 [StructLayout(LayoutKind.Explicit, Size = 160)]
-internal struct MaterialParams
+internal partial struct MaterialParams
 {
     [FieldOffset(0)] public Vector4 BaseColor;
     [FieldOffset(16)] public Vector4 EmissiveFactor;
@@ -76,24 +70,10 @@ internal struct MaterialParams
 /// is immediately visible to the GPU,
 /// equivalent to persistent mapping in DX12 with N-buffered frame-index switching.
 /// </summary>
-internal sealed class PrimitiveData : IDisposable
+// Geometry, material constants, textures and part keys live in the shared PrimitiveCpuData; only the Metal buffers
+// and the vertex-stream resolution below are Metal's own.
+internal sealed partial class PrimitiveData : PrimitiveCpuData<MaterialParams, Texture>, IDisposable
 {
-    public int InstanceStreamIndex = -1;
-    public List<Vertex> Vertices = null!;
-    public Vertex[]? BaseVertices;
-    public List<GLTFMorphTarget>? MorphTargets;
-    public GltfNodeBase? OwnerNode;
-    public uint LastAppliedWeightsVersion;
-
-    public uint[] Indices = null!;
-    public bool Use32BitIndices;
-    public bool DoubleSided;
-    /// <summary>Contract clause 7 of 2-2: GTAO exemption, synchronized from Mesh3D.ExcludeFromAo. The draw bucket uses it to switch to OpaqueNoDepthState.</summary>
-    public bool AoExempt;
-    public Vector3 LocalBoundsCenter;
-    /// <summary>Local primitive AABB half-extents for render-quality 1-3, paired with LocalBoundsCenter and used by primitive-level and instance-level culling.</summary>
-    public Vector3 LocalBoundsExtents;
-
     public IMTLBuffer VertexBuffer = null!;
 
     /// <summary>
@@ -127,60 +107,8 @@ internal sealed class PrimitiveData : IDisposable
     /// <summary>N-buffered MaterialParams at b2, with length equal to Device.frameCount.</summary>
     public IMTLBuffer[] MaterialBuffers = null!;
 
-    public Texture BaseColorTexture = null!;
-
-    public Texture NormalTexture = null!;
-
-    public Texture MetallicRoughnessTexture = null!;
-
-    public Texture OcclusionTexture = null!;
-
-    public Texture EmissiveTexture = null!;
-
     public IMTLBuffer? MorphDeltasBuffer;
     public bool OwnsMorphDeltasBuffer;
-
-    public MaterialParams MaterialParams;
-
-    /// <summary>
-    /// Contract clause 6 of 2-3: CPU shadow copy of the previous-frame world matrix, kept in non-transposed form.
-    /// MatrixBuffers live in CPU-writable N-buffer heaps and must never be read back for historical frames,
-    /// so history must come from this field instead.
-    /// All zeros means no history exists yet, such as the first frame, and the shader falls back to the current world matrix.
-    /// </summary>
-    public System.Numerics.Matrix4x4 PrevWorldMatrix;
-
-    /// <summary>The original glTF material BaseColor.W alpha, used together with Model.Alpha as the final transparency multiplier.</summary>
-    public float OriginalBaseColorAlpha = 1.0f;
-
-    /// <summary>The original Surface BaseColor captured during Load. It is the multiplicative base for SyncColorTint, where rgb is multiplied by tint and W stays unchanged.</summary>
-    public Vector4 OriginalBaseColor = Vector4.One;
-
-    /// <summary>glTF material name of the part this primitive draws; null when the asset has no material. This is the primary
-    /// key <c>Model.SetPartColor</c> resolves against.</summary>
-    public string? PartName;
-
-    /// <summary>Name of the node that owns this primitive, the fallback key for <c>Model.SetPartColor</c>.</summary>
-    public string? PartNodeName;
-
-    /// <summary>BaseColor.rgb as loaded (after the MaterialColor tint, before any part override). It is what SyncPartColors
-    /// restores when a part override is cleared, so an absolute override never needs to re-derive the authored value.</summary>
-    public Vector3 PartBaseColor = Vector3.One;
-
-    /// <summary>
-    /// The original glTF material AlphaCutoff.
-    /// When Model.Alpha is less than 1, this value is scaled proportionally with alpha
-    /// so MASK materials do not get discarded as a whole by discard(alpha - alphaCutoff) at low Model.Alpha.
-    /// </summary>
-    public float OriginalAlphaCutoff = 0.5f;
-
-    /// <summary>
-    /// Whether the material is transparent, derived from the glTF AlphaMode:
-    /// BLEND is transparent and uses the Transparent PSO,
-    /// MASK uses the Opaque PSO plus shader-side discard,
-    /// and OPAQUE uses the Opaque PSO.
-    /// </summary>
-    public bool IsTransparent;
 
     public void Dispose()
     {

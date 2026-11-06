@@ -192,7 +192,7 @@ internal class WGPUModel
 
         instance._asset.gltfNodes = _asset.gltfNodes.Select(node => nodeMap[node]).ToList();
         instance._asset._nodeMap = _asset._nodeMap.ToDictionary(kvp => kvp.Key, kvp => nodeMap[kvp.Value]);
-        instance._asset._animations = CloneAnimations(_asset._animations, nodeMap);
+        instance._asset._animations = AnimationOps.CloneAnimations(_asset._animations, nodeMap);
         instance._asset._animationPlayer = new GLTFAnimationPlayer();
         instance._asset._animationPlayer.Initialize(instance._asset._animations);
         // Shared-template instancing path: inject the instance asset into the control
@@ -338,61 +338,14 @@ internal class WGPUModel
         return clone;
     }
 
-    static List<GLTFAnimation> CloneAnimations(List<GLTFAnimation> sourceAnimations, Dictionary<GltfNodeBase, GltfNodeBase> nodeMap)
-    {
-        var result = new List<GLTFAnimation>(sourceAnimations.Count);
-        foreach (var sourceAnimation in sourceAnimations)
-        {
-            var clonedAnimation = new GLTFAnimation
-            {
-                Name = sourceAnimation.Name,
-            };
-
-            foreach (var sourceChannel in sourceAnimation.Channels)
-            {
-                var clonedSampler = new AnimationSampler
-                {
-                    Inputs = new List<float>(sourceChannel.Sampler?.Inputs ?? new List<float>()),
-                    Values = new List<float>(sourceChannel.Sampler?.Values ?? new List<float>()),
-                    InTangents = sourceChannel.Sampler?.InTangents != null ? new List<float>(sourceChannel.Sampler.InTangents) : null,
-                    OutTangents = sourceChannel.Sampler?.OutTangents != null ? new List<float>(sourceChannel.Sampler.OutTangents) : null,
-                    OutputElementCount = sourceChannel.Sampler?.OutputElementCount ?? 4,
-                    Interpolation = sourceChannel.Sampler?.Interpolation ?? AnimationInterpolationMode.Linear,
-                };
-
-                var clonedChannel = new AnimationChannel
-                {
-                    Sampler = clonedSampler,
-                    Target = sourceChannel.Target == null
-                        ? null
-                        : new AnimationChannelTarget
-                        {
-                            Node = sourceChannel.Target.Node != null ? nodeMap[sourceChannel.Target.Node] : null,
-                            Path = sourceChannel.Target.Path,
-                        }
-                };
-
-                clonedAnimation.Samplers.Add(clonedSampler);
-                if (clonedChannel.Target != null)
-                    clonedAnimation.Channels.Add(clonedChannel);
-            }
-
-            result.Add(clonedAnimation);
-        }
-
-        return result;
-    }
-
     static void ApplyInstanceMaterialOverrides(WGPUPrimitiveData primData, Season.Controls.Model model)
     {
         var colorTint = model.MaterialColor ?? Vector4.One;
         primData.BaseColor = primData.SourceBaseColor * colorTint;
         primData.OriginalBaseColorAlpha = primData.BaseColor.W;
         primData.RenderMode = model.Unlit ? 0u : 1u;
-        primData.CurrentAlpha = primData.OriginalBaseColorAlpha * model.Alpha;
-        primData.CurrentAlphaCutoff = primData.AlphaMode == 1u
-            ? primData.AlphaCutoff * model.Alpha
-            : primData.AlphaCutoff;
+        primData.CurrentAlpha = MaterialOps.CombineAlpha(primData.OriginalBaseColorAlpha, model.Alpha);
+        primData.CurrentAlphaCutoff = MaterialOps.CombineCutoff(primData.AlphaMode, primData.AlphaCutoff, model.Alpha);
     }
 
     /// <summary>
@@ -749,11 +702,7 @@ internal class WGPUModel
 
         if (gpuBake != null)
         {
-            var player = _asset._animationPlayer;
-            player.Advance(time);
-            int clip = player.CurrentAnimationIndex;
-            _skinning.SetInstance(0, (uint)clip, gpuBake.NormalizeTime(clip, player.AnimationTime, player.Loop));
-            _asset.CpuPoseStale = true;
+            GpuBakeRoute.Advance(_asset, _skinning, gpuBake, time);
 
             // Nothing is uploaded on this route: an empty stream is what tells JS the key now resolves to storage buffers rather than
             // to an upload, and it is also what keeps BeginSkinnedModelDraw from paying for a copy the kernel already made redundant.
@@ -1000,28 +949,16 @@ internal class WGPUModel
     // Non-instanced morph path: take the first 4 node weights
     // (the VS accumulates them under bit 64, matching native MaterialParams.MorphWeights).
     // 2-3 Step C: this helper is shared by shadow-copy advancement and both draw paths so that all three sites use identical values.
-    static Vector4 ExtractMorphWeights(GltfNodeBase? node)
-    {
-        if (node == null || node.Weights.Length == 0)
-            return Vector4.Zero;
-
-        var weights = node.Weights;
-        return new Vector4(
-            weights.Length > 0 ? weights[0] : 0f,
-            weights.Length > 1 ? weights[1] : 0f,
-            weights.Length > 2 ? weights[2] : 0f,
-            weights.Length > 3 ? weights[3] : 0f);
-    }
+    static Vector4 ExtractMorphWeights(GltfNodeBase? node) => MorphDelta.ExtractWeights(node);
 
     void SyncAlpha(float modelAlpha)
     {
         foreach (var prim in GetAllPrimitives())
         {
-            float finalAlpha = prim.OriginalBaseColorAlpha * modelAlpha;
-            prim.CurrentAlpha = finalAlpha;
+            prim.CurrentAlpha = MaterialOps.CombineAlpha(prim.OriginalBaseColorAlpha, modelAlpha);
 
             if (prim.AlphaMode == 1u)
-                prim.CurrentAlphaCutoff = prim.AlphaCutoff * modelAlpha;
+                prim.CurrentAlphaCutoff = MaterialOps.CombineCutoff(prim.AlphaMode, prim.AlphaCutoff, modelAlpha);
         }
     }
 

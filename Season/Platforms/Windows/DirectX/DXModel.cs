@@ -240,7 +240,7 @@ internal unsafe class DXModel : DXPrimitiveGroup
 
         instance._asset.gltfNodes = _asset.gltfNodes.Select(node => nodeMap[node]).ToList();
         instance._asset._nodeMap = _asset._nodeMap.ToDictionary(kvp => kvp.Key, kvp => nodeMap[kvp.Value]);
-        instance._asset._animations = CloneAnimations(_asset._animations, nodeMap);
+        instance._asset._animations = AnimationOps.CloneAnimations(_asset._animations, nodeMap);
         instance._asset._animationPlayer = new GLTFAnimationPlayer();
         instance._asset._animationPlayer.Initialize(instance._asset._animations);
         instance._asset.PlayAnimation();
@@ -401,111 +401,6 @@ internal unsafe class DXModel : DXPrimitiveGroup
         }
 
         return clone;
-    }
-
-    static void ApplyInstanceMaterialOverrides(PrimitiveData primitiveData, Season.Controls.Model model)
-    {
-        var colorTint = model.MaterialColor ?? Vector4.One;
-        primitiveData.MaterialParams.BaseColor *= colorTint;
-        primitiveData.MaterialParams.RenderMode = model.Unlit ? 0u : 1u;
-        primitiveData.MaterialParams.IsSkinned = primitiveData.OwnerNode?.Skin != null ? 1u : 0u;
-        primitiveData.MaterialParams.BonePaletteStride = 1;
-        primitiveData.OriginalBaseColorAlpha = primitiveData.MaterialParams.BaseColor.W;
-    }
-
-    /// <summary>
-    /// Replaces one primitive's RGB with the override the model holds for its part, if any. Absolute rather than
-    /// multiplicative - see <see cref="Season.Controls.Model.SetPartColor"/> for why a tint cannot recolor a saturated
-    /// material. W is left untouched because the alpha chain belongs to SyncAlpha.
-    /// </summary>
-    static void ApplyPartColorOverride(PrimitiveData primitiveData, Season.Controls.Model model)
-    {
-        if (!model.TryGetPartColor(primitiveData.PartName, primitiveData.PartNodeName, out var color))
-            return;
-
-        var baseColor = primitiveData.MaterialParams.BaseColor;
-        primitiveData.MaterialParams.BaseColor = new Vector4(color.X, color.Y, color.Z, baseColor.W);
-    }
-
-    /// <summary>
-    /// Pushes <c>Model.SetPartColor</c> into every primitive's material CB: RGB becomes the override, or the load-time
-    /// baseline when the override was cleared. Gated on <see cref="Season.Controls.Model.PartColorVersion"/>, so a steady
-    /// frame pays one integer compare; when it does move, all N-buffered frames are written, the same stale-frame rule
-    /// SyncAlpha follows. The canonical <c>MaterialParams</c> struct is updated too, so anything that rewrites the CBs from
-    /// it later (the skinning sync, a clone) sees the same colors this frame drew.
-    /// </summary>
-    void SyncPartColors(Season.Controls.Model model)
-    {
-        if (_appliedPartColorVersion == model.PartColorVersion)
-            return;
-        _appliedPartColorVersion = model.PartColorVersion;
-
-        int n = (int)Device.frameCount;
-        var primitives = new List<PrimitiveData>();
-        CollectAllPrimitives(primitives);
-
-        foreach (var primitive in primitives)
-        {
-            var rgb = model.TryGetPartColor(primitive.PartName, primitive.PartNodeName, out var color)
-                ? new Vector3(color.X, color.Y, color.Z)
-                : primitive.PartBaseColor;
-
-            var canonical = primitive.MaterialParams;
-            canonical.BaseColor = new Vector4(rgb.X, rgb.Y, rgb.Z, canonical.BaseColor.W);
-            primitive.MaterialParams = canonical;
-
-            for (int i = 0; i < n; i++)
-            {
-                var materialParams = Unsafe.Read<MaterialParams>(primitive.MappedMaterialBuffers[i]);
-                materialParams.BaseColor = new Vector4(rgb.X, rgb.Y, rgb.Z, materialParams.BaseColor.W);
-                Unsafe.Write(primitive.MappedMaterialBuffers[i], materialParams);
-            }
-        }
-    }
-
-    internal static List<GLTFAnimation> CloneAnimations(List<GLTFAnimation> sourceAnimations, Dictionary<GltfNodeBase, GltfNodeBase> nodeMap)
-    {
-        var result = new List<GLTFAnimation>(sourceAnimations.Count);
-        foreach (var sourceAnimation in sourceAnimations)
-        {
-            var clonedAnimation = new GLTFAnimation
-            {
-                Name = sourceAnimation.Name,
-            };
-
-            foreach (var sourceChannel in sourceAnimation.Channels)
-            {
-                var clonedSampler = new AnimationSampler
-                {
-                    Inputs = new List<float>(sourceChannel.Sampler?.Inputs ?? new List<float>()),
-                    Values = new List<float>(sourceChannel.Sampler?.Values ?? new List<float>()),
-                    InTangents = sourceChannel.Sampler?.InTangents != null ? new List<float>(sourceChannel.Sampler.InTangents) : null,
-                    OutTangents = sourceChannel.Sampler?.OutTangents != null ? new List<float>(sourceChannel.Sampler.OutTangents) : null,
-                    OutputElementCount = sourceChannel.Sampler?.OutputElementCount ?? 4,
-                    Interpolation = sourceChannel.Sampler?.Interpolation ?? Season.Models.AnimationInterpolationMode.Linear,
-                };
-
-                var clonedChannel = new Season.Models.AnimationChannel
-                {
-                    Sampler = clonedSampler,
-                    Target = sourceChannel.Target == null
-                        ? null
-                        : new AnimationChannelTarget
-                        {
-                            Node = sourceChannel.Target.Node != null ? nodeMap[sourceChannel.Target.Node] : null,
-                            Path = sourceChannel.Target.Path,
-                        }
-                };
-
-                clonedAnimation.Samplers.Add(clonedSampler);
-                if (clonedChannel.Target != null)
-                    clonedAnimation.Channels.Add(clonedChannel);
-            }
-
-            result.Add(clonedAnimation);
-        }
-
-        return result;
     }
 
     GltfNodeBase CreateGLTFNode(SharpGLTF.Schema2.Node node)
@@ -1101,13 +996,6 @@ internal unsafe class DXModel : DXPrimitiveGroup
         }
     }
 
-    /// <summary>
-    /// Latch of <see cref="Season.Controls.Model.PartColorVersion"/> this group's material CBs currently hold. Starts at a
-    /// value no model can report, so the first Update always syncs - which also bakes in a set that was made between the
-    /// load-time ProcessMaterial/ClonePrimitiveData pass and the first frame.
-    /// </summary>
-    int _appliedPartColorVersion = int.MinValue;
-
     public void Update(Season.Controls.Model model, float time)
     {
         bool wasInitialized = _transformInitialized;
@@ -1118,17 +1006,8 @@ internal unsafe class DXModel : DXPrimitiveGroup
 
         if (gpuBake != null)
         {
-            // The kernel samples the bake, so no curve is evaluated and no node transform is touched: the clock and one 16-byte
-            // parameter row are the whole per-frame cost. WorldTransform stays at rest, which is exactly what the palette is
-            // relative to - the vertex stage multiplies each primitive by restWorld * userTransform while the palette carries
-            // inverse(restWorld), so the two cancel and only the user transform survives.
-            var player = _asset._animationPlayer;
-            player.Advance(time);
-            int clip = player.CurrentAnimationIndex;
-            _skinning.SetInstance(0, (uint)clip, gpuBake.NormalizeTime(clip, player.AnimationTime, player.Loop));
-
-            // Picking cannot read a storage buffer, so it asks for a CPU pose instead; see GltfAsset.EnsureCpuPose.
-            _asset.CpuPoseStale = true;
+            // The kernel samples the bake, so the CPU only advances the clock and publishes the instance row.
+            GpuBakeRoute.Advance(_asset, _skinning, gpuBake, time);
         }
         else
         {
@@ -1255,54 +1134,9 @@ internal unsafe class DXModel : DXPrimitiveGroup
         // sync is version-gated, so this costs one compare on every frame that did not change the part-color set.
         SyncPartColors(model);
 
-        // Unified highlighting: sync the wireframe bit
-        // (runtime on/off is supported) and lazily build per-primitive shell
-        // geometry on the first enabled frame, then keep it resident. When fully
-        // disabled, there is no memory cost and no draw.
-        // Each frame writes "node WorldTransform x userTransform" plus face/edge
-        // colors into every shell box. This stays in sync with
-        // ApplyUserTransformToNodeTree rendering, because shell vertices are in
-        // node-local space. Without the node matrix, shells shift or scale
-        // incorrectly as a whole, for example when GLB root-node scaling makes
-        // the shell larger than the model. Face alpha is animated per frame.
-        _wireframeEnabled = model.Highlight.Wireframe;
-        if (_wireframeEnabled)
-        {
-            EnsureWireframeHighlights(model.Highlight.EdgeWidth,
-                MathF.Max(model.LocalSize.X, MathF.Max(model.LocalSize.Y, model.LocalSize.Z)));
-            if (_wireframeBoxes != null)
-            {
-                for (int i = 0; i < _wireframeBoxes.Count; i++)
-                {
-                    var highlight = _wireframeBoxes[i];
-                    if (highlight != null)
-                    {
-                        var nodeWorld = highlight.OwnerNode?.WorldTransform ?? Matrix4x4.Identity;
-                        WriteHighlightBox(highlight, nodeWorld * userTransform, model.Highlight.SurfaceColor, model.Highlight.EdgeColor);
-                    }
-                }
-            }
-        }
-
-        // Unified highlighting: sync the bounds box.
-        // Box geometry is built lazily on the first enabled frame. Face/edge
-        // colors are independent of the model alpha chain and are written every
-        // frame. Boxes with near-zero extents (unloaded / degenerate) stay off.
-        _boundsActive = model.Highlight.Bounds;
-        if (_boundsActive)
-        {
-            var bounds = model.GetWorldBoundsRaw();
-            if (bounds.Extents.LengthSquared() >= 1e-12f)
-            {
-                _boundsBox ??= CreateBoundsBox();
-                WriteHighlightBox(_boundsBox,
-                    Matrix4x4.CreateScale(bounds.Extents * 2f) * Matrix4x4.CreateTranslation(bounds.Center),
-                    model.Highlight.SurfaceColor, model.Highlight.EdgeColor);
-            }
-        }
-
-        SetOutline2DState(model.Highlight.Outline,
-            model.Highlight.OutlineColor, model.Highlight.OutlineWidth);
+        // Unified highlighting: wireframe shells, Bounds box and Outline2D state, in the shared order. Everything that
+        // differs per API is behind WriteHighlightBox.
+        SyncModelHighlight(model, userTransform);
     }
 
     /// <summary>

@@ -92,7 +92,12 @@ internal class Robots : Panel
             var person = new Person()
             {
                 PosX = -2,
-                PosY = 1f,
+                // 0.5 = grass at y=0 plus half the body: Pos is the world position of the bounding-box
+                // centre (see InstancedMesh3DBase.TemplateAnchorLocal), so the feet sit at PosY - Height/2.
+                // This used to read 1f, which was "standing on the ground" under the retired top-face
+                // anchor (Min.X, Max.Y, Min.Z). Moving the anchor to the centre left it behind, lifting
+                // the whole row half a body off the grass.
+                PosY = 0.5f,
                 PosZ = 6 + i * 3,
                 Width = 1,
                 Height = 1,
@@ -109,7 +114,7 @@ internal class Robots : Panel
             var person = new Person()
             {
                 PosX = 2,
-                PosY = 1f,
+                PosY = 0.5f,   // Same centre-anchor placement as the left-hand row: feet on the grass at y=0.
                 PosZ = 6 + i * 3,
                 Width = 1,
                 Height = 1,
@@ -128,7 +133,9 @@ internal class Robots : Panel
             Name = "Assets/Happy.png",
             Color = Season.Basic.Colors.White,
             PosX = Persons[0].PosX,
-            PosY = Persons[0].PosY + Persons[0].Height / 3,
+            // PosY is the box centre now, so the head is half a body above it; the emoji keeps the
+            // third-of-a-body clearance over that head, i.e. the absolute height it has always had.
+            PosY = Persons[0].PosY + Persons[0].Height * 0.5f + Persons[0].Height / 3,
             PosZ = Persons[0].PosZ,
             Width = 0.3f,
             Height = 0.3f,

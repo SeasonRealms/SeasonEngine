@@ -38,6 +38,15 @@ internal unsafe struct DXSceneDrawCommand : ISceneDrawCommand
         // root parameters (the b3 placeholder CBV plus seven tables) repeat per draw.
         Pipeline.SetPipeline(Mode, Cull, DepthWrite, sceneSignatureBound: true);
         Pipeline.SceneReplayDrawCount++;
+        // S0 baseline: the replay half of the trace. This is the only place the DX backend reaches
+        // DrawIndexedInstanced for scene geometry, so without this line the trace would show the collection order
+        // (what the group code decided) but not the submission order (what the queue finally emitted, after the
+        // opaque discard and the transparent re-sort). The AO exemption is not carried on this struct -- it only
+        // exists as the DepthWrite flag already printed on the SetPipeline line just above, and as the indirect
+        // form has no CPU-side counts, index and instance counts read 0 there by construction.
+        if (DrawTrace.On)
+            DrawTrace.Draw("dx", "replay", Cull == PipelineCullVariant.None, aoExempt: false,
+                Count, InstanceCount, StartInstance, collecting: false, part: null);
         // 3A micro accounting: SetPipeline always rewrites the b6 boneBase half (one root-constant call);
         // this command then adds five CBVs and one table per non-zero texture slot.
         int roots = 1;

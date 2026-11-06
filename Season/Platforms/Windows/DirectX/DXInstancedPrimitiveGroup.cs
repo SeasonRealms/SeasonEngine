@@ -18,35 +18,11 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     // _currentAlpha / _transformInitialized / Name / SyncAlpha / CreateMaterialBuffer / WriteMaterialBuffer
     // All inherited from DXPrimitiveGroup and not repeated here.
 
-    protected readonly List<PrimitiveData> _primitives = new();
-    protected readonly List<PrimitiveData> _opaquePrimitives = new();
-    protected readonly List<PrimitiveData> _transparentPrimitives = new();
-    protected readonly List<int> _transparentInstanceOrder = new();
-
+    // The primitive buckets, the per-instance world matrices, the transparent instance order, the wireframe /
+    // Outline2D activation state and the merged cull box all live in PrimitiveGroupCore.Instanced.cs: they are
+    // CPU-side bookkeeping that every instance backend keeps identical, and the transparent sort reads the world
+    // matrices, so the two cannot be separated. Only the D3D12 instance stream below is backend state.
     protected InstanceTransformData[] _instanceData = Array.Empty<InstanceTransformData>();
-    protected Matrix4x4[] _instanceWorlds = Array.Empty<Matrix4x4>();
-
-    // _wireframeActive = true when any enabled instance has Wireframe on.
-    // It gates Draw, so there is no cost when fully disabled.
-    // Shell-geometry templates and per-instance shell boxes are built lazily by
-    // the base-class highlight pool.
-    protected bool _wireframeActive;
-
-    // Outline2D (per-instance activation): list of active-instance writeIndex
-    // slots for this frame, rebuilt every frame.
-    // When the host is active as a whole (_outline2DHostActive), this list is
-    // ignored and the mask is drawn for all instances.
-    // For per-instance activation, the composed frame color / width comes from
-    // the first active instance (the picker writes panel colors there); host
-    // activation uses the host values instead.
-    protected readonly List<int> _outline2DInstances = new();
-    protected bool _outline2DHostActive;
-    protected Vector4 _outline2DInstanceColor;
-    protected float _outline2DInstanceWidth;
-
-    /// <summary>Per-instance outline colors aligned with `_outline2DInstances`,
-    /// rebuilt every frame. The per-slot mask fetches color by slot.</summary>
-    protected readonly List<Vector4> _outline2DInstanceColors = new();
 
     protected ID3D12Resource*[] _matrixBuffers = null!;
     protected byte*[] _mappedMatrixBuffers = null!;
@@ -82,7 +58,6 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     protected ID3D12Resource*[] _instanceBuffers = EmptyResourceRing;
     protected VertexBufferView[] _instanceBufferViews = Array.Empty<VertexBufferView>();
     protected int _instanceCapacity;
-    protected int _instanceCount;
 
     /// <summary>This frame's IA instance buffer and view.</summary>
     protected ID3D12Resource* CurrentInstanceBuffer
@@ -178,10 +153,6 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     byte[]? _cullArgsTemplate;
     bool _cullRegistered;
 
-    /// <summary>Group-local merged bounding box. The culling kernel uses it to convert instance matrices into world bounding spheres, so a multi-surface group must pass the union.</summary>
-    Vector3 _cullLocalCenter;
-    Vector3 _cullLocalExtents;
-
     /// <summary>Whether this frame has transitioned the reorder stream and indirect args into a drawable state. Cleared at the start of Update, set by PrepareCullDraw.</summary>
     bool _cullDrawReady;
 
@@ -269,34 +240,6 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
             Unsafe.Write(primitiveData.MappedMaterialBuffers[i], primitiveData.MaterialParams);
     }
 
-    /// <summary>Rebuilds the Opaque/Transparent buckets from IsTransparent.</summary>
-    protected void RebuildPrimitiveBuckets()
-    {
-        _opaquePrimitives.Clear();
-        _transparentPrimitives.Clear();
-
-        foreach (var primitive in _primitives)
-        {
-            if (primitive.IsTransparent)
-                _transparentPrimitives.Add(primitive);
-            else
-                _opaquePrimitives.Add(primitive);
-        }
-
-        UpdateCullLocalBounds();
-    }
-
-    /// <summary>
-    /// Override the cull box with a caller-computed one. A glTF model must: its primitives' local boxes live in their own node spaces
-    /// and ignore animation, while the kernel transforms the box by the root instance world, so the box has to be in model space and
-    /// cover every pose the clips can reach (see <see cref="InstancedModel.TemplateCullBounds"/>).
-    /// </summary>
-    protected void SetCullLocalBounds(Season.Rendering.Bounds3D bounds)
-    {
-        _cullLocalCenter = bounds.Center;
-        _cullLocalExtents = bounds.Extents;
-    }
-
     /// <summary>
     /// Latch this frame's A7 state at the top of Update. The transition state is recomputed each frame: last frame's true must not
     /// keep authorizing this frame's indirect draw.
@@ -305,32 +248,6 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     {
         _cullDrawReady = false;
         _cullMainView = owner.EffectiveDrawPath == InstanceDrawPath.Indirect;
-    }
-
-    /// <summary>
-    /// Merge the local bounding boxes of all primitives into a group-level merged box. The culling kernel takes
-    /// only one box, so the union is mandatory: passing one surface's box would make the other surfaces' instances
-    /// outside the box get wrongly culled in batches.
-    /// </summary>
-    void UpdateCullLocalBounds()
-    {
-        if (_primitives.Count == 0)
-        {
-            _cullLocalCenter = Vector3.Zero;
-            _cullLocalExtents = Vector3.Zero;
-            return;
-        }
-
-        var min = new Vector3(float.MaxValue);
-        var max = new Vector3(float.MinValue);
-        foreach (var primitive in _primitives)
-        {
-            min = Vector3.Min(min, primitive.LocalBoundsCenter - primitive.LocalBoundsExtents);
-            max = Vector3.Max(max, primitive.LocalBoundsCenter + primitive.LocalBoundsExtents);
-        }
-
-        _cullLocalCenter = (min + max) * 0.5f;
-        _cullLocalExtents = (max - min) * 0.5f;
     }
 
     // ============================================================
@@ -730,43 +647,12 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         SyncAlpha(alpha);
     }
 
-    /// <summary>Whether this group owns a previous-frame bone palette. Only the model path does; a static surface group has no skinning.</summary>
-    protected virtual bool HasPrevBoneHistory => false;
-
-    /// <summary>Whether this group owns previous-frame morph weights. Model-only for the same reason as <see cref="HasPrevBoneHistory"/>.</summary>
-    protected virtual bool HasPrevMorphHistory => false;
-
     /// <summary>
-    /// 2-3 Step C: publishes whether previous-frame data may be read this frame, on the main primitives and the highlight shells alike.
-    /// It is called every frame instead of once, because "the previous frame" is only the previous frame while the compacted instance
-    /// order holds: switching one instance off shifts every later instance's slot, and reading history then pairs each instance with its
-    /// predecessor (a one-frame velocity spike on everything past the change). Passing false makes the shaders fall back to current data.
-    /// Shell primitives are kept in sync (plan risk 2), otherwise the shell keeps a trail the body no longer has.
+    /// D3D12 records a group's draw commands into <see cref="DXSceneDrawCollection"/> and replays them later, so the
+    /// transparent order is fixed at record time and must not be re-sorted: the replay does not come back through the
+    /// sort, and the two orders would then disagree. Vulkan and Metal submit immediately and keep the core default.
     /// </summary>
-    protected void UpdatePrevStateFlags(bool historyValid)
-    {
-        uint prevWorld = historyValid ? 1u : 0u;
-        uint prevBones = historyValid && HasPrevBoneHistory ? 1u : 0u;
-        uint prevMorph = historyValid && HasPrevMorphHistory ? 1u : 0u;
-
-        for (int i = 0; i < _primitives.Count; i++)
-        {
-            var primitive = _primitives[i];
-            if (primitive.MaterialParams.HasPrevInstanceWorld == prevWorld
-                && primitive.MaterialParams.HasPrevBones == prevBones
-                && primitive.MaterialParams.HasPrevMorph == prevMorph)
-                continue;
-
-            primitive.MaterialParams.HasPrevInstanceWorld = prevWorld;
-            primitive.MaterialParams.HasPrevBones = prevBones;
-            primitive.MaterialParams.HasPrevMorph = prevMorph;
-            for (int f = 0; f < Device.frameCount; f++)
-                Unsafe.Write(primitive.MappedMaterialBuffers[f], primitive.MaterialParams);
-        }
-
-        // Both template sets and both instance-box pools: a pooled box may have been created before the flags settled.
-        SyncShellPrevFlags(prevWorld != 0, prevBones != 0, prevMorph != 0);
-    }
+    protected override bool IsQueuedReplayActive => DXSceneDrawCollection.Active != null;
 
     // SyncAlpha is inherited from DXPrimitiveGroup and adapts automatically
     // through the CollectPrimitives override
@@ -863,96 +749,55 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         }
     }
 
-    // ============================================================
-    // Draw (three-bucket flow: Opaque -> Fade -> Transparent)
-    // ============================================================
+    /// <summary>
+    /// Main pass for the instance group. Overrides the core entry rather than hiding it, so a
+    /// <see cref="Season.Rendering.Drawables.PrimitiveGroupCore{TPrim, TMat, TTex}"/> reference dispatches here.
+    /// The bucket walk, the fade decision and the two-pass transparent split live in
+    /// <c>PrimitiveGroupCore.DrawInstancedMainPass</c>.
+    /// </summary>
+    public override void Draw() => DrawInstancedMainPass();
 
-    public override void Draw()
+    protected override void OnBeginMainPass()
+        => DrawTrace.Group("dx", "main", Name, _opaquePrimitives.Count);
+
+    protected override void DrawOpaqueInstances(PrimitiveData primitive, int streamIndex, bool fadeInsteadOfOpaque)
     {
-        if (!_transformInitialized || _instanceCount == 0)
-            return;
+        int fi = (int)Device.FrameIndex;
+        var lightCB = DXPrimitiveGroup.lightConstantBuffers[fi];
 
-        var lightCB = DXPrimitiveGroup.lightConstantBuffers[(int)Device.FrameIndex];
-        bool forceFadeByAlpha = _currentAlpha < 1f;
-
-        // 1. Opaque (use the Opaque PSO when overall alpha >= 1, otherwise Fade)
         // A7 main view: the opaque body reads the culled, compacted main-view segment and takes its instance count from the
         // indirect args. Fade stays direct: the scene collector splits a Fade draw per instance for back-to-front order,
         // which a GPU-sized draw cannot be, and a fading group is about to change visibility anyway.
-        if (!forceFadeByAlpha && TryGetMainViewSegment(0, out var segment, out var sortedResource, out var argsResource))
+        if (!fadeInsteadOfOpaque && TryGetMainViewSegment(0, out var segment, out var sortedResource, out var argsResource))
         {
-            int fiMain = (int)Device.FrameIndex;
-            for (int i = 0; i < _opaquePrimitives.Count; i++)
-            {
-                var primitive = _opaquePrimitives[i];
-                Pipeline.SetPipeline(PipelineMode.Opaque, primitive.DoubleSided);
-                Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fiMain], &segment, 0, 0,
-                    GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(),
-                    sortedResource, argsResource,
-                    Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, i), CurrentInstanceBuffer,
-                    instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
-                Season.Rendering.InstanceCull.MainViewDraws++;
-            }
-        }
-        else
-        {
-            for (int i = 0; i < _opaquePrimitives.Count; i++)
-            {
-                var primitive = _opaquePrimitives[i];
-                Pipeline.SetPipeline(forceFadeByAlpha ? PipelineMode.Fade : PipelineMode.Opaque, primitive.DoubleSided);
-                DrawPrimitiveInstances(primitive, lightCB, (uint)_instanceCount, 0);
-            }
+            Pipeline.SetPipeline(PipelineMode.Opaque, primitive.DoubleSided);
+            Pipeline.DrawPrimitive(primitive, lightCB, _matrixBuffers[fi], &segment, 0, 0,
+                GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(),
+                sortedResource, argsResource,
+                Season.Rendering.InstanceCull.ArgsOffset(Season.Rendering.InstanceCull.MainViewSlot, streamIndex), CurrentInstanceBuffer,
+                instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
+            Season.Rendering.InstanceCull.MainViewDraws++;
+            return;
         }
 
-        // 2. Transparent (actual BLEND materials)
-        for (int i = 0; i < _transparentPrimitives.Count; i++)
-        {
-            var primitive = _transparentPrimitives[i];
-            BuildTransparentInstanceOrder(primitive);
-
-            for (int orderIndex = 0; orderIndex < _transparentInstanceOrder.Count; orderIndex++)
-            {
-                int instanceIndex = _transparentInstanceOrder[orderIndex];
-                if (primitive.DoubleSided)
-                {
-                    Pipeline.SetPipeline(PipelineMode.Transparent, PipelineCullVariant.Front);
-                    DrawPrimitiveInstances(primitive, lightCB, 1, (uint)instanceIndex);
-                }
-
-                Pipeline.SetPipeline(PipelineMode.Transparent, primitive.DoubleSided ? PipelineCullVariant.Back : PipelineCullVariant.Back);
-                DrawPrimitiveInstances(primitive, lightCB, 1, (uint)instanceIndex);
-            }
-        }
-
-        // Unified highlighting: per-instance highlighting
-        // (bounds boxes + wireframe shell boxes; enabled instances this frame,
-        // with transparent faces in 2-pass mode plus opaque edges, drawn after
-        // all regular surfaces)
-        if (_boundsActive)
-            DrawBoundsBoxes(lightCB);
-        if (_wireframeActive)
-            DrawShellBoxes(lightCB, CurrentInstanceBuffer, CurrentInstanceBufferView);
+        Pipeline.SetPipeline(fadeInsteadOfOpaque ? PipelineMode.Fade : PipelineMode.Opaque, primitive.DoubleSided);
+        DrawPrimitiveInstances(primitive, lightCB, (uint)_instanceCount, 0);
     }
 
-    void BuildTransparentInstanceOrder(PrimitiveData primitive)
+    protected override void DrawTransparentInstance(PrimitiveData primitive, int instanceIndex, bool frontFace)
     {
-        _transparentInstanceOrder.Clear();
-        for (int i = 0; i < _instanceCount; i++)
-            _transparentInstanceOrder.Add(i);
-        if (DXSceneDrawCollection.Active != null) return;
-
-        _transparentInstanceOrder.Sort((a, b) =>
-        {
-            float depthA = ComputeTransparentDepth(_instanceWorlds[a], primitive.LocalBoundsCenter);
-            float depthB = ComputeTransparentDepth(_instanceWorlds[b], primitive.LocalBoundsCenter);
-            return depthB.CompareTo(depthA);
-        });
+        Pipeline.SetPipeline(PipelineMode.Transparent, frontFace ? PipelineCullVariant.Front : PipelineCullVariant.Back);
+        DrawPrimitiveInstances(primitive, DXPrimitiveGroup.lightConstantBuffers[(int)Device.FrameIndex], 1, (uint)instanceIndex);
     }
 
-    static float ComputeTransparentDepth(Matrix4x4 world, Vector3 localCenter)
-    {
-        return RenderView.SortDepth(Vector3.Transform(localCenter, world));
-    }
+    // Unified highlighting: per-instance bounds boxes plus wireframe shell boxes. It uses the instances
+    // enabled for this frame, draws transparent faces in two passes plus opaque edges, and runs after all
+    // surfaces have finished.
+    protected override void DrawInstanceBoundsBoxes()
+        => DrawBoundsBoxes(DXPrimitiveGroup.lightConstantBuffers[(int)Device.FrameIndex]);
+
+    protected override void DrawInstanceShellBoxes()
+        => DrawShellBoxes(DXPrimitiveGroup.lightConstantBuffers[(int)Device.FrameIndex], CurrentInstanceBuffer, CurrentInstanceBufferView);
 
     void DrawPrimitiveInstances(PrimitiveData primitiveData, ID3D12Resource* lightConstantBuffer, uint instanceCount, uint startInstanceLocation)
     {
@@ -1039,20 +884,23 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     /// Uses the same group-level Matrix CB + instance buffer as the main pass.
     /// Group-invariant t6/t8/t9/t10 are bound once before the primitive loop
     /// (see Pipeline.SetShadowGroupBindings).
+    /// The loop, the shared-material decision and the skip accounting live in
+    /// <c>PrimitiveGroupCore.DrawInstancedShadowPass</c>.
     /// </summary>
-    public override void DrawShadow()
-    {
-        if (!_transformInitialized || _instanceCount == 0)
-            return;
+    public override void DrawShadow() => DrawInstancedShadowPass();
 
+    protected override void OnBeginShadowPass()
+    {
+        DrawTrace.Group("dx", "shadow", Name, _opaquePrimitives.Count);
         Pipeline.SetShadowGroupBindings(GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(),
             GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle());
+    }
 
-        // When b2/t5 are identical within the group, only let the first
-        // primitive bind them (see CanShareShadowMaterial)
-        bool shareMaterial = CanShareShadowMaterial(_opaquePrimitives);
-        bool materialBound = false;
+    /// <summary>A generated group owns one group-wide stream, so every opaque primitive is drawable.</summary>
+    protected override bool TryBeginInstancePrimitive(PrimitiveData primitive) => true;
 
+    protected override void DrawShadowInstance(PrimitiveData primitive, int streamIndex, bool bindMaterial)
+    {
         int fi = (int)Device.FrameIndex;
 
         // A7: when this frame's culling chain is ready, the instance stream reads this slot's reorder segment and
@@ -1061,24 +909,16 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         // where the parameters come from, it does not merge draws.
         if (TryGetShadowSegment(0, out var slotView, out var argsResource, out int slot))
         {
-            for (int i = 0; i < _opaquePrimitives.Count; i++)
-            {
-                Pipeline.DrawShadowPrimitiveIndirect(_opaquePrimitives[i], _matrixBuffers[fi], &slotView,
-                    argsResource, Season.Rendering.InstanceCull.ArgsOffset(slot, i),
-                    bindMaterial: !shareMaterial || !materialBound);
-                materialBound = true;
-            }
+            Pipeline.DrawShadowPrimitiveIndirect(primitive, _matrixBuffers[fi], &slotView,
+                argsResource, Season.Rendering.InstanceCull.ArgsOffset(slot, streamIndex),
+                bindMaterial: bindMaterial);
             return;
         }
 
         var shadowVBValue = CurrentInstanceBufferView;
         VertexBufferView* shadowVB = &shadowVBValue;
-        for (int i = 0; i < _opaquePrimitives.Count; i++)
-        {
-            Pipeline.DrawShadowPrimitive(_opaquePrimitives[i], _matrixBuffers[fi], shadowVB,
-                (uint)_instanceCount, 0, bindMaterial: !shareMaterial || !materialBound);
-            materialBound = true;
-        }
+        Pipeline.DrawShadowPrimitive(primitive, _matrixBuffers[fi], shadowVB,
+            (uint)_instanceCount, 0, bindMaterial: bindMaterial);
     }
 
     /// <summary>
@@ -1089,44 +929,42 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
     /// stream with an identity matrix, causing missing / misaligned instances, so
     /// this override is required.
     /// Transparent buckets are skipped, matching the base-class mask semantics.
+    /// The loop and the slot guard live in <c>PrimitiveGroupCore.DrawInstancedOutlineMask</c>.
     /// </summary>
-    public override void DrawOutlineMask()
+    public override void DrawOutlineMask() => DrawInstancedOutlineMask();
+
+    /// <summary>Root constant b6: one colour for the whole group. Several colours may occur in the same
+    /// frame; the value is the group colour fixed during UpdateInstanceData.</summary>
+    protected override void OnBeginOutlineMaskPass() => Pipeline.SetOutlineMaskColor(_outline2DColor);
+
+    /// <summary>A generated group owns one group-wide stream, so every opaque primitive is drawable.</summary>
+    protected override bool TryBeginOutlineMaskPrimitive(PrimitiveData primitive)
     {
-        if (!_transformInitialized || _instanceCount == 0 || !Outline2DActive)
-            return;
+        Pipeline.SetPipeline(PipelineMode.Opaque,
+            primitive.DoubleSided ? PipelineCullVariant.None : PipelineCullVariant.Back, depthWrite: false);
+        return true;
+    }
 
-        // Rewrite outline color per group through root constant b6. Multiple
-        // colors may exist in the same frame; colors come from the group color
-        // fixed during UpdateInstanceData (instance color or host color).
-        Pipeline.SetOutlineMaskColor(_outline2DColor);
-
+    protected override void DrawOutlineMaskBatch(PrimitiveData primitive)
+    {
         int fi = (int)Device.FrameIndex;
-        var lightCB = DXPrimitiveGroup.lightConstantBuffers[fi];
-        var instanceBuffer = CurrentInstanceBuffer;
         var instanceVBValue = CurrentInstanceBufferView;
         VertexBufferView* instanceVB = &instanceVBValue;
-        for (int i = 0; i < _opaquePrimitives.Count; i++)
-        {
-            var p = _opaquePrimitives[i];
-            Pipeline.SetPipeline(PipelineMode.Opaque,
-                p.DoubleSided ? PipelineCullVariant.None : PipelineCullVariant.Back, depthWrite: false);
-            if (_outline2DHostActive)
-            {
-                Pipeline.DrawPrimitive(p, lightCB, _matrixBuffers[fi], instanceVB, (uint)_instanceCount, 0,
-                    GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer, instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
-            }
-            else
-            {
-                for (int k = 0; k < _outline2DInstances.Count; k++)
-                {
-                    int idx = _outline2DInstances[k];
-                    if ((uint)idx >= (uint)_instanceCount)
-                        continue;
-                    Pipeline.DrawPrimitive(p, lightCB, _matrixBuffers[fi], instanceVB, 1, (uint)idx,
-                        GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(), instanceBuffer, instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
-                }
-            }
-        }
+        Pipeline.DrawPrimitive(primitive, DXPrimitiveGroup.lightConstantBuffers[fi], _matrixBuffers[fi], instanceVB,
+            (uint)_instanceCount, 0,
+            GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(),
+            CurrentInstanceBuffer, instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
+    }
+
+    protected override void DrawOutlineMaskInstance(PrimitiveData primitive, int instanceIndex, int slot)
+    {
+        int fi = (int)Device.FrameIndex;
+        var instanceVBValue = CurrentInstanceBufferView;
+        VertexBufferView* instanceVB = &instanceVBValue;
+        Pipeline.DrawPrimitive(primitive, DXPrimitiveGroup.lightConstantBuffers[fi], _matrixBuffers[fi], instanceVB,
+            1, (uint)instanceIndex,
+            GetInstanceBoneSrvHandle(), GetPrevBoneSrvHandle(), GetPrevInstanceWorldSrvHandle(), GetPrevMorphSrvHandle(),
+            CurrentInstanceBuffer, instanceExtrasSrvHandle: GetInstanceExtrasSrvHandle());
     }
 
     /// <summary>
