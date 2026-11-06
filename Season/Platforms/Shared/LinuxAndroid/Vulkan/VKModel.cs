@@ -162,64 +162,9 @@ internal unsafe class VKModel : VKPrimitiveGroup
         instance.CreatePrevBonePaletteBuffer();
         instance.CreatePrevMorphWeightsBuffer();
 
-        var nodeMap = new Dictionary<GltfNodeBase, GltfNodeBase>();
-        foreach (var nodeBase in _asset.gltfNodes)
-            instance.EnsureClonedNode(nodeMap, nodeBase, model);
-
-        var skinMap = new Dictionary<GLTFSkin, GLTFSkin>();
-        foreach (var sourceSkin in _asset.GetAllSkins())
-        {
-            skinMap[sourceSkin] = new GLTFSkin
-            {
-                Name = sourceSkin.Name,
-                InverseBindMatrices = new List<Matrix4x4>(sourceSkin.InverseBindMatrices),
-                Joints = new List<GltfNodeBase>(),
-            };
-
-            foreach (var joint in sourceSkin.Joints)
-                instance.EnsureClonedNode(nodeMap, joint, model);
-
-            if (sourceSkin.SkeletonRoot != null)
-                instance.EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model);
-
-            if (sourceSkin.BindNode != null)
-                instance.EnsureClonedNode(nodeMap, sourceSkin.BindNode, model);
-        }
-
-        foreach (var animation in _asset._animations)
-        {
-            foreach (var channel in animation.Channels)
-            {
-                if (channel.Target?.Node != null)
-                    instance.EnsureClonedNode(nodeMap, channel.Target.Node, model);
-            }
-        }
-
-        foreach (var nodeBase in _asset.gltfNodes)
-        {
-            var sourceNode = nodeBase;
-            var clonedNode = nodeMap[sourceNode];
-            clonedNode.Children = sourceNode.Children.Select(child => instance.EnsureClonedNode(nodeMap, child, model)).ToList();
-
-            if (sourceNode.Skin != null && skinMap.TryGetValue(sourceNode.Skin, out var clonedSkin))
-                clonedNode.Skin = clonedSkin;
-        }
-
-        foreach (var pair in skinMap)
-        {
-            var sourceSkin = pair.Key;
-            var clonedSkin = pair.Value;
-            clonedSkin.Joints = sourceSkin.Joints.Select(joint => instance.EnsureClonedNode(nodeMap, joint, model)).ToList();
-            clonedSkin.SkeletonRoot = sourceSkin.SkeletonRoot != null ? instance.EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model) : null;
-            clonedSkin.BindNode = sourceSkin.BindNode != null ? instance.EnsureClonedNode(nodeMap, sourceSkin.BindNode, model) : null;
-        }
-
-        instance._asset.gltfNodes = _asset.gltfNodes.Select(node => nodeMap[node]).ToList();
-        instance._asset._nodeMap = _asset._nodeMap.ToDictionary(kvp => kvp.Key, kvp => nodeMap[kvp.Value]);
-        instance._asset._animations = AnimationOps.CloneAnimations(_asset._animations, nodeMap);
-        instance._asset._animationPlayer = new GLTFAnimationPlayer();
-        instance._asset._animationPlayer.Initialize(instance._asset._animations);
-        instance._asset.PlayAnimation();
+        // Shared-template clone: GltfNodeGraph copies the tree, the skins and the clips onto this instance's own asset,
+        // so two controls holding one template pose independently. The node type and the primitive buffers are per-API.
+        GltfNodeGraph.Clone(_asset, instance._asset, model, instance.CreateClonedNode);
         // Shared-template instancing path:
         // inject the instance asset into the control, matching the semantics of direct-load Load.
         model.Asset = instance._asset;
@@ -247,62 +192,21 @@ internal unsafe class VKModel : VKPrimitiveGroup
         return instance;
     }
 
-    GltfNodeBase EnsureClonedNode(Dictionary<GltfNodeBase, GltfNodeBase> nodeMap, GltfNodeBase sourceNode, Season.Controls.Model model)
+    /// <summary>VK node clone: the shared identity copy, then one cloned primitive per source primitive, each with its
+    /// own vertex/index buffers and descriptor sets. The primitive is created here rather than in the shared graph walk
+    /// because <c>ClonePrimitiveData</c> is where the control's material overrides are folded in.</summary>
+    GltfNodeBase CreateClonedNode(GltfNodeBase sourceNode, Season.Controls.Model model)
     {
-        if (nodeMap.TryGetValue(sourceNode, out var existing))
-            return existing;
+        var vkNode = new GLTFNode();
+        sourceNode.CloneIdentityInto(vkNode);
 
-        GltfNodeBase clonedNode;
         if (sourceNode is GLTFNode sourceVkNode)
         {
-            var vkNode = new GLTFNode
-            {
-                Name = sourceVkNode.Name,
-                LogicalIndex = sourceVkNode.LogicalIndex,
-                Mesh = sourceVkNode.Mesh,
-                IsJoint = sourceVkNode.IsJoint,
-                JointIndex = sourceVkNode.JointIndex,
-                Translation = sourceVkNode.InitialTranslation,
-                Rotation = sourceVkNode.InitialRotation,
-                Scale = sourceVkNode.InitialScale,
-                InitialTranslation = sourceVkNode.InitialTranslation,
-                InitialRotation = sourceVkNode.InitialRotation,
-                InitialScale = sourceVkNode.InitialScale,
-                InitialWeights = sourceVkNode.InitialWeights.Length == 0 ? Array.Empty<float>() : (float[])sourceVkNode.InitialWeights.Clone(),
-                Weights = sourceVkNode.Weights.Length == 0 ? Array.Empty<float>() : (float[])sourceVkNode.Weights.Clone(),
-                WeightsVersion = sourceVkNode.WeightsVersion,
-                WorldTransform = sourceVkNode.WorldTransform,
-            };
-
             foreach (var primitive in sourceVkNode.Primitives)
                 vkNode.Primitives.Add(ClonePrimitiveData(primitive, vkNode, model));
-
-            clonedNode = vkNode;
-        }
-        else
-        {
-            clonedNode = new GltfNodeBase
-            {
-                Name = sourceNode.Name,
-                LogicalIndex = sourceNode.LogicalIndex,
-                Mesh = sourceNode.Mesh,
-                IsJoint = sourceNode.IsJoint,
-                JointIndex = sourceNode.JointIndex,
-                Translation = sourceNode.InitialTranslation,
-                Rotation = sourceNode.InitialRotation,
-                Scale = sourceNode.InitialScale,
-                InitialTranslation = sourceNode.InitialTranslation,
-                InitialRotation = sourceNode.InitialRotation,
-                InitialScale = sourceNode.InitialScale,
-                InitialWeights = sourceNode.InitialWeights.Length == 0 ? Array.Empty<float>() : (float[])sourceNode.InitialWeights.Clone(),
-                Weights = sourceNode.Weights.Length == 0 ? Array.Empty<float>() : (float[])sourceNode.Weights.Clone(),
-                WeightsVersion = sourceNode.WeightsVersion,
-                WorldTransform = sourceNode.WorldTransform,
-            };
         }
 
-        nodeMap[sourceNode] = clonedNode;
-        return clonedNode;
+        return vkNode;
     }
 
     PrimitiveData ClonePrimitiveData(PrimitiveData source, GLTFNode ownerNode, Season.Controls.Model model)

@@ -107,7 +107,7 @@ internal class WGPUModel
 
     /// <summary>Shared-template instancing: clones the node tree.
     /// PickMesh is immutable after loading, so it is shared by reference and keeps the picking-data chain
-    /// consistent with the direct-load path, see <see cref="EnsureClonedNode"/>.
+    /// consistent with the direct-load path, see <see cref="GltfNodeGraph.Clone"/>.
     /// No per-instance picking shadow is built (InstancePickNodeWorlds / Bones remain empty):
     /// static hosts are picked exactly through the <c>hasShadow</c> fallback path in InstancedModel.TryPickInstanceSurface,
     /// while animated hosts remain approximate, which is a documented boundary already described in the shared-layer comments.</summary>
@@ -138,63 +138,9 @@ internal class WGPUModel
         instance._asset.Model = model;
         instance._asset._nodeTransforms = new Dictionary<GltfNodeBase, Matrix4x4>();
 
-        var nodeMap = new Dictionary<GltfNodeBase, GltfNodeBase>();
-        foreach (var nodeBase in _asset.gltfNodes)
-            EnsureClonedNode(nodeMap, nodeBase, model);
-
-        var skinMap = new Dictionary<GLTFSkin, GLTFSkin>();
-        foreach (var sourceSkin in _asset.GetAllSkins())
-        {
-            skinMap[sourceSkin] = new GLTFSkin
-            {
-                Name = sourceSkin.Name,
-                InverseBindMatrices = new List<Matrix4x4>(sourceSkin.InverseBindMatrices),
-                Joints = new List<GltfNodeBase>(),
-            };
-
-            foreach (var joint in sourceSkin.Joints)
-                EnsureClonedNode(nodeMap, joint, model);
-
-            if (sourceSkin.SkeletonRoot != null)
-                EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model);
-
-            if (sourceSkin.BindNode != null)
-                EnsureClonedNode(nodeMap, sourceSkin.BindNode, model);
-        }
-
-        foreach (var animation in _asset._animations)
-        {
-            foreach (var channel in animation.Channels)
-            {
-                if (channel.Target?.Node != null)
-                    EnsureClonedNode(nodeMap, channel.Target.Node, model);
-            }
-        }
-
-        foreach (var nodeBase in _asset.gltfNodes)
-        {
-            var sourceNode = nodeBase;
-            var clonedNode = nodeMap[sourceNode];
-            clonedNode.Children = sourceNode.Children.Select(child => EnsureClonedNode(nodeMap, child, model)).ToList();
-
-            if (sourceNode.Skin != null && skinMap.TryGetValue(sourceNode.Skin, out var clonedSkin))
-                clonedNode.Skin = clonedSkin;
-        }
-
-        foreach (var pair in skinMap)
-        {
-            var sourceSkin = pair.Key;
-            var clonedSkin = pair.Value;
-            clonedSkin.Joints = sourceSkin.Joints.Select(joint => EnsureClonedNode(nodeMap, joint, model)).ToList();
-            clonedSkin.SkeletonRoot = sourceSkin.SkeletonRoot != null ? EnsureClonedNode(nodeMap, sourceSkin.SkeletonRoot, model) : null;
-            clonedSkin.BindNode = sourceSkin.BindNode != null ? EnsureClonedNode(nodeMap, sourceSkin.BindNode, model) : null;
-        }
-
-        instance._asset.gltfNodes = _asset.gltfNodes.Select(node => nodeMap[node]).ToList();
-        instance._asset._nodeMap = _asset._nodeMap.ToDictionary(kvp => kvp.Key, kvp => nodeMap[kvp.Value]);
-        instance._asset._animations = AnimationOps.CloneAnimations(_asset._animations, nodeMap);
-        instance._asset._animationPlayer = new GLTFAnimationPlayer();
-        instance._asset._animationPlayer.Initialize(instance._asset._animations);
+        // Shared-template clone: GltfNodeGraph copies the tree, the skins and the clips onto this instance's own asset,
+        // so two controls holding one template pose independently. The node type and the primitive buffers are per-API.
+        GltfNodeGraph.Clone(_asset, instance._asset, model, CreateClonedNode);
         // Shared-template instancing path: inject the instance asset into the control
         // with the same semantics used by the direct-load path in Load.
         model.Asset = instance._asset;
@@ -207,68 +153,21 @@ internal class WGPUModel
         return instance;
     }
 
-    static GltfNodeBase EnsureClonedNode(Dictionary<GltfNodeBase, GltfNodeBase> nodeMap, GltfNodeBase sourceNode, Season.Controls.Model model)
+    /// <summary>Web node clone: the shared identity copy, then one cloned primitive per source primitive, each with its
+    /// own vertex/index byte arrays. The primitive is created here rather than in the shared graph walk because
+    /// <c>ClonePrimitiveData</c> is where the control's material overrides are folded in.</summary>
+    static GltfNodeBase CreateClonedNode(GltfNodeBase sourceNode, Season.Controls.Model model)
     {
-        if (nodeMap.TryGetValue(sourceNode, out var existing))
-            return existing;
+        var webNode = new WGPUGLTFNode();
+        sourceNode.CloneIdentityInto(webNode);
 
-        GltfNodeBase clonedNode;
         if (sourceNode is WGPUGLTFNode sourceWebNode)
         {
-            var webNode = new WGPUGLTFNode
-            {
-                Name = sourceWebNode.Name,
-                LogicalIndex = sourceWebNode.LogicalIndex,
-                Mesh = sourceWebNode.Mesh,
-                IsJoint = sourceWebNode.IsJoint,
-                JointIndex = sourceWebNode.JointIndex,
-                Translation = sourceWebNode.InitialTranslation,
-                Rotation = sourceWebNode.InitialRotation,
-                Scale = sourceWebNode.InitialScale,
-                InitialTranslation = sourceWebNode.InitialTranslation,
-                InitialRotation = sourceWebNode.InitialRotation,
-                InitialScale = sourceWebNode.InitialScale,
-                InitialWeights = sourceWebNode.InitialWeights.Length == 0 ? Array.Empty<float>() : (float[])sourceWebNode.InitialWeights.Clone(),
-                Weights = sourceWebNode.Weights.Length == 0 ? Array.Empty<float>() : (float[])sourceWebNode.Weights.Clone(),
-                WeightsVersion = sourceWebNode.WeightsVersion,
-                WorldTransform = sourceWebNode.WorldTransform,
-                // v2 picking: PickMesh is immutable after loading, so it is shared by reference
-                // (no deep copy; NodeIndex stays consistent on both sides).
-                PickMeshes = sourceNode.PickMeshes,
-            };
-
             foreach (var primitive in sourceWebNode.Primitives)
                 webNode.Primitives.Add(ClonePrimitiveData(primitive, webNode, model));
-
-            clonedNode = webNode;
-        }
-        else
-        {
-            clonedNode = new GltfNodeBase
-            {
-                Name = sourceNode.Name,
-                LogicalIndex = sourceNode.LogicalIndex,
-                Mesh = sourceNode.Mesh,
-                IsJoint = sourceNode.IsJoint,
-                JointIndex = sourceNode.JointIndex,
-                Translation = sourceNode.InitialTranslation,
-                Rotation = sourceNode.InitialRotation,
-                Scale = sourceNode.InitialScale,
-                InitialTranslation = sourceNode.InitialTranslation,
-                InitialRotation = sourceNode.InitialRotation,
-                InitialScale = sourceNode.InitialScale,
-                InitialWeights = sourceNode.InitialWeights.Length == 0 ? Array.Empty<float>() : (float[])sourceNode.InitialWeights.Clone(),
-                Weights = sourceNode.Weights.Length == 0 ? Array.Empty<float>() : (float[])sourceNode.Weights.Clone(),
-                WeightsVersion = sourceNode.WeightsVersion,
-                WorldTransform = sourceNode.WorldTransform,
-                // v2 picking: PickMesh is immutable after loading, so it is shared by reference
-                // (no deep copy; NodeIndex stays consistent on both sides).
-                PickMeshes = sourceNode.PickMeshes,
-            };
         }
 
-        nodeMap[sourceNode] = clonedNode;
-        return clonedNode;
+        return webNode;
     }
 
     static WGPUPrimitiveData ClonePrimitiveData(WGPUPrimitiveData source, WGPUGLTFNode ownerNode, Season.Controls.Model model)

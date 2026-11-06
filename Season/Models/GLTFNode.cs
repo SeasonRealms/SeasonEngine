@@ -62,6 +62,40 @@ public class GltfNodeBase
     public GLTFSkin Skin;
     public bool IsJoint;
     public int JointIndex = -1;
+
+    /// <summary>
+    /// Copies this node's loader identity onto <paramref name="target"/>: the mesh and pick-mesh handles, the joint
+    /// flags, the rest pose and the morph weights. Every backend used to assign these fields by hand when a template was
+    /// cloned into a control, and the three copies had drifted - two of them never copied <see cref="PickMeshes"/>, so
+    /// on those platforms <c>Model.TryPickSurface</c> fell back to the bounding-volume path for every cloned instance
+    /// instead of testing triangles.
+    ///
+    /// <see cref="Mesh"/> and <see cref="PickMeshes"/> are shared by reference: both are immutable after loading, and the
+    /// pick meshes' <c>NodeIndex</c> only makes sense against the shared copy. The morph weights are copied because
+    /// evaluation writes into them in place. The pose starts from the initial TRS rather than the template's current
+    /// one, because the template may already be mid-clip by the time a control clones it.
+    ///
+    /// Parent/child links, skins and animation channels are not part of a node's identity and are left to the caller.
+    /// </summary>
+    public void CloneIdentityInto(GltfNodeBase target)
+    {
+        target.Name = Name;
+        target.LogicalIndex = LogicalIndex;
+        target.Mesh = Mesh;
+        target.PickMeshes = PickMeshes;
+        target.IsJoint = IsJoint;
+        target.JointIndex = JointIndex;
+        target.Translation = InitialTranslation;
+        target.Rotation = InitialRotation;
+        target.Scale = InitialScale;
+        target.InitialTranslation = InitialTranslation;
+        target.InitialRotation = InitialRotation;
+        target.InitialScale = InitialScale;
+        target.InitialWeights = InitialWeights.Length == 0 ? Array.Empty<float>() : (float[])InitialWeights.Clone();
+        target.Weights = Weights.Length == 0 ? Array.Empty<float>() : (float[])Weights.Clone();
+        target.WeightsVersion = WeightsVersion;
+        target.WorldTransform = WorldTransform;
+    }
 }
 
 public class GLTFSkin
