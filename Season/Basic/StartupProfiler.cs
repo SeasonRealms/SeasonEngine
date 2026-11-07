@@ -521,6 +521,7 @@ public static class StartupProfiler
         AppendKindSummary(report, snapshot, "stage");
         AppendKindSummary(report, snapshot, "shader");
         AppendKindSummary(report, snapshot, "pso");
+        AppendKindSummary(report, snapshot, "effect");
         AppendKindSummary(report, snapshot, "load");
         AppendKindSummary(report, snapshot, "load-failed");
         AppendKindSummary(report, snapshot, "load-churn");
@@ -550,6 +551,7 @@ public static class StartupProfiler
 
         AppendTop(report, snapshot, "shader", 20);
         AppendTop(report, snapshot, "pso", 20);
+        AppendTop(report, snapshot, "effect", 20);
         AppendTop(report, snapshot, "load", 20);
 
         try
@@ -572,6 +574,13 @@ public static class StartupProfiler
             $"quiescent={elapsedMs:0.0}ms loads={loadCount} failed={loadFailures} " +
             $"fxc={FindCounter(counterSnapshot, "shader.compile")} hits={FindCounter(counterSnapshot, "shader.cache-hit")} " +
             $"output={(string.IsNullOrEmpty(outputDirectory) ? "(none)" : outputDirectory)}");
+
+        // Contract 3-2: the compute bill on its own line. kernels > cs_fxc means sources were shared; the ms totals are
+        // what a deferral or a disk cache would be credited with, so they have to be readable without opening the report.
+        Console.Error.WriteLine($"[STARTUP] compute kernels={FindCounter(counterSnapshot, "compute.pso")} " +
+            $"cs_fxc={FindCounter(counterSnapshot, "shader.compile.cs")} cs_hits={FindCounter(counterSnapshot, "shader.cache-hit.cs")} " +
+            $"cs_fxc_ms={FindCounterMs(counterSnapshot, "shader.compile.cs")} pso_ms={FindCounterMs(counterSnapshot, "compute.pso")} " +
+            $"sig_ms={FindCounterMs(counterSnapshot, "compute.signature")}");
 
         if (exitWhenDone) Environment.Exit(0);
     }
@@ -727,6 +736,19 @@ public static class StartupProfiler
         }
 
         return "0";
+    }
+
+    // Contract 3-2: FindCounter answers "how many"; the console line also needs "how much time", in the units the report
+    // uses, and "-" when the counter never fired so an absent number cannot be mistaken for a measured zero.
+    static string FindCounterMs(KeyValuePair<string, Counter>[] snapshot, string name)
+    {
+        for (int i = 0; i < snapshot.Length; i++)
+        {
+            if (string.Equals(snapshot[i].Key, name, StringComparison.Ordinal))
+                return snapshot[i].Value.Ms.ToString("0.0", CultureInfo.InvariantCulture);
+        }
+
+        return "-";
     }
 
     static double Sum(List<double> values)

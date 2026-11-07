@@ -142,6 +142,10 @@ internal sealed unsafe class DXComputeKernel : Season.Rendering.ComputeKernel
 
         using ComPtr<ID3D10Blob> signature = null;
         using ComPtr<ID3D10Blob> error = null;
+        // Contract 3-2: this ctor pays three bills and only the middle one (fxc, reported by ShaderCompiler) was on the
+        // startup report. Root signature and PSO creation are measured here so a deferral decision sees the whole cost.
+        long signatureStart = StartupProfiler.Enabled ? StartupProfiler.Ticks() : 0;
+
         var result0 = Device.D3D12.SerializeRootSignature(
             &rootSignatureDesc, D3DRootSignatureVersion.Version1, signature.GetAddressOf(), error.GetAddressOf());
         Device.CheckResult(result0);
@@ -153,11 +157,22 @@ internal sealed unsafe class DXComputeKernel : Season.Rendering.ComputeKernel
         Device.CheckResult(result);
         RootSignature = rootSignature;
 
+        double signatureMs = 0;
+
+        if (signatureStart != 0)
+        {
+            signatureMs = StartupProfiler.ElapsedMs(signatureStart);
+
+            StartupProfiler.Add("compute.signature", signatureMs);
+        }
+
         // ── CS compilation + compute PSO ──
         ID3D10Blob* csBlob = null;
         try
         {
-            csBlob = ShaderCompiler.CompileShaderFromSource(desc.Source.Hlsl!, desc.Source.EntryPoint, "cs_5_0");
+            long compileStart = StartupProfiler.Enabled ? StartupProfiler.Ticks() : 0;
+            csBlob = ShaderCompiler.CompileShaderFromSource(desc.Source.Hlsl!, desc.Source.EntryPoint, "cs_5_0", label: desc.Name);
+            double compileMs = compileStart != 0 ? StartupProfiler.ElapsedMs(compileStart) : 0;
             var psoDesc = new ComputePipelineStateDesc
             {
                 PRootSignature = RootSignature,
@@ -165,9 +180,23 @@ internal sealed unsafe class DXComputeKernel : Season.Rendering.ComputeKernel
             };
             ID3D12PipelineState* pso;
             iid = ID3D12PipelineState.Guid;
+            long psoStart = StartupProfiler.Enabled ? StartupProfiler.Ticks() : 0;
             var psoResult = Device.D3dDevice->CreateComputePipelineState(&psoDesc, &iid, (void**)&pso);
             Device.CheckResult(psoResult);
             PipelineState = pso;
+
+            // Contract 3-2: one row per kernel, named after the kernel, so a slow row is traceable instead of every row
+            // reading "cs_5_0 CSMain". The detail carries the other two bills of this ctor: the row plus them is the cost.
+            if (psoStart != 0)
+            {
+                double psoMs = StartupProfiler.ElapsedMs(psoStart);
+
+                StartupProfiler.Item("pso", $"compute {desc.Name}", psoMs,
+                    csBlob != null ? (long)csBlob->GetBufferSize() : 0,
+                    $"cs_ms={compileMs:0.###} sig_ms={signatureMs:0.###}");
+
+                StartupProfiler.Add("compute.pso", psoMs);
+            }
         }
         catch
         {

@@ -1059,7 +1059,7 @@ public static class WindowsApp
 
         // Create() registers the compute effects, so this second reading covers graphics plus every kernel that
         // has to be compiled before the frame loop starts.
-        DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [ShaderCache][total] fxc compiles={DirectX.ShaderCompiler.CompileCount}, cache hits={DirectX.ShaderCompiler.CacheHitCount}");
+        DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [ShaderCache][total] fxc compiles={DirectX.ShaderCompiler.CompileCount}, cache hits={DirectX.ShaderCompiler.CacheHitCount}, fxc_level={DirectX.ShaderCompiler.LevelLabel}");
 
         StartupProfiler.Mark("frame-loop-begin");
 

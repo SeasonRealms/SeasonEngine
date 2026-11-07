@@ -1,5 +1,12 @@
 # SeasonEngine Roadmap
 
+> **Last audited against the source: 2026-11-07.** The previous audit was 2026-11-01. In the days between them, more
+> work landed outside this plan than inside it: cloth, volumetric fog, decals, weather, water, GPU particles,
+> screen-space reflections, multi-view rendering and the frame profiler all ship today. The baseline below was rewritten
+> rather than appended to, because nine rows that said **Absent** were describing a repository that no longer exists.
+> Section 0.5 records the unplanned work. Track F and Track P are new and are the two places where the next year of
+> effort actually goes.
+
 ## How to read this
 
 Work is grouped into tracks that map to the questions the project actually faces:
@@ -10,13 +17,18 @@ Work is grouped into tracks that map to the questions the project actually faces
 | **B. Host & worlds** | Can someone see what the engine does without reading the source? | Evaluators, and eventually creators |
 | **C. AI** | Is the paid layer worth money, and does it help make games? | Buyers |
 | **D. Foundations** | Can any of the above be proven, maintained, or shipped? | Everyone, including future contributors |
+| **F. Agent surface** | Can a machine drive the engine as well as a person can? | The next audience: tooling, automation, and the paid layer's own workflow |
+| **P. Performance** | Does the frame budget hold, and can every claim above be measured? | Whoever runs this on a laptop GPU |
 | **E. VR / XR** | Can the renderer claim reach the platforms where single-view assumptions stop applying? | A later audience, after the desktop story ships |
 
 Track D is not in the original three. It exists because several items in A, B, and C are unprovable or unshippable
-without it, and because the project's central differentiation claim — *architectural minimalism recovers the
-performance a managed language costs you* — currently has no measurement behind it at all. Track E is newer still,
-and it is deliberately last: its only pre-payment is A0.4, hoisted into Track A so the most expensive refactor is
-absorbed while the scene pass is already open.
+without it. Track F is newer, and it comes from a single observation: this engine's behaviour model — one C# class per
+behaviour, a world record that is a type name plus construction parameters — is already a command surface. An agent
+needs no node graph and no inspector to drive it; it needs three verbs and a way to see the result. An agent is also a
+far cheaper way to keep a demonstration honest than a person clicking through it every release. Track P is what used to
+be scattered across A and D: the work that decides whether the frame budget survives contact with integrated hardware,
+where most of this engine's audience will actually run it. Track E stays deliberately last, and its only pre-payment —
+A0.4, the per-view matrix split — has already shipped.
 
 **Ordering inside each track is by dependency, not by appeal.** Where an item is blocked by another, it says so.
 Several attractive features are deliberately placed late because their prerequisites are infrastructure work across
@@ -24,7 +36,8 @@ four backends.
 
 Status vocabulary used throughout:
 
-- **Shipped** — implemented and exercised by a running app
+- **Shipped** — implemented and exercised by a running app. Where a shipped item still has a named limit, the row says
+  so; "shipped" is never a claim of completeness.
 - **Partial** — exists but incomplete, or implemented on some backends only
 - **Absent** — no code exists
 
@@ -52,26 +65,43 @@ not repeat the archive's mistake of describing goals without establishing the st
 | Per-instance surface picking and highlight modes | Shipped | `Season/Panels/ObjectPicker.cs`, `Rendering/Highlight.cs` |
 | glTF loading and animation playback | Shipped | `Models/GltfAsset.cs`, `Models/GLTFAnimationPlayer.cs` |
 | MSDF text rendering | Shipped | `Season/Fonts/`, glyph atlas manager across all backends |
-| **Scene normal buffer** | **Absent** | `RenderPass.cs` declares `ColorTarget`, `DepthTarget`, `VelocityTarget` only — GTAO derives normals from depth |
-| **Indirect draw / dispatch** | **Absent** | Zero matches for `ExecuteIndirect`, `CommandSignature`, `DispatchIndirect`, `vkCmdDrawIndexedIndirect` across all backends |
+| Scene normal target | Shipped | `RenderPass.cs` — MRT slot 2: octahedral normal, Toksvig roughness, SSR reflection weight |
+| Indirect draw and dispatch | Shipped, four backends | `Rendering/Indirect.cs` — `DrawIndexedIndirect`, `vkCmdDrawIndexedIndirect`, indirect command buffers, `drawIndexedIndirect` |
+| GPU-driven instance culling | Shipped, without occlusion | `Rendering/InstanceCull.cs` — 5 slots (3 cascades + punctual + main view), 16 primitives, indirect gather behind `SEASON_CULL_INDIRECT` |
+| GPU particles | Shipped, unsorted | `Effects/Particles.cs` + four shader sources; flame, spark and smoke in `Apps/Engine/Panels/Campfire.cs` |
+| Screen-space reflections | Shipped | `Effects/SsrEffect.cs`, with `Effects/HiZ.cs` as its depth pyramid and a DDGI fallback on miss |
+| Decals | Shipped, screen-space | `DecalEffect.cs`, `DecalPipeline.cs`, `SceneDecals.cs`, four shader sources — modulate and additive, roughness written into the normal target |
+| Volumetric fog and light shafts | Shipped, four backends | `Effects/VolumetricFog.cs` + four shader sources, `FogVolume.cs`, `SceneFog.cs`, `FogMath.cs`; aerial-perspective froxel volume |
+| Weather regions, rain curtain, lightning | Shipped | `Rendering/Weather.cs`, `WeatherVisualState.cs`, `Effects/WeatherCurtain.cs`, `Effects/Lightning.cs`; `WeatherField` samples regions on the CPU and packs them for the GPU |
+| Water surface, river ribbons, waterfalls | Shipped, no planar reflection | `WaterEffect.cs`, `WaterPipeline.cs`, `WaterRibbonEffect.cs`, `WaterfallEffect.cs`, four shader sets |
+| Cloth simulation (XPBD) | Shipped, four backends | `Effects/Cloth.cs` + four shader sources — compute, three vertex streams, rim loop |
+| Motion blur | Shipped | `Effects/MotionBlur.cs` |
+| Depth of field | Shipped | `Effects/DepthOfField.cs` |
+| Colour grading | Partial | `ColorGrading.cs` — seven coefficients and presets; no 3D LUT, deferred on purpose |
+| MSAA 4x | Shipped, four backends | DX `MsaaSceneRT`, a private MSAA pair in Vulkan, `MTLMsaaTarget`, a private target on Web |
+| Multi-view, up to 8 views | Shipped | `FrameState.cs`, `ViewTargets.cs`, `RenderView.cs`, `SecondaryView.cs`, `ViewSlot` |
+| Per-view matrix split (A0.4) | Shipped | Zero `static Camera` left; view and projection are per view, not per object |
+| GPU skinning | Shipped, four backends | `InstanceSkinning.cs` + four shader sources; the palm palette moved off the bone CBV onto a storage binding |
+| Animation LOD | Shipped | `InstancedModel.AnimationLod.cs` — distance-tiered sampling at full, half and quarter rate |
+| Frame profiler | Shipped, GPU timing on D3D12 only | `FrameProfiler.cs` — per-pass GPU and CPU time, p50/p95 over a 96-frame window, per-frame allocation, GC counts, HUD, CSV sink |
 | **Texture compression** (BC / ASTC / ETC2 / KTX2) | **Absent** | No compressed-format path in texture loading |
-| Occlusion culling, Hi-Z | Absent | — |
-| GPU particles | Absent | — |
-| Screen-space reflections | Absent | DDGI covers indirect diffuse only |
-| Decals | Absent | — |
-| Volumetric fog / light shafts | Absent | Atmospheric scattering exists; local volumetrics do not |
-| Water system | Absent | `Apps/Engine/Panels/Sea.cs` is scene content, not an engine system |
+| Occlusion culling | Absent | The Hi-Z pyramid is SSR's acceleration structure, not an occlusion test |
 | Terrain system, heightmaps, tessellation | Absent | — |
-| Mesh or terrain LOD, impostors | Absent | — |
-| Motion blur | Absent | Velocity buffer already exists, so only the resolve is missing |
-| **VR / XR of any kind** (OpenXR, stereo rendering, HMD tracking, controller input) | **Absent** | Zero matches for `OpenXR`, `XR_`, `stereo`, `HMD`, `foveated`; the only `Stereo` hit is an audio channel count in `LinuxImage.cs` |
+| Mesh LOD, decimation, impostors | Absent | Animation LOD exists; geometry LOD does not |
+| **VR / XR of any kind** (OpenXR, stereo rendering, HMD tracking, controller input) | **Absent** | Zero matches for `OpenXR`, `XR_`, `HMD`, `foveated`; the only `Stereo` hit is an audio channel count in `LinuxImage.cs` |
 | glTF **export** | Absent | Import only |
 | Mesh processing (decimation, UV repair, normal repair) | Absent | — |
 | Material instances / variants, batch merging by material | Absent | Materials come from glTF import |
+| Animation blending and state machines | Absent | One clip at a time, switched as a cut |
 
 Note on the render pipeline shape: the D3D12 pipeline states are organised as Opaque / Transparent / Fade with cull
-variants (`Platforms/Windows/DirectX/Pipeline.cs`), i.e. **forward rendering**, with a storable depth target and a
-velocity target. There is no G-buffer. This single fact sets the cost of several Track A items.
+variants (`Platforms/Windows/DirectX/Pipeline.cs`), i.e. **forward rendering**, with a storable depth target, a
+velocity target and — since A0.2 — a normal target. There is still no G-buffer. That single fact is why decals are a
+screen-space pass rather than a deferred one, and why SSR reads `SceneNormal` instead of reconstructing it from depth.
+
+The scene path is also no longer dual. `RenderPass.cs` now requires `ISegmentedSceneGraphics` and throws without it:
+collect, then replay opaque, composites and transparent. The old parallel path is gone rather than flagged off, which is
+why `split` can only insert composite passes now.
 
 ### Host, editor, worlds
 
@@ -83,7 +113,8 @@ velocity target. There is no G-buffer. This single fact sets the cost of several
 | Property editing (position, size) | Partial | `ObjectPanel` in `ObjectPicker.cs:663+` — fixed fields, no generic property grid |
 | Player collision, occluder fade | Shipped | `Apps/Engine/Management/PlayerCollider.cs`, `OcclusionFade.cs` |
 | Island scene with dynamic behaviour (movement, jumping, birds, robots) | Shipped, hardcoded | `Apps/Engine/App.cs` `Create()`; behaviour in `Panels/Direction.cs`, `Skill.cs`, `Player.cs`, `Birds.cs` |
-| Debug views for intermediate buffers | Shipped | `DepthView`, `VelocityView`, `Sdf3DView` |
+| Debug views for intermediate buffers | Shipped | `DepthView`, `NormalView`, `VelocityView`, `Sdf3DView` |
+| Secondary views and rear-view mirrors | Shipped | `Rendering/SecondaryView.cs`, `Apps/Engine/Panels/RearViews.cs`, `Views.cs` |
 | **Scene serialization, save, load** | **Absent** | No serializer, no scene format, no world file |
 | **Empty / sceneless startup** | **Absent** | `Create()` builds the entire island unconditionally |
 | Scene hierarchy inspection | Absent | — |
@@ -94,162 +125,190 @@ velocity target. There is no G-buffer. This single fact sets the cost of several
 
 | Capability | Status | Evidence |
 |---|---|---|
-| Text generation and translation | Shipped | `SeasonAI/Text.cs` — llama.cpp / GGUF |
-| Image generation and editing (SD1.5, SDXL, SD3.5, Qwen-Image-Edit, Flux.2-Klein, Ovis, LongCat) | Shipped | `SeasonAI/Image.cs` (941 lines) |
-| Video generation | Shipped | `AIVideo` in `Image.cs`; UI in `Panels/VideoPanel.cs` (1111 lines) |
-| Music generation | Shipped | `SeasonAI/Music.cs` — StableAudio |
-| Speech to text | Shipped | `SeasonAI/STT.cs` — Whisper / GGUF |
-| Text to speech, dual ONNX + GGML backends | Shipped | `SeasonAI/TTS.cs` (766 lines) |
-| Vision / OCR | Shipped | `SeasonAI/Vision.cs` |
+| Text generation and translation | Shipped | `SeasonAIs/SeasonLLM` — llama.cpp / GGUF |
+| Image generation and editing (SD1.5, SDXL, SD3.5, Qwen-Image-Edit, Flux.2-Klein, Ovis, LongCat) | Shipped | `SeasonAIs/SeasonImage`; panels in `SeasonStudio/Panels/ImagePanel.cs` |
+| Video generation | Shipped | `SeasonStudio/Panels/VideoPanel.cs` |
+| Music generation | Shipped | `SeasonAIs/SeasonMusic` — StableAudio |
+| Speech to text | Shipped | `SeasonAIs/SeasonSTT` — Whisper / GGUF |
+| Text to speech, dual ONNX + GGML backends | Shipped | `SeasonAIs/SeasonTTS`; panel in `SeasonStudio/Panels/TTSPanel.cs` |
+| Vision / OCR | Shipped | `SeasonAIs/SeasonVision`, `SeasonAIs/SeasonOCR` |
+| 3D generation (image to mesh) | Shipped, single backend | `SeasonAIs/SeasonThreeD` — a Trellis runner with session, progress and result parsing; no mesh post-processing |
+| **AI layer as a separate host** | **Shipped** | `SeasonStudio/SeasonStudio.csproj` references `Season.csproj` plus ten `SeasonAIs` libraries; `Apps/Engine/Engine.csproj` references none of them |
 | Model acquisition | By hand | Panels link to Hugging Face; the app does not download models |
-| **Generated output flowing back into the engine as an asset** | **Absent** | Results are shown inside AI panels; nothing binds a generated image to a scene material |
-| **Any network client** | **Absent** | No `HttpClient` anywhere in the repository |
-| **3D generation, auto-rigging, animation synthesis** | **Absent** | — |
+| **Generated output flowing back into the engine as a scene asset** | **Partial** | `SeasonStudio/Controls/ModelPreview.cs` previews a generated mesh inside an engine control; nothing binds a generated image to a scene material |
+| Network client | Partial | `Season/Net/WebClient.cs` — multipart upload and download with progress and cancellation; no streaming chat completion, no key storage |
+| **Cloud LLM and runtime C# compilation** | **Absent** | Zero `Microsoft.CodeAnalysis` references anywhere in the solution |
+| **Auto-rigging, animation synthesis** | **Absent** | — |
 
 ### Foundations
 
-| Capability | Status |
-|---|---|
-| Unit tests | Absent |
-| Benchmark scenes with recorded numbers | Absent |
-| Screenshot / image-diff regression | Absent |
-| Frame allocation budget or GC measurement | Absent |
-| Feature-by-backend support matrix in docs | Absent |
-| Asset import caching | Absent |
+| Capability | Status | Evidence |
+|---|---|---|
+| Assertion-based tests, no framework | Partial | Five console projects under `Tests/` — `Season.Rendering.{Tests,DirectX.Tests,Vulkan.Tests,Metal.Tests,Web.Tests}` — with hand-rolled `Check` / `Near` / `Throws` helpers. Real assertions on layout and parameter contracts; no xUnit, no CI |
+| Benchmark scene with recorded numbers | Absent | A fixed camera tour and a published table still do not exist |
+| Screenshot A/B harness | Partial | `Apps/Engine/AbCapture.cs` plus `.dbg/ab_pixel_diff.ps1`; the S0 acceptance gate defines four rulers, not a CI job |
+| Draw-order trace | Partial | `Rendering/DrawTrace.cs` — records submission order so a refactor cannot silently reorder state changes |
+| CPU frame-time budget | Partial | `Rendering/CostProfile.cs`, `ICostProfileScene.cs` — per-scene CPU cost, no threshold and no regression gate |
+| Frame allocation and GC measurement | Shipped, no target | `FrameProfiler.cs` records bytes allocated per frame and Gen0/1/2; there is no zero-allocation contract behind it yet |
+| Feature-by-backend support matrix in docs | Absent | `docs/features` carries a hand-maintained matrix that is already out of date |
+| Asset import caching | Absent | glTF is re-parsed on every run |
+| CI of any kind | Absent | No workflow file, so none of the above runs on a commit |
+
+---
+
+## 0.5 Shipped, but never on this roadmap
+
+Everything below was built without appearing in any prior version of this document. It is recorded separately rather
+than folded into the baseline for one reason: a roadmap that quietly absorbs whatever happened cannot be used to argue
+about what should happen next. Each row names what the feature is **and what it is not**, because most of the
+misreadings in this repository come from the gap between the two.
+
+| Shipped | What it is | What it is not |
+|---|---|---|
+| Cloth simulation (`Effects/Cloth.cs`, four shader sources) | XPBD on the GPU, compute-simulated, three vertex streams, a pinned rim for a flagpole | No collision against scene geometry, no self-collision, no cloth-to-cloth coupling. One solver, one material model |
+| Weather (`Weather.cs`, `WeatherField`, `WeatherCurtain.cs`, `Lightning.cs`) | Regional weather field — axis-aligned ellipses with priority, edge feather and a stable sort by id — sampled on the CPU, packed into three `float4` rows per region and consumed by cloud, rain and snow shaders. Lightning is a channel with a flash term in the same frame header | Not a climate simulation, no wind advection of the field, no wetness response on materials. Regions are authored, not simulated |
+| Volumetric fog (`Effects/VolumetricFog.cs`, four shader sources, `FogVolume.cs`, `SceneFog.cs`, `FogMath.cs`) | A froxel volume with scatter and extinction injection, a CPU reference implementation that the GPU must match, punctual-lamp shadowing so a lamp in a valley casts a shaft, and a depth-slice accumulation pass | Not a global participating-medium solution. There is no multi-scatter, no temporal reprojection of the froxel history |
+| Decals (`DecalEffect.cs`, `DecalPipeline.cs`, `DecalVolume.cs`, four shader sources) | Screen-space projected boxes: 36 programmatic vertices, front-face culled so back faces cover each pixel once, depth sampled and never attached, roughness written into the normal target's blue channel only | Not deferred decals. Two blend modes only (modulate, additive), 64 active decals, no per-pixel nearest-wins rule |
+| Water (`WaterEffect.cs`, `WaterRibbonEffect.cs`, `WaterfallEffect.cs`) | A surface pass with screen-space refraction from the depth target, river ribbons that follow a spline, waterfall sheets, all four backends | Not a water system. No planar reflection, no FFT or clipmap height field, no shoreline foam from wave energy |
+| GPU particles (`Effects/Particles.cs`) | Compute simulation over a persistent buffer, indirect draw of the alive set, and flame, spark and smoke emitters in `Panels/Campfire.cs` | No sorting. Alpha-blended particles are therefore limited to additive and alpha-tested; sorted transparency is still unbuilt |
+| Screen-space reflections (`SsrEffect.cs`, `HiZ.cs`) | A screen-space march with a four-level depth pyramid and a DDGI irradiance fallback on miss | **Not occlusion culling.** `HiZ.cs` is SSR's acceleration structure. Occlusion is still absent, and this is the most frequently misread file in the repository |
+| GPU-driven culling (`InstanceCull.cs`) | Per-instance bounds in a storage buffer, a compute pass writing compacted lists into five slots, original-index indirection, indirect gather switched by `SEASON_CULL_INDIRECT` for A/B | No occlusion test and no measured justification. The A/B switch exists precisely because the baseline has not been recorded yet |
+| Frame profiler (`FrameProfiler.cs`) | Per-pass GPU and CPU intervals, median and p95 over a 96-frame window, per-frame allocation bytes, Gen0/1/2 counts, a compact HUD string, a CSV sink, and `PinDelta` for reproducible scenarios | **The GPU column is empty on three of four backends.** Only D3D12 implements `IGpuFrameTimer`; the base `CreateGpuFrameTimer()` returns null elsewhere. This is why P0 exists |
+| Multi-view up to 8, per-view matrices (`FrameState.cs`, `ViewTargets.cs`, `SecondaryView.cs`) | Per-view camera and lighting snapshots, per-view targets, `ViewSlot` / `ViewFeature` / `ViewShadowPolicy`, and zero `static Camera` remaining. Rear-view mirrors in the sample app are the first consumer | Not VR. There is no stereo submission, no per-eye pacing, no HMD pose path |
+| MSAA 4x on four backends | DX `MsaaSceneRT`, a private MSAA pair in Vulkan, `MTLMsaaTarget`, a private target on Web — each backend resolving on its own terms | Not MSAA on every pass. Post-process chain targets stay single-sample |
+| Animation LOD (`InstancedModel.AnimationLod.cs`) | Distance-tiered pose sampling at full, half and quarter rate, with a shadow-only tier for instances the camera cannot see | Not geometry LOD. There is no mesh LOD, no decimation and no impostor anywhere in the pipeline |
+| AI layer moved out of the engine (`SeasonAIs/`, `SeasonStudio/`) | Ten AI libraries plus a MAUI studio app that references `Season.csproj`. `Apps/Engine/Engine.csproj` now references none of them | Not an AI feature in the engine. The engine repository no longer contains the commercial layer at all |
+
+**What this cost.** Every one of those features landed as a new four-language shader set: one `.cs` driver plus
+`X.Hlsl.cs`, `X.Glsl.cs`, `X.Msl.cs`, `X.Wgsl.cs`. The measured shader corpus grew from roughly 18.4K to 29.8K lines
+since the previous audit, and the per-language line counts remain within a few percent of each other. That is the
+honest price of "each backend owns its own shader": a new visual feature is four implementations, not one. It is also
+the argument for P1 and P2 below, which attack the boilerplate around those implementations rather than the
+implementations themselves.
 
 ---
 
 ## Gate 0 — Release engineering
 
-Not a track. A gate. These items block the open-source launch, the store submission, and every community post, and
-they are tracked in detail in [`Store/Windows/SubmissionChecklist.md`](Store/Windows/SubmissionChecklist.md).
+Not a track. A gate. These items block the open-source launch, the store submission, and every community post.
 
-1. **B1 — conditional commercial reference.** `Apps/Engine/Engine.csproj` references `SeasonAI` unconditionally and
-   the repository has no `.gitignore`. Publishing as-is either leaks the source being sold or leaves a repository
-   that will not build after cloning. Both outcomes are fatal to the funnel, because the funnel depends on cloning
-   and running. Fix with `Condition="Exists(...)"` plus an MIT stub panel, so the missing layer becomes an upgrade
-   prompt rather than a compile error.
-2. **B2 — store product identifiers.** All three add-on IDs return `""`, so no purchase can complete.
-3. **B3 — MSIX packaging identity.** `WindowsPackageType=None`, and the manifest is still MAUI template
-   boilerplate. Store in-app purchase requires package identity.
-4. **S1 — source-code delivery.** The commercial archive ships inside the package with the decryption key in the
-   same binary. Move delivery server-side before selling the source tier.
+1. **B1 — conditional commercial reference.** *Largely resolved, by a route nobody planned.* `Apps/Engine/Engine.csproj`
+   no longer references the AI layer at all — the ten `SeasonAIs` libraries are now referenced by `SeasonStudio`
+   instead — and the repository has a `.gitignore`. The funnel is therefore no longer broken by cloning. What is
+   missing is the guarantee: nothing fails a build if the reference comes back. That is D6.
+2. **B2 — store product identifiers.** The three add-on IDs still need to be real product ids before any purchase can
+   complete. Unchanged and unverified in this audit.
+3. **B3 — MSIX packaging identity.** `WindowsPackageType` is now `MSIX` (the `None` override is commented out), so the
+   packaging half is done. What remains is confirming the manifest identity is no longer MAUI template text.
+4. **S1 — source-code delivery.** A commercial archive that ships inside the package with the decryption key in the
+   same binary is not a delivery mechanism. Move it server-side before selling the source tier.
 5. **S4 — capability declarations and privacy contact.** Add the `microphone` device capability; replace the
    placeholder contact address in `PRIVACY.md`.
 
-Nothing in Track A/B/C/D should be prioritised over Gate 0. Every day the repository is unpublished, all four
-tracks are being built for an audience that cannot see them.
+Nothing in Track A/B/C/D/F/P should be prioritised over Gate 0. Every day the repository is unpublished, every track
+is being built for an audience that cannot see it.
 
 ---
 
 ## Track A — Rendering
 
-The requested list is sound; the ordering needs to change, because three of the items are not features at all but
-infrastructure that other items sit on top of, and one item is nearly free today.
+The list was sound; the execution went further than the list. Ten of the thirteen items below are shipping code, and
+the three that are not are the three that need something outside this track: a build pipeline, an asset pipeline, and a
+recorded baseline. So this section is no longer a plan — it is a status table with the design record kept where it
+still explains a decision.
 
 ### A0. Prerequisites
 
-These unlock most of the rest. They are unglamorous and none of them produce a screenshot.
+All three of these were infrastructure that other items sat on, none of them produce a screenshot, and all three are
+done. They are kept because the reason each one had to come first is still the reason the next feature will be cheap or
+expensive.
 
-#### A0.1 Indirect draw and dispatch abstraction — *blocks A6, A7*
+#### A0.1 Indirect draw and dispatch abstraction — **Shipped, four backends**
 
-There is currently **no indirect draw or indirect dispatch path on any backend.** GPU-driven culling means the GPU
-decides what to draw, which requires the draw arguments to live in a GPU buffer. Without indirect draw, "GPU
-culling" can only mean *compute a visibility mask on the GPU, read it back, and issue CPU draws* — which adds a
-pipeline stall and is usually slower than the CPU frustum culling already shipping.
+`Rendering/Indirect.cs` carries the shared argument concept, and all four backends have the path: `ExecuteIndirect`
+with a command signature on D3D12, `vkCmdDrawIndexedIndirect` on Vulkan, indirect command buffers on Metal,
+`drawIndexedIndirect` on WebGPU. The earlier prediction that Metal and WebGPU would lag behind a capability flag was
+wrong; all four landed.
 
-Scope: an `IndirectArgsBuffer` concept in the shared layer, plus `ExecuteIndirect` + command signature (D3D12),
-`vkCmdDrawIndexedIndirect` (Vulkan), indirect command buffers (Metal), and `drawIndexedIndirect` (WebGPU). Metal and
-WebGPU have the most awkward story here and should be allowed to lag behind an explicit capability flag rather than
-holding back the desktop path.
+The design record is worth keeping, because it is why the rest of the track was cheap: without indirect draw,
+"GPU culling" can only mean *compute a visibility mask, read it back, and issue CPU draws*, which adds a stall and is
+usually slower than the CPU frustum culling already shipping. Indirect had to come before culling, not after it.
 
-This is the single largest piece of enabling work in Track A. It should be scheduled deliberately, not discovered
-halfway through building particles.
+#### A0.2 Scene normal target — **Shipped**
 
-#### A0.2 Scene normal target — *blocks A2, A5; improves GTAO*
+MRT slot 2 of the scene pass now carries an octahedral normal in `.xy`, Toksvig roughness in `.z` and the SSR
+reflection weight in `.w`. GTAO no longer reconstructs normals from depth, and both SSR and the decal pass read the
+real thing.
 
-The scene pass writes colour, depth, and velocity. GTAO reconstructs normals from depth because there is nothing
-else to read. Depth-derived normals are flat-shaded per triangle and lose all normal-map detail, which is
-survivable for ambient occlusion and **not** survivable for reflections or decals.
+The judgement that made this cheap still matters: depth-derived normals are flat-shaded per triangle and lose all
+normal-map detail, which survives ambient occlusion and does **not** survive reflections or decals. Doing SSR first and
+adding the buffer afterwards would have meant writing the resolve twice.
 
-Adding an RGB10A2 or RG16 (octahedral) normal target to the scene pass is a four-backend change to the scene pass
-attachment set, plus a shader output addition. It is modest, and it converts SSR and decals from "possible with
-visible artefacts" into "straightforward".
+#### A0.4 Per-view matrix split — **Shipped**
 
-Decide this before A2. Doing SSR against depth-derived normals and then adding the normal buffer afterwards means
-writing the resolve twice.
+View and projection moved out of the per-object constant buffer into a per-view constant, the constant-buffer ring
+gained a view dimension, and the scene pass stopped assuming one camera per frame. `FrameState.cs` holds per-view
+camera and lighting snapshots, `ViewTargets.cs` holds per-view targets, `ViewSlot` / `ViewFeature` /
+`ViewShadowPolicy` describe what a view is allowed to consume, and `MaxViews` is 8. There is no `static Camera` left
+anywhere in the engine.
 
-#### A0.4 Per-view matrix split — *pre-requisite for Track E, useful on its own*
+The first consumer was not VR — it was the rear-view mirrors in `Apps/Engine/Panels/RearViews.cs`, which is exactly
+the test the roadmap predicted. Track E still needs E0 and E1; it no longer needs this.
 
-The per-object matrix constant buffer bundles World, View, and Projection together (`Season/Basic/Camera.cs`
-`MatrixBuffer`), and every backend indexes its constant-buffer ring by frame index alone (`int fi = (int)
-Device.FrameIndex` in the D3D12 groups). That bakes in two assumptions: one camera per frame, and each object drawn
-at most once per frame with that camera. Both break the moment the scene is rendered twice — stereo eyes today,
-rear-view mirrors or picture-in-picture views later.
+#### A0.3 Texture compression and a container format — *moved to P3*
 
-The shadow pass already demonstrates the fix: `DrawShadowPrimitive` keeps per-object data (World) in b0 and moves the
-view matrix into a separate per-view constant (`ShadowPassParams` root constant, written once per atlas quadrant in
-`Pipeline.SetShadowViewProj`). A0.4 generalises that pattern into the scene pass: World stays per-object, View and
-Projection move to a per-view constant written once per view, and the ring indexing gains a view dimension.
+Still not started, and now reclassified. It is not a rendering feature and it never was: its payoffs are package size,
+web load time and VRAM bandwidth. Those are build economics, so the item lives in Track P, where the rest of the same
+argument lives.
 
-It touches all four shader sources (HLSL / GLSL / MSL / WGSL) but is mechanical, and it is the single change that
-makes multi-camera rendering cheap for every future consumer — Track E included. Its cost is why it sits early in
-the Track A ordering while nothing in Track A blocks on it.
+### A1. Motion blur — **Shipped**
 
-#### A0.3 Texture compression and a container format — *not a visual feature*
+`Effects/MotionBlur.cs` gathers along the velocity vector with depth-aware weighting to limit bleeding across
+silhouettes, and `Effects/DepthOfField.cs` followed it in the same pass slot. Both were as cheap as predicted because
+the velocity buffer and `VelocityView` already existed.
 
-Belongs here rather than at the end of the list, because it is not about image quality:
+The prediction about the return on effort also held: motion in a capture is what makes the renderer legible in a video,
+which is the format the store listing and every community post actually uses.
 
-- **Package size.** The store submission already carries package-size risk. Uncompressed textures are the largest
-  controllable contributor.
-- **Web viability.** `Apps/EngineWasm` and `Apps/EngineWeb` fetch assets over the network. Uncompressed textures
-  make the browser hosts a demo that nobody waits for.
-- **VRAM and bandwidth.** Compressed formats are typically the largest single frame-time win available on
-  integrated GPUs, which is what most evaluators will run this on.
+### A2. Screen-space reflections — **Shipped**
 
-Scope: BC7/BC5/BC6H on desktop, ASTC on mobile, ETC2 as the Android floor, KTX2 as the container so one asset file
-serves every platform, and an offline transcode step rather than runtime compression. Runtime decode to
-uncompressed is an anti-goal — it defeats the purpose.
+`Effects/SsrEffect.cs` runs as an AfterOpaque compute effect, marching the depth buffer in screen space and sampling
+scene colour at the hit. It is faster than the plan assumed because the march is accelerated by a depth pyramid
+(`Effects/HiZ.cs`, four levels, 1/16 stop) rather than a fixed-step walk, and it composites additively into the scene
+colour with no separate resolve target.
 
-### A1. Motion blur — *do this first*
+On a miss it falls back to the DDGI irradiance atlas, which remains the architectural advantage worth naming: engines
+without a GI solution ship a separate reflection probe system to avoid black misses. This one already had the volume.
 
-The cheapest item on the entire list and it should not wait. The velocity buffer already exists and is already
-consumed by TAA; `VelocityView` already visualises it. What is missing is one resolve kernel that gathers along the
-velocity vector, with the usual depth-aware weighting to limit bleeding across silhouettes.
+The gap that remains is not SSR itself: it is that the water surface uses screen-space refraction and not reflection.
+That is recorded under A4.
 
-It also has outsized marketing value relative to cost: motion blur is instantly legible in a video capture, and the
-store listing and community posts both need motion.
+### A3. Volumetric fog and light shafts — **Shipped, and scoped further than planned**
 
-### A2. Screen-space reflections — *needs A0.2*
+The plan was a froxel grid sampling the cascades and compositing during the scene resolve. What shipped
+(`Effects/VolumetricFog.cs`, four shader sources, `FogVolume.cs`, `SceneFog.cs`, `FogMath.cs`) also shadows the volume
+against punctual lamps, so a street lamp in a valley casts a shaft and not just a glow, and it carries an
+aerial-perspective froxel volume out to kilometres on the Web backend.
 
-`SceneColorCopy` already produces a downscaled scene colour, which is the other half of what an SSR march needs.
-With A0.2 in place this is a contained AfterScene compute effect: march the depth buffer in screen space, sample
-scene colour at the hit, fall back to the DDGI irradiance atlas on miss so that off-screen reflections degrade to
-something plausible rather than to black.
+Two things made this affordable and both were already there: `SkyAtmosphere` had a working ray-march with 3D LUTs, and
+`CascadedShadow` already had the shadow lookup. The CPU reference in `FogMath.cs` / `SceneFog.cs` is the reason the four
+shader implementations can be checked against one another at all, and it is the pattern the other effects should copy.
 
-That DDGI fallback is worth calling out as a genuine architectural advantage: engines without a GI solution have to
-ship a separate reflection probe system to avoid black SSR misses. This project already has the volume.
+What is missing is named rather than hidden: no multi-scatter, and no temporal reprojection of the froxel history.
 
-### A3. Volumetric fog and light shafts
+### A4. Dynamic water — **Shipped, with one named gap**
 
-Reuses more existing infrastructure than it looks. `SkyAtmosphere` already contains a working ray-march with 3D
-LUTs, and `CascadedShadow` already provides the shadow lookup needed to make shafts appear. The work is a
-froxel-grid volume (scatter/extinction injection, then a depth-slice accumulation pass) sampling the existing
-cascades for occlusion, composited during the scene resolve.
+The surface pass (`WaterEffect.cs`, `WaterPipeline.cs`) does screen-space refraction from the depth target, river
+ribbons follow a spline (`WaterRibbonEffect.cs`) and waterfalls have their own sheet pass (`WaterfallEffect.cs`), all
+four backends. `App.Create()`'s sea was migrated onto it, which was the test of whether "engine system" and "scene
+content" separate cleanly — they did.
 
-Medium cost, high visual payoff, and it pairs with the day/night cycle that is already the strongest thing to
-demonstrate.
+The gap is the one the original ordering predicted: water without reflections looks wrong in a way no amount of wave
+detail fixes. There is no planar reflection and no FFT or clipmap height field, so the surface is a normal-mapped
+screen-space effect rather than a simulated one. Closing it is a deliberate choice, not an oversight: planar reflection
+is a second scene pass, and the scene pass is the expensive one.
 
-### A4. Dynamic water — *schedule after A2*
-
-Water without reflections looks wrong in a way that no amount of wave detail fixes, so this follows SSR rather than
-preceding it. Scope: FFT or Gerstner displacement on a GPU-computed height field, screen-space refraction using the
-existing depth target, shoreline blending from depth difference, and reflection from A2.
-
-There is an existing `Sea.cs` in the island scene to migrate onto the engine-level system, which conveniently makes
-this the first test of whether "engine system" and "scene content" are cleanly separated.
-
-### A5. Decals — *screen-space pass; needs A0.2 and an explicit depth target*
+### A5. Decals — **Shipped, screen-space**
 
 Deferred decals need a G-buffer this renderer does not have. Forward projected decals — a decal list bound per object
 and evaluated inside every material shader — push the cost into every material, need a per-object list, and still do
@@ -300,32 +359,34 @@ Failure is deliberately boring: when a backend has no implementation (or the fea
 null and the decal effect never registers; when the visible table is empty, `Prepare` returns false and the pass is
 never begun. Either way the frame schedule is untouched, so a decal-free frame costs exactly what it did before.
 
-### A6. GPU particles — *needs A0.1*
+### A6. GPU particles — **Shipped, exactly as scoped — which means unsorted**
 
-Simulation in a compute shader over a persistent particle buffer, with an indirect draw for the alive set. The
-compute framework and `StorageBuffer` already exist, so the simulation half is well-supported today; the draw half
-is exactly what A0.1 provides. Attempting this before A0.1 produces a CPU-readback design that will be thrown away.
+`Effects/Particles.cs` and its four shader sources simulate over a persistent buffer and draw the alive set through
+indirect arguments. `Panels/Campfire.cs` is the first real content: flame, spark and smoke in one emitter set.
 
-Sorting for correct alpha blending is the hidden cost. A GPU radix sort is a real piece of work. Consider shipping
-with additive and alpha-tested particles first, which need no sorting, and treating sorted alpha as a later step.
+The warning in the previous version of this document was correct and is still open: sorting for correct alpha blending
+is a GPU radix sort, which is a real piece of work. What shipped is the additive and alpha-tested subset. Anything
+that needs painter's-order blending is waiting on the sort.
 
-### A7. GPU-driven culling — *needs A0.1 and a benchmark from D1*
+### A7. GPU-driven culling — **Built, unproven. The honest status is Partial**
 
-The highest-leverage item for the "tens of thousands of units" scenario, and the one most likely to be built without
-evidence that it helped. Prerequisites in order:
+The one item on this list that was built *without* the evidence that was supposed to gate it. `Rendering/InstanceCull.cs`
+has per-instance bounds in a storage buffer, a compute pass writing compacted lists into five slots (three shadow
+cascades, one punctual slot, one main-view slot) over up to sixteen primitives, original-index indirection so the draw
+still knows which instance it is, and an indirect gather path switched by `SEASON_CULL_INDIRECT` so the fixed and
+indirect gathers can be compared frame for frame.
 
-1. A0.1, without which this cannot exist in a useful form.
-2. **A measured benchmark scene (D1).** CPU frustum culling already ships and is on by default. Without a recorded
-   baseline there is no way to show that the GPU path is faster, and no way to find the actual bottleneck — which,
-   in a managed engine at ten thousand entities, is more likely to be per-entity `Update` cost and allocation
-   pressure than draw submission.
+What is missing is the part the previous ordering demanded first, and it is still the right criticism:
 
-Scope once unblocked: per-instance bounds in a GPU buffer, a compute pass writing a compacted visible-instance
-list, Hi-Z pyramid from the previous frame's depth for occlusion, and indirect draw of the compacted list.
+1. **No recorded baseline.** CPU frustum culling ships and is on by default. Without a number there is no way to show
+the GPU path is faster, and the A/B switch exists precisely because that has not been measured.
+2. **No occlusion.** There is no Hi-Z test against the previous frame's depth. The compacted list is frustum-only, so
+   the cost of drawing occluded geometry is unchanged.
 
-**Sequencing warning.** If the ten-thousand-unit scenario turns out to be CPU-bound in `Update` rather than in draw
-submission, then A7 is the wrong fix and the right fix is in Track D (allocation budget) or in a data-oriented
-update path for bulk entities. Measure before building.
+**Sequencing warning, still live.** If the ten-thousand-unit scenario turns out to be CPU-bound in `Update` rather
+than in draw submission, then A7 was the wrong fix and the right fix is an allocation budget (D2) or a data-oriented
+update path for bulk entities. Building it was defensible — the switch makes it reversible — but shipping it as a win
+without the measurement is not.
 
 ### A8. Mesh LOD — *an asset pipeline feature, not a renderer feature*
 
@@ -336,38 +397,61 @@ Selecting a LOD at draw time is trivial. Having LODs to select is not, and that 
 - Without mesh decimation in the pipeline, LOD chains must be authored externally, which contradicts the
   "generate assets locally" story in Track C.
 
-This is where Track A and Track C meet: both need mesh processing. Build the decimator once and use it for both.
+This is where Track A and Track C meet: both need mesh processing. Build the decimator once and use it for both. That
+is also why it is the one remaining unstarted item whose blocker is not inside this repository's control.
 
-### A9. Terrain and terrain LOD — *largest item, schedule last*
+Do not confuse it with what already shipped. `InstancedModel.AnimationLod.cs` throttles *pose sampling* by screen size
+— full, half and quarter rate, with a shadow-only tier — and it is a real optimisation, but it reduces CPU animation
+work, not vertices submitted. A crowd of a thousand characters still draws a thousand full meshes.
+
+### A9. Terrain and terrain LOD — *largest item, still last*
 
 A terrain system is not one feature. It is heightmap representation, chunking, a CLOD or clipmap scheme, crack-free
-stitching, splat-mapped multi-layer materials, and vegetation scattering — and vegetation scattering wants A6 and A7
-to already exist.
+stitching, splat-mapped multi-layer materials, and vegetation scattering.
 
-Recommendation: do not start terrain until A0.1, A7, and A8 are in place. Starting earlier produces a terrain
-implementation that has to be rewritten once GPU-driven culling changes how geometry is submitted.
+The dependency picture changed in its favour: three of the four prerequisites now exist. Indirect draw, GPU particles
+and GPU-driven instance culling are all shipping, so the submission path terrain would be built on is settled. The
+remaining blocker is mesh LOD and decimation (A8), because a terrain chunk without a LOD chain is a fixed cost per
+square kilometre and no amount of culling fixes that.
 
-### Track A ordering summary
+Recommendation unchanged: do not start terrain until A8 exists, and do not build vegetation scattering on top of a
+particle system that cannot sort.
 
-| Order | Item | Blocked by | Relative cost | Visible in a screenshot |
-|---|---|---|---|---|
-| 1 | A1 Motion blur | — | Low | Yes |
-| 2 | A0.3 Texture compression | — | Medium | No |
-| 3 | A0.2 Normal target | — | Low–Medium | No |
-| 4 | A0.4 Per-view matrix split | — | Medium, four backends | No |
-| 5 | A2 SSR | A0.2 | Medium | Yes |
-| 6 | A3 Volumetrics | — | Medium | Yes |
-| 7 | A0.1 Indirect draw | — | High | No |
-| 8 | A6 GPU particles | A0.1 | Medium | Yes |
-| 9 | A7 GPU-driven culling | A0.1, D1 | High | No |
-| 10 | A4 Water | A2 | Medium | Yes |
-| 11 | A5 Decals | A0.2 | Medium | Yes |
-| 12 | A8 Mesh LOD | Mesh processing | Medium | No |
-| 13 | A9 Terrain | A0.1, A7, A8 | Very high | Yes |
+### A10. Occlusion culling — *the half of A7 that was not built*
 
-A0.4 is placed at position 4 despite blocking nothing in Track A: it is a four-backend refactor best done while the
-scene pass is being touched anyway (A0.2), and deferring it until Track E starts would make VR pay the whole cost at
-once. A1 stays first because it is a one-kernel visual win with marketing value, not because A0.4 is less important.
+Deliberately separated from A7, because they answer different questions and one is already shipping. Frustum culling
+and instance compaction decide *what might be visible*; occlusion decides *what is certainly not*, from the previous
+frame's depth pyramid.
+
+The infrastructure is closer than it looks: `HiZ.cs` already builds a four-level min-depth pyramid every frame for SSR.
+Reusing it as the occlusion test means the pyramid stops being an SSR detail and becomes a frame resource with two
+consumers — which is a better design anyway.
+
+The reasons to keep it behind a measurement are the same as A7's: it only pays off when overdraw of hidden geometry is
+actually the cost, and in a scene that is not dense that is never true.
+
+### Track A status summary
+
+| Item | Status | What is left |
+|---|---|---|
+| A0.1 Indirect draw and dispatch | Shipped, four backends | — |
+| A0.2 Scene normal target | Shipped | — |
+| A0.3 Texture compression | Not started | Moved to P3 |
+| A0.4 Per-view matrix split | Shipped | — |
+| A1 Motion blur | Shipped | — |
+| A2 Screen-space reflections | Shipped | — |
+| A3 Volumetric fog | Shipped | No multi-scatter, no temporal froxel history |
+| A4 Water | Shipped | No planar reflection, no FFT height field |
+| A5 Decals | Shipped | Two blend modes, 64 decals, no per-pixel ordering |
+| A6 GPU particles | Shipped | No sorting, so no true alpha blending |
+| A7 GPU-driven culling | Partial | No occlusion, no recorded baseline |
+| A8 Mesh LOD | Absent | Needs a decimator; needs the asset pipeline first |
+| A9 Terrain | Absent | Blocked on A8 |
+| A10 Occlusion culling | Absent | Should reuse `HiZ.cs`; needs A7's baseline first |
+
+The shape of the remaining rendering work changed accordingly. Nothing left in this track is a rendering feature —
+every one of the four open items is an asset pipeline, a measurement, or an optimisation that has to be justified by
+one. That is the difference between a renderer that is unfinished and a renderer that is done and unproven.
 
 ---
 
@@ -475,17 +559,26 @@ It should be built as a `Samples/` world, not folded into the island, and it sho
 
 ## Track C — AI
 
-The three-part shape here is right — output-to-engine, cloud reasoning, 3D generation — but the **relative ordering
-of 3D generation and cloud LLM should be reversed** from the original framing. The reasoning is below, after the
-items, because it is the one substantive disagreement in this document.
+The three-part shape here is right — output-to-engine, cloud reasoning, 3D generation — and the layer itself moved
+while nobody was updating this document. It is no longer inside the engine: ten libraries under `SeasonAIs/` and a MAUI
+studio app at `SeasonStudio/` now own it, and `Apps/Engine/Engine.csproj` references none of them. That is a better
+outcome than the one this track planned for, because it means the open repository cannot accidentally depend on the
+commercial layer.
 
-### C1. Generated output into the engine — *do this first, it is nearly free*
+The ordering argument below still matters, but the practice inverted it: 3D generation shipped first. The section
+records why that was the easy half and why C2 — cloud reasoning plus runtime C# — is still the one that unlocks
+something no competitor has.
 
-The most under-valued gap in the whole repository. Eight generation capabilities ship, and **none of their output can
-become an engine asset.** Results are displayed inside the AI panels and stop there.
+### C1. Generated output into the engine — **Partial**
 
-Meanwhile the paid tier's entire premise is that developers want generated assets *in their game*. Today the app is,
-functionally, a local generation utility that happens to be bolted to a renderer.
+The gap narrowed but did not close. `SeasonStudio/Controls/ModelPreview.cs` puts a generated mesh inside an engine
+control, so one direction — 3D output, previewed by the renderer — now exists. The other direction does not: no
+generated image becomes a scene material, no generated audio becomes a scene source, and no generated asset lives in a
+folder a project can reference.
+
+The framing still holds. The paid tier's premise is that developers want generated assets *in their game*; a studio
+that generates and previews but cannot bind is still, functionally, a local generation utility that happens to link a
+renderer.
 
 Scope, all of it small:
 
@@ -501,12 +594,14 @@ buy this instead of using ComfyUI, which is free* — ComfyUI cannot select an o
 
 **This is the highest return-on-effort item in the entire roadmap**, measured against the paid tier's credibility.
 
-### C2. Cloud LLM and runtime C# generation — *desktop only*
+### C2. Cloud LLM and runtime C# generation — *now the highest-value item in this track*
 
-Two capabilities that combine into something neither has alone.
+Two capabilities that combine into something neither has alone, and the first one is now half-built.
 
-**Cloud model access.** Requires an HTTP client, since the repository has none, plus streaming response parsing,
-user-supplied API key storage, and cancellation. A few hundred lines, not a pipeline. Commercially it has an
+**Cloud model access.** `Season/Net/WebClient.cs` already provides multipart upload and download with progress
+reporting and a cancellation token — the plumbing that the previous version of this section said the repository lacked
+entirely. What is still missing is the shape a chat completion actually needs: streaming response parsing, user-supplied
+API key storage, and a retry/backoff policy. Still a few hundred lines, not a pipeline. Commercially it has an
 attractive property: **the user brings their own key, so inference cost never lands on the vendor.** That is a
 materially better position than subsidising tokens.
 
@@ -529,20 +624,21 @@ Constraints to state plainly:
 - Generated code executes with full application trust. The security and consent story must be designed in, not
   retrofitted.
 
-### C3. 3D asset generation — *static props only, no rigging promise*
+### C3. 3D asset generation — **Shipped the easy half, as predicted**
 
-Valuable and genuinely wanted; the scope needs to be honest about where the work actually is. The generation model
-is the *small* part.
+The scope warning was correct down to the ordering. `SeasonAIs/SeasonThreeD` wraps a Trellis runner — session
+lifecycle, runtime location, native invocation, progress and output parsing, typed results — which is exactly step 1
+below, "model integration, real, and the easiest step". It shipped first, and it is a single backend with no fallback.
 
-What has to exist that does not exist today:
+What has not been built is everything after it:
 
-1. **Model integration** — a local image-to-3D or text-to-3D model. Real, and the easiest step.
+1. ~~Model integration~~ — done.
 2. **Mesh post-processing** — generated meshes arrive with poor topology, unconstrained triangle counts, and no
-   usable UV layout. Decimation, UV unwrapping, and normal repair are required, and the repository contains **no
+   usable UV layout. Decimation, UV unwrapping and normal repair are required, and the repository still contains **no
    mesh processing code at all**.
-3. **glTF export** — the engine consumes exactly one format, and only the *import* half exists. Writing a glTF
-   exporter is new work.
-4. Only then: something usable in a scene.
+3. **glTF export** — the engine consumes exactly one format, and only the *import* half exists. Writing an exporter
+   is new work.
+4. Only then: something usable in a scene without a preview window holding it.
 
 That is a mesh pipeline, not a feature. It is also where A8 (mesh LOD) meets this track — both need a decimator, so
 build it once.
@@ -559,9 +655,11 @@ work after paying.
 
 Keep this in research. Do not put it on a store listing until output quality is verified against real characters.
 
-### Why C2 should precede C3
+### Why C2 should precede C3 — and why the practice disagreed
 
-The original framing places 3D generation near-term and cloud reasoning long-term. Four reasons to invert that:
+The original framing places 3D generation near-term and cloud reasoning long-term. Four reasons were given to invert
+that, and then the code inverted them back: 3D generation shipped, cloud reasoning did not. The four reasons survive
+that, and one of them has grown stronger.
 
 1. **Effort asymmetry.** C2 is an HTTP client plus a Roslyn host. C3 is a mesh processing pipeline plus a glTF
    exporter plus a model. C3 is several times the work.
@@ -584,38 +682,48 @@ than being cut. It is an argument about eventual value, not about sequence.
 Not in the original three. Every item here is either a prerequisite for proving a Track A/B/C claim, or a
 prerequisite for the project surviving contact with contributors.
 
-### D1. Benchmarks and screenshot regression — *the highest-leverage engineering investment available*
+### D1. Benchmarks and screenshot regression — **Half built, and the half that exists is good**
 
-Two things, both absent:
+The S0 acceptance gate (`docs/acceptance/s0-baseline.md`) defines four rulers and all four now have code behind them:
 
-**Benchmark scenes with recorded numbers.** A7 cannot be justified without a baseline, B4 cannot support the scale
-claim without one, and the differentiation argument is unmeasured today. Each benchmark needs a fixed camera path, a
-fixed frame count, and recorded frame time, draw count, and allocation figures.
+| Ruler | Question it answers | Tool |
+|---|---|---|
+| Layout freeze | Are the bytes the CPU writes the bytes the shader reads? | `Tests/Shared/MaterialParamsLayoutChecks.cs`, shared into two test hosts |
+| Draw-order trace | Did the order of state changes and draws move? | `Rendering/DrawTrace.cs` |
+| Screenshot A/B | Did the pixels move? | `Apps/Engine/AbCapture.cs` + `.dbg/ab_pixel_diff.ps1` |
+| CPU frame time | Did the hot path get slower? | `Rendering/CostProfile.cs`, `ICostProfileScene.cs` |
 
-**Image-diff regression.** For a project whose entire pitch is *the renderer is real*, a silent visual regression is
-the most expensive possible bug — and this codebase's accumulated pitfalls are overwhelmingly of exactly the kind
-that a reference-image comparison catches immediately and a compile check never catches: per-frame UBO cross-talk
-between controls, atlas memory not cleared before use, backend-specific struct layout drift, shader output divergence
-between the four APIs. Render a fixed set of scenes headless per backend, compare against references with a
-perceptual threshold, fail the build on divergence.
+That is the right shape, and it was extracted from the right failures — this codebase's accumulated pitfalls are
+exactly the kind a reference-image comparison catches instantly and a compile check never catches: per-frame buffer
+cross-talk, uncleared atlas memory, struct layout drift, shader divergence between four APIs.
 
-This also has a specific and growing value: it is the only mechanism that makes AI-assisted changes to shader and
-backend code safe to accept.
+What is still missing is the part that makes it a gate rather than a tool:
 
-### D2. Frame allocation budget — *make the central claim measurable*
+- **Recorded numbers.** A fixed camera tour, a fixed frame count, and a published table of frame time, draw count and
+  allocation per scene. A7 cannot be justified without it and B4 cannot support the scale claim without it.
+- **CI.** Nothing runs on a commit. Every ruler above is currently something a person remembers to run.
+
+This also has a specific and growing value: it is the only mechanism that makes machine-generated changes to shader and
+backend code safe to accept — which is Track F's whole premise.
+
+### D2. Frame allocation budget — *measured, not yet a budget*
 
 The differentiating argument is that architectural minimalism recovers what a managed runtime costs. Pure C# engines
 are dismissed on exactly one axis — **GC pauses** — and that dismissal will appear in the first community thread.
 
-The answer cannot be prose. It has to be a number:
+The measurement half shipped by accident, as part of `FrameProfiler`: it records bytes allocated per frame and
+Gen0/1/2 collection counts over the same 96-frame window as the timings. That means the answer is no longer a research
+task; it is a published number waiting to be read off a fixed scenario.
 
-- An explicit **zero-steady-state-allocation** target for the frame loop, treated as a contract rather than an
-  aspiration.
-- Allocation measurement in the benchmark harness, with failure on regression.
-- A published figure: allocated bytes per frame, and GC collection counts over a fixed benchmark run.
+The half that did not ship is the contract:
 
-"Zero bytes allocated per frame at ten thousand animated instances" ends that argument in one line. Nothing else
-does.
+- An explicit **zero-steady-state-allocation** target for the frame loop, treated as a rule rather than an aspiration.
+- A failure on regression inside the benchmark harness — not a graph a person has to interpret.
+- A published figure: allocated bytes per frame and GC counts over a fixed benchmark run, for both the island and a
+  mass-unit scene.
+
+"Zero bytes allocated per frame at ten thousand animated instances" ends that argument in one line. Without the target,
+the profiler only tells you what you already suspected.
 
 ### D3. Asset pipeline
 
@@ -649,21 +757,212 @@ matrix in D4 is generated from the same source.
 
 ### D6. Maintaining the commercial boundary
 
-Once Gate 0's conditional reference lands, the two-tier licence split becomes something that can silently break. A CI
-job that builds the open repository *without* `SeasonAI` present is the cheapest possible protection against the open
-engine quietly acquiring a dependency on the commercial layer.
+The boundary moved, and it moved in the right direction: the AI layer now lives outside the engine repository entirely
+(`SeasonAIs/`, `SeasonStudio/`), so `Apps/Engine/Engine.csproj` references none of it and the open repository builds
+without it. That happened by relocation, not by policy — which is exactly why it needs a test.
+
+A CI job that builds the open repository with no `SeasonAIs` present is still the cheapest possible protection against
+the engine quietly re-acquiring a dependency on the commercial layer. It costs one workflow file, and it is the only
+item in this track that can be finished in an afternoon.
+
+---
+
+---
+
+## Track F — Agent surface and the lightweight editor
+
+This track exists because of one property the engine already has, and which most engines being compared against do not.
+A behaviour here is **one C# class**. A world record is **a type name plus construction parameters**. There is no
+component model, no inspector-configured behaviour, no prefab graph to satisfy. That means an agent does not need to
+understand an editor to drive this engine — it needs to emit a class, name it, and place it.
+
+The second reason is cheaper to state and harder to argue with: an agent is the only realistic way to keep a
+demonstration honest. Every release needs the island, the weather, the fog, the cloth and the water to still look right
+on four backends, and a person clicking through that is a person who will eventually stop. A replayable command stream
+with a screenshot diff behind it is the difference between a demo and a regression suite.
+
+### F0. One command surface, two clients — *the design rule, not a feature*
+
+> **Every editor action is a command. The agent is a second client of the same command stream.** There is no
+> agent-only API and no UI-only mutation path. If a person can do it, the agent calls the same command; if an agent
+> does it, the editor shows it and can undo it.
+
+This is the same weight of decision as B1's anti-fragmentation contract, and it has four immediate consequences:
+
+1. **Undo is promoted.** It stops being "late" and becomes the command layer's first requirement, because a command
+   stream *is* an undo log. B2's item 5 moves to the front of B2.
+2. **Objects need addresses, not references.** `ObjectPicker` currently returns a live object; a command needs a stable
+   id that survives a save and a reload. That falls out of B1's type registry, not out of a new system.
+3. **Every command needs a dry run.** The agent proposes a diff, the human reads it, and only then does it apply. That
+   is the same shape as `git diff`, and it is the reason this track is not "give the model the keyboard".
+4. **The editor is not the API.** If the shell is the only client, the API will grow shell-shaped — modal state,
+   selection, focus. Two clients from day one keeps it honest.
+
+### F1. Headless run and capture
+
+The cheapest of the three enabling pieces, because most of it exists: `Apps/Engine/AbCapture.cs` already captures a
+frame, `Rendering/FrameProfiler.cs` already produces a compact summary string and a CSV sink, and `PinDelta` already
+makes a scenario reproducible by fixing the timestep. What is missing is a way to ask for them from outside a window.
+
+Scope: a `--headless` run mode that loads a world, steps N fixed frames, writes a PNG per requested view slot, writes
+the profile summary as JSON, and exits with a status code. Nothing in that sentence is new capability; it is packaging.
+
+Once it exists, D1's reference images stop being a hand-run ritual, and B4's benchmark stops being a scene someone
+has to watch.
+
+### F2. World commands
+
+The part that depends on B0 and B1, and the reason this track cannot go first. The command vocabulary is deliberately
+tiny, because every verb added here is a verb the UI must also implement:
+
+| Verb | Answers | Exists today |
+|---|---|---|
+| `world.list` | What is in the world, by id, type and transform | No — needs B1's registry |
+| `world.spawn` | Create a registered type at a transform | Partially — `ObjectPicker` placement, by hand |
+| `world.set` | Change a construction parameter | Partially — `ObjectPanel`, fixed fields |
+| `world.remove` | Delete by id | No |
+| `world.save` / `world.load` | Round-trip a world file | No — B1 |
+| `view.set` | Bind a camera to a view slot | Yes — `SecondaryView`, `Views.cs` |
+| `frame.capture` | Render and write a PNG | Yes — `AbCapture.cs` |
+| `frame.profile` | Timings, allocation and GC for the last window | Yes — `FrameProfiler` |
+| `scene.measure` | Draw count, instance count, triangle count | No — `DrawTrace.cs` counts order, not volume |
+| `asset.generate` | Produce a texture, mesh or audio file from a prompt | Partially — `SeasonAIs`, `SeasonThreeD` |
+| `code.compile` | Compile a C# snippet and report diagnostics | No — needs the Roslyn host from C2 |
+| `code.apply` | Hot-replace a behaviour instance | No — same dependency |
+
+Two rows in that table are the whole track. `code.compile` plus `code.apply`, sitting on top of `world.set`, is the
+loop that makes natural-language world creation real: describe a behaviour, get a class, apply it to an instance, look
+at a screenshot, keep or discard. Everything above them is plumbing that exists or is already scheduled.
+
+### F3. What the agent actually gets
+
+An MCP-shaped tool surface, over stdio or a localhost socket, backed by exactly the verbs above — no special cases.
+The tool list is short on purpose:
+
+- **Inspection** — `world.list`, `frame.profile`, `scene.measure`. Read-only, cheap, and the thing that stops an agent
+  from guessing at state it cannot see.
+- **Mutation** — `world.spawn`, `world.set`, `world.remove`, each with a dry-run mode that returns a diff.
+- **Perception** — `frame.capture`, returning an image path rather than bytes, so the caller decides what to do with it.
+- **Generation** — `asset.generate`, `code.compile`, `code.apply`, in that order of risk.
+- **Verification** — `test.image_diff` against a reference, which is how an agent checks its own work without a person
+  in the loop.
+
+### F4. The lightweight editor is the same surface, rendered
+
+Not a new application, and not a step toward becoming an editor-centric engine. `SeasonStudio` already is the shape
+this needs: a MAUI shell that references `Season.csproj`, hosts engine controls, and has ten tool panels behind one
+window. What it does not have is a **scene** — it has `Controls/ModelPreview.cs`, which is a model in a box.
+
+The smallest honest version is four panes: a viewport bound to a view slot, a hierarchy driven by B1's type registry, a
+property grid over construction parameters only, and a command palette that shows the same command strings the agent
+sends. That is B0 + B1 + B2 + B3, with the command layer as the spine — which is exactly why it should not be a separate
+project with a separate plan.
+
+### F5. Safety, stated plainly
+
+- **No network listener by default.** Stdio, or a localhost socket with a token in a file the user can see. A control
+  surface that can spawn objects and compile code is remote code execution if it is ever bound to `0.0.0.0`.
+- **Generated code runs with full application trust**, because it is a normal C# class in the normal app. There is no
+  sandbox and C2 says so. Consent is therefore per session, visible, and revocable.
+- **The agent never gets a capability the UI lacks.** That is not a security property, it is an auditability one: if a
+  command did something a person could not, there would be no way to review it.
+
+### What this changes about the rest of the roadmap
+
+- **B2's undo moves first**, because a command stream is an undo log.
+- **D1 stops being optional**, because an agent without a screenshot diff is an agent that generates visual regressions
+  at machine speed.
+- **C2 is promoted** from "the paid layer's next step" to "Track F's enabler". That is the strongest argument for it:
+  the feature that looked like a nice-to-have is the one the automation loop depends on.
+- **Nothing about the non-goals changes.** No visual scripting, no node graph, no behaviour assembled from fragments. The
+  agent writes the same C# class a person writes, which is the only reason this is defensible at all.
+
+---
+
+## Track P — Performance and build economics
+
+Everything here answers the same question: does the frame budget hold on the hardware the audience actually owns, and
+can the answer be shown rather than asserted. It is separate from Track A because none of it is a rendering feature,
+and separate from Track D because it is not about proving the project works — it is about making it fast and small.
+
+### P0. Measurement on all four backends — *do this first, it gates the rest*
+
+`FrameProfiler` is real: per-pass GPU and CPU intervals, p50/p95, allocation bytes, GC counts, a HUD and a CSV sink.
+But `IGpuFrameTimer` has exactly one implementation, `Platforms/Windows/DirectX/DXGpuFrameTimer.cs`, and the base
+`CreateGpuFrameTimer()` returns null everywhere else. The GPU column is therefore empty on Vulkan, Metal and WebGPU —
+which are the three backends where a managed engine's frame budget actually needs defending, because that is where the
+integrated GPUs and the browsers are.
+
+Scope: timestamp queries per backend (`vkCmdWriteTimestamp` with a query pool, `MTLCommandBuffer` sample buffers,
+`timestamp-query` where the WebGPU adapter offers it), the same fence-gated readback ring D3D12 already uses, and an
+explicit "unsupported" state rather than a silent NaN. Then one recorded run per backend of the same scene.
+
+Until this exists, every item below can only be argued. After it, each one is either a number or it does not ship.
+
+### P1. Contract code generation
+
+`IGraphics` is a large interface — roughly seventy-five methods — and each backend implements the whole surface by hand.
+Measured similarity between backends ranges from about 30 % to about 90 % per object family, and the low end is not
+shared code waiting to be extracted: it is D3D12-specific logic that grew there for a reason. So the goal is not
+"delete half the lines".
+
+The goal is to **shrink the surface a change has to touch**. One declarative description of the object families and
+their parameters, with per-backend forwarding and validation generated from it, turns "add a method and edit four
+files" into "add a method and regenerate". The realistic saving is three to five thousand lines, not the six to eight
+that a similarity ratio suggests — but the real payoff is that the four implementations cannot drift apart silently,
+because they are generated from one description.
+
+This is also what makes the four-language shader corpus survivable. The shaders stay hand-written per backend; the
+boilerplate around them stops being hand-written.
+
+### P2. Shader precompile and PSO disk cache
+
+All four backends compile at startup: FXC to DXBC on D3D12, glslang to SPIR-V on Vulkan, Metal source compile, WGSL on
+Web. The in-process cache prevents recompiling within a session; nothing survives a restart, D3D12 has no pipeline
+library and Vulkan does not persist a `VkPipelineCache`. The cost is a first-run hitch and a startup latency that a
+store reviewer notices before they notice anything else.
+
+Scope: a content-addressed shader and pipeline cache on disk, keyed by source hash plus pipeline state, with the runtime
+compilers still present as the fallback. The rule from D3 applies unchanged: the cache is an optimisation and never an
+entry requirement — cloning the repository and running it must still work with an empty cache.
+
+### P3. Texture compression and a KTX2 container
+
+Formerly A0.3. Unchanged in content, changed in category. BC7/BC5/BC6H on desktop, ASTC on mobile, ETC2 as the Android
+floor, KTX2 as the container so one file serves every platform, and an offline transcode step. Runtime decode to
+uncompressed stays an anti-goal.
+
+The reason it belongs in this track and not in Track A is the shape of the payoff: package size, web load time, VRAM and
+bandwidth. None of those is a picture. All of them are the difference between a browser build someone waits for and one
+they close.
+
+### P4. Temporal upscaling and dynamic resolution
+
+TAA already owns everything an upscaler needs: jittered history, a velocity buffer, variance clipping and a resolve.
+A TAAU-style upscale from an internal resolution of 67 % or 50 % is a small increment on an effect that already works,
+and it is the largest single GPU win available on the integrated hardware most evaluators will run this on.
+
+Dynamic resolution is the other half, and it is not a rendering feature either: it is the feedback loop that keeps the
+frame budget under a target when the scene changes under you. It is also the mechanism E5's Quest preset will need,
+because a fixed preset on a mobile GPU is either too slow or too ugly depending on the room.
+
+Order: build the upscale against a fixed scale first and measure it, then add the controller. A dynamic resolution
+system without a profiler behind it oscillates, and P0 is what stops that.
 
 ---
 
 ## Track E — VR / XR
 
-The renderer is single-view by construction: the camera is LookAt plus symmetric FOV
-(`Rendering/Camera3D.cs`), the per-object matrix buffer bundles View with World (`Basic/Camera.cs`), the render
-target chain is a set of static singletons (`FrameSchedule.SceneColor/SceneDepth/SceneVelocity`), D3D12 render
-targets are created with `DepthOrArraySize = 1`, the frame loop paces itself on window vsync (`Present(SyncInterval:
-1)`), input is pointer-only (`TouchService`, no gamepad), and the UI is screen-space (`Panels/Input.cs`). Every one
-of those is an assumption VR breaks, so this track is deliberately last: it is a new platform claim, not a feature on
-the existing one, and none of it should be started before the desktop story ships.
+The single-view objection that used to open this section is gone. A0.4 shipped: view and projection are per view, the
+frame state carries per-view camera and lighting snapshots, `ViewTargets` holds per-view targets, up to eight views
+render in one frame, and the sample app already renders rear-view mirrors through the same path. That was the expensive
+half, and it was paid for while the scene pass was open for other reasons — which is exactly what the previous ordering
+predicted.
+
+What still blocks VR is the part that was never in this track's prepayment: there is no OpenXR binding, no stereo
+submission and no per-eye pacing; the frame loop still paces on window vsync (`Present(SyncInterval: 1)`); input is
+pointer-only (`TouchService`, no gamepad); and the UI is screen-space (`Panels/Input.cs`). This track stays last because
+it is a new platform claim, not a feature on the existing one.
 
 Ordering here is by dependency, and one dependency is deliberately hoisted out into Track A:
 
@@ -676,9 +975,10 @@ Ordering here is by dependency, and one dependency is deliberately hoisted out i
 | **E4. VR UI** | Screen-space panels do not exist in VR: world-space anchored panel quads, or OpenXR composition layers for 2D surfaces | E0 |
 | **E5. Quest (Android)** | OpenXR Loader plus the Android Activity lifecycle under the MAUI host; Vulkan swapchain path (`Shared/LinuxAndroid/Vulkan`); an XR quality preset that drops DDGI/GTAO tiers via the existing `RenderQuality` ladder, which is exactly what that ladder was built for | E2, E3 |
 
-A0.4 exists in Track A so that the hardest refactor — separating per-view matrices from per-object state across four
-shader sources — is paid for long before this track starts. The shadow pass is the working precedent
-(`Pipeline.SetShadowViewProj` already writes a per-view matrix as a root constant per atlas quadrant).
+A0.4 has already been paid for, and it is why this track can start with the session rather than with a refactor. The
+shadow pass was the working precedent — `Pipeline.SetShadowViewProj` already wrote a per-view matrix as a root constant
+per atlas quadrant — and the scene pass now follows the same pattern. E1's remaining work is submission and pacing, not
+argument layout.
 
 ---
 
@@ -687,33 +987,47 @@ shader sources — is paid for long before this track starts. The shadow pass is
 ```
 Gate 0 ──> everything
 
-A0.1 indirect draw ──> A6 particles
-                   └─> A7 GPU culling ──> A9 terrain
-A0.2 normal target ──> A2 SSR ──> A4 water
-                   └─> A5 decals
+SHIPPED, and their edges are now historical:
+  A0.1 indirect draw ──> A6 particles
+                     └─> A7 GPU culling
+  A0.2 normal target ──> A2 SSR
+                     └─> A5 decals
+  A3 volumetrics ──> A4 water
+  A0.4 per-view split ──> E1 dual-view
+
+STILL OPEN:
+D1 recorded baseline ──> A7 (justification)
+                     ├─> A10 occlusion
+                     ├─> D2 allocation contract
+                     ├─> B4 scale claim
+                     └─> P4 dynamic resolution controller
+
+P0 GPU timers on four backends ──> P1, P2, P3, P4 are arguments until this lands
 mesh decimation ──> A8 mesh LOD ──> A9 terrain
-                └─> C3 3D generation
+                └─> C3 (the half that is still missing)
 
-D1 benchmarks ──> A7 (justification)
-              ├─> D2 allocation budget
-              └─> B4 scale claim
-
-B0 shell/scene split ──> B1 serialization ──> B2 editing ──> B3 catalogue
-                                          └─> C2 runtime C# (shared design)
+B0 shell/scene split ──> B1 serialization ──> F2 world commands ──> F4 editor panes
+                                          │                     └─> B2 editing ──> B3 catalogue
+                                          └─> C2 runtime C# ──> F3 code.compile / code.apply
 
 C1 output-to-engine ──> raises the value of the existing paid tier immediately
-
-A0.4 per-view matrix split ──> E1 dual-view rendering ──> E2 per-eye state ──> E5 Quest
+A0.4 (shipped) ──> E1 dual-view ──> E2 per-eye state ──> E5 Quest
 E0 OpenXR binding ──> E3 input, E4 UI
 RenderQuality ladder ──> E5 XR quality preset (Quest)
 ```
 
 Convergences worth designing for deliberately rather than discovering later:
 
-- **Mesh decimation** is required by both A8 and C3. One implementation.
-- **B1's type-name-plus-parameters format** and **C2's generated C# class** are the same idea. Design them together.
-- **A0.4's per-view matrix split** and any eventual multiview broadcast (E1) share the same per-view constant layout.
-  Land A0.4 first; it is the non-negotiably portable half, and multiview can stay a per-backend acceleration on top.
+- **Mesh decimation** is required by both A8 and C3. One implementation, and it is now the single largest shared blocker
+  left in the document.
+- **B1's type-name-plus-parameters record**, **C2's generated class** and **F0's command payload** are the same idea three
+  times. A world record, a generated behaviour and a `world.spawn` argument should all be describable by one schema, or
+  the project will end up maintaining three.
+- **The Hi-Z pyramid already exists** for SSR. A10 should consume it rather than build a second one, which also means
+  occlusion culling becomes a frame-resource change instead of a new effect.
+- **A0.4 landed before Track E needed it**, which is the only example in this document of a prepayment actually being
+  collected in time. The pattern is worth repeating for P0: everything in Track P is an argument until the GPU timers
+  exist on all four backends.
 
 ---
 
@@ -725,50 +1039,52 @@ Dates are intent, not commitment.
 
 Nothing here is new capability. All of it is the difference between a private repository and a public project.
 
-- Gate 0 in full
-- **A1 motion blur** — the one cheap visual win, and both the store listing and community posts need motion
-- **C1 generated output into the engine** — makes the paid tier defensible
-- **D1 benchmark harness**, even minimally, so later work has a baseline
-- Store submission; first community posts once Gate 0's B1 is fixed
+- Gate 0 remainder: product ids, manifest identity, source delivery, privacy contact
+- **P0 GPU timers on Vulkan, Metal and WebGPU** — the one item that turns every later optimisation into a number
+- **D1 recorded numbers and CI**, so the four rulers in `docs/acceptance` run on a commit instead of in someone's memory
+- **C1 completion** — generated image to material, generated audio to source, a generated-assets folder
+- **F1 headless run and capture**, which is packaging on top of `AbCapture` and costs almost nothing
+- Store submission; first community posts
 
-Outcome: the funnel exists and the paid tier has a reason to be bought.
+Outcome: the funnel exists, the paid tier has a reason to be bought, and the first profile table is published.
 
 ### Phase 1 — Demonstrability (2027 H1)
 
-- **B0 shell/scene decoupling**, then **B1 world serialization**
-- **A0.2 normal target** and **A0.4 per-view matrix split**, then **A2 SSR** — the scene pass is open for A0.2, so
-  pay for the matrix split in the same visit
-- **A0.3 texture compression** — required before the web hosts are worth showing to anyone
-- **D4 sample ladder** and the compute-effect walkthrough
-- **D2 allocation budget** established as a measured contract
+- **B0 shell/scene decoupling**, then **B1 world serialization**, then **undo as the command layer's first requirement**
+- **F0 and F2** — the command surface and the world verbs, against the same registry B1 introduces
+- **P2 shader and PSO cache** — the first-run hitch is what a store reviewer notices
+- **P3 texture compression and KTX2** — required before the web hosts are worth showing to anyone
+- **D4 sample ladder**, the compute-effect walkthrough, and a feature-by-backend matrix generated rather than written
 
-Outcome: someone can create and save a world, and the performance claim has a number attached.
+Outcome: someone can create and save a world, an agent can drive that same world through commands, and the performance
+claim has a number attached.
 
 ### Phase 2 — Scale (2027 H2)
 
-- **A0.1 indirect draw** across the desktop backends
-- **A6 GPU particles**
-- **A7 GPU-driven culling**, justified against the Phase 1 baseline
-- **B4 mass-unit reference world**
-- **A3 volumetrics**
+- **A7 justified or demoted** against the Phase 1 baseline, using the `SEASON_CULL_INDIRECT` switch that already exists
+- **A10 occlusion culling** on the existing Hi-Z pyramid, once A7 has a number
+- **B4 mass-unit reference world** — the scene that makes the strategy-scale claim falsifiable
+- **A8 mesh LOD** and the decimator, then **A9 terrain**
+- **P4 temporal upscaling**, then dynamic resolution on top of the P0 profiler
 
-Outcome: the strategy-scale claim is demonstrated rather than asserted.
+Outcome: the strategy-scale claim is measured rather than asserted, and mesh LOD stops being the shared blocker for
+both Track A and Track C.
 
 ### Phase 3 — Creation (2028 H1)
 
-- **C2 cloud LLM plus Roslyn runtime C#**, desktop only
-- **B2 editing affordances** and **B3 asset catalogue**
-- **A4 water**, **A5 decals**
-- **D3 asset pipeline** consolidated
+- **C2 cloud LLM plus Roslyn runtime C#**, desktop only — and the enabler for everything below
+- **F3 agent tools** over the command surface, with dry-run diffs
+- **B2 editing affordances**, **B3 asset catalogue**, and **F4 the four-pane editor** on top of both
+- **D3 asset pipeline** consolidated, including the glTF exporter C3 needs
 
-Outcome: natural-language world creation sitting on a world format that was designed for it.
+Outcome: natural-language world creation, sitting on a world format that was designed for it and a command layer that
+can undo it.
 
 ### Phase 4 and beyond
 
-- **A8 mesh LOD**, **A9 terrain**
-- **C3 3D static prop generation**
+- **C3 completion** — mesh post-processing and glTF export, so generated meshes stop living in a preview window
 - **C4 auto-rigging**, if output quality justifies it
-- **Track E** starting as a Windows + D3D12 pilot (E0 → E1 → E2 → E3 → E4); A0.4 is already in place from Phase 1
+- **Track E** starting as a Windows + D3D12 pilot (E0 → E1 → E2 → E3 → E4); A0.4 is already in place
 - **E5 Quest**, after the desktop pilot proves the session, dual-view, and input abstractions hold
 - Mac and mobile store presence
 - **Console technical adaptation** — acknowledged, not scheduled; see the section below
@@ -832,6 +1148,12 @@ Unchanged in spirit from the archive, with additions from this analysis:
   schedules none of it.
 - Shipping the AI layer into console builds. SeasonAI is a developer service for Windows/Mac/Linux; console builds
   carry the finished game, nothing more.
+- An agent-only mutation API, or a control surface bound to a network interface by default. One command surface, two
+  clients — and the agent never gets a capability the editor lacks.
+- A second shader toolchain. P1 generates the C# around the shaders; it never generates the shaders. Each backend keeps
+  its own hand-written source, because that independence is the one architectural decision that has paid for itself
+  repeatedly.
+- A second Hi-Z pyramid, or a separate occlusion hierarchy, while SSR's already runs every frame.
 
 ---
 
@@ -848,4 +1170,9 @@ The roadmap is working if:
 - `Season/` stays smaller and clearer than the feature list would suggest.
 - One implementation per domain still holds — no OpenGL fallback appears, no second animation format, no second text
   renderer.
+- Every editor action is also a command, and every command can be undone.
+- The GPU profile column is populated on all four backends for the same scene, so "it got faster" is a measurement
+  rather than a memory.
+- Adding a visual feature stops costing four driver files of boilerplate. The shaders stay four; the plumbing around
+  them does not.
 - When Track E starts, the same rule extends to XR: OpenXR only, no runtime-specific integration layers.

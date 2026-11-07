@@ -808,7 +808,31 @@ public static class FrameSchedule
             || _computeAfterScene.Contains(effect))
             return true;
         if (!g.ComputeSupported) return false;
-        if (!effect.Initialize(g)) return false;
+
+        // Contract 3-2: one row per effect. Kernel rows answer "which shader cost how much"; this answers "which effect
+        // owns the bill", which is what a deferral decision needs - Initialize is where the kernels, the storage textures
+        // and the effect's own graphics pipeline are all created.
+        long initializeStart = StartupProfiler.Enabled ? StartupProfiler.Ticks() : 0;
+
+        string outcome = "threw";
+
+        bool ready;
+
+        try
+        {
+            ready = effect.Initialize(g);
+
+            outcome = ready ? "ok" : "declined";
+        }
+        finally
+        {
+            if (initializeStart != 0)
+                StartupProfiler.Item("effect", $"{effect.Phase}/{effect.Name}", StartupProfiler.ElapsedMs(initializeStart),
+                    0, $"outcome={outcome}");
+        }
+
+        if (!ready) return false;
+
         effects.Add(effect);
         return true;
     }

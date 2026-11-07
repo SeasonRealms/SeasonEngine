@@ -356,19 +356,19 @@ public abstract class BaseApp : Panel
             // D1: the decal PSO must be built before the first frame. Each platform already builds SceneColor/SceneDepth according to RenderQuality before calling Create,
             // so this is the only timing that all five backends pass through and at which the targets are already in place;
             // on platforms without a backend implementation, CreateDecalPipeline returns null, and RegisterDecals does not register itself and leaves no residue.
-            Season.Rendering.FrameSchedule.RegisterDecals(Graphics.Instance);
+            using (StartupProfiler.Scope("RegisterDecals")) Season.Rendering.FrameSchedule.RegisterDecals(Graphics.Instance);
 
             // P2: the water surface PSO and refraction snapshot must likewise be prepared before the first frame. The preconditions match decals (single-sample HDR scene color + explicit depth),
             // and in addition a snapshot target of the same shape as SceneColor is required; if either is missing, RegisterWaters falls back itself and leaves no residue.
-            Season.Rendering.FrameSchedule.RegisterWaters(Graphics.Instance);
+            using (StartupProfiler.Scope("RegisterWaters")) Season.Rendering.FrameSchedule.RegisterWaters(Graphics.Instance);
 
             // P1: the waterfall water curtain PSO must likewise be built before the first frame. The preconditions match decals (single-sample HDR scene color + explicit depth),
             // with no refraction snapshot; if the backend has no implementation, RegisterWaterfalls falls back itself and leaves no residue.
-            Season.Rendering.FrameSchedule.RegisterWaterfalls(Graphics.Instance);
+            using (StartupProfiler.Scope("RegisterWaterfalls")) Season.Rendering.FrameSchedule.RegisterWaterfalls(Graphics.Instance);
 
             // P1: the river ribbon PSO, same preconditions as the curtain (the Pass and the resource shape are shared). Built
             // before the first frame because the bank meshes register their ribbons in their own constructor.
-            Season.Rendering.FrameSchedule.RegisterWaterRivers(Graphics.Instance);
+            using (StartupProfiler.Scope("RegisterWaterRivers")) Season.Rendering.FrameSchedule.RegisterWaterRivers(Graphics.Instance);
 
             // On Web, consume the channel from the main-thread render loop; on native platforms, start a background consumer.
             if (DeviceServices.Core.Platform is not Platform.Web)
