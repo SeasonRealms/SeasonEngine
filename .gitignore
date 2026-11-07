@@ -64,3 +64,9 @@ nunit-*.xml
 /Season/.dbg/_river_bin
 /.dbg
 /_s3trace
+/.build_net10.0-browser.err
+/.build_net10.0-browser.out
+/.build_net10.0-windows10.0.19041.0.err
+/.build_net10.0-windows10.0.19041.0.out
+/.build_net10.0.err
+/.build_net10.0.out
