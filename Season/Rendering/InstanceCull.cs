@@ -18,18 +18,20 @@ namespace Season.Rendering;
 /// "per-instance culling would require rebuilding and uploading the instance buffer for every cascade, violating clause 2 of 1-3", while the index table sidesteps the rebuild.
 ///
 /// All buffers are tiled across <see cref="InstanceCull.MaxSlots"/> slots. The shadow slots keep the layout of
-/// <see cref="CascadedShadow"/>: 0..2 are the sun cascades and 3 is the spot light; slot 4 (<see cref="CascadedShadow.FarSlot"/>) is
-/// the fog's far map and is deliberately left out of the chain below - its view is anchored to the medium rather than to a
-/// visible main view, so it takes the direct whole-batch path instead of a gathered segment. <see cref="InstanceCull.MainViewSlot"/> follows them
+/// <see cref="CascadedShadow"/>: 0..2 are the sun cascades, 3 is the spot light, and 4 (<see cref="CascadedShadow.FarSlot"/>) is the
+/// fog's far map. The far map is tested against its own view rather than the camera's, because it is anchored to the medium: an instance
+/// the eye has left behind can still cast into the fog, and an instance the eye can see but the fog volume does not contain cannot. It is
+/// culled on every frame the fog is live, whether or not the atlas quadrants were reused -- it owns a texture and a pass of its own, and
+/// reuse only ever skips the atlas. <see cref="InstanceCull.MainViewSlot"/> follows them
 /// and holds the main camera's frustum for the groups that opted into indirect main-view drawing (<see cref="CullMainView"/>).
 ///
 /// That layout is a numbering, not a coverage list, and the difference is a silent failure rather than a compile error. Slots from
 /// <see cref="CascadedShadow.LocalSlotBase"/> up are the local point-light cube maps: their arg rows sit inside
 /// <see cref="InstanceCull.MaxSlots"/> but the chain never writes them, because those maps follow a lamp rather than an eye. Which slots
 /// were actually culled this frame is published as <see cref="InstanceCull.ShadowSlotMask"/>; a shadow draw must ask that mask
-/// (<see cref="InstanceCull.ShadowSlotActive"/>). A range test against <see cref="InstanceCull.MaxSlots"/> instead accepts both the far
-/// slot and a local slot, and hands them an arg row holding the zero InstanceCount that <see cref="InstanceCull.BuildArgsTemplate"/>
-/// installed -- the draw then submits nothing at all, where falling back to the whole batch would have been correct.
+/// (<see cref="InstanceCull.ShadowSlotActive"/>). A range test against <see cref="InstanceCull.MaxSlots"/> instead accepts a local slot
+/// and hands it an arg row holding the zero InstanceCount that <see cref="InstanceCull.BuildArgsTemplate"/> installed -- the draw then
+/// submits nothing at all, where falling back to the whole batch would have been correct.
 /// Inactive slots are skipped directly by slotMask,
 /// rather than by filling in a "matrix that culls everything" -- that would require constructing a degenerate projection that silently breaks the moment the plane-extraction code changes.
 /// </summary>
@@ -170,7 +172,7 @@ public static class InstanceCull
     /// </summary>
     public const int MainViewSlot = CascadedShadow.SlotCount;
 
-    /// <summary>Slot count: the shadow system's atlas partitions (three cascades + one spot light) plus the main view.
+    /// <summary>Slot count: the shadow system's slot numbering (three cascades, one spot light, one far map) plus the main view.
     /// It multiplies every per-slot buffer size below, so the backends that allocate through these helpers grow with it automatically.</summary>
     public const int MaxSlots = CascadedShadow.SlotCount + 1;
 
@@ -272,14 +274,14 @@ public static class InstanceCull
     public static readonly List<IInstanceCullTarget> Targets = new();
 
     /// <summary>
-    /// Slots the cull chain actually wrote this frame: the sun cascades and the spot light that were active. Zero when no target was
-    /// dispatched, no shadow slot was active, or the shadow atlas was reused.
+    /// Slots the cull chain actually wrote this frame: the sun cascades, the spot light and the far map that were active. Zero when no
+    /// target was dispatched or no shadow slot was active at all; atlas reuse alone does not zero it, because the far map is culled on
+    /// every frame the fog is live whether or not the atlas quadrants were reused.
     ///
     /// This is the only truthful answer to "can this draw read a gathered segment", because the slot numbering cannot be asked: the range
-    /// <c>0..MaxSlots</c> also covers slots the chain never touches (the far slot, and every slot from
-    /// <see cref="CascadedShadow.LocalSlotBase"/> up), whose rows keep the InstanceCount=0 written by <see cref="BuildArgsTemplate"/> for the
-    /// lifetime of the buffer. A draw trusting the range test therefore submits nothing, silently, while the direct whole-batch draw it
-    /// displaced would have been correct.
+    /// <c>0..MaxSlots</c> also covers every slot from <see cref="CascadedShadow.LocalSlotBase"/> up, whose rows keep the InstanceCount=0
+    /// written by <see cref="BuildArgsTemplate"/> for the lifetime of the buffer. A draw trusting the range test therefore submits nothing,
+    /// silently, while the direct whole-batch draw it displaced would have been correct.
     ///
     /// Written once per frame in <see cref="InstanceCullEffect"/>'s Record, and cleared on entry there, before any early return: the mask is
     /// frame state, and an early return (no targets, a graphics mismatch, no active slot at all) would otherwise leave the previous frame's
@@ -549,7 +551,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         // The slot mask is determined here rather than letting the kernel guess from an "invalid matrix": inactive slots simply do not participate,
         // their arg table keeps the InstanceCount=0 written by reset, and the draw side then naturally draws nothing.
         //
-        // On a shadow-map reuse hit the entire shadow Pass is skipped, so the shadow slots have no consumers this frame and stay out of the mask.
+        // On a shadow-map reuse hit the atlas Pass is skipped, so the atlas slots have no consumers this frame and stay out of the mask.
         // That used to end Record outright; it no longer may, because the main-view slot is consumed by the scene Pass, which runs every frame
         // whether or not the shadow atlas is reused or shadows are on at all.
         int shadowMask = 0;
@@ -568,6 +570,15 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             }
         }
 
+        // The far map is outside the reuse guard on purpose: it targets its own texture from a medium-anchored matrix, so the atlas being
+        // reusable says nothing about it. ComputeFar runs before this phase and sets FarActive in the same frame it produces the matrix the
+        // far pass uploads, so "culled here" and "drawn there" cannot disagree about which view was tested.
+        if (CascadedShadow.FarActive)
+        {
+            WriteSlotMatrix(CascadedShadow.FarSlot, CascadedShadow.FarViewProj);
+            shadowMask |= 1 << CascadedShadow.FarSlot;
+        }
+
         // Published before the main-view decision and before the `slotMask == 0` return: a frame that culls only the main view still has to
         // publish "no shadow slot is readable" here, because that is what the shadow draw side checks before taking a segment.
         InstanceCull.ShadowSlotMask = shadowMask;
@@ -579,7 +590,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             _localBypassLogged = true;
             DeviceServices.BaseApp.AddLog(LogType.Backend,
                 $"[InstanceCull] Local cube shadow slots ({CascadedShadow.LocalSlotBase}..{CascadedShadow.TotalSlotCount - 1}) stay on the direct " +
-                "whole-batch path: A7 culls the atlas, the spot and the main view, never a lamp-anchored map.");
+                "whole-batch path: A7 culls the atlas, the spot, the far map and the main view, never a lamp-anchored map.");
         }
 
         // The main view's unjittered ViewProjection without the backend NDC adjustment -- the same matrix control-level frustum culling uses,

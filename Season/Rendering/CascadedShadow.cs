@@ -91,7 +91,8 @@ public static class CascadedShadow
     public static int Epoch;
 
     /// <summary>Atlas slot index used by the fog's far shadow map. It is not a quadrant: the far map has a texture of
-    /// its own, so this index only names its diagnostics row and its culling frustum.</summary>
+    /// its own, so this index names its diagnostics row, its culling frustum, and its slot in the cull chain that
+    /// <see cref="InstanceCull.ShadowSlotActive"/> reports.</summary>
     public const int FarSlot = MaxCascades + 1;
 
     /// <summary>Total number of shadow slots: the three cascade quadrants, the spotlight quadrant, and
