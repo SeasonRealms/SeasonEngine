@@ -41,6 +41,26 @@ public enum RenderPassId
     /// but it needs no refraction snapshot - the curtain does not sample scene color, and its color attachment is itself the blend base.
     /// It is ordered after the water surface so the curtain at the impact point covers the pool edge; transparent primitives are still overlaid last.</summary>
     SceneWaterfall = 13,
+
+    /// <summary>
+    /// Fog-only far shadow: one orthographic depth pass over the fog medium, right after <see cref="Shadow"/>.
+    ///
+    /// It is a separate slot rather than a fifth atlas quadrant because its whole point is a coverage and a texel size
+    /// the cascade atlas cannot offer: the atlas is sliced four ways around the camera, while this map spans the fog
+    /// volume from a fixed centre. Its output has exactly one consumer - the fog injection kernel - so surfaces shade
+    /// from the cascades alone and nothing else in the pipeline changes.
+    /// </summary>
+    ShadowFar = 14,
+
+    /// <summary>
+    /// Local point-light cube shadows: one depth pass over the whole medium, right after <see cref="ShadowFar"/>.
+    ///
+    /// A slot of its own rather than atlas quadrants because a lamp's occlusion is a sphere of directions - six faces per
+    /// light, and up to two lights - which no arrangement of four camera-aligned quadrants can hold. Like the far map it
+    /// has exactly one consumer, the fog injection kernel, so surface shading never consults it and no existing pass
+    /// changes shape.
+    /// </summary>
+    ShadowLocal = 15,
 }
 
 /// <summary>RenderTarget pixel format (cross-platform abstraction mapped to native formats per backend).</summary>
@@ -590,6 +610,33 @@ public static class FrameSchedule
     /// <summary>Shadow pass draw content (depth-only draw); registered by 1-5 CSM.</summary>
     public static Action<IGraphics>? RenderShadow;
 
+    /// <summary>
+    /// Depth-only target of <see cref="RenderPassId.ShadowFar"/>: the fog's own shadow map.
+    ///
+    /// Registered as a pair with <see cref="RenderFarShadow"/>, exactly like <see cref="ShadowMap"/> and
+    /// <see cref="RenderShadow"/>, so an app that does not opt in pays nothing. Its size is fixed
+    /// (<see cref="CascadedShadow.FarSize"/>) and it is never resized, because its coverage is a property of the medium
+    /// and not of the window.
+    /// </summary>
+    public static RenderTarget? FarShadowMap;
+
+    /// <summary>Draw content of <see cref="RenderPassId.ShadowFar"/>; registered by the volumetric fog's host.</summary>
+    public static Action<IGraphics>? RenderFarShadow;
+
+    /// <summary>
+    /// Depth-only target of <see cref="RenderPassId.ShadowLocal"/>: the point-light cube atlas the fog's injection kernel
+    /// samples. Registered as a pair with <see cref="RenderLocalShadow"/>, exactly like the two maps above, so an app that
+    /// does not opt in pays nothing - neither the allocation nor the pass.
+    ///
+    /// Its size is fixed (<see cref="CascadedShadow.LocalShadowWidth"/> x <see cref="CascadedShadow.LocalShadowHeight"/>)
+    /// because the tiling is part of the frame layout the shader reproduces from literals; resizing it with the window
+    /// would break that mirror for no benefit.
+    /// </summary>
+    public static RenderTarget? LocalShadowMap;
+
+    /// <summary>Draw content of <see cref="RenderPassId.ShadowLocal"/>; registered by the volumetric fog's host.</summary>
+    public static Action<IGraphics>? RenderLocalShadow;
+
     /// <summary>Output target of the Post pass (the input is always SceneColor, so this depends on SceneColor being non-null).
     /// Registered by the backend during initialization as an LDR BackbufferCompatible target holding the finished uber composite
     /// with luma baked into alpha. Two tiers register it and they are mutually exclusive: 2-1 clause 4 (FXAA) and 2-3 clause 17
@@ -1010,6 +1057,11 @@ public static class FrameSchedule
         finally
         {
             FrameProfiler.EndFrame();
+
+            // Contract 3-2: same argument as the frame boundary above - every platform reaches a frame through this
+            // method, so this is the only place the startup report has to be ticked. It costs one static bool read when
+            // the report is off, and when it is on it turns "the queue is empty" into "startup is over".
+            StartupProfiler.OnFrame(app.PendingLoadCount);
         }
     }
 
@@ -1109,6 +1161,57 @@ public static class FrameSchedule
             });
 
             RenderShadow(g);
+
+            g.EndPass();
+            FrameProfiler.EndPass();
+        }
+
+        // Fog-only far shadow, immediately after the atlas. Deliberately outside the reuse decision above: that clause
+        // exists to avoid redrawing a camera-following atlas whose contents have not changed, while this map is anchored
+        // to the medium and its own matrix is the only thing that can invalidate it. Skipping it whenever the cascades
+        // happen to be reusable would freeze the shafts the moment the camera stopped moving.
+        //
+        // FarActive is the gate rather than the atlas being present: it is set by the same ComputeFar that produced the
+        // matrix the fog frame block carries, so "pass ran" and "matrix is live" cannot disagree. When it is false the
+        // clear would cost 4 MB of depth per frame for a texture nothing samples.
+        if (FarShadowMap != null && RenderFarShadow != null && CascadedShadow.FarActive)
+        {
+            FrameProfiler.BeginPass(RenderPassId.ShadowFar, ActiveTargets.Index);
+
+            g.BeginPass(new PassDesc
+            {
+                Id = RenderPassId.ShadowFar,
+                DepthTarget = FarShadowMap,
+                ClearDepthEnable = true,
+                StoreDepth = true,
+            });
+
+            RenderFarShadow(g);
+
+            g.EndPass();
+            FrameProfiler.EndPass();
+        }
+
+        // Local point-light cubes, immediately after the far map. Outside the atlas reuse decision for the same reason the
+        // far pass is: this target is not the camera-following atlas, so a reusable cascade frame says nothing about it,
+        // and skipping it whenever the sun happened to be still would freeze a flickering torch's shadow.
+        //
+        // LocalActive is the gate rather than the target being present, because it is set by the same ComputeLocal that
+        // produced the matrices the fog frame carries. Each face clears on entry to the pass, and a clear nobody samples
+        // is the one cost worth skipping.
+        if (LocalShadowMap != null && RenderLocalShadow != null && CascadedShadow.LocalActive)
+        {
+            FrameProfiler.BeginPass(RenderPassId.ShadowLocal, ActiveTargets.Index);
+
+            g.BeginPass(new PassDesc
+            {
+                Id = RenderPassId.ShadowLocal,
+                DepthTarget = LocalShadowMap,
+                ClearDepthEnable = true,
+                StoreDepth = true,
+            });
+
+            RenderLocalShadow(g);
 
             g.EndPass();
             FrameProfiler.EndPass();

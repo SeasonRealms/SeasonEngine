@@ -325,7 +325,7 @@ float3 SkyRadiance(float3 dir)
 }
 
 // The sky reflection term the main PS originally added for this pixel (the value after A+B). The
-// delta is 'replaced by the hit point', so it must know what is being replaced -- adding the hit
+// delta is ""replaced by the hit point"", so it must know what is being replaced -- adding the hit
 // point's radiance directly would count the sky energy twice.
 float3 ReflectedSky(float3 P, float3 R)
 {
@@ -336,8 +336,8 @@ float3 ReflectedSky(float3 P, float3 R)
 }
 
 // Single exit + explicit .x: fxc 4.x misreports X4000 (use of potentially uninitialized variable)
-// for the flow analysis of 'templated SampleLevel return implicitly converted to float + multiple
-// returns'.
+// for the flow analysis of ""templated SampleLevel return implicitly converted to float + multiple
+// returns"".
 float HiZ(float2 uv, int level)
 {
     float value;

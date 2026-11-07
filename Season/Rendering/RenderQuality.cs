@@ -105,6 +105,53 @@ public enum SkyMode
 }
 
 /// <summary>
+/// F1 depth-of-field tier: mutually exclusive and fixed at initialization, following the same convention as
+/// <see cref="AoMode"/> / <see cref="SsrMode"/>. There is one algorithm tier; quality scaling changes the gather
+/// budget and the radius cap rather than switching implementations.
+/// </summary>
+public enum DofMode
+{
+    /// <summary>Off. Registers no effect and allocates no texture, leaving the scene chain with zero residue. The default,
+    /// because a lens that blurs the background by default would silently restyle every scene that never asked for it.</summary>
+    Off,
+
+    /// <summary>F1: single-pass circle-of-confusion gather in linear HDR - a golden-angle disc scaled by each pixel's own
+    /// CoC and weighted so an in-focus tap cannot bleed onto its blurred neighbours.</summary>
+    Gather,
+}
+
+/// <summary>
+/// G1 colour-grading preset: a named set of display-referred coefficients applied after tone mapping, in every
+/// backend's <c>Tonemap()</c>. There is no algorithm tier to switch here, so unlike <see cref="AoMode"/> this enum is a
+/// pure look selector: <see cref="ColorGrading.Lookup"/> turns it into the seven numbers the shader consumes, and the
+/// blend weight lives separately in <see cref="Basic.RenderQuality.ColorGradeIntensity"/>.
+///
+/// <para><b>Why presets and not seven loose knobs in the file.</b> The coefficients only mean something together (a
+/// contrast lift with no saturation matching it reads as washed out), so the persisted state is the named look and the
+/// numbers are derived from it in one place. A scene that wants its own grade can call
+/// <see cref="ColorGrading.Lookup"/> with a look of its own choosing, but it does not get to write half a preset into
+/// Settings.json and have the panel report a look that the numbers no longer match.</para>
+/// </summary>
+public enum ColorGradingPreset
+{
+    /// <summary>Off. The shader branch is skipped entirely, so the image is bit-identical to the pre-G1 pipeline.</summary>
+    Off,
+
+    /// <summary>Every coefficient at its identity value. On, but deliberately invisible: it is the control that proves the
+    /// grading path itself is lossless, and the state an author uses to keep the pass without styling the picture.</summary>
+    Neutral,
+
+    /// <summary>Warm film: lifted blacks, a gentle contrast increase, and a red-shifted white point.</summary>
+    WarmFilm,
+
+    /// <summary>Cool teal: the same structure as <see cref="WarmFilm"/> with the white point pushed the other way.</summary>
+    CoolTeal,
+
+    /// <summary>Monochrome: saturation driven to zero behind a contrast increase, so the grey scale keeps its separation.</summary>
+    Mono,
+}
+
+/// <summary>
 /// 2-6 clause 1: per-texture mipmap policy. This is deliberately opt-in per texture rather than a global
 /// "give every RGBA8 texture a chain", because the main pixel shader reaches several very different kinds of
 /// texture through the same albedo slot and the same static sampler s0.
@@ -411,6 +458,42 @@ public class RenderQuality
     /// 0.04 is roughly 24 px at 1080p: long enough to read, short enough that a fast rotation does not average the frame centre
     /// into a flat grey. This is a safety valve above all else - see <see cref="MotionBlurMaxRadius"/>.</summary>
     public static float DefaultMotionBlurMaxRadius = 0.04f;
+
+    /// <summary>Default value for DepthOfField (overrideable in the app constructor and captured by Init()).
+    /// Off, not on: unlike motion blur, which spends a buffer the velocity tier already paid for, a lens changes the
+    /// look of every frame it touches. A scene that never asked for depth of field must not be restyled by a default.</summary>
+    public static DofMode DefaultDepthOfField = DofMode.Off;
+
+    /// <summary>Default value for ColorGrade (overrideable in the app constructor and captured by Init()).
+    /// Off for the same reason <see cref="DefaultDepthOfField"/> is: a grade restyles every frame it touches, so a scene
+    /// that never asked for one must not be silently re-graded by a default.</summary>
+    public static ColorGradingPreset DefaultColorGrade = ColorGradingPreset.Off;
+
+    /// <summary>Default value for ColorGradeIntensity (overrideable in the app constructor and captured by Init()).
+    /// One, because the intensity is a blend against the ungraded image rather than a second look switch: the preset
+    /// already decides which way the picture goes, and this decides how far. Zero is the same image as Off, which is what
+    /// makes it usable as a live A/B knob.</summary>
+    public static float DefaultColorGradeIntensity = 1f;
+
+    /// <summary>Default value for DofMaxCoCRadius (overrideable in the app constructor and captured by Init()).
+    /// A fraction of screen height, matching <see cref="DefaultMotionBlurMaxRadius"/>: the blur circle keeps the same
+    /// relative size at every resolution. 0.02 is about 22 px at 1080p, which is the largest disc the effect's fixed
+    /// 24-tap gather can cover without visible ringing - the golden-angle spiral puts consecutive taps ~5.5 px apart at
+    /// that radius. The disc area is the cost, so this stays a ceiling rather than a taste dial.</summary>
+    public static float DefaultDofMaxCoCRadius = 0.02f;
+
+    /// <summary>Default value for DofAperture (overrideable in the app constructor and captured by Init()).
+    /// The f-number the main camera starts with, not the value the effect reads: <see cref="DepthOfFieldEffect"/> always
+    /// reads <see cref="Camera3D.Aperture"/>, so that a scene which points its own lens (per view, per shot) is never
+    /// overridden by a global. This pair exists so the chosen look survives a restart and so the settings panel has one
+    /// owner to write; the app seeds the main camera from it once, at creation.</summary>
+    public static float DefaultDofAperture = 1.4f;
+
+    /// <summary>Default value for DofFocusDistance (overrideable in the app constructor and captured by Init()).
+    /// Same separation as <see cref="DefaultDofAperture"/>: a startup seed for the main camera's
+    /// <see cref="Camera3D.FocusDistance"/>, which is what the effect actually reads every frame. 6 m is the Engine
+    /// sample's over-the-shoulder distance, so the default look keeps the player sharp and softens the island.</summary>
+    public static float DefaultDofFocusDistance = 6f;
 
     /// <summary>Default value for GlobalIllumination (overrideable in the app constructor and captured by Init()).</summary>
     public static GiMode DefaultGlobalIllumination = GiMode.Off;
@@ -923,6 +1006,42 @@ public class RenderQuality
     /// clamping per axis would bend the streak away from the direction the pixel actually moved.</summary>
     public float MotionBlurMaxRadius { get; set; } = DefaultMotionBlurMaxRadius;
 
+    /// <summary>F1 contract clause 1: depth-of-field tier. Mutually exclusive and fixed at initialization. Off registers no
+    /// effect and allocates no texture; switched off at runtime it stands down on the next frame instead, because Record
+    /// skips its dispatch and revokes only its own publication. It requires the explicit single-sampled HDR SceneDepth that
+    /// <see cref="RequiresDofSceneDepth"/> asks for, plus <see cref="ViewFeature.DepthOfField"/> on the view itself, so a
+    /// secondary view pays nothing unless it opts in.</summary>
+    public DofMode DepthOfField { get; set; } = DefaultDepthOfField;
+
+    /// <summary>F1: f-number the main camera is seeded with at creation. Runtime knob, persisted here rather than on
+    /// <see cref="Camera3D"/> because settings survive restarts while a camera instance does not. The effect never reads
+    /// this: it reads <see cref="Camera3D.Aperture"/>, so a scene's own lens still wins after the seed. Only the Engine
+    /// app's settings panel writes it, and it writes the camera in the same gesture so the change is live.</summary>
+    public float DofAperture { get; set; } = DefaultDofAperture;
+
+    /// <summary>F1: focus distance in metres the main camera is seeded with at creation. Same split from the effect's
+    /// input as <see cref="DofAperture"/> - <see cref="Camera3D.FocusDistance"/> is what is read per frame, this is only
+    /// what the main camera is set to once.</summary>
+    public float DofFocusDistance { get; set; } = DefaultDofFocusDistance;
+
+    /// <summary>F1 contract clause 2: hard cap on the circle of confusion as a fraction of screen height. Runtime knob, and a
+    /// safety valve rather than a taste dial: the gather cost is the disc area, so without a ceiling a focus distance set to
+    /// the near plane, or an aperture opened to f/0.7, would turn a highlight into a screen-wide smear. This bounds it;
+    /// Aperture and the camera's FocusDistance shape the blur below the cap.</summary>
+    public float DofMaxCoCRadius { get; set; } = DefaultDofMaxCoCRadius;
+
+    /// <summary>G1: colour-grading look applied after tone mapping. Runtime knob, and Off is a real off switch: every
+    /// backend's Tonemap() branches on the intensity below before touching a single coefficient, so the image stays
+    /// bit-identical to the pre-G1 pipeline. Unlike the tier enums this is not fixed at initialization - the coefficients
+    /// are uniform data, so switching looks costs nothing and needs no resource rebuild.</summary>
+    public ColorGradingPreset ColorGrade { get; set; } = DefaultColorGrade;
+
+    /// <summary>G1: blend weight between the ungraded tonemapped image (0) and the full preset (1). Runtime knob. Zero is
+    /// the same image as <see cref="ColorGradingPreset.Off"/>, which is the point: it lets the panel stage a look live and
+    /// lets a test prove that "On at 0" and "Off" agree. Values above 1 are clamped by the shader, because extrapolating a
+    /// grade past its own coefficients is not a look anyone authored.</summary>
+    public float ColorGradeIntensity { get; set; } = DefaultColorGradeIntensity;
+
     /// <summary>2-4 contract clause 1: global-illumination tier. Mutually exclusive, fixed at initialization, and downgraded to Off when unsupported.</summary>
     public GiMode GlobalIllumination { get; set; } = DefaultGlobalIllumination;
 
@@ -1055,6 +1174,14 @@ public class RenderQuality
         => ScreenSpaceReflections != SsrMode.Off && hdrSceneColor && computeSupported && !immediate2D;
 
     public int FogShadowSamples => VolumetricFog == FogQuality.Low ? 1 : 4;
+
+    /// <summary>F1 contract clause 3: the depth-of-field requirement for an explicit SceneDepth. It is a compute effect
+    /// that reads the linearized depth to derive the circle of confusion, so it needs a compute backend, the single-sampled
+    /// HDR SceneColor the gather reads and writes, and the explicit single-sampled SceneDepth that the gather samples.
+    /// Mirrors <see cref="RequiresFogSceneDepth"/>: the tier is the first term, the environment the rest, so a platform can
+    /// answer it before any resource exists.</summary>
+    public bool RequiresDofSceneDepth(bool hdrSceneColor, bool computeSupported, bool immediate2D)
+        => DepthOfField != DofMode.Off && hdrSceneColor && computeSupported && !immediate2D;
 
     /// <summary>The fog depth requirement of graphics initialization; unrelated to the scene runtime switch, AO and TAA.</summary>
     public bool RequiresFogSceneDepth(bool hdrSceneColor, bool computeSupported, bool immediate2D)

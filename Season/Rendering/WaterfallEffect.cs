@@ -76,7 +76,7 @@ public sealed class WaterfallEffect : IDisposable
         float ambientIntensity = valid ? lights.Ambient.W : 0f;
         WaterfallMath.Pack(_frame, jitteredVp, view.Position, view.Width, view.Height,
             sunDirection, sunColor, sunIntensity, ambient, ambientIntensity, time,
-            _sorted.AsSpan(0, _count));
+            _sorted.AsSpan(0, _count), Season.Basic.DeviceServices.BaseApp?.Fog);
 
         // The frame block lives on the view, not on this effect: two views upload it in the same frame, and on backends
         // whose staging keeps only a frame's last write a shared buffer would leave the main view drawing with the

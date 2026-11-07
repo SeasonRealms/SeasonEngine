@@ -330,14 +330,29 @@ internal static unsafe class BlitPipeline
         Device.Vk.CmdDraw(cmd, 3, 1, 0, 0);
     }
 
-    /// <summary>Push the full 28-byte constant block, mirroring the seven constants of DX b0.
-    /// Variants that declare the block must receive the full push to satisfy validation layers.</summary>
+    /// <summary>Push the full 60-byte constant block, mirroring the constants of DX b0. Every variant that declares the
+    /// block receives the whole thing, because one pipeline layout serves all of them and a partial push would leave the
+    /// tail undefined for whichever variant reads it next.</summary>
     static void PushParams(CommandBuffer cmd, float exposure, float bloomIntensity, float texelSizeX, float texelSizeY,
         float aoIntensity, float outlineWidth = 0f, float sharpness = 0f)
     {
-        var p = stackalloc float[7] { exposure, bloomIntensity, texelSizeX, texelSizeY, aoIntensity, outlineWidth, sharpness };
-        Device.Vk.CmdPushConstants(cmd, PipelineLayout, ShaderStageFlags.FragmentBit, 0, 7 * sizeof(float), p);
+        var p = stackalloc float[PushedFloatCount]
+        {
+            exposure, bloomIntensity, texelSizeX, texelSizeY, aoIntensity, outlineWidth, sharpness,
+            0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f
+        };
+
+        // G1: the grading block is read from RenderQuality rather than passed in, so the FXAA, RCAS and outline draws
+        // cannot forget it - they do not read it, but the push has to cover the layout's whole range either way.
+        var grade = ColorGrading.Resolve(RenderQuality.Current, out float intensity);
+        ColorGrading.Pack(grade, intensity, new Span<float>(p + 7, ColorGrading.PackedFloatCount));
+
+        Device.Vk.CmdPushConstants(cmd, PipelineLayout, ShaderStageFlags.FragmentBit, 0, PushedFloatCount * sizeof(float), p);
     }
+
+    /// <summary>Seven legacy constants plus the eight G1 grading floats; the size of both the push above and the
+    /// layout's <c>VkPushConstantRange</c>.</summary>
+    const int PushedFloatCount = 7 + ColorGrading.PackedFloatCount;
 
     static Sampler CreateSampler(Filter filter)
     {
@@ -405,14 +420,15 @@ internal static unsafe class BlitPipeline
         // set 2 = AO texture for step C of 2-2.
         // All three use the same layout, and only the variants that statically reference them bind them, which is valid, mirroring the three t0/t1/t2 tables in the DX root signature.
         var setLayouts = stackalloc DescriptorSetLayout[3] { SetLayout, SetLayout, SetLayout };
-        // The 28-byte push constant block contains exposure, BloomIntensity, texelSizeX/Y, AoIntensity, outlineWidth, and sharpness, mirroring the seven constants of DX b0.
+        // The push constant block contains exposure, BloomIntensity, texelSizeX/Y, AoIntensity, outlineWidth, sharpness,
+        // and the eight G1 colour-grading floats, mirroring the constants of DX b0.
         // It is consumed by tonemap, bloom, ao, uber, FXAA, RCAS, and composite variants.
         // Ordinary variants declare nothing and receive no push, and the shared layout range remains harmless to them.
         var pushRange = new PushConstantRange
         {
             StageFlags = ShaderStageFlags.FragmentBit,
             Offset = 0,
-            Size = 7 * sizeof(float)
+            Size = PushedFloatCount * sizeof(float)
         };
         var info = new PipelineLayoutCreateInfo
         {
@@ -626,7 +642,8 @@ void main()
 ";
 
     // Shared push-constant block:
-    // expanded to 16 bytes in step D of 2-1, to 20 bytes in step C of 2-2, and to 28 bytes in clause 17 of 2-3, mirroring the seven constants of DX b0.
+    // expanded to 16 bytes in step D of 2-1, to 20 bytes in step C of 2-2, to 28 bytes in clause 17 of 2-3, and to 60
+    // bytes by the G1 colour-grading block, mirroring the constants of DX b0.
     // Tonemap variants read exposure, bloom variants additionally read bloomIntensity,
     // FXAA and RCAS variants read texelSizeX/Y, AO variants additionally read aoIntensity, and the RCAS variant additionally reads sharpness.
     const string PushParamsGlsl = @"
@@ -638,6 +655,18 @@ layout(push_constant) uniform BlitParams {
     float aoIntensity;    // Step C of 2-2: AO occlusion strength, RenderQuality.AoIntensity, referenced only by AO variants.
     float outlineWidth;   // Phase 4: outline-composite step size in pixels, referenced only by composite variants.
     float sharpness;      // Clause 17 of 2-3: RCAS lobe scale, RenderQuality.TaaSharpness, referenced only by the RCAS variant.
+
+    // G1: colour grading, read only by GradeLdr and therefore only by the tonemap and uber variants. Consecutive floats
+    // keep a 4-byte stride under std430, so this block follows the seven above with no padding, and ColorGrading.Pack
+    // writes it in exactly this order.
+    float gradeIntensity;    // 0 = Off: GradeLdr returns its input untouched
+    float gradeContrast;     // (rgb - 0.5) * contrast + 0.5
+    float gradeSaturation;   // mix(Rec.601 luma, rgb, saturation)
+    float gradeTemperature;  // r *= 1 + t, b *= 1 - t
+    float gradeTint;         // g *= 1 + t
+    float gradeLift;         // black floor blended in by lift/gamma/gain
+    float gradeGamma;        // pow(clamp(rgb), 1 / gamma)
+    float gradeGain;         // linear scale applied before the lift blend
 };
 ";
 
@@ -655,10 +684,50 @@ vec3 AcesFilm(vec3 x)
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
+// G1: colour grading, applied to the display-referred image after the tone curve.
+// Each step is guarded by a uniform comparison against its own identity value, so Neutral runs none of them and has
+// to reproduce its input exactly - that is what makes it a lossless control rather than merely a subtle look. The
+// guards are uniform branches, so every invocation in the draw takes the same path and they cost nothing.
+vec3 GradeLdr(vec3 ldr)
+{
+    if (gradeIntensity <= 0.0)
+        return ldr;
+
+    vec3 g = ldr;
+
+    // White point: red/blue along temperature, green/magenta along tint.
+    if (gradeTemperature != 0.0 || gradeTint != 0.0)
+        g *= vec3(1.0 + gradeTemperature, 1.0 + gradeTint, 1.0 - gradeTemperature);
+
+    // Lift/gamma/gain in the ASC CDL sense: gain scales the signal, lift blends black toward the raised floor.
+    if (gradeLift != 0.0 || gradeGain != 1.0)
+        g = g * gradeGain + gradeLift * (1.0 - g);
+
+    // Mid-tone power. clamp first because a lift, or a gain above 1, can push a channel past 1 and pow of a
+    // negative base is undefined.
+    if (gradeGamma != 1.0)
+        g = pow(clamp(g, 0.0, 1.0), vec3(1.0 / max(gradeGamma, 1e-3)));
+
+    // Contrast about mid-grey.
+    if (gradeContrast != 1.0)
+        g = (g - 0.5) * gradeContrast + 0.5;
+
+    // Saturation against Rec.601 luma - the same weights the uber variants bake into alpha, so FXAA and RCAS
+    // downstream read a luma that still matches the graded image.
+    if (gradeSaturation != 1.0)
+    {
+        float luma = dot(g, vec3(0.299, 0.587, 0.114));
+        g = mix(vec3(luma), g, gradeSaturation);
+    }
+
+    g = clamp(g, 0.0, 1.0);
+    return gradeIntensity >= 1.0 ? g : mix(ldr, g, gradeIntensity);
+}
+
 vec3 Tonemap(vec3 hdr)
 {
     vec3 mapped = AcesFilm(max(hdr, vec3(0.0)) * exposure);
-    return pow(mapped, vec3(1.0 / 2.2));
+    return GradeLdr(pow(mapped, vec3(1.0 / 2.2)));
 }
 ";
 

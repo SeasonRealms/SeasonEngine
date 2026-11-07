@@ -74,7 +74,8 @@ public static class WebGPUUniformLayout
 /// <c>minUniformBufferOffsetAlignment</c> unit).
 ///
 /// Slot map: 0..7 = render views (<see cref="Season.Rendering.RenderView.Index"/>),
-/// 8..11 = shadow quadrants (3 cascades + spotlight), 13 = screen space (2D sprites / MSDF text), 12/14/15 reserved.
+/// 8..12 = shadow views (3 cascades + spotlight + the fog's far map), 13 = screen space (2D sprites / MSDF text),
+/// 14 = fog local point-light cubes, 15 reserved.
 ///
 /// The full 256-byte ViewConstants block is uploaded verbatim: its first <see cref="StructBytes"/> bytes are exactly
 /// the three matrices the vertex shader reads, already in the row-major byte order that WGSL reinterprets as the
@@ -100,10 +101,21 @@ public static class WebGPUViewUniformLayout
     public const int ViewSlotCount = 8;
     /// <summary>First shadow-quadrant slot (cascade 0).</summary>
     public const int ShadowSlotBase = 8;
-    /// <summary>Shadow slots: <see cref="Season.Rendering.CascadedShadow.MaxCascades"/> cascades + one spotlight.</summary>
-    public const int ShadowSlotCount = 4;
-    /// <summary>Slot used by identity screen-space geometry (2D sprites, MSDF text).</summary>
-    public const int ScreenSpaceSlot = 13;
+    /// <summary>Shadow slots: <see cref="Season.Rendering.CascadedShadow.MaxCascades"/> cascades + one spotlight +
+    /// the fog-only far map. Slot <c>ShadowSlotBase + MaxCascades + 1</c> is what the far map publishes into; it is a slot
+    /// of its own rather than a fifth atlas quadrant because it targets a texture of its own.</summary>
+    public const int ShadowSlotCount = Season.Rendering.CascadedShadow.SlotCount;
+    /// <summary>Slot used by identity screen-space geometry (2D sprites, MSDF text). Derived from the shadow block rather
+    /// than written out: <see cref="ShadowSlotBase"/> + <see cref="ShadowSlotCount"/> = 13 today, and expressing it this
+    /// way is what stops a fourth cascade from quietly landing on top of the sprite slot.</summary>
+    public const int ScreenSpaceSlot = ShadowSlotBase + ShadowSlotCount;
+    /// <summary>
+    /// Slot used by the fog-only local point-light cubes. Deliberately one slot for the whole block: two lamps of six faces
+    /// would need twelve, and the table has four left past the screen-space slot. The slot is republished per face, so the
+    /// backend flushes its deferred batches before each repoint - the same ordering the atlas quadrants already need, only
+    /// here the reason is reuse rather than a different tile.
+    /// </summary>
+    public const int LocalShadowSlot = ScreenSpaceSlot + 1;
     /// <summary>Total number of slots in the shared buffer.</summary>
     public const int TotalSlots = 16;
     /// <summary>Size of the shared per-view buffer (4 KiB).</summary>

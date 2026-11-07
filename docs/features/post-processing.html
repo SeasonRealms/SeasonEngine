@@ -363,6 +363,133 @@
                     </section>
 
                     <section class="se-card">
+                        <h2 class="se-mt0">Depth of field</h2>
+                        <p>
+                            One gather kernel that turns the circle of confusion implied by a thin lens into a bokeh
+                            disc, in linear HDR and after the TAA resolve. It reads the resolved scene colour and the
+                            explicit single-sampled <code class="se-inline">SceneDepth</code>, and publishes
+                            <code class="se-inline">compute://dof</code> as the third head of the scene chain.
+                        </p>
+                        <p>
+                            Registration order is execution order: after <code class="se-inline">MotionBlurEffect</code>,
+                            so a moving highlight is gathered once instead of once per tap, and before
+                            <code class="se-inline">BloomEffect</code>, so the bloom chain sees the final defocused
+                            highlights rather than a sharp glow floating over a soft body.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Setting</th><th>Default</th><th>Meaning</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>DepthOfField</code></td><td>off</td><td><code>Off</code> registers nothing and allocates no texture. <code>Gather</code> is the 24-tap disc. The tier is read at registration, so switching it on needs a restart; switching it off stands the registered effect down on the next frame.</td></tr>
+                                    <tr><td><code>DofAperture</code></td><td>1.4</td><td>f-number the main camera starts with. The effect itself reads <code>Camera3D.Aperture</code> every frame, so a scene that points its own lens still wins.</td></tr>
+                                    <tr><td><code>DofFocusDistance</code></td><td>6</td><td>Startup focus distance in metres. Same split: the live value is <code>Camera3D.FocusDistance</code>.</td></tr>
+                                    <tr><td><code>DofMaxCoCRadius</code></td><td>0.02</td><td>Hard cap on the blur radius as a fraction of frame height, about 22 px at 1080p. The disc area is the cost and the tap budget is fixed, so this is a ceiling rather than a taste dial; anything above 0.05 is clamped.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p>
+                            The circle of confusion is the thin-lens one, computed per sample from the loaded depth:
+                            <code class="se-inline">c = f&sup2; / (N (F &minus; f)) &middot; |z &minus; F| / z</code>, with
+                            the sensor height derived as <code class="se-inline">2 f tan(FovY / 2)</code>, so focal length
+                            and field of view stay two independent numbers. Focus is a per-camera lens quantity: it does
+                            not dirty the view or projection matrices, and a rack focus is a plain runtime write to
+                            <code class="se-inline">Camera.FocusDistance</code>. There is no autofocus and no focus-pull
+                            easing.
+                        </p>
+
+                        <p class="se-muted">
+                            Only opaque geometry writes depth, so transparent passes &mdash; particles, the water
+                            surface, the Overlay pass and every 2D and text path &mdash; are focused by whatever surface
+                            sits behind them. A secondary view pays nothing unless
+                            <code class="se-inline">ViewFeature.DepthOfField</code> is added to it, which is why the
+                            minimap and the rear mirror stay sharp.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
+                        <h2 class="se-mt0">Colour grading</h2>
+                        <p>
+                            Not an effect. Grading rides the constant block every backend already uploads for the
+                            tonemap, so there is nothing to register, nothing to allocate and no pass to schedule. It
+                            lives inside the same <code class="se-inline">Tonemap()</code> that converts HDR to
+                            display-referred sRGB, which is also why both the post pass and the direct-to-backbuffer
+                            blit get it without a second code path.
+                        </p>
+                        <p>
+                            The order is fixed and deliberately photographic: white balance, ASC CDL lift/gain, gamma,
+                            contrast about mid-grey, saturation against Rec.601 luma, then a single strength that mixes
+                            the result back over the ungraded image. Every step is guarded by a uniform comparison
+                            against its own identity value, so <code class="se-inline">Neutral</code> walks the whole
+                            function and still has to reproduce its input bit for bit &mdash; that is what makes it a
+                            control you can measure against rather than a subtle look.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Preset</th><th>Coefficients</th><th>Intent</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>Off</code></td><td>none</td><td>Default. The shader branch is skipped entirely, so the image is bit-identical to the pipeline before grading existed.</td></tr>
+                                    <tr><td><code>Neutral</code></td><td>all identity</td><td>The lossless control: full code path, no deviation.</td></tr>
+                                    <tr><td><code>WarmFilm</code></td><td>contrast and saturation up, warm white point, lifted black</td><td>Late-afternoon film print.</td></tr>
+                                    <tr><td><code>CoolTeal</code></td><td>stronger contrast, cool white point, slightly crushed gamma</td><td>Night exteriors and underwater distance.</td></tr>
+                                    <tr><td><code>Mono</code></td><td>saturation 0, contrast and lift raised</td><td>A full desaturation that keeps the blacks from going flat.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p>
+                            Two persisted settings, both live on the next frame because the coefficients are re-read
+                            whenever the constants are uploaded: <code class="se-inline">ColorGrade</code> names the
+                            preset and <code class="se-inline">ColorGradeIntensity</code> scales the whole result, so a
+                            shot can fade a look in without editing the table. A scene that wants its own numbers calls
+                            <code class="se-inline">ColorGrading.Lookup</code>; the file only ever stores the name,
+                            because half a preset written into <code class="se-inline">Settings.json</code> would make
+                            the panel and the image disagree.
+                        </p>
+
+                        <p class="se-muted">
+                            Where it runs: D3D12 root constants (b0, slots 8&ndash;15), Vulkan push constants (floats
+                            7&ndash;14), Metal <code class="se-inline">BlitParams</code> (bytes 32&ndash;63) and the
+                            WebGPU tonemap uniform array &mdash; the same eight floats in the same order everywhere.
+                        </p>
+                        <p>
+                            The other three backends share the maths and compile, but only D3D12 has been photographed.
+                            The table below is the reference scene pinned to absolute frame 3000, anti-aliasing off,
+                            particles off and the animation throttle off, so two runs differ only in the two settings
+                            above &mdash; which is what makes the first row the yardstick for the rest.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Pair</th><th>Pixels changed</th><th>Largest step</th><th>Reading</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>Off</code> vs <code>Off</code></td><td>0.804%</td><td>1</td><td>Two runs of the same settings. This is the noise floor every other row is read against.</td></tr>
+                                    <tr><td><code>Neutral</code> vs <code>Off</code></td><td>0.805%</td><td>1</td><td>The whole grading body runs and the picture still stops at the noise floor: the path is lossless.</td></tr>
+                                    <tr><td>The same pair, run again</td><td>0.002%</td><td>1</td><td>22 pixels of 1.26 million &mdash; the second <code>Neutral</code> run is ungraded except for the dither.</td></tr>
+                                    <tr><td><code>Mono</code> vs <code>Off</code></td><td>98.539%</td><td>160</td><td>Full desaturation: a 45 LSB average step, visible in every corner.</td></tr>
+                                    <tr><td><code>WarmFilm</code> vs <code>Off</code></td><td>98.538%</td><td>33</td><td>Visible everywhere and gentle everywhere &mdash; a white-point move, not a clip.</td></tr>
+                                    <tr><td><code>WarmFilm</code> at 50% vs <code>Off</code></td><td>98.518%</td><td>17</td><td>Half the step of the row above; two runs of this row agree with each other to 0.020%.</td></tr>
+                                    <tr><td>50% against the arithmetic half of 0% and 100%</td><td>0 channels past 24 LSB</td><td>1</td><td>Least-squares strength 0.5003. The strength row blends two images; it does not scale the coefficients toward identity.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p class="se-muted">
+                            One earlier 50% run was discarded rather than averaged in: its sky matched the half-mix to
+                            2 LSB while its ground did not, which is a scene state that drifted between runs, not a
+                            grading difference.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
                         <h2 class="se-mt0">Known gaps</h2>
                         <ul class="se-list">
                             <li>
@@ -380,9 +507,18 @@
                                 attachment does not blur at all.
                             </li>
                             <li>
+                                <span class="se-badge se-badge--partial">Partial</span>
+                                <strong>Depth of field is a fixed 24-tap gather.</strong> A larger radius spreads the
+                                same taps thinner, so past roughly 0.03 of frame height the bokeh starts to ring rather
+                                than soften; that is why the cap exists. It also has no scatter-as-gather, no
+                                half-resolution path, and no autofocus.
+                            </li>
+                            <li>
                                 <span class="se-badge se-badge--absent">Absent</span>
-                                <strong>Depth of field, chromatic aberration, colour grading LUTs.</strong>
-                                The post chain is tonemap, bloom, motion blur and AA. Anything else is an effect you would write.
+                                <strong>Chromatic aberration and 3D LUT files.</strong>
+                                Grading itself is parameter-based, as above &mdash; a look is seven numbers, not a cube.
+                                Importing a <code class="se-inline">.cube</code> or any sampled LUT would need a
+                                sampler and a 3D-texture path the blit pass does not have.
                             </li>
                             <li>
                                 <span class="se-badge se-badge--absent">Absent</span>

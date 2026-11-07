@@ -18,7 +18,9 @@ namespace Season.Rendering;
 /// "per-instance culling would require rebuilding and uploading the instance buffer for every cascade, violating clause 2 of 1-3", while the index table sidesteps the rebuild.
 ///
 /// All buffers are tiled across <see cref="InstanceCull.MaxSlots"/> slots. The shadow slots keep the layout of
-/// <see cref="CascadedShadow"/>: 0..2 are the sun cascades and 3 is the spot light; <see cref="InstanceCull.MainViewSlot"/> follows them
+/// <see cref="CascadedShadow"/>: 0..2 are the sun cascades and 3 is the spot light; slot 4 (<see cref="CascadedShadow.FarSlot"/>) is
+/// the fog's far map and is deliberately left out of the chain below - its view is anchored to the medium rather than to a
+/// visible main view, so it takes the direct whole-batch path instead of a gathered segment. <see cref="InstanceCull.MainViewSlot"/> follows them
 /// and holds the main camera's frustum for the groups that opted into indirect main-view drawing (<see cref="CullMainView"/>).
 /// Inactive slots are skipped directly by slotMask,
 /// rather than by filling in a "matrix that culls everything" -- that would require constructing a degenerate projection that silently breaks the moment the plane-extraction code changes.
@@ -780,7 +782,8 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferRead },
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferReadWrite },
         },
-        // One thread. The reduction is over at most MaxSlots(5) uints; opening a whole workgroup just to synchronize five reads costs far more than the reads themselves,
+        // One thread. The reduction is over at most MaxSlots uints (6: three cascades, the spotlight, the fog far map and the
+        // main view); opening a whole workgroup just to synchronize that many reads costs far more than the reads themselves,
         // to say nothing of writing a threadsync dialect per backend (GroupMemoryBarrierWithGroupSync / barrier /
         // threadgroup_barrier / workgroupBarrier), which would mean four implementations that can drift.
         WorkgroupX = 1,

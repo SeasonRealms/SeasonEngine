@@ -1877,18 +1877,69 @@ struct BlitVSOut {
 // ── Two tonemap variants (1-4 Step B): HDR source (rgba16float, linear space)
 // -> exposure * ACES (Narkowicz) -> gamma(1/2.2) for presentation.
 // The constants 2.51/0.03/2.43/0.59/0.14 are textually identical to DX/VK/Metal (Contract 2).
-// In 2-1 Step D, parameters expand to x=exposure, y=bloomIntensity, zw=texelSize for FXAA,
+// In 2-1 Step D, element 0 expanded to x=exposure, y=bloomIntensity, zw=texelSize for FXAA,
 // uploaded each frame by blitToBackbuffer/renderPost through writeBuffer.
-@group(0) @binding(2) var<uniform> tonemapParams : vec4f;
+// G1 appends elements 1 and 2 for the colour-grading block. They stay inside this uniform rather than becoming new
+// bindings because WebGPU's auto layout requires each entry point's statically referenced bindings to match its bind
+// group exactly: one array keeps every entry point on the same binding set, and only the buffer size changed.
+@group(0) @binding(2) var<uniform> tonemapParams : array<vec4f, 3>;
 
 fn AcesFilm(x : vec3f) -> vec3f {
     let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3f(0.0), vec3f(1.0));
 }
 
+// G1: colour grading, applied to the display-referred image after the tone curve.
+// Each step is guarded by a uniform comparison against its own identity value, so Neutral runs none of them and has
+// to reproduce its input exactly - that is what makes it a lossless control rather than merely a subtle look. The
+// guards are uniform branches, so every invocation in the draw takes the same path and they cost nothing.
+// Element 1 packs intensity, contrast, saturation and temperature; element 2 packs tint, lift, gamma and gain, in the
+// order ColorGrading.Pack writes them.
+fn GradeLdr(ldr : vec3f) -> vec3f {
+    let grade0 = tonemapParams[1];
+    let grade1 = tonemapParams[2];
+
+    if (grade0.x <= 0.0) {
+        return ldr;
+    }
+
+    var g = ldr;
+
+    // White point: red/blue along temperature, green/magenta along tint.
+    if (grade0.w != 0.0 || grade1.x != 0.0) {
+        g *= vec3f(1.0 + grade0.w, 1.0 + grade1.x, 1.0 - grade0.w);
+    }
+
+    // Lift/gamma/gain in the ASC CDL sense: gain scales the signal, lift blends black toward the raised floor.
+    if (grade1.y != 0.0 || grade1.w != 1.0) {
+        g = g * grade1.w + grade1.y * (1.0 - g);
+    }
+
+    // Mid-tone power. clamp first because a lift, or a gain above 1, can push a channel past 1 and pow of a
+    // negative base is undefined.
+    if (grade1.z != 1.0) {
+        g = pow(clamp(g, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / max(grade1.z, 1e-3)));
+    }
+
+    // Contrast about mid-grey.
+    if (grade0.y != 1.0) {
+        g = (g - 0.5) * grade0.y + 0.5;
+    }
+
+    // Saturation against Rec.601 luma - the same weights the uber variants bake into alpha, so FXAA and RCAS
+    // downstream read a luma that still matches the graded image.
+    if (grade0.z != 1.0) {
+        let luma = dot(g, vec3f(0.299, 0.587, 0.114));
+        g = mix(vec3f(luma), g, grade0.z);
+    }
+
+    g = clamp(g, vec3f(0.0), vec3f(1.0));
+    return select(mix(ldr, g, grade0.x), g, grade0.x >= 1.0);
+}
+
 fn Tonemap(hdr : vec3f) -> vec3f {
-    let mapped = AcesFilm(max(hdr, vec3f(0.0)) * tonemapParams.x);
-    return pow(mapped, vec3f(1.0 / 2.2));
+    let mapped = AcesFilm(max(hdr, vec3f(0.0)) * tonemapParams[0].x);
+    return GradeLdr(pow(mapped, vec3f(1.0 / 2.2)));
 }
 
 @fragment fn fs_point_tonemap(@builtin(position) fragCoord : vec4f) -> @location(0) vec4f {
@@ -1908,12 +1959,12 @@ fn Tonemap(hdr : vec3f) -> vec3f {
 
 @fragment fn fs_tonemap_bloom(@builtin(position) fragCoord : vec4f, @location(0) uv : vec2f) -> @location(0) vec4f {
     var c = textureLoad(srcTex, vec2i(fragCoord.xy), 0);
-    c = vec4f(c.rgb + textureSample(bloomTex, srcSampler, uv).rgb * tonemapParams.y, c.a);
+    c = vec4f(c.rgb + textureSample(bloomTex, srcSampler, uv).rgb * tonemapParams[0].y, c.a);
     return vec4f(Tonemap(c.rgb), c.a);
 }
 @fragment fn fs_linear_tonemap_bloom(@location(0) uv : vec2f) -> @location(0) vec4f {
     var c = textureSample(srcTex, srcSampler, uv);
-    c = vec4f(c.rgb + textureSample(bloomTex, srcSampler, uv).rgb * tonemapParams.y, c.a);
+    c = vec4f(c.rgb + textureSample(bloomTex, srcSampler, uv).rgb * tonemapParams[0].y, c.a);
     return vec4f(Tonemap(c.rgb), c.a);
 }
 
@@ -1932,7 +1983,7 @@ fn Luma(ldr : vec3f) -> f32 {
 }
 @fragment fn fs_uber_bloom(@builtin(position) fragCoord : vec4f, @location(0) uv : vec2f) -> @location(0) vec4f {
     var c = textureLoad(srcTex, vec2i(fragCoord.xy), 0);
-    c = vec4f(c.rgb + textureSample(bloomTex, srcSampler, uv).rgb * tonemapParams.y, c.a);
+    c = vec4f(c.rgb + textureSample(bloomTex, srcSampler, uv).rgb * tonemapParams[0].y, c.a);
     let ldr = Tonemap(c.rgb);
     return vec4f(ldr, Luma(ldr));
 }
@@ -1964,13 +2015,13 @@ fn ApplyAo(scene : vec3f, uv : vec2f) -> vec3f {
 @fragment fn fs_tonemap_bloom_ao(@builtin(position) fragCoord : vec4f, @location(0) uv : vec2f) -> @location(0) vec4f {
     var c = textureLoad(srcTex, vec2i(fragCoord.xy), 0);
     c = vec4f(ApplyAo(c.rgb, uv), c.a);
-    c = vec4f(c.rgb + textureSample(bloomTex, srcSampler, uv).rgb * tonemapParams.y, c.a);
+    c = vec4f(c.rgb + textureSample(bloomTex, srcSampler, uv).rgb * tonemapParams[0].y, c.a);
     return vec4f(Tonemap(c.rgb), c.a);
 }
 @fragment fn fs_linear_tonemap_bloom_ao(@location(0) uv : vec2f) -> @location(0) vec4f {
     var c = textureSample(srcTex, srcSampler, uv);
     c = vec4f(ApplyAo(c.rgb, uv), c.a);
-    c = vec4f(c.rgb + textureSample(bloomTex, srcSampler, uv).rgb * tonemapParams.y, c.a);
+    c = vec4f(c.rgb + textureSample(bloomTex, srcSampler, uv).rgb * tonemapParams[0].y, c.a);
     return vec4f(Tonemap(c.rgb), c.a);
 }
 @fragment fn fs_uber_ao(@builtin(position) fragCoord : vec4f, @location(0) uv : vec2f) -> @location(0) vec4f {
@@ -1982,7 +2033,7 @@ fn ApplyAo(scene : vec3f, uv : vec2f) -> vec3f {
 @fragment fn fs_uber_bloom_ao(@builtin(position) fragCoord : vec4f, @location(0) uv : vec2f) -> @location(0) vec4f {
     var c = textureLoad(srcTex, vec2i(fragCoord.xy), 0);
     c = vec4f(ApplyAo(c.rgb, uv), c.a);
-    c = vec4f(c.rgb + textureSample(bloomTex, srcSampler, uv).rgb * tonemapParams.y, c.a);
+    c = vec4f(c.rgb + textureSample(bloomTex, srcSampler, uv).rgb * tonemapParams[0].y, c.a);
     let ldr = Tonemap(c.rgb);
     return vec4f(ldr, Luma(ldr));
 }
@@ -2004,7 +2055,7 @@ fn ApplyAo(scene : vec3f, uv : vec2f) -> vec3f {
     let FXAA_EDGE_THRESHOLD = 1.0 / 8.0;
     let FXAA_EDGE_THRESHOLD_MIN = 1.0 / 24.0;
 
-    let rcpFrame = tonemapParams.zw;
+    let rcpFrame = tonemapParams[0].zw;
 
     let colorM = textureSampleLevel(srcTex, pointSampler, uv, 0.0);
     let lumaM  = colorM.a;
@@ -2067,7 +2118,7 @@ fn ApplyAo(scene : vec3f, uv : vec2f) -> vec3f {
     // Away from those two points it only perturbs rings darker than 1e-4, far below one 8-bit code value of the target.
     let RCAS_EPS = 1.0 / 32768.0;
 
-    let rcpFrame = tonemapParams.zw;
+    let rcpFrame = tonemapParams[0].zw;
 
     // Cross neighbourhood, point sampled at 1:1 (the same texel-load-through-uv fs_fxaa relies on;
     // textureSampleLevel at mip 0 for the same reason it uses it).
@@ -2090,7 +2141,7 @@ fn ApplyAo(scene : vec3f, uv : vec2f) -> vec3f {
     let hitMin = mn4 / (4.0 * mx4 + RCAS_EPS);
     let hitMax = (1.0 - mx4) / (4.0 * mn4 - 4.0 - RCAS_EPS);
     let lobeRgb = max(-hitMin, hitMax);
-    let lobe = max(-RCAS_LIMIT, min(max(lobeRgb.r, max(lobeRgb.g, lobeRgb.b)), 0.0)) * tonemapParams.x;
+    let lobe = max(-RCAS_LIMIT, min(max(lobeRgb.r, max(lobeRgb.g, lobeRgb.b)), 0.0)) * tonemapParams[0].x;
 
     // FSR_RCAS_DENOISE is deliberately not ported rather than overlooked: it is FSR1's opt-in for noisy input,
     // and this input is a temporally converged TAA resolve. The divide needs no guard because lobe is clamped into
@@ -2113,7 +2164,7 @@ fn ApplyAo(scene : vec3f, uv : vec2f) -> vec3f {
 @group(0) @binding(7) var outlineMaskTex : texture_2d<f32>;
 
 @fragment fn fs_outline_composite(@location(0) uv : vec2f) -> @location(0) vec4f {
-    let stepUv = tonemapParams.xy * max(tonemapParams.z, 1.0);
+    let stepUv = tonemapParams[0].xy * max(tonemapParams[0].z, 1.0);
     let center = textureSampleLevel(outlineMaskTex, pointSampler, uv, 0.0).a;
     var neighbor = 0.0;
     var outlineColor = vec3f(0.0);

@@ -145,6 +145,8 @@ internal static unsafe class BlitPipeline
         // (blitPad, for HLSL packing alignment; the outline color is carried per
         // pixel by the mask, so there is no constant color slot and slots 8-11
         // are no longer uploaded)
+        // G1 adds 8-15: the colour-grading block, which ColorGrading.Pack writes
+        // in the declaration order of the cbuffer.
         rootParameters[1] = new RootParameter
         {
             ParameterType = RootParameterType.Type32BitConstants,
@@ -152,7 +154,7 @@ internal static unsafe class BlitPipeline
             {
                 ShaderRegister = 0,
                 RegisterSpace = 0,
-                Num32BitValues = 8
+                Num32BitValues = 16
             },
             ShaderVisibility = ShaderVisibility.Pixel
         };
@@ -259,6 +261,17 @@ cbuffer TonemapParams : register(b0)
     float outlineWidth;   // Outline2D width in pixels
     float sharpness;      // 2-3 clause 17: RCAS lobe scale (RenderQuality.TaaSharpness, referenced only by the RCAS variant)
     float blitPad;        // HLSL packing: float4 values may not cross 16-byte register boundaries (the outline color is carried per pixel by the mask, so there is no constant color slot)
+
+    // G1: colour grading, read only by GradeLdr and therefore only by the tonemap and uber variants. The block starts
+    // at slot 8 so it lands on a 16-byte register boundary (c2), and ColorGrading.Pack writes it in exactly this order.
+    float gradeIntensity;    // 0 = Off: GradeLdr returns its input untouched
+    float gradeContrast;     // (rgb - 0.5) * contrast + 0.5
+    float gradeSaturation;   // lerp(Rec.601 luma, rgb, saturation)
+    float gradeTemperature;  // r *= 1 + t, b *= 1 - t
+    float gradeTint;         // g *= 1 + t
+    float gradeLift;         // black floor blended in by lift/gamma/gain
+    float gradeGamma;        // pow(saturate(rgb), 1 / gamma)
+    float gradeGain;         // linear scale applied before the lift blend
 };
 
 struct PSInput
@@ -304,10 +317,58 @@ float3 AcesFilm(float3 x)
     return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
 }
 
+// G1: colour grading, applied to the display-referred image after the tone curve.
+// Each step is guarded by a uniform comparison against its own identity value, so Neutral runs none of them and has
+// to reproduce its input exactly - that is what makes it a lossless control rather than merely a subtle look. The
+// guards are uniform branches, so every invocation in the draw takes the same path and they cost nothing.
+//
+// One exit and one initialised accumulator on purpose: fxc flags an early return of a parameter here as X4000,
+// reporting a potentially uninitialized variable, and ShaderCompiler treats every diagnostic as fatal. The nesting
+// is semantically identical - with intensity 0 the body is skipped and g is still ldr.
+float3 GradeLdr(float3 ldr)
+{
+    float3 g = ldr;
+
+    if (gradeIntensity > 0.0)
+    {
+        // White point: red/blue along temperature, green/magenta along tint.
+        if (gradeTemperature != 0.0 || gradeTint != 0.0)
+            g *= float3(1.0 + gradeTemperature, 1.0 + gradeTint, 1.0 - gradeTemperature);
+
+        // Lift/gamma/gain in the ASC CDL sense: gain scales the signal, lift blends black toward the raised floor.
+        if (gradeLift != 0.0 || gradeGain != 1.0)
+            g = g * gradeGain + gradeLift * (1.0 - g);
+
+        // Mid-tone power. saturate first because a lift, or a gain above 1, can push a channel past 1 and pow of a
+        // negative base is undefined.
+        if (gradeGamma != 1.0)
+            g = pow(saturate(g), 1.0 / max(gradeGamma, 1e-3));
+
+        // Contrast about mid-grey.
+        if (gradeContrast != 1.0)
+            g = (g - 0.5) * gradeContrast + 0.5;
+
+        // Saturation against Rec.601 luma - the same weights the uber variants bake into alpha, so FXAA and RCAS
+        // downstream read a luma that still matches the graded image.
+        if (gradeSaturation != 1.0)
+        {
+            float luma = dot(g, float3(0.299, 0.587, 0.114));
+            g = lerp(float3(luma, luma, luma), g, gradeSaturation);
+        }
+
+        g = saturate(g);
+
+        if (gradeIntensity < 1.0)
+            g = lerp(ldr, g, gradeIntensity);
+    }
+
+    return g;
+}
+
 float3 Tonemap(float3 hdr)
 {
     float3 mapped = AcesFilm(max(hdr, 0.0) * exposure);
-    return pow(mapped, 1.0 / 2.2);
+    return GradeLdr(pow(mapped, 1.0 / 2.2));
 }
 
 float4 PSMainTonemap(PSInput input) : SV_TARGET
@@ -690,6 +751,25 @@ float4 PSMainOutlineComposite(PSInput input) : SV_TARGET
     /// State leakage is harmless because normal drawing rebinds
     /// RootSignature / PSO / topology in every SetPipeline call.
     /// </summary>
+    /// <summary>
+    /// G1: uploads the eight colour-grading floats into root constants 8-15. Called only by the tonemap and uber draws,
+    /// which are the only variants whose pixel shader reaches Tonemap(); FXAA, RCAS and the outline composite read the
+    /// already graded image and never reference the block, so leaving it stale for them cannot matter. Values are
+    /// re-read every frame because the preset and its intensity are live knobs.
+    /// </summary>
+    static void UploadGrade()
+    {
+        var cmdList = Device.GraphicsCommandList;
+        var grade = ColorGrading.Resolve(RenderQuality.Current, out float intensity);
+        var packed = stackalloc float[ColorGrading.PackedFloatCount];
+        ColorGrading.Pack(grade, intensity, new Span<float>(packed, ColorGrading.PackedFloatCount));
+
+        // Eight single-slot writes rather than the batched constant overload: this runs at most twice a frame, and the
+        // per-slot form is the one already in use here, so it is the one whose behaviour is already known.
+        for (int i = 0; i < ColorGrading.PackedFloatCount; i++)
+            cmdList->SetGraphicsRoot32BitConstant(1, BitConverter.SingleToUInt32Bits(packed[i]), (uint)(8 + i));
+    }
+
     internal static void Draw(GpuDescriptorHandle srcSrv, bool linear = false, bool tonemap = false,
         GpuDescriptorHandle bloomSrv = default, bool bloom = false,
         GpuDescriptorHandle aoSrv = default, bool ao = false)
@@ -715,7 +795,10 @@ float4 PSMainOutlineComposite(PSInput input) : SV_TARGET
         cmdList->IASetPrimitiveTopology(D3DPrimitiveTopology.D3DPrimitiveTopologyTrianglelist);
         cmdList->SetGraphicsRootDescriptorTable(0, srcSrv);
         if (tonemap)
+        {
             cmdList->SetGraphicsRoot32BitConstant(1, BitConverter.SingleToUInt32Bits(Device.HdrExposure), 0);
+            UploadGrade();
+        }
         if (bloom)
         {
             cmdList->SetGraphicsRoot32BitConstant(1, BitConverter.SingleToUInt32Bits(RenderQuality.Current.BloomIntensity), 1);
@@ -756,6 +839,7 @@ float4 PSMainOutlineComposite(PSInput input) : SV_TARGET
         cmdList->IASetPrimitiveTopology(D3DPrimitiveTopology.D3DPrimitiveTopologyTrianglelist);
         cmdList->SetGraphicsRootDescriptorTable(0, srcSrv);
         cmdList->SetGraphicsRoot32BitConstant(1, BitConverter.SingleToUInt32Bits(Device.HdrExposure), 0);
+        UploadGrade();
         if (bloom)
         {
             cmdList->SetGraphicsRoot32BitConstant(1, BitConverter.SingleToUInt32Bits(RenderQuality.Current.BloomIntensity), 1);

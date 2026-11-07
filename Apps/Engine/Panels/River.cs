@@ -2100,7 +2100,7 @@ internal sealed class River : Panel
     /// <summary>
     /// The estuary's mist: a solid white cloud, not a wisp. The authored box is 12 x 5 m at its foot, so the density had to
     /// come up with it - 1024 x 0.95 is roughly 970 puffs, one every 0.25 m of that footprint, while a puff is 0.45 m across
-    /// at birth and 1.25 m at death. Any point in the cloud is therefore behind five or six puffs, which is what "实" means
+    /// at birth and 1.25 m at death. Any point in the cloud is therefore behind five or six puffs, which is what "solid" means
     /// here: the body reads as one mass of spray rather than a countable row of balls.
     ///
     /// <para>Noise is down to 0.35 for the same reason the waterfall's foam keeps its own low: more than that shreds every

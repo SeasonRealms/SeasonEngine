@@ -15,6 +15,10 @@ public partial class App : Microsoft.UI.Xaml.Application
 
     protected override async void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
     {
+        // Contract 3-2: the earliest engine-owned instruction in the process. Every startup number is relative to the
+        // moment this type was first touched, and this call is what touches it.
+        StartupProfiler.Mark("app-launch");
+
         var app = new Engine.App();
 
         WindowsApp.Run(app);

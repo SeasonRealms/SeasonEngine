@@ -152,6 +152,37 @@ public sealed class SceneFog
         return (density * exclusion, scattering * exclusion);
     }
 
+    /// <summary>
+    /// Density-weighted mean phase at a position: the CPU counterpart of what the injection kernel bakes into a froxel.
+    ///
+    /// Every medium has its own anisotropy now, so a froxel that straddles a valley mist and a spray plume carries a mix
+    /// rather than one number. Weighting by each medium's local extinction makes the result reduce to
+    /// <see cref="FogMath.Phase"/> at that volume's own g wherever a single volume covers the point - the property the
+    /// tests assert - and it is why this cannot be read back from <see cref="SampleMedium"/>, which returns only the
+    /// summed medium and has already forgotten which part came from where.
+    /// </summary>
+    public float PhaseAt(Vector3 position, float cosine)
+    {
+        FogMath.Finite(position);
+        float global = FogMath.Phase(cosine, Anisotropy);
+        if (!Enabled) return global;
+        var (density, _) = GlobalMedium(position);
+        double weight = density, accumulated = density * global;
+        for (int i = 0; i < _volumes.Count; i++)
+        {
+            var volume = _volumes[i];
+            if (!volume.Enabled) continue;
+            float mask = volume.WeightAt(position);
+            // An exclusion volume scales the whole medium by the same factor, so it cannot move the mean.
+            if (volume.Mode == FogVolumeMode.Exclude) continue;
+            float local = volume.Extinction * mask
+                * FogMath.DensityNoise(position - WindOffset, volume.NoiseScale, volume.NoiseAmount);
+            weight += local;
+            accumulated += local * FogMath.Phase(cosine, volume.EffectiveAnisotropy(Anisotropy));
+        }
+        return weight > 1e-12 ? (float)(accumulated / weight) : global;
+    }
+
     (float Density, Vector3 Scattering) GlobalMedium(Vector3 position)
     {
         float density = Extinction * MathF.Exp(-HeightFalloff * Math.Max(position.Y - BaseHeight, 0f));

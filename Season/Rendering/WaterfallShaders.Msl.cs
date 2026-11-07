@@ -43,6 +43,13 @@ float4 WfTransform(const device float4* data, float4 p, int i) {
     return p.x * data[i] + p.y * data[i + 1] + p.z * data[i + 2] + p.w * data[i + 3];
 }
 
+// Analytic mist for the sheet itself; see WaterfallShaders.Hlsl for why this is an exponential rather than a volume
+// sample. Slot 37.w is the extinction averaged along this sheet's eye ray, zero when no medium covers the path.
+float WfFogTransmittance(float3 world, float3 eye, float sigma) {
+    if (sigma <= 0.0f) return 1.0f;
+    return exp(-sigma * distance(world, eye));
+}
+
 // Per-sheet placement matrix (slots 38..41): points carry w=1, directions carry w=0, and the translation only affects points.
 // The normal follows rotation and non-uniform scaling automatically via the cross product of the two tangents, using the same derivation as the other three backends.
 float3 WfSheetPoint(const device float4* data, int offset, float3 p) {
@@ -319,6 +326,9 @@ fragment float4 PSMain(WaterfallVertex in [[stage_in]], const device float4* dat
     // A very light rim light: a cartoon-style sheet needs a bright edge when backlit, otherwise the whole thing smears into the background rocks.
     color += (ambientLight + direct) * pow(1.0f - saturate(dot(shadedNormal, view)), 4.0f) * 0.08f;
 
+    // Fog last: alpha, not colour, because the fraction the sheet loses is exactly the fraction the already-fogged
+    // background shows through.
+    alpha *= WfFogTransmittance(in.world, camera.xyz, data[offset + 37].w);
     return float4(color, alpha);
 }
 """;

@@ -257,7 +257,8 @@ public static class FrameProfiler
     {
         "Shadow", "Scene", "Post", "OutlineMask", "FinalBlit", "Overlay",
         "SceneOpaque", "FogComposite", "SceneTransparent", "WeatherComposite",
-        "SceneDecal", "SceneWater", "SsrComposite", "SceneWaterfall",
+        "SceneDecal", "SceneWater", "SsrComposite", "SceneWaterfall", "ShadowFar",
+        "ShadowLocal",
     };
 
     // Small fixed tables, allocated once with the type. They are read on every Begin even when the profiler is off, so

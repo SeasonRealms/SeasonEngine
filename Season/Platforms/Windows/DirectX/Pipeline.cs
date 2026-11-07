@@ -3387,9 +3387,27 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
 
         ID3D12PipelineState* pipelineState;
 
+        // Contract 3-2: PSO creation is the second half of the startup bake - fxc produced the bytecode, the driver still
+        // has to turn it into a pipeline object, and on this backend that conversion is synchronous under this call. The
+        // name mirrors the variant switches so a slow row can be traced back to the PSO it belongs to.
+        long psoStart = StartupProfiler.Enabled ? StartupProfiler.Ticks() : 0;
+
         var iid = ID3D12PipelineState.Guid;
         var result = DirectX.Device.D3dDevice->CreateGraphicsPipelineState(&psoDesc, &iid, (void**)&pipelineState);
         DirectX.Device.CheckResult(result);
+
+        if (psoStart != 0)
+        {
+            string psoName = $"{mode}" +
+                (cullVariant == PipelineCullVariant.Back ? string.Empty : "/" + cullVariant) +
+                (shadowPass ? "/shadow" : string.Empty) +
+                (overlay ? "/overlay" : string.Empty) +
+                (outlineMask ? "/outline" : string.Empty) +
+                (depthWrite ? string.Empty : "/nodepth");
+
+            StartupProfiler.Item("pso", psoName, StartupProfiler.ElapsedMs(psoStart), 0,
+                $"rts={psoDesc.NumRenderTargets} samples={psoDesc.SampleDesc.Count}");
+        }
 
         // Release shader blobs
         vertexShaderBlob->Release();
@@ -3491,7 +3509,8 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         }
         DirectX.Device.GraphicsCommandList->SetPipelineState(pso);
         if (_fogSamplingEnabled && mode != PipelineMode.Opaque
-            && Device.ActivePassId is not (RenderPassId.Overlay or RenderPassId.OutlineMask or RenderPassId.Shadow))
+            && Device.ActivePassId is not (RenderPassId.Overlay or RenderPassId.OutlineMask or RenderPassId.Shadow
+                or RenderPassId.ShadowFar or RenderPassId.ShadowLocal))
             BindSceneFog();
     
         // Set the primitive topology

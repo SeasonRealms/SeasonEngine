@@ -361,7 +361,7 @@ VSOutput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
     if (ribbon.w > 0.5)
     {
         // The instance record changes meaning in this mode: Position is the segment midpoint and
-        // Velocity is the half-segment vector, so 'midpoint +/- half segment' gives the two endpoints
+        // Velocity is the half-segment vector, so ""midpoint +/- half segment"" gives the two endpoints
         // and no extra instance per segment is needed.
         float segLen = length(velocity);
         float3 tangent = segLen > 1e-5 ? velocity / segLen : float3(0.0, 1.0, 0.0);
@@ -373,8 +373,8 @@ VSOutput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
         float sideLen = length(side);
         side = sideLen > 1e-5 ? side / sideLen : right;
 
-        // Minimum screen width: project the world-space side into pixel space to get 'how many pixels
-        // one meter laterally equals', then invert it to find the world half-width needed to
+        // Minimum screen width: project the world-space side into pixel space to get ""how many pixels
+        // one meter laterally equals"", then invert it to find the world half-width needed to
         // guarantee the minimum pixel width. When a polyline is thinner than a pixel, rasterization
         // flickers in and out -- that is a fragment that was never generated at all, and no temporal
         // compensation can rescue it. TAA's reactive rect
@@ -448,7 +448,7 @@ float4 Shade(VSOutput input)
     float edge = input.Misc2.x;
     if (edge > 0.0)
     {
-        // coverage is 'how much coverage this pixel originally had'; the peak coverage is used as the
+        // coverage is ""how much coverage this pixel originally had""; the peak coverage is used as the
         // denominator to normalize back to [0,1] before cutting. The denominator is clamped to 1e-5
         // only to guard against division by zero: the additive mode's alpha is already 0, and it stays
         // 0 after the cut.

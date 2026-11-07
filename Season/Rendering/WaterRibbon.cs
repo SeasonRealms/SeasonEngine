@@ -268,7 +268,8 @@ public sealed class SceneWaterRibbons
 /// <item>33 (water color.rgb, opacity); 34 (foam color.rgb, foam amount);</item>
 /// <item>35 (flow speed in m/s, normal strength, normal tiling, erosion);</item>
 /// <item>36 (edge foam, edge softness, water depth in meters, 0);</item>
-/// <item>37 (sort key, phase in meters, 0, 0) - the phase is what continues the current across segments;</item>
+/// <item>37 (sort key, phase in meters, 0, extinction seen through) - the phase is what continues the current across
+/// segments, the extinction is what puts the band inside the fog instead of in front of it;</item>
 /// <item>38..41 placement matrix (local-to-world, row vectors).</item>
 /// </list>
 ///
@@ -320,9 +321,11 @@ public static class WaterRibbonMath
     public const float ScrollRepeatMeters = 3f;
 
     /// <summary>Writes this frame's header and ribbon slots. The caller must have sorted the ribbon table first.</summary>
+    /// <param name="fog">The medium the band is seen through; null means "no medium" and writes an extinction of 0, which
+    /// the shader reads as "no attenuation".</param>
     public static void Pack(Span<Vector4> data, in Matrix4x4 jitteredVp, Vector3 camera, float width, float height,
         Vector3 sunDirection, Vector3 sunColor, float sunIntensity, Vector3 ambient, float ambientIntensity,
-        float time, ReadOnlySpan<WaterRibbon> ribbons)
+        float time, ReadOnlySpan<WaterRibbon> ribbons, SceneFog? fog = null)
     {
         if (data.Length < VectorCount) throw new ArgumentException("Ribbon frame buffer is too small.", nameof(data));
         data.Clear();
@@ -341,11 +344,13 @@ public static class WaterRibbonMath
             int count = Math.Clamp(ribbon.Points.Count, 0, MaxControlPoints);
             float arc = 0f;
             float maxHalfWidth = 0f;
+            Vector3 center = Vector3.Zero;
             for (int p = 0; p < count; p++)
             {
                 var point = ribbon.Points[p];
                 float halfWidth = MathF.Max(point.HalfWidth, 0.02f);
                 maxHalfWidth = MathF.Max(maxHalfWidth, halfWidth);
+                center += point.Position;
                 data[offset + p * 2] = new(point.Position, halfWidth);
 
                 // Same zero-vector fallback as the waterfall: normalize(0) is NaN and would throw the whole band out of clip space.
@@ -356,6 +361,7 @@ public static class WaterRibbonMath
                 if (p > 0) arc += Vector3.Distance(ribbon.Points[p - 1].Position, point.Position);
             }
 
+            if (count > 0) center /= count;
             int flags = 0;
             if (ribbon.MaskTexture != null) flags |= FlagMask;
             if (ribbon.NormalTexture != null) flags |= FlagNormal;
@@ -366,7 +372,17 @@ public static class WaterRibbonMath
             data[offset + 35] = new(ribbon.FlowSpeed, ribbon.NormalStrength, ribbon.NormalTiling, 0f);
             data[offset + 36] = new(ribbon.EdgeFoam, ribbon.EdgeSoftness, ribbon.Depth, 0f);
             // .y is the phase: the shader samples at phase + arc, which is what keeps the current continuous across a joint.
-            data[offset + 37] = new(ribbon.SortOrder, ribbon.Phase, 0f, 0f);
+            // .w is the extinction the band is seen through - the ribbon's counterpart of WaterfallMath's slot 37.w, and
+            // the same eye-ray integral (WaterfallMath.FogPathExtinction). This Pass also draws *after* FogComposite, so
+            // without it the band keeps its full contrast on top of an already fogged background and reads as a decal
+            // pasted over the scene rather than as water lying in it.
+            //
+            // One value per ribbon instead of per pixel, because the band is a segment of a course rather than a whole
+            // river (see SceneWaterRibbons.MaxActiveRibbons) and the medium is piecewise smooth over that span - the same
+            // trade the curtain makes. Sampling the ribbon's own centre alone would report zero for a dry bank between the
+            // eye and the water, which is exactly the case that needs the fade most.
+            data[offset + 37] = new(ribbon.SortOrder, ribbon.Phase, 0f,
+                fog == null ? 0f : WaterfallMath.FogPathExtinction(fog, camera, Vector3.Transform(center, ribbon.Transform)));
             WriteMatrix(data, offset + PlacementOffset, ribbon.Transform);
             offset += RibbonStride;
         }

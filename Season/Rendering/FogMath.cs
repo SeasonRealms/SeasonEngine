@@ -87,11 +87,37 @@ public static class FogMath
             (depth - SliceDepth(slice, local.Length, maxDistance)) * rayLength);
     }
 
-    /// <summary>cosine is the cosine of the angle between the view ray and the direction toward the light; a positive g strengthens when viewing toward the light.</summary>
+    /// <summary>
+    /// Weight of the forward lobe of <see cref="Phase"/>; the remainder goes to a weaker back-scattering lobe.
+    ///
+    /// A single Henyey-Greenstein lobe at the scene default of 0.6 has a peak-to-back ratio of about 64:1, which is what
+    /// makes mist read as a flat sheet with the sun behind the viewer and as a blown-out disc with it in front. Splitting
+    /// the lobe keeps the forward peak, sends part of the energy back the other way, and is what every backend evaluates
+    /// per medium. The two weights sum to one, so the phase stays normalized over the sphere.
+    /// </summary>
+    public const float PhaseForwardWeight = 0.75f;
+
+    /// <summary>Anisotropy of the back-scattering lobe as a fraction of the medium's own g, with the sign flipped.</summary>
+    public const float PhaseBackwardRatio = 0.5f;
+
+    /// <summary>
+    /// Two-lobe phase. <paramref name="cosine"/> is the cosine of the angle between the view ray and the direction toward
+    /// the light; a positive <paramref name="anisotropy"/> strengthens when viewing toward the light.
+    ///
+    /// g = 0 collapses to 1/(4 pi) for every cosine, exactly as the single lobe did, so a scene that never sets an
+    /// anisotropy is numerically unchanged.
+    /// </summary>
     public static float Phase(float cosine, float anisotropy)
     {
         float g = Math.Clamp(Finite(anisotropy), -0.9f, 0.9f);
-        float denominator = 1f + g * g - 2f * g * Math.Clamp(Finite(cosine), -1f, 1f);
+        float c = Math.Clamp(Finite(cosine), -1f, 1f);
+        return PhaseForwardWeight * HenyeyGreenstein(c, g)
+            + (1f - PhaseForwardWeight) * HenyeyGreenstein(c, -PhaseBackwardRatio * g);
+    }
+
+    static float HenyeyGreenstein(float cosine, float g)
+    {
+        float denominator = 1f + g * g - 2f * g * cosine;
         return (1f - g * g) / (4f * MathF.PI * denominator * MathF.Sqrt(denominator));
     }
 

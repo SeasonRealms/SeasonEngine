@@ -1034,6 +1034,17 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             return DictionaryWGPUTexture.ContainsKey(sceneName) ? sceneName : null;
     }
 
+    /// <summary>G1: hands the resolved colour-grading coefficients to the JS side, whose parameter upload copies them
+    /// into elements 1 and 2 of the 48-byte uniform behind binding 2. Called at the start of both composition entry
+    /// points rather than threaded through the blit signatures: the values are uniform state, not per-draw parameters,
+    /// and the call is idempotent, so it does not matter which entry point owns the frame.</summary>
+    static void UploadColorGrade()
+    {
+        var grade = Season.Rendering.ColorGrading.Resolve(RenderQuality.Current, out float intensity);
+        WebGPUInterop.SetColorGrade(intensity, grade.Contrast, grade.Saturation, grade.Temperature,
+            grade.Tint, grade.Lift, grade.Gamma, grade.Gain);
+    }
+
     /// <summary>
     /// P3: a secondary view presents into its own LDR surface, while every publication passed on the paths below
     /// (bloom chain, AO chain, TAA resolve) is a product of the main view's frame. Compositing another view's
@@ -1043,6 +1054,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     public void BlitToBackbuffer(Season.Rendering.RenderTarget src)
     {
         if (!_initialized) return;
+        UploadColorGrade();
         if (!ReferenceEquals(Season.Rendering.FrameSchedule.ActiveTargets, Season.Rendering.FrameSchedule.PrimaryTargets))
         {
             WebGPUInterop.BlitToBackbuffer(((WGPURenderTarget)src).Name, RenderQuality.Current.HdrExposure, null, 0f,
@@ -1098,6 +1110,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
     internal void RenderPostPass(Season.Basic.IGraphics g, Season.Rendering.RenderTarget sceneColor)
     {
         if (!_initialized) return;
+        UploadColorGrade();
         WebGPUInterop.RenderPost(
             ((WGPURenderTarget)sceneColor).Name,
             RenderQuality.Current.HdrExposure,
@@ -4310,6 +4323,77 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
 
         // The quadrants repointed the JS-side current slot, so 3D draws outside a view's own collection (overlay
         // billboards) get the scene view back. The view slot itself is re-published by PrepareView per view anyway.
+        PublishViewConstants(RenderView.Current);
+    }
+
+    /// <summary>
+    /// Fog-only far shadow pass body (FrameSchedule.RenderFarShadow callback). One 1024^2 map spanning the medium from a
+    /// fixed centre instead of the camera's frustum, so the entire pass is a single viewport and a single matrix: no
+    /// quadrant loop and no reuse bookkeeping. The traversal is the same DrawShadow replay the cascades use; the only
+    /// difference from <see cref="RenderShadowPass"/> is that the target is a texture of its own, not an atlas tile.
+    /// Web-specific ordering: one viewport means one slot, so the two batches are flushed once at the end.
+    /// </summary>
+    internal void RenderFarShadowPass(Season.Basic.IGraphics g)
+    {
+        if (!RenderQuality.Current.ShadowsEnabled)
+            return;
+        if (!Season.Rendering.CascadedShadow.FarActive)
+            return;
+
+        var app = DeviceServices.BaseApp;
+        if (app == null)
+            return;
+
+        WebGPUInterop.SetShadowViewport(0, 0, Season.Rendering.CascadedShadow.FarSize);
+        _shadowViewProj = Season.Rendering.CascadedShadow.BeginFarSlot();
+        // FarSlot sits past the four atlas slots, so this view slot collides with neither a cascade nor the spot.
+        PublishShadowView(
+            WebGPUViewUniformLayout.ShadowSlotBase + Season.Rendering.CascadedShadow.FarSlot, _shadowViewProj);
+        app.DrawShadow();
+        FlushDrawMesh3DBatch();
+        FlushDrawSkinnedMeshBatch();
+        Season.Rendering.CascadedShadow.EndPass();
+
+        // Same reason as RenderShadowPass: the shadow slot repointed the JS-side current view, so the scene view goes back.
+        PublishViewConstants(RenderView.Current);
+    }
+
+    /// <summary>
+    /// Fog-only local point-light cubes (FrameSchedule.RenderLocalShadow callback). Up to two lamps, six 90 degree faces
+    /// each, packed four tiles to a row of one 512x384 depth map.
+    /// Web-specific ordering: the cascades give every quadrant a view slot of its own, so their deferred batches can share
+    /// one; two lamps of six faces would need twelve slots the table does not have, so the whole local block shares a single
+    /// slot and republishes it per face. Both batches are therefore flushed before each repoint, not once at the end.
+    /// </summary>
+    internal void RenderLocalShadowPass(Season.Basic.IGraphics g)
+    {
+        if (!RenderQuality.Current.ShadowsEnabled)
+            return;
+        if (!Season.Rendering.CascadedShadow.LocalActive)
+            return;
+
+        var app = DeviceServices.BaseApp;
+        if (app == null)
+            return;
+
+        for (int slot = 0; slot < Season.Rendering.CascadedShadow.LocalCount; slot++)
+        {
+            for (int face = 0; face < Season.Rendering.CascadedShadow.LocalShadowFaces; face++)
+            {
+                Season.Rendering.CascadedShadow.GetLocalViewport(slot, face, out int x, out int y, out int size);
+                WebGPUInterop.SetShadowViewport(x, y, size);
+                // Clause 7: BeginLocalSlot emits both the matrix and the culling frustum from the same source.
+                _shadowViewProj = Season.Rendering.CascadedShadow.BeginLocalSlot(slot, face);
+                PublishShadowView(WebGPUViewUniformLayout.LocalShadowSlot, _shadowViewProj);
+                app.DrawShadow();
+                FlushDrawMesh3DBatch();
+                FlushDrawSkinnedMeshBatch();
+            }
+        }
+
+        Season.Rendering.CascadedShadow.EndPass();
+
+        // Same reason as RenderShadowPass: the shared slot repointed the JS-side current view, so the scene view goes back.
         PublishViewConstants(RenderView.Current);
     }
 

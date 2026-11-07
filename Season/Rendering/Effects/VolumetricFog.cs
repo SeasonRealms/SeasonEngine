@@ -12,12 +12,28 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
     // 11 density/height/falloff/noise, 12 albedo/scale, 13 wind/count, 14 environment/PCF,
     // 15 previousCamera/valid, 16 previousForward/cloudReady, 18..21 inverseJitteredVP, 22..25 currentVP,
     // 32..185 final SceneLightParams (including regional weather and the 2-8 virtual ground), 192..447 for 32 local volumes.
-    // Each local volume is 8 rows: matrix (4), albedo/extinction, shape/mode/feather/noise, noise scale, self-illumination.
+    // 448..455 the fog's own far shadow: view-projection at 448, parameters at 452.
+    // 456..505 the local point-light cube shadows: two slots of 25 rows, six 4-row matrices then one meta row.
+    // Each local volume is 8 rows: matrix (4), albedo/extinction, shape/mode/feather/noise, noise scale/anisotropy, self-illumination.
     // 186..191 is headroom reserved for SceneLightParams to keep appending: appended fields only grow here and never reach 192.
-    public const int FrameVectorCount = 448;
+    // The far-shadow and local-shadow blocks sit past the volumes rather than in that headroom for the same reason they
+    // exist at all - they belong to this kernel alone, while the headroom belongs to the lighting struct every shader reads.
+    public const int FrameVectorCount = LocalShadowOffset + CascadedShadow.LocalShadowLights * LocalShadowStride;
     public const int LightingOffset = 32;
     public const int VolumeOffset = 192;
     public const int VolumeStride = 8;
+
+    /// <summary>Row of the far shadow's light-space ViewProj. Rows 449..451 continue the matrix; 452 carries its parameters.</summary>
+    public const int FarShadowOffset = 448;
+
+    /// <summary>
+    /// Row of the first local point-light slot. The far block occupies eight rows (four of matrix, one of parameters, three
+    /// unused), so this starts right after it rather than in the lighting headroom the volumes are kept away from.
+    /// </summary>
+    public const int LocalShadowOffset = FarShadowOffset + 8;
+
+    /// <summary>Rows per local slot: six cube faces of four matrix rows each, then a meta row at +24.</summary>
+    public const int LocalShadowStride = CascadedShadow.LocalShadowFaces * 4 + 1;
     public const string NoiseTexture = "compute3d://fog/noise";
     public const string InjectionTexture = "compute3d://fog/injection";
     public const string IntegratedTexture = "compute3d://fog/integrated";
@@ -28,7 +44,7 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
     static VolumetricFogEffect? _active;
     readonly Vector4[] _frame = new Vector4[FrameVectorCount];
     readonly ComputeResourceRef[] _noiseResources = { NoiseTexture };
-    readonly ComputeResourceRef[] _injectResources = new ComputeResourceRef[5];
+    readonly ComputeResourceRef[] _injectResources = new ComputeResourceRef[7];
     readonly ComputeResourceRef[] _filterResources = new ComputeResourceRef[4];
     readonly ComputeResourceRef[] _integrateResources = new ComputeResourceRef[3];
     IGraphics? _graphics;
@@ -360,7 +376,18 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
         _injectResources[2] = FrameSchedule.ShadowMap ?? targets.SceneDepth;
         _injectResources[3] = FrameSchedule.CloudNoiseTexture is string cloud
             ? new ComputeResourceRef { TextureName = cloud } : new ComputeResourceRef { Target = targets.SceneColor };
+        // Slot 4 stays the injection output: the far map is the sixth binding, appended after the storage write so the
+        // four existing slots keep the meaning the kernel declaration already gave them.
         _injectResources[4] = injection;
+        // The far map is bound only when the host registered it; otherwise the scene depth keeps the binding shape valid
+        // while the shader's enable flag stays zero, so the texture is never read.
+        _injectResources[5] = FrameSchedule.FarShadowMap is { } farShadow
+            ? new ComputeResourceRef { Target = farShadow } : new ComputeResourceRef { Target = targets.SceneDepth };
+        // Same shape for the local point-light atlas. PackFrame is what actually switches the shader term off - it writes
+        // -1 into every meta row when the host registered no local map - so the scene depth here is a placeholder the
+        // kernel's light-index test can never reach.
+        _injectResources[6] = FrameSchedule.LocalShadowMap is { } localShadow
+            ? new ComputeResourceRef { Target = localShadow } : new ComputeResourceRef { Target = targets.SceneDepth };
         _filterResources[0] = frameBuf;
         _filterResources[1] = injection;
         _filterResources[2] = historyRead;
@@ -512,10 +539,46 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
             WriteMatrix(data, index, local);
             data[index + 4] = new(volume.Albedo, volume.Extinction);
             data[index + 5] = new((int)volume.Shape, (int)volume.Mode, volume.EdgeFeather, volume.NoiseAmount);
-            data[index + 6] = new(volume.NoiseScale, 0, 0, 0);
+            data[index + 6] = new(volume.NoiseScale, volume.EffectiveAnisotropy(fog.Anisotropy), 0, 0);
             // Row 7 was padding: it now carries the self-illumination floor, so the stride and every existing index stay put.
             data[index + 7] = new(volume.SelfIllumination, 0);
             index += VolumeStride;
+        }
+        // Far shadow, written only when the host registered the pass and a directional light actually casts into a live
+        // volume. Zero means the injection kernel never samples the map, which is also how a host that never registered
+        // it behaves - there is no second flag to keep in sync.
+        //
+        // .x is the enable flag and .y the depth bias: those are the whole of what the injection kernel reads. .z and .w
+        // carry the map's half extent and the texel size, filled so a depth view can read its resolution off this row.
+        if (CascadedShadow.FarActive)
+        {
+            WriteMatrix(data, FarShadowOffset, CascadedShadow.FarViewProj);
+            data[FarShadowOffset + 4] = new(1f, CascadedShadow.FarBias, CascadedShadow.FarExtent, 1f / CascadedShadow.FarSize);
+        }
+        // Local point-light cubes, one slot per selected light: six light-space ViewProj followed by the row the kernel
+        // keys on. A slot is written only when a light was selected *and* the host registered the atlas; anything else
+        // writes .x = -1, which names no light. Leaving the row at the zero PackFrame cleared the frame to would have
+        // made an empty slot claim light 0, so the -1 is load-bearing rather than a spare sentinel.
+        bool localBound = FrameSchedule.LocalShadowMap != null && RenderQuality.Current.ShadowsEnabled;
+        float localStrength = Math.Clamp(RenderQuality.Current.ShadowStrength, 0f, 1f);
+        for (int slot = 0; slot < CascadedShadow.LocalShadowLights; slot++)
+        {
+            int baseRow = LocalShadowOffset + slot * LocalShadowStride;
+            int light = localBound ? CascadedShadow.LocalLightIndex[slot] : -1;
+            if (light < 0)
+            {
+                data[baseRow + LocalShadowStride - 1] = new(-1f, 0f, 0f, 0f);
+                continue;
+            }
+            for (int face = 0; face < CascadedShadow.LocalShadowFaces; face++)
+                WriteMatrix(data, baseRow + face * 4, CascadedShadow.LocalViewProj[slot * CascadedShadow.LocalShadowFaces + face]);
+            // .x the light index, .y the strength, .z the per-metre bias coefficient the kernel divides by clip.w,
+            // .w the receiver-plane tilt strength. Both come from the lamp's range rather than from a fixed NDC margin:
+            // see CascadedShadow.LocalBiasCoefficient for why a constant here was the wrong unit. An empty slot writes
+            // zeros, which the kernel never reads because .x names no light.
+            data[baseRow + LocalShadowStride - 1] = new(light, localStrength,
+                CascadedShadow.LocalBiasCoefficient(lights.Lights[light].PosRange.W),
+                CascadedShadow.LocalShadowNormalOffset);
         }
     }
 
@@ -577,7 +640,8 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
     public static ComputeKernelDesc CreateInjectionKernel() => Kernel("fogInject",
         new() { Hlsl = InjectionHlsl, Glsl = InjectionGlsl, Msl = InjectionMsl, Wgsl = InjectionWgsl }, false,
         ComputeBindingType.StorageBufferRead, ComputeBindingType.SampledTexture3D, ComputeBindingType.DepthTexture,
-        ComputeBindingType.SampledTexture, ComputeBindingType.StorageTexture3DWrite);
+        ComputeBindingType.SampledTexture, ComputeBindingType.StorageTexture3DWrite, ComputeBindingType.DepthTexture,
+        ComputeBindingType.DepthTexture);
 
     public static ComputeKernelDesc CreateFilterKernel() => Kernel("fogFilter",
         new() { Hlsl = FilterHlsl, Glsl = FilterGlsl, Msl = FilterMsl, Wgsl = FilterWgsl }, false,

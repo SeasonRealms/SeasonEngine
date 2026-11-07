@@ -7,22 +7,24 @@ using System.Globalization;
 namespace Engine.Management;
 
 /// <summary>
-/// 雷电天气的"雷"。闪电由 <see cref="WeatherVisualState"/> 逐帧调度，这里补上声音：
-/// 播放在 Resources/Raw/Musics 下预先生成的三段雷声，按落雷点到听者的距离延迟与衰减。
+/// The "thunder" of thunderstorm weather. Lightning is scheduled frame by frame by <see cref="WeatherVisualState"/>;
+/// this fills in the sound: three pre-generated thunder clips under Resources/Raw/Musics, played with a delay and
+/// attenuation based on the distance from the strike point to the listener.
 /// </summary>
 /// <remarks>
-/// <para>音频不在这里合成。WAV 是构建期用 Stable Audio 3 生成的静态资源（生成工具见
-/// .dbg/thunder_probe），运行时既不加载模型也不预读采样：每道雷只解析一次路径，
-/// 交给 <see cref="IMediaPlayer"/> 自己去读文件——和背景音乐走的是同一条通道。</para>
-/// <para>雷暴之外不出声；天气切走时已排队的条目直接作废，不补播。
-/// 资源缺失时只记一次日志，闪电本身不依赖音频。</para>
+/// <para>The audio is not synthesised here. The WAV files are static assets generated at build time with Stable Audio 3
+/// (generator tool in .dbg/thunder_probe); at runtime no model is loaded and no sample is pre-read: each thunder resolves
+/// its path once and hands it to <see cref="IMediaPlayer"/> to read the file itself - the same channel as the background
+/// music.</para>
+/// <para>Nothing plays outside a thunderstorm; when the weather switches away, already queued entries are dropped without a
+/// catch-up play. A missing asset is logged once; the lightning itself does not depend on the audio.</para>
 /// </remarks>
 internal sealed class ThunderAudio
 {
-    /// <summary>声速。雷声延迟就是落雷点到听者的距离除以它。</summary>
+    /// <summary>Speed of sound. The thunder delay is the strike-to-listener distance divided by it.</summary>
     const float SoundSpeed = 343f;
 
-    /// <summary>三段预生成雷声，播放时随机取一段，避免每道雷听起来都一样。</summary>
+    /// <summary>Three pre-generated thunder clips; one is picked at random per play so each strike does not sound identical.</summary>
     static readonly string[] Clips =
     [
         "Musics/ThunderClose.wav",
@@ -30,10 +32,10 @@ internal sealed class ThunderAudio
         "Musics/ThunderRoll.wav",
     ];
 
-    /// <summary>已排队、等待到达的雷声。只在帧线程读写。</summary>
+    /// <summary>Queued thunder awaiting arrival. Read and written only on the frame thread.</summary>
     readonly List<(double Due, string Clip, int Volume)> _pending = [];
 
-    /// <summary>缺失的资源只报一次，避免每道雷都往日志里写同一行。</summary>
+    /// <summary>A missing asset is reported once, so every strike does not write the same line to the log.</summary>
     readonly HashSet<string> _warned = [];
 
     readonly Random _random = new();
@@ -42,8 +44,9 @@ internal sealed class ThunderAudio
     int _serialSeen = -1;
 
     /// <summary>
-    /// 每帧调用一次，必须在 <see cref="WeatherVisualState.Update"/> 之后（落雷边沿在本帧已推进）。
-    /// <paramref name="thunderstorm"/> 为假时既不排队也不播放：晴天不该有雷声。
+    /// Called once per frame and must run after <see cref="WeatherVisualState.Update"/> (the strike edge has already
+    /// advanced this frame). When <paramref name="thunderstorm"/> is false it neither queues nor plays: a fair sky
+    /// should have no thunder.
     /// </summary>
     internal void Update(float seconds, WeatherVisualState visuals, Vector3 listener, bool thunderstorm)
     {
@@ -55,7 +58,7 @@ internal sealed class ThunderAudio
 
         if (_serialSeen < 0)
         {
-            // 首帧只做基线：启动前已经落过的雷不该在开场补一声。
+            // The first frame only takes a baseline: a strike that happened before startup should not ring out at the opening.
             _serialSeen = serial;
         }
         else if (serial != _serialSeen)
@@ -67,7 +70,7 @@ internal sealed class ThunderAudio
 
         if (_pending.Count == 0) return;
 
-        // 倒序删：同帧可能有两条到期。
+        // Remove in reverse: two entries may fall due in the same frame.
         for (int i = _pending.Count - 1; i >= 0; i--)
         {
             var item = _pending[i];
@@ -76,7 +79,7 @@ internal sealed class ThunderAudio
 
             _pending.RemoveAt(i);
 
-            // 天气已经切走：这条雷声作废，不补播（否则晴天后突然响一声）。
+            // The weather has already switched away: this thunder is void and not replayed (otherwise a fair sky would suddenly ring out).
             if (!thunderstorm) continue;
 
             var path = Resolve(item.Clip);
@@ -88,12 +91,15 @@ internal sealed class ThunderAudio
     }
 
     /// <summary>
-    /// 排队一次雷声。延迟按真实声速算：落雷点到听者通常 200~1500 m，对应 0.6~4.4 s，
-    /// 这正是"先见闪电、后闻雷"的间隔；音量随距离衰减，远处的雷只剩一声闷响。
+    /// Queues one thunder. The delay uses the real speed of sound: the strike-to-listener distance is usually 200~1500 m,
+    /// which is 0.6~4.4 s - exactly the gap of "see the flash first, hear the thunder after"; the volume falls off with
+    /// distance, so a remote strike is only a low rumble.
     ///
-    /// 距离取通道上离听者最近的那一段，而不是云内击穿点：一道横向斜出一公里的通道，
-    /// 它最低的那一段可能就在听者几百米外，而击穿点还远在云里——两者算出的延迟能差一秒以上，
-    /// 音量也差一档。云内闪没有通道，此时回退到击穿点距离，那正是"头顶闷雷"的正确形状。
+    /// The distance is taken from the nearest point of the channel to the listener, not the in-cloud breakdown point: for a
+    /// channel slanting a kilometre sideways, its lowest reach may be only a few hundred metres from the listener while the
+    /// breakdown point is still far inside the cloud - the two compute delays that can differ by over a second, and volumes
+    /// that differ by a step. An intra-cloud flash has no channel, so it falls back to the breakdown-point distance, which is
+    /// exactly the right shape for a rumble overhead.
     /// </summary>
     void Enqueue(WeatherVisualState visuals, Vector3 listener)
     {
@@ -104,20 +110,20 @@ internal sealed class ThunderAudio
         if (!float.IsFinite(distance) || distance < 0) distance = 0;
 
         double delay = Math.Clamp(distance / SoundSpeed, 0.2f, 4.5f);
-        // 云底落雷到地面听者约 700 m，音量落在 60 上下（背景音乐是 60）；再远只剩闷响。
+        // A cloud-base strike to a ground listener is about 700 m, putting the volume around 60 (the background music is 60); further out is only a rumble.
         float audibility = Math.Clamp(1f - distance / 2000f, 0.2f, 1f);
         int volume = (int)MathF.Round(audibility * 90f);
 
-        // 上限只防极端情况（区域被反复重建导致计数跳变），正常落雷间隔 2.6 s 起，排不出队列。
+        // The cap only guards against extreme cases (a region rebuilt repeatedly, jumping the counter); normal strikes are 2.6 s apart or more, so the queue never builds up.
         if (_pending.Count >= 4) _pending.RemoveAt(0);
 
         _pending.Add((_clock + delay, clip, volume));
     }
 
     /// <summary>
-    /// 把资源名解析成播放器能直接打开的真实路径。桌面与 Apple 是程序目录里的文件，
-    /// Android 会把 APK assets 落进 CacheDir（MediaPlayer 只认真实文件），
-    /// Web 端原样返回，由 WebMediaPlayer 拼成 wwwroot 下的 URL。
+    /// Resolves an asset name to a real path the player can open directly. On desktop and Apple it is a file in the program
+    /// directory; on Android the APK assets are extracted into CacheDir (MediaPlayer only accepts real files); on the web it
+    /// is returned as-is, and WebMediaPlayer makes it a URL under wwwroot.
     /// </summary>
     string? Resolve(string clip)
     {
@@ -127,7 +133,7 @@ internal sealed class ThunderAudio
 
         if (_warned.Add(clip))
         {
-            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} 雷声：找不到资源 {clip}，这一段静音。");
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} Thunder: asset {clip} not found, staying silent for this one.");
         }
 
         return null;

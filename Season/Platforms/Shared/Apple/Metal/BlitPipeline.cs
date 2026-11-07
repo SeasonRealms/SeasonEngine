@@ -35,8 +35,8 @@ namespace Season.Platforms.Shared.Apple.Metal;
 ///   Uber variants are used by the Post pass and output tonemap(+bloom) into LDR PostColor while packing Rec.601 luma into alpha.
 ///   FXAA variants are used by FinalBlit resolve, and their contract constants are ported literally from the DX reference implementation,
 ///   using sampler 0 for point neighborhood taps and sampler 1 for linear directional taps.
-///   All of them share the 16-byte BlitParams block, containing exposure, bloomIntensity, and texelSize,
-///   delivered through SetFragmentBytes at buffer 0.
+///   All of them share the BlitParams block, which contains exposure, bloomIntensity, and texelSize and is delivered
+///   through SetFragmentBytes at buffer 0. G1 appends the eight colour-grading floats and the block becomes 64 bytes.
 /// - Step C of 2-2, aligned with DX 2-2 step B:
 ///   six AO variants exist, covering tonemap with or without bloom, point or linear, plus uber with or without bloom.
 ///   Before ACES, the linear scene is multiplied by AO and then bloom is added:
@@ -45,6 +45,9 @@ namespace Season.Platforms.Shared.Apple.Metal;
 ///   The AO texture is bound at <c>texture(2)</c> and always upsampled linearly from the half-resolution GTAO output r channel,
 ///   scaled by AoIntensity.
 ///   This adds the fifth component to BlitParams and expands the block to 20 bytes.
+/// - G1 colour grading, aligned with DX and VK: GradeLdr runs inside Tonemap, so both the Post uber pass and the
+///   direct-to-backbuffer tonemap variants are graded and FXAA, RCAS and the outline composite read the graded image.
+///   The tonemap entry points therefore take the whole BlitParams block rather than a bare exposure float.
 /// - Step D of 2-3, aligned with DX and VK contract clause 12:
 ///   when <c>sceneTex</c> is non-null and ready, it replaces <c>texture(0)</c> as the scene source.
 ///   That texture is the TAA resolve storage texture and matches SceneColor in size and rgba16float format,
@@ -91,6 +94,37 @@ fragment float4 blit_fs_linear(BlitVSOut vsOut [[stage_in]],
     return srcTex.sample(srcSampler, vsOut.uv);
 }
 
+// G1: the fragment parameter block shared by every variant that needs more than the source texture, delivered through
+// SetFragmentBytes at buffer 0 with the same layout as VK push constants and DX root constants.
+// It is declared ahead of the tone-mapping helpers because GradeLdr and Tonemap read the whole block rather than taking
+// exposure alone: a grade needs seven more coefficients, and passing a block reference keeps one signature for every
+// variant instead of a parameter list that grows with each feature.
+// The block was 16 bytes at 2-1, 20 after 2-2 appended aoIntensity, and 32 after 2-3 appended sharpness plus the
+// trailing pad float2 alignment already reserved; G1 appends eight grading floats and the block becomes 64 bytes. The
+// C# push length equals sizeof(BlitParams) exactly rather than stopping short of the struct MSL lays out.
+struct BlitParams
+{
+    float exposure;       // Linear exposure multiplier from Device.HdrExposure.
+    float bloomIntensity; // Bloom composition coefficient from RenderQuality.BloomIntensity, used only by bloom and uber variants.
+    float2 texelSize;     // Source-texture texel size for FXAA, also used by the RCAS variant of 2-3.
+    float aoIntensity;    // Step C of 2-2: AO occlusion intensity from RenderQuality.AoIntensity, used only by AO variants.
+    float outlineWidth;   // Phase 4: outline width in screen pixels for Outline2D composition, used only by outline_composite.
+    float sharpness;      // Clause 17 of 2-3: RCAS lobe scale from RenderQuality.TaaSharpness, used only by blit_fs_rcas.
+    float blitPad;        // Trailing pad: float2 alignment rounds the struct up to 32 bytes, and the push must cover all of it.
+
+    // G1: colour grading, read only by GradeLdr and therefore only by the tonemap and uber variants. The block starts
+    // at byte 32 so it lands on the struct's natural 16-byte boundary, and ColorGrading.Pack writes it in this exact
+    // order.
+    float gradeIntensity;    // 0 = Off: GradeLdr returns its input untouched
+    float gradeContrast;     // (rgb - 0.5) * contrast + 0.5
+    float gradeSaturation;   // mix(Rec.601 luma, rgb, saturation)
+    float gradeTemperature;  // r *= 1 + t, b *= 1 - t
+    float gradeTint;         // g *= 1 + t
+    float gradeLift;         // black floor blended in by lift/gamma/gain
+    float gradeGamma;        // pow(saturate(rgb), 1 / gamma)
+    float gradeGain;         // linear scale applied before the lift blend
+};
+
 // Tonemap variants for render-quality 1-4 step B:
 // HDR linear source in RGBA16Float goes through exposure, ACES, and gamma encoding before presentation.
 // ACES uses the Narkowicz 2015 fitted curve, an RRT plus ODT approximation.
@@ -105,45 +139,72 @@ static float3 AcesFilm(float3 x)
     return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
 }
 
-static float3 Tonemap(float3 hdr, float exposure)
+// G1: colour grading, applied to the display-referred image after the tone curve.
+// Each step is guarded by a uniform comparison against its own identity value, so Neutral runs none of them and has
+// to reproduce its input exactly - that is what makes it a lossless control rather than merely a subtle look. The
+// guards are uniform branches, so every invocation in the draw takes the same path and they cost nothing.
+static float3 GradeLdr(float3 ldr, constant BlitParams& params)
 {
-    float3 mapped = AcesFilm(max(hdr, float3(0.0)) * exposure);
-    return pow(mapped, float3(1.0 / 2.2));
+    if (params.gradeIntensity <= 0.0)
+        return ldr;
+
+    float3 g = ldr;
+
+    // White point: red/blue along temperature, green/magenta along tint.
+    if (params.gradeTemperature != 0.0 || params.gradeTint != 0.0)
+        g *= float3(1.0 + params.gradeTemperature, 1.0 + params.gradeTint, 1.0 - params.gradeTemperature);
+
+    // Lift/gamma/gain in the ASC CDL sense: gain scales the signal, lift blends black toward the raised floor.
+    if (params.gradeLift != 0.0 || params.gradeGain != 1.0)
+        g = g * params.gradeGain + params.gradeLift * (1.0 - g);
+
+    // Mid-tone power. saturate first because a lift, or a gain above 1, can push a channel past 1 and pow of a
+    // negative base is undefined.
+    if (params.gradeGamma != 1.0)
+        g = pow(saturate(g), float3(1.0 / max(params.gradeGamma, 1e-3)));
+
+    // Contrast about mid-grey.
+    if (params.gradeContrast != 1.0)
+        g = (g - 0.5) * params.gradeContrast + 0.5;
+
+    // Saturation against Rec.601 luma - the same weights the uber variants bake into alpha, so FXAA and RCAS
+    // downstream read a luma that still matches the graded image.
+    if (params.gradeSaturation != 1.0)
+    {
+        float luma = dot(g, float3(0.299, 0.587, 0.114));
+        g = mix(float3(luma), g, params.gradeSaturation);
+    }
+
+    g = saturate(g);
+    return params.gradeIntensity >= 1.0 ? g : mix(ldr, g, params.gradeIntensity);
+}
+
+static float3 Tonemap(float3 hdr, constant BlitParams& params)
+{
+    float3 mapped = AcesFilm(max(hdr, float3(0.0)) * params.exposure);
+    return GradeLdr(pow(mapped, float3(1.0 / 2.2)), params);
 }
 
 fragment float4 blit_fs_tonemap(float4 pos [[position]],
-                                constant float& exposure [[buffer(0)]],
+                                constant BlitParams& params [[buffer(0)]],
                                 texture2d<float> srcTex [[texture(0)]])
 {
     float4 c = srcTex.read(uint2(pos.xy));
-    return float4(Tonemap(c.rgb, exposure), c.a);
+    return float4(Tonemap(c.rgb, params), c.a);
 }
 
 fragment float4 blit_fs_linear_tonemap(BlitVSOut vsOut [[stage_in]],
-                                       constant float& exposure [[buffer(0)]],
+                                       constant BlitParams& params [[buffer(0)]],
                                        texture2d<float> srcTex [[texture(0)]],
                                        sampler srcSampler [[sampler(0)]])
 {
     float4 c = srcTex.sample(srcSampler, vsOut.uv);
-    return float4(Tonemap(c.rgb, exposure), c.a);
+    return float4(Tonemap(c.rgb, params), c.a);
 }
 
 // ---- Step D of 2-1: bloom, uber, and FXAA variants, aligned with DX step B and C ----
-// The parameter block is 16 bytes and matches the layout of VK push constants and DX root constants.
-// It is delivered through SetFragmentBytes at buffer 0.
-// Step C of 2-2 expands it to 20 bytes by appending aoIntensity, without affecting float2 alignment.
-// Clause 17 of 2-3 appends sharpness plus an explicit trailing pad, so the block is 32 bytes and the C# push length
-// equals sizeof(BlitParams) exactly rather than stopping short of the struct MSL lays out.
-struct BlitParams
-{
-    float exposure;       // Linear exposure multiplier from Device.HdrExposure.
-    float bloomIntensity; // Bloom composition coefficient from RenderQuality.BloomIntensity, used only by bloom and uber variants.
-    float2 texelSize;     // Source-texture texel size for FXAA, also used by the RCAS variant of 2-3.
-    float aoIntensity;    // Step C of 2-2: AO occlusion intensity from RenderQuality.AoIntensity, used only by AO variants.
-    float outlineWidth;   // Phase 4: outline width in screen pixels for Outline2D composition, used only by outline_composite.
-    float sharpness;      // Clause 17 of 2-3: RCAS lobe scale from RenderQuality.TaaSharpness, used only by blit_fs_rcas.
-    float blitPad;        // Trailing pad: float2 alignment rounds the struct up to 32 bytes, and the push must cover all of it.
-};
+// BlitParams is declared above, ahead of the tone-mapping helpers: G1 made Tonemap depend on the grading block, and MSL
+// requires a declaration before use. The struct layout and its history are documented there.
 
 // Tonemap plus bloom:
 // bloom is added in linear space before ACES, following the RenderQuality 2-1 contract.
@@ -156,7 +217,7 @@ fragment float4 blit_fs_tonemap_bloom(BlitVSOut vsOut [[stage_in]],
 {
     float4 c = srcTex.read(uint2(vsOut.pos.xy));
     c.rgb += bloomTex.sample(linearSampler, vsOut.uv).rgb * params.bloomIntensity;
-    return float4(Tonemap(c.rgb, params.exposure), c.a);
+    return float4(Tonemap(c.rgb, params), c.a);
 }
 
 fragment float4 blit_fs_linear_tonemap_bloom(BlitVSOut vsOut [[stage_in]],
@@ -167,7 +228,7 @@ fragment float4 blit_fs_linear_tonemap_bloom(BlitVSOut vsOut [[stage_in]],
 {
     float4 c = srcTex.sample(linearSampler, vsOut.uv);
     c.rgb += bloomTex.sample(linearSampler, vsOut.uv).rgb * params.bloomIntensity;
-    return float4(Tonemap(c.rgb, params.exposure), c.a);
+    return float4(Tonemap(c.rgb, params), c.a);
 }
 
 // Uber variant used by the Post pass:
@@ -186,7 +247,7 @@ fragment float4 blit_fs_uber(float4 pos [[position]],
                              texture2d<float> srcTex [[texture(0)]])
 {
     float4 c = srcTex.read(uint2(pos.xy));
-    float3 ldr = Tonemap(c.rgb, params.exposure);
+    float3 ldr = Tonemap(c.rgb, params);
     return float4(ldr, Luma(ldr));
 }
 
@@ -198,7 +259,7 @@ fragment float4 blit_fs_uber_bloom(BlitVSOut vsOut [[stage_in]],
 {
     float4 c = srcTex.read(uint2(vsOut.pos.xy));
     c.rgb += bloomTex.sample(linearSampler, vsOut.uv).rgb * params.bloomIntensity;
-    float3 ldr = Tonemap(c.rgb, params.exposure);
+    float3 ldr = Tonemap(c.rgb, params);
     return float4(ldr, Luma(ldr));
 }
 
@@ -220,7 +281,7 @@ fragment float4 blit_fs_tonemap_ao(BlitVSOut vsOut [[stage_in]],
 {
     float4 c = srcTex.read(uint2(vsOut.pos.xy));
     c.rgb = ApplyAo(c.rgb, vsOut.uv, aoTex, linearSampler, params.aoIntensity);
-    return float4(Tonemap(c.rgb, params.exposure), c.a);
+    return float4(Tonemap(c.rgb, params), c.a);
 }
 
 fragment float4 blit_fs_linear_tonemap_ao(BlitVSOut vsOut [[stage_in]],
@@ -231,7 +292,7 @@ fragment float4 blit_fs_linear_tonemap_ao(BlitVSOut vsOut [[stage_in]],
 {
     float4 c = srcTex.sample(linearSampler, vsOut.uv);
     c.rgb = ApplyAo(c.rgb, vsOut.uv, aoTex, linearSampler, params.aoIntensity);
-    return float4(Tonemap(c.rgb, params.exposure), c.a);
+    return float4(Tonemap(c.rgb, params), c.a);
 }
 
 fragment float4 blit_fs_tonemap_bloom_ao(BlitVSOut vsOut [[stage_in]],
@@ -244,7 +305,7 @@ fragment float4 blit_fs_tonemap_bloom_ao(BlitVSOut vsOut [[stage_in]],
     float4 c = srcTex.read(uint2(vsOut.pos.xy));
     c.rgb = ApplyAo(c.rgb, vsOut.uv, aoTex, linearSampler, params.aoIntensity);
     c.rgb += bloomTex.sample(linearSampler, vsOut.uv).rgb * params.bloomIntensity;
-    return float4(Tonemap(c.rgb, params.exposure), c.a);
+    return float4(Tonemap(c.rgb, params), c.a);
 }
 
 fragment float4 blit_fs_linear_tonemap_bloom_ao(BlitVSOut vsOut [[stage_in]],
@@ -257,7 +318,7 @@ fragment float4 blit_fs_linear_tonemap_bloom_ao(BlitVSOut vsOut [[stage_in]],
     float4 c = srcTex.sample(linearSampler, vsOut.uv);
     c.rgb = ApplyAo(c.rgb, vsOut.uv, aoTex, linearSampler, params.aoIntensity);
     c.rgb += bloomTex.sample(linearSampler, vsOut.uv).rgb * params.bloomIntensity;
-    return float4(Tonemap(c.rgb, params.exposure), c.a);
+    return float4(Tonemap(c.rgb, params), c.a);
 }
 
 fragment float4 blit_fs_uber_ao(BlitVSOut vsOut [[stage_in]],
@@ -268,7 +329,7 @@ fragment float4 blit_fs_uber_ao(BlitVSOut vsOut [[stage_in]],
 {
     float4 c = srcTex.read(uint2(vsOut.pos.xy));
     c.rgb = ApplyAo(c.rgb, vsOut.uv, aoTex, linearSampler, params.aoIntensity);
-    float3 ldr = Tonemap(c.rgb, params.exposure);
+    float3 ldr = Tonemap(c.rgb, params);
     return float4(ldr, Luma(ldr));
 }
 
@@ -282,7 +343,7 @@ fragment float4 blit_fs_uber_bloom_ao(BlitVSOut vsOut [[stage_in]],
     float4 c = srcTex.read(uint2(vsOut.pos.xy));
     c.rgb = ApplyAo(c.rgb, vsOut.uv, aoTex, linearSampler, params.aoIntensity);
     c.rgb += bloomTex.sample(linearSampler, vsOut.uv).rgb * params.bloomIntensity;
-    float3 ldr = Tonemap(c.rgb, params.exposure);
+    float3 ldr = Tonemap(c.rgb, params);
     return float4(ldr, Luma(ldr));
 }
 
@@ -568,14 +629,29 @@ fragment float4 blit_fs_outline_composite(BlitVSOut vsOut [[stage_in]],
             ?? throw new Exception("CreateSamplerState [FinalBlit point] failed");
     }
 
-    /// <summary>Pushes the 32-byte BlitParams block through buffer 0 with the same layout as VK push constants and DX root constants.
-    /// Sending it every Draw guarantees that runtime parameter changes take effect immediately, per contract clause 5.
-    /// Phase 4 appends outlineWidth, and clause 17 of 2-3 appends sharpness plus the trailing pad that float2 alignment
-    /// already reserves inside the struct, so the pushed length matches sizeof(BlitParams) rather than falling short of it.</summary>
+    /// <summary>Pushes the 64-byte BlitParams block through buffer 0 with the same layout as VK push constants and DX
+    /// root constants. Sending it every Draw guarantees that runtime parameter changes take effect immediately, per
+    /// contract clause 5. Phase 4 appends outlineWidth, clause 17 of 2-3 appends sharpness plus the trailing pad that
+    /// float2 alignment already reserves inside the struct, and G1 appends the eight colour-grading floats read from
+    /// RenderQuality here rather than passed in, so no draw can forget them. The pushed length always covers
+    /// sizeof(BlitParams) exactly.</summary>
     static unsafe void SetParams(IMTLRenderCommandEncoder enc, float exposure, float bloomIntensity, float texelSizeX, float texelSizeY, float aoIntensity = 0f, float outlineWidth = 0f, float sharpness = 0f)
     {
-        float* p = stackalloc float[8] { exposure, bloomIntensity, texelSizeX, texelSizeY, aoIntensity, outlineWidth, sharpness, 0f };
-        enc.SetFragmentBytes((IntPtr)p, 8 * sizeof(float), 0);
+        const int blockFloats = 8 + ColorGrading.PackedFloatCount;
+        float* p = stackalloc float[blockFloats];
+        p[0] = exposure;
+        p[1] = bloomIntensity;
+        p[2] = texelSizeX;
+        p[3] = texelSizeY;
+        p[4] = aoIntensity;
+        p[5] = outlineWidth;
+        p[6] = sharpness;
+        p[7] = 0f;
+
+        var grade = ColorGrading.Resolve(RenderQuality.Current, out float intensity);
+        ColorGrading.Pack(grade, intensity, new Span<float>(p + 8, ColorGrading.PackedFloatCount));
+
+        enc.SetFragmentBytes((IntPtr)p, blockFloats * sizeof(float), 0);
     }
 
     /// <summary>Draws the full-screen triangle on the current pass encoder and presents the source color.
@@ -629,11 +705,11 @@ fragment float4 blit_fs_outline_composite(BlitVSOut vsOut [[stage_in]],
                 enc.SetFragmentSamplerState(_linearSampler!, 0);
             if (tonemap)
             {
-                // Push exposure on every Draw, per contract clause 5.
-                // Because it is far below 4 KB, SetFragmentBytes avoids creating a buffer
-                // and lets runtime exposure changes take effect immediately.
-                float exposure = Device.HdrExposure;
-                enc.SetFragmentBytes((IntPtr)(&exposure), sizeof(float), 0);
+                // Push the whole block on every Draw, per contract clause 5. Since G1 the tonemap entry points read
+                // BlitParams rather than a bare exposure float, so the push length has to cover the struct; the block
+                // stays far below 4 KB, so SetFragmentBytes still avoids creating a buffer.
+                SetParams(enc, Device.HdrExposure, RenderQuality.Current.BloomIntensity, 0f, 0f,
+                    RenderQuality.Current.AoIntensity);
             }
         }
         enc.DrawPrimitives(MTLPrimitiveType.Triangle, 0, 3);

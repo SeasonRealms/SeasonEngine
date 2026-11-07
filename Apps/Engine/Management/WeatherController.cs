@@ -11,8 +11,10 @@ using Season.Rendering.Effects;
 namespace Engine.Management;
 
 /// <summary>
-/// 管理天气配置与空间快照；视觉配方由 WeatherPrecipitationEffect 消费，不改动旧天空与树林雾。
-/// UI 排队请求，Update 在帧线程修改配置并发布结果；粒子与后续云层共用同一空间场。
+/// Manages weather configuration and the spatial snapshot; the visual recipe is consumed by
+/// WeatherPrecipitationEffect and does not touch the legacy sky or the forest fog. The UI queues requests,
+/// and Update modifies the configuration on the frame thread and publishes the result; particles and the
+/// later cloud layers share the same spatial field.
 /// </summary>
 internal sealed class WeatherController
 {
@@ -23,14 +25,16 @@ internal sealed class WeatherController
     internal WeatherField Field { get; } = new();
 
     /// <summary>
-    /// 室内遮挡区域。来自场景几何而不是用户配置，因此既不写入 WorldSettings 也不参与状态过渡；
-    /// 每帧重建快照时追加在配置区域之后，排序不变量保证它总是最先消耗覆盖权重。
+    /// The indoor shelter region. It comes from scene geometry rather than user configuration, so it is neither
+    /// written into WorldSettings nor part of any state transition; when the snapshot is rebuilt each frame it is
+    /// appended after the configured regions, and the ordering invariant keeps it first to consume coverage weight.
     /// </summary>
     internal WeatherRegionSettings? Cover { get; set; }
 
     /// <summary>
-    /// 当前快照里是否有任何区域带电。雷声合成在第一次为真时启动：不进雷暴就完全不加载模型，
-    /// 进过之后缓存常驻，再进只看本地 WAV。
+    /// Whether any region in the current snapshot is charged. Thunder synthesis starts the first time this is true:
+    /// without entering a thunderstorm the model is never loaded, and once entered the cache stays resident, so a
+    /// later entry only reads the local WAV.
     /// </summary>
     internal bool LightningActive
     {
@@ -45,7 +49,7 @@ internal sealed class WeatherController
         }
     }
 
-    // Rocks 位于 X=+75；区域以世界坐标固定，转动或移动相机不改变天气所在位置。
+    // The rocks are at X=+75; regions are fixed in world coordinates, so turning or moving the camera does not change where the weather sits.
     static readonly WeatherRegionSettings Island = new()
     {
         Id = IslandId, Priority = 10, RadiusX = 145, RadiusZ = 145, EdgeFeather = 30,
@@ -66,9 +70,11 @@ internal sealed class WeatherController
 
     WeatherRegionSettings[] Normalize(WeatherRegionSettings[]? saved)
     {
-        // 遮挡区不占用户配额：有遮挡时给配置区少留一格，否则 SetRegions 会因超限抛错。
+        // The shelter region does not take a user slot: when there is shelter, one less slot is left for the configured
+        // regions, otherwise SetRegions would throw on exceeding the limit.
         int capacity = WeatherField.MaxRegions - (Cover != null ? 1 : 0);
-        // 不覆盖用户已保存的范围；损坏条目才丢弃。复制数组避免保存线程枚举时被原地修改。
+        // The user's saved ranges are not overwritten; only corrupt entries are dropped. The array is copied so the save
+        // thread is not modified in place while enumerating.
         var regions = new List<WeatherRegionSettings>();
         foreach (var region in saved ?? [])
         {
@@ -77,7 +83,7 @@ internal sealed class WeatherController
             catch (ArgumentException) { continue; }
             if (!regions.Any(r => r.Id == region.Id)) regions.Add(region);
         }
-        // 双区域始终保留槽位，其余区域仍能通过配置扩展。
+        // The two regions always keep their slots, and other regions can still be added through configuration.
         var island = regions.Find(r => r.Id == IslandId) ?? Island;
         var offshore = regions.Find(r => r.Id == OffshoreId) ?? Offshore;
         return new[] { island, offshore }
@@ -91,7 +97,7 @@ internal sealed class WeatherController
         _requests.Enqueue((id, kind));
     }
 
-    /// <returns>是否消费了需保存的设置更改。</returns>
+    /// <returns>Whether a settings change that needs saving was consumed.</returns>
     internal bool Update(WorldSettings settings, float seconds)
     {
         bool changed = false;
@@ -125,7 +131,7 @@ internal sealed class WeatherController
             _states[config.Id] = state;
             _snapshot[count++] = new WeatherRegion(config, state.Transition.Current);
         }
-        // 遮挡区不带强度，只在 GPU 与 CPU 两侧按同一覆盖规则压掉排在它之后的降水。
+        // The shelter region carries no strength; it only suppresses precipitation ranked after it, using the same coverage rule on both the GPU and CPU sides.
         if (Cover != null && count < WeatherField.MaxRegions)
             _snapshot[count++] = new WeatherRegion(Cover, new WeatherSample(0, 0, 0));
         Field.SetRegions(_snapshot.AsSpan(0, count));
@@ -135,11 +141,11 @@ internal sealed class WeatherController
 
     internal string Status(string id)
     {
-        if (!_states.TryGetValue(id, out var state)) return "晴";
+        if (!_states.TryGetValue(id, out var state)) return "Clear";
         return Text(state.Kind) + (state.Transition.Progress < 1 ? $" {state.Transition.Progress:P0}" : "");
     }
 
-    // 强度只是业务信号；雨雪效果把当前实际值映射为视觉配方，不能直接用目标枚举切换。
+    // The strength is only a business signal; the rain/snow effect maps the current actual value to a visual recipe, so it cannot switch directly on the target enum.
     internal static WeatherSample Profile(WeatherKind kind) => kind switch
     {
         WeatherKind.Cloudy => new(0, 0, 0.35f),
@@ -149,27 +155,31 @@ internal sealed class WeatherController
         WeatherKind.HeavyRain => new(1, 0, 1),
         WeatherKind.LightSnow => new(0, 0.2f, 0.55f),
         WeatherKind.HeavySnow => new(0, 1, 0.9f),
-        // 雷电：乌云到顶、不落雨雪。云厚直接取 1，因为云片数与消光都由它驱动，
-        // 闪光只能靠一层足够厚且足够低的云才读得出来。
+        // Thunder: the storm cloud reaches the top and no rain or snow falls. Cloud thickness is taken as 1 directly,
+        // because the cloud sheet count and extinction are both driven by it, and a flash is only readable against a
+        // cloud layer that is thick enough and low enough.
         WeatherKind.Thunderstorm => new(0, 0, 1, 1),
-        // 雷雨：同样的满厚度雷云，同时落大雨。雨量取 1 与大雨一致，闪电、雷声和雨幕
-        // 都读同一个区域的同一条过渡曲线，切换时雨不会比电先到。
+        // Thunderstorm: the same full-thickness storm cloud, with heavy rain falling at the same time. Rain amount is
+        // taken as 1 to match heavy rain; the flash, the thunder and the rain curtain all read the same transition
+        // curve of the same region, so on a switch the rain never arrives before the lightning.
         WeatherKind.ThunderRain => new(1, 0, 1, 1),
         _ => default,
     };
 
     internal static string Text(WeatherKind kind) => kind switch
     {
-        WeatherKind.Cloudy => "多云", WeatherKind.Overcast => "阴",
-        WeatherKind.LightRain => "小雨", WeatherKind.Rain => "中雨", WeatherKind.HeavyRain => "大雨",
-        WeatherKind.LightSnow => "小雪", WeatherKind.HeavySnow => "大雪",
-        WeatherKind.Thunderstorm => "雷电", WeatherKind.ThunderRain => "雷雨", _ => "晴",
+        WeatherKind.Cloudy => "Cloudy", WeatherKind.Overcast => "Overcast",
+        WeatherKind.LightRain => "Light Rain", WeatherKind.Rain => "Moderate Rain", WeatherKind.HeavyRain => "Heavy Rain",
+        WeatherKind.LightSnow => "Light Snow", WeatherKind.HeavySnow => "Heavy Snow",
+        WeatherKind.Thunderstorm => "Thunder", WeatherKind.ThunderRain => "Thunderstorm", _ => "Clear",
     };
 }
 
 /// <summary>
-/// 第二阶段的近景雨雪。每个区域保留一对系统、独立风和种子；只注册这一层 compute 调度，
-/// 子系统仅初始化提交路由，由此处逐帧 Record，避免时间或派发重复。云、远景雨幕和碰撞不在此层实现。
+/// The second stage's near-field rain and snow. Each region keeps one pair of systems, its own wind and its own
+/// seed; only this compute pass is registered, and the subsystems merely initialise the submission routes, which
+/// are Recorded frame by frame from here to avoid duplicated time or dispatch. Clouds, the distant rain curtain
+/// and collision are not implemented in this layer.
 /// </summary>
 internal sealed class WeatherPrecipitationEffect(WeatherField field, bool reducedBudget = false) : ComputeEffect, IDisposable
 {
@@ -235,29 +245,29 @@ internal sealed class WeatherPrecipitationEffect(WeatherField field, bool reduce
             {
                 slot = new RegionParticles(reducedBudget);
                 _systems[i] = slot;
-                // 初始化失败时粒子自身清理资源；连带释放另一半，不能留下半对提交路由。
+                // On initialisation failure the particles clean up their own resources; release the other half too, so no half-pair of submission routes is left behind.
                 slot.Ready = slot.Rain.Initialize(g) && slot.Snow.Initialize(g);
                 if (!slot.Ready) slot.Dispose();
             }
-            // 移除/新增区域复用已分配槽，不在天气切换时反复编译 shader 或重新分配 GPU 缓冲。
+            // Removed/added regions reuse an already allocated slot, so a weather switch does not repeatedly compile shaders or reallocate GPU buffers.
             slot.Id = id;
             return slot;
         }
-        throw new InvalidOperationException("天气区域数量超过粒子槽位上限。");
+        throw new InvalidOperationException("The number of weather regions exceeds the particle slot limit.");
     }
 
     public override bool Initialize(IGraphics g)
     {
-        if (_graphics != null) throw new InvalidOperationException("雨雪效果已经初始化。");
+        if (_graphics != null) throw new InvalidOperationException("The rain/snow effect is already initialized.");
         if (!g.ComputeSupported || !g.IndirectDrawSupported) return false;
         _graphics = g;
-        // 遮挡区只压制降水，自己不派发粒子；为它分配两套满额系统纯属浪费显存与初始化时间。
+        // The shelter region only suppresses precipitation and dispatches no particles itself; allocating two full systems for it would waste VRAM and initialisation time.
         foreach (var region in field.Regions)
             if (!region.Settings.Shelter && !Acquire(region.Settings.Id, g).Ready) { Dispose(); return false; }
         return true;
     }
 
-    /// <summary>实际帧时间，不乘昼夜倍率；Record 消费一次，未更新时保持冻结。</summary>
+    /// <summary>The actual frame time, without the day/night multiplier; Record consumes it once and it stays frozen until the next update.</summary>
     internal void Advance(float seconds, float daylight)
     {
         _pendingDelta = MathF.Min(0.1f, _pendingDelta + (float.IsFinite(seconds) ? Math.Clamp(seconds, 0, 0.1f) : 0));
@@ -278,8 +288,9 @@ internal sealed class WeatherPrecipitationEffect(WeatherField field, bool reduce
             if (region.Settings.Shelter) continue;
             var system = Acquire(region.Settings.Id, g);
             if (!system.Ready) continue;
-            // 其他区域仍消耗覆盖权重，只把当前区域强度改为单位基。
-            // 强度交给 Density，避免再次乘 alpha 导致小雨变为强度平方；晴区遮罩也不会丢失。
+            // Other regions still consume coverage weight; only the current region's strength is set to the unit basis.
+            // The strength is handed to Density, to avoid multiplying alpha again and turning light rain into strength
+            // squared; the clear-region mask is not lost either.
             FillMask(system.RainMask, region.Settings.Id, new(1, 0, 0));
             FillMask(system.SnowMask, region.Settings.Id, new(0, 1, 0));
             ApplyRecipe(system.Rain, region.Settings, region.State.Rain, false, camera, validCamera);
@@ -289,7 +300,7 @@ internal sealed class WeatherPrecipitationEffect(WeatherField field, bool reduce
         {
             if (system is not { Ready: true }) continue;
             system.Rain.Advance(delta); system.Snow.Advance(delta);
-            // 停用系统也要 Record 以清除上一帧 ready 和待消费时间，但不会上传、派发或绘制。
+            // Disabled systems are still Recorded to clear the previous frame's ready flag and pending time, but they never upload, dispatch or draw.
             system.Rain.Record(g); system.Snow.Record(g);
         }
     }
@@ -309,7 +320,7 @@ internal sealed class WeatherPrecipitationEffect(WeatherField field, bool reduce
         if (!float.IsFinite(height)) return;
         effect.WorldOrigin = new(region.CenterX, (float)(region.Bottom + 0.3 * height), region.CenterZ);
         effect.BoxHeight = height;
-        // 世界垂直落差覆盖区域，XZ 只选相机附近周期窗口；登高不会带着整片粒子向上平移。
+        // The world's vertical drop covers the region; XZ only selects a periodic window near the camera, so climbing does not shift the whole particle field upwards.
         effect.WindVelocity = new(Math.Clamp(region.WindX, -40, 40), 0, Math.Clamp(region.WindZ, -40, 40));
         effect.Seed = region.Seed ^ (snow ? 0x005A17u : 0u);
         effect.Density = strength;
@@ -320,7 +331,7 @@ internal sealed class WeatherPrecipitationEffect(WeatherField field, bool reduce
         float illumination = 0.08f + 0.92f * MathF.Sqrt(_daylight);
         var color = (snow ? new Vector3(0.95f, 1, 1.05f) : new Vector3(0.55f, 0.65f, 0.78f)) * illumination;
         effect.Color = new(color, snow ? 0.65f + 0.15f * strength : 0.28f + 0.12f * strength);
-        // 保守球界只跳过完全远离近景窗口的区域，不能只采相机点，否则站在雨区外就看不到边缘。
+        // The conservative sphere bound only skips regions entirely far from the near-field window; sampling the camera point alone would make the edge invisible when standing outside the rain region.
         double dx = (double)camera.X - region.CenterX, dz = (double)camera.Z - region.CenterZ;
         double reach = Math.Max(region.RadiusX, region.RadiusZ) + effect.ViewDistance;
         effect.Enabled = Enabled && validCamera && strength > 0 && dx * dx + dz * dz <= reach * reach

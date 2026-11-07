@@ -38,6 +38,13 @@ public sealed class Camera3D
     float _orthoHeight = 10f;
     float _near = 0.1f;
     float _far = 100f;
+    // Calibrated so DoF is visible the moment the tier is switched on: at the sample's 65-degree FovY the
+    // 50 mm lens above has a ~64 mm virtual sensor, and the 10 m / 2.8 pair this used to carry produced a
+    // ~1.4 px circle of confusion at 400 m, which is indistinguishable from sharp. 6 m matches the Engine
+    // sample's over-the-shoulder distance (ShoulderBack), so the player stays in focus and the island softens.
+    float _focusDistance = 6f;
+    float _aperture = 1.4f;
+    float _focalLengthMM = 50f;
     float _aspect;
     bool _dirty = true;
 
@@ -99,6 +106,45 @@ public sealed class Camera3D
     {
         get => _far;
         set { if (_far != value) { _far = value; _dirty = true; } }
+    }
+
+    /// <summary>
+    /// F1 depth-of-field: the world-space distance the lens is focused at, in the same unit as <see cref="Near"/> and
+    /// <see cref="Far"/> (0.1/100 imply meters). Objects at exactly this distance are sharp; sharpness falls off
+    /// towards and beyond it at a rate set by <see cref="Aperture"/>. This is a per-camera lens quantity, so a second
+    /// view (minimap, rear mirror) carries its own and a rack focus is just a runtime write here.
+    ///
+    /// It deliberately does not mark the matrix dirty: focus is an optical parameter and does not touch View,
+    /// Projection or the frustum, so rebuilding them for it would be pure waste. The DoF effect re-reads it every
+    /// frame like motion blur re-reads its shutter, so there is nothing to invalidate.
+    /// </summary>
+    public float FocusDistance
+    {
+        get => _focusDistance;
+        set { if (_focusDistance != value) _focusDistance = value; }
+    }
+
+    /// <summary>
+    /// F1 depth-of-field: lens f-number (focal ratio), the conventional photographic aperture. Smaller values open the
+    /// iris and shorten the depth of field, larger values stop it down towards pinhole sharpness. Ignored by the
+    /// projection, which is why the setter does not dirty it. Defaults to 1.4.
+    /// </summary>
+    public float Aperture
+    {
+        get => _aperture;
+        set { if (_aperture != value) _aperture = value; }
+    }
+
+    /// <summary>
+    /// F1 depth-of-field: focal length in millimetres, the second half of the circle-of-confusion term. It is paired
+    /// with <see cref="FovY"/> rather than redundant with it - the sensor height is derived as
+    /// <c>2 * FocalLengthMM * tan(FovY / 2)</c>, so widening the field of view at a fixed focal length means a larger
+    /// virtual sensor, exactly as a real lens works. Defaults to 50.
+    /// </summary>
+    public float FocalLengthMM
+    {
+        get => _focalLengthMM;
+        set { if (_focalLengthMM != value) _focalLengthMM = value; }
     }
 
     /// <summary>Current aspect ratio, valid after UpdateIfChanged. Used by 1-5 CascadedShadow when rebuilding frustum slices.</summary>

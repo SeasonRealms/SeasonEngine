@@ -1342,6 +1342,7 @@ internal unsafe static class Device
         "SceneWater\0"u8.ToArray(),
         "SsrComposite\0"u8.ToArray(),
         "SceneWaterfall\0"u8.ToArray(),
+        "ShadowFar\0"u8.ToArray(),
     ];
 
     internal static void PushDebugGroup(byte[] utf8LabelZ)

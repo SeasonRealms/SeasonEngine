@@ -51,9 +51,9 @@ internal class SettingPanel : BoardPanel
     Input inputPage;
     int page, pageCount = 1;
 
-    Texts textsMode, textsMovement, textsPlayerSpeed, textsFov, textsDayNightSpeed, textsStartHour, textsStep, textsAntiAliasing, textsGi, textsShadows, textsAo, textsSea, textsWaveHeight, textsWaveSpeed, textsWindDirection, textsWindLevel, textsFog, textsFogPreset, textsFogDensity, textsFogQuality, textsFogHistory, textsFogInfo, textsShadowOffset, textsShadowSoftness, textsShadowContact, textsNormalVariance, textsSceneNormals, textsLog;
+    Texts textsMode, textsMovement, textsPlayerSpeed, textsFov, textsDayNightSpeed, textsStartHour, textsStep, textsAntiAliasing, textsGi, textsShadows, textsAo, textsDof, textsDofAperture, textsDofFocus, textsDofMaxBlur, textsColorGrade, textsColorGradeIntensity, textsSea, textsWaveHeight, textsWaveSpeed, textsWindDirection, textsWindLevel, textsFog, textsFogPreset, textsFogDensity, textsFogQuality, textsFogHistory, textsFogInfo, textsShadowOffset, textsShadowSoftness, textsShadowContact, textsNormalVariance, textsSceneNormals, textsLog;
 
-    Input inputMode, inputMovement, inputPlayerSpeed, inputFov, inputDayNightSpeed, inputStartHour, inputStep, inputAntiAliasing, inputGi, inputShadows, inputAo, inputSea, inputWaveHeight, inputWaveSpeed, inputWindDirection, inputWindLevel, inputFog, inputFogPreset, inputFogDensity, inputFogQuality, inputFogHistory, inputFogInfo, inputShadowOffset, inputShadowSoftness, inputShadowContact, inputNormalVariance, inputSceneNormals, inputLog;
+    Input inputMode, inputMovement, inputPlayerSpeed, inputFov, inputDayNightSpeed, inputStartHour, inputStep, inputAntiAliasing, inputGi, inputShadows, inputAo, inputDof, inputDofAperture, inputDofFocus, inputDofMaxBlur, inputColorGrade, inputColorGradeIntensity, inputSea, inputWaveHeight, inputWaveSpeed, inputWindDirection, inputWindLevel, inputFog, inputFogPreset, inputFogDensity, inputFogQuality, inputFogHistory, inputFogInfo, inputShadowOffset, inputShadowSoftness, inputShadowContact, inputNormalVariance, inputSceneNormals, inputLog;
 
     BaseControl current = null;
 
@@ -69,6 +69,13 @@ internal class SettingPanel : BoardPanel
     // authored choice and the effective one share one field.
     static Season.Rendering.AaMode _sessionAntiAliasing;
     static bool _sessionAntiAliasingSeeded;
+
+    // Same witness for the DoF row, for the same reason: DepthOfFieldEffect.Initialize refuses to register unless the tier
+    // is Gather at startup, so a later switch-on cannot be live in this process. Tracked separately from the live value
+    // because the row also has to say "off" honestly after a switch-off, which does take effect immediately (Record stops
+    // publishing and revokes its own name on the next frame).
+    static Season.Rendering.DofMode _sessionDepthOfField;
+    static bool _sessionDepthOfFieldSeeded;
 
     internal SettingPanel()
         : base()
@@ -655,9 +662,9 @@ internal class SettingPanel : BoardPanel
         };
         AddPanel(inputStartHour);
 
-        // 第一阶段为配置入口，百分比显示实际过渡进度；视觉配方在下一阶段接入。
-        textsIslandWeather = new Texts { Content = "岛上天气配置", Color = Season.Basic.Colors.Black };
-        textsOffshoreWeather = new Texts { Content = "东侧海域配置", Color = Season.Basic.Colors.Black };
+        // This first stage is the configuration entry point; the percentage shows the actual transition progress, and the visual recipe is hooked up in the next stage.
+        textsIslandWeather = new Texts { Content = "Island Weather", Color = Season.Basic.Colors.Black };
+        textsOffshoreWeather = new Texts { Content = "East Offshore Weather", Color = Season.Basic.Colors.Black };
         AddControl(textsIslandWeather);
         AddControl(textsOffshoreWeather);
         inputIslandWeather = new Input { WidthMin = WidthMin, Abbreviate = true,
@@ -666,7 +673,7 @@ internal class SettingPanel : BoardPanel
             OnAction = () => PickWeather(WeatherController.OffshoreId, inputOffshoreWeather) };
         AddPanel(inputIslandWeather);
         AddPanel(inputOffshoreWeather);
-        textsWeatherMode = new Texts { Content = "天气模式", Color = Season.Basic.Colors.Black };
+        textsWeatherMode = new Texts { Content = "Weather Mode", Color = Season.Basic.Colors.Black };
         AddControl(textsWeatherMode);
         inputWeatherMode = new Input { WidthMin = WidthMin, Abbreviate = true, OnAction = () =>
         {
@@ -937,6 +944,394 @@ internal class SettingPanel : BoardPanel
         };
         AddPanel(inputAo);
 
+        // F1. One row that is authored-for-next-launch and three that are live. DepthOfFieldEffect.Initialize refuses to
+        // register when the tier is Off, so switching it on later cannot take effect in this process and the box marks
+        // that with * exactly like Anti-alias; switching it off does stand the registered effect down on the next frame.
+        // The other three write values the effect re-reads every frame, so they are live on the next dispatch.
+        if (!_sessionDepthOfFieldSeeded)
+        {
+            _sessionDepthOfFieldSeeded = true;
+            _sessionDepthOfField = RenderQuality.Current.DepthOfField;
+        }
+
+        textsDof = new Texts()
+        {
+            Content = "Depth of field",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsDof);
+
+        // f-number rather than a 0..1 strength. The effect's formula is photographic (c = f^2 / (N (F - f)) * |z - F| / z),
+        // so an abstract dial would have to invent a mapping and then hide it; the four stops below are the ones that
+        // read differently in the island scene, and 1.4 is the sample's default. The row writes both the persisted seed
+        // (DofAperture, what the next launch starts from) and the live camera, because those are the only two owners.
+        textsDofAperture = new Texts()
+        {
+            Content = "DoF aperture",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsDofAperture);
+
+        // Focus is a lens quantity and stays per-camera: a rack focus is a plain write to Camera.FocusDistance, so this
+        // row only offers fixed distances. 6 m is the over-the-shoulder distance the sample sits at, which is why it is
+        // the default: the player stays on the focal plane while the island falls away.
+        textsDofFocus = new Texts()
+        {
+            Content = "DoF focus",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsDofFocus);
+
+        // The cap, not the look: the disc area is the gather cost, so this stays a safety valve. The two rows above
+        // shape the blur below it; this one only decides how far a defocused highlight may smear. Titles print the
+        // pixel width at 1080p because a fraction of screen height is not something anyone can picture.
+        textsDofMaxBlur = new Texts()
+        {
+            Content = "DoF max blur",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsDofMaxBlur);
+
+        // The two grading rows sit next to DoF because both answer "how does the finished picture look", not "how is
+        // the scene lit". They are two rows rather than one because the presets carry their own magnitude - Mono is a
+        // full desaturation while Warm film is a nudge - and strength is the separate dial that scales whichever one is
+        // loaded, which is also how a shot fades a look in without editing the table.
+        textsColorGrade = new Texts()
+        {
+            Content = "Color grade",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsColorGrade);
+
+        textsColorGradeIntensity = new Texts()
+        {
+            Content = "Grade strength",
+            Color = Season.Basic.Colors.Black,
+            Scale = Vector2.One * 1f
+        };
+        AddControl(textsColorGradeIntensity);
+
+        inputDof = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                var sources = new List<Season.Entities.EData>
+                {
+                    new Season.Entities.EData() { Key = nameof(Season.Rendering.DofMode.Off), Title = "Off (sharp everywhere)" },
+                    new Season.Entities.EData() { Key = nameof(Season.Rendering.DofMode.Gather), Title = "On (24-tap gather)" }
+                };
+
+                current = inputDof;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null && Enum.TryParse<Season.Rendering.DofMode>(picked.Key, out var mode))
+                        {
+                            RenderQuality.Current.DepthOfField = mode;
+
+                            // Persisted here because the tier is read once, when the effect registers; without the save the
+                            // choice would be lost before the launch it applies to. The log states all three facts explicitly
+                            // because the value box has room for a marker, not for "restart to apply": the tier that was in
+                            // force at startup, whether a kernel actually exists, and therefore what the next frame does.
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+
+                            App.Instance.AddLog(LogType.Backend,
+                                $"{DateTime.UtcNow} [Setting] DepthOfField={mode} saved, tier at startup={_sessionDepthOfField}" +
+                                $", kernel={(Season.Rendering.Effects.DepthOfFieldEffect.Ready ? "registered" : "none")}" +
+                                (mode == _sessionDepthOfField ? "" : " (restart to apply)"));
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputDof);
+
+        inputDofAperture = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                // Stops, low number = wider iris = shallower depth of field. Keys are the f-numbers as written so the
+                // live and persisted values round-trip without a second table.
+                var sources = new List<Season.Entities.EData>
+                {
+                    new Season.Entities.EData() { Key = "2.8", Title = "f/2.8 (gentle)" },
+                    new Season.Entities.EData() { Key = "2", Title = "f/2 (soft)" },
+                    new Season.Entities.EData() { Key = "1.4", Title = "f/1.4 (default)" },
+                    new Season.Entities.EData() { Key = "1", Title = "f/1 (strong)" },
+                    new Season.Entities.EData() { Key = "0.7", Title = "f/0.7 (extreme)" }
+                };
+
+                current = inputDofAperture;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null && float.TryParse(picked.Key,
+                                System.Globalization.NumberStyles.Float,
+                                System.Globalization.CultureInfo.InvariantCulture, out var aperture))
+                        {
+                            // Two owners on purpose - see RenderQuality.DofAperture: the persisted seed is what the next
+                            // launch starts from, the camera is what this frame's dispatch reads.
+                            RenderQuality.Current.DofAperture = aperture;
+                            App.Instance.Camera.Aperture = aperture;
+
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+
+                            App.Instance.AddLog(LogType.Backend,
+                                $"{DateTime.UtcNow} [Setting] DofAperture=f/{aperture}");
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputDofAperture);
+
+        inputDofFocus = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                var sources = new List<Season.Entities.EData>
+                {
+                    new Season.Entities.EData() { Key = "2", Title = "2 m (close)" },
+                    new Season.Entities.EData() { Key = "4", Title = "4 m" },
+                    new Season.Entities.EData() { Key = "6", Title = "6 m (default)" },
+                    new Season.Entities.EData() { Key = "10", Title = "10 m" },
+                    new Season.Entities.EData() { Key = "20", Title = "20 m (far)" }
+                };
+
+                current = inputDofFocus;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null && float.TryParse(picked.Key,
+                                System.Globalization.NumberStyles.Float,
+                                System.Globalization.CultureInfo.InvariantCulture, out var focus))
+                        {
+                            RenderQuality.Current.DofFocusDistance = focus;
+                            App.Instance.Camera.FocusDistance = focus;
+
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+
+                            App.Instance.AddLog(LogType.Backend,
+                                $"{DateTime.UtcNow} [Setting] DofFocusDistance={focus}m");
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputDofFocus);
+
+        inputDofMaxBlur = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                // Titles carry the 1080p pixel width next to the fraction the file stores, because the fraction is an
+                // implementation detail and the pixel width is what the eye sees. 3% is the largest stop offered: past it
+                // the fixed 24-tap spiral leaves gaps wider than the kernel and the bokeh rings.
+                var sources = new List<Season.Entities.EData>
+                {
+                    new Season.Entities.EData() { Key = "0.01", Title = "1% (~11 px)" },
+                    new Season.Entities.EData() { Key = "0.02", Title = "2% (~22 px, default)" },
+                    new Season.Entities.EData() { Key = "0.03", Title = "3% (~32 px)" }
+                };
+
+                current = inputDofMaxBlur;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null && float.TryParse(picked.Key,
+                                System.Globalization.NumberStyles.Float,
+                                System.Globalization.CultureInfo.InvariantCulture, out var radius))
+                        {
+                            RenderQuality.Current.DofMaxCoCRadius = radius;
+
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+
+                            App.Instance.AddLog(LogType.Backend,
+                                $"{DateTime.UtcNow} [Setting] DofMaxCoCRadius={radius}");
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputDofMaxBlur);
+
+        inputColorGrade = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                // Neutral is a stop, not a hidden state: it runs the whole grading path with every coefficient at its
+                // identity value, so it is the row that proves the path itself is lossless when compared against Off.
+                // Off is the true bypass - it skips the block in every backend's tonemap.
+                var sources = new List<Season.Entities.EData>
+                {
+                    new Season.Entities.EData() { Key = nameof(Season.Rendering.ColorGradingPreset.Off), Title = "Off (untouched)" },
+                    new Season.Entities.EData() { Key = nameof(Season.Rendering.ColorGradingPreset.Neutral), Title = "Neutral (identity control)" },
+                    new Season.Entities.EData() { Key = nameof(Season.Rendering.ColorGradingPreset.WarmFilm), Title = "Warm film" },
+                    new Season.Entities.EData() { Key = nameof(Season.Rendering.ColorGradingPreset.CoolTeal), Title = "Cool teal" },
+                    new Season.Entities.EData() { Key = nameof(Season.Rendering.ColorGradingPreset.Mono), Title = "Mono" }
+                };
+
+                current = inputColorGrade;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null && Enum.TryParse<Season.Rendering.ColorGradingPreset>(picked.Key, out var preset))
+                        {
+                            // Live on the next frame in every backend: the coefficients ride the constant block each
+                            // one already uploads with the tonemap pass, so nothing is rebuilt and no restart marker
+                            // applies - which is why this row has no * convention unlike its neighbours above.
+                            RenderQuality.Current.ColorGrade = preset;
+
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+
+                            App.Instance.AddLog(LogType.Backend,
+                                $"{DateTime.UtcNow} [Setting] ColorGrade={preset}" +
+                                $", intensity={RenderQuality.Current.ColorGradeIntensity}");
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputColorGrade);
+
+        inputColorGradeIntensity = new Input()
+        {
+            WidthMin = WidthMin,
+            Abbreviate = true,
+            OnAction = async () =>
+            {
+                // Percent in the titles, invariant decimals in the keys: the box beside this row prints percent, and a
+                // 0..1 float in a value box reads as a version number. 0 is the same early-out as Off inside every
+                // backend's GradeLdr, so this row doubles as a fade without disturbing the loaded preset.
+                var sources = new List<Season.Entities.EData>
+                {
+                    new Season.Entities.EData() { Key = "0", Title = "0% (bypass)" },
+                    new Season.Entities.EData() { Key = "0.25", Title = "25%" },
+                    new Season.Entities.EData() { Key = "0.5", Title = "50%" },
+                    new Season.Entities.EData() { Key = "0.75", Title = "75%" },
+                    new Season.Entities.EData() { Key = "1", Title = "100% (full)" }
+                };
+
+                current = inputColorGradeIntensity;
+
+                var result = new List<Season.Entities.EData> { };
+
+                simplePicker = new Season.Panels.SimplePicker(sources, result)
+                {
+                    OnSelect = () =>
+                    {
+                        var picked = simplePicker.Results?.Count > 0 ? simplePicker.Results[0] : null;
+
+                        if (picked != null && float.TryParse(picked.Key,
+                                System.Globalization.NumberStyles.Float,
+                                System.Globalization.CultureInfo.InvariantCulture, out var strength))
+                        {
+                            RenderQuality.Current.ColorGradeIntensity = strength;
+
+                            DeviceServices.BaseApp?.RequestSaveSettings();
+
+                            App.Instance.AddLog(LogType.Backend,
+                                $"{DateTime.UtcNow} [Setting] ColorGradeIntensity={strength}");
+                        }
+
+                        simplePicker.OnClose?.Invoke();
+                    },
+                    OnClose = () =>
+                    {
+                        RemovePanel(simplePicker);
+                        simplePicker = null;
+                    }
+                };
+                AddPanel(simplePicker);
+            }
+        };
+        AddPanel(inputColorGradeIntensity);
+
         inputSea = new Input()
         {
             WidthMin = WidthMin,
@@ -1099,15 +1494,18 @@ internal class SettingPanel : BoardPanel
         };
         AddPanel(inputWaveSpeed);
 
-        // 风向与风量：一对配套的世界参数，所以和波纹一样紧挨着放在海面那组之后 —— 都是"这个世界此刻怎么动"的数值，
-        // 而不是"用哪一档渲染"。风本身由 Wind 统一换算成 m/s 的向量，面板只写这两个数。
+        // Wind direction and wind level: a matched pair of world parameters, so like the wave speed they sit right after
+        // the sea group - both are "how this world moves right now" values, not "which render tier to use". Wind itself is
+        // converted uniformly into an m/s vector by Wind, and the panel only writes these two numbers.
         //
-        // 风向是自由输入的 0~360，而不是像波纹那样的预设列表：角度没有"看得过的几个值"，任何一度都可能是想要的方向，
-        // 用弹窗输入才不至于把 0~360 砍成 8 个方位。输入框里的显示带 °，但回填给键盘的是裸数字，否则原样确认会因为
-        // 那个符号解析失败。超范围与负数由 WorldSettings.WindDirection 自己绕回 0~360。
+        // Wind direction is a free 0~360 input rather than a preset list like the wave speed: an angle has no "few values
+        // worth looking at", and any degree may be the desired direction, so a keyboard dialog avoids cutting 0~360 into 8
+        // compass points. The field displays a ° suffix, but what is fed back to the keyboard is the bare number, otherwise
+        // confirming as-is would fail to parse that symbol. Out-of-range and negative values are wrapped back to 0~360 by
+        // WorldSettings.WindDirection itself.
         textsWindDirection = new Texts()
         {
-            Content = "风向",
+            Content = "Wind Direction",
             Color = Season.Basic.Colors.Black,
             Scale = Vector2.One * 1f
         };
@@ -1119,15 +1517,15 @@ internal class SettingPanel : BoardPanel
             Abbreviate = true,
             OnAction = async () =>
             {
-                // 回填的是格式化后的裸数字，而不是 inputWindDirection.Text：那个带 ° 后缀，原样确认会解析失败。
+                // The seed is the formatted bare number, not inputWindDirection.Text: that one carries the ° suffix and confirming as-is would fail to parse.
                 string seed = Wind.DirectionDegrees.ToString("0", System.Globalization.CultureInfo.InvariantCulture);
 
-                var result = await DeviceServices.Dialog.ShowKeyboard("风向".Translate(), "", new string[] { "OK".Translate(), "Cancel".Translate() }, seed);
+                var result = await DeviceServices.Dialog.ShowKeyboard("Wind Direction".Translate(), "", new string[] { "OK".Translate(), "Cancel".Translate() }, seed);
 
                 if (result is not null && float.TryParse(result, System.Globalization.NumberStyles.Float,
                     System.Globalization.CultureInfo.InvariantCulture, out float degrees))
                 {
-                    // 只写设置，不写粒子：火堆每帧自己读 Wind.Velocity，所以改完立刻生效，也不需要通知谁。
+                    // Only the setting is written, not the particles: the campfire reads Wind.Velocity itself every frame, so the change takes effect immediately and no one needs to be notified.
                     WorldSettings.Current.WindDirection = degrees;
 
                     DeviceServices.BaseApp?.RequestSaveSettings();
@@ -1136,11 +1534,12 @@ internal class SettingPanel : BoardPanel
         };
         AddPanel(inputWindDirection);
 
-        // 风量是 0~10 的整数档，用预设列表而不是键盘：档位有界且只有十一项，列表比输入法可靠。0 明确写成"无风"，
-        // 因为 0 在这里不是"最小"而是一个特殊状态 —— 烟雾会笔直上升，而不是被吹得很慢。
+        // Wind level is an integer tier from 0~10, using a preset list rather than the keyboard: the tiers are bounded and
+        // there are only eleven, so a list is more reliable than the IME. 0 is written explicitly as "Calm" because 0 here is
+        // not "the minimum" but a special state - the smoke rises straight up instead of being blown slowly.
         textsWindLevel = new Texts()
         {
-            Content = "风量",
+            Content = "Wind Level",
             Color = Season.Basic.Colors.Black,
             Scale = Vector2.One * 1f
         };
@@ -1156,14 +1555,14 @@ internal class SettingPanel : BoardPanel
 
                 for (int level = 0; level <= Wind.MaxLevel; level++)
                 {
-                    string suffix = level == 0 ? "（无风）"
-                        : level == WorldSettings.DefaultWindLevel ? "（默认）"
+                    string suffix = level == 0 ? " (Calm)"
+                        : level == WorldSettings.DefaultWindLevel ? " (Default)"
                         : "";
 
                     sources.Add(new Season.Entities.EData()
                     {
                         Key = level.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                        Title = level + " 级 · " + Wind.SpeedOfLevel(level).ToString("0.##",
+                        Title = "Level " + level + " · " + Wind.SpeedOfLevel(level).ToString("0.##",
                             System.Globalization.CultureInfo.InvariantCulture) + " m/s" + suffix
                     });
                 }
@@ -1771,9 +2170,10 @@ internal class SettingPanel : BoardPanel
         var paddingH = 100;
         var width0 = 180; var inputLeft = 350; var height0 = 70;
 
-        // 同时限制列宽和行高，避免新增天气行后越出面板。短窗口压缩行距，放不下时分页。
-        // 非当前页的输入停用且透明，防止看不见的旧位置仍参与命中。
-        const int rowCount = 31;
+        // Column width and row height are both constrained so that added weather rows do not overflow the panel. A short
+        // window compresses the row pitch and paginates when nothing fits.
+        // Inputs not on the current page are disabled and transparent, so invisible old positions do not still take hits.
+        const int rowCount = 37;
         var rowTop = (int)(title.PosY + padding + paddingH);
         var rowWidth = inputLeft + width0 + 100;
         var panelWidth = (int)(width ?? App.Instance.ExtendResolution.X - 200);
@@ -1792,7 +2192,7 @@ internal class SettingPanel : BoardPanel
         pageCount = (rowCount + rowsPerPage - 1) / rowsPerPage;
         page = Math.Min(page, pageCount - 1);
         inputPage.Enable = pageCount > 1;
-        inputPage.Text = $"{page + 1}/{pageCount} 下一页";
+        inputPage.Text = $"{page + 1}/{pageCount} Next Page";
         inputPage.Color = inputPage.MouseOver ? Season.Basic.Colors.Red : Season.Basic.Colors.Black;
         result |= inputPage.Update(time, alpha: pageCount > 1 ? Alpha : 0,
             posX: PosX + panelWidth - padding - 220, posY: title.PosY, width: 220, height: 50);
@@ -1841,9 +2241,9 @@ internal class SettingPanel : BoardPanel
         // happened to be - so the field would quietly rewrite itself just by being opened.
         Place(textsStartHour, inputStartHour, Season.Rendering.WorldSettings.Current.StartHour.ToString("0.##",
             System.Globalization.CultureInfo.InvariantCulture));
-        Place(textsWeatherMode, inputWeatherMode, WorldSettings.Current.WeatherMode == WeatherMode.Showcase ? "自动天空展示" : "区域天气");
-        Place(textsIslandWeather, inputIslandWeather, App.Instance.weather?.Status(WeatherController.IslandId) ?? "晴");
-        Place(textsOffshoreWeather, inputOffshoreWeather, App.Instance.weather?.Status(WeatherController.OffshoreId) ?? "晴");
+        Place(textsWeatherMode, inputWeatherMode, WorldSettings.Current.WeatherMode == WeatherMode.Showcase ? "Auto Sky Showcase" : "Regional Weather");
+        Place(textsIslandWeather, inputIslandWeather, App.Instance.weather?.Status(WeatherController.IslandId) ?? "Clear");
+        Place(textsOffshoreWeather, inputOffshoreWeather, App.Instance.weather?.Status(WeatherController.OffshoreId) ?? "Clear");
         Place(textsStep, inputStep, App.Instance.step.ToString());
 
         // The trailing * on the four rows below means "this is what will be used, but not what is running". Each of them
@@ -1863,6 +2263,31 @@ internal class SettingPanel : BoardPanel
             && RenderQuality.Current.AoIntensity > 0f
             ? Season.Rendering.FrameSchedule.AoTexture != null ? "On" : "On *"
             : "Off");
+
+        // F1. The * has the same meaning as the rows above, and the witness is now the effect's own registration flag: the
+        // tier is what the file asks for and survives a restart, so a switch-on after a launch that registered nothing is
+        // remembered, not running - while switching it off is immediate (Record stops dispatching and revokes its own
+        // publication) and the tier branch below already says "Off" for it.
+        Place(textsDof, inputDof, RenderQuality.Current.DepthOfField != Season.Rendering.DofMode.Gather
+            ? "Off"
+            : Season.Rendering.Effects.DepthOfFieldEffect.Ready ? "On" : "On *");
+        // Read off the camera, not off the seed: the file's value is only what the next launch starts from, and a scene
+        // may point the lens itself. Same reason the two rows below print the live values.
+        Place(textsDofAperture, inputDofAperture, "f/" + App.Instance.Camera.Aperture.ToString("0.0#",
+            System.Globalization.CultureInfo.InvariantCulture));
+        Place(textsDofFocus, inputDofFocus, App.Instance.Camera.FocusDistance.ToString("0.##",
+            System.Globalization.CultureInfo.InvariantCulture) + " m");
+        Place(textsDofMaxBlur, inputDofMaxBlur,
+            (RenderQuality.Current.DofMaxCoCRadius * 100f).ToString("0.#",
+                System.Globalization.CultureInfo.InvariantCulture) + "%");
+
+        // No * marker on these two: unlike the tiers above, nothing is resolved at startup that could disagree with the
+        // file. The values are read off RenderQuality every time the constants are uploaded, so a pick is in force on
+        // the next frame in all four backends.
+        Place(textsColorGrade, inputColorGrade, GradeText(RenderQuality.Current.ColorGrade));
+        Place(textsColorGradeIntensity, inputColorGradeIntensity,
+            (RenderQuality.Current.ColorGradeIntensity * 100f).ToString("0",
+                System.Globalization.CultureInfo.InvariantCulture) + "%");
 
         // The fog block follows the AO row because the two are read together: the volumetric composite is the only
         // consumer of AO that is not the final blit, so whether fog is on decides where the occlusion lands. The * here
@@ -1897,12 +2322,14 @@ internal class SettingPanel : BoardPanel
         Place(textsWaveSpeed, inputWaveSpeed, Season.Rendering.WorldSettings.Current.SeaWaveSpeed.ToString("0.##",
             System.Globalization.CultureInfo.InvariantCulture) + " m/s");
 
-        // 风向打印成整数度：Wind 内部是 0~360 的浮点，但一列像素宽的框里带小数只会挤，而 1° 在这个尺度上已经是
-        // 看不出来的差别。风量同时给出级和它对应的 m/s，因为两者是同一个风向量的两个说法 —— 级是面板的语言，
-        // m/s 是 Wind 真正交给烟雾的语言，写在一起就不必去翻代码对账。
+        // Wind direction is printed as whole degrees: Wind is a 0~360 float internally, but decimals only crowd a field a
+        // few pixels wide, and 1° is already an imperceptible difference at this scale. The wind level shows both the tier
+        // and its corresponding m/s, because the two are two ways of saying the same wind magnitude - the tier is the panel's
+        // language, m/s is the language Wind actually hands to the smoke, and writing them together avoids checking the code
+        // to reconcile them.
         Place(textsWindDirection, inputWindDirection, Wind.DirectionDegrees.ToString("0",
             System.Globalization.CultureInfo.InvariantCulture) + "°");
-        Place(textsWindLevel, inputWindLevel, Wind.Level + " 级 · " + Wind.Speed.ToString("0.##",
+        Place(textsWindLevel, inputWindLevel, "Level " + Wind.Level + " · " + Wind.Speed.ToString("0.##",
             System.Globalization.CultureInfo.InvariantCulture) + " m/s");
 
         Place(textsShadowOffset, inputShadowOffset, RenderQuality.Current.ShadowNormalOffset.ToString("0.##",
@@ -1962,5 +2389,16 @@ internal class SettingPanel : BoardPanel
         FogPreset.SunShafts => "Sun shafts",
         FogPreset.NightLamps => "Night lamps",
         _ => "Morning mist",
+    };
+
+    // Same split again for the grading preset. The enum name would fit in the box, but "WarmFilm" reads as an
+    // identifier; the box should read like a look name.
+    static string GradeText(Season.Rendering.ColorGradingPreset preset) => preset switch
+    {
+        Season.Rendering.ColorGradingPreset.Neutral => "Neutral",
+        Season.Rendering.ColorGradingPreset.WarmFilm => "Warm film",
+        Season.Rendering.ColorGradingPreset.CoolTeal => "Cool teal",
+        Season.Rendering.ColorGradingPreset.Mono => "Mono",
+        _ => "Off",
     };
 }

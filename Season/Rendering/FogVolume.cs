@@ -17,6 +17,7 @@ public sealed class FogVolume
     Vector3 _position, _size = Vector3.One, _albedo = new(0.9f), _selfIllumination;
     Quaternion _rotation = Quaternion.Identity;
     float _extinction = 0.02f, _edgeFeather = 0.2f, _noiseAmount, _noiseScale = 0.1f;
+    float? _anisotropy;
     FogVolumeShape _shape;
     FogVolumeMode _mode;
 
@@ -93,6 +94,26 @@ public sealed class FogVolume
     public float EdgeFeather { get => _edgeFeather; set => _edgeFeather = Math.Clamp(FogMath.Finite(value), 0f, 1f); }
     public float NoiseAmount { get => _noiseAmount; set => _noiseAmount = Math.Clamp(FogMath.Finite(value), 0f, 1f); }
     public float NoiseScale { get => _noiseScale; set => _noiseScale = Math.Max(0.0001f, FogMath.Finite(value)); }
+
+    /// <summary>
+    /// Per-volume scattering anisotropy; null follows <see cref="SceneFog.Anisotropy"/>.
+    ///
+    /// The global medium is one medium with one directionality, but a mist patch lying in a valley and the spray plume
+    /// at the foot of a waterfall have no reason to scatter alike: the first is fine droplets, the second is coarse spray
+    /// that sends a visible share of the light back toward the viewer. Authoring it here lets the same phase recipe read
+    /// differently across one scene instead of putting the same halo on every patch.
+    /// </summary>
+    public float? Anisotropy
+    {
+        get => _anisotropy;
+        set => _anisotropy = value is float g ? Math.Clamp(FogMath.Finite(g), -0.9f, 0.9f) : null;
+    }
+
+    /// <summary>
+    /// The anisotropy the injection kernel should use for this volume: its own when authored, the scene's otherwise.
+    /// Kept here rather than at the packing site so the CPU reference and the frame builder cannot drift apart.
+    /// </summary>
+    internal float EffectiveAnisotropy(float fallback) => _anisotropy ?? fallback;
 
     /// <summary>CPU reference soft mask, using the same normalized shape definition as the injection shader.</summary>
     public float WeightAt(Vector3 worldPosition)

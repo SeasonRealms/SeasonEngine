@@ -117,7 +117,7 @@ internal class Flagpole : Panel
     const int ClothGridColumns = ClothColumns + 1;          // 25 particles hoist to fly
     const int ClothGridRows = ClothRows + 1;                // 17 particles top to bottom
 
-    // -- Wind response, tuned against .dbg/_cloth_check/cloth_ref.py (calm droop 76°, 3级 44°, 10级 8°). --
+    // -- Wind response, tuned against .dbg/_cloth_check/cloth_ref.py (calm droop 76°, level 3 44°, level 10 8°). --
     const float SwivelTimeConstant = 2f;    // seconds for the swivel to follow a change of wind bearing
     const float FlutterBaseHz = 0.6f;       // flutter frequency at a breath of wind ...
     const float FlutterHzPerSpeed = 0.12f;  // ... rising a little with every m/s

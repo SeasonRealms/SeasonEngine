@@ -758,7 +758,7 @@ window.seasonWebGPU = (() => {
 
     // ── P2: per-view uniform buffer (binding 22) ──
     // One 256-byte slot per view / shadow quadrant. Slot map mirrors WebGPUViewUniformLayout on the C# side:
-    // 0..7 = render views, 8..11 = shadow quadrants (3 cascades + spotlight), 13 = screen space (2D sprite / text).
+    // 0..7 = render views, 8..11 = shadow quadrants (3 cascades + spotlight), 12 = fog far map, 13 = screen space (2D sprite / text).
     // The slot is pinned into the bind group through a fixed buffer offset instead of a dynamic offset, so a
     // collected scene draw replays with the view it was recorded with and setBindGroup(0, group) stays a two-argument
     // call at every site.
@@ -2254,10 +2254,35 @@ window.seasonWebGPU = (() => {
     // Uses its own buffer for the same reason as _postParamsBuffer:
     // to avoid parameter overwrites with other FinalBlit variants.
     let _outlineCompositeParamsBuffer = null;
-    const _BLIT_EXPOSURE_SCRATCH = new Float32Array(4);
-    const _POST_PARAMS_SCRATCH = new Float32Array(4);
+    // G1: the three buffers that back binding 2 hold 48 bytes because the shader declares tonemapParams as
+    // array<vec4f,3>: element 0 is the original parameter vec4, elements 1 and 2 are the colour-grading block.
+    // WebGPU validates a bind group against the declared size even for entry points that never read the tail, so the
+    // outline composite buffer has to grow as well. The AO buffer stays 16 bytes; it is bound at binding 6.
+    const _BLIT_EXPOSURE_SCRATCH = new Float32Array(12);
+    const _POST_PARAMS_SCRATCH = new Float32Array(12);
     const _AO_PARAMS_SCRATCH = new Float32Array(4);
-    const _OUTLINE_COMPOSITE_PARAMS_SCRATCH = new Float32Array(4);
+    const _OUTLINE_COMPOSITE_PARAMS_SCRATCH = new Float32Array(12);
+
+    // G1: grading coefficients handed over once per frame by the C# setColorGrade import. _uploadParams copies them
+    // into elements 1 and 2 right before each upload, so every path that writes binding 2 carries the same grade
+    // without any of the call sites having to know about it.
+    const _colorGradeScratch = new Float32Array(8);
+
+    function setColorGrade(intensity, contrast, saturation, temperature, tint, lift, gamma, gain) {
+        _colorGradeScratch[0] = intensity;
+        _colorGradeScratch[1] = contrast;
+        _colorGradeScratch[2] = saturation;
+        _colorGradeScratch[3] = temperature;
+        _colorGradeScratch[4] = tint;
+        _colorGradeScratch[5] = lift;
+        _colorGradeScratch[6] = gamma;
+        _colorGradeScratch[7] = gain;
+    }
+
+    function _uploadParams(target, scratch) {
+        scratch.set(_colorGradeScratch, 4);
+        _device.queue.writeBuffer(target, 0, scratch);
+    }
 
     function _ensureBlitPipeline() {
         if (_blitPipeline) return;
@@ -2425,10 +2450,10 @@ window.seasonWebGPU = (() => {
         });
         _blitSampler = _device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
         _blitPointSampler = _device.createSampler({ magFilter: 'nearest', minFilter: 'nearest' });
-        _blitExposureBuffer = _device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        _postParamsBuffer = _device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        _blitExposureBuffer = _device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        _postParamsBuffer = _device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         _aoParamsBuffer = _device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        _outlineCompositeParamsBuffer = _device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        _outlineCompositeParamsBuffer = _device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     }
 
     // 2-1 variant bind-group cache:
@@ -2490,7 +2515,7 @@ window.seasonWebGPU = (() => {
         _OUTLINE_COMPOSITE_PARAMS_SCRATCH[1] = 1 / Math.max(mrt.height, 1);
         _OUTLINE_COMPOSITE_PARAMS_SCRATCH[2] = outlineWidth > 0 ? outlineWidth : 1;
         _OUTLINE_COMPOSITE_PARAMS_SCRATCH[3] = 0;
-        _device.queue.writeBuffer(_outlineCompositeParamsBuffer, 0, _OUTLINE_COMPOSITE_PARAMS_SCRATCH);
+        _uploadParams(_outlineCompositeParamsBuffer, _OUTLINE_COMPOSITE_PARAMS_SCRATCH);
         // Variant bind-group caching follows the same pattern as the other blit variants
         // and is invalidated by mask RT view identity changes.
         // Auto layout contains only {2,4,7},
@@ -2516,7 +2541,7 @@ window.seasonWebGPU = (() => {
             const rcas = resolve === 2;
             _BLIT_EXPOSURE_SCRATCH[0] = rcas ? sharpness : 0; _BLIT_EXPOSURE_SCRATCH[1] = 0;
             _BLIT_EXPOSURE_SCRATCH[2] = 1 / rt.width; _BLIT_EXPOSURE_SCRATCH[3] = 1 / rt.height;
-            _device.queue.writeBuffer(_blitExposureBuffer, 0, _BLIT_EXPOSURE_SCRATCH);
+            _uploadParams(_blitExposureBuffer, _BLIT_EXPOSURE_SCRATCH);
             // The two auto layouts differ: fs_rcas never references the linear sampler at binding 1,
             // so including it would fail bind-group validation. Separate cache keys keep the entry lists apart.
             const pipeline = rcas ? _blitPipelineRcas : _blitPipelineFxaa;
@@ -2572,7 +2597,7 @@ window.seasonWebGPU = (() => {
             _BLIT_EXPOSURE_SCRATCH[0] = exposure;
             _BLIT_EXPOSURE_SCRATCH[1] = bloomIntensity;
             _BLIT_EXPOSURE_SCRATCH[2] = 0; _BLIT_EXPOSURE_SCRATCH[3] = 0;
-            _device.queue.writeBuffer(_blitExposureBuffer, 0, _BLIT_EXPOSURE_SCRATCH);
+            _uploadParams(_blitExposureBuffer, _BLIT_EXPOSURE_SCRATCH);
         }
         // 2-1: switch to tonemap+bloom variants when the bloom texture is ready
         // on the direct path, i.e. when no resolve was requested.
@@ -2665,7 +2690,7 @@ window.seasonWebGPU = (() => {
         _POST_PARAMS_SCRATCH[0] = exposure;
         _POST_PARAMS_SCRATCH[1] = bloomIntensity;
         _POST_PARAMS_SCRATCH[2] = 0; _POST_PARAMS_SCRATCH[3] = 0;
-        _device.queue.writeBuffer(_postParamsBuffer, 0, _POST_PARAMS_SCRATCH);
+        _uploadParams(_postParamsBuffer, _POST_PARAMS_SCRATCH);
         const ovView = sceneOverrideName ? (_textureViews[sceneOverrideName] || null) : null;
         const srcView = ovView || rt.colorView;
         const ovKey = ovView ? '|' + sceneOverrideName : '';
@@ -2751,7 +2776,9 @@ window.seasonWebGPU = (() => {
     // Offscreen targets are introduced in Step 2.
     // passId order matches the C# RenderPassId enum,
     // and the debug group is attached at the encoder level to wrap the whole pass (Step 0).
-    const _passLabels = ['Shadow', 'Scene', 'Post', 'OutlineMask', 'FinalBlit', 'Overlay', 'SceneOpaque', 'FogComposite', 'SceneTransparent', 'WeatherComposite', 'SceneDecal', 'SceneWater', 'SsrComposite', 'SceneWaterfall'];
+    // ShadowLocal is the fog's local point-light cube atlas. It is a label only: routing goes through the same
+    // depth-only state as Shadow and ShadowFar, so nothing else here has to know it exists.
+    const _passLabels = ['Shadow', 'Scene', 'Post', 'OutlineMask', 'FinalBlit', 'Overlay', 'SceneOpaque', 'FogComposite', 'SceneTransparent', 'WeatherComposite', 'SceneDecal', 'SceneWater', 'SsrComposite', 'SceneWaterfall', 'ShadowFar', 'ShadowLocal'];
 
     function beginPass(passId, targetName, clearColorEnable, clearR, clearG, clearB, clearA, clearDepthEnable, storeDepth, depthTargetName, velocityTargetName, normalTargetName) {
         if (!_frameStarted || !_commandEncoder) return;
@@ -4256,7 +4283,7 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
 
     // 独立雾合成：生产 WGSL 由 C# 提供；异步编译完成前 Prepare 明确回退。
     const _fogComposites = Object.create(null);
-    const _fogFrameBytes = 448 * 16;
+    const _fogFrameBytes = 456 * 16;
     // 前导 8 行（逆抖动 VP + 相机位置）+ SceneLightParams 全部 154 行（2464B）。
     // 与 C# WeatherCurtainEffect.FrameVectorCount 和 SceneLightParams 大小严格同步；
     // 小于它时 Prepare 会直接回退，天气合成静默失效。
@@ -6157,6 +6184,7 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         synchronizeRenderTargetSizes,
         blitToBackbuffer,
         renderPost,
+        setColorGrade,
         drawSprite2D,
         drawTextAtlasSprite,
         updateTextInstance,

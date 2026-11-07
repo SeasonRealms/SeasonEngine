@@ -62,6 +62,10 @@ public static class WindowsApp
 
     public static void Run(BaseApp app)
     {
+        // Contract 3-2: the first line of engine code after the XAML shell. Everything before it is reported as the
+        // process-start bridge; everything after it is a real interval.
+        StartupProfiler.Mark("window-run");
+
         ArgumentNullException.ThrowIfNull(app);
         if (Window != null) throw new InvalidOperationException("WindowsApp supports one application per process.");
         _closing = false;
@@ -206,6 +210,8 @@ public static class WindowsApp
         ApplyWindowState(app, "Startup");
 
         Window.Activate();
+
+        StartupProfiler.Mark("window-activated");
 
         dispatcherQueue?.TryEnqueue(() =>
         {
@@ -642,6 +648,10 @@ public static class WindowsApp
 
     static async void CreateInstance(SwapChainPanel swapChainPanel)
     {
+        // Contract 3-2: the swap chain panel reached its first non-zero size, so initialization starts now. The gap from
+        // window-activated to here is the XAML layout pass, and it is the part of the white screen no engine scope covers.
+        StartupProfiler.Mark("engine-init-begin");
+
         try { await InitializeAndRun(swapChainPanel); }
         catch (Exception error)
         {
@@ -752,6 +762,10 @@ public static class WindowsApp
         }
 
         DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [Init] Device.Init begin");
+
+        // Contract 3-2: every stage below is a wall-clock interval on the thread that runs initialization, and the
+        // scopes also give the report its nesting - the shader/pso rows land inside the stage that caused them.
+        var deviceInit = StartupProfiler.Scope("Device.Init");
         try
         {
             DirectX.Device.Init(true);
@@ -760,6 +774,10 @@ public static class WindowsApp
         {
             DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [Init] Device.Init failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
             throw;
+        }
+        finally
+        {
+            deviceInit.Dispose();
         }
         DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [Init] Device.Init done");
 
@@ -771,6 +789,7 @@ public static class WindowsApp
         DirectX.Device.BackgroundColor = DeviceServices.BaseApp.BackgroundColor;
 
         DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [Init] CreateSwapChain begin");
+        var swapChain = StartupProfiler.Scope("CreateSwapChain");
         try
         {
             DirectX.Device.CreateSwapChain((int)DeviceServices.BaseApp.DeviceResolution.X, (int)DeviceServices.BaseApp.DeviceResolution.Y);
@@ -780,15 +799,20 @@ public static class WindowsApp
             DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [Init] CreateSwapChain failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
             throw;
         }
+        finally
+        {
+            swapChain.Dispose();
+        }
         DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [Init] CreateSwapChain done");
 
-        DirectX.Device.CreateDescriptorHeapsAndViews();
+        using (StartupProfiler.Scope("DescriptorHeaps")) DirectX.Device.CreateDescriptorHeapsAndViews();
 
         // Skipped in immediate-2D mode: the main PSO family (and every fxc compile it triggers)
         // is never baked, which is where the startup cost would otherwise go.
         if (!immediate2D)
         {
             DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [Init] Pipeline.Init begin");
+            var pipelineInit = StartupProfiler.Scope("Pipeline.Init");
             try
             {
                 Pipeline.Init();
@@ -797,6 +821,10 @@ public static class WindowsApp
             {
                 DeviceServices.BaseApp.AddLog(LogType.Error, $"{DateTime.UtcNow} [Init] Pipeline.Init failed: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
                 throw;
+            }
+            finally
+            {
+                pipelineInit.Dispose();
             }
             DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [Init] Pipeline.Init done");
         }
@@ -811,13 +839,19 @@ public static class WindowsApp
         // Skipped in immediate-2D mode: no 3D pass consumes it, and the matching per-frame
         // DXPrimitiveGroup.Update in the render loop is skipped as well.
         if (!immediate2D)
-            DXPrimitiveGroup.InitLights();
+        {
+            using (StartupProfiler.Scope("InitLights")) DXPrimitiveGroup.InitLights();
+        }
 
-        DXSprite2D.Init();
+        using (StartupProfiler.Scope("Sprite2D.Init")) DXSprite2D.Init();
 
         // Per-frame command lists. In immediate-2D mode Pipeline.OpaquePipelineState is null,
         // which FrameContext.Initialize forwards as the optional pInitialState (D3D12 allows null).
-        DirectX.Device.CreateGraphicsCommandLists();
+        using (StartupProfiler.Scope("CommandLists")) DirectX.Device.CreateGraphicsCommandLists();
+
+        // Contract 3-2: the target block below is one stage on purpose - the individual creations are a few hundred
+        // microseconds each, and what a startup report has to answer is "how much of the white screen was targets".
+        var renderTargets = StartupProfiler.Scope("RenderTargets");
 
         // Offscreen SceneColor (Step 2): when non-null, FrameSchedule automatically appends
         // the FinalBlit pass for presentation.
@@ -904,7 +938,33 @@ public static class WindowsApp
                 SampleCount = 1,
             });
             if (Season.Basic.Graphics.Instance is Graphics shadowGraphics)
+            {
                 Season.Rendering.FrameSchedule.RenderShadow = shadowGraphics.RenderShadowPass;
+                // Fog-only far shadow: the medium's own map, fixed at FarSize^2 and anchored to the volumes rather than
+                // to the camera. Registered unconditionally because execution is gated by CascadedShadow.FarActive, so
+                // a host that never enables fog allocates 4 MB and runs no pass.
+                Season.Rendering.FrameSchedule.FarShadowMap = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
+                {
+                    DepthFormat = Season.Rendering.RtFormat.D32Float,
+                    MatchBackbufferSize = false,
+                    Width = (uint)Season.Rendering.CascadedShadow.FarSize,
+                    Height = (uint)Season.Rendering.CascadedShadow.FarSize,
+                    SampleCount = 1,
+                });
+                Season.Rendering.FrameSchedule.RenderFarShadow = shadowGraphics.RenderFarShadowPass;
+                // Fog-only local point-light cubes: two lamps of six 128^2 faces packed into 512x384, under a megabyte of
+                // depth. Registered alongside the far map and gated the same way - CascadedShadow.LocalActive is false
+                // unless a point light actually reaches a fog volume, so a scene without lamps runs no pass.
+                Season.Rendering.FrameSchedule.LocalShadowMap = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
+                {
+                    DepthFormat = Season.Rendering.RtFormat.D32Float,
+                    MatchBackbufferSize = false,
+                    Width = (uint)Season.Rendering.CascadedShadow.LocalShadowWidth,
+                    Height = (uint)Season.Rendering.CascadedShadow.LocalShadowHeight,
+                    SampleCount = 1,
+                });
+                Season.Rendering.FrameSchedule.RenderLocalShadow = shadowGraphics.RenderLocalShadowPass;
+            }
         }
 
         // 2-2 contract clause 1: finalize the AO tier during initialization
@@ -969,6 +1029,8 @@ public static class WindowsApp
                 DirectX.Device.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)
                 || RenderQuality.Current.RequiresDecalSceneDepth(DirectX.Device.HdrSceneColor, immediate2D)
                 || RenderQuality.Current.RequiresReflectionSceneDepth(DirectX.Device.HdrSceneColor,
+                    Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)
+                || RenderQuality.Current.RequiresDofSceneDepth(DirectX.Device.HdrSceneColor,
                     Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)))
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
@@ -979,21 +1041,27 @@ public static class WindowsApp
             });
         }
 
+        renderTargets.Dispose();
+
         // One-shot tier report: the app ships with the desktop-class defaults (HDR + TAA tier +
         // GTAO + shadows + bloom), so this line is what a device log needs to tell which pipeline the
         // frame actually pays for, and whether immediate-2D mode is active.
-        DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] tier: {(int)DeviceServices.BaseApp.DeviceResolution.X}x{(int)DeviceServices.BaseApp.DeviceResolution.Y} hdr={DirectX.Device.HdrSceneColor} aa={RenderQuality.Current.EffectiveAntiAliasing} mv={RenderQuality.Current.MotionVectors} ao={RenderQuality.Current.AmbientOcclusion} shadows={RenderQuality.Current.ShadowsEnabled} bloom={RenderQuality.Current.BloomEnabled} taaSharpness={RenderQuality.Current.TaaSharpness} immediate2D={immediate2D}");
+        DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] tier: {(int)DeviceServices.BaseApp.DeviceResolution.X}x{(int)DeviceServices.BaseApp.DeviceResolution.Y} hdr={DirectX.Device.HdrSceneColor} aa={RenderQuality.Current.EffectiveAntiAliasing} mv={RenderQuality.Current.MotionVectors} ao={RenderQuality.Current.AmbientOcclusion} shadows={RenderQuality.Current.ShadowsEnabled} bloom={RenderQuality.Current.BloomEnabled} dof={RenderQuality.Current.DepthOfField} taaSharpness={RenderQuality.Current.TaaSharpness} immediate2D={immediate2D}");
 
         // Extra line when the mode is on: this is what a device log needs to tell that the frame is
         // Overlay-only and that the tier line right above is inert.
         if (immediate2D)
             DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [RenderQuality] immediate-2D mode: the main PSO family was not compiled and no offscreen target, shadow map or post effect exists this session; every frame renders only the Overlay pass directly into the backbuffer");
 
-        DeviceServices.BaseApp.Create();
+        // Contract 3-2: the app's own construction - UI tree, scene panels, effect registration, and the RequestLoad calls
+        // that fill the queue below. It runs synchronously inside this call, so its duration is main-thread blocking time.
+        using (StartupProfiler.Scope("BaseApp.Create")) DeviceServices.BaseApp.Create();
 
         // Create() registers the compute effects, so this second reading covers graphics plus every kernel that
         // has to be compiled before the frame loop starts.
         DeviceServices.BaseApp.AddLog(LogType.None, $"{DateTime.UtcNow} [ShaderCache][total] fxc compiles={DirectX.ShaderCompiler.CompileCount}, cache hits={DirectX.ShaderCompiler.CacheHitCount}");
+
+        StartupProfiler.Mark("frame-loop-begin");
 
         WorkItemHandler handler = delegate
         {

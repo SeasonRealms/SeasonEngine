@@ -181,18 +181,35 @@ RibbonVertex VSMain(uint id : SV_VertexID)
 """;
 
     /// <summary>
+    /// Analytic mist for the band itself - the exact counterpart of <see cref="WaterfallShaders.FogHlsl"/>, kept separate
+    /// for the same reason. <see cref="RenderPassId.SceneWaterfall"/> runs after <see cref="RenderPassId.FogComposite"/>, so
+    /// the color target already holds the fogged scene; without applying the same medium here the band composites at full
+    /// contrast on top of it and reads as floating in front of the fog rather than lying in it.
+    ///
+    /// Header slot 37.w carries that ribbon's own extinction, averaged along the eye ray rather than sampled at the band:
+    /// water at the foot of a fogged bank is covered by the medium in between, and there is none on the water itself.
+    /// </summary>
+    public const string FogHlsl = """
+float RbFogTransmittance(float3 world, float3 eye, float sigma)
+{
+    if (sigma <= 0.0f) return 1.0f;
+    return exp(-sigma * distance(world, eye));
+}
+""";
+
+    /// <summary>
     /// Pixel stage: shallow cartoon river water.
     ///
-    /// Order: depth test -> soft shoreline -> sampling -> bank foam -> lighting. The depth test uses the unperturbed fragment
-    /// position (a normal perturbation must not change occlusion), and it is the only thing keeping the band from painting over
-    /// the bank it is tucked under.
+    /// Order: depth test -> soft shoreline -> sampling -> bank foam -> lighting -> fog. The depth test uses the unperturbed
+    /// fragment position (a normal perturbation must not change occlusion), and it is the only thing keeping the band from
+    /// painting over the bank it is tucked under.
     ///
     /// The absorption term is deliberately a screen-space ramp rather than a physical one: the channel is ~13 cm deep, so a
     /// Beer-Lambert term would be numerically indistinguishable from zero, and the depth buffer here is device depth with no
     /// linearization available in this pass. What the ramp buys is a tint that darkens slightly where the bed is far behind the
     /// surface, which reads as depth without pretending to be accurate.
     /// </summary>
-    public const string PixelHlsl = """
+    public const string PixelHlsl = FogHlsl + """
 float4 PSMain(RibbonVertex input) : SV_TARGET
 {
     uint offset = RbOffset(input.slot);
@@ -201,7 +218,7 @@ float4 PSMain(RibbonVertex input) : SV_TARGET
     float4 material1 = RbF(offset + 34u);  // foam color.rgb, foam amount
     float4 material2 = RbF(offset + 35u);  // flow speed m/s, normal strength, normal tiling, unused
     float4 material3 = RbF(offset + 36u);  // edge foam, edge softness, depth meters, unused
-    float4 material4 = RbF(offset + 37u);  // sort order, phase meters, 0, 0
+    float4 material4 = RbF(offset + 37u);  // sort order, phase meters, 0, extinction
     float4 camera = RbF(4u);
     float4 sun = RbF(6u);
     float4 sunColor = RbF(7u);
@@ -300,6 +317,11 @@ float4 PSMain(RibbonVertex input) : SV_TARGET
     float3 halfVector = normalize(view + toSun);
     color += sunColor.rgb * (sun.w * pow(saturate(dot(shadedNormal, halfVector)), 64.0f) * 0.45f);
     color += (ambientLight + direct) * pow(1.0f - saturate(dot(shadedNormal, view)), 4.0f) * 0.06f;
+
+    // Fog last: everything above is the band's own radiance, and the medium only decides how much of it reaches the eye.
+    // Attenuating alpha rather than colour is what puts the water *inside* the fog: the fraction it loses is exactly the
+    // fraction the already-fogged background shows through.
+    alpha *= RbFogTransmittance(input.world, camera.xyz, material4.w);
 
     return float4(color, alpha);
 }

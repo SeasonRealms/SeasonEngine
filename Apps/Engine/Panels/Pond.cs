@@ -44,7 +44,8 @@ internal class Pond : Panel
     internal InstancedModel Rim { get; }
 
     // Water surface: a flat rectangle spanning the pond interior. It is not walkable and not a GI proxy, so it is not in
-    // pondParts. 这里存的是数据而不是网格：P2 的水面 Pass 按矩形现算 6 个顶点，法线、折射与吸收都在着色器里。
+    // pondParts. What is stored here is data, not a mesh: P2's water Pass computes the 6 vertices of the rectangle on the
+    // fly, and the normals, refraction and absorption all live in the shader.
     internal Season.Rendering.WaterPlane Water { get; }
 
     // -- Pond-local layout. Orientation convention matches Room: north = +Z, south = -Z, east = +X, west = -X. --
@@ -112,7 +113,8 @@ internal class Pond : Panel
     // Water tint with partial coverage so the grass bottom stays visible through the surface.
     static readonly Vector4 WaterColor = new Vector4(0.10f, 0.32f, 0.38f, 1f);
 
-    // 平视时的不透明度：0.35 让池底的草与焦散仍然透出来，掠射角由 Fresnel 推到接近 1。
+    // Opacity when viewed straight on: 0.35 still lets the pond-bottom grass and caustics show through, and at grazing
+    // angles Fresnel pushes it towards 1.
     const float WaterOpacity = 0.35f;
 
     /// <summary>One piece of the ring: where its anchor goes, which way its length runs, and which face looks at the water.</summary>
@@ -155,12 +157,14 @@ internal class Pond : Panel
 
         ring.AddRange(BuildRing());
 
-        // 水面已退场旧的透明 Mesh3D：它只能作为主着色器的一个材质，而主着色器采不到本帧的 SceneColor/SceneDepth
-        // （透明段里这两张都是附件）。P2 的独立 Pass 才能同时读（快照 + 深度）与写（场景色），
-        // 遮挡改由着色器里的软件深度测试负责。注册由 App 完成，位置每帧跟着面板。
+        // The surface has retired the old transparent Mesh3D: it could only be a material of the main shader, and the main
+        // shader cannot sample this frame's SceneColor/SceneDepth (in the transparent pass both are attachments). Only P2's
+        // own Pass can read (snapshot + depth) and write (scene colour) at once, and occlusion is now handled by a software
+        // depth test in the shader. Registration is done by App, and the position follows the panel every frame.
         Water = new Season.Rendering.WaterPlane
         {
-            // 比内沿多出 1cm：压住与内壁之间的缝。内壁现在是堤坝件的内侧面，这 1cm 正好塞到件的底下。
+            // 1 cm beyond the inner edge: covers the seam against the inner wall. The inner wall is now the inner face of the
+            // dyke pieces, so this 1 cm tucks exactly under the pieces.
             Size = new Vector2(2f * InnerHalfX + 0.02f, 2f * InnerHalfZ + 0.02f),
             Tint = new Vector4(WaterColor.X, WaterColor.Y, WaterColor.Z, 1f),
             Opacity = WaterOpacity,
@@ -493,7 +497,7 @@ internal class Pond : Panel
                 result = true;
         }
 
-        // 水面矩形是一份世界坐标数据（没有网格也没有子控件），直接跟着面板走。
+        // The water rectangle is a piece of world-space data (no mesh and no child control); it simply follows the panel.
         Water.Position = new Vector3(origin.X, WaterLevel, origin.Z);
 
         return result;

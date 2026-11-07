@@ -2157,6 +2157,63 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         CascadedShadow.EndPass();
     }
 
+    /// <summary>
+    /// Fog-only far shadow pass body (FrameSchedule.RenderFarShadow callback). One 1024^2 map spanning the medium from a
+    /// fixed centre instead of the camera's frustum, so the entire pass is a single viewport and a single matrix: no
+    /// quadrant loop and no reuse bookkeeping. The traversal is the same DrawShadow replay the cascades use, which is why
+    /// this is a pass of its own rather than a fifth atlas slot - the target is a different texture, not a different tile.
+    /// </summary>
+    internal void RenderFarShadowPass(Season.Basic.IGraphics g)
+    {
+        if (!RenderQuality.Current.ShadowsEnabled)
+            return;
+        if (!CascadedShadow.FarActive)
+            return;
+
+        var app = DeviceServices.BaseApp;
+        if (app == null)
+            return;
+
+        Pipeline.SetShadowPipeline();
+        DirectX.Device.SetShadowViewport(0, 0, CascadedShadow.FarSize);
+        // Clause 7: BeginFarSlot publishes the matrix and the culling frustum together, exactly like BeginSlot.
+        Pipeline.SetShadowViewProj(CascadedShadow.BeginFarSlot());
+        app.DrawShadow();
+        CascadedShadow.EndPass();
+    }
+
+    /// <summary>
+    /// Fog-only local point-light cubes (FrameSchedule.RenderLocalShadow callback). Up to two lamps, six 90 degree faces
+    /// each, packed four tiles to a row of one 512x384 depth map. Unlike the single-viewport far pass this is a slot x face
+    /// loop: the tile changes per face while the target stays the same, so only the viewport and the matrix are rewritten.
+    /// </summary>
+    internal void RenderLocalShadowPass(Season.Basic.IGraphics g)
+    {
+        if (!RenderQuality.Current.ShadowsEnabled)
+            return;
+        if (!CascadedShadow.LocalActive)
+            return;
+
+        var app = DeviceServices.BaseApp;
+        if (app == null)
+            return;
+
+        Pipeline.SetShadowPipeline();
+        for (int slot = 0; slot < CascadedShadow.LocalCount; slot++)
+        {
+            for (int face = 0; face < CascadedShadow.LocalShadowFaces; face++)
+            {
+                CascadedShadow.GetLocalViewport(slot, face, out int x, out int y, out int size);
+                DirectX.Device.SetShadowViewport(x, y, size);
+                // Clause 7: BeginLocalSlot publishes the matrix and the culling frustum together, exactly like BeginSlot.
+                Pipeline.SetShadowViewProj(CascadedShadow.BeginLocalSlot(slot, face));
+                app.DrawShadow();
+            }
+        }
+
+        CascadedShadow.EndPass();
+    }
+
     public void DisposeModel(Model model)
     {
         DXModel dxModel = null;

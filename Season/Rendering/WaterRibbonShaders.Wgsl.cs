@@ -59,6 +59,13 @@ fn rbTransform(p : vec4<f32>, index : u32) -> vec4<f32> {
          + p.z * ribbonFrame[index + 2u] + p.w * ribbonFrame[index + 3u];
 }
 
+// Analytic mist for the band itself; see WaterRibbonShaders.Hlsl for why this is an exponential rather than a volume
+// sample. Slot 37.w is the extinction averaged along this ribbon's eye ray, zero when no medium covers the path.
+fn rbFogTransmittance(world : vec3<f32>, eye : vec3<f32>, sigma : f32) -> f32 {
+    if (sigma <= 0.0) { return 1.0; }
+    return exp(-sigma * distance(world, eye));
+}
+
 // Per-ribbon placement matrix (slots 38..41): points carry w=1, directions carry w=0, and the translation only affects points.
 fn rbSheetPoint(offset : u32, p : vec3<f32>) -> vec3<f32> {
     return rbTransform(vec4<f32>(p, 1.0), offset + 38u).xyz;
@@ -182,7 +189,7 @@ fn PSMain(input : RibbonVaryings) -> @location(0) vec4<f32> {
     let material1 = rbF(offset + 34u);  // foam color.rgb, foam amount
     let material2 = rbF(offset + 35u);  // flow speed m/s, normal strength, normal tiling, unused
     let material3 = rbF(offset + 36u);  // edge foam, edge softness, depth meters, unused
-    let material4 = rbF(offset + 37u);  // sort order, phase meters, 0, 0
+    let material4 = rbF(offset + 37u);  // sort order, phase meters, 0, extinction
     let camera = rbF(4u);
     let sun = rbF(6u);                  // propagation direction.xyz, intensity
     let sunColor = rbF(7u);
@@ -254,7 +261,8 @@ fn PSMain(input : RibbonVaryings) -> @location(0) vec4<f32> {
     let density = 0.72 + 0.28 * saturate(mask.r * 1.6);
     let bodyAlpha = material0.w * density * edgeCut;
     let foamAlpha = foam * 0.85 * foamCut;
-    let alpha = saturate(max(bodyAlpha, foamAlpha) * shore);
+    // var, not let: the fog term below attenuates it in place, like the other three backends.
+    var alpha = saturate(max(bodyAlpha, foamAlpha) * shore);
 
     // Lighting: the surface normal is mostly up, so the sun term is nearly constant across the band and the interest has to
     // come from the Fresnel rim and the foam. The sky stand-in is the frame's ambient color, since this pass cannot sample the sky.
@@ -283,6 +291,10 @@ fn PSMain(input : RibbonVaryings) -> @location(0) vec4<f32> {
     color = color + sunColor.rgb * (sun.w * pow(saturate(dot(shadedNormal, halfVector)), 64.0) * 0.45);
     color = color
         + (ambientLight + direct) * pow(1.0 - saturate(dot(shadedNormal, view)), 4.0) * 0.06;
+
+    // Fog last: alpha, not colour, because the fraction the band loses is exactly the fraction the already-fogged
+    // background shows through.
+    alpha = alpha * rbFogTransmittance(input.world, camera.xyz, material4.w);
 
     return vec4<f32>(color, alpha);
 }

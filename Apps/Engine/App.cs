@@ -51,7 +51,7 @@ internal class App : BaseApp
     /// </summary>
     internal float HourOfDay => Season.Rendering.DayNightCycle.HourFromPhase(celestial?.DayPhase ?? 0f);
 
-    /// <summary>当前昼夜相位（0..1）。WaterfallPool 的潭底焦散与 Pond 焦散同源，每帧按阳光高度重算亮度。</summary>
+    /// <summary>Current day/night phase in (0..1). WaterfallPool's pool-floor caustics share the same source as the Pond caustics, and their brightness is recomputed every frame from the sunlight height.</summary>
     internal float DayPhase => celestial?.DayPhase ?? 0f;
 
     // Scene-medium driver: the three authored fog presets, the local volumes they use, and the colonnade the sun-shaft
@@ -64,18 +64,18 @@ internal class App : BaseApp
     // report what was actually built rather than what was asked for.
     internal Season.Rendering.Effects.VolumetricFogEffect fogEffect;
 
-    // 后端拒绝 compute/indirect 时为空；晴天不会提交原先无区域约束的演示粒子。
+    // Null when the backend declines compute/indirect; clear weather does not submit the previously unconstrained demo particles.
     internal WeatherPrecipitationEffect precipitation;
 
     internal WeatherController weather;
     readonly WeatherVisualState weatherVisuals = new();
-    // 雷电天气的雷声：落雷边沿来自 weatherVisuals，播放的是 Resources/Raw/Musics 里的静态 WAV。
+    // Thunder sound for stormy weather: the strike edge comes from weatherVisuals, and the sound played is a static WAV in Resources/Raw/Musics.
     readonly ThunderAudio thunderAudio = new();
     WeatherCurtainEffect weatherCurtain;
-    // 闪电通道 V2：每次落雷把通道几何当 ribbon 带间接绘制一次；注册失败时保持 null，退回 v1 的云内发光。
+    // Lightning channel V2: each strike indirect-draws the channel geometry once as a ribbon strip; keeps null on registration failure, falling back to v1's in-cloud glow.
     LightningEffect lightning;
 
-    // 最后一次同步给天气场的房间内腔；房间被缩放或移动后才会重建遮挡区域记录。
+    // The room interior last synced to the weather field; the occlusion region record is rebuilt only after the room is scaled or moved.
     Vector3 weatherCoverMin, weatherCoverMax;
 
     internal Ground ground;
@@ -104,9 +104,9 @@ internal class App : BaseApp
     // below is the only medium in the world and every pixel outside it composites as identity. That is the shape a general
     // "one fog per place" capability takes - the grove has mist, the beach, the road and the meadow do not.
     //
-    // The patch covers the grove (x in [-60, -40], z in [-30, -10], trees 2 m tall) plus 12 m of feather on every side, so
-    // its box never reads as a box. Density is set so ~10 m inside it is already half opaque, while a viewer standing
-    // outside sees a lit bank between the trunks rather than a wall.
+    // The patch covers the grove (x in [-60, -40], z in [-30, -10], trees 2 m tall) with about 33 m of clearance on every
+    // side, so its box never reads as a box. Density is set so ~7 m inside it is already half opaque, while a viewer
+    // standing outside sees a lit bank between the trunks rather than a wall.
     //
     // Night needs no special case: a patch that nothing lights is invisible, and the player's torch (5 cd, 12 m range,
     // registered in Player) turns it into a visible glow the moment they walk in. That is the intended behaviour.
@@ -123,34 +123,68 @@ internal class App : BaseApp
     // The global medium is off. This is the one number that decides whether the world has weather or only patches.
     const float GlobalExtinction = 0f;
 
-    // Anisotropy, depth range and wind are medium-wide by construction - the phase function and the froxel layout have no
-    // per-volume counterpart - so they stay here even though the global extinction is zero.
-    const float MistAnisotropy = 0.60f;    // Forward scattering: the sunlit side of the patch glows, the far side greys out.
+    // Depth range and wind are medium-wide by construction - the froxel layout carries neither per volume - so they stay
+    // here even though the global extinction is zero. Anisotropy is no longer one of them: FogVolume.Anisotropy overrides
+    // it per patch, and this value is only what the volumes that do not author one inherit.
+    //
+    // 0.75 rather than 0.60: a shaft only reads as a shaft when the phase function strongly favours looking into the sun.
+    // The two-lobe FogMath.Phase at g = 0.75 evaluates to 21.1x isotropic looking into the sun and 0.94x looking away, a
+    // forward-to-back ratio of 22:1. The single lobe it replaced gave 28x and 0.082x, i.e. 343:1 - punchier by a quarter,
+    // but a patch under it collapsed to a flat sheet whenever the sun was behind the camera, which is half of the orbit
+    // and the half where mist is actually looked at. 22:1 keeps the beam and leaves the other side lit. Clamped at 0.9 by
+    // both SceneFog.Anisotropy and FogVolume.Anisotropy.
+    const float MistAnisotropy = 0.75f;
     const float MistMaxDistance = 400f;
     static readonly Vector3 MistWind = new(0.30f, 0f, 0.10f);
 
     // Density at the centre of the patch, before the density multiplier. Denser than a scene-wide medium on purpose: it
     // only has 22 m to work with, so the contrast has to come from the near field.
-    const float ForestMistExtinction = 0.06f;
+    //
+    // 0.10 rather than 0.06: in-scattering is sigma_s * illumination, so this number scales the beam as well as the
+    // extinction. At 0.06 the single-scattering term came out at the same magnitude as the ambient term and the floor
+    // below, which is why the patch read as one evenly lit volume with no structure in it. 0.10 puts ten metres at about
+    // two thirds opaque (1 - exp(-1)) and the direct term clearly above both of the light-independent ones.
+    const float ForestMistExtinction = 0.10f;
 
-    // Sky light the patch gets regardless of what lights it, in the same units as the shader's illumination accumulator:
-    // peak 0.55 is the order of the noon ambient, which is enough to lift a canopy-shadowed patch reading as black-grey
-    // smoke back to white mist, without outshining the sky. It only opens around dawn and dusk (see MistSkyWeight): at
-    // noon the ambient already does the job, and at night a constant floor would turn the patch into a glowing white box.
-    const float MistSkyFloorPeak = 0.55f;
+    // Multiple-scattering gain on the sky term, not a fixed emission floor. The shader only ever gives the patch one
+    // bounce of ambient, while real water vapour bounces the sky many times; multiplying the ambient by this number is
+    // that approximation, which is why the coefficient sits next to the extinction below rather than next to a clock.
+    //
+    // It replaces a dawn/dusk-only bell window, which left exactly the worst hours uncovered: at 09:00 the window has
+    // just closed and the 2 m trees already throw 2 m shadows across a 4 m grid, so the whole patch sat in canopy shadow
+    // with ambient 0.09 and read as black smoke at 44:1 against the direct term. Scaling with ambient instead of with
+    // the hour also keeps night dark for free - ambient falls to its floor, so this term does too, and the patch never
+    // turns into a glowing white box.
+    //
+    // 10 puts a shaded patch near 0.9 in HDR while the sunlit beam stays around 8, so the shaft keeps roughly 9:1.
+    // Raise it for whiter vapour, lower it for a denser beam.
+    const float MistScatterBoost = 10f;
 
-    // Slightly cool, matching forestMist.Albedo's blue-white instead of fighting the warm sunrise light.
+    // Slightly cool, matching forestMist.Albedo's blue-white instead of fighting the warm ambient, which is what the
+    // sky term above is now derived from.
     static readonly Vector3 MistSkyTint = new(0.97f, 1.00f, 1.06f);
 
     readonly FogVolume forestMist = new()
     {
         Shape = FogVolumeShape.Box,
-        Position = new Vector3(-50f, 2.4f, -20f),   // Grove centre, lifted so the densest layer sits at trunk height.
-        Size = new Vector3(44f, 6.5f, 44f),         // 20x20 grove plus 12 m of feather on every side.
+        // Doubled horizontally around the same centre, and grown upward only: the floor stays at -0.2, so all of the extra
+        // height sits above the trees rather than half of it under the ground. Position is the centre, hence 4.0 (floor
+        // -0.2 plus half of 8.4) instead of 1.9.
+        Position = new Vector3(-50f, 4.0f, -20f),
+        // 88 x 8.4 x 88, twice the previous extent on every axis. Extinction is untouched: density per metre does not change
+        // when the box grows, only the reach. EdgeFeather is a fraction of the half-extent rather than a distance, so the fade
+        // now spans 22 m instead of 11 and the fully dense core is still the original 44 m grove, with the new ring entirely
+        // inside the fade. The cost is vertical: with a 4.2 m half-height the ground under the trunks falls from 9.5% to
+        // 2.5% of full density (smoothstep, not linear) and only recovers to full at y=2, which is exactly the band the
+        // shafts are read in. Dropping EdgeFeather to 0.25 restores the old 11 m fade if that band reads too thin.
+        Size = new Vector3(88f, 8.4f, 88f),
         Extinction = ForestMistExtinction,
         EdgeFeather = 0.5f,
-        NoiseAmount = 0.5f,
-        NoiseScale = 0.05f,                          // ~20 m banks, so the trunks sit inside moving clumps.
+        // 0.35 rather than 0.5, and 0.03 rather than 0.05: the noise modulates sigma before the light is integrated, so it
+        // multiplies the beam too. Strong fine-grained noise shreds a shaft into speckle; larger, weaker banks let the beam
+        // stay continuous while the patch still moves.
+        NoiseAmount = 0.35f,
+        NoiseScale = 0.03f,
         Albedo = new Vector3(0.86f, 0.90f, 0.96f),   // Slightly darker than the sky: a pure-white patch vanishes at noon.
     };
 
@@ -162,8 +196,8 @@ internal class App : BaseApp
 
     internal House house;
 
-    // 风车小屋：站在支线西侧、桥与南脉坡脚之间的草地上，模型自带的单段动画（风车叶片旋转）循环播放。
-    // 见 LittleHouse.cs。
+    // Windmill cottage: standing on the grass west of the branch, between the bridge and the foot of the southern ridge; the model's single built-in animation (windmill blades rotating) plays on a loop.
+    // See LittleHouse.cs.
     internal LittleHouse littleHouse;
 
     // Hot air balloon moored just off the tower deck on the house side, 8 player heights tall. See HotAirBalloon.cs.
@@ -179,18 +213,18 @@ internal class App : BaseApp
 
     internal Tower tower;
 
-    // 池底的焦散贴花。Additive 贴花本身与光照无关，所以由 Update 每帧把阳光倍率写进 Intensity，
-    // 否则夜里场景变暗后它会因为对比度反而显得更亮。
+    // Pond-floor caustics decal. An Additive decal is itself independent of lighting, so Update writes the sunlight factor into Intensity every frame;
+    // otherwise, once the scene darkens at night, it would only look brighter because of the contrast.
     Season.Rendering.DecalVolume pondCaustics;
 
     internal Campfire campfire;
 
-    // 瀑布潭：水面 + 潭底贴花 + 石块潭沿 + 水花/雾/白沫三组粒子，锚点每帧跟随瀑布落点。见 WaterfallPool.cs。
+    // Waterfall pool: water surface + pool-floor decal + stone rim + three particle groups (spray/mist/foam), with the anchor following the waterfall's landing point every frame. See WaterfallPool.cs.
     internal WaterfallPool waterfallPool;
 
-    // 河流：从瀑布潭一路弯绕到 Rocks 一侧的海。整条河道是一张固定表（见 River.Course），
-    // 按“直线段 / 弯道段”切成六个可选取的 Mesh3D；水面由 SceneWaterfall Pass 按 WaterRibbon 数据现算；
-    // 两岸的草土堤坝是 RiverBank.glb 的一个批次（River.Dikes），由河段每帧把自身矩阵折进去。
+    // River: winds all the way from the waterfall pool to the sea on the Rocks side. The entire course is a fixed table (see River.Course),
+    // split into six selectable Mesh3D segments by "straight / curve"; the water surface is computed on the fly by the SceneWaterfall Pass from WaterRibbon data;
+    // the grassy earth dikes on both banks are one batch from RiverBank.glb (River.Dikes), with each segment folding its own matrix in every frame.
     internal River river;
 
     // Stone arch bridge over the main river channel, at the spot the player first stood (halfway from the
@@ -200,34 +234,34 @@ internal class App : BaseApp
     // Bridge.cs.
     internal Bridge bridge;
 
-    // 水池东堤旁的海边阶梯与直路：三排石阶与 Pond 台阶同款、面朝大海、沿堤坝行居中，路从阶梯脚下
-    // 沿 z = -7.05 铺到 x = 74 的海岸岩石带为止，沥青纹路与南侧的路同出一处。See SeaRoad.cs.
+    // Seaside stair and straight road beside the pond's east dike: three flights of stone steps matching the Pond steps, facing the sea, centered on the dike row; the road runs from the foot of the stair
+    // along z = -7.05 to the coastal rock band at x = 74, with asphalt texture from the same source as the south road. See SeaRoad.cs.
     internal SeaRoad seaRoad;
 
-    // 鬼屋与跑道正中间的圆形旗杆：底座是可行走的圆形平台，杆顶挂一面两面各印一幅海盗图的薄布旗。
+    // Round flagpole midway between the haunted house and the runway: the base is a walkable circular platform, and a thin cloth flag with a different pirate picture on each face hangs at the top of the pole.
     // See Flagpole.cs.
     internal Flagpole flagpole;
 
-    // 维京小船：泊在水池北岸的台阶边，也就是 Player 出生点正下方，模型自带的 morph 动画驱动划桨与风帆。
-    // 静止时由 Boat 自己算三个低频摇晃；跳上甲板后 Player 绑定在座位上、方向键驱动 Boat.Steer，
-    // 可行水域（水池 / 支流 / 主河道 / 桥下 / 海口 / 海面 / 瀑布潭）见 Boat.cs。
+    // Viking boat: moored by the steps on the pond's north bank, directly below the Player spawn point; the model's built-in morph animation drives the oars and the sail.
+    // At rest, Boat computes three low-frequency rockings itself; after jumping onto the deck the Player is bound to the seat and the arrow keys drive Boat.Steer.
+    // The navigable waters (pond / branch / main channel / under the bridge / river mouth / sea surface / waterfall pool) are listed in Boat.cs.
     internal Boat boat;
 
-    // 东岸岩石外的帆船：只有一个 Model，高度随 Sea.SurfaceY 起伏，帆面颜色每 5 秒换一次（红橙黄绿青蓝紫，35 秒一轮）。
-    // 它是"按部件改基色"的第一处用例，见 SailingBoats.cs。
+    // Sailboat beyond the east-shore rocks: a single Model whose height follows Sea.SurfaceY; the sail colour changes every 5 seconds (red, orange, yellow, green, cyan, blue, violet; a 35-second cycle).
+    // It is the first use case of "changing base colour per part", see SailingBoats.cs.
     internal SailingBoats sailingBoats;
 
     internal Robots robots;
 
     internal Birds birds;
 
-    // 飞机群：十架按 1/2/3/4 四列排成楔形，在岛外的海面上方、与高塔平台同高绕岛作圆周飞行，
-    // 每架的螺旋桨循环自转。见 Planes.cs。
+    // Plane squadron: ten planes in a wedge of four columns (1/2/3/4), flying in a circle around the island above the sea outside it, at the same height as the tower deck,
+    // with each plane's propeller spinning continuously. See Planes.cs.
     internal Planes planes;
 
-    // 海边跑道上的玩家飞机：停在水池东堤旁那条沥青路上、机头朝海，Player 跳进座舱后整段航程自动完成
-    // （3-2-1 倒计时、滑跑、半程起飞、掠过 Rocks 爬升、左转汇入 Planes 的绕岛航线飞三圈、原路俯冲回跑道、
-    // 滑回停机位掉头）。见 AeroPlane.cs。
+    // The player's aircraft on the seaside runway: parked on the asphalt road beside the pond's east dike, nose toward the sea; after the Player jumps into the cockpit the whole flight completes automatically
+    // (3-2-1 countdown, taxi, takeoff at mid-field, climb past Rocks, bank left to join the Planes' island orbit for three laps, dive back to the runway along the same path,
+    // taxi back to the parking spot and turn around). See AeroPlane.cs.
     internal AeroPlane aeroPlane;
 
     CubeField cubeField;
@@ -240,12 +274,12 @@ internal class App : BaseApp
 
     internal List<Mesh3D> meshes = new List<Mesh3D>();
 
-    // P1 瀑布：控件只提供代理网格（选取/包围盒/描边）与摆放矩阵，真正的水幕仍由 SceneWaterfall Pass 画。
-    // 用列表而不是单个字段，是为了让“多条瀑布”只差一次 Add：同一份 Sheet 可以 Clone 到多个控件，
-    // 各自 Place 到不同坐标，注册表上限见 SceneWaterfalls.MaxActiveWaterfalls。
+    // P1 waterfall: the control provides only the proxy mesh (picking/bounds/outline) and the placement matrix, while the actual water curtain is still drawn by the SceneWaterfall Pass.
+    // A list rather than a single field, so that "multiple waterfalls" differ by only one Add: the same Sheet can be cloned to several controls,
+    // each Placed at a different coordinate; for the registry limit see SceneWaterfalls.MaxActiveWaterfalls.
     internal List<Waterfall> waterfalls = new List<Waterfall>();
 
-    // 已交给后端的贴图名（见 RegisterNamedTexture）。贴花与瀑布常常共用一张图，按名字记一份就够。
+    // Texture names already handed to the backend (see RegisterNamedTexture). Decals and waterfalls often share one texture, so one entry per name suffices.
     readonly HashSet<string> namedTextures = new();
 
     internal Views views;
@@ -258,6 +292,9 @@ internal class App : BaseApp
 
     Setting setting;
     internal SettingPanel settingPanel;
+
+    // Day/night dial between the Settings button and the rear-view mirror. See Clock.cs.
+    Clock clock;
 
     Direction direction;
 
@@ -346,17 +383,20 @@ internal class App : BaseApp
         // VolumetricFogEffect.Initialize accept the registration. Off cannot be rescued at runtime, because the pass is
         // built once - the settings row that writes this tier therefore says "restart to apply".
         //
-        // The sample runs Medium everywhere it can measure it. Low collapses the shadow taps to one, which is what the
-        // weaker mobile GPUs and the browser's single-threaded backend want; Medium is the tier the shafts are authored
-        // against. A saved setting still wins, because Init reads Settings.json after this and only snapshots these
-        // values when the file has no key of its own.
+        // The desktop sample runs High; mobile and the browser stay on Low. Low collapses the shadow taps to one, which is
+        // what the weaker mobile GPUs and the browser's single-threaded backend want. High is the tier the shafts are
+        // authored against, and the reason is depth rather than width: at this sample's 400 m range the exponential slice
+        // layout puts a boundary every 2.0 m at 20 m out with Medium's 64 slices, and every 1.35 m with High's 96. A trunk's
+        // shadow crossing the view ray spans roughly that much depth, so 64 slices average it back into the surrounding
+        // mist while 96 keep it. Columns going from 16 to 12 pixels is the secondary gain. A saved setting still wins,
+        // because Init reads Settings.json after this and only snapshots these values when the file has no key of its own.
         RenderQuality.DefaultVolumetricFog = OperatingSystem.IsAndroid() || OperatingSystem.IsBrowser()
             ? FogQuality.Low
-            : FogQuality.Medium;
+            : FogQuality.High;
 
-        // D1 贴花同样是初始化期档位：它决定后端要不要为贴花把场景打散成不透明/透明两段，也决定
-        // SceneDepth 会不会被补出来 —— 两件事都无法在运行期补救，所以在这里开。
-        // 没有这个开关时贴花只是数据，不会出现在画面上。
+        // The D1 decal is likewise an initialization-time tier: it decides whether the backend splits the scene into opaque/transparent sections for decals, and whether
+        // SceneDepth gets synthesized — neither can be rescued at runtime, so it is enabled here.
+        // Without this switch decals are only data and never appear on screen.
         RenderQuality.DefaultDecals = true;
 
         // P3: Hi-Z screen-space reflection, consumed only by the water pass. The scene depth it needs is
@@ -534,19 +574,19 @@ internal class App : BaseApp
 
     void RegisterEffects()
     {
-        // A7：逐实例 GPU 剔除。Phase=FrameStart 且 Scope=App，因为派发必须在任何 Pass 之外（Vulkan 在 Pass 内
-        // 禁止 dispatch，Metal 的 compute 与 render encoder 互斥），而级联图集整帧只有一张，不该随视图重复剔除。
-        // 注册失败（后端无 kernel 源、或缺少间接绘制能力）时 InstanceCull.Enabled 保持 false，
-        // 各端 instanced group 于是不分配剔除资源，阴影自然退回 CPU 整批剔除，不会拿空缓冲去画。
+        // A7: per-instance GPU culling. Phase=FrameStart and Scope=App, because the dispatch must lie outside any Pass (Vulkan forbids
+        // dispatch inside a Pass, and Metal's compute and render encoders are mutually exclusive), and the cascade atlas is a single copy per frame that should not be culled repeatedly per view.
+        // On registration failure (backend has no kernel source, or lacks indirect-draw capability) InstanceCull.Enabled stays false,
+        // so each backend's instanced group allocates no culling resources and shadows naturally fall back to whole-batch CPU culling rather than drawing from an empty buffer.
         if (Season.Rendering.FrameSchedule.RegisterCompute(
                 Season.Basic.Graphics.Instance, new Season.Rendering.InstanceCullEffect()))
         {
         }
 
-        // P1：逐实例 GPU 骨骼求值。Phase=FrameStart 且 Scope=App：调色板必须在场景 Pass 之前写完，而 Vulkan 在 Pass 内
-        // 禁止 dispatch、Metal 的 compute 与 render encoder 互斥，所以只能落在 Record 里；整帧只有一份调色板，不该随视图重复。
-        // 注册失败（后端无 kernel 源、或不能把 storage buffer 绑进顶点阶段）时 InstanceSkinning.Enabled 保持 false，
-        // 各端 InstancedModel 于是整模型退回 CPU 重放，不会去画一份没人写的调色板。
+        // P1: per-instance GPU skeletal evaluation. Phase=FrameStart and Scope=App: the palette must be fully written before the scene Pass, while Vulkan forbids
+        // dispatch inside a Pass and Metal's compute and render encoders are mutually exclusive, so it can only go in Record; there is one palette per frame and it should not repeat per view.
+        // On registration failure (backend has no kernel source, or cannot bind the storage buffer into the vertex stage) InstanceSkinning.Enabled stays false,
+        // so each backend's InstancedModel falls back to whole-model CPU replay rather than drawing a palette nobody wrote.
         Season.Rendering.FrameSchedule.RegisterCompute(
             Season.Basic.Graphics.Instance, new Season.Rendering.InstanceSkinningEffect());
 
@@ -594,6 +634,21 @@ internal class App : BaseApp
 
         }
 
+        // F1 Step B: register the depth-of-field gather.
+        // It sits between the two effects above and below for the same registration-order reason: after
+        // MotionBlurEffect, so the lens blurs the exposure-correct image rather than the velocity field (and so the
+        // streak is gathered once instead of once per circle-of-confusion tap); and before BloomEffect, so the bloom
+        // chain sees the final, defocused highlights and the other order cannot smear a glow into a soft halo.
+        // It is the third publisher of SceneColorOverride, which is a per-frame chain rather than a slot -
+        // DepthOfFieldEffect documents the rule it follows when it stands down.
+        // The tier being Off, a missing explicit SceneDepth, a missing offscreen SceneColor, or a backend without
+        // compute all degrade to a registration-time bypass with zero residue.
+        if (Season.Rendering.FrameSchedule.RegisterCompute(
+                Season.Basic.Graphics.Instance, new Season.Rendering.Effects.DepthOfFieldEffect()))
+        {
+
+        }
+
         // 2-1 Step B: register BloomEffect.
         // It runs a three-kernel dual-chain pass in AfterScene and writes FrameSchedule.BloomTexture for FinalBlit composition.
         // Threshold and intensity are controlled by RenderQuality.
@@ -634,10 +689,10 @@ internal class App : BaseApp
                 Season.Basic.Graphics.Instance, new Season.Rendering.Effects.HiZEffect());
         }
 
-        // P0: SSR。紧随 Hi-Z —— 它按名字引用那四级金字塔，注册顺序反了会拿到还没建出来的纹理。
-        // 反射增量的合成入口由它自己挂到 FrameSchedule.Prepare/RenderSsrComposite 上，
-        // 注册失败（后端没有加法合成能力、没有 SceneNormal、天空不是程序化）时两个委托保持 null，
-        // 场景 Pass 也就不打散，画面停在主着色器已经算好的天空 + 地面反射。
+        // P0: SSR. Right after Hi-Z — it references that four-level pyramid by name, and a reversed registration order would fetch a texture not yet built.
+        // Its reflection-delta composite entry point is attached by itself to FrameSchedule.Prepare/RenderSsrComposite;
+        // on registration failure (the backend has no additive-composite capability, no SceneNormal, or the sky is not procedural) both delegates stay null,
+        // and the scene Pass is not split either, so the image stops at the sky + ground reflection the main shader already computed.
         if (Season.Rendering.FrameSchedule.RegisterCompute(
                 Season.Basic.Graphics.Instance, new Season.Rendering.Effects.SsrEffect()))
         {
@@ -718,8 +773,8 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             fogEffect = null;
         }
 
-        // 第二阶段：区域雨雪替换无约束演示；仍作为最后一层透明间接绘制，不改动旧天空或树林雾。
-        // 每区域桌面预算为雨 8192 / 雪 4096，移动端及 Web 减半，晴天和远离窗口的系统不派发。
+        // Second phase: regional rain/snow replaces the unconstrained demo; still the last transparent indirect draw, without touching the old sky or forest mist.
+        // The per-region desktop budget is 8192 rain / 4096 snow, halved on mobile and Web; systems that are clear or far from the window are not dispatched.
         precipitation = new WeatherPrecipitationEffect(weather.Field,
             OperatingSystem.IsAndroid() || OperatingSystem.IsIOS() || OperatingSystem.IsBrowser());
         if (!FrameSchedule.RegisterCompute(Season.Basic.Graphics.Instance, precipitation))
@@ -728,15 +783,15 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         if (!FrameSchedule.RegisterCompute(Season.Basic.Graphics.Instance, weatherCurtain))
             weatherCurtain = null;
 
-        // 闪电通道 V2：几何与 args 都在 FrameStart 里写完，绘制则挂在粒子提交列表上，
-        // 与降水共用场景透明阶段的末尾——闪电必须画在雨幕之后、雾合成之前。
-        // 没有 compute 或间接绘制的后端在这里失败，通道不出现，云内发光仍由主着色器给出。
+        // Lightning channel V2: the geometry and args are fully written in FrameStart, while the draw is attached to the particle submission list,
+        // sharing the end of the scene's transparent phase with precipitation — lightning must be drawn after the rain curtain and before the fog composite.
+        // Backends without compute or indirect draw fail here, the channel does not appear, and the in-cloud glow is still produced by the main shader.
         lightning = new LightningEffect();
         if (!FrameSchedule.RegisterCompute(Season.Basic.Graphics.Instance, lightning))
             lightning = null;
 
-        // D1: 屏幕空间贴花。它不在 Compute 相位里，而是一个固定位置的独立 Pass（雾合成之前），
-        // 所以注册顺序与上面的相位无关；后端没有实现时这里返回 false 并留下零残留。
+        // D1: screen-space decals. They are not in a Compute phase, but a standalone Pass at a fixed position (before the fog composite),
+        // so their registration order is independent of the phases above; when the backend does not implement them, this returns false and leaves zero residue.
         Season.Rendering.FrameSchedule.RegisterDecals(Season.Basic.Graphics.Instance);
     }
 
@@ -766,24 +821,23 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         scene.WindVelocity = MistWind;
 
         // The patch is the whole medium, so the density row scales it directly.
-        forestMist.Extinction = ForestMistExtinction * density;
-        // 树冠在清晨把直射光整根砍掉，雾只剩很低的环境光，于是整片雾被压成黑灰烟；瀑布水汽有自发光下限所以仍是白的。
-        // 这里补的就是“雾被头顶天空照亮”的那部分，只在晨昏张开。
-        forestMist.SelfIllumination = MistSkyTint * (MistSkyFloorPeak * MistSkyWeight(HourOfDay));
+        float sigma = ForestMistExtinction * density;
+        forestMist.Extinction = sigma;
+        // Emission shares sigma with the scattering term, so it is already per metre and the density multiplier scales
+        // both together: a thicker patch reads brighter but also more opaque, exactly as the single-scatter term does.
+        // Ambient is read before sky?.Update runs this frame, so this lags one frame - it moves over tens of seconds,
+        // which makes the lag invisible.
+        forestMist.SelfIllumination = MistSkyTint * (sigma * SkyLuminance(Lighting.Ambient) * (MistScatterBoost - 1f));
     }
 
     /// <summary>
-    /// 晨昏权重：以日出（6 时）和日落（18 时）为中心的钟形，窗口边界处归零。
-    /// 用钟形而不是“日出后固定值”，是因为白天环境光会自己把雾抬亮，而夜里补光会让雾变成一块发光的白盒。
+    /// Grey level of the ambient term, Rec.709 weights. The sky contribution is a colour in the lighting state but the
+    /// multiple-scattering coefficient is a single number, so it is collapsed here once instead of per component.
     /// </summary>
-    static float MistSkyWeight(float hour)
-        => MathF.Max(Bell(hour, 6.3f, 2.6f), Bell(hour, 18.2f, 2.2f));
-
-    /// <summary>1 at <paramref name="centre"/>, 0 beyond the half width, flat at both ends so the patch never pops.</summary>
-    static float Bell(float hour, float centre, float halfWidth)
+    static float SkyLuminance(Vector4 ambient)
     {
-        float t = Math.Clamp(MathF.Abs(hour - centre) / halfWidth, 0f, 1f);
-        return 1f - t * t * (3f - 2f * t);
+        float value = ambient.X * 0.2126f + ambient.Y * 0.7152f + ambient.Z * 0.0722f;
+        return float.IsFinite(value) ? MathF.Max(value, 0f) : 0f;
     }
 
     // Fully synchronous and intentionally free of blocking loads.
@@ -793,6 +847,12 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     public override void Create()
     {
         base.Create();
+
+        // F1: seed the main lens from the persisted tier defaults. The effect reads Camera3D every frame and never these
+        // fields, so this is a one-time handoff and a later scene write to Camera.Aperture/FocusDistance simply wins.
+        // Done here rather than in the constructor because RenderQuality is only populated once the settings are loaded.
+        Camera.Aperture = Season.Rendering.RenderQuality.Current.DofAperture;
+        Camera.FocusDistance = Season.Rendering.RenderQuality.Current.DofFocusDistance;
 
         weather = new WeatherController(WorldSettings.Current);
         FrameSchedule.WeatherVisuals = weatherVisuals;
@@ -852,7 +912,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         AddPanel(rocks);
         DeviceServices.BaseApp?.RequestLoad(rocks);   // Queue the whole panel so Load can extract in the background.
 
-        // 岩石外的帆船：排在 sea 与 rocks 之后，它的吃水线直接取自 Sea.SurfaceY。
+        // Sailboat beyond the rocks: ordered after sea and rocks; its waterline is taken directly from Sea.SurfaceY.
         sailingBoats = new SailingBoats(sea);
         AddPanel(sailingBoats);
 
@@ -913,28 +973,28 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         pond.PosZ = Pond.StairFootZ;
         AddPanel(pond);
 
-        // P2: 水面几何由着色器按 SV_VertexID 现算，所以这里注册的是数据而不是控件 ——
-        // 矩形与位置由 Pond 自己维护（位置每帧跟着面板）。
-        // 后端建不出水面管线时它只是一份没人读的数据，不会退化成错的画面。
+        // P2: the water surface geometry is computed on the fly by the shader from SV_VertexID, so what is registered here is data rather than a control —
+        // the rectangle and position are maintained by Pond itself (the position follows the panel every frame).
+        // When the backend cannot build the water pipeline it is just data nobody reads, and does not degrade into a wrong image.
         Waters.Add(pond.Water);
 
-        // P3: 海面同样是一份矩形数据。Sea 的 255×255 起伏网格已经退到水面以下 12m 当水体底面，
-        // 水面本身由 SceneWater Pass 画：Fresnel、折射、Hi-Z 屏幕空间反射与深度吸收全在着色器里。
+        // P3: the sea surface is likewise rectangle data. Sea's 255×255 undulating mesh has already dropped 12m below the water surface to act as the water body floor,
+        // while the surface itself is drawn by the SceneWater Pass: Fresnel, refraction, Hi-Z screen-space reflection, and depth absorption are all in the shader.
         Waters.Add(sea.Water);
 
         CreateWaterfall();
 
-        // 瀑布潭必须在 CreateWaterfall 之后：面板要引用刚登记的那条瀑布（落点锚定的唯一数据源，
-        // 以及“瀑布是否已经 Load 完”这个门控 —— 首次摆放水汽盒要用到）。
+        // The waterfall pool must come after CreateWaterfall: the panel needs to reference the waterfall just registered (the sole data source for anchoring the landing point,
+        // as well as the "has the waterfall finished loading" gate — needed for the first placement of the mist box).
         waterfallPool = new WaterfallPool(waterfalls[^1]);
         AddPanel(waterfallPool);
 
-        // P1 河流。必须在 CreateWaterfall 之后：水面复用的是瀑布那三张同名贴图，
-        // 下面再登记一次只是为了“场景里没有瀑布时河也能画”（RegisterNamedTexture 按名字去重）。
+        // P1 river. Must come after CreateWaterfall: the water surface reuses the waterfall's three same-named textures,
+        // and registering them again below is only so that "the river can be drawn even when the scene has no waterfall" (RegisterNamedTexture deduplicates by name).
         //
-        // 每一段都是独立的 Mesh3D：岸坡在绘制时就是世界坐标，Load 完之后 Pos 取自己的锚点，
-        // 世界矩阵退化为单位阵，所以面板上的 PosX/PosY/PosZ + Width/Height/Depth + Rotation
-        // 改的就是这一段本身；水面挂在 RiverSegment.Water.Placement 上读同一个矩阵，不会落后一帧。
+        // Each segment is an independent Mesh3D: the bank slope is already in world coordinates when drawn, and after Load the Pos takes its own anchor,
+        // the world matrix degenerating to identity, so the panel's PosX/PosY/PosZ + Width/Height/Depth + Rotation
+        // changes that very segment; the water surface hangs off RiverSegment.Water.Placement reading the same matrix, so it never lags a frame behind.
         river = new River(Rivers);
         AddPanel(river);
         foreach (var texture in River.Textures)
@@ -950,9 +1010,9 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         bridge = new Bridge();
         AddPanel(bridge);
 
-        // 维京小船泊在池北岸的台阶边：构造时从 pond 取池塘矩形与位置，所以水池移动时航道和泊位都自动跟着走。
-        // 船头默认朝 +Z，正对 Player 走下来的那排台阶；跳上甲板即绑定位置，划出去后跳回岸上，船留在原地。
-        // 海面段还给 sea：船在海里跟着可见浪面起伏与倾斜，而不是浮在恒定海平面上。
+        // The Viking boat is moored by the steps on the pond's north bank: at construction it takes the pond rectangle and position from pond, so when the pond moves both the channel and the berth follow automatically.
+        // The bow faces +Z by default, straight at the flight of steps the Player walks down; jumping onto the deck binds the position, and after rowing out and jumping back ashore the boat stays put.
+        // The sea segment is also handed to sea: in the sea the boat follows the visible wave surface's rise and tilt instead of floating on a constant sea level.
         boat = new Boat(pond, sea);
         AddPanel(boat);
 
@@ -1034,6 +1094,11 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         painting = new Painting();
         AddPanel(painting);
 
+        // Day/night dial: sits in the free gap between the Settings button and the mirror stack, so it
+        // is added before neither makes a difference to drawing order - the two never overlap.
+        clock = new Clock();
+        AddPanel(clock);
+
         setting = new Setting()
         {
             OnClick = () =>
@@ -1082,30 +1147,30 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         picker.Targets.Add(room.bottle);
         picker.Targets.Add(room.busterDrone);
         picker.Targets.Add(sphere.sphereRow);
-        // 瀑布也走同一条路径：代理网格提供三角级拾取，Bounds/Wireframe/Outline 三种高亮与其它实体一致。
-        // 这里用列表而不是单个字段，多条瀑布时只需往 waterfalls 里再 Add 一个。
+        // Waterfalls take the same path: the proxy mesh provides triangle-level picking, and the Bounds/Wireframe/Outline highlights match other entities.
+        // A list rather than a single field, so multiple waterfalls just need one more Add into waterfalls.
         for (int i = 0; i < waterfalls.Count; i++)
         {
             picker.Targets.Add(waterfalls[i]);
         }
-        // 水汽体积也是同一类目标：不可见的盒控件，拾取后可在属性面板里改 Pos/Width/Height/Depth/Rotation，
-        // 改完下一帧就作用到雾的出生矩形上（见 WaterfallPool.Update）。
+        // The mist volume is the same kind of target: an invisible box control whose Pos/Width/Height/Depth/Rotation can be changed in the property panel after picking,
+        // and the change takes effect on the mist's spawn rectangle the next frame (see WaterfallPool.Update).
         if (waterfallPool != null)
         {
             picker.Targets.Add(waterfallPool.Mist);
         }
-        // 河流的每一段各自是一个选取目标：直线段与弯道段都能单独拖动、改长宽高、转方向。
-        // 高亮必须走 Wireframe（长条网格的世界 AABB 一旋转就“变胖”，见 RiverSegment 的类注释）。
+        // Each river segment is its own pick target: straight and curve segments can be dragged, resized, and rotated individually.
+        // The highlight must use Wireframe (a long mesh's world AABB "fattens" as soon as it rotates, see RiverSegment's class comment).
         foreach (var segment in river.Segments)
         {
             picker.Targets.Add(segment);
         }
-        // 两岸堤坝也可选，但粒度是单块：整条河一百多块共用一个 GLB 模板，按实例命中后选中的就是那一块，
-        // 面板上的 Pos/Width/Height/Depth/Rotation 直接写进这个实例（见 ObjectPanel 的实例分支）。
-        // 这些改动在 SyncDikes 里被当成相对自动布局的偏移保留，所以挪动整段河道时堤坝不会回到原样。
+        // The dikes on both banks are also selectable, but at single-block granularity: the whole river's hundred-plus blocks share one GLB template, and an instance hit selects that one block,
+        // with the panel's Pos/Width/Height/Depth/Rotation written directly into that instance (see ObjectPanel's instance branch).
+        // These changes are kept in SyncDikes as offsets relative to the automatic layout, so the dikes do not snap back when the whole river course is moved.
         picker.InstancedTargets.Add(river.Dikes);
-        // 出海口的水汽盒也是同一类目标：不可见的盒子，拾取后在属性面板里改位置/长宽高/朝向，
-        // 下一帧就作用到三组粒子的出生矩形上（见 River.UpdateMouthSpray：雾与白沫走盒底面，水花走盒顶面）。
+        // The river mouth's mist box is the same kind of target: an invisible box whose position/size/orientation can be changed in the property panel after picking,
+        // and the change takes effect on the three particle groups' spawn rectangles the next frame (see River.UpdateMouthSpray: mist and foam use the box's bottom face, spray the top face).
         picker.Targets.Add(river.MouthMist);
         if (robots != null)
         {
@@ -1113,11 +1178,11 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         }
         picker.InstancedTargets.Add(birds.seagullsModel);
         picker.InstancedTargets.Add(planes.planesModel);
-        // 船也是普通可选实体：点击选中后可在属性面板里查看它，与房子/瀑布同一条路径。
+        // The boat is an ordinary selectable entity too: click to select it and inspect it in the property panel, the same path as the house/waterfalls.
         picker.Targets.Add(boat.Hull);
         // The player's aircraft is the same kind of entity: click it to inspect the airframe in the property panel.
         picker.Targets.Add(aeroPlane.body);
-        // 旗杆与旗帜同样可选：杆柱和布面各算一个目标，点击后可在属性面板里查看位置与尺寸。
+        // The flagpole and flag are selectable as well: the column and the cloth each count as a target, and clicking them shows position and size in the property panel.
         picker.Targets.Add(flagpole.Pole);
         picker.Targets.Add(flagpole.Flag);
         AddPanel(picker);
@@ -1266,7 +1331,19 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
                 {
                     try
                     {
+                        // Contract 3-2: fonts load on a background task in parallel with the first frames, so their
+                        // duration belongs to the "everything is usable" milestone rather than to the white screen.
+                        long fontStart = StartupProfiler.Enabled ? StartupProfiler.Ticks() : 0;
+
                         var fontInstance = await Season.Fonts.Font.CreateAsync(font.File, font.Size);
+
+                        if (fontStart != 0)
+                        {
+                            StartupProfiler.Item("font", string.IsNullOrEmpty(font.Name) ? font.File : font.Name,
+                                StartupProfiler.ElapsedMs(fontStart), 0, font.File);
+
+                            StartupProfiler.TouchActivity();
+                        }
 
                         Season.Fonts.Font.Instance.Add(fontInstance);
                     }
@@ -1282,8 +1359,9 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     }
 
     /// <summary>
-    /// 把房间内腔交给天气场作为遮挡区域。降水区先消耗覆盖权重，因此室内棱柱内雨雪归零，
-    /// 纵向只到天花板，屋顶以上仍按自身区域降水。
+    /// Hands the room interior to the weather field as a shelter region. The precipitation region consumes
+    /// the cover weight first, so rain and snow are zeroed inside the interior prism, which extends vertically
+    /// only up to the ceiling; above the roof the own region still drives precipitation.
     /// </summary>
     void RefreshWeatherCover()
     {
@@ -1294,8 +1372,9 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         weatherCoverMax = max;
         float halfX = (max.X - min.X) * 0.5f, halfZ = (max.Z - min.Z) * 0.5f;
         float centerX = (min.X + max.X) * 0.5f, centerZ = (min.Z + max.Z) * 0.5f;
-        // 房间是方形、屋顶是双坡，内切椭圆会漏掉四角；这里用外接圆加过渡带，沿对角恰好盖住墙角，
-        // 于是墙外只多出半个屋檐宽的干燥带，看上去就是屋檐本身的雨影。
+        // The room is rectangular and the roof is a gable, so an inscribed ellipse would miss the corners; here we use
+        // the circumscribed circle plus a feather band, which along the diagonal exactly covers the wall corners,
+        // leaving only a half-eave-wide dry band outside the walls that reads as the eave's own rain shadow.
         float corner = MathF.Sqrt(halfX * halfX + halfZ * halfZ);
         float feather = MathF.Max(1f, MathF.Max(halfX, halfZ) * 0.2f);
         weather.Cover = new WeatherRegionSettings
@@ -1303,16 +1382,17 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             Id = "room-cover", Weather = WeatherKind.Clear, Shelter = true,
             CenterX = centerX, CenterZ = centerZ, RadiusX = corner + feather, RadiusZ = corner + feather,
             EdgeFeather = feather, Bottom = min.Y, Top = max.Y,
-            // 云范围收到亚米级：遮挡区只压制雨雪，不能在天上的云层里开洞。
+            // The cloud radius is shrunk to sub-meter: the shelter only suppresses rain and snow, it must not punch a hole in the sky's cloud deck.
             CloudRadiusX = 0.001f, CloudRadiusZ = 0.001f, CloudBase = 0,
         };
     }
 
     public override bool Update(float time, float? alpha = null, float? posX = null, float? posY = null, float? width = null, float? height = null, float? posZ = null, float? depth = null)
     {
-        // 逐像素 A/B 的取证钩子（见 AbCapture）：未启用时这两行分别是原样返回与一个静态布尔判断。
-        // delta 必须在 base.Update 之前替换，否则 Time 已经按墙上时钟推进过一帧了。
-        // Contract 3-1 的固定步长走同一个开关位：成本表要求 t 是帧号的纯函数，两个钩子都关着时只是一次静态布尔判断。
+        // Per-pixel A/B forensic hooks (see AbCapture): when disabled, these two lines are a pass-through and a
+        // static boolean check respectively. delta must be substituted before base.Update, otherwise Time has already
+        // been advanced by one frame on wall-clock time. Contract 3-1's fixed timestep uses the same switch:
+        // the cost table requires t to be a pure function of the frame number, and with both hooks off it is just one static boolean check.
         time = FrameProfiler.FixedDelta(AbCapture.FrameDelta(time));
         AbCapture.Tick();
 
@@ -1338,6 +1418,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             picker?.Alpha = 0f;
             views?.Alpha = 0f;
             mirrors?.Alpha = 0f;
+            clock?.Alpha = 0f;
         }
         else if (Mode is Mode.Play)
         {
@@ -1348,6 +1429,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             picker?.Alpha = 0f;
             views?.Alpha = 0f;
             mirrors?.Alpha = 1f;
+            clock?.Alpha = 1f;
         }
         else if (Mode is Mode.Edit)
         {
@@ -1358,6 +1440,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             picker?.Alpha = 1f;
             views?.Alpha = 0f;
             mirrors?.Alpha = 1f;
+            clock?.Alpha = 1f;
 
             Time -= time;
         }
@@ -1370,9 +1453,10 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             picker?.Alpha = 1f;
             views?.Alpha = 1f;
             mirrors?.Alpha = 1f;
+            clock?.Alpha = 1f;
         }
 
-        // 在所有面板早退前消费请求，打开设置也能预览天气。time 本身是帧秒数，与昼夜倍率无关。
+        // Consume the request before any panel's early return, so weather can be previewed even with settings open. time is frame seconds, independent of the day/night rate.
         RefreshWeatherCover();
         if (weather?.Update(WorldSettings.Current, time) == true)
             RequestSaveSettings();
@@ -1381,7 +1465,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         if (weather != null)
         {
             weatherVisuals.Update(weather.Field, time, regionalWeather, Camera.Far);
-            // 落雷边沿在本帧已经推进，雷声按声速延迟到闪电之后才响；展示模式没有区域闪电，不发声。
+            // The lightning edge has already advanced this frame; thunder is delayed behind the flash by the speed of sound, and Showcase mode has no regional lightning, so it stays silent.
             thunderAudio.Update(time, weatherVisuals, CameraPos, regionalWeather && weather.LightningActive);
         }
         DayNightCycle.Evaluate(celestial?.DayPhase ?? 0, out _, out float daylight, out _, out _, out _, out _);
@@ -1390,7 +1474,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             precipitation.Enabled = regionalWeather;
             precipitation.Advance(time, daylight);
         }
-        // 贴花的 Intensity 每帧都要重算：DecalEffect 每帧按当前值重新打包，所以写在这里就够，不需要通知。
+        // The decal Intensity must be recomputed every frame: DecalEffect repacks from the current value each frame, so writing it here is enough and no notification is needed.
         if (pondCaustics != null) pondCaustics.Intensity = CausticsIntensity * SunlightFactor(celestial?.DayPhase ?? 0);
 
         if (settingPanel != null)
@@ -1543,6 +1627,8 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // consume the release that a click inside a sensor needs.
         mirrors?.Update(time);
 
+        clock?.Update(time);
+
         setting?.Update(time);
 
         direction?.Update(time);
@@ -1571,7 +1657,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // Sea uses static geometry; each frame only synchronizes transforms and materials.
         sea?.Update(time);
 
-        // 帆船要在 sea 之后：它的吃水线读的是本帧的海面采样（Sea.SurfaceY）。
+        // Sailboats must come after sea: their waterline reads this frame's sea-surface sample (Sea.SurfaceY).
         sailingBoats?.Update(time);
 
         // Beach uses static instances; each frame only synchronizes instance matrices and materials.
@@ -1627,26 +1713,28 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
 
         pond?.Update(time);
 
-        // 船要排在 pond 之后：它的水面高度与航道都来自池塘，且每帧自己算摇晃与动画状态。
+        // The boat must come after pond: its water height and channel both come from the pond, and it computes its own rocking and animation state each frame.
         boat?.Update(time);
 
         tower?.Update(time);
 
         sphere?.Update(time);
 
-        // 瀑布控件每帧一同步：把 Pos/Rotation/Scale 算成摆放矩阵交给水幕，并更新高亮的三条通道。
-        // 水幕本身由 SceneWaterfall Pass 画，这里只管「对象」那一半。
+        // The waterfall control syncs every frame: it turns Pos/Rotation/Scale into a placement matrix for the sheet
+        // and updates the three highlighted channels. The sheet itself is drawn by the SceneWaterfall pass; this handles only the "object" half.
         for (int i = 0; i < waterfalls.Count; i++)
         {
             waterfalls[i].Update(time);
         }
 
-        // 瀑布潭必须接在瀑布之后：它的锚点是 sheet.Transform × 末控制点，要读本帧刚同步好的摆放矩阵；
-        // Panel.Update 不会自动递归（见上方注释），漏掉这一行水面/贴花/石块/粒子就会停在默认值（原点、默认 8m 矩形）。
+        // The waterfall pool must follow the waterfalls: its anchor is sheet.Transform x the last control point, so it
+        // reads the placement matrix synced just this frame. Panel.Update does not recurse automatically (see the comment above),
+        // so missing this line would leave the water surface/decals/rocks/particles at their defaults (origin, default 8m rectangle).
         waterfallPool?.Update(time);
 
-        // 河流同理：每个河段各自是独立 Mesh3D，Panel 不会递归 tick，漏了这行高亮脉动与 Changed 就停在初值。
-        // 真正的水面由 SceneWaterfall Pass 按 River 构造时注册好的 WaterRibbon 数据现算，与这里无关。
+        // Same for the river: each segment is its own separate Mesh3D and Panel does not tick recursively, so missing
+        // this line would leave the highlight pulse and Changed at their initial values. The actual water surface is
+        // computed on the fly by the SceneWaterfall pass from the WaterRibbon data registered when the River was built, unrelated to this.
         river?.Update(time);
 
         bridge?.Update(time);
@@ -1743,27 +1831,31 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     }
 
     /// <summary>
-    /// 瀑布的通用入口：拿一份形状（<paramref name="template"/>）生成一条独立的水幕控件，可选就地摆放。
+    /// Generic entry point for waterfalls: takes a shape (<paramref name="template"/>) and generates an independent
+    /// waterfall control, optionally placing it in the scene.
     ///
-    /// 一次调用做完五件事：拷作者数据（形状/材质/贴图名）、按需 <see cref="Waterfall.Place"/>、
-    /// AddControl 排队 Load（到那一刻才建代理网格）、登记进场景瀑布表（真正画水的那一侧）、
-    /// 登记进本 App 的 <see cref="waterfalls"/>（每帧 Update 与拾取目标）。
-    /// 于是「多条瀑布」只是多写几行：同一份 template 换一个 center 就能再长一条。
+    /// One call does five things: copies the author data (shape/material/texture names), calls
+    /// <see cref="Waterfall.Place"/> as needed, queues a Load via AddControl (the proxy mesh is built only at that
+    /// moment), registers into the scene waterfall table (the side that actually draws the water), and registers into
+    /// this App's <see cref="waterfalls"/> (per-frame Update and pick targets). So "multiple waterfalls" is just a few
+    /// more lines: the same template with a different center grows one more.
     ///
-    /// <paramref name="center"/> 为空表示不摆放：控制点里的参考坐标同时就是世界坐标（P1 的旧行为）。
-    /// center 与属性面板的 PosX/PosY/PosZ 是同一个量（包围盒中心）；<paramref name="size"/> 是逐轴目标尺寸（米），
-    /// 与面板的 Width/Height/Depth 同一套数，null 则各轴沿用 <paramref name="scale"/>。
-    /// 视觉微调后把面板上的这几个数抄回来就是启动值。
+    /// An empty <paramref name="center"/> means no placement: the reference coordinates in the control points are also
+    /// the world coordinates (P1's old behavior). center is the same quantity as the property panel's PosX/PosY/PosZ
+    /// (the bounding-box center); <paramref name="size"/> is the per-axis target size (meters), the same set of numbers
+    /// as the panel's Width/Height/Depth, and null keeps <paramref name="scale"/> for each axis. After visual tweaks,
+    /// copying these numbers from the panel back gives the startup values.
     ///
-    /// 三张 P0 资产也在这里登记：后端只按名字查字典，任一没注册就整条跳过（是「不显示」，
-    /// 而不是把白纹理当成满值白沫烧成一片白）。名字相同只加载一次，见 <see cref="RegisterNamedTexture"/>。
+    /// The three P0 assets are also registered here: the backend only looks textures up by name in a dictionary, and
+    /// any unregistered one makes the whole thing be skipped (it's "not shown", rather than burning the white texture
+    /// into full-value white foam across the sheet). The same name is loaded only once, see <see cref="RegisterNamedTexture"/>.
     /// </summary>
     internal Waterfall SpawnWaterfall(string name, Season.Rendering.WaterfallSheet template,
         Vector3? center = null, float yawDegrees = 0f, float scale = 1f, Vector3? size = null)
     {
         var waterfall = new Waterfall(name);
 
-        // 拷贝而不是共享：DeepColor/Opacity/SortOrder 这类参数要能逐条调，改一条不会波及整群。
+        // Copy rather than share: parameters like DeepColor/Opacity/SortOrder must be tweakable per instance, so changing one does not affect the whole group.
         waterfall.Sheet.CopyFrom(template);
 
         if (center.HasValue) waterfall.Place(center.Value, yawDegrees, scale, size);
@@ -1779,22 +1871,25 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     }
 
     /// <summary>
-    /// P1 瀑布演示：P0 选址探针定下的 12 行控制点（candidate #5，海岛山脉相对房子/鬼屋那一侧的内侧凹角，
-    /// 与东岸 Rocks 保持距离，四条观察视线全部可见）。数据逐行照抄
-    /// <c>.dbg/_waterfall_site/out/site_report.txt</c> 的 paste-ready 段。
+    /// P1 waterfall demo: the 12 rows of control points fixed by the P0 site-selection probe (candidate #5, the inner
+    /// concave corner of the island mountains on the side facing the house/haunted house, kept clear of the east-shore
+    /// Rocks, visible from all four observation lines). The data is copied row by row from the paste-ready section of
+    /// <c>.dbg/_waterfall_site/out/site_report.txt</c>.
     ///
-    /// outward 恒为 (0.511, 0, 0.860)（背离岩面的水平方向），半宽从 1.30 涨到 2.50 —— 水流在下落中摊开；
-    /// 弧长 17.97 m、落差 12.5 m。改形状只改这里：控制点进帧缓冲，着色器不需要重编译。
+    /// outward is always (0.511, 0, 0.860) (the horizontal direction away from the rock face), and the half-width grows
+    /// from 1.30 to 2.50 -- the flow spreads out as it falls; arc length 17.97 m, drop 12.5 m. To change the shape, edit
+    /// only here: the control points go into a frame buffer, so the shader needs no recompile.
     ///
-    /// 下面这 12 个点是探针给出的<b>原始世界坐标</b>，现在只当「形状模板」用：真正的启动位置与尺寸
-    /// 由 tunedCenter / tunedSize 给出（视觉微调的实测读数），见那一块的注释。
-    /// 要再挑位置：选中瀑布拖动或改数，把面板上的 PosX/PosY/PosZ 与 Width/Height/Depth 覆盖这两个变量即可。
+    /// The 12 points below are the <b>raw world coordinates</b> given by the probe, now used only as a "shape template":
+    /// the actual startup position and size are given by tunedCenter / tunedSize (the measured readings from visual
+    /// tweaks), see the comment on that block. To pick another location: select the waterfall and drag or edit the
+    /// numbers, then overwrite these two variables with the panel's PosX/PosY/PosZ and Width/Height/Depth.
     /// </summary>
     void CreateWaterfall()
     {
         var sheet = new Season.Rendering.WaterfallSheet
         {
-            // 海水蓝绿的水体本色 + 近白泡沫。卡通风靠明度差把两条白边和水体分开，不靠高光。
+            // The water body's own blue-green sea tone + near-white foam. The cartoon look separates the two white edges from the water body by brightness difference, not by specular highlights.
             DeepColor = new(0.09f, 0.31f, 0.36f),
             FoamColor = new(0.93f, 0.98f, 1.00f),
             Opacity = 0.85f,
@@ -1802,23 +1897,23 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             NormalStrength = 0.55f,
             NormalTiling = 2.5f,
             FoamAmount = 0.85f,
-            // 落差 12.5 m 的长带：唇口/落点白边按比例收窄，否则中段会被两条白带啃没。
+            // A long 12.5 m drop: the lip/impact white edges are narrowed proportionally, otherwise the middle would be eaten away by the two white bands.
             LipFoam = 0.08f,
             FootFoam = 0.10f,
             EdgeFoam = 0.22f,
             EdgeSoftness = 0.14f,
             Erosion = 0.30f,
             Bow = 0.14f,
-            // 截面是绕控制点连线的闭合环：Thickness 是总厚度，前后各分一半。
-            // 崖面就在控制点连线上，所以后半个截面埋进岩体（被软件深度测试剔除），
-            // 前半个截面鼓出来才是能看见的“水体”。1.0 m 对 5 m 宽、12.5 m 高的瀑布大约是一人高的水墙。
-            // 想让瀑布更“实”就加这个数，代价是前壁也离崖面更远（远处看会显得往外飘）。
+            // The cross-section is a closed ring around the control-point polyline: Thickness is the total thickness, split evenly front and back.
+            // The cliff face lies on the control-point polyline, so the rear half of the section sinks into the rock (culled by the software depth test),
+            // and only the front half bulges out as the visible "water body". 1.0 m for a 5 m wide, 12.5 m high waterfall is roughly a person-high wall of water.
+            // To make the waterfall look more "solid", raise this number, at the cost of the front wall moving further from the cliff face (it will appear to float outward from a distance).
             Thickness = 1.0f,
-            // 环向列数（含首尾重合的那一列）：12 段肉眼已看不出棱，两侧的切线过渡也不会太硬。
+            // Number of columns around the ring (including the coincident first/last column): at 12 segments the eye can no longer see the facets, and the tangent transition between the two sides is not too hard either.
             Columns = 12,
             Subdiv = 2,
         };
-        // 顺序必须从出水口到落点；v=0 是唇口、v=1 是落点，泡沫带按这个方向分配。
+        // The order must go from the outlet to the impact point; v=0 is the lip and v=1 is the impact point, and the foam band is assigned along this direction.
         sheet.Points.Add(new(new Vector3( -75.32f,  13.44f,  -74.70f), 1.30f, new Vector3( 0.511f, 0f,  0.860f)));
         sheet.Points.Add(new(new Vector3( -74.92f,  12.10f,  -74.03f), 1.66f, new Vector3( 0.511f, 0f,  0.860f)));
         sheet.Points.Add(new(new Vector3( -74.52f,  10.67f,  -73.36f), 1.81f, new Vector3( 0.511f, 0f,  0.860f)));
@@ -1832,36 +1927,41 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         sheet.Points.Add(new(new Vector3( -69.90f,   1.71f,  -65.58f), 2.44f, new Vector3( 0.511f, 0f,  0.860f)));
         sheet.Points.Add(new(new Vector3( -69.19f,   0.92f,  -64.38f), 2.50f, new Vector3( 0.511f, 0f,  0.860f)));
 
-        // 视觉微调的实测读数（属性面板原样）：位置是包围盒中心，尺寸是包围盒的边长（米），绕 Y 无旋转。
+        // Measured readings from visual tweaks (as-is from the property panel): position is the bounding-box center, size is the bounding-box side lengths (meters), no rotation about Y.
         //
-        // 这些值不能像上一版那样烘进控制点：尺寸是逐轴的（15 × 13 × 13），而控制点只描述位置，
-        // 截面的半宽与厚度又是各向同性的标量，吸不掉 X 与 Y/Z 不同的缩放；而且这条水幕斜着横跨 XZ，
-        // 只拉宽 X 会连带改变水流的走向 —— 这类各向异性只能由摆放矩阵做，也就是 Width/Height/Depth。
-        // 于是控制点保持探针原值，摆放交给 Place：矩阵是 p → (p - 锚点)·缩放 + Pos，
-        // 锚点（包围盒中心）正好落在 Pos 上，包围盒边长正好等于 tunedSize，面板读回来的还是这两组数。
+        // Unlike the previous version, these values cannot be baked into the control points: the size is per-axis (15 x 13 x 13),
+        // while the control points describe only position, and the section's half-width and thickness are isotropic scalars that
+        // cannot absorb the different X and Y/Z scaling; also, this sheet spans XZ diagonally, so widening only X would change
+        // the flow's direction -- such anisotropy can only be done by the placement matrix, i.e. Width/Height/Depth.
+        // So the control points keep the probe's original values and placement is delegated to Place: the matrix is p -> (p - anchor)·scale + Pos,
+        // the anchor (bounding-box center) lands exactly on Pos, and the bounding-box side lengths equal tunedSize exactly, so the panel reads back the same two sets of numbers.
         var tunedCenter = new Vector3(-75f, 6.8f, -73f);
         var tunedSize = new Vector3(15f, 14f, 13f);
 
-        // 一条瀑布就是一调。同形状、换坐标再调一次就多一条（不同模板也可以），
-        // 上限见 SceneWaterfalls.MaxActiveWaterfalls：
+        // Each waterfall is one call. The same shape with different coordinates called again grows one more (different templates work too);
+        // the cap is SceneWaterfalls.MaxActiveWaterfalls:
         //     SpawnWaterfall("Waterfall P2", sheet, new Vector3(x, y, z), yaw, scale, new Vector3(w, h, d));
         SpawnWaterfall("Waterfall P1", sheet, tunedCenter, yawDegrees: 0f, size: tunedSize);
     }
 
     /// <summary>
-    /// D1 贴花演示：三块贴花各带一张 SeasonImage 生成的 RGBA 贴图（见 .dbg/_decal_assets）。
-    /// 贴图是「乘数」而不是反照率：Modulate 走 dst*src 混合，把一张照片直接当 albedo 会把地面
-    /// 压暗好几倍，所以两张地表图的亮度在生成器里已被压进 [0.5,1.0] / [0.62,1.0]，颜色仍留在图里，
-    /// Tint 只做轻微偏向。alpha 由生成器画出有机轮廓，取代了原先着色器里的 4x4 调试棋盘格。
+    /// D1 decal demo: three decals each carry an RGBA texture generated by SeasonImage (see .dbg/_decal_assets).
+    /// The textures are "multipliers" rather than albedo: Modulate blends as dst*src, and using a photo directly as
+    /// albedo would darken the ground several times over, so the brightness of the two ground textures has already been
+    /// squeezed into [0.5,1.0] / [0.62,1.0] in the generator while the color stays in the image; Tint only applies a
+    /// slight bias. The alpha is drawn by the generator as an organic outline, replacing the earlier 4x4 debug checkerboard
+    /// in the shader.
     ///
-    /// 贴花只按名字查后端纹理字典，不会自己加载文件：名字未注册的那一帧整块贴花会被后端跳过，
-    /// 所以要先把同一张图交给 <see cref="RegisterDecalTexture"/> 走既有的命名纹理路径。
+    /// Decals only look up textures by name in the backend dictionary and do not load files themselves: on the frame a name
+    /// is unregistered the whole decal is skipped by the backend, so the same image must first be handed to
+    /// <see cref="RegisterDecalTexture"/> to go through the existing named-texture path.
     /// </summary>
     void CreatePondDecals()
     {
-        // 池外西南侧的湿草：Modulate 且写粗糙度（水洼），这是 s9 的验证点。
-        // 投影盒必须以受贴表面为中心、上下各留余量：盒面恰好落在表面上时，深度重建的误差加上 TAA 抖动
-        // 会让 |local.y|≤1 的判定逐行翻转，表现为闪烁的条纹。草地在 y=0。
+        // Wet grass on the southwest side outside the pond: Modulate and writes roughness (puddles); this is the s9 verification point.
+        // The projection box must be centered on the surface being decaled with slack above and below: if the box face lands exactly
+        // on the surface, the depth-reconstruction error plus TAA jitter makes the |local.y|<=1 test flip row by row, showing up as
+        // flickering stripes. The grass is at y=0.
         var wetGrass = new Season.Rendering.DecalVolume
         {
             Mode = Season.Rendering.DecalMode.Modulate,
@@ -1871,7 +1971,7 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             Tint = new(0.94f, 0.97f, 1.00f),
             Opacity = 0.9f,
             AngleFade = 0f,
-            // 轮廓已经由贴图 alpha 画好，盒边羽化再压下去就只剩一个小圆点了。
+            // The outline is already drawn by the texture alpha; pushing it down further with box-edge feathering would leave only a small dot.
             EdgeFade = 0.15f,
             AffectRoughness = true,
             Roughness = 0.04f,
@@ -1880,8 +1980,9 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         Decals.Add(wetGrass);
         RegisterNamedTexture(wetGrass.Texture);
 
-        // 北侧池沿顶面的苔藓：只调制颜色。池沿顶面在 Pond.RimTop（堤坝件高 0.86 米埋入 0.10 米后为 0.76），
-        // 盒子以它为中心；池沿内外侧壁有一截落进盒里，正好用来看掠射淡出。北带中心在池心 +4.775 米处。
+        // Moss on the top face of the north pond rim: modulates color only. The rim top face is at Pond.RimTop (0.76 after a
+        // 0.86 m dam piece sunk 0.10 m), and the box is centered on it; a stretch of the rim's inner and outer side walls falls
+        // into the box, which is exactly what shows the grazing-angle fadeout. The north band's center is at pond center + 4.775 m.
         var moss = new Season.Rendering.DecalVolume
         {
             Mode = Season.Rendering.DecalMode.Modulate,
@@ -1897,10 +1998,10 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         Decals.Add(moss);
         RegisterNamedTexture(moss.Texture);
 
-        //池底的焦散：Additive，透明度 0.35 的池水会盖在它上面，同时验证“贴花在透明之前”。
-        // 贴图本身已经是「黑底上的光网」，像素就是光，所以 Tint 只带到接近白，强度靠 Intensity 收。
-        // 池底就是 y=0 的草地，水面在 0.4：盒子以池底为中心，顶端 0.15 仍在水面以下。
-        // Intensity 这里只是设计值，实际亮度每帧由 Update 按阳光高度重算（见 CausticsIntensity / SunlightFactor）。
+        //Caustics on the pond floor: Additive, and the 0.35-opacity pond water draws over it, which also verifies "decals before transparent".
+        // The texture itself is already a "light mesh on a black background", so the pixels are the light; Tint only brings it near white and the strength is set by Intensity.
+        // The pond floor is the grass at y=0 and the water surface is at 0.4: the box is centered on the pond floor, and its top at 0.15 is still below the water surface.
+        // Intensity here is only a design value; the actual brightness is recomputed each frame by Update from the sun height (see CausticsIntensity / SunlightFactor).
         pondCaustics = new Season.Rendering.DecalVolume
         {
             Mode = Season.Rendering.DecalMode.Additive,
@@ -1918,15 +2019,16 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         RegisterNamedTexture(pondCaustics.Texture);
     }
 
-    /// <summary>正午直射时的焦散强度设计值。</summary>
+    /// <summary>Design value for the caustics intensity under direct noon sunlight.</summary>
     const float CausticsIntensity = 0.5f;
 
     /// <summary>
-    /// 直射阳光倍率：色散焦散是阳光经水面折射汇聚出来的亮网，不是自发光，亮度必须跟着太阳走。
-    /// 太阳越高越强、接近地平线时几乎全部被水面按菲涅尔反射掉，所以用高次幂而不是线性，
-    /// 并带一个起始阈值，避免日没前后在地平线附近拖出一条微亮的贴花。
-    /// 月光焦散太弱，不参与。
-    /// internal：潭底焦散（WaterfallPool）与池底焦散共用这一条曲线，两处亮度永远同源。
+    /// Direct-sunlight multiplier: dispersive caustics are the bright mesh of sunlight refracted and focused through the
+    /// water surface, not self-emission, so the brightness must follow the sun. The higher the sun the stronger, and near
+    /// the horizon almost all of it is Fresnel-reflected off the water surface, hence the high-power curve rather than a
+    /// linear one, plus an onset threshold to avoid a faint decal trailing near the horizon around sunset. Moonlight caustics
+    /// are too weak and do not participate. internal: the pool-floor caustics (WaterfallPool) and the pond-floor caustics
+    /// share this one curve, so the two brightnesses always come from the same source.
     /// </summary>
     internal static float SunlightFactor(float phase)
     {
@@ -1936,20 +2038,25 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
     }
 
     /// <summary>
-    /// 把贴图名字注册进后端纹理字典。贴花与水幕都只按名字查字典、不会自己加载文件，
-    /// 名字没注册就会被整块跳过，所以这里复用既有的命名纹理路径：一张永远不画的 Sprite2D 用同一个名字加载。
+    /// Registers a texture name into the backend texture dictionary. Decals and waterfall sheets only look names up in
+    /// the dictionary and never load files themselves, so an unregistered name means the whole thing is skipped; that's why
+    /// this reuses the existing named-texture path: a Sprite2D that is never drawn loads under the same name.
     ///
-    /// 注册时同步解码一次：AddControl 走的是后台队列（BaseApp.RequestLoad → 消费线程），只排队的话
-    /// 贴图要过几秒才进字典，而水幕/河流的第一帧就要按名字取样，期间整条水带按“缺表即跳过”的约定不画。
-    /// LoadSprite2D 内部是同步解码，队列里那条稍后会命中同一个缓存键，不会重复解码。
+    /// It decodes once synchronously on registration: AddControl goes through a background queue (BaseApp.RequestLoad -> consumer
+    /// thread), and merely queuing would let a texture take a few seconds to reach the dictionary, while the waterfall/river needs
+    /// to sample by name on its very first frame, and during that time the whole water band is not drawn per the "missing entry means
+    /// skip" rule. LoadSprite2D decodes synchronously internally, and the queued entry later hits the same cache key, so it won't
+    /// decode twice.
     ///
-    /// 浏览器是唯一例外：WASM 单线程运行时没有 Monitor，任何 Task.Wait / GetResult 都会抛
-    /// PlatformNotSupportedException（见下方），而浏览器取图本身也只能走异步 fetch，同步等不到任何东西。
-    /// 那里只保留 AddControl 排进队列的那一条，由图元队列逐帧解码（BaseApp.ProcessControlQueueFrame）；
-    /// 代价是水幕在最初几帧还没图、按缺表约定不画，等字典填上后自然出现。
+    /// The browser is the only exception: the single-threaded WASM runtime has no Monitor, and any Task.Wait / GetResult throws
+    /// PlatformNotSupportedException (see below), while fetching images in the browser itself can only go through an async fetch,
+    /// so a synchronous wait gets nothing. There only the AddControl-queued entry is kept, decoded frame by frame by the primitive
+    /// queue (BaseApp.ProcessControlQueueFrame); the cost is that the waterfall sheet has no texture for the first few frames and
+    /// is not drawn per the missing-entry rule, appearing naturally once the dictionary is filled.
     ///
-    /// 按名字去重：多条瀑布共用同一套三张贴图，不去重就是几个空 Sprite2D 各自加载同一份文件。
-    /// internal：WaterfallPool 的潭底两张贴花走同一条命名纹理路径，不再另开加载链。
+    /// Deduplicated by name: multiple waterfalls share the same set of three textures, and without dedup that would be several
+    /// empty Sprite2D instances each loading the same file. internal: WaterfallPool's two pool-floor decals go through the same
+    /// named-texture path instead of opening their own load chain.
     /// </summary>
     internal void RegisterNamedTexture(string? name)
     {
@@ -1959,17 +2066,18 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         var sprite = new Season.Controls.Sprite2D
         {
             Name = name,
-            // LoadSprite2D 内部把 Width/Height 转成 int，null 会被吞成一次“加载失败”，这里给实数。
+            // LoadSprite2D internally converts Width/Height to int, and null gets swallowed as a "load failure", so give real numbers here.
             Width = 1,
             Height = 1,
-            // 纯载体：Alpha 为 0 时 Draw 直接返回，不会出现在屏幕上。
+            // Pure carrier: with Alpha 0 Draw returns immediately and it never appears on screen.
             Alpha = 0f,
             Enable = false,
         };
         AddControl(sprite);
 
-        // 浏览器：AddControl 已经把它排进队列，那一条就是它唯一的解码路径 —— 这里若再直接调一次
-        // LoadSprite2D，两次都会走到 AddRef，队列那条稍后落空就是引用计数收支不一致。
+        // Browser: AddControl has already queued it, and that entry is its only decode path -- calling
+        // LoadSprite2D directly again here would make both reach AddRef, and the queue entry later failing
+        // would leave the reference count unbalanced.
         if (OperatingSystem.IsBrowser()) return;
 
         try
@@ -1981,8 +2089,8 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
             AddLog(LogType.Error, $"[Texture] '{name}' LoadSprite2D threw: {ex}");
         }
 
-        // 三张表缺任意一张，瀑布与河流就整段跳过，而后端失败是静默的（只是不画）。
-        // 缺图时把“文件在不在”一起写进日志，省得再猜是寻址错还是解码错。
+        // If any one of the three maps is missing, the waterfall and river are skipped entirely, and backend failures are silent (just not drawn).
+        // When a texture is missing, log "whether the file exists" as well, to save guessing whether it's an addressing error or a decode error.
         if (sprite.OriginWidth <= 0 || sprite.OriginHeight <= 0)
         {
             string baseDir = Season.Storage.StorageService.DirectoryBase;

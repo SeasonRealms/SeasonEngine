@@ -110,7 +110,12 @@ public enum ViewFeature
     /// <see cref="All"/> so a view that never touches this property keeps the main view's behaviour.</summary>
     MotionBlur = 1 << 14,
 
-    All = Opaque | Transparent | Shadows | Fog | Weather | AmbientOcclusion | Bloom | AntiAliasing | Particles | Post | Decals | Water | Reflections | Waterfalls | MotionBlur,
+    /// <summary>F1 depth-of-field. Off means this view records no gather dispatch and owns no blur texture, so a 192 px
+    /// minimap does not pay for a lens its camera was never pointed with. Included in <see cref="All"/> so a view that
+    /// never touches this property keeps the main view's behaviour.</summary>
+    DepthOfField = 1 << 15,
+
+    All = Opaque | Transparent | Shadows | Fog | Weather | AmbientOcclusion | Bloom | AntiAliasing | Particles | Post | Decals | Water | Reflections | Waterfalls | MotionBlur | DepthOfField,
 }
 
 /// <summary>How a view consumes the frame-wide cascaded shadow atlas.</summary>

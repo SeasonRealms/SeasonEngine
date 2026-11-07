@@ -40,6 +40,13 @@ vec4 RbF(int i) { return rbF[i]; }
 int RbOffset(uint index) { return 16+int(index)*48; }
 vec4 RbTransform(vec4 p,int i) { return p.x*RbF(i)+p.y*RbF(i+1)+p.z*RbF(i+2)+p.w*RbF(i+3); }
 
+// Analytic mist for the band itself; see WaterRibbonShaders.Hlsl for why this is an exponential rather than a volume
+// sample. Slot 37.w is the extinction averaged along this ribbon's eye ray, zero when no medium covers the path.
+float RbFogTransmittance(vec3 world,vec3 eye,float sigma) {
+    if(sigma<=0.0) return 1.0;
+    return exp(-sigma*distance(world,eye));
+}
+
 // Per-ribbon placement matrix (slots 38..41). Points carry w=1 and directions carry w=0, so translation applies only to points.
 vec3 RbSheetPoint(int offset,vec3 p) { return RbTransform(vec4(p,1.0),offset+38).xyz; }
 vec3 RbSheetVector(int offset,vec3 v) { return RbTransform(vec4(v,0.0),offset+38).xyz; }
@@ -160,7 +167,8 @@ void main() {
 """;
 
     /// <summary>
-    /// Fragment stage: shallow cartoon river water. Order is depth test -> soft shoreline -> sampling -> bank foam -> lighting.
+    /// Fragment stage: shallow cartoon river water. Order is depth test -> soft shoreline -> sampling -> bank foam ->
+    /// lighting -> fog.
     /// The absorption term is deliberately a screen-space ramp rather than a physical one: the channel is ~13 cm deep, so a
     /// Beer-Lambert term would be numerically indistinguishable from zero, and this pass has no linear depth available.
     /// </summary>
@@ -180,7 +188,7 @@ void main() {
     vec4 material1 = RbF(offset+34);  // foam color.rgb, foam amount
     vec4 material2 = RbF(offset+35);  // flow speed m/s, normal strength, normal tiling, unused
     vec4 material3 = RbF(offset+36);  // edge foam, edge softness, depth meters, unused
-    vec4 material4 = RbF(offset+37);  // sort order, phase meters, 0, 0
+    vec4 material4 = RbF(offset+37);  // sort order, phase meters, 0, extinction
     vec4 camera = RbF(4);
     vec4 sun = RbF(6);                // propagation direction.xyz, intensity
     vec4 sunColor = RbF(7);
@@ -275,6 +283,10 @@ void main() {
     vec3 halfVector = normalize(view+toSun);
     color += sunColor.rgb*(sun.w*pow(clamp(dot(shadedNormal,halfVector),0.0,1.0),64.0)*0.45);
     color += (ambientLight+direct)*pow(1.0-clamp(dot(shadedNormal,view),0.0,1.0),4.0)*0.06;
+
+    // Fog last: alpha, not colour, because the fraction the band loses is exactly the fraction the already-fogged
+    // background shows through.
+    alpha *= RbFogTransmittance(vWorld,camera.xyz,material4.w);
 
     outColor = vec4(color,alpha);
 }

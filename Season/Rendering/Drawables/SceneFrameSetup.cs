@@ -42,6 +42,11 @@ internal static class SceneFrameSetup
             && lightParams.Lights[spotIdx].DirType.W == GpuLight.TypeSpot)
             CascadedShadow.ComputeSpot(in lightParams.Lights[spotIdx]);
 
+        // Local point-light cube shadows, consumed only by the fog's injection kernel. Selected and ranked against the fog
+        // volumes rather than the camera, so the matrices hold still while the eye moves - the same reasoning that anchors
+        // the far map to the medium. Nothing here reaches the lighting UBO, so a frame with no fog pays nothing.
+        CascadedShadow.ComputeLocal(in lightParams);
+
         CascadedShadow.Apply(ref lightParams);
     }
 

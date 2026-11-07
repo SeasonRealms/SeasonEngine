@@ -241,6 +241,30 @@ public static class WebApp
                 Season.Rendering.FrameSchedule.ShadowMap = shadowRt;
                 Season.Rendering.FrameSchedule.RenderShadow = _graphics.RenderShadowPass;
                 WebGPUInterop.SetShadowAtlas(((WGPURenderTarget)shadowRt).Name);
+                // Fog-only far shadow: the medium's own map, fixed at FarSize^2 and anchored to the volumes rather than
+                // to the camera. Registered unconditionally because execution is gated by CascadedShadow.FarActive, so
+                // a host that never enables fog allocates the texture and runs no pass. It is not an atlas and never
+                // goes through SetShadowAtlas: only the fog injection kernel binds it.
+                Season.Rendering.FrameSchedule.FarShadowMap = _graphics.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
+                {
+                    DepthFormat = Season.Rendering.RtFormat.D32Float,
+                    MatchBackbufferSize = false,
+                    Width = (uint)Season.Rendering.CascadedShadow.FarSize,
+                    Height = (uint)Season.Rendering.CascadedShadow.FarSize,
+                    SampleCount = 1,
+                });
+                Season.Rendering.FrameSchedule.RenderFarShadow = _graphics.RenderFarShadowPass;
+                // Fog-only local point-light cubes: two lamps of six 128^2 faces packed into one 512x384 map. Like the far
+                // map it is not an atlas and never goes through SetShadowAtlas - only the fog injection kernel binds it.
+                Season.Rendering.FrameSchedule.LocalShadowMap = _graphics.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
+                {
+                    DepthFormat = Season.Rendering.RtFormat.D32Float,
+                    MatchBackbufferSize = false,
+                    Width = (uint)Season.Rendering.CascadedShadow.LocalShadowWidth,
+                    Height = (uint)Season.Rendering.CascadedShadow.LocalShadowHeight,
+                    SampleCount = 1,
+                });
+                Season.Rendering.FrameSchedule.RenderLocalShadow = _graphics.RenderLocalShadowPass;
             }
 
             // 2-2 Contract Clause 1: finalize the AO tier at initialization time
@@ -332,6 +356,8 @@ public static class WebApp
                     Graphics.HdrSceneColor, _graphics.ComputeSupported, immediate2D)
                     || RenderQuality.Current.RequiresDecalSceneDepth(Graphics.HdrSceneColor, immediate2D)
                     || RenderQuality.Current.RequiresReflectionSceneDepth(Graphics.HdrSceneColor,
+                        _graphics.ComputeSupported, immediate2D)
+                    || RenderQuality.Current.RequiresDofSceneDepth(Graphics.HdrSceneColor,
                         _graphics.ComputeSupported, immediate2D)))
             {
                 Season.Rendering.FrameSchedule.SceneDepth = _graphics.CreateRenderTarget(new Season.Rendering.RenderTargetDesc

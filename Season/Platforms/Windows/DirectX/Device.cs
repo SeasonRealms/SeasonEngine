@@ -2166,6 +2166,8 @@ uint subresource = D3D12.ResourceBarrierAllSubresources, ResourceBarrierFlags fl
         "SceneWater\0"u8.ToArray(),
         "SsrComposite\0"u8.ToArray(),
         "SceneWaterfall\0"u8.ToArray(),
+        "ShadowFar\0"u8.ToArray(),
+        "ShadowLocal\0"u8.ToArray(),
     ];
 
     internal static void PushDebugGroup(byte[] asciiLabelZ)

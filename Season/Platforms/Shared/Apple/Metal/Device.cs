@@ -207,7 +207,7 @@ internal static class Device
     static MTLRenderPassDescriptor? _backbufferRpd;
 
     /// <summary>Pass debug labels used for encoder.Label and Xcode GPU capture markers in step 0. The index matches RenderPassId.</summary>
-    static readonly string[] _passLabels = { "Shadow", "Scene", "Post", "OutlineMask", "FinalBlit", "Overlay", "SceneOpaque", "FogComposite", "SceneTransparent", "WeatherComposite", "SceneDecal", "SceneWater", "SsrComposite", "SceneWaterfall" };
+    static readonly string[] _passLabels = { "Shadow", "Scene", "Post", "OutlineMask", "FinalBlit", "Overlay", "SceneOpaque", "FogComposite", "SceneTransparent", "WeatherComposite", "SceneDecal", "SceneWater", "SsrComposite", "SceneWaterfall", "ShadowFar", "ShadowLocal" };
 
     /// <summary>Phase 4 current pass id, written by BeginPass and reset by EndPass.
     /// Pipeline.SetPipeline uses it to route OutlineMask passes to the mask PSO,

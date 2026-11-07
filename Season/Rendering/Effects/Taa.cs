@@ -699,8 +699,8 @@ void main()
         bool inside = all(greaterThan(prevUv, vec2(0.0))) && all(lessThan(prevUv, vec2(1.0)));
         float w = (uHistoryValid > 0.5 && inside) ? fb : 0.0;
 
-        // Reactive rect: verbatim equivalent to the HLSL side; the rationale and the 'do not skip the
-        // sample' trade-off are in the comment there.
+        // Reactive rect: verbatim equivalent to the HLSL side; the rationale and the ""do not skip the
+        // sample"" trade-off are in the comment there.
         bool reactive = uv.x > uReactiveMinX && uv.y > uReactiveMinY
             && uv.x < uReactiveMaxX && uv.y < uReactiveMaxY;
         if (reactive) w = 0.0;
@@ -871,8 +871,8 @@ kernel void CSMain(
         bool inside = all(prevUv > float2(0.0)) && all(prevUv < float2(1.0));
         float w = (params.uHistoryValid > 0.5 && inside) ? fb : 0.0;
 
-        // Reactive rect: verbatim equivalent to the HLSL side; the rationale and the 'do not skip the
-        // sample' trade-off are in the comment there.
+        // Reactive rect: verbatim equivalent to the HLSL side; the rationale and the ""do not skip the
+        // sample"" trade-off are in the comment there.
         bool reactive = uv.x > params.uReactiveMinX && uv.y > params.uReactiveMinY
             && uv.x < params.uReactiveMaxX && uv.y < params.uReactiveMaxY;
         if (reactive) w = 0.0;
@@ -1046,8 +1046,8 @@ fn CSMain(@builtin(global_invocation_id) id : vec3<u32>)
             w = fb;
         }
 
-        // Reactive rect: verbatim equivalent to the HLSL side; the rationale and the 'do not skip the
-        // sample' trade-off are in the comment there.
+        // Reactive rect: verbatim equivalent to the HLSL side; the rationale and the ""do not skip the
+        // sample"" trade-off are in the comment there.
         let reactive = uv.x > params.uReactiveMinX && uv.y > params.uReactiveMinY
             && uv.x < params.uReactiveMaxX && uv.y < params.uReactiveMaxY;
         if (reactive)

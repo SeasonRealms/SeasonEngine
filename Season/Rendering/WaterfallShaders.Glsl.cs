@@ -38,6 +38,12 @@ layout(push_constant) uniform WaterfallParams { uvec4 waterfallParams; };
 vec4 WfF(int i) { return wfF[i]; }
 int WfOffset(uint index) { return 16+int(index)*48; }
 vec4 WfTransform(vec4 p,int i) { return p.x*WfF(i)+p.y*WfF(i+1)+p.z*WfF(i+2)+p.w*WfF(i+3); }
+// Analytic mist for the sheet itself; see WaterfallShaders.Hlsl for why this is an exponential rather than a volume
+// sample. Slot 37.w is the extinction averaged along this sheet's eye ray, zero when no medium covers the path.
+float WfFogTransmittance(vec3 world,vec3 eye,float sigma) {
+    if(sigma<=0.0) return 1.0;
+    return exp(-sigma*distance(world,eye));
+}
 
 // Per-sheet placement matrix (slots 38..41). Points carry w=1 and directions carry w=0: translation applies only to points,
 // and the normal follows rotation and non-uniform scale automatically via the cross of the two tangents, the same derivation as the other three backends.
@@ -321,6 +327,9 @@ void main() {
     // A very light rim light: a cartoon-style sheet needs a bright edge when backlit, otherwise the whole thing smears into the background rocks.
     color += (ambientLight+direct)*pow(1.0-clamp(dot(shadedNormal,view),0.0,1.0),4.0)*0.08;
 
+    // Fog last: alpha, not colour, because the fraction the sheet loses is exactly the fraction the already-fogged
+    // background shows through.
+    alpha *= WfFogTransmittance(vWorld,camera.xyz,WfF(offset+37).w);
     outColor = vec4(color,alpha);
 }
 """;

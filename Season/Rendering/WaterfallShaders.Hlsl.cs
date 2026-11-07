@@ -234,7 +234,29 @@ WaterfallVertex VSMain(uint id : SV_VertexID)
     /// software depth test (both are in front of the scene depth). The back wall is darkened and faded using the geometric normal's orientation against the view direction,
     /// while the front wall's backFace is 0 and is completely unaffected.
     /// </summary>
-    public const string PixelHlsl = """
+    /// <summary>
+    /// Analytic mist for the sheet itself. This Pass is ordered after FogComposite, so the color target already holds the
+    /// fogged background; without applying the same medium here the curtain composites at full contrast on top of it and
+    /// reads as floating in front of the fog rather than inside it.
+    ///
+    /// Analytic instead of a sample of fogIntegrated on purpose: the sheet only needs the medium's transmittance at one
+    /// point, and an exponential with the volume's extinction gets that without giving this pipeline its own 3D-texture
+    /// descriptor set on four backends. In-scatter is not added because it is already in the target - attenuating alpha
+    /// lets it show through - and the sheet's own radiance loses exactly the fraction the fog has replaced.
+    ///
+    /// Header slot 37.w carries that sheet's own extinction, averaged along the eye ray rather than sampled at the sheet:
+    /// a curtain standing beyond a fog bank is covered by the medium in between, and there is none at the curtain itself.
+    /// Per sheet rather than per frame because it is an integral along that sheet's own ray.
+    /// </summary>
+    public const string FogHlsl = """
+float WfFogTransmittance(float3 world, float3 eye, float sigma)
+{
+    if (sigma <= 0.0f) return 1.0f;
+    return exp(-sigma * distance(world, eye));
+}
+""";
+
+    public const string PixelHlsl = FogHlsl + """
 float4 PSMain(WaterfallVertex input) : SV_TARGET
 {
     uint offset = WfOffset(input.slot);
@@ -351,6 +373,10 @@ float4 PSMain(WaterfallVertex input) : SV_TARGET
     // A very light rim light: a cartoon-style sheet needs a bright edge when backlit, otherwise the whole thing smears into the background rock.
     color += (ambientLight + direct) * pow(1.0f - saturate(dot(shadedNormal, view)), 4.0f) * 0.08f;
 
+    // Fog last: everything above is the sheet's own radiance, and the medium only decides how much of it reaches the
+    // eye. Attenuating alpha rather than colour is what puts the sheet *inside* the fog: the fraction it loses is
+    // exactly the fraction the already-fogged background shows through.
+    alpha *= WfFogTransmittance(input.world, camera.xyz, WfF(offset + 37u).w);
     return float4(color, alpha);
 }
 """;

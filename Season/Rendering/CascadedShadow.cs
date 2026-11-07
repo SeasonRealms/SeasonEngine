@@ -65,6 +65,23 @@ public static class CascadedShadow
     public static bool SpotActive;
 
     /// <summary>
+    /// Light-space ViewProj of the fog's far shadow map for this frame, valid when <see cref="FarActive"/>.
+    ///
+    /// Unlike the cascades this one is anchored to the medium, not to the camera: the centre is the union of the enabled
+    /// fog volumes' world bounds, so walking the camera around leaves the matrix bit-identical and no temporal filter has
+    /// to chase a map that moved underneath it. The cascades have to follow the camera because they cover the camera's
+    /// frustum; the far map covers the fog, and the fog does not move.
+    /// </summary>
+    public static Matrix4x4 FarViewProj = Matrix4x4.Identity;
+
+    /// <summary>Whether the fog's far shadow map is valid this frame. Cleared in <see cref="BeginFrame"/> and set by
+    /// <see cref="ComputeFar"/> only when a directional light casts into a live fog volume.</summary>
+    public static bool FarActive;
+
+    /// <summary>Half extent the far map spans on each axis, in metres. Zero while <see cref="FarActive"/> is false.</summary>
+    public static float FarExtent;
+
+    /// <summary>
     /// Generation counter for the shadow pass. It is incremented monotonically by <see cref="BeginFrame"/> and stays constant within a frame.
     /// Backends use it to cache "the caster primitive list for this pass": within one shadow pass, the same list is replayed for all four atlas quadrants
     /// (3 cascades + 1 spotlight), with only the viewport and light-space ViewProj changing per slot.
@@ -73,8 +90,137 @@ public static class CascadedShadow
     /// </summary>
     public static int Epoch;
 
-    /// <summary>Total number of atlas quadrants: 3 cascades + 1 spotlight, per contract clause 2.</summary>
-    public const int SlotCount = MaxCascades + 1;
+    /// <summary>Atlas slot index used by the fog's far shadow map. It is not a quadrant: the far map has a texture of
+    /// its own, so this index only names its diagnostics row and its culling frustum.</summary>
+    public const int FarSlot = MaxCascades + 1;
+
+    /// <summary>Total number of shadow slots: the three cascade quadrants, the spotlight quadrant, and
+    /// <see cref="FarSlot"/>. Only the first four share the atlas, per contract clause 2.</summary>
+    public const int SlotCount = MaxCascades + 2;
+
+    /// <summary>Edge length of the fog's own shadow map. 1024 across a medium-sized fog volume is roughly a decimetre
+    /// per texel - coarse next to a cascade, which is the point: this map exists to keep a shaft readable at a distance
+    /// the cascades no longer reach, not to resolve the trunk that makes it.</summary>
+    public const int FarSize = 1024;
+
+    /// <summary>Depth bias in light-space NDC. The far map's texel is ~0.13 m across a ~260 m depth range, so a surface
+    /// leaning away from the light can shift by well over a tenth of a metre between neighbouring texels.</summary>
+    public const float FarBias = 0.0015f;
+
+    /// <summary>Smallest half extent the far map is allowed to cover, in metres: 120 m across, which is what a fog
+    /// volume of this project's size asks for and what the shafts were tuned against.</summary>
+    public const float FarMinExtent = 60f;
+
+    /// <summary>Largest half extent. A scene whose fog volumes are spread across the whole map would otherwise pull the
+    /// texel size up until the tree that casts a shaft is smaller than one texel and the shaft disappears into a blur.</summary>
+    public const float FarMaxExtent = 200f;
+
+    /// <summary>
+    /// Number of local (point-light) shadow slots the fog may sample. Two because that is the count the medium actually
+    /// asks for in practice - a fire and the nearest lamp - and because each slot costs six full shadow traversals.
+    ///
+    /// The slots are selected against the fog volumes, never against the camera, for the same reason
+    /// <see cref="ComputeFar"/> centres its map on the medium: a matrix that moves with the eye re-samples every stored
+    /// depth at a new phase every frame, and the fog's own history would chase a shadow map that never holds still.
+    /// </summary>
+    public const int LocalShadowLights = 2;
+
+    /// <summary>Cube faces per local light. The order is +X, -X, +Y, -Y, +Z, -Z and the injection kernel picks a face
+    /// by the dominant axis of (froxel - light), so the two sides must keep this order.</summary>
+    public const int LocalShadowFaces = 6;
+
+    /// <summary>Edge length of one cube face. 128 across a lamp's whole sphere is a decimetre per texel at 8 m, which is
+    /// still finer than the froxel grid the result feeds; the point of the map is the silhouette of the lamp housing and
+    /// of whatever stands between it and the mist, not a resolved leaf.</summary>
+    public const int LocalShadowFaceSize = 128;
+
+    /// <summary>Faces packed per atlas row. Four keeps the atlas as wide as it is with three rows, which is the shape
+    /// most backends like best for a depth attachment.</summary>
+    public const int LocalShadowTilesPerRow = 4;
+
+    /// <summary>Width of the local atlas in pixels.</summary>
+    public const int LocalShadowWidth = LocalShadowTilesPerRow * LocalShadowFaceSize;
+
+    /// <summary>Height of the local atlas in pixels: every light's six faces, laid out four to a row.</summary>
+    public const int LocalShadowHeight = LocalShadowLights * LocalShadowFaces / LocalShadowTilesPerRow * LocalShadowFaceSize;
+
+    /// <summary>
+    /// Depth margin for the local faces, measured in texels of the face's own footprint at the sampled distance. Not an
+    /// NDC constant like <see cref="FarBias"/>, because a cube face is perspective: one NDC unit of depth is worth
+    /// <c>near * far / (far - near) / z^2</c> metres, so a fixed NDC margin buys the opposite of what a margin is for.
+    /// The previous 0.003 NDC over a 12 m range was a 0.24 m dead zone at 2 m and a 3.8 m one at 8 m - a lamp behind a
+    /// nearby wall still lit the mist through it, while a far silhouette had to be metres in front of the froxel before
+    /// its shadow showed at all. In texels the dead zone stays one texel of the face wide at every distance, which is
+    /// exactly as coarse as the shadow it is protecting, and it is <see cref="LocalBiasCoefficient"/> that converts it.
+    /// </summary>
+    public const float LocalShadowBias = 1.5f;
+
+    /// <summary>
+    /// Strength of the receiver-plane tilt, 0..1, carried in the meta row's .w. Offset along a surface normal is not
+    /// available here: a froxel is a point in the medium and has no normal, and offsetting along the lamp-to-froxel
+    /// radius leaves ndc.xy untouched on a cube face - that projection is a ratio of the two smaller axes to the largest,
+    /// so moving outward along the largest changes neither. What a normal offset buys a rasterised surface - sample where
+    /// the receiver would be at this tap's texel instead of where the occluder happens to be - the kernel gets by fitting
+    /// a plane through its eight taps and evaluating that plane at each tap's offset. At 0 each tap is read raw, which is
+    /// the plain eight-tap percentage-closer filter.
+    /// </summary>
+    public const float LocalShadowNormalOffset = 1f;
+
+    /// <summary>Near plane of a local cube face. Perspective, so a smaller value only spends depth precision.</summary>
+    const float LocalNear = 0.05f;
+
+    /// <summary>
+    /// Converts <see cref="LocalShadowBias"/> from texels of footprint into the per-metre coefficient the injection
+    /// kernel divides by clip.w. A face spans two NDC units across <see cref="LocalShadowFaceSize"/> texels whatever the
+    /// distance, so one texel is <c>2 * w / faceSize</c> metres wide at w; the projection turns a metre at w into
+    /// <c>B / w^2</c> NDC with <c>B = near * far / (far - near)</c>, and the two w factors cancel. What is left depends on
+    /// the lamp's range alone, which is why this is a constant per light rather than per froxel: clip.w is the distance
+    /// along the face's own axis, so the kernel's division is the whole of the reconstruction.
+    /// </summary>
+    public static float LocalBiasCoefficient(float range)
+    {
+        if (!(range > LocalNear)) return 0f; // a lamp nearer than the near plane has no depth range to bias across
+        float depthScale = LocalNear * range / (range - LocalNear);
+        return depthScale * LocalShadowBias * 2f / LocalShadowFaceSize;
+    }
+
+    /// <summary>First diagnostics slot used by a local light; local slots follow the atlas and far slots so their
+    /// indices never collide with <see cref="ActiveSlot"/> values a backend passes to <see cref="BeginSlot"/>.</summary>
+    public const int LocalSlotBase = SlotCount;
+
+    /// <summary>Total number of slots any shadow pass may enter, atlas, far and local together. Only used to size the
+    /// per-slot diagnostics counters; it deliberately does not feed the web view-slot layout, which is why
+    /// <see cref="SlotCount"/> stays what it was.</summary>
+    public const int TotalSlotCount = SlotCount + LocalShadowLights;
+
+    /// <summary>Whether at least one local light is being shadowed this frame. Cleared in <see cref="BeginFrame"/> and
+    /// set by <see cref="ComputeLocal"/>.</summary>
+    public static bool LocalActive;
+
+    /// <summary>Index into <see cref="SceneLightParams.Lights"/> of each local slot, or -1 when the slot is unused.
+    /// Indexed by slot; written by <see cref="ComputeLocal"/>.</summary>
+    public static readonly int[] LocalLightIndex = CreateLocalLightIndices();
+
+    static int[] CreateLocalLightIndices()
+    {
+        var indices = new int[LocalShadowLights];
+        for (int i = 0; i < indices.Length; i++) indices[i] = -1;
+        return indices;
+    }
+
+    /// <summary>Light-space ViewProj per local slot per face, indexed <c>slot * LocalShadowFaces + face</c>.
+    /// Only the slots whose <see cref="LocalLightIndex"/> is non-negative are valid.</summary>
+    public static readonly Matrix4x4[] LocalViewProj = new Matrix4x4[LocalShadowLights * LocalShadowFaces];
+
+    /// <summary>Number of local slots in use this frame, valid after <see cref="ComputeLocal"/>.</summary>
+    public static int LocalCount;
+
+    /// <summary>The six cube directions, in the order <see cref="LocalViewProj"/> stores them and the order the injection
+    /// kernel's dominant-axis test reproduces.</summary>
+    static readonly Vector3[] LocalFaceDirections =
+    {
+        Vector3.UnitX, -Vector3.UnitX, Vector3.UnitY, -Vector3.UnitY, Vector3.UnitZ, -Vector3.UnitZ,
+    };
 
     /// <summary>
     /// Light-space culling frustum for the current quadrant of this pass, written by <see cref="BeginSlot"/> and read-only during DrawShadow traversal.
@@ -93,8 +239,8 @@ public static class CascadedShadow
         => ActiveSlot >= 0 && RenderQuality.Current.ShadowCulling;
 
     /// <summary>Per-slot group-level submitted/culled counters used for diagnostics. Cleared at the start of each frame; index = slot.</summary>
-    static readonly int[] _submitted = new int[SlotCount];
-    static readonly int[] _culled = new int[SlotCount];
+    static readonly int[] _submitted = new int[TotalSlotCount];
+    static readonly int[] _culled = new int[TotalSlotCount];
 
     /// <summary>
     /// 1-5 clause 10: whether every active slot's light-space ViewProj is bit-for-bit unchanged from the previous frame.
@@ -310,6 +456,12 @@ public static class CascadedShadow
         Epoch++;
         SunActive = false;
         SpotActive = false;
+        FarActive = false;
+        FarExtent = 0f;
+        LocalActive = false;
+        LocalCount = 0;
+        for (int i = 0; i < LocalLightIndex.Length; i++)
+            LocalLightIndex[i] = -1;
 
         // Cleared pessimistically rather than left to Apply: when shadows are disabled or no light is active, Apply
         // returns before evaluating, and a stale true from an earlier frame would let clause 12 reuse an atlas that was
@@ -336,6 +488,45 @@ public static class CascadedShadow
         ActiveSlot = slot;
         Frustum.FromViewProjection(in vp, out ActiveFrustum);
         return vp;
+    }
+
+    /// <summary>
+    /// Enters <see cref="FarSlot"/>: publishes the culling frustum derived from <see cref="FarViewProj"/> and returns
+    /// that same matrix for the backend to upload. Same no-drift contract as <see cref="BeginSlot"/> - the frustum and the
+    /// matrix come from one value, so CPU culling and GPU clipping cannot disagree.
+    /// </summary>
+    public static Matrix4x4 BeginFarSlot()
+    {
+        ActiveSlot = FarSlot;
+        Frustum.FromViewProjection(in FarViewProj, out ActiveFrustum);
+        return FarViewProj;
+    }
+
+    /// <summary>
+    /// Enters one cube face of a local light: publishes the culling frustum derived from that face's ViewProj and returns
+    /// the same matrix for the backend to upload. Same no-drift contract as <see cref="BeginSlot"/>.
+    ///
+    /// The 90 degree pyramid of a face is what makes the six traversals affordable: a lamp inside a clearing rejects
+    /// almost everything on any one face, so the pass pays for six frustum walks and a fraction of six draw lists.
+    /// </summary>
+    public static Matrix4x4 BeginLocalSlot(int slot, int face)
+    {
+        var vp = LocalViewProj[slot * LocalShadowFaces + face];
+        ActiveSlot = LocalSlotBase + slot;
+        Frustum.FromViewProjection(in vp, out ActiveFrustum);
+        return vp;
+    }
+
+    /// <summary>
+    /// Maps a local slot and cube face to its atlas viewport. Tile order is slot-major, four tiles to a row, matching
+    /// <see cref="LocalShadowHeight"/>; the injection kernel reproduces the same arithmetic from literals.
+    /// </summary>
+    public static void GetLocalViewport(int slot, int face, out int x, out int y, out int size)
+    {
+        int tile = slot * LocalShadowFaces + face;
+        size = LocalShadowFaceSize;
+        x = tile % LocalShadowTilesPerRow * LocalShadowFaceSize;
+        y = tile / LocalShadowTilesPerRow * LocalShadowFaceSize;
     }
 
     /// <summary>Leaves the shadow pass. Called after the quadrant loop ends; <see cref="BeginFrame"/> also provides a fallback reset.</summary>
@@ -392,7 +583,7 @@ public static class CascadedShadow
             return;
 
         int culled = 0, total = 0;
-        for (int i = 0; i < SlotCount; i++)
+        for (int i = 0; i < TotalSlotCount; i++)
         {
             culled += _culled[i];
             total += _culled[i] + _submitted[i];
@@ -401,12 +592,20 @@ public static class CascadedShadow
         if (total == 0)
             return;
 
+        int localCulled = 0, localTotal = 0;
+        for (int i = LocalSlotBase; i < TotalSlotCount; i++)
+        {
+            localCulled += _culled[i];
+            localTotal += _culled[i] + _submitted[i];
+        }
+
         DeviceServices.BaseApp?.AddLog(LogType.Backend,
             $"{DateTime.UtcNow} [ShadowCull] " +
             $"c0 {_culled[0]}/{_culled[0] + _submitted[0]}  " +
             $"c1 {_culled[1]}/{_culled[1] + _submitted[1]}  " +
             $"c2 {_culled[2]}/{_culled[2] + _submitted[2]}  " +
             $"spot {_culled[SpotSlot]}/{_culled[SpotSlot] + _submitted[SpotSlot]}  " +
+            $"local {localCulled}/{localTotal}  " +
             $"total {culled}/{total} ({(total > 0 ? culled * 100 / total : 0)}% of group submissions skipped)");
     }
 
@@ -852,6 +1051,201 @@ public static class CascadedShadow
             far);
         ActiveCascadeCount = count;
         SunActive = true;
+        ComputeFar(sunDir);
+    }
+
+    /// <summary>
+    /// Builds the fog's own shadow view: one orthographic map that covers the medium rather than the camera.
+    ///
+    /// Why a second map at all: the cascades stop at <see cref="RenderQuality.ShadowDistance"/> because every metre they
+    /// add is paid for by the near cascade, where the acne that matters lives. A fog volume tens of metres across can be
+    /// viewed from outside it - from a ridge, from across a clearing - and the froxels that make up a shaft then sit past
+    /// the last cascade, where the fog's own visibility test has nothing to say and every shaft flattens into a slab.
+    /// Widening the cascades would trade the near field's precision for this; a second map costs one 1024^2 depth pass
+    /// and is sampled by exactly one consumer, the fog injection kernel.
+    ///
+    /// Centre and extent come from the medium, not the camera. That choice is what makes the map stable: with the sun
+    /// direction already quantized by the caller, the matrix only changes when that direction moves, so the texture is
+    /// reused across camera motion without any of the temporal bookkeeping the cascades need.
+    ///
+    /// Returns without activating when there is no medium to cover. Global fog alone is not a reason to build this:
+    /// its extinction is low by construction and it never resolves into individual shafts, which is the only thing the
+    /// extra pass buys.
+    /// </summary>
+    static void ComputeFar(Vector3 sunDir)
+    {
+        var fog = DeviceServices.BaseApp?.Fog;
+        if (fog == null || !fog.Enabled) return;
+
+        // Union of the world AABBs of the volumes that actually add density. Exclude volumes subtract light rather than
+        // occlude it, so a corridor carved out of a basin must not stretch the map to its own far corner.
+        var minimum = new Vector3(float.MaxValue);
+        var maximum = new Vector3(float.MinValue);
+        foreach (var volume in fog.Volumes)
+        {
+            if (!volume.Enabled || volume.Mode != FogVolumeMode.Add || volume.Extinction <= 0f) continue;
+            // A rotated box's world AABB: take the absolute rotation, because a rotation can only ever move a corner
+            // outwards in each axis. The same formula bounds a sphere volume's ellipsoid, so both shapes share one path.
+            var rotation = Matrix4x4.CreateFromQuaternion(volume.Rotation);
+            var half = volume.Size * 0.5f;
+            var box = new Vector3(
+                MathF.Abs(rotation.M11) * half.X + MathF.Abs(rotation.M21) * half.Y + MathF.Abs(rotation.M31) * half.Z,
+                MathF.Abs(rotation.M12) * half.X + MathF.Abs(rotation.M22) * half.Y + MathF.Abs(rotation.M32) * half.Z,
+                MathF.Abs(rotation.M13) * half.X + MathF.Abs(rotation.M23) * half.Y + MathF.Abs(rotation.M33) * half.Z);
+            minimum = Vector3.Min(minimum, volume.Position - box);
+            maximum = Vector3.Max(maximum, volume.Position + box);
+        }
+        if (minimum.X > maximum.X) return;
+
+        var center = (minimum + maximum) * 0.5f;
+        // The bounding sphere rather than the box, because the light direction is arbitrary: a box covering the AABB
+        // exactly along the light's own axes would still clip its corners under a raking sun. 1.05 leaves a margin for
+        // the noise offset the injection kernel adds on top of a volume's position.
+        float radius = ((maximum - minimum) * 0.5f).Length() * 1.05f;
+        float extent = Math.Clamp(radius, FarMinExtent, FarMaxExtent);
+
+        // Same light basis as the cascades, so the two maps agree on which way is up around the sun and a shadow edge
+        // crossing from one to the other does not rotate.
+        float verticality = MathF.Abs(sunDir.Y);
+        if (verticality < 1e-4f) return; // the sun is in the horizon plane; no orthographic view can be built from it
+        float upTilt = Math.Clamp((verticality - UpBlendStart) / (UpBlendEnd - UpBlendStart), 0f, 1f);
+        var lightUp = Vector3.Normalize(Vector3.Lerp(Vector3.UnitY, Vector3.UnitZ, upTilt));
+
+        float casterHeight = RenderQuality.Current.ShadowCasterHeight;
+        if (!(casterHeight > 0f)) casterHeight = 0f;
+        float lightPad = MathF.Min(casterHeight / MathF.Max(verticality, MinElevationSine), extent);
+        lightPad = MathF.Ceiling(lightPad * 16f) / 16f;
+
+        var eye = center - sunDir * (extent + lightPad);
+        var view = Matrix4x4.CreateLookAtLeftHanded(eye, center, lightUp);
+
+        // Same texel snap as the cascades, for the same reason: a matrix that only differs in its sub-texel translation
+        // re-samples every stored depth at a new phase, which shows up as crawling edges on a shadow that is otherwise
+        // static. Here it also keeps the map reusable across frames that moved nothing but the camera.
+        float texelSize = extent * 2f / FarSize;
+        view.M41 = MathF.Floor(view.M41 / texelSize) * texelSize;
+        view.M42 = MathF.Floor(view.M42 / texelSize) * texelSize;
+        view.M43 = MathF.Floor(view.M43 / texelSize) * texelSize;
+
+        var proj = Matrix4x4.CreateOrthographicLeftHanded(extent * 2f, extent * 2f, 0f, extent * 2f + lightPad);
+        FarViewProj = view * proj;
+        FarExtent = extent;
+        FarActive = true;
+    }
+
+    /// <summary>
+    /// Selects up to <see cref="LocalShadowLights"/> point lights and builds a cube of light-space matrices for each, so the
+    /// fog injection kernel can test whether geometry stands between a froxel and the lamp warming it.
+    ///
+    /// Why the fog needs this at all: without a depth map a punctual light reaches a froxel at 1/d² and nothing else, so a
+    /// torch inside a barn lights the mist through the wall. The cascades cannot help - they belong to the sun - and the
+    /// spotlight quadrant belongs to a spot light, which has a cone the point light does not. A lamp's occlusion is a
+    /// sphere of directions, which is what a cube is.
+    ///
+    /// Why selection ignores the camera: the resulting matrices must be bit-identical while the eye moves, or the fog's
+    /// temporal filter re-converges on a shadow that shimmers every frame. The predicate here is "the light's range sphere
+    /// touches a volume that adds density" and the ranking is the light's own luminance-weighted intensity, neither of
+    /// which mentions the camera. This is the same reasoning that anchors <see cref="ComputeFar"/> to the medium.
+    ///
+    /// Only point lights participate. A spot light already owns atlas slot 3 and is reached through it, and a directional
+    /// light has no position to build a cube around.
+    ///
+    /// Cost is bounded and paid only when it buys something: nothing is computed, no pass is opened and no matrix is
+    /// uploaded when no enabled Add volume overlaps a point light.
+    /// </summary>
+    public static void ComputeLocal(in SceneLightParams scene)
+    {
+        var fog = DeviceServices.BaseApp?.Fog;
+        if (fog == null || !fog.Enabled) return;
+
+        // Union of the world AABBs of the volumes that add density, by the same formula ComputeFar uses: a rotated box's
+        // world AABB takes the absolute rotation, and the same expression bounds a sphere volume's ellipsoid.
+        var minimum = new Vector3(float.MaxValue);
+        var maximum = new Vector3(float.MinValue);
+        foreach (var volume in fog.Volumes)
+        {
+            if (!volume.Enabled || volume.Mode != FogVolumeMode.Add || volume.Extinction <= 0f) continue;
+            var rotation = Matrix4x4.CreateFromQuaternion(volume.Rotation);
+            var half = volume.Size * 0.5f;
+            var box = new Vector3(
+                MathF.Abs(rotation.M11) * half.X + MathF.Abs(rotation.M21) * half.Y + MathF.Abs(rotation.M31) * half.Z,
+                MathF.Abs(rotation.M12) * half.X + MathF.Abs(rotation.M22) * half.Y + MathF.Abs(rotation.M32) * half.Z,
+                MathF.Abs(rotation.M13) * half.X + MathF.Abs(rotation.M23) * half.Y + MathF.Abs(rotation.M33) * half.Z);
+            minimum = Vector3.Min(minimum, volume.Position - box);
+            maximum = Vector3.Max(maximum, volume.Position + box);
+        }
+        if (minimum.X > maximum.X) return;
+
+        int lightCount = Math.Clamp(scene.LightCount, 0, SceneLightParams.MaxLights);
+        Span<int> chosen = stackalloc int[LocalShadowLights];
+        Span<float> chosenScore = stackalloc float[LocalShadowLights];
+        for (int s = 0; s < LocalShadowLights; s++)
+        {
+            chosen[s] = -1;
+            chosenScore[s] = 0f;
+        }
+
+        // Insertion by descending score. A tie leaves the lower light index in front, because a light only displaces one
+        // already held on a strictly greater score - which is what keeps the ranking stable against a flame whose
+        // intensity is being modulated every frame.
+        for (int i = 0; i < lightCount; i++)
+        {
+            var light = scene.Lights[i];
+            if (light.DirType.W >= 0.5f) continue; // spots own atlas slot 3, directional lights have no position
+            float range = light.PosRange.W;
+            if (!(range > 0f)) continue; // an unbounded light has no cube to build; the fog leaves it at plain 1/d²
+            var position = new Vector3(light.PosRange.X, light.PosRange.Y, light.PosRange.Z);
+            if (!SphereTouches(position, range, minimum, maximum)) continue;
+            float score = light.ColorIntensity.W * MathF.Max(
+                light.ColorIntensity.X * 0.2126f + light.ColorIntensity.Y * 0.7152f + light.ColorIntensity.Z * 0.0722f, 0f);
+            if (!(score > 0f)) continue;
+            for (int s = 0; s < LocalShadowLights; s++)
+            {
+                if (chosen[s] >= 0 && score <= chosenScore[s]) continue;
+                for (int k = LocalShadowLights - 1; k > s; k--)
+                {
+                    chosen[k] = chosen[k - 1];
+                    chosenScore[k] = chosenScore[k - 1];
+                }
+                chosen[s] = i;
+                chosenScore[s] = score;
+                break;
+            }
+        }
+
+        // The six faces share one projection: a square 90 degree frustum per axis is exactly a cube face, and 90 rather
+        // than a little more because at exactly 90 the faces tile the sphere with no overlap and no gap, so the kernel's
+        // dominant-axis test can never land on a face that does not cover the direction.
+        float fovY = MathF.PI * 0.5f;
+        for (int s = 0; s < LocalShadowLights; s++)
+        {
+            LocalLightIndex[s] = chosen[s];
+            if (chosen[s] < 0) continue;
+
+            var light = scene.Lights[chosen[s]];
+            var position = new Vector3(light.PosRange.X, light.PosRange.Y, light.PosRange.Z);
+            // Selection above rejected every light whose range is not positive, so the far plane is always authored.
+            float range = light.PosRange.W;
+            var proj = Matrix4x4.CreatePerspectiveFieldOfViewLeftHanded(fovY, 1f, LocalNear, range);
+            for (int face = 0; face < LocalShadowFaces; face++)
+            {
+                var direction = LocalFaceDirections[face];
+                // A face pointing along Y cannot look up at Y; the spot path makes the same substitution.
+                var up = MathF.Abs(direction.Y) > 0.99f ? Vector3.UnitZ : Vector3.UnitY;
+                var view = Matrix4x4.CreateLookAtLeftHanded(position, position + direction, up);
+                LocalViewProj[s * LocalShadowFaces + face] = view * proj;
+            }
+            LocalCount = s + 1;
+            LocalActive = true;
+        }
+    }
+
+    /// <summary>Whether a sphere overlaps an axis-aligned box. Used to skip lamps whose light cannot reach any of the
+    /// medium, which is the only reason a local cube would be built for nothing.</summary>
+    static bool SphereTouches(Vector3 center, float radius, Vector3 minimum, Vector3 maximum)
+    {
+        var closest = Vector3.Clamp(center, minimum, maximum);
+        return Vector3.DistanceSquared(center, closest) < radius * radius;
     }
 
     /// <summary>

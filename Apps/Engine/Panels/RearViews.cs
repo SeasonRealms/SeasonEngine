@@ -103,6 +103,14 @@ internal class RearViews : Panel
     SecondaryView? _mirror;
     SecondaryView? _minimap;
 
+    /// <summary>
+    /// Left edge of the instrument block in design units, refreshed by <see cref="Layout"/> every frame.
+    /// The HUD clock (see Clock.cs) centres itself in the gap between the Settings button and this
+    /// edge, so it reads the laid-out value instead of repeating the centring arithmetic and drifting
+    /// apart the day someone adds a third instrument.
+    /// </summary>
+    internal float LeftEdge { get; private set; }
+
     public RearViews()
     {
         RenderDomain = Season.Controls.RenderDomain.Overlay;
@@ -180,6 +188,7 @@ internal class RearViews : Panel
         bool hasMinimap = mapSprite != null && mapView != null;
         float total = (hasMirror ? MirrorWidth : 0f) + (hasMirror && hasMinimap ? Gap : 0f) + (hasMinimap ? MinimapSize : 0f);
         float left = MathF.Max(0f, (app.ExtendResolution.X - total) * 0.5f);
+        LeftEdge = left;
 
         if (hasMirror)
         {

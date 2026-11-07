@@ -132,6 +132,13 @@ internal static partial class WebGPUInterop
     [JSImport("globalThis.seasonWebGPU.renderPost")]
     internal static partial void RenderPost(string sceneName, float exposure, string? bloomName, float bloomIntensity, string? aoName, float aoIntensity, string? sceneOverrideName);
 
+    /// <summary>G1: hands the resolved colour-grading coefficients to the JS side, whose parameter upload copies them
+    /// into elements 1 and 2 of the 48-byte uniform behind binding 2. The values are uniform state rather than per-draw
+    /// parameters, so they travel through their own import instead of widening both blit signatures by eight floats.
+    /// Off arrives here as intensity 0 with identity coefficients, which the shader branches on and skips.</summary>
+    [JSImport("globalThis.seasonWebGPU.setColorGrade")]
+    internal static partial void SetColorGrade(float intensity, float contrast, float saturation, float temperature, float tint, float lift, float gamma, float gain);
+
     /// <summary>Direct Sprite2D/Shape draw path.
     /// clock and source*/pixelRange semantics are aligned with DX/VK/MTL TextCoords.GetTransforms:
     /// flip is applied in source space first, then UVs are rotated clockwise by clock (90/180/270).

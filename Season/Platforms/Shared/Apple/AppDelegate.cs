@@ -1039,7 +1039,33 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
                 SampleCount = 1,
             });
             if (Season.Basic.Graphics.Instance is Graphics shadowGraphics)
+            {
                 Season.Rendering.FrameSchedule.RenderShadow = shadowGraphics.RenderShadowPass;
+                // Fog-only far shadow: the medium's own map, fixed at FarSize^2 and anchored to the volumes rather than
+                // to the camera. Registered unconditionally because execution is gated by CascadedShadow.FarActive, so
+                // a host that never enables fog allocates 4 MB and runs no pass.
+                Season.Rendering.FrameSchedule.FarShadowMap = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
+                {
+                    DepthFormat = Season.Rendering.RtFormat.D32Float,
+                    MatchBackbufferSize = false,
+                    Width = (uint)Season.Rendering.CascadedShadow.FarSize,
+                    Height = (uint)Season.Rendering.CascadedShadow.FarSize,
+                    SampleCount = 1,
+                });
+                Season.Rendering.FrameSchedule.RenderFarShadow = shadowGraphics.RenderFarShadowPass;
+                // Fog-only local point-light cubes: two lamps of six 128^2 faces packed into 512x384, under a megabyte of
+                // depth. Registered alongside the far map and gated the same way - CascadedShadow.LocalActive is false
+                // unless a point light actually reaches a fog volume, so a scene without lamps runs no pass.
+                Season.Rendering.FrameSchedule.LocalShadowMap = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
+                {
+                    DepthFormat = Season.Rendering.RtFormat.D32Float,
+                    MatchBackbufferSize = false,
+                    Width = (uint)Season.Rendering.CascadedShadow.LocalShadowWidth,
+                    Height = (uint)Season.Rendering.CascadedShadow.LocalShadowHeight,
+                    SampleCount = 1,
+                });
+                Season.Rendering.FrameSchedule.RenderLocalShadow = shadowGraphics.RenderLocalShadowPass;
+            }
         }
 
         // 8.7) Contract clause 1 of 2-2:
@@ -1102,6 +1128,8 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
                 MtlDevice.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)
                 || RenderQuality.Current.RequiresDecalSceneDepth(MtlDevice.HdrSceneColor, immediate2D)
                 || RenderQuality.Current.RequiresReflectionSceneDepth(MtlDevice.HdrSceneColor,
+                    Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)
+                || RenderQuality.Current.RequiresDofSceneDepth(MtlDevice.HdrSceneColor,
                     Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)))
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc

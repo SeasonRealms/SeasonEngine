@@ -155,9 +155,10 @@ internal class Robots : Panel
 
         var texts = new string[] { "Where do you come from?", "What's beyond the sea?" };
 
-        // 每进程抽一次，让重开时换句问候。逐像素 A/B 却要两轮画出同一行字：无种子抽取在那里是五成硬币，
-        // 实测在 x≈1520..1719 / y≈820..859 上贡献了 worst 739 的差值 —— 比整条被测路由的残差大两个数量级。
-        // 取证运行时直接取第一句，抽取本身在正常运行时照旧。
+        // Drawn once per process, so a restart changes the greeting. Per-pixel A/B, however, has to draw the same
+        // line on both passes: an unseeded draw is a coin flip there and was measured to contribute a worst-case
+        // difference of 739 over x≈1520..1719 / y≈820..859 - two orders of magnitude larger than the residual of
+        // the whole route under test. During capture it takes the first line directly; normal runs still draw randomly.
         bubbleText = new Texts()
         {
             RenderDomain = RenderDomain.Overlay,

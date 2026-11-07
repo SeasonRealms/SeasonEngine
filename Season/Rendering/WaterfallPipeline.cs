@@ -128,7 +128,7 @@ public static class WaterfallMath
     /// <summary>Write this frame's header and sheet array into the buffer. The caller is responsible for having sorted the sheet table first.</summary>
     public static void Pack(Span<Vector4> data, in Matrix4x4 jitteredVp, Vector3 camera, float width, float height,
         Vector3 sunDirection, Vector3 sunColor, float sunIntensity, Vector3 ambient, float ambientIntensity,
-        float time, ReadOnlySpan<WaterfallSheet> sheets)
+        float time, ReadOnlySpan<WaterfallSheet> sheets, SceneFog? fog = null)
     {
         if (data.Length < VectorCount) throw new ArgumentException("Waterfall frame buffer is too small.", nameof(data));
         data.Clear();
@@ -147,11 +147,13 @@ public static class WaterfallMath
             int count = Math.Clamp(sheet.Points.Count, 0, MaxControlPoints);
             float arc = 0f;
             float maxHalfWidth = 0f;
+            Vector3 center = Vector3.Zero;
             for (int p = 0; p < count; p++)
             {
                 var point = sheet.Points[p];
                 float halfWidth = MathF.Max(point.HalfWidth, 0.02f);
                 maxHalfWidth = MathF.Max(maxHalfWidth, halfWidth);
+                center += point.Position;
                 data[offset + p * 2] = new(point.Position, halfWidth);
 
                 // The outward direction uses only the horizontal components; a zero vector degenerates to +Z, so the consequence of "forgetting to fill it" is a fixed orientation
@@ -163,6 +165,8 @@ public static class WaterfallMath
                 if (p > 0) arc += Vector3.Distance(sheet.Points[p - 1].Position, point.Position);
             }
 
+            if (count > 0) center /= count;
+            var transform = sheet.Transform;
             int flags = 0;
             if (sheet.MaskTexture != null) flags |= FlagMask;
             if (sheet.NormalTexture != null) flags |= FlagNormal;
@@ -173,13 +177,51 @@ public static class WaterfallMath
             data[offset + 35] = new(sheet.ScrollSpeed, sheet.NormalStrength, sheet.NormalTiling, sheet.Erosion);
             data[offset + 36] = new(sheet.LipFoam, sheet.FootFoam, sheet.EdgeFoam, sheet.EdgeSoftness);
             // .z is the section thickness: the vertex shader uses it to expand a center line into a water body with thickness.
-            data[offset + 37] = new(sheet.SortOrder, sheet.Bow, sheet.Thickness, 0f);
+            // .w is the extinction this sheet sees through (WaterfallShaders.FogHlsl): the Pass draws after FogComposite,
+            // so without it the curtain composites at full contrast on top of the fog and reads as hanging in front of it.
+            // Per sheet rather than per frame because the value is an integral along that sheet's own eye ray.
+            data[offset + 37] = new(sheet.SortOrder, sheet.Bow, sheet.Thickness,
+                fog == null ? 0f : FogPathExtinction(fog, camera, Vector3.Transform(center, transform)));
             // Placement matrix: Identity when null, fully equivalent to old data that only provided control points.
             // Written here rather than uploaded by the backend, so that "driver" and "data" share the same source:
             // the bounding box used for culling and the transform used by the shader both come from the same sheet.Transform.
-            WriteMatrix(data, offset + PlacementOffset, sheet.Transform);
+            WriteMatrix(data, offset + PlacementOffset, transform);
             offset += SheetStride;
         }
+    }
+
+    /// <summary>
+    /// Optical depth from the eye to one point, spread back over that distance so the shader can keep its per-pixel
+    /// exponential. Integrating along the ray rather than sampling at the sheet is what makes a curtain standing
+    /// <em>beyond</em> a fog bank fade: the medium covering it is the medium in between, and that medium is not at the
+    /// sheet - sampling the endpoint alone reports zero for exactly the case that needs the fade most.
+    ///
+    /// 16 trapezoid steps: the medium is piecewise smooth with one hard box edge, and a sheet is a few metres across, so
+    /// at any distance the curtain is readable from this resolves the edge well below a pixel. Cost is one sheet times
+    /// 17 samples per frame, the same order as the culling that precedes it.
+    ///
+    /// Shared with <see cref="WaterRibbonMath.Pack"/>: the river is drawn in the same Pass over the same already-fogged
+    /// target and has the identical problem, so it must not grow a second, drifting copy of this integral.
+    /// </summary>
+    internal static float FogPathExtinction(SceneFog fog, Vector3 eye, Vector3 position)
+    {
+        if (!fog.Enabled) return 0f;
+        Vector3 delta = position - eye;
+        float distance = delta.Length();
+        if (!(distance > 1e-3f)) return 0f;
+        // Past MaxDistance the pass integrates nothing, so the march must stop there too or a distant curtain would keep
+        // fading through medium the renderer never applied. Dividing by the full distance keeps T = e^-tau exact.
+        float along = MathF.Min(distance, fog.MaxDistance) / distance;
+        const int Steps = 16;
+        float step = distance * along / Steps;
+        float tau = 0f, previous = fog.SampleMedium(eye).Extinction;
+        for (int i = 1; i <= Steps; i++)
+        {
+            float current = fog.SampleMedium(eye + delta * (along * (i / (float)Steps))).Extinction;
+            tau += (previous + current) * (0.5f * step);
+            previous = current;
+        }
+        return tau / distance;
     }
 
     /// <summary>

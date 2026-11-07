@@ -721,8 +721,34 @@ public static class AndroidApp
             Season.Rendering.FrameSchedule.ShadowMap = shadowRT;
             if (shadowRT is VKRenderTarget vkShadowRT)
                 VkPipeline.EnsureShadowPipeline(vkShadowRT.RenderPass);
+            // Fog-only far shadow: the medium's own map, fixed at FarSize^2 and anchored to the volumes rather than to the
+            // camera. Its render pass is structurally identical to the atlas's (depth32, one sample, clear+store), so the
+            // shadow PSO already baked above stays render-pass compatible and needs no second bake.
+            Season.Rendering.FrameSchedule.FarShadowMap = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
+            {
+                DepthFormat = Season.Rendering.RtFormat.D32Float,
+                MatchBackbufferSize = false,
+                Width = (uint)Season.Rendering.CascadedShadow.FarSize,
+                Height = (uint)Season.Rendering.CascadedShadow.FarSize,
+                SampleCount = 1,
+            });
             if (Season.Basic.Graphics.Instance is Season.Platforms.Shared.LinuxAndroid.Graphics shadowGraphics)
+            {
                 Season.Rendering.FrameSchedule.RenderShadow = shadowGraphics.RenderShadowPass;
+                Season.Rendering.FrameSchedule.RenderFarShadow = shadowGraphics.RenderFarShadowPass;
+                // Fog-only local point-light cubes: two lamps of six 128^2 faces packed into 512x384. Same depth format and
+                // sample count as the two maps above, so the PSO baked for the atlas render pass serves it unchanged; only
+                // the viewport per tile differs, and CascadedShadow.LocalActive gates whether the pass runs at all.
+                Season.Rendering.FrameSchedule.LocalShadowMap = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
+                {
+                    DepthFormat = Season.Rendering.RtFormat.D32Float,
+                    MatchBackbufferSize = false,
+                    Width = (uint)Season.Rendering.CascadedShadow.LocalShadowWidth,
+                    Height = (uint)Season.Rendering.CascadedShadow.LocalShadowHeight,
+                    SampleCount = 1,
+                });
+                Season.Rendering.FrameSchedule.RenderLocalShadow = shadowGraphics.RenderLocalShadowPass;
+            }
         }
 
         // Contract 2-2 clause 1:
@@ -785,6 +811,8 @@ public static class AndroidApp
                 VkDevice.HdrSceneColor, Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)
                 || RenderQuality.Current.RequiresDecalSceneDepth(VkDevice.HdrSceneColor, immediate2D)
                 || RenderQuality.Current.RequiresReflectionSceneDepth(VkDevice.HdrSceneColor,
+                    Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)
+                || RenderQuality.Current.RequiresDofSceneDepth(VkDevice.HdrSceneColor,
                     Season.Basic.Graphics.Instance.ComputeSupported, immediate2D)))
         {
             Season.Rendering.FrameSchedule.SceneDepth = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
@@ -798,7 +826,7 @@ public static class AndroidApp
         // One-shot tier report: the app ships with the desktop-class defaults (HDR + TAA tier +
         // GTAO + shadows + bloom), so this line is what a device log needs to tell which pipeline the
         // frame actually pays for, and whether the validation layer activated.
-        Diag($"[RenderQuality] tier: {width}x{height} validation={(VkDevice.ValidationEnabled ? "on" : "off")} hdr={VkDevice.HdrSceneColor} aa={RenderQuality.Current.EffectiveAntiAliasing} mv={RenderQuality.Current.MotionVectors} ao={RenderQuality.Current.AmbientOcclusion} shadows={RenderQuality.Current.ShadowsEnabled} bloom={RenderQuality.Current.BloomEnabled} taaSharpness={RenderQuality.Current.TaaSharpness} immediate2D={immediate2D}");
+        Diag($"[RenderQuality] tier: {width}x{height} validation={(VkDevice.ValidationEnabled ? "on" : "off")} hdr={VkDevice.HdrSceneColor} aa={RenderQuality.Current.EffectiveAntiAliasing} mv={RenderQuality.Current.MotionVectors} ao={RenderQuality.Current.AmbientOcclusion} shadows={RenderQuality.Current.ShadowsEnabled} bloom={RenderQuality.Current.BloomEnabled} dof={RenderQuality.Current.DepthOfField} taaSharpness={RenderQuality.Current.TaaSharpness} immediate2D={immediate2D}");
 
         // Extra line when the mode is on: this is what a device log needs to tell that the frame is
         // Overlay-only and that the tier line right above is inert.

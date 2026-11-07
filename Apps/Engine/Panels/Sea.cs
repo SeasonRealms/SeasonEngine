@@ -185,7 +185,7 @@ internal class Sea : Panel
     internal float SeaLevel
     {
         get => Water.Position.Y;
-        // Position 是 struct：只能整体回写，改不动 Water.Position.Y 本身。
+        // Position is a struct: it can only be written back as a whole, so Water.Position.Y cannot be mutated in place.
         set => Water.Position = new Vector3(Water.Position.X, value, Water.Position.Z);
     }
 

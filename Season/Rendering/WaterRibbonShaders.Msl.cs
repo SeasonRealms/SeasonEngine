@@ -43,6 +43,13 @@ float4 RbTransform(const device float4* data, float4 p, int i) {
     return p.x * data[i] + p.y * data[i + 1] + p.z * data[i + 2] + p.w * data[i + 3];
 }
 
+// Analytic mist for the band itself; see WaterRibbonShaders.Hlsl for why this is an exponential rather than a volume
+// sample. Slot 37.w is the extinction averaged along this ribbon's eye ray, zero when no medium covers the path.
+float RbFogTransmittance(float3 world, float3 eye, float sigma) {
+    if (sigma <= 0.0f) return 1.0f;
+    return exp(-sigma * distance(world, eye));
+}
+
 // Per-ribbon placement matrix (slots 38..41): points carry w=1, directions carry w=0, and the translation only affects points.
 float3 RbSheetPoint(const device float4* data, int offset, float3 p) {
     return RbTransform(data, float4(p, 1.0f), offset + 38).xyz;
@@ -167,7 +174,7 @@ vertex RibbonVertex VSMain(uint id [[vertex_id]], const device float4* data [[bu
 """;
 
     /// <summary>
-    /// Pixel side: shallow cartoon river water. Order is depth test -> soft shoreline -> sampling -> bank foam -> lighting.
+    /// Pixel side: shallow cartoon river water. Order is depth test -> soft shoreline -> sampling -> bank foam -> lighting -> fog.
     /// The absorption term is deliberately a screen-space ramp rather than a physical one: the channel is ~13 cm deep, so a
     /// Beer-Lambert term would be numerically indistinguishable from zero, and this pass has no linear depth available.
     /// </summary>
@@ -183,7 +190,7 @@ fragment float4 PSMain(RibbonVertex in [[stage_in]], const device float4* data [
     float4 material1 = data[offset + 34];  // foam color.rgb, foam amount
     float4 material2 = data[offset + 35];  // flow speed m/s, normal strength, normal tiling, unused
     float4 material3 = data[offset + 36];  // edge foam, edge softness, depth meters, unused
-    float4 material4 = data[offset + 37];  // sort order, phase meters, 0, 0
+    float4 material4 = data[offset + 37];  // sort order, phase meters, 0, extinction
     float4 camera = data[4];
     float4 sun = data[6];                  // propagation direction.xyz, intensity
     float4 sunColor = data[7];
@@ -279,6 +286,10 @@ fragment float4 PSMain(RibbonVertex in [[stage_in]], const device float4* data [
     float3 halfVector = normalize(view + toSun);
     color += sunColor.rgb * (sun.w * pow(saturate(dot(shadedNormal, halfVector)), 64.0f) * 0.45f);
     color += (ambientLight + direct) * pow(1.0f - saturate(dot(shadedNormal, view)), 4.0f) * 0.06f;
+
+    // Fog last: alpha, not colour, because the fraction the band loses is exactly the fraction the already-fogged
+    // background shows through.
+    alpha *= RbFogTransmittance(in.world, camera.xyz, material4.w);
 
     return float4(color, alpha);
 }

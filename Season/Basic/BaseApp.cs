@@ -431,6 +431,15 @@ public abstract class BaseApp : Panel
     /// </summary>
     private async Task LoadControlAsync(ILoadable control)
     {
+        // Contract 3-2: one row per loadable, measured across the await so a Load that yields still reports its whole
+        // wall-clock cost, plus the queue wait it paid before the consumer reached it. The outcome is recorded even on
+        // the early exits, because "skipped" and "failed" are what make a short load list look complete when it is not.
+        double queuedMs = StartupProfiler.TakeQueuedWait(control.ID);
+
+        long loadStart = StartupProfiler.Enabled ? StartupProfiler.Ticks() : 0;
+
+        string outcome = "skipped";
+
         try
         {
             // The control was disposed after being queued: skip Load and create no GPU resources.
@@ -450,10 +459,14 @@ public abstract class BaseApp : Panel
                 // GPU resources are cleaned up by the Dispose path.
                 if (control.IsDisposed)
                 {
+                    outcome = "disposed";
+
                     AddLog(LogType.Load, $"{DateTime.UtcNow} {control.ID} {control.ToString()} Loaded IsDisposed");
                 }
                 else
                 {
+                    outcome = "ok";
+
                     AddLog(LogType.Load, $"{DateTime.UtcNow} {control.ID} {control.ToString()} Loaded");
 
                     control.Ready = true;
@@ -462,12 +475,23 @@ public abstract class BaseApp : Panel
             }
             else
             {
+                outcome = "false";
+
                 AddLog(LogType.Load, $"{DateTime.UtcNow} {control.ID} {control.ToString()} Load false");
             }
         }
         catch (Exception ex)
         {
+            outcome = "error";
+
             AddLog(LogType.Error, $"{DateTime.UtcNow} {control.ID} {control.ToString()} LoadFailed...{ex}");
+        }
+        finally
+        {
+            if (loadStart != 0)
+                StartupProfiler.NoteLoaded(control.ID,
+                    string.IsNullOrEmpty(control.Name) ? control.ToString() ?? "(unnamed)" : control.Name,
+                    StartupProfiler.ElapsedMs(loadStart), queuedMs, outcome);
         }
     }
 
@@ -594,6 +618,12 @@ public abstract class BaseApp : Panel
         }
     }
 
+    /// <summary>
+    /// Items queued or in flight right now. Contract 3-2 samples this once per frame to tell "the queue went quiet"
+    /// from "nothing was ever queued": only the second one is also pending==0, and both look identical from outside.
+    /// </summary>
+    public int PendingLoadCount => _pendingControls.Count;
+
     public virtual bool RequestLoad(ILoadable control)
     {
         if (control is null)
@@ -612,6 +642,10 @@ public abstract class BaseApp : Panel
             _pendingControls.TryRemove(control, out _);
             return false;
         }
+
+        // Contract 3-2: the queue wait is the difference between "this model took 40 ms to load" and "this model held
+        // the startup for 900 ms". It is stamped here and taken by the consumer when it picks the item up.
+        StartupProfiler.NoteQueued(control.ID);
 
         return true;
     }

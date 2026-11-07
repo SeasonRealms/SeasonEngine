@@ -309,6 +309,7 @@ sealed class EdgeEffect : ComputeEffect
                                     <tr><td><code>PlasmaEffect</code></td><td>FrameStart</td><td><code>compute://plasma</code> &mdash; the compute-baseline smoke test</td></tr>
                                     <tr><td><code>Sdf3DViewEffect</code></td><td>FrameStart</td><td><code>compute://sdf3dview</code></td></tr>
                                     <tr><td><code>TaaEffect</code></td><td>AfterScene</td><td><code>compute://taa0</code> / <code>taa1</code> ping-pong, <code>TaaActive</code></td></tr>
+                                    <tr><td><code>DepthOfFieldEffect</code></td><td>AfterScene</td><td><code>compute://dof</code> &mdash; third head of the scene chain, after TAA and motion blur, before bloom</td></tr>
                                     <tr><td><code>BloomEffect</code></td><td>AfterScene</td><td><code>BloomTexture</code>, plus its <code>compute://bloom/</code> mip chain</td></tr>
                                     <tr><td><code>GtaoEffect</code></td><td>AfterScene</td><td><code>AoTexture</code></td></tr>
                                     <tr><td><code>DdgiEffect</code></td><td>AfterScene</td><td>Probe and SDF volumes</td></tr>

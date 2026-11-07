@@ -39,7 +39,8 @@ internal static unsafe class ShaderCompiler
         string hlslSource,
         string entryPoint,
         string target,
-        uint compileFlags = 0)
+        uint compileFlags = 0,
+        [CallerMemberName] string caller = "")
     {
         var key = (hlslSource, entryPoint, target, compileFlags);
 
@@ -50,10 +51,13 @@ internal static unsafe class ShaderCompiler
                 var hit = (ID3D10Blob*)cached;
                 hit->AddRef();
                 CacheHitCount++;
+                // Contract 3-2: the dedup ratio is what makes the compile bill readable - six PSOs over one source are
+                // one fxc invocation, and only this counter shows whether that reuse actually happened.
+                StartupProfiler.Add("shader.cache-hit");
                 return hit;
             }
 
-            var compiled = Compile(hlslSource, entryPoint, target, compileFlags);
+            var compiled = Compile(hlslSource, entryPoint, target, compileFlags, caller);
             _cache[key] = (nint)compiled;
             CompileCount++;
 
@@ -63,10 +67,14 @@ internal static unsafe class ShaderCompiler
         }
     }
 
-    static ID3D10Blob* Compile(string hlslSource, string entryPoint, string target, uint compileFlags)
+    static ID3D10Blob* Compile(string hlslSource, string entryPoint, string target, uint compileFlags, string caller)
     {
         // 1. Get the D3DCompiler instance, reused across compilations.
         _compiler ??= D3DCompiler.GetApi();
+
+        // Contract 3-2: fxc is the one place every graphics and compute shader is actually translated, and on the
+        // pre-first-frame path it runs on the calling (main) thread - the duration below is main-thread blocking time.
+        long compileStart = StartupProfiler.Enabled ? StartupProfiler.Ticks() : 0;
 
         // 2. Prepare compilation parameters.
         ID3D10Blob* shaderBlob = null;
@@ -117,6 +125,14 @@ internal static unsafe class ShaderCompiler
             if (result.IsFailure)
             {
                 throw new Exception($"Shader compilation failed [{entryPoint} {target}] with HResult: {result}");
+            }
+
+            if (compileStart != 0)
+            {
+                StartupProfiler.Item("shader", $"{target} {entryPoint}", StartupProfiler.ElapsedMs(compileStart),
+                    (long)shaderBlob->GetBufferSize(), $"caller={caller}");
+
+                StartupProfiler.Add("shader.compile");
             }
 
             return shaderBlob;
