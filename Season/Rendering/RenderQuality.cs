@@ -186,6 +186,13 @@ public enum TextureMipPolicy
 ///   softening of a single fetch compounds across the whole feedback window rather than being paid once. Clause 17 then borrows the Post slot that
 ///   2-1 built for FXAA and resolves with FSR1 RCAS, which is the only place a display-referred sharpener can legally run in this engine;
 ///   it is off by default because owning that slot costs a whole extra pass, and TaaSharpness above zero is the switch that buys it.
+/// - A1 motion blur: one AfterScene gather kernel that consumes the existing SceneVelocity and SceneDepth, registered after TaaEffect
+///   and before BloomEffect so it blurs the resolved image and bloom consumes the blurred one. It is the second publisher of
+///   SceneColorOverride, which is a per-frame chain rather than a slot: the effect reads targets.EffectiveSceneSource inside Record,
+///   publishes its own name while active, and must leave the field untouched when it stands down - clearing it would remove the
+///   upstream TAA output. Its output is full-resolution rgba16float on purpose, because the Post entry resolves the override by name
+///   while still describing the source with SceneColor.Desc. Geometry that writes no velocity (water, curtains, rivers, decals,
+///   Overlay, 2D and text) is deliberately not blurred.
 /// - 1-7 cubemap + IBL: TextureCube is a minimal cross-platform type, SH9 irradiance/radiance ride the lighting UBO, diffuse picks either SH9 or constant ambient,
 ///   and the entire path falls back cleanly to the old ambient-only baseline.
 /// - 2-4 DDGI + SDF: GI uses box/sphere proxies, accepts one-frame latency, stores all runtime parameters in the existing lighting UBO tail,
@@ -383,6 +390,27 @@ public class RenderQuality
     /// Changing it at runtime through <see cref="TaaSharpness"/> only scales the lobe and can never create or remove
     /// the pass, so a process that started at zero cannot gain sharpening later. See that property for the full rule.</summary>
     public static float DefaultTaaSharpness = 0.5f; //0f;
+
+    /// <summary>Default value for MotionBlur (overrideable in the app constructor and captured by Init()).
+    /// On, because the expensive half of A1 - the velocity buffer - is already paid for by the 2-3 tier, so what this switch
+    /// buys is one full-resolution gather. Off at initialization registers nothing and leaves the scene chain with zero residue.</summary>
+    public static bool DefaultMotionBlur = true;
+
+    /// <summary>Default value for MotionBlurSamples (overrideable in the app constructor and captured by Init()).
+    /// 12 sits in the middle of the 8/12/16 ladder. The gather is a triangle-weighted sum along one axis, so the visible return
+    /// past 8 taps is the staircase at the two ends of a long streak; 16 doubles the cost for a difference that only reads at 4K.</summary>
+    public static int DefaultMotionBlurSamples = 12;
+
+    /// <summary>Default value for MotionBlurShutter (overrideable in the app constructor and captured by Init()).
+    /// 0.5 is a 180-degree shutter, the film convention: the streak covers half the frame interval, which is what keeps a pan
+    /// readable while still removing the strobe. 1.0 uses the whole interval and reads as a longer, softer smear.</summary>
+    public static float DefaultMotionBlurShutter = 0.5f;
+
+    /// <summary>Default value for MotionBlurMaxRadius (overrideable in the app constructor and captured by Init()).
+    /// A fraction of screen height rather than a pixel count, so the streak keeps the same relative length at every resolution.
+    /// 0.04 is roughly 24 px at 1080p: long enough to read, short enough that a fast rotation does not average the frame centre
+    /// into a flat grey. This is a safety valve above all else - see <see cref="MotionBlurMaxRadius"/>.</summary>
+    public static float DefaultMotionBlurMaxRadius = 0.04f;
 
     /// <summary>Default value for GlobalIllumination (overrideable in the app constructor and captured by Init()).</summary>
     public static GiMode DefaultGlobalIllumination = GiMode.Off;
@@ -869,6 +897,31 @@ public class RenderQuality
         AaMode.Taa => PostResolve.Rcas,
         _ => PostResolve.Copy,
     };
+
+    /// <summary>A1 contract clause 1: global motion-blur switch. Off at initialization registers no effect and allocates no
+    /// texture; switched off at runtime it stands down on the next frame instead, because Record treats it as shutter 0 and
+    /// revokes only its own publication. It rides on the 2-3 velocity tier, so it is unavailable wherever that tier is:
+    /// MotionVectors off, or the Msaa4x exclusion that drops velocity during platform initialization. A view that switched
+    /// <see cref="ViewFeature.MotionBlur"/> off pays nothing either, which is what keeps the minimap and the rear mirror from
+    /// blurring at 192 px.</summary>
+    public bool MotionBlur { get; set; } = DefaultMotionBlur;
+
+    /// <summary>A1 contract clause 1: gather taps per pixel. Runtime knob, because the loop bound is a parameter rather than a
+    /// compiled-in constant. 8/12/16 are the intended tiers; anything a hand-edited Settings.json puts here is clamped into [4, 32]
+    /// by the effect rather than rejected, so an unexpected value degrades the image instead of failing registration. Cost is linear in this.</summary>
+    public int MotionBlurSamples { get; set; } = DefaultMotionBlurSamples;
+
+    /// <summary>A1 contract clause 2: shutter fraction in [0, 1], i.e. how much of the frame interval the streak covers.
+    /// 0.5 is a 180-degree shutter. Runtime knob, and 0 is a real off switch: the effect skips its dispatch and publishes no
+    /// override, so the downstream chain reads the upstream image unchanged and the frame costs exactly what it did before A1.
+    /// Values above 1 are clamped, because no camera integrates longer than its own frame interval.</summary>
+    public float MotionBlurShutter { get; set; } = DefaultMotionBlurShutter;
+
+    /// <summary>A1 contract clause 2: hard cap on streak length as a fraction of screen height. Runtime knob, and a safety valve
+    /// rather than a taste dial: without it a teleport, a cut that slipped past Camera3D.ResetTemporal, or a fast spinner would
+    /// gather across the whole screen and dissolve the image into its own average. The clamp scales the whole velocity vector;
+    /// clamping per axis would bend the streak away from the direction the pixel actually moved.</summary>
+    public float MotionBlurMaxRadius { get; set; } = DefaultMotionBlurMaxRadius;
 
     /// <summary>2-4 contract clause 1: global-illumination tier. Mutually exclusive, fixed at initialization, and downgraded to Off when unsupported.</summary>
     public GiMode GlobalIllumination { get; set; } = DefaultGlobalIllumination;

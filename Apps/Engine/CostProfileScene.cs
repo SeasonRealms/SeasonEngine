@@ -83,6 +83,9 @@ internal sealed class CostProfileScene : ICostProfileScene
             Feature("no-ao", ViewFeature.AmbientOcclusion),
             Feature("no-bloom", ViewFeature.Bloom),
             Feature("no-taa", ViewFeature.AntiAliasing),
+            // A1 rides on the same velocity buffer as TAA, so its row is the one that answers "what does the gather cost
+            // on top of the tier that already pays for the motion vectors".
+            Feature("no-motion-blur", ViewFeature.MotionBlur),
             Feature("no-particles", ViewFeature.Particles),
             Feature("no-post", ViewFeature.Post),
             Feature("no-decals", ViewFeature.Decals),

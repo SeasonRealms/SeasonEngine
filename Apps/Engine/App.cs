@@ -580,6 +580,20 @@ internal class App : BaseApp
 
         }
 
+        // A1: register the motion-blur gather.
+        // It has to sit between the two effects above and below, for the same registration-order reason TAA does:
+        // after TaaEffect, so it blurs the resolved image instead of feeding a smeared image into TAA's history and
+        // smearing the subpixel jitter along every streak; and before BloomEffect, so the highlights the bloom chain
+        // extracts are the streaked ones. It is the second publisher of SceneColorOverride, which is a per-frame
+        // chain rather than a slot - MotionBlurEffect documents the rule it follows when it stands down.
+        // Missing velocity, missing SceneDepth, a missing offscreen SceneColor, or the tier being off all degrade to
+        // a registration-time bypass with zero residue.
+        if (Season.Rendering.FrameSchedule.RegisterCompute(
+                Season.Basic.Graphics.Instance, new Season.Rendering.Effects.MotionBlurEffect()))
+        {
+
+        }
+
         // 2-1 Step B: register BloomEffect.
         // It runs a three-kernel dual-chain pass in AfterScene and writes FrameSchedule.BloomTexture for FinalBlit composition.
         // Threshold and intensity are controlled by RenderQuality.

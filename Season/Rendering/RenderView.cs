@@ -105,7 +105,12 @@ public enum ViewFeature
     /// <summary>P1 waterfall curtain material. When off, this view draws no curtain and does not split the scene into opaque/transparent segments for it.</summary>
     Waterfalls = 1 << 13,
 
-    All = Opaque | Transparent | Shadows | Fog | Weather | AmbientOcclusion | Bloom | AntiAliasing | Particles | Post | Decals | Water | Reflections | Waterfalls,
+    /// <summary>A1 motion blur. Off means this view records no gather dispatch and owns no streak texture - which is what keeps a
+    /// 192 px minimap from paying a full-screen post effect whose whole point is motion the map does not have. Included in
+    /// <see cref="All"/> so a view that never touches this property keeps the main view's behaviour.</summary>
+    MotionBlur = 1 << 14,
+
+    All = Opaque | Transparent | Shadows | Fog | Weather | AmbientOcclusion | Bloom | AntiAliasing | Particles | Post | Decals | Water | Reflections | Waterfalls | MotionBlur,
 }
 
 /// <summary>How a view consumes the frame-wide cascaded shadow atlas.</summary>

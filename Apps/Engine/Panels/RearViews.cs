@@ -65,7 +65,7 @@ internal class RearViews : Panel
     /// Fog is part of the list for the same reason as water: the island's mist is not a screen-space effect but an authored volume
     /// placed in the world, so a mirror that switches it off renders the grove without its mist while the main view has it -
     /// "the fog does not reflect in the mirror", which reads as a bug rather than as a quality trade-off. Everything that is
-    /// frame-global (shadows, weather fall, AO, bloom, anti-aliasing, Post) still stays off.
+    /// frame-global (shadows, weather fall, AO, bloom, anti-aliasing, motion blur, Post) still stays off.
     /// </summary>
     const ViewFeature MirrorFeatures = ViewFeature.Opaque | ViewFeature.Transparent | ViewFeature.Decals
         | ViewFeature.Waterfalls | ViewFeature.Water | ViewFeature.Particles | ViewFeature.Fog;

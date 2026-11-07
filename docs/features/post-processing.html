@@ -133,6 +133,7 @@
                                     <tr><td><code>BloomEffect</code></td><td>AfterScene</td><td>Downsample / upsample chain over HDR scene colour.</td></tr>
                                     <tr><td><code>GtaoEffect</code></td><td>AfterScene</td><td>Ambient occlusion for indirect diffuse.</td></tr>
                                     <tr><td><code>TaaEffect</code></td><td>AfterScene</td><td>Jittered temporal resolve with variance clipping and sharpening.</td></tr>
+                                    <tr><td><code>MotionBlurEffect</code></td><td>AfterScene</td><td>Camera and object streaks gathered along the velocity buffer.</td></tr>
                                     <tr><td><code>DdgiEffect</code></td><td>AfterScene</td><td>Probe tracing and irradiance atlas update.</td></tr>
                                     <tr><td><code>SkyAtmosphereEffect</code></td><td>FrameStart</td><td>Scattering LUTs, cloud noise and the aerial volume.</td></tr>
                                     <tr><td><code>SceneColorCopyEffect</code></td><td>AfterScene</td><td>A readable snapshot of scene colour for effects that need it.</td></tr>
@@ -314,6 +315,54 @@
                     </section>
 
                     <section class="se-card">
+                        <h2 class="se-mt0">Motion blur</h2>
+                        <p>
+                            One gather kernel over the velocity buffer the engine already writes for TAA, at full
+                            resolution in linear HDR and before tone mapping. It reads the image TAA resolved, this
+                            frame's velocity and depth, and publishes <code class="se-inline">compute://motionblur</code>
+                            as the new head of the scene chain.
+                        </p>
+                        <p>
+                            Registration order is execution order, and the reference application registers it after
+                            <code class="se-inline">TaaEffect</code> and before <code class="se-inline">BloomEffect</code>.
+                            After the resolve, because blurring before it would feed a smeared image into the history
+                            and smear the subpixel jitter along every streak. Before bloom, because a highlight that
+                            was streaked has to be the highlight bloom sees &mdash; the other order leaves a
+                            hard-edged glow floating over a blurred body.
+                        </p>
+
+                        <div class="se-table-wrap">
+                            <table class="se-table">
+                                <thead>
+                                    <tr><th>Setting</th><th>Default</th><th>Meaning</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><code>MotionBlur</code></td><td>on</td><td>Off at startup registers nothing and allocates no texture; switched off at runtime it stands down on the next frame and revokes only its own publication.</td></tr>
+                                    <tr><td><code>MotionBlurSamples</code></td><td>12</td><td>Taps along the streak. The loop bound is a parameter, clamped to 4..32 rather than trusted.</td></tr>
+                                    <tr><td><code>MotionBlurShutter</code></td><td>0.5</td><td>Fraction of the velocity vector integrated. Zero is a clean bypass, not a blur of zero length.</td></tr>
+                                    <tr><td><code>MotionBlurMaxRadius</code></td><td>0.04</td><td>Cap on the streak length as a fraction of frame height, so a fast pan cannot smear the frame into soup.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <p>
+                            Velocity is the surface's displacement from the previous frame to this one &mdash; the same
+                            convention TAA reprojects with &mdash; so the gather walks forwards along it. Tap
+                            <code class="se-inline">t</code> reads the colour that was here when the shutter opened,
+                            which is now found further along the motion, and <code class="se-inline">t = 0</code> lands
+                            on this pixel. The streak therefore trails behind whatever moved. Each tap is weighted by a
+                            relative depth difference, so a streak cannot pull a foreground silhouette into the
+                            background or dissolve one into the other.
+                        </p>
+
+                        <p class="se-muted">
+                            Only passes that carry a velocity attachment write velocity. Water, the waterfall, the
+                            river ribbon, decals, the Overlay pass and every 2D and text path write none, so they stay
+                            sharp &mdash; which for text is the outcome you want.
+                        </p>
+                    </section>
+
+                    <section class="se-card">
                         <h2 class="se-mt0">Known gaps</h2>
                         <ul class="se-list">
                             <li>
@@ -324,9 +373,16 @@
                                 than claiming the reference implementation.
                             </li>
                             <li>
+                                <span class="se-badge se-badge--partial">Partial</span>
+                                <strong>Motion blur is a centre-velocity gather.</strong> It does not dilate the velocity
+                                neighbourhood the way a tiled implementation does, so an object smaller than its own
+                                displacement dims instead of leaving a long tail. Geometry drawn without a velocity
+                                attachment does not blur at all.
+                            </li>
+                            <li>
                                 <span class="se-badge se-badge--absent">Absent</span>
-                                <strong>Depth of field, motion blur, chromatic aberration, colour grading LUTs.</strong>
-                                The post chain is tonemap, bloom and AA. Anything else is an effect you would write.
+                                <strong>Depth of field, chromatic aberration, colour grading LUTs.</strong>
+                                The post chain is tonemap, bloom, motion blur and AA. Anything else is an effect you would write.
                             </li>
                             <li>
                                 <span class="se-badge se-badge--absent">Absent</span>

@@ -55,6 +55,14 @@ internal class Views : Panel
     // into bloom and the final present path.
     Sprite2D taaView;
 
+    // A1 first validation target for the motion-blur gather. It samples the streak texture the effect publishes,
+    // so it shows exactly what bloom and the Post entry consume. Acceptance: identical to SceneColor when the
+    // camera and the scene are still (every gather tap lands on the same texel), a streak trailing opposite to the
+    // motion while panning, a streak no longer than MotionBlurMaxRadius, and no fringe pulled across a silhouette.
+    // The thumbnail is absent from the chain when the tier is off or the velocity shape is missing, which is the
+    // same clean bypass every other compute thumbnail here exercises.
+    Sprite2D motionBlurView;
+
     // 1-8 visualization target for 3D SDF slices, which is the only acceptance image for the expanded compute 3D resource path.
     // It shows the 256x256 output of the 3D-to-2D slice kernel. The 3D texture lives in a platform-specific dictionary
     // and cannot be consumed directly by Sprite2D.
@@ -108,6 +116,18 @@ internal class Views : Panel
             Alpha = 1f
         };
         AddControl(taaView);
+
+        motionBlurView = new Sprite2D()
+        {
+            Name = Season.Rendering.Effects.MotionBlurEffect.TextureName,
+            Color = Season.Basic.Colors.White,
+            PosX = 1040,
+            PosY = 430,
+            Width = 240,
+            Height = 135,
+            Alpha = 1f
+        };
+        AddControl(motionBlurView);
 
         bloomMip = new Sprite2D()
         {
@@ -229,6 +249,8 @@ internal class Views : Panel
         normalView?.Update(time, alpha: Alpha);
 
         taaView?.Update(time, alpha: Alpha);
+
+        motionBlurView?.Update(time, alpha: Alpha);
 
         sdf3dView?.Update(time, alpha: Alpha);
 

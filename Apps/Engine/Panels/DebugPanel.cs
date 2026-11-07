@@ -23,7 +23,9 @@ internal class DebugPanel : Panel
     {
         var result = base.Update(time, alpha: alpha, posX: posX, posY: posY, posZ: posZ, width: width, height: height, depth: depth);
 
-        message.Content = $"JitterScale:{App.Instance.Settings.RenderQuality.JitterScale.ToString()};TaaSharpness:{App.Instance.Settings.RenderQuality.TaaSharpness.ToString()};TaaVarianceClipGamma:{App.Instance.Settings.RenderQuality.TaaVarianceClipGamma.ToString()}";
+        // MotionBlurSamples / Shutter / MaxRadius are the A1 knobs: they are read every frame by the gather, so editing
+        // Settings.json and watching this line plus the motionBlur thumbnail is the whole tuning loop.
+        message.Content = $"JitterScale:{App.Instance.Settings.RenderQuality.JitterScale.ToString()};TaaSharpness:{App.Instance.Settings.RenderQuality.TaaSharpness.ToString()};TaaVarianceClipGamma:{App.Instance.Settings.RenderQuality.TaaVarianceClipGamma.ToString()};MotionBlurSamples:{App.Instance.Settings.RenderQuality.MotionBlurSamples.ToString()};MotionBlurShutter:{App.Instance.Settings.RenderQuality.MotionBlurShutter.ToString()};MotionBlurMaxRadius:{App.Instance.Settings.RenderQuality.MotionBlurMaxRadius.ToString()}";
         message?.Update(time, posX: 200, posY: 100);
 
         return result;
