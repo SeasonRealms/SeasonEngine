@@ -4152,7 +4152,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         // and the instance stream is replaced by the compacted block produced by gather -- segmented by slot, so the offset goes on setVertexBuffer.
         // The iteration order of the argument table must exactly match the CPU loop below, otherwise the index range would be misaligned with the primitive.
         int cullSlot = Season.Rendering.CascadedShadow.ActiveSlot;
-        if (cullSlot >= 0 && cullSlot < Season.Rendering.InstanceCull.MaxSlots
+        if (Season.Rendering.InstanceCull.ShadowSlotActive(cullSlot)
             && wgpuMesh.TryGetCullDrawHandles(out var cullSortedId, out var cullArgsId, out int cullCapacity))
         {
             var indirectMatrix = _scratchWorldMatrix;
@@ -4239,7 +4239,7 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         int cullSlot = Season.Rendering.CascadedShadow.ActiveSlot;
         string cullArgsId = string.Empty;
         int cullCapacity = 0;
-        bool shadowIndirect = cullSlot >= 0 && cullSlot < Season.Rendering.InstanceCull.MaxSlots
+        bool shadowIndirect = Season.Rendering.InstanceCull.ShadowSlotActive(cullSlot)
             && wgpuModel.TryGetCullDrawHandles(out cullArgsId, out cullCapacity);
         long cullVertexOffset = shadowIndirect ? (long)cullSlot * cullCapacity * Season.Rendering.InstanceCull.WorldStride : 0;
         int cullSlotBytes = cullCapacity * (int)Season.Rendering.InstanceCull.WorldStride;

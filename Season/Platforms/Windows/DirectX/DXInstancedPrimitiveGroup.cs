@@ -859,7 +859,9 @@ internal unsafe abstract class DXInstancedPrimitiveGroup : DXPrimitiveGroup, Sea
         slot = Season.Rendering.CascadedShadow.ActiveSlot;
         if (!_cullDrawReady || _cullCapacity < _instanceCount)
             return false;
-        if (slot < 0 || slot >= Season.Rendering.InstanceCull.MaxSlots)
+        // Not a range test against MaxSlots: the far slot and the local cube slots sit inside that range, but the chain never writes their
+        // arg rows, so accepting one here would submit an empty batch where the whole-batch draw below would have been correct.
+        if (!Season.Rendering.InstanceCull.ShadowSlotActive(slot))
             return false;
         if ((uint)stream >= (uint)_cullSorted.Length
             || _cullSorted[stream] is not DXStorageBuffer sorted || sorted.Resource == null

@@ -185,7 +185,12 @@ public static class CascadedShadow
     }
 
     /// <summary>First diagnostics slot used by a local light; local slots follow the atlas and far slots so their
-    /// indices never collide with <see cref="ActiveSlot"/> values a backend passes to <see cref="BeginSlot"/>.</summary>
+    /// indices never collide with <see cref="ActiveSlot"/> values a backend passes to <see cref="BeginSlot"/>.
+    ///
+    /// The value is numerically equal to <see cref="InstanceCull.MainViewSlot"/>. The two numbering spaces overlap here and mean different
+    /// things -- a lamp-anchored cube face versus the main camera's frustum -- which is exactly why a shadow draw asks
+    /// <see cref="InstanceCull.ShadowSlotActive"/> rather than comparing a slot number against a range: only the mask knows which slots the
+    /// cull chain wrote this frame. Local slots are never among them, so a local pass always takes the whole-batch draw.</summary>
     public const int LocalSlotBase = SlotCount;
 
     /// <summary>Total number of slots any shadow pass may enter, atlas, far and local together. Only used to size the

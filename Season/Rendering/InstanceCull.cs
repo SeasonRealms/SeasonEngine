@@ -22,6 +22,14 @@ namespace Season.Rendering;
 /// the fog's far map and is deliberately left out of the chain below - its view is anchored to the medium rather than to a
 /// visible main view, so it takes the direct whole-batch path instead of a gathered segment. <see cref="InstanceCull.MainViewSlot"/> follows them
 /// and holds the main camera's frustum for the groups that opted into indirect main-view drawing (<see cref="CullMainView"/>).
+///
+/// That layout is a numbering, not a coverage list, and the difference is a silent failure rather than a compile error. Slots from
+/// <see cref="CascadedShadow.LocalSlotBase"/> up are the local point-light cube maps: their arg rows sit inside
+/// <see cref="InstanceCull.MaxSlots"/> but the chain never writes them, because those maps follow a lamp rather than an eye. Which slots
+/// were actually culled this frame is published as <see cref="InstanceCull.ShadowSlotMask"/>; a shadow draw must ask that mask
+/// (<see cref="InstanceCull.ShadowSlotActive"/>). A range test against <see cref="InstanceCull.MaxSlots"/> instead accepts both the far
+/// slot and a local slot, and hands them an arg row holding the zero InstanceCount that <see cref="InstanceCull.BuildArgsTemplate"/>
+/// installed -- the draw then submits nothing at all, where falling back to the whole batch would have been correct.
 /// Inactive slots are skipped directly by slotMask,
 /// rather than by filling in a "matrix that culls everything" -- that would require constructing a degenerate projection that silently breaks the moment the plane-extraction code changes.
 /// </summary>
@@ -154,6 +162,11 @@ public static class InstanceCull
     /// Slot of the main camera's frustum, placed right after the shadow atlas partitions so the shadow slot numbers stay identical to
     /// <see cref="CascadedShadow"/>'s and every shadow-side caller keeps indexing by <see cref="CascadedShadow.ActiveSlot"/> unchanged.
     /// Its reordered stream carries the original-index tag like every other slot's (see the gather kernel and <see cref="InstanceCull.TagMask"/>).
+    ///
+    /// The value coincides with <see cref="CascadedShadow.LocalSlotBase"/>. That is a numbering coincidence, not a claim that the two name the
+    /// same slot: local cube maps are outside the chain, so a draw issued from the local pass while trusting this number would read the main
+    /// view's arg row. <see cref="ShadowSlotActive(int)"/> is what keeps the two apart; never compare a shadow slot against this constant or
+    /// against <see cref="MaxSlots"/>.
     /// </summary>
     public const int MainViewSlot = CascadedShadow.SlotCount;
 
@@ -257,6 +270,29 @@ public static class InstanceCull
 
     /// <summary>Cull targets registered for this frame. Added by each backend's group on creation and removed by reference on disposal.</summary>
     public static readonly List<IInstanceCullTarget> Targets = new();
+
+    /// <summary>
+    /// Slots the cull chain actually wrote this frame: the sun cascades and the spot light that were active. Zero when no target was
+    /// dispatched, no shadow slot was active, or the shadow atlas was reused.
+    ///
+    /// This is the only truthful answer to "can this draw read a gathered segment", because the slot numbering cannot be asked: the range
+    /// <c>0..MaxSlots</c> also covers slots the chain never touches (the far slot, and every slot from
+    /// <see cref="CascadedShadow.LocalSlotBase"/> up), whose rows keep the InstanceCount=0 written by <see cref="BuildArgsTemplate"/> for the
+    /// lifetime of the buffer. A draw trusting the range test therefore submits nothing, silently, while the direct whole-batch draw it
+    /// displaced would have been correct.
+    ///
+    /// Written once per frame in <see cref="InstanceCullEffect"/>'s Record, and cleared on entry there, before any early return: the mask is
+    /// frame state, and an early return (no targets, a graphics mismatch, no active slot at all) would otherwise leave the previous frame's
+    /// bits standing for a frame in which nothing was written.
+    /// </summary>
+    public static int ShadowSlotMask { get; internal set; }
+
+    /// <summary>
+    /// Whether the chain culled <paramref name="slot"/> this frame, i.e. whether that slot's indirect arg row and gathered segment were
+    /// written. Shadow-side draw code must ask this instead of testing the slot against <see cref="MaxSlots"/>.
+    /// </summary>
+    public static bool ShadowSlotActive(int slot)
+        => (uint)slot < (uint)MaxSlots && (ShadowSlotMask & (1 << slot)) != 0;
 
     /// <summary>
     /// Whether this frame's dispatches included <see cref="MainViewSlot"/> for the targets that asked for it. Written by
@@ -456,6 +492,7 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
     StorageBuffer? _dispatchArgs;
 
     bool _routed;
+    bool _localBypassLogged;
 
     public override bool Initialize(IGraphics g)
     {
@@ -501,6 +538,10 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
 
     public override void Record(IGraphics g)
     {
+        // Cleared before every early return below: an early return happens on a frame where this effect wrote nothing at all, and a stale
+        // mask would then tell the draw side to read rows that still hold the previous frame's counts.
+        InstanceCull.ShadowSlotMask = 0;
+
         if (!ReferenceEquals(g, _graphics) || _cull == null || _finalize == null
             || _gather == null || _slotBuffer == null) return;
         if (InstanceCull.Targets.Count == 0) return;
@@ -525,6 +566,20 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
                 WriteSlotMatrix(CascadedShadow.SpotSlot, CascadedShadow.SpotViewProj);
                 shadowMask |= 1 << CascadedShadow.SpotSlot;
             }
+        }
+
+        // Published before the main-view decision and before the `slotMask == 0` return: a frame that culls only the main view still has to
+        // publish "no shadow slot is readable" here, because that is what the shadow draw side checks before taking a segment.
+        InstanceCull.ShadowSlotMask = shadowMask;
+
+        // Local cube maps are outside the chain by design, but the numbering alone cannot say so (their base equals MainViewSlot). Say it
+        // once in the log, so the next reader does not rediscover this as a missing feature.
+        if (CascadedShadow.LocalActive && !_localBypassLogged)
+        {
+            _localBypassLogged = true;
+            DeviceServices.BaseApp.AddLog(LogType.Backend,
+                $"[InstanceCull] Local cube shadow slots ({CascadedShadow.LocalSlotBase}..{CascadedShadow.TotalSlotCount - 1}) stay on the direct " +
+                "whole-batch path: A7 culls the atlas, the spot and the main view, never a lamp-anchored map.");
         }
 
         // The main view's unjittered ViewProjection without the backend NDC adjustment -- the same matrix control-level frustum culling uses,
