@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 // https://github.com/SeasonRealms/SeasonEngine
 
+using OccPyramid = Season.Rendering.Effects.OcclusionPyramidEffect;
+
 namespace Engine;
 
 /// <summary>
@@ -428,6 +430,9 @@ internal static class AbCapture
             }
 
             var bytes = DeviceServices.Image.SaveImage(image, Season.Basic.ImageFormat.Png);
+            // L2.1: the sidecar's occPyramid level0 has to be checked against the depth attachment it was reduced from
+            // (level0 must be max(1, (depth + 1) / 2)); there is no other way to prove the size on the runtime side.
+            var sceneDepthDesc = Season.Rendering.FrameSchedule.SceneDepth?.Desc;
             var directory = System.IO.Path.GetDirectoryName(OutputPath);
             if (!string.IsNullOrEmpty(directory))
                 System.IO.Directory.CreateDirectory(directory);
@@ -459,6 +464,14 @@ internal static class AbCapture
                 // L1.2: the sub-texel threshold in texels, invariant-formatted because the sidecar is a space-separated key=value
                 // line and a culture that writes "1,5" would split one field into two. 0 means the kernel's test is inactive.
                 + $"texelCull={InstanceCull.ShadowTexelCull.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}) "
+                // L2.1: the pyramid is a producer with no consumer yet, so the only thing a capture can check is that the chain
+                // ran, that a history layer exists by now, and at what size. level0 is the number the acceptance script compares
+                // against HiZ's own level 0 for the same frame: equal sizes plus identical kernel text is what "texel for texel"
+                // reduces to without a compute readback path.
+                + $"occPyramid=(req={(OccPyramid.Requested ? 1 : 0)},ready={(OccPyramid.Ready ? 1 : 0)},"
+                + $"history={(OccPyramid.HistoryValid ? 1 : 0)},layer={OccPyramid.CurrentLayer},"
+                + $"level0={OccPyramid.Level0Width}x{OccPyramid.Level0Height},"
+                + $"depth={sceneDepthDesc?.Width ?? 0}x{sceneDepthDesc?.Height ?? 0}) "
                 // P1: the same evidence for the skinning route. dispatches is what the FrameStart kernel actually served this frame, so a
                 // run that asked for SEASON_INSTANCE_SKINNING=gpu but served 0 is a fallback, not a comparison.
                 // P3 L2: pooled is how many shared (clip, tick) groups the frame actually collapsed. A frame that pools nothing is

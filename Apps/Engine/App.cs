@@ -689,6 +689,16 @@ internal class App : BaseApp
                 Season.Basic.Graphics.Instance, new Season.Rendering.Effects.HiZEffect());
         }
 
+        // L2.1: occlusion pyramid. Same four-level downsample as Hi-Z, but into two ping-ponged layers and for the main view
+        // only, so a later culler can test against last frame's pyramid while this frame's is rebuilt. It has no consumer yet,
+        // so it is registered only when SEASON_OCCLUSION_PYRAMID asked for it - otherwise the four dispatches are pure cost.
+        // It is deliberately independent of SSR and therefore sits outside the block above: it neither requires nor feeds HiZ.
+        if (Season.Rendering.Effects.OcclusionPyramidEffect.Requested)
+        {
+            Season.Rendering.FrameSchedule.RegisterCompute(
+                Season.Basic.Graphics.Instance, new Season.Rendering.Effects.OcclusionPyramidEffect());
+        }
+
         // P0: SSR. Right after Hi-Z — it references that four-level pyramid by name, and a reversed registration order would fetch a texture not yet built.
         // Its reflection-delta composite entry point is attached by itself to FrameSchedule.Prepare/RenderSsrComposite;
         // on registration failure (the backend has no additive-composite capability, no SceneNormal, or the sky is not procedural) both delegates stay null,
