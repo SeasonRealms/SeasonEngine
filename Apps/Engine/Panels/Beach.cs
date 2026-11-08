@@ -68,6 +68,8 @@ internal class Beach : Panel
             CastShadows = false,
             // Keep the coastline on the always-visible baseline, exempt from frustum culling.
             CullingEnabled = false,
+            // DrawPath therefore stays Direct: the indirect path culls with the same frustum predicate, so opting in here would
+            // revoke the exemption above rather than save vertices.
         };
         beachField.Surfaces.Add(BuildTileSurface());
         AddControl(beachField);

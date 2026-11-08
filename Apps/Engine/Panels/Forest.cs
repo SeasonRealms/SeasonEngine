@@ -64,6 +64,8 @@ internal class Forest : Panel, ILoadable
         {
             Name = "Forest",
             ModelName = GlbPath,
+            // The grid is centred on the meadow and the camera stands inside it, so about half the trees sit behind it every frame.
+            DrawPath = InstanceDrawPath.Indirect,
             // CastShadows keeps the default true: these are near-field solid trees, not background silhouettes.
         };
 

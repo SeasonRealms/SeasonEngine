@@ -157,7 +157,9 @@ internal class Birds : Panel
 
         seagullsModel = new InstancedModel()
         {
-            ModelName = @"Assets/flying_seagull_merged.glb"
+            ModelName = @"Assets/flying_seagull_merged.glb",
+            // The flock spreads across the bay, so most gulls sit outside any single view.
+            DrawPath = InstanceDrawPath.Indirect
         };
         AddControl(seagullsModel);
 

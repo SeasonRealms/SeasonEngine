@@ -441,6 +441,8 @@ internal class Mountains : Panel, ILoadable
             var field = new InstancedMesh3D()
             {
                 Name = $"mountain{i + 1}",
+                // The ring spans nearly the whole horizon, so most of it is outside the frustum at any one time.
+                DrawPath = InstanceDrawPath.Indirect,
                 CastShadows = false,   // Background mountains stay out of shadow maps and GI proxies to avoid SDF pollution.
             };
 

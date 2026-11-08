@@ -173,6 +173,8 @@ internal sealed class SailingBoats : Panel
         {
             Name = GlbPath + ":fleet",
             ModelName = GlbPath,
+            // The stations are spread around the island, so most of the fleet is off screen at any heading.
+            DrawPath = InstanceDrawPath.Indirect,
             // Only the sail opts into the per-instance color. Everything else on board keeps TintMode = 0, so the
             // instance color never reaches the hull, the glass, the steel, or the deck paint.
             InstanceTintParts = new[] { SailPart },

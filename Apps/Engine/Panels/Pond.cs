@@ -148,6 +148,8 @@ internal class Pond : Panel
         {
             Name = "PondRim",
             ModelName = River.DikeGlbPath,
+            // A closed ring of rim pieces: half of a ring is always behind the camera.
+            DrawPath = InstanceDrawPath.Indirect,
 
             // A piece is a 4 m strip, so its world AABB goes fat as soon as it turns - the same reason the river's own
             // bank batch uses Wireframe.

@@ -519,6 +519,8 @@ internal class Rocks : Panel, ILoadable
             var field = new InstancedMesh3D()
             {
                 Name = $"rock{i + 1}",
+                // The shoreline ring is the largest instance population in the scene and mostly behind the camera: cull it on the GPU.
+                DrawPath = InstanceDrawPath.Indirect,
                 // Keep CastShadows at the default true: these are near-field solid rocks, not thin shoreline shells.
             };
 

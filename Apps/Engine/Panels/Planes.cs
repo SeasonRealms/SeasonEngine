@@ -99,7 +99,9 @@ internal class Planes : Panel
     {
         planesModel = new InstancedModel()
         {
-            ModelName = PlaneGlbPath
+            ModelName = PlaneGlbPath,
+            // A closed orbit around the island: by construction the half behind the camera is never visible.
+            DrawPath = InstanceDrawPath.Indirect
         };
         AddControl(planesModel);
 

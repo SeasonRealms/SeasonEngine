@@ -81,6 +81,8 @@ internal class Robots : Panel
         robotField = new InstancedModel()
         {
             ModelName = "Assets/3DGodotRobot.glb",
+            // A full skinned rig is the most expensive single instance in the scene, so one behind the camera is worth skipping.
+            DrawPath = InstanceDrawPath.Indirect,
             SkinningMode = InstanceSkinningMode.Gpu
         };
         AddControl(robotField);

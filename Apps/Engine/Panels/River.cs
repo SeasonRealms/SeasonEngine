@@ -1727,6 +1727,8 @@ internal sealed class River : Panel
         {
             Name = "RiverBanks",
             ModelName = DikeGlbPath,
+            // Two long channels of 4 m bank pieces: the far reaches are off screen from anywhere the player can stand.
+            DrawPath = InstanceDrawPath.Indirect,
             // These are solid ridges standing half a metre proud of the meadow, so they cast like any other prop.
 
             // A piece is a 4 m long strip, so its world AABB goes fat as soon as it turns - the same reason the levee

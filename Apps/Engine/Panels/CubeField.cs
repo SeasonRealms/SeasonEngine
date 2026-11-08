@@ -43,7 +43,9 @@ internal class CubeField : Panel
 
         instancedCubeField = new InstancedMesh3D()
         {
-            Name = "InstancedCubeField"
+            Name = "InstancedCubeField",
+            // A dense grid of animated cubes: the rows behind the camera are pure vertex cost.
+            DrawPath = InstanceDrawPath.Indirect
         };
         BuildCubeSurfaces(instancedCubeField, "Assets/Sun.png");
         BuildInstancedCubeField(instancedCubeField);
