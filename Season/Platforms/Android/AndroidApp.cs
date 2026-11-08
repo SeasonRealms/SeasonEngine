@@ -107,6 +107,10 @@ public static class AndroidApp
     /// </summary>
     public static void Run(BaseApp app)
     {
+        // Contract 3-2: the first line of engine code after the activity's OnCreate. Everything before it is reported as
+        // the process-start bridge; everything after it is a real interval.
+        StartupProfiler.Mark("app-run");
+
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _closed) != 0, typeof(AndroidApp));
         _keyboard = new AndroidKeyboardService();
 
@@ -151,9 +155,18 @@ public static class AndroidApp
             _currentWidth = width;
             _currentHeight = height;
 
+            // Contract 3-2: the surface arriving is what unblocks the whole bootstrap chain on this platform - the gap
+            // from app-run to here is activity inflation and the driver's first surface, not engine work.
+            StartupProfiler.Mark("surface-available");
+
             InitializeVulkan(nativeWindow, width, height);
             _initialized = true;
             _surfaceAlive = true;
+
+            // Contract 3-2: everything before this point is the blocking half of startup; from here the render loop runs
+            // and the asynchronous load queue is what the report waits on.
+            StartupProfiler.Mark("frame-loop-begin");
+
             WakeRenderLoop();
         }
         else if (!_surfaceAlive)
@@ -495,6 +508,9 @@ public static class AndroidApp
     /// </summary>
     static unsafe void InitializeVulkan(IntPtr window, int width, int height)
     {
+        // Contract 3-2: initialization starts here. The gap from surface-available to this point is activity-level work.
+        StartupProfiler.Mark("engine-init-begin");
+
         // Immediate-2D compatibility mode (Season.Rendering.Immediate2DMode):
         // the app renders exclusively through the immediate 2D backend, so everything the 3D path
         // would need is skipped below - no PSO bake, no offscreen targets, no effect registration,
@@ -587,11 +603,14 @@ public static class AndroidApp
         // the hot path and floods logcat, so the request follows the build configuration instead of
         // being hardcoded on. Whether the layer actually activated is decided inside VkDevice.Init by
         // CheckValidationLayerSupport and reported in the tier log below.
+        // Contract 3-2: every stage below is a wall-clock interval on the thread that runs initialization, and the
+        // scopes also give the report its nesting - the shader/pso rows land inside the stage that caused them.
 #if DEBUG
         const bool requestValidation = true;
 #else
         const bool requestValidation = false;
 #endif
+        using (StartupProfiler.Scope("Device.Init"))
         VkDevice.Init(
             window: window,
             debug: requestValidation,
@@ -599,32 +618,40 @@ public static class AndroidApp
             createSurface: instHandle => CreateAndroidSurface(instHandle, window));
 
         // 3) Create the SwapChain and upper-layer resource manager.
-        VkDevice.CreateSwapChain(width, height);
+        using (StartupProfiler.Scope("CreateSwapChain")) VkDevice.CreateSwapChain(width, height);
 
         // 4) Display (Depth + RenderPass + Framebuffers)
-        VkDevice.CreateDescriptorHeapsAndViews();
+        using (StartupProfiler.Scope("DescriptorHeaps")) VkDevice.CreateDescriptorHeapsAndViews();
 
         // 5) Initialize the three Pipeline variants, which depend on the RenderPass.
         // Skipped in immediate-2D mode: the main PSO family is never compiled, which is where the
         // startup bake cost would otherwise go.
         if (!immediate2D)
-            VkPipeline.Init(VkDevice.Display.RenderPass);
+        {
+            using (StartupProfiler.Scope("Pipeline.Init")) VkPipeline.Init(VkDevice.Display.RenderPass);
+        }
 
         // 6) Initialize the globally shared lighting UBO before Sprite2D.Init and resource loading.
         // Skipped in immediate-2D mode: no 3D pass consumes it, and the matching per-frame
         // VKPrimitiveGroup.Update in the render loop is skipped as well.
         if (!immediate2D)
-            VKPrimitiveGroup.InitLights();
+        {
+            using (StartupProfiler.Scope("InitLights")) VKPrimitiveGroup.InitLights();
+        }
 
         // 7) Set up the 2D orthographic camera.
-        VKSprite2D.Init();
+        using (StartupProfiler.Scope("Sprite2D.Init")) VKSprite2D.Init();
 
         // 8) Create per-frame CommandPool, buffers, semaphores, and the white placeholder texture.
-        VkDevice.CreateGraphicsCommandLists();
+        using (StartupProfiler.Scope("CommandLists")) VkDevice.CreateGraphicsCommandLists();
 
         // 9) Inject the IGraphics implementation so BaseApp can run unchanged.
         Season.Basic.Graphics.Instance = new Season.Platforms.Shared.LinuxAndroid.Graphics();
         _graphicsReady = true;
+
+        // Contract 3-2: the target block below is one stage on purpose - the individual creations are a few hundred
+        // microseconds each, and what a startup report has to answer is "how much of the black screen was targets".
+        var renderTargets = StartupProfiler.Scope("RenderTargets");
 
         // 10) Offscreen SceneColor for step 2:
         // when not null, FrameSchedule automatically appends the FinalBlit pass to present on screen,
@@ -823,6 +850,8 @@ public static class AndroidApp
             });
         }
 
+        renderTargets.Dispose();
+
         // One-shot tier report: the app ships with the desktop-class defaults (HDR + TAA tier +
         // GTAO + shadows + bloom), so this line is what a device log needs to tell which pipeline the
         // frame actually pays for, and whether the validation layer activated.
@@ -834,7 +863,9 @@ public static class AndroidApp
             Diag("[RenderQuality] immediate-2D mode: the main PSO family was not compiled and no offscreen target, shadow map or post effect exists this session; every frame renders only the Overlay pass directly into the backbuffer");
 
         DeviceServices.BaseApp.ApplyResolution(width, height, 1f, 1f);
-        DeviceServices.BaseApp.Create();
+        // Contract 3-2: the app's own construction - UI tree, scene panels, effect registration, and the RequestLoad calls
+        // that fill the queue below. It runs synchronously inside this call, so its duration is main-thread blocking time.
+        using (StartupProfiler.Scope("BaseApp.Create")) DeviceServices.BaseApp.Create();
     }
 
     /// <summary>

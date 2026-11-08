@@ -75,8 +75,7 @@ internal sealed class MTLDecalPipeline : DecalPipeline
         {
             DepthCompareFunction = MTLCompareFunction.Always, DepthWriteEnabled = false,
         };
-        _noDepthState = Device.MtlDevice.CreateDepthStencilState(noDepth)
-            ?? throw new InvalidOperationException("Decal depth state creation failed.");
+        _noDepthState = MTLPipelineFactory.CreateDepthState(noDepth, "decal");
 
         for (int roughness = 0; roughness < 2; roughness++)
         {
@@ -135,9 +134,7 @@ internal sealed class MTLDecalPipeline : DecalPipeline
             normal.DestinationAlphaBlendFactor = MTLBlendFactor.Zero;
             normal.WriteMask = MTLColorWriteMask.Blue;
         }
-        var pipeline = Device.MtlDevice.CreateRenderPipelineState(desc, out NSError? error);
-        return pipeline ?? throw new InvalidOperationException(
-            $"Decal PSO creation failed: {error?.LocalizedDescription ?? "(no NSError)"}");
+        return MTLPipelineFactory.CreateRender(desc);
     }
 
     static bool Readable(IMTLTexture? texture, MTLTextureType type) => texture != null

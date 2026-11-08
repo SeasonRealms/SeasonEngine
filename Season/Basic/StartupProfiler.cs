@@ -20,8 +20,10 @@ namespace Season.Basic;
 /// finished" instead would never fire for a control that only loads after user input; a queue that keeps loading is
 /// closed by <see cref="maxMs"/> and the report records that as the reason.</para>
 ///
-/// <para><b>Off is free.</b> <see cref="Enabled"/> is a static readonly read from the environment once, and every entry
-/// point tests it first, so a normal build pays one predictable branch per call site and allocates nothing.</para>
+/// <para><b>Off is free.</b> <see cref="Enabled"/> is resolved once, on the first entry point, and every call site tests it
+/// first, so a normal build pays one predictable branch per call site and allocates nothing. Resolution is lazy rather
+/// than a static field initializer because a host without an environment (Android, a browser) has to push its switches in
+/// through <see cref="ProfileSwitch"/> before the profiler reads them - see that type for the ordering contract.</para>
 ///
 /// <para><b>Why the zero is <see cref="origin"/>.</b> It is the moment this type was first touched, which is the first
 /// instrumentation site (<c>app-launch</c>). Everything before it - CLR, XAML, the shell - cannot be subdivided from
@@ -53,28 +55,100 @@ public static class StartupProfiler
     /// <summary>Zero of every number in the report: the moment this type was initialized, i.e. the first instrumentation site.</summary>
     static readonly long origin = Stopwatch.GetTimestamp();
 
-    static readonly string? outputDirectory = ReadText(OutputVariable);
+    /// <summary>
+    /// Where the report goes, or null when the profiler was asked to collect without writing (the one-line console summary
+    /// is still printed). Resolved once by <see cref="Resolve"/>; see <see cref="ProfileOutput"/> for the destinations.
+    /// </summary>
+    static IProfileOutput? output;
 
     /// <summary>
     /// Optional breadcrumb file. Every mark appends one line, so "no report was written" can be told apart from "the run
     /// never reached the first frame": without it the two failures look identical - an empty output directory.
     /// </summary>
-    static readonly string? tracePath = ReadText(TraceVariable);
+    static string? tracePath;
+
+    /// <summary>Set when the trace destination is the console instead of a file; see <see cref="ProfileOutput.ConsoleDestination"/>.</summary>
+    static bool traceToConsole;
 
     static readonly object traceLock = new();
 
-    static readonly bool exitWhenDone = ReadFlag(ExitVariable);
+    static bool exitWhenDone;
 
-    static readonly double quietMs = ReadNumber(QuietVariable, DefaultQuietMs);
+    static double quietMs = DefaultQuietMs;
 
-    static readonly double maxMs = ReadNumber(MaxVariable, DefaultMaxMs);
+    static double maxMs = DefaultMaxMs;
 
     static readonly string runId = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
 
     static readonly string platform = RuntimeInformation.RuntimeIdentifier;
 
+    /// <summary>Set after every switch above has been read; this is the fast path of <see cref="Enabled"/>.</summary>
+    static volatile bool configResolved;
+
+    static volatile bool enabled;
+
     /// <summary>True when <c>SEASON_STARTUP</c> or <c>SEASON_STARTUP_OUT</c> is set. Read at every site as the first line.</summary>
-    public static readonly bool Enabled = ReadEnabled();
+    public static bool Enabled
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            if (configResolved) return enabled;
+
+            EnsureConfig();
+
+            return enabled;
+        }
+    }
+
+    /// <summary>
+    /// Resolves every switch exactly once. Separate from <see cref="Enabled"/> so the hot path can inline away: the first
+    /// call pays for the switch reads, every later one is a volatile bool read.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void EnsureConfig()
+    {
+        if (configResolved) return;
+
+        Resolve();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void Resolve()
+    {
+        lock (sync)
+        {
+            if (configResolved) return;
+
+            // Contract 3-2: every read goes through ProfileSwitch, so a host that has no environment to set (an intent
+            // extra, a URL query, a marker file) can push the same names in before this runs. See ProfileSwitch.Set.
+            output = ProfileOutput.Create(ProfileSwitch.Text(OutputVariable));
+
+            string? trace = ProfileSwitch.Text(TraceVariable);
+
+            if (string.Equals(trace, ProfileOutput.ConsoleDestination, StringComparison.OrdinalIgnoreCase))
+            {
+                traceToConsole = true;
+            }
+            else
+            {
+                tracePath = trace;
+            }
+
+            exitWhenDone = ProfileSwitch.Flag(ExitVariable);
+
+            quietMs = ProfileSwitch.Number(QuietVariable, DefaultQuietMs);
+
+            maxMs = ProfileSwitch.Number(MaxVariable, DefaultMaxMs);
+
+            enabled = output != null || ProfileSwitch.Flag(FlagVariable);
+
+            configResolved = true;
+
+            // Published last: from here on a late ProfileSwitch.Set has no effect and says so.
+            ProfileSwitchTable.Resolved = true;
+        }
+    }
 
     static readonly object sync = new();
 
@@ -113,9 +187,13 @@ public static class StartupProfiler
     /// </summary>
     public static ScopeToken Scope(string name)
     {
-        if (!Enabled) return default;
+        // Resolved before the trace test, because the trace destination is itself part of the configuration: a host that
+        // pushes its switches in after the first scope must still get the breadcrumb it asked for.
+        EnsureConfig();
 
-        if (tracePath != null) Trace($"scope-begin {name}");
+        if (!enabled) return default;
+
+        if (tracePath != null || traceToConsole) Trace($"scope-begin {name}");
 
         return new ScopeToken(name, Stopwatch.GetTimestamp(), depth++);
     }
@@ -123,9 +201,11 @@ public static class StartupProfiler
     /// <summary>Records a point in time: a stage boundary that has no duration of its own.</summary>
     public static void Mark(string name)
     {
-        if (tracePath != null) Trace($"mark {name} enabled={Enabled} out={outputDirectory ?? "(null)"}");
+        EnsureConfig();
 
-        if (!Enabled) return;
+        if (tracePath != null || traceToConsole) Trace($"mark {name} enabled={enabled} out={output?.Description ?? "(null)"}");
+
+        if (!enabled) return;
 
         double now = Ms(Stopwatch.GetTimestamp());
 
@@ -303,7 +383,7 @@ public static class StartupProfiler
 
         if (depth > 0) depth--;
 
-        if (tracePath != null) Trace($"scope-end {name} {(now - start) * 1000.0 / Stopwatch.Frequency:0.000}");
+        if (tracePath != null || traceToConsole) Trace($"scope-end {name} {(now - start) * 1000.0 / Stopwatch.Frequency:0.000}");
 
         var entry = new Entry("stage", name, Ms(start), Ms(now), openDepth, 0, 0, null);
 
@@ -556,13 +636,11 @@ public static class StartupProfiler
 
         try
         {
-            if (!string.IsNullOrEmpty(outputDirectory))
+            if (output != null)
             {
-                Directory.CreateDirectory(outputDirectory);
-
                 WriteCsv(snapshot);
 
-                File.AppendAllText(Path.Combine(outputDirectory, "startup-report.txt"), report.ToString(), Encoding.UTF8);
+                output.Append("startup-report.txt", report.ToString());
             }
         }
         catch (Exception ex)
@@ -573,7 +651,7 @@ public static class StartupProfiler
         Console.Error.WriteLine($"[STARTUP] {reason} first-frame={Format(firstFrameMs)} last-load={Format(lastLoadMs)} " +
             $"quiescent={elapsedMs:0.0}ms loads={loadCount} failed={loadFailures} " +
             $"fxc={FindCounter(counterSnapshot, "shader.compile")} hits={FindCounter(counterSnapshot, "shader.cache-hit")} " +
-            $"output={(string.IsNullOrEmpty(outputDirectory) ? "(none)" : outputDirectory)}");
+            $"output={(output == null ? "(none)" : output.Description)}");
 
         // Contract 3-2: the compute bill on its own line. kernels > cs_fxc means sources were shared; the ms totals are
         // what a deferral or a disk cache would be credited with, so they have to be readable without opening the report.
@@ -582,7 +660,9 @@ public static class StartupProfiler
             $"cs_fxc_ms={FindCounterMs(counterSnapshot, "shader.compile.cs")} pso_ms={FindCounterMs(counterSnapshot, "compute.pso")} " +
             $"sig_ms={FindCounterMs(counterSnapshot, "compute.signature")}");
 
-        if (exitWhenDone) Environment.Exit(0);
+        // A browser has no process to exit and a phone would be killed before the log buffer drains; the report is already
+        // written by now, so only a desktop host that asked for it honours the switch.
+        if (exitWhenDone && !OperatingSystem.IsBrowser()) Environment.Exit(0);
     }
 
     static void AppendKindSummary(StringBuilder report, Entry[] snapshot, string kind)
@@ -644,13 +724,13 @@ public static class StartupProfiler
 
     static void WriteCsv(Entry[] snapshot)
     {
-        string path = Path.Combine(outputDirectory!, "startup-items.csv");
+        const string fileName = "startup-items.csv";
 
-        bool header = !File.Exists(path);
+        // The whole table is built in memory and handed to the sink in one block, because a console sink has no file to
+        // append to and a directory sink is one open either way. A startup run is a few hundred rows, so the copy is free.
+        var text = new StringBuilder(1 << 16);
 
-        using var writer = new StreamWriter(path, true, Encoding.UTF8, 1 << 16);
-
-        if (header) writer.WriteLine("run,platform,kind,name,start_ms,end_ms,ms,depth,bytes,aux,detail");
+        if (!output!.Exists(fileName)) text.AppendLine("run,platform,kind,name,start_ms,end_ms,ms,depth,bytes,aux,detail");
 
         var line = new StringBuilder(256);
 
@@ -674,8 +754,10 @@ public static class StartupProfiler
 
             AppendField(line, entry.Detail ?? string.Empty);
 
-            writer.WriteLine(line.ToString());
+            text.AppendLine(line.ToString());
         }
+
+        output.Append(fileName, text.ToString());
     }
 
     static void AppendField(StringBuilder line, string value)
@@ -694,11 +776,22 @@ public static class StartupProfiler
 
     static void Trace(string message)
     {
+        string line = $"{DateTime.Now:HH:mm:ss.fff} {message}";
+
         try
         {
+            if (traceToConsole)
+            {
+                Console.Error.WriteLine($"[startup-trace] {line}");
+
+                return;
+            }
+
+            if (tracePath == null) return;
+
             lock (traceLock)
             {
-                File.AppendAllText(tracePath!, $"{DateTime.Now:HH:mm:ss.fff} {message}{Environment.NewLine}");
+                File.AppendAllText(tracePath, line + Environment.NewLine);
             }
         }
         catch
@@ -778,39 +871,5 @@ public static class StartupProfiler
         int index = (int)Math.Round(percentile * (values.Count - 1), MidpointRounding.AwayFromZero);
 
         return values[Math.Clamp(index, 0, values.Count - 1)];
-    }
-
-    static bool ReadEnabled()
-    {
-        if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable(OutputVariable))) return true;
-
-        return ReadFlag(FlagVariable);
-    }
-
-    static string? ReadText(string variable)
-    {
-        string? value = Environment.GetEnvironmentVariable(variable);
-
-        return string.IsNullOrWhiteSpace(value) ? null : value;
-    }
-
-    static bool ReadFlag(string variable)
-    {
-        string? value = Environment.GetEnvironmentVariable(variable);
-
-        if (string.IsNullOrEmpty(value)) return false;
-
-        return value != "0" && !string.Equals(value, "false", StringComparison.OrdinalIgnoreCase);
-    }
-
-    static double ReadNumber(string variable, double fallback)
-    {
-        string? value = Environment.GetEnvironmentVariable(variable);
-
-        if (string.IsNullOrEmpty(value)) return fallback;
-
-        return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsed) && parsed > 0
-            ? parsed
-            : fallback;
     }
 }

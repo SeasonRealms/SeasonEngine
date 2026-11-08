@@ -328,10 +328,23 @@ float Visibility(vec3 p,float depth,int light) {
 // Two-point Gauss-Legendre over the span. The default is the old centre sample, so a slice thinner than half a metre
 // (everything the near field produces) is bit-identical to the previous behaviour.
 float SliceVisibility(vec3 ray,float depth,float z0,float span,int light) {
-    float result=Visibility(F(8).xyz+ray*depth,depth,light);
-    if(light==int(F(34).z) && span>=0.5) {
-        float a=z0+span*0.21132487,b=z0+span*0.78867513;
-        result=0.5*(Visibility(F(8).xyz+ray*a,a,light)+Visibility(F(8).xyz+ray*b,b,light));
+    // One exit, both arms writing the same variable, matching DX. The centre sample is only taken when the
+    // resample does not run: the two Gauss taps below overwrite it anyway, so computing it first spent one full
+    // evaluation of the shadow chain - eight ring taps, two face reads and the seam blend - on a value that was
+    // then thrown away, on exactly the froxels far enough out to make that chain expensive.
+    float result=0;
+    if(light!=int(F(34).z) || span<0.5) {
+        result=Visibility(F(8).xyz+ray*depth,depth,light);
+    } else {
+        // Both Gauss points as one loop body. glslang keeps Visibility as a function, so the two-call form would
+        // cost two OpFunctionCall instead of one and nothing else - see the note on DX, where DXBC has no call
+        // instruction and the same shape had to be inlined in full at every site. Same weights, same order.
+        float sum=0;
+        for(int gaussIndex=0;gaussIndex<2;gaussIndex++) {
+            float gaussT=gaussIndex==0?z0+span*0.21132487:z0+span*0.78867513;
+            sum+=Visibility(F(8).xyz+ray*gaussT,gaussT,light);
+        }
+        result=0.5*sum;
     }
     return result;
 }

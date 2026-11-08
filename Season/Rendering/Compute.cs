@@ -150,6 +150,23 @@ public sealed class ComputeKernelDesc
     public ComputeBindingDesc[] Bindings = Array.Empty<ComputeBindingDesc>();
 
     /// <summary>
+    /// True when this kernel may be compiled after the first frame is already on screen.
+    ///
+    /// <para>Why a flag on the descriptor rather than a backend detail: whether a feature can afford to be late is a
+    /// property of the feature, not of the API. Only an effect that already knows how to render a frame without itself
+    /// - one that publishes a per-frame ready flag and whose consumers treat "not ready" as "neutral" - may set this.
+    /// Declaring it here keeps that decision in one place the effect owns, and lets every backend honour it with the
+    /// same source of truth. As of Step 5 only D3D12 acts on it: the compute compile moves to a background lane while
+    /// the frame loop runs, and <c>TryDispatchCompute</c> answers false until the blob lands. VK/Metal/Web keep
+    /// compiling inside CreateComputeKernel and simply ignore the flag, so the field is inert there rather than wrong.</para>
+    ///
+    /// <para>The contract a deferred kernel must keep: no dispatch may observe it half-built (the handle is valid from
+    /// CreateComputeKernel on), and a false dispatch must leave the feature in a state the frame already knows how to
+    /// draw. Both are existing requirements of the degrade-gracefully path, which is why deferral needed no new one.</para>
+    /// </summary>
+    public bool Deferred;
+
+    /// <summary>
     /// Workgroup size for threadgroup/local_size, introduced in 1-8 and defaulting to 8×8×1, so existing kernels require no changes.
     /// Limits are the intersection of the minimum guarantees shared by all four backends, with Vulkan being the strictest:
     /// maxComputeWorkGroupSize=[128,128,64] and maxComputeWorkGroupInvocations=128, so X≤128, Y≤128, Z≤64, and X*Y*Z≤128.

@@ -170,9 +170,14 @@ public sealed class DdgiEffect : ComputeEffect
     }
 
 
+    // gather/update are the real DDGI path. The slice kernel only drives the Views thumbnail, so Step 1 moved
+    // its compilation behind EnableDebugSlice instead of paying for it on every boot.
     ComputeKernel? _gather;
     ComputeKernel? _slice;
     ComputeKernel? _update;
+
+    /// <summary>Set once the Views panel asked for the debug slice; Initialize honours it for later registrations.</summary>
+    bool _debugSliceWanted;
 
     StorageBuffer? _proxies;
 
@@ -314,25 +319,9 @@ public sealed class DdgiEffect : ComputeEffect
                 new ComputeBindingDesc { Type = ComputeBindingType.StorageTexture3DWrite, StorageFormat = ComputeStorageFormat.R16Float },
             },
         });
-        _slice = g.CreateComputeKernel(new ComputeKernelDesc
-        {
-            Name = "ddgiSdfSlice",
-            Source = new ShaderSourceSet
-            {
-                Hlsl = SourceSliceHlsl,
-                Glsl = SourceSliceGlsl,
-                Msl = SourceSliceMsl,
-                Wgsl = SourceSliceWgsl,
-                EntryPoint = "CSMain",
-            },
-            Bindings = new[]
-            {
-                new ComputeBindingDesc { Type = ComputeBindingType.Params, SizeInBytes = 32 },
-                new ComputeBindingDesc { Type = ComputeBindingType.SampledTexture3D },
-                new ComputeBindingDesc { Type = ComputeBindingType.SampledTexture },
-                new ComputeBindingDesc { Type = ComputeBindingType.StorageTextureWrite, StorageFormat = ComputeStorageFormat.Rgba8Unorm },
-            },
-        });
+        // Step 1: ddgiSdfSlice is a debug-only source (its only consumer is the Views thumbnail), so it is not
+        // compiled here. EnableDebugSlice compiles it on demand; this one and the other 8 debug-only sources stay
+        // out of the boot bill until the panel is opened.
 
         // Finalize probe-grid dimensions for this run, then derive the probe count and atlas sizes.
         _gridX = (uint)Math.Max(1, q.GiProbeGridX);
@@ -371,14 +360,13 @@ public sealed class DdgiEffect : ComputeEffect
                 new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferRead },
             },
         });
-        if (_gather == null || _slice == null || _update == null)
+        if (_gather == null || _update == null)
         {
             Dispose();
             return false;
         }
 
         g.CreateComputeTexture3D(VolumeName, _resolution, _resolution, _resolution, ComputeStorageFormat.R16Float);
-        g.CreateComputeTexture(DebugTextureName, DebugSize, DebugSize, ComputeStorageFormat.Rgba8Unorm);
         g.CreateComputeTexture(IrrAtlasName0, _atlasW, _atlasH, ComputeStorageFormat.Rgba16Float);
         g.CreateComputeTexture(IrrAtlasName1, _atlasW, _atlasH, ComputeStorageFormat.Rgba16Float);
         // Depth-moment atlas: independent 16x16 tiles (14x14 core, see DepTile), same ping-pong scheme,
@@ -395,10 +383,68 @@ public sealed class DdgiEffect : ComputeEffect
         // with two ping-pong variants.
         _updateResP0 = new ComputeResourceRef[] { _proxies, VolumeName, _giSh, IrrAtlasName1, IrrAtlasName0, DepAtlasName1, DepAtlasName0, _lights };
         _updateResP1 = new ComputeResourceRef[] { _proxies, VolumeName, _giSh, IrrAtlasName0, IrrAtlasName1, DepAtlasName0, DepAtlasName1, _lights };
+        // The slice kernel, its output texture and its resource arrays are built by EnableDebugSlice.
+        if (_debugSliceWanted) EnableDebugSlice(g);
+        return true;
+    }
+
+    /// <summary>
+    /// Step 1 on-demand debug source: compiles ddgiSdfSlice and creates its 256x256 output texture the first time
+    /// the Views panel asks for it, instead of paying for it in every boot. Idempotent, and it must run at a frame
+    /// boundary with no pass open - the same constraint <see cref="Initialize"/> has. Until it is called, Record
+    /// skips the slice dispatch and <see cref="DebugTextureName"/> does not exist; the thumbnail renders blank,
+    /// which is the same graceful shape as a backend that declines DDGI entirely.
+    /// </summary>
+    public bool EnableDebugSlice(IGraphics g)
+    {
+        _debugSliceWanted = true;
+
+        if (_slice != null) return true;
+
+        // Not initialized yet: Initialize calls back in once the gather/update path is up.
+        if (_gather == null) return false;
+
+        _slice = g.CreateComputeKernel(new ComputeKernelDesc
+        {
+            Name = "ddgiSdfSlice",
+            Source = new ShaderSourceSet
+            {
+                Hlsl = SourceSliceHlsl,
+                Glsl = SourceSliceGlsl,
+                Msl = SourceSliceMsl,
+                Wgsl = SourceSliceWgsl,
+                EntryPoint = "CSMain",
+            },
+            Bindings = new[]
+            {
+                new ComputeBindingDesc { Type = ComputeBindingType.Params, SizeInBytes = 32 },
+                new ComputeBindingDesc { Type = ComputeBindingType.SampledTexture3D },
+                new ComputeBindingDesc { Type = ComputeBindingType.SampledTexture },
+                new ComputeBindingDesc { Type = ComputeBindingType.StorageTextureWrite, StorageFormat = ComputeStorageFormat.Rgba8Unorm },
+            },
+        });
+        if (_slice == null) return false;
+
+        g.CreateComputeTexture(DebugTextureName, DebugSize, DebugSize, ComputeStorageFormat.Rgba8Unorm);
         // Slice samples the surface written this frame (the one just produced by update): [sdf, atlas, output].
         _sliceResP0 = new ComputeResourceRef[] { VolumeName, IrrAtlasName0, DebugTextureName };
         _sliceResP1 = new ComputeResourceRef[] { VolumeName, IrrAtlasName1, DebugTextureName };
         return true;
+    }
+
+    /// <summary>
+    /// Step 1: drops the debug slice kernel while the Views panel is closed, so a closed panel costs no dispatch.
+    /// The output texture stays registered (an unused 256x256 rgba8 target is cheaper than recreating one on every
+    /// open), and the next <see cref="EnableDebugSlice"/> recompiles the kernel from the fxc source cache.
+    /// </summary>
+    public void DisableDebugSlice()
+    {
+        _debugSliceWanted = false;
+
+        _slice?.Dispose();
+        _slice = null;
+        _sliceResP0 = null;
+        _sliceResP1 = null;
     }
 
     public override void Record(IGraphics g)
@@ -568,24 +614,28 @@ public sealed class DdgiEffect : ComputeEffect
         });
 
         // 3) Slice: render the unchanged main debug area plus the lower probe-atlas strip from this frame's write surface.
-        Span<float> sp = stackalloc float[8];
-        sp[0] = DebugSize;
-        sp[1] = DebugMainRows;
-        sp[2] = extent * 0.5f;
-        sp[3] = _gridX;
-        sp[4] = _gridY;
-        sp[5] = _gridZ;
-        sp[6] = 0f;
-        sp[7] = 0f;
-        g.DispatchCompute(new ComputeDispatchArgs
+        // Step 1: the kernel only exists after EnableDebugSlice (Views opened), so the whole block is conditional.
+        if (_slice != null)
         {
-            Kernel = _slice!,
-            Params = MemoryMarshal.AsBytes(sp),
-            Resources = _pingWrite ? _sliceResP1! : _sliceResP0!,
-            GroupsX = (DebugSize + 7) / 8,
-            GroupsY = (DebugSize + 7) / 8,
-            GroupsZ = 1,
-        });
+            Span<float> sp = stackalloc float[8];
+            sp[0] = DebugSize;
+            sp[1] = DebugMainRows;
+            sp[2] = extent * 0.5f;
+            sp[3] = _gridX;
+            sp[4] = _gridY;
+            sp[5] = _gridZ;
+            sp[6] = 0f;
+            sp[7] = 0f;
+            g.DispatchCompute(new ComputeDispatchArgs
+            {
+                Kernel = _slice,
+                Params = MemoryMarshal.AsBytes(sp),
+                Resources = _pingWrite ? _sliceResP1! : _sliceResP0!,
+                GroupsX = (DebugSize + 7) / 8,
+                GroupsY = (DebugSize + 7) / 8,
+                GroupsZ = 1,
+            });
+        }
 
         // Step 2b publish state: the surface just written this frame becomes the consumed surface,
         // and will be sampled by the next frame's main pass.
@@ -616,6 +666,8 @@ public sealed class DdgiEffect : ComputeEffect
         _giSh = null;
         _lights?.Dispose();
         _lights = null;
+        _sliceResP0 = null;
+        _sliceResP1 = null;
     }
 
     // ── Shader sources shared across all four backends. Slot order follows the binding layout above,

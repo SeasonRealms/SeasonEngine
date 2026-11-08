@@ -90,6 +90,9 @@ public sealed class PlasmaEffect : ComputeEffect
         });
     }
 
+    /// <summary>Step 1: registered only while the Views panel is open, so unregistering must release the kernel too.</summary>
+    public override void OnUnregistered() => Dispose();
+
     public void Dispose()
     {
         _kernel?.Dispose();

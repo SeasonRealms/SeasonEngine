@@ -176,6 +176,23 @@ window.seasonWebGPU = (() => {
     // 而 _passNormal 只说得清「有没有」，说不清「是哪一张」。
     let _activeNormalView = null;
 
+    // Contract 3-1: GPU frame timing. WebGPU writes a timestamp only at a pass boundary, and a stable browser rejects
+    // the per-pass writeTimestamp method (it needs chromium-experimental-timestamp-query-inside-passes at device
+    // creation). The portable form is the pass descriptor's timestampWrites, so the C# side hands over a pass's two
+    // indices before it opens; marks that no pass can carry - the frame's own two and a compute interval's closing one -
+    // get a one-line marker pass of their own.
+    const _TS_SLOTS = 4;
+    let _tsSlots = null;      // [{ querySet, resolve, readback, busy }] - one per slot, so a pending map is never overwritten
+    let _tsSlot = -1;         // slot this frame writes into; -1 when no timer is attached or the frame was dropped
+    let _tsTag = 0;           // frame token the active slot belongs to, echoed back with the readback
+    let _tsMarks = 0;         // samples to resolve when this frame's command buffer is submitted
+    let _tsHeadMark = -1;     // the frame's opening mark, until the first pass writes it ahead of itself
+    let _tsTailMark = -1;     // the frame's closing mark, written when the frame closes
+    let _tsBeginMark = -1;    // index the next pass writes when it opens
+    let _tsEndMark = -1;      // index the next pass writes when it closes
+    const _tsResults = [];    // finished readbacks waiting for the C# side to poll them
+    const _tsEmpty = [];      // shared empty answer, so the per-frame poll allocates nothing
+
     function _clearActivePass() {
         _activePassId = -1; _activeColorTarget = _activeColorView = _activeDepthView = _activeNormalView = null;
         _passDepthOnly = _passVelocity = _passNormal = _passOutlineMask = _passOverlay = _passMsaa = false;
@@ -871,7 +888,9 @@ window.seasonWebGPU = (() => {
         // The probe results are stored in _gpuFeatures
         // and consumed only by the downgrade chain in _mapStorageFormat
         // (see Compute.cs decision 3).
-        const _optionalFeatures = ['texture-formats-tier1', 'float32-filterable'];
+        // 'timestamp-query' is requested the same conditional way: the only consumer is the Contract 3-1 GPU frame
+        // timer, and a device that does not offer it must still start (the profiler keeps its CPU columns).
+        const _optionalFeatures = ['texture-formats-tier1', 'float32-filterable', 'timestamp-query'];
         const _requiredFeatures = [];
         for (const f of _optionalFeatures)
             if (adapter.features.has(f)) { _requiredFeatures.push(f); _gpuFeatures.add(f); }
@@ -2923,6 +2942,10 @@ window.seasonWebGPU = (() => {
             });
         }
 
+        // Contract 3-1: the frame's opening mark goes out ahead of the first pass, and the two indices this pass
+        // carries travel on its descriptor - the only portable way to name a pass boundary.
+        _flushHeadMark();
+        const tsWrites = _takePassWrites();
         _passEncoder = _commandEncoder.beginRenderPass({
             // Depth-only passes (shadow maps) use a depth-only attachment set,
             // and contents must be rendered through the dedicated depth32float pipeline (1-5)
@@ -2936,7 +2959,8 @@ window.seasonWebGPU = (() => {
                 // aligned with DontCare on the DX/Vulkan side.
                 // Shadow passes store depth for later sampling.
                 depthStoreOp: storeDepth ? 'store' : 'discard',
-            }
+            },
+            timestampWrites: tsWrites ?? undefined,
         });
         // 1-5: the depth-only flag drives implicit routing in draw functions
         // to the shadow pipeline + shadow bind group
@@ -5863,7 +5887,13 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
             slot.bufferRefs = bufferRefs.length > 0 ? bufferRefs : null;
         }
 
-        const pass = _commandEncoder.beginComputePass({ label: `compute_${name}` });
+        // Contract 3-1: a compute interval's opening mark rides on its first dispatch; the closing one is placed as
+        // soon as the interval ends, because one interval may span several dispatches.
+        _flushHeadMark();
+        const pass = _commandEncoder.beginComputePass({
+            label: `compute_${name}`,
+            timestampWrites: _takePassWrites() ?? undefined,
+        });
         pass.setPipeline(k.pipeline);
         pass.setBindGroup(0, slot.bindGroup);
         if (indirectBuffer) {
@@ -5893,7 +5923,18 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
                 { buffer: readback, bytesPerRow: stride, rowsPerImage: height }, [width, height]);
             capture.width = width; capture.height = height; capture.stride = stride;
         }
+        // Contract 3-1: resolve this frame's timestamps into its slot's readback before the buffer is submitted, and
+        // start the map right after - the C# side polls it and never waits for it.
+        let tsSlot = -1, tsTag = 0, tsMarks = 0;
+        if (_tsSlot >= 0) {
+            tsSlot = _tsSlot; tsTag = _tsTag; tsMarks = _tsMarks;
+            try { _resolveTimestamps(); }
+            catch (error) { console.error(`[WebGPU] timestamp resolve failed: ${error?.message}`); tsMarks = 0; }
+        }
         _device.queue.submit([_commandEncoder.finish()]);
+        if (tsSlot >= 0 && tsMarks > 0) _mapTimestamps(tsSlot, tsTag, tsMarks);
+        _tsSlot = -1; _tsTag = 0; _tsMarks = 0;
+        _tsHeadMark = _tsTailMark = _tsBeginMark = _tsEndMark = -1;
         if (readback) {
             readback.mapAsync(GPUMapMode.READ).then(() => {
                 const raw = new Uint8Array(readback.getMappedRange());
@@ -5923,6 +5964,162 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
                 _fpsLastSec = now; _fpsFrameCount = 0; _fpsMaxFrameMs = 0;
             }
         }
+    }
+
+    // ── Contract 3-1: GPU frame timing (timestamp queries) ──
+    // Capability probe, slot ring, mark queue and readback. The C# side owns the ring's slot policy and the mark indices;
+    // this side owns the only two things it can own - when an encoder exists, and when a map has come back.
+
+    function createGpuTimer(capacity) {
+        if (!_device) return false;
+        if (_tsSlots) return true;
+        // The feature has to be requested at device creation. The descriptor form is what this module uses: a timestamp
+        // exists only at a pass boundary, and the descriptor is the only portable way to name one.
+        if (!_gpuFeatures.has('timestamp-query')) return false;
+        const count = capacity | 0;
+        try {
+            const slots = [];
+            for (let i = 0; i < _TS_SLOTS; i++) {
+                const querySet = _device.createQuerySet({ label: `gpu_timer_${i}`, type: 'timestamp', count });
+                // Two buffers per slot, because MAP_READ may not be combined with QUERY_RESOLVE: the samples land in the
+                // resolve buffer and are copied from there. One pair per slot: the next frame may start before this
+                // readback has come back, and sharing one buffer would overwrite an unread result.
+                const resolve = _device.createBuffer({
+                    label: `gpu_timer_resolve_${i}`, size: count * 8,
+                    usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+                });
+                const readback = _device.createBuffer({
+                    label: `gpu_timer_readback_${i}`, size: count * 8,
+                    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+                });
+                slots.push({ querySet, resolve, readback, busy: false });
+            }
+            _tsSlots = slots;
+            return true;
+        } catch (error) {
+            console.error(`[WebGPU] timestamp timer unavailable: ${error?.message}`);
+            return false;
+        }
+    }
+
+    function disposeGpuTimer() {
+        if (!_tsSlots) return;
+        for (const s of _tsSlots) {
+            // A buffer with a pending map throws on destroy; that is exactly the case where the frame that owned it is
+            // gone, and the context teardown reclaims it.
+            try { if (!s.busy) s.readback.destroy(); } catch { /* already released */ }
+            try { s.resolve.destroy(); } catch { /* already released */ }
+            try { s.querySet.destroy(); } catch { /* already released */ }
+        }
+        _tsSlots = null; _tsSlot = -1; _tsTag = 0; _tsMarks = 0;
+        _tsHeadMark = _tsTailMark = _tsBeginMark = _tsEndMark = -1;
+        _tsResults.length = 0;
+    }
+
+    // False means this slot still has a readback mapped: the caller tries the next one, which is what turns "the CPU is
+    // four frames ahead" into a dropped frame instead of a query set overwritten under a pending map.
+    function beginGpuTimestamps(slot, tag) {
+        if (!_tsSlots || slot < 0 || slot >= _tsSlots.length) return false;
+        if (_tsSlots[slot].busy) return false;
+        _tsSlot = slot; _tsTag = tag; _tsMarks = 0;
+        _tsHeadMark = _tsTailMark = _tsBeginMark = _tsEndMark = -1;
+        return true;
+    }
+
+    // The indices the next pass must write. A negative one means that boundary has nothing to write; the frame's opening
+    // mark is only ever replaced by a real value, so a pass that never opens cannot lose it.
+    function setPassTimestamps(head, begin, end) {
+        if (_tsSlot < 0) return;
+        if (head >= 0) _tsHeadMark = head;
+        _tsBeginMark = begin;
+        _tsEndMark = end;
+    }
+
+    // One empty compute pass is the cheapest legal place for a timestamp that has no pass boundary of its own. Only an
+    // index that is really written goes in: a descriptor with no indices at all is not worth a pass.
+    function _writeMarker(label, writes) {
+        const pass = _commandEncoder.beginComputePass({
+            label,
+            timestampWrites: { querySet: _tsSlots[_tsSlot].querySet, ...writes },
+        });
+        pass.end();
+    }
+
+    function placeGpuTimestamp(index) {
+        if (_tsSlot < 0 || index < 0 || !_commandEncoder) return;
+        _writeMarker('gpu_ts_mark', { beginningOfPassWriteIndex: index });
+    }
+
+    // The frame's opening mark means "before anything else this frame", so it becomes a marker pass the first time a
+    // pass opens. Called from beginPass and dispatchCompute.
+    function _flushHeadMark() {
+        if (_tsSlot < 0 || _tsHeadMark < 0 || !_commandEncoder) return;
+        _writeMarker('gpu_ts_frame_head', { beginningOfPassWriteIndex: _tsHeadMark });
+        _tsHeadMark = -1;
+    }
+
+    // The timestampWrites member for the pass that is about to open, or null when this pass carries no marks.
+    function _takePassWrites() {
+        if (_tsSlot < 0) return null;
+        const begin = _tsBeginMark, end = _tsEndMark;
+        _tsBeginMark = _tsEndMark = -1;
+        if (begin < 0 && end < 0) return null;
+        const writes = { querySet: _tsSlots[_tsSlot].querySet };
+        if (begin >= 0) writes.beginningOfPassWriteIndex = begin;
+        if (end >= 0) writes.endOfPassWriteIndex = end;
+        return writes;
+    }
+
+    function endGpuTimestamps(marks, tail) {
+        if (_tsSlot < 0) return;
+        _tsMarks = marks | 0;
+        _tsTailMark = tail;
+    }
+
+    function _resolveTimestamps() {
+        const s = _tsSlots[_tsSlot];
+        // Whatever is left has no pass of its own: the frame's opening mark when the frame recorded no pass at all, and
+        // the closing mark, which is always taken after the last pass. One marker pass carries both.
+        if (_tsHeadMark >= 0 || _tsTailMark >= 0) {
+            const writes = {};
+            if (_tsHeadMark >= 0) writes.beginningOfPassWriteIndex = _tsHeadMark;
+            if (_tsTailMark >= 0) writes.endOfPassWriteIndex = _tsTailMark;
+            _writeMarker('gpu_ts_frame_marks', writes);
+            _tsHeadMark = _tsTailMark = -1;
+        }
+        _tsBeginMark = _tsEndMark = -1;
+        if (_tsMarks <= 0) return;
+        // MAP_READ cannot be combined with QUERY_RESOLVE, so the samples take one hop through the resolve buffer.
+        _commandEncoder.resolveQuerySet(s.querySet, 0, _tsMarks, s.resolve, 0);
+        _commandEncoder.copyBufferToBuffer(s.resolve, 0, s.readback, 0, _tsMarks * 8);
+    }
+
+    function _mapTimestamps(slot, tag, marks) {
+        const s = _tsSlots[slot];
+        s.busy = true;
+        s.readback.mapAsync(GPUMapMode.READ).then(() => {
+            // WebGPU timestamps are 64-bit nanoseconds; copying the prefix first keeps the copy valid after unmap.
+            const raw = new BigUint64Array(s.readback.getMappedRange().slice(0, marks * 8));
+            const values = new Float64Array(marks);
+            for (let i = 0; i < marks; i++) values[i] = Number(raw[i]);
+            s.readback.unmap();
+            s.busy = false;
+            _tsResults.push({ tag, values });
+        }).catch((error) => {
+            s.busy = false;
+            console.error(`[WebGPU] timestamp readback failed: ${error?.message}`);
+        });
+    }
+
+    // [tag, ns0, ns1, ...] for the oldest finished frame, or the shared empty array. Never blocks: a frame whose map is
+    // still in flight simply is not here yet, and the shared ring ages it out to "GPU unknown" instead of waiting.
+    function takeGpuTimestamps() {
+        if (_tsResults.length === 0) return _tsEmpty;
+        const r = _tsResults.shift();
+        const out = new Array(r.values.length + 1);
+        out[0] = r.tag;
+        for (let i = 0; i < r.values.length; i++) out[i + 1] = r.values[i];
+        return out;
     }
 
     function resizeCanvas(width, height) {
@@ -6260,5 +6457,8 @@ function drawInstancedMesh3DIndirect(cacheKey, uniformData, sortedId, vertexOffs
         // 1-8 Compute 3D resource expansion
         createComputeTexture3D, releaseComputeTexture3D,
         updateStorageBuffer,
+        // Contract 3-1: GPU frame timing (timestamp queries)
+        createGpuTimer, disposeGpuTimer, beginGpuTimestamps, setPassTimestamps, placeGpuTimestamp, endGpuTimestamps,
+        takeGpuTimestamps,
     };
 })();

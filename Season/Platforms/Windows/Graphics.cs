@@ -470,10 +470,19 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
     public bool ComputeSupported => DirectX.Device.D3dDevice != null;
 
+    /// <summary>
+    /// Step 2: kernels registered since the last frame boundary, in registration order.
+    ///
+    /// No lock, because there is only ever one producer: <c>FrameSchedule.RegisterCompute</c> is called from App.Create
+    /// and from the runtime registrations (river, campfire, flagpole), and all of those run on the frame-loop thread.
+    /// The consumer is the same thread, at the top of the next frame.
+    /// </summary>
+    readonly List<DXComputeKernel> _pendingComputeKernels = new();
+
     /// <summary>Parameter-level validation is centralized here (same rules on all backends):
     /// missing HLSL source returns null for graceful fallback; invalid binding declarations
-    /// throw exceptions (programming error); fxc compilation or PSO creation failures are
-    /// logged and return null (graceful degradation during registration, with no platform residue).</summary>
+    /// throw exceptions (programming error). Compilation and PSO creation no longer happen here - Step 2 moved them to
+    /// <see cref="FlushPendingCompute"/> so a whole registration batch shares one parallel fxc wave.</summary>
     public Season.Rendering.ComputeKernel CreateComputeKernel(Season.Rendering.ComputeKernelDesc desc)
     {
         if (!ComputeSupported || string.IsNullOrEmpty(desc.Source.Hlsl))
@@ -494,7 +503,11 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
 
         try
         {
-            return new DXComputeKernel(desc);
+            // Step 2: construction only. The root signature, the fxc pass and the PSO are paid at the next frame
+            // boundary, where the whole batch compiles in one wave instead of one shader at a time.
+            var kernel = new DXComputeKernel(desc);
+            _pendingComputeKernels.Add(kernel);
+            return kernel;
         }
         catch (Exception ex)
         {
@@ -502,6 +515,71 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             return null;
         }
     }
+
+    /// <summary>
+    /// Step 2: turns registration into a parallel compile wave, then finishes each kernel on the main thread.
+    ///
+    /// <para><b>Why a frame boundary and not the registration site.</b> App.Create registers every built-in effect in one
+    /// straight line before the first frame exists, so at registration time the list of kernels to compile is not yet
+    /// known - the last effect has not been constructed when the first one wants its shader. Waiting one boundary is
+    /// what makes the batch a batch: thirty-odd sources reach the pool together, where the wall clock is the longest one
+    /// rather than the sum of all of them.</para>
+    ///
+    /// <para><b>Why the split is safe.</b> fxc is pure CPU and moves to the pool; the root signature and the PSO need the
+    /// device and stay here. A kernel dispatched before this ever saw it is caught by TryDispatchCompute's EnsureBuilt,
+    /// so the worst case is "one kernel pays its own build at the point of use" - the pre-Step-2 behaviour.</para>
+    ///
+    /// <para><b>Step 5 splits the batch again, by necessity rather than by count.</b> The kernels a frame cannot be drawn
+    /// without are compiled here, because the first frame is the thing being protected and the rest of this file has no
+    /// way to draw without them. The kernels whose feature already knows how to be absent - fog and cloth, declared with
+    /// <see cref="Season.Rendering.ComputeKernelDesc.Deferred"/> - are handed to a background lane instead, where they
+    /// land while later frames are presenting. Measured on 28 sources: the two deferred families are 36.1 s of the 42.9 s
+    /// black screen, and the 26 sources left on this path are 1.2 s of it.</para>
+    /// </summary>
+    public void FlushPendingCompute()
+    {
+        if (_pendingComputeKernels.Count != 0)
+        {
+            var kernels = _pendingComputeKernels.ToArray();
+
+            _pendingComputeKernels.Clear();
+
+            var essential = new List<ShaderCompiler.PrewarmRequest>(kernels.Length);
+            var deferred = new List<ShaderCompiler.PrewarmRequest>();
+
+            for (int i = 0; i < kernels.Length; i++)
+            {
+                var desc = kernels[i].Desc;
+                var request = new ShaderCompiler.PrewarmRequest(desc.Source.Hlsl!, desc.Source.EntryPoint, desc.Name);
+
+                if (desc.Deferred) deferred.Add(request);
+                else essential.Add(request);
+            }
+
+            if (essential.Count != 0) ShaderCompiler.Prewarm(essential);
+
+            // Deferred kernels are finished here too, but only from cache: a miss answers false and leaves the kernel
+            // unbuilt, which is the state the effect already knows how to draw (fog publishes FogOutputReady = false,
+            // cloth keeps its static vertices). Waiting for a deferred source here would put the 19.9 s fog compile
+            // back in front of the first frame.
+            for (int i = 0; i < kernels.Length; i++) kernels[i].EnsureBuilt();
+
+            if (deferred.Count != 0) ShaderCompiler.QueueBackground(deferred);
+        }
+
+        // Step 5, graphics half: adopt the fog-sampling PSO family as soon as its pixel shader lands. Independent of the
+        // compute queue above - it is a different shader on a different lane - and it runs every boundary, even one with
+        // no kernels, because registration time is not when the family arrives.
+        Pipeline.PumpFogVariant();
+
+        // The lanes open one boundary late on purpose: this method runs before the frame is recorded, so starting fxc
+        // on the first boundary would put two compilers on the memory bus the very first frame is using.
+        if (++_computeBoundaries > 1) ShaderCompiler.StartBackground();
+    }
+
+    /// <summary>How many frame boundaries this process has drained. Only used to hold the background lanes back until
+    /// one frame has actually been presented.</summary>
+    int _computeBoundaries;
 
     /// <summary>Storage textures are registered into DictionaryDXTexture by name
     /// (LoadSprite2D hits them, AddRefs, and skips file loading). Sprite2D consumes them by
@@ -653,6 +731,24 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             return false;
         dxBuffer.TransitionTo(cmd, ResourceStates.VertexAndConstantBuffer);
         return true;
+    }
+
+    public bool StorageBufferReadbackSupported => ComputeSupported && DirectX.Device.D3dDevice != null;
+
+    public byte[][]? TryReadStorageBuffers(IReadOnlyList<Season.Rendering.StorageBuffer> buffers)
+    {
+        if (!StorageBufferReadbackSupported || buffers == null || buffers.Count == 0) return null;
+
+        var native = new DXStorageBuffer[buffers.Count];
+        for (int i = 0; i < buffers.Count; i++)
+        {
+            // Every element is checked before anything is submitted: a readback that fired for half a list
+            // would hand the caller a short array with no way to tell which number went missing.
+            if (buffers[i] is not DXStorageBuffer dx || dx.Resource == null || dx.SizeInBytes == 0) return null;
+            native[i] = dx;
+        }
+
+        return DirectX.Device.ReadBuffersOnce(native);
     }
 
     /// <summary>Indirect instanced quad draw pipeline. Returns null on creation failure, which makes the particle effect skip registration entirely and the image fall back to its pre-change state.</summary>
@@ -808,6 +904,13 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
             return false;
 
         var kernel = (DXComputeKernel)args.Kernel;
+
+        // Step 2: a kernel that has not been through a frame-boundary drain yet - one registered after this frame
+        // started - builds itself here. Same cost it would have paid at registration before, so this is the fallback
+        // that keeps the deferred path from being a correctness change.
+        if (!kernel.EnsureBuilt())
+            return false;
+
         var bindings = kernel.Desc.Bindings;
 
         // A0.2 admission is placed up front rather than at the dispatch point: if the validation came after the binding loop,

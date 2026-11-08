@@ -74,15 +74,13 @@ internal sealed class Draw2DPipeline : IDisposable
             color.DestinationRgbBlendFactor = MTLBlendFactor.OneMinusSourceAlpha;
             color.SourceAlphaBlendFactor = MTLBlendFactor.One;
             color.DestinationAlphaBlendFactor = MTLBlendFactor.Zero;
-            _pipeline = Device.MtlDevice.CreateRenderPipelineState(descriptor, out Foundation.NSError? error)
-                ?? throw new InvalidOperationException($"Immediate Metal pipeline: {error?.LocalizedDescription}");
+            _pipeline = MTLPipelineFactory.CreateRender(descriptor);
             using var depth = new MTLDepthStencilDescriptor
             {
                 DepthCompareFunction = MTLCompareFunction.Always,
                 DepthWriteEnabled = false
             };
-            _depth = Device.MtlDevice.CreateDepthStencilState(depth)
-                ?? throw new InvalidOperationException("Cannot create immediate depth state.");
+            _depth = MTLPipelineFactory.CreateDepthState(depth, "immediate2d");
             _linear = CreateSampler(MTLSamplerMinMagFilter.Linear);
             _point = CreateSampler(MTLSamplerMinMagFilter.Nearest);
         }
@@ -97,8 +95,8 @@ internal sealed class Draw2DPipeline : IDisposable
             SAddressMode = MTLSamplerAddressMode.ClampToEdge,
             TAddressMode = MTLSamplerAddressMode.ClampToEdge
         };
-        return Device.MtlDevice.CreateSamplerState(descriptor)
-            ?? throw new InvalidOperationException("Cannot create immediate sampler.");
+        return MTLPipelineFactory.CreateSampler(descriptor,
+            filter == MTLSamplerMinMagFilter.Linear ? "immediate2d-linear" : "immediate2d-point");
     }
 
     internal unsafe void Draw(Texture texture, Draw2DConstants constants)

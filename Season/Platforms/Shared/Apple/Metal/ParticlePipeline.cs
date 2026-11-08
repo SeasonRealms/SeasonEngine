@@ -83,14 +83,12 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
             {
                 DepthCompareFunction = MTLCompareFunction.LessEqual, DepthWriteEnabled = false,
             };
-            _depthState = Device.MtlDevice.CreateDepthStencilState(depth)
-                ?? throw new InvalidOperationException("Failed to create particle depth state.");
+            _depthState = MTLPipelineFactory.CreateDepthState(depth, "particle");
             using var noDepth = new MTLDepthStencilDescriptor
             {
                 DepthCompareFunction = MTLCompareFunction.Always, DepthWriteEnabled = false,
             };
-            _noDepthState = Device.MtlDevice.CreateDepthStencilState(noDepth)
-                ?? throw new InvalidOperationException("Failed to create particle no-depth state.");
+            _noDepthState = MTLPipelineFactory.CreateDepthState(noDepth, "particle-no-depth");
         }
         catch { Dispose(); throw; }
     }
@@ -151,9 +149,7 @@ internal sealed class MTLParticleDrawPipeline : Season.Rendering.ParticleDrawPip
             }
         }
 
-        var pipeline = Device.MtlDevice.CreateRenderPipelineState(desc, out NSError? error);
-        if (pipeline == null)
-            throw new InvalidOperationException($"Failed to create particle PSO: {error?.LocalizedDescription ?? "(no NSError)"}");
+        var pipeline = MTLPipelineFactory.CreateRender(desc);
         _pipelines[key] = pipeline;
         return pipeline;
     }

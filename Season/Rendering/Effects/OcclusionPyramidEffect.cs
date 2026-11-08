@@ -80,9 +80,12 @@ public sealed class OcclusionPyramidEffect : ComputeEffect
     /// <summary>Layer written by the frame before <see cref="CurrentLayer"/>; the only safe read for a same-frame consumer.</summary>
     public static int HistoryLayer { get; private set; } = 1;
 
-    static bool ReadRequested()
+    static bool ReadRequested() => ReadSwitch("SEASON_OCCLUSION_PYRAMID");
+
+    /// <summary>Shared reader for the boolean <c>SEASON_*</c> switches this effect owns.</summary>
+    static bool ReadSwitch(string variable)
     {
-        var raw = Environment.GetEnvironmentVariable("SEASON_OCCLUSION_PYRAMID")?.Trim();
+        var raw = Environment.GetEnvironmentVariable(variable)?.Trim();
 
         return raw is "1" or "on" or "true" or "yes";
     }
@@ -128,6 +131,253 @@ public sealed class OcclusionPyramidEffect : ComputeEffect
 
     /// <summary>Level 0's height; see <see cref="Level0Width"/>.</summary>
     public static uint Level0Height { get; private set; }
+
+    /// <summary>
+    /// L2.3: the unjittered main-view ViewProjection whose SceneDepth <see cref="CurrentLayer"/> was reduced from -
+    /// the camera this pyramid is a snapshot of. Meaningful only while <see cref="HasBuiltViewProjection"/>.
+    ///
+    /// <para><b>Why the producer stamps this instead of the consumer remembering it.</b> A consumer one frame later
+    /// could carry its own previous-frame matrix, but only if it knew the pyramid had been rebuilt on every frame in
+    /// between. <see cref="Record"/> returns early on a resize, on a missed dispatch and on every view that is not
+    /// the primary one, and each of those leaves the published layer more than one frame old. Stamping the camera
+    /// beside the layer rotation makes the two inseparable: whichever frame is being read, the matrix next to it is
+    /// the one that produced it.</para>
+    ///
+    /// <para>Same source as the cull's slot matrix (<see cref="DeviceServices.BaseApp"/>'s MainView), so "the
+    /// pyramid was built for the camera that is testing against it" is one opinion read twice rather than two
+    /// opinions that could disagree.</para>
+    /// </summary>
+    public static Matrix4x4 BuiltViewProjection { get; private set; }
+
+    /// <summary>
+    /// Whether <see cref="BuiltViewProjection"/> describes <see cref="CurrentLayer"/>. Revoked together with
+    /// <see cref="Ready"/> - never separately - on every path that stops short of publishing a whole chain, and
+    /// cleared by <see cref="Allocate"/> because a reallocation replaces the textures the stamp described.
+    /// </summary>
+    public static bool HasBuiltViewProjection { get; private set; }
+
+    /// <summary>
+    /// L2.3: the screen budget of <see cref="GateOpen"/>, in level-0 texels. One texel is two screen pixels.
+    ///
+    /// <para><b>Why six.</b> <c>SEASON_OCCLUSION_GATE_SWEEP</c> measures the exchange rate on real geometry and real
+    /// level-0 dimensions: about 20 level-0 texels per degree of yaw at 1139x628. Six texels is therefore roughly 0.3
+    /// degrees per frame, or 18 degrees per second at 60 Hz - the band a mouse drag lives in and a slow pan does
+    /// not. The value this shipped with first was two, which shuts the gate at 0.1 degrees per frame (6 degrees per
+    /// second): safe, but slow enough that a stationary camera with a hand tremor would count as motion, so it would
+    /// have thrown away most of what the step after this one exists to earn.</para>
+    ///
+    /// <para><b>What it costs.</b> A budget of N texels lets the pyramid be consulted while every texel in it sits up
+    /// to 2N screen pixels away from the surface it described. Nothing can go wrong today, because L2.2's
+    /// min-pyramid can only keep instances. Once the reduce flips to max, this number becomes the width of the hole
+    /// a fast-moving thin occluder can punch, and six is the largest value that still reads as "small compared to an
+    /// occluder worth testing" - 12 screen pixels is well inside a wall and well outside a fence rail. Raise it
+    /// further only against a measurement of how many instances the flip actually culls; it is a parameter rather
+    /// than a constant precisely so that measurement can move it without a rebuild.</para>
+    ///
+    /// <para>A negative value means "never open", which is the fault injection the acceptance script uses to take
+    /// the pyramid-free path on a frame where the camera happens to be still.</para>
+    /// </summary>
+    public static float GateTexels { get; } = ReadGate("SEASON_OCCLUSION_GATE_TEXELS", 6f);
+
+    /// <summary>
+    /// L2.3: the depth budget of <see cref="GateOpen"/>, in NDC depth units. This engine's projections map near/far
+    /// onto 0/1, so the number is a fraction of the whole depth range and is comparable across resolutions and
+    /// fields of view.
+    ///
+    /// <para><b>Held at exactly one thousandth of <see cref="GateTexels"/></b> because that is the ratio the sweep
+    /// measures: 0.001 NDC of depth drift per level-0 texel of screen drift, steady to within 5% across a hundred-fold
+    /// range of yaw rates. Leaving it at the old 0.002 while the screen budget grew to six would have made this the
+    /// only bound that ever fires - the gate would have stayed shut at 0.1 degrees per frame and the screen budget
+    /// would have been unreachable, which is the one way to widen this gate and get nothing for it.</para>
+    ///
+    /// <para>The two bounds are not redundant even at a fixed ratio. A pure dolly moves depth with almost no corner
+    /// drift, and a field-of-view change moves depth with no screen drift at all; those are exactly the cases where a
+    /// min-pyramid's "nearest surface at this texel" stops describing the same surface, so the second bound earns its
+    /// keep precisely where the first one goes quiet.</para>
+    ///
+    /// <para>Negative means "never open".</para>
+    /// </summary>
+    public static float GateDepth { get; } = ReadGate("SEASON_OCCLUSION_GATE_DEPTH", 0.006f);
+
+    static float ReadGate(string variable, float fallback)
+    {
+        var raw = Environment.GetEnvironmentVariable(variable)?.Trim();
+
+        return float.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out float value) ? value : fallback;
+    }
+
+    /// <summary>
+    /// L2.3: whether <see cref="BuiltViewProjection"/> is close enough to <paramref name="viewProjection"/> that this
+    /// pyramid's depths still describe the same screen.
+    ///
+    /// <para><b>What is being gated.</b> The pyramid is a snapshot of the previous frame's depth, taken with the
+    /// previous frame's camera; the consumer runs before this frame's opaque stage, so it cannot have a fresher one.
+    /// Under a slow camera the two frusta nearly coincide and a confirmation means what it says. Under a fast drag
+    /// they do not: a block that held the nearest surface at one screen position now holds whatever the drag swept
+    /// into that position, and the confirmation would be answering about a picture that is no longer on screen. This
+    /// gate is the check that the two pictures coincide, expressed in the only two units the consumer cares about -
+    /// where things landed (level-0 texels) and how deep they are (NDC depth).</para>
+    ///
+    /// <para><b>How it measures.</b> The previous frame's NDC cube is pushed back to world through the inverse of
+    /// <see cref="BuiltViewProjection"/> and projected forward through the candidate. Each corner's distance from
+    /// where it used to be, in each unit, is a lower bound on how far that part of the view has moved. A projective
+    /// map is linear along edges, so the eight corners bound the six faces. This is a probe rather than a proof, and
+    /// it does not have to be one: a false "open" only lets a confirmation fire, and under L2.2's min-pyramid a
+    /// confirmation can only keep an instance that the plane test might have dropped. The proof obligation belongs
+    /// to the step that flips the reduce, and that step inherits this gate as a precondition rather than as a
+    /// substitute.</para>
+    ///
+    /// <para><b>Why it runs on the CPU.</b> The previous matrix would have to be a second push-constant block to
+    /// reach the kernel, and 80 bytes of cull parameters plus 64 bytes of matrix already exceed Vulkan's 128-byte
+    /// guaranteed push-constant budget; turning it into a storage buffer would put a per-frame upload and a fifth
+    /// binding in front of a decision that is made once per frame rather than once per instance. A gate is by
+    /// definition the cheap side of the trade: it either lets the whole frame's pyramid through or refuses it.</para>
+    ///
+    /// <para><paramref name="texels"/> and <paramref name="depth"/> are NaN when no comparison could be made at
+    /// all - no stamp, no published size, a singular inverse, or a corner behind the candidate camera. NaN rather
+    /// than a large number on purpose: a capture has to be able to tell "the gate refused to measure" from "the gate
+    /// measured twelve texels and closed", and those are different bugs.</para>
+    /// </summary>
+    public static bool GateOpen(in Matrix4x4 viewProjection, out float texels, out float depth)
+    {
+        texels = float.NaN;
+        depth = float.NaN;
+
+        if (!HasBuiltViewProjection) return false;
+
+        texels = MeasureStaleness(BuiltViewProjection, viewProjection, Level0Width, Level0Height, out depth);
+
+        // NaN is the honest value for "the comparison could not be made", and a gate that cannot compare is a gate
+        // that refuses: the caller falls back to the plane test, which is what shipped before L2.2.
+        if (float.IsNaN(texels)) return false;
+
+        return texels <= GateTexels && depth <= GateDepth;
+    }
+
+    /// <summary>
+    /// L2.3: the measurement behind <see cref="GateOpen"/>, with the provenance and the budgets taken out.
+    ///
+    /// <para>Split out because it is the only part of this step that can be swept without dragging a mouse: given two
+    /// view matrices and a level-0 size, "how far did the old frustum corner move" is a closed-form number, and
+    /// <c>SEASON_OCCLUSION_GATE_SWEEP</c> sweeps it over yaw rates to show where the shipped budgets land. A single
+    /// combined function would have forced that sweep to copy the loop, and a copy is the one thing a staleness
+    /// threshold must not have.</para>
+    ///
+    /// <para>Returns NaN when the two matrices cannot be compared at all: no invertible <paramref name="built"/>, a
+    /// corner with no finite pre-image, or a corner on or behind <paramref name="current"/>'s eye plane. All three
+    /// mean the same thing to a caller - nothing here can be vouched for.</para>
+    /// </summary>
+    public static float MeasureStaleness(in Matrix4x4 built, in Matrix4x4 current, uint width, uint height, out float depth)
+    {
+        depth = float.NaN;
+
+        if (width == 0u || height == 0u) return float.NaN;
+        if (!Matrix4x4.Invert(built, out var fromNdc)) return float.NaN;
+
+        // One NDC unit is half the texture, hence the halving: the cube spans [-1, 1] and the texel grid spans
+        // [0, width]. Depth needs no scaling because near/far already sit on 0/1 (see Frustum.FromViewProjection).
+        float halfWidth = width * 0.5f;
+        float halfHeight = height * 0.5f;
+        float worstTexels = 0f;
+        float worstDepth = 0f;
+
+        for (int corner = 0; corner < 8; corner++)
+        {
+            // x/y on the cube's faces, z on its near and far planes: the old view's whole frustum boundary.
+            var previous = new Vector4(
+                (corner & 1) != 0 ? 1f : -1f,
+                (corner & 2) != 0 ? 1f : -1f,
+                (corner & 4) != 0 ? 1f : 0f,
+                1f);
+
+            var world = Vector4.Transform(previous, fromNdc);
+            if (MathF.Abs(world.W) < 1e-6f) return float.NaN;
+            world /= world.W;
+
+            var clip = Vector4.Transform(world, current);
+
+            // On or behind the new eye plane the point has no finite screen position: the projection sends it to
+            // infinity and then wraps it back into the frame. Nothing about it can be compared, and a drag fast
+            // enough to do this is precisely the case this gate exists to refuse.
+            if (clip.W <= 1e-6f) return float.NaN;
+
+            float x = clip.X / clip.W;
+            float y = clip.Y / clip.W;
+            float z = clip.Z / clip.W;
+
+            // `previous` is where this world point used to land, so each difference is how far it has moved.
+            worstTexels = MathF.Max(worstTexels, MathF.Max(
+                MathF.Abs(x - previous.X) * halfWidth,
+                MathF.Abs(y - previous.Y) * halfHeight));
+            worstDepth = MathF.Max(worstDepth, MathF.Abs(z - previous.Z));
+        }
+
+        depth = worstDepth;
+        return worstTexels;
+    }
+
+    /// <summary>
+    /// L2.3: diagnostic. <c>SEASON_OCCLUSION_GATE_SWEEP=1</c> makes every published frame compute what the gate would
+    /// say at a range of camera yaw rates, and publishes it as the sidecar's <c>gateSweep=</c> token.
+    ///
+    /// It exists because the budgets are otherwise unreadable: a capture harness parks the camera, so the sidecar's
+    /// texels are near zero on every frame of every run and say nothing about where "too stale" begins. Rotating
+    /// the recorded view about its own Y axis and feeding the result back through the very same
+    /// <see cref="MeasureStaleness"/> turns "six texels" into "this many degrees per frame", which is a sentence
+    /// that can be checked against a mouse drag.
+    /// </summary>
+    static bool GateSweep { get; } = ReadSwitch("SEASON_OCCLUSION_GATE_SWEEP");
+
+    /// <summary>Yaw rates in degrees per frame: a still camera, a slow pan, a drag, and a flick.</summary>
+    static readonly float[] GateSweepRates = { 0.05f, 0.1f, 0.25f, 0.5f, 1f, 2f, 5f };
+
+    /// <summary>
+    /// L2.3: the sweep's text, empty unless <c>SEASON_OCCLUSION_GATE_SWEEP</c> is set. Published statically for the same
+    /// reason <see cref="Level0Width"/> is: the effect is registered anonymously, so a sidecar has no instance to ask.
+    /// </summary>
+    public static string GateSweepReport { get; private set; } = "";
+
+    bool _gateSweepLogged;
+
+    /// <summary>
+    /// Rebuilds <see cref="GateSweepReport"/> for the frame that just published.
+    ///
+    /// Rebuilt every frame rather than once, because the text is only useful if its candidate camera is the frame
+    /// whose sidecar carries it; the log line is written once, because a hundred identical lines would bury the one
+    /// that matters. This is the only allocation on <see cref="Record"/>'s path and it exists only when the diagnostic
+    /// is armed - the shipped path stays at the "zero allocations" the base class asks for.
+    /// </summary>
+    void ReportGateSweep(in Matrix4x4 view, in Matrix4x4 projection)
+    {
+        var log = new StringBuilder();
+        // One whitespace-free token: these lines go into a space-separated key=value sidecar, so a nested list has to
+        // live inside parentheses with comma separators, exactly as the "a7=" and "skinning=" fields already do.
+        log.Append("gateSweep=(at=").Append(Level0Width).Append('x').Append(Level0Height)
+            .Append(",budgets=").Append(GateTexels.ToString("0.###", CultureInfo.InvariantCulture)).Append('/')
+            .Append(GateDepth.ToString("0.#####", CultureInfo.InvariantCulture));
+
+        for (int i = 0; i < GateSweepRates.Length; i++)
+        {
+            float yaw = GateSweepRates[i] * MathF.PI / 180f;
+            // Right-multiplied: the rotation happens in view space, i.e. about the camera's own origin, which leaves
+            // its position fixed and turns only its facing. That is what a view drag is; a left-multiplied rotation
+            // would orbit the camera around the world origin instead.
+            var candidate = view * Matrix4x4.CreateRotationY(yaw) * projection;
+            float texels = MeasureStaleness(BuiltViewProjection, candidate, Level0Width, Level0Height, out float depth);
+            bool open = !float.IsNaN(texels) && texels <= GateTexels && depth <= GateDepth;
+            log.Append(',').Append(GateSweepRates[i].ToString("0.##", CultureInfo.InvariantCulture)).Append("deg=")
+                .Append(texels.ToString("0.##", CultureInfo.InvariantCulture)).Append('/')
+                .Append(depth.ToString("0.####", CultureInfo.InvariantCulture))
+                .Append(open ? "/open" : "/shut");
+        }
+
+        log.Append(')');
+        GateSweepReport = log.ToString();
+
+        if (_gateSweepLogged) return;
+        _gateSweepLogged = true;
+        DeviceServices.BaseApp?.AddLog(LogType.Backend, GateSweepReport);
+    }
 
     /// <summary>Compiles the two kernels and allocates both layers. False means no depth attachment, a narrower depth format
     /// than D32Float, or a backend that cannot compile the sources.</summary>
@@ -216,6 +466,9 @@ public sealed class OcclusionPyramidEffect : ComputeEffect
         HistoryLayer = 1;
         Level0Width = _widths[0];
         Level0Height = _heights[0];
+        // A reallocation replaces the textures the stamp described, so the stamp goes with them.
+        BuiltViewProjection = default;
+        HasBuiltViewProjection = false;
         return true;
     }
 
@@ -236,7 +489,10 @@ public sealed class OcclusionPyramidEffect : ComputeEffect
         // already published this frame's pyramid, and clearing Ready here would revoke a valid publication.
         if (!ReferenceEquals(FrameSchedule.ActiveTargets, FrameSchedule.PrimaryTargets)) return;
 
+        // Revoked together with the publication, never separately: a consumer reads the two as a pair, and "the layer
+        // is current but I cannot say from which camera" is exactly the state a stale read would come from.
         Ready = false;
+        HasBuiltViewProjection = false;
         if (!ReferenceEquals(g, _graphics) || _fromDepth == null || _reduce == null) return;
         var depth = FrameSchedule.SceneDepth;
         if (depth == null || depth.Desc.Width != _sourceWidth || depth.Desc.Height != _sourceHeight) return;
@@ -289,7 +545,21 @@ public sealed class OcclusionPyramidEffect : ComputeEffect
         HistoryValid = _hasHistory;
         _hasHistory = true;
         _writeLayer = 1 - write;
+
+        // L2.3: the camera this layer is a snapshot of. A frame with no prepared main view still publishes the
+        // pyramid - the depth is real - but without a stamp, and the gate then refuses to vouch for it rather than
+        // guessing that the camera did not move.
+        if (DeviceServices.BaseApp?.MainView is { Prepared: true } mainView)
+        {
+            BuiltViewProjection = mainView.ViewProjection;
+            HasBuiltViewProjection = true;
+        }
+
         Ready = true;
+
+        // Last, so the sweep reads the stamp and the size this frame just published rather than the previous pair.
+        if (GateSweep && DeviceServices.BaseApp?.MainView is { Prepared: true } swept)
+            ReportGateSweep(swept.View, swept.Projection);
     }
 
     /// <summary>Unregistration is a full teardown: the kernels and the published names go away with the effect.</summary>
@@ -303,6 +573,8 @@ public sealed class OcclusionPyramidEffect : ComputeEffect
         HistoryLayer = 1;
         Level0Width = 0;
         Level0Height = 0;
+        BuiltViewProjection = default;
+        HasBuiltViewProjection = false;
         _graphics = null;
     }
 

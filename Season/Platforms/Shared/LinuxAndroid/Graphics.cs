@@ -3479,6 +3479,164 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         return true;
     }
 
+    // L5.0: storage buffer readback -- the one piece of A/B evidence that used to be D3D12-only.
+
+    /// <summary>
+    /// L5.0: Vulkan answers, so a capture taken on Linux or Android publishes the real cullSlice instead of
+    /// <c>cullSlice=unsupported</c>.
+    ///
+    /// The copy runs on the graphics queue, and that is a correctness requirement rather than a preference: every buffer is
+    /// created with <c>SharingMode.Exclusive</c> (see ResourceManager.CreateBuffer), and Device deliberately prefers a
+    /// dedicated transfer family when the driver exposes one, so a transfer-queue copy would need a release/acquire pair of
+    /// queue-family ownership transfers wrapped around it. The graphics family performs transfers as well, so staying inside
+    /// one family leaves nothing to hand over and only an ordinary buffer barrier to record.
+    ///
+    /// That choice forces a command pool of its own: TextureUploadBatch.Pool is created against the transfer family and must
+    /// not be submitted to the graphics queue. It is created and destroyed per call, which is acceptable because the only
+    /// caller is a one-shot capture path -- a resident pool would cost a handle on every backend for a feature two of them
+    /// use.
+    /// </summary>
+    public bool StorageBufferReadbackSupported => ComputeSupported;
+
+    public unsafe byte[][]? TryReadStorageBuffers(IReadOnlyList<Season.Rendering.StorageBuffer> buffers)
+    {
+        if (!StorageBufferReadbackSupported || buffers == null || buffers.Count == 0) return null;
+
+        var native = new VKStorageBuffer[buffers.Count];
+        ulong total = 0;
+        for (int i = 0; i < buffers.Count; i++)
+        {
+            // Every element is checked before anything is created or submitted: a partial readback would hand the caller a
+            // short array with no way to tell which number went missing.
+            if (buffers[i] is not VKStorageBuffer sb || sb.Buffer.Buffer.Handle == 0 || sb.SizeInBytes == 0) return null;
+            native[i] = sb;
+            // Sized by the allocation, not by SizeInBytes: VKStorageBuffer rounds capacity up to 16 bytes, and a copy region
+            // that stops mid-granule is what the validation layer rejects. The surplus is dropped below, where each array is
+            // cut back to the size the caller asked for.
+            total += sb.Buffer.Size;
+        }
+
+        // The gate first, the recording test second: on a background thread the gate waits for the frame to end, which is
+        // what makes the test below pass rather than bail. Called from the render thread inside its own frame the gate is
+        // re-entrant and does not wait, so the test still refuses -- submitting an unrelated list to the queue being
+        // recorded into is exactly the overlap TextureUploadBatch.Execute documents.
+        using var gpuAccess = Vulkan.Device.EnterGpuAccessScope();
+        if (Vulkan.Device.IsRecording) return null;
+
+        var vk = Vulkan.Device.Vk;
+        var d = Vulkan.Device.LogicalDevice;
+        var rm = Vulkan.Device.ResourceManager;
+
+        var poolInfo = new Silk.NET.Vulkan.CommandPoolCreateInfo
+        {
+            SType = VkStructureType.CommandPoolCreateInfo,
+            Flags = Silk.NET.Vulkan.CommandPoolCreateFlags.TransientBit,
+            QueueFamilyIndex = Vulkan.Device.GraphicsQueueFamily
+        };
+        if (vk.CreateCommandPool(d, in poolInfo, null, out var pool) != VkResult.Success) return null;
+
+        BufferResource staging = default;
+        try
+        {
+            staging = rm.CreateBuffer(total,
+                VkBufferUsageFlags.TransferDstBit,
+                VkMemoryPropertyFlags.HostVisibleBit | VkMemoryPropertyFlags.HostCoherentBit);
+
+            var allocInfo = new Silk.NET.Vulkan.CommandBufferAllocateInfo
+            {
+                SType = VkStructureType.CommandBufferAllocateInfo,
+                Level = Silk.NET.Vulkan.CommandBufferLevel.Primary,
+                CommandBufferCount = 1,
+                CommandPool = pool
+            };
+            if (vk.AllocateCommandBuffers(d, in allocInfo, out var cmd) != VkResult.Success) return null;
+
+            try
+            {
+                var beginInfo = new Silk.NET.Vulkan.CommandBufferBeginInfo
+                {
+                    SType = VkStructureType.CommandBufferBeginInfo,
+                    Flags = Silk.NET.Vulkan.CommandBufferUsageFlags.OneTimeSubmitBit
+                };
+                vk.BeginCommandBuffer(cmd, in beginInfo);
+
+                // The sources were last written by the cull and gather kernels, and a ComputeAndVertexInput stream is also
+                // read through a vertex-stage alias. ALL_COMMANDS as the source stage orders the copy after whatever touched
+                // them without having to name which; the access mask still names the write, because a stage-only dependency
+                // would order the copy without making those writes visible to it.
+                ulong offset = 0;
+                for (int i = 0; i < buffers.Count; i++)
+                {
+                    var src = native[i].Buffer;
+                    ulong size = src.Size;
+
+                    var barrier = new VkBufferMemoryBarrier
+                    {
+                        SType = VkStructureType.BufferMemoryBarrier,
+                        SrcAccessMask = VkAccessFlags.ShaderWriteBit | VkAccessFlags.MemoryWriteBit,
+                        DstAccessMask = VkAccessFlags.TransferReadBit,
+                        SrcQueueFamilyIndex = SVk.QueueFamilyIgnored,
+                        DstQueueFamilyIndex = SVk.QueueFamilyIgnored,
+                        Buffer = src.Buffer,
+                        Offset = 0,
+                        Size = size
+                    };
+                    vk.CmdPipelineBarrier(cmd,
+                        VkPipelineStageFlags.AllCommandsBit, VkPipelineStageFlags.TransferBit,
+                        0, 0, null, 1, &barrier, 0, null);
+
+                    var region = new Silk.NET.Vulkan.BufferCopy { SrcOffset = 0, DstOffset = offset, Size = size };
+                    vk.CmdCopyBuffer(cmd, src.Buffer, staging.Buffer, 1, &region);
+                    offset += size;
+                }
+
+                vk.EndCommandBuffer(cmd);
+
+                var submitInfo = new Silk.NET.Vulkan.SubmitInfo
+                {
+                    SType = VkStructureType.SubmitInfo,
+                    CommandBufferCount = 1,
+                    PCommandBuffers = &cmd
+                };
+                vk.QueueSubmit(Vulkan.Device.GraphicsCommandQueue.NativeQueue, 1, in submitInfo, default);
+                vk.QueueWaitIdle(Vulkan.Device.GraphicsCommandQueue.NativeQueue);
+            }
+            finally
+            {
+                vk.FreeCommandBuffers(d, pool, 1, in cmd);
+            }
+
+            // Host-visible and coherent, so nothing has to be invalidated between the wait above and the read below.
+            void* mapped;
+            if (vk.MapMemory(d, staging.Memory, 0, total, 0, &mapped) != VkResult.Success) return null;
+
+            var result = new byte[buffers.Count][];
+            try
+            {
+                ulong read = 0;
+                for (int i = 0; i < buffers.Count; i++)
+                {
+                    int length = (int)native[i].SizeInBytes;
+                    var bytes = new byte[length];
+                    fixed (byte* dst = bytes) Unsafe.CopyBlock(dst, (byte*)mapped + read, (uint)length);
+                    result[i] = bytes;
+                    read += native[i].Buffer.Size;
+                }
+            }
+            finally
+            {
+                vk.UnmapMemory(d, staging.Memory);
+            }
+
+            return result;
+        }
+        finally
+        {
+            if (staging.Buffer.Handle != 0) rm.DestroyBuffer(staging);
+            vk.DestroyCommandPool(d, pool, null);
+        }
+    }
+
     // 1-7 Cubemap
     // see the contract in IGraphics / Season.Rendering.TextureCube
 
@@ -3855,5 +4013,16 @@ internal unsafe partial class Graphics : IGraphics, ISegmentedSceneGraphics
         => Vulkan.Device.TryQueryGpuMemoryUsage(out long used, out long total)
             ? new GraphicsMemoryInfo(used, total)
             : GraphicsMemoryInfo.Unknown;
-
+    
+    /// <summary>
+    /// Contract 3-1: the Vulkan timestamp query pool behind GPU frame timing. One implementation covers both Linux and
+    /// Android - both reach the device through this backend, and the driver facts that differ between them
+    /// (timestampValidBits, timestampPeriod) are read from the same physical device at construction rather than
+    /// compiled per platform.
+    /// A family that cannot write timestamps fails the construction, and the shared layer treats that exactly like a
+    /// backend without a timer: every GPU column reports "--", never a fallback zero. Built at most once per process,
+    /// only while profiling is enabled.
+    /// </summary>
+    public IGpuFrameTimer? CreateGpuFrameTimer() => new VkGpuFrameTimer();
+    
     }

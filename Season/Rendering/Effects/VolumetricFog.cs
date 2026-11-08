@@ -625,7 +625,12 @@ public sealed partial class VolumetricFogEffect : ComputeEffect, IDisposable
         var bindings = new ComputeBindingDesc[types.Length + 1];
         bindings[0] = new() { Type = ComputeBindingType.Params, SizeInBytes = 16 };
         for (int i = 0; i < types.Length; i++) bindings[i + 1] = new() { Type = types[i], StorageFormat = ComputeStorageFormat.Rgba16Float };
-        return new() { Name = name, Source = source, Bindings = bindings,
+        // Step 5: the whole fog family is Deferred, and it is deferred as one unit - Record() publishes
+        // FogOutputReady for the view and every consumer (the composite pass, the transparent PS) reads that flag
+        // instead of the kernels, so no frame can observe a half-built fog volume. Deferring it is what buys the
+        // first frame its screen: these four sources are 33.6 s of fxc in one report (fogInject alone 19.9 s), and
+        // without them the frame still renders - unfogged, with the composite simply not happening.
+        return new() { Name = name, Source = source, Bindings = bindings, Deferred = true,
             WorkgroupX = columns ? 8u : 4u, WorkgroupY = columns ? 8u : 4u, WorkgroupZ = columns ? 1u : 4u };
     }
 

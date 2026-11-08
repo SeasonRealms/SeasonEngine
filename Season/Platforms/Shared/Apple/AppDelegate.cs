@@ -34,6 +34,10 @@ public class AppDelegate : UIApplicationDelegate
 
     public override bool FinishedLaunching(UIKit.UIApplication application, Foundation.NSDictionary launchOptions)
     {
+        // Contract 3-2: the first line of engine code on this platform after iOSApp.Run. Everything before it is the
+        // process-start bridge; everything after it is a real interval.
+        StartupProfiler.Mark("app-launch");
+
         Runtime.MarshalManagedException += (_, e) =>
         {
             // Log the managed exception with its real stack before it crosses the native boundary.
@@ -755,6 +759,11 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
 
             _initialized = true;
             _previousSeconds = _stopwatch.Elapsed.TotalSeconds;
+
+            // Contract 3-2: everything before this point is the blocking half of startup; from here the frame loop runs
+            // and the asynchronous load queue is what the report waits on.
+            StartupProfiler.Mark("frame-loop-begin");
+
             // The first callback runs the full bootstrap chain.
             // This frame is yielded, and the next Draw enters the regular frame sequence.
             return;
@@ -827,6 +836,10 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
     /// </summary>
     void InitializeMetal(MTKView view)
     {
+        // Contract 3-2: initialization starts here, on the first draw callback with a valid drawable size. The gap from
+        // app-launch to this point is window and view-controller construction, which no engine scope covers.
+        StartupProfiler.Mark("engine-init-begin");
+
         // Immediate-2D compatibility mode (Season.Rendering.Immediate2DMode):
         // the app renders exclusively through the immediate 2D backend, so everything the 3D path
         // would need is skipped below - no PSO bake, no offscreen targets, no effect registration,
@@ -847,13 +860,15 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         DeviceServices.BaseApp.ApplyResolution(w, h, 1f, 1f);
 
         // 1) Bind IMTLDevice and MTKView, including color and depth pixel-format configuration.
-        MtlDevice.Init(view);
+        // Contract 3-2: every stage below is a wall-clock interval on the thread that runs initialization, and the
+        // scopes also give the report its nesting - the shader/pso rows land inside the stage that caused them.
+        using (StartupProfiler.Scope("Device.Init")) MtlDevice.Init(view);
 
         // 2) CommandQueue, ResourceManager, and TextureUploadBatch.
-        MtlDevice.CreateSwapChain(w, h);
+        using (StartupProfiler.Scope("CreateSwapChain")) MtlDevice.CreateSwapChain(w, h);
 
         // 3) Display, including Viewport and Scissor.
-        MtlDevice.CreateDescriptorHeapsAndViews();
+        using (StartupProfiler.Scope("DescriptorHeaps")) MtlDevice.CreateDescriptorHeapsAndViews();
 
         // Step A of 1-4:
         // must be finalized before Pipeline.Init, where PSOs are baked.
@@ -933,7 +948,9 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         // Skipped in immediate-2D mode: the main PSO family is never compiled, which is where the
         // startup bake cost would otherwise go.
         if (!immediate2D)
-            Pipeline.Init(MtlDevice.SceneColorFormat, MtlDevice.DepthBufferFormat);
+        {
+            using (StartupProfiler.Scope("Pipeline.Init")) Pipeline.Init(MtlDevice.SceneColorFormat, MtlDevice.DepthBufferFormat);
+        }
 
         // 5) Global shared lighting UBO.
         // Both Pbr3D and SpriteQuad buffer b1 read from it,
@@ -941,13 +958,15 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         // Skipped in immediate-2D mode: no 3D pass consumes it, and the matching per-frame
         // MTLPrimitiveGroup.Update in the render loop is skipped as well.
         if (!immediate2D)
-            MTLPrimitiveGroup.InitLights();
+        {
+            using (StartupProfiler.Scope("InitLights")) MTLPrimitiveGroup.InitLights();
+        }
 
         // 6) 2D orthographic camera.
-        MTLSprite2D.Init();
+        using (StartupProfiler.Scope("Sprite2D.Init")) MTLSprite2D.Init();
 
         // 7) FrameContext ring plus the White placeholder texture.
-        MtlDevice.CreateGraphicsCommandLists();
+        using (StartupProfiler.Scope("CommandLists")) MtlDevice.CreateGraphicsCommandLists();
 
         // 8) Inject the IGraphics implementation so BaseApp can run unchanged.
         _graphics = new Graphics();
@@ -957,6 +976,10 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
         // When non-null, FrameSchedule automatically appends a FinalBlit pass to present it, mirrored with WindowsApp.
         // Under step A of 1-4, the HDR chain switches it to Rgba16Float,
         // and FinalBlit automatically selects the tonemap variant.
+
+        // Contract 3-2: the target block below is one stage on purpose - the individual creations are a few hundred
+        // microseconds each, and what a startup report has to answer is "how much of the black screen was targets".
+        var renderTargets = StartupProfiler.Scope("RenderTargets");
         if (!immediate2D && UseOffscreenSceneColor)
         {
             Season.Rendering.FrameSchedule.SceneColor = Season.Basic.Graphics.Instance.CreateRenderTarget(new Season.Rendering.RenderTargetDesc
@@ -1140,8 +1163,12 @@ public class SeasonMTKViewDelegate : MTKViewDelegate
             });
         }
 
+        renderTargets.Dispose();
+
         // 9) Create BaseApp, the entry point for resource loading.
-        DeviceServices.BaseApp.Create();
+        // Contract 3-2: the app's own construction - UI tree, scene panels, effect registration, and the RequestLoad calls
+        // that fill the queue below. It runs synchronously inside this call, so its duration is main-thread blocking time.
+        using (StartupProfiler.Scope("BaseApp.Create")) DeviceServices.BaseApp.Create();
 
         // On launch, OnActivated (with its SetPaused(false)) runs before Create, so the input
         // gate must be armed here too; mirrors LinuxApp where ShowWindow is followed by

@@ -128,6 +128,23 @@ internal static unsafe class Pipeline
     internal static ID3D12PipelineState* FadePipelineState;
     internal static ID3D12PipelineState* FadeDoubleSidedPipelineState;
 
+    /// <summary>
+    /// Step 5: the pre-fog family of the same variants (`FOG_SAMPLING=0`). Init builds these, they draw every frame
+    /// until <see cref="_fogVariantActive"/> flips, and then they are simply never selected again.
+    ///
+    /// <para>The two families exist because the macro is the most expensive thing in the process: the fog-sampling pixel
+    /// shader is 151 KB and 13.7 s of fxc, while the same source without it is byte-for-byte the opaque shader the
+    /// pre-first-frame path compiles anyway, i.e. a cache hit that costs one PSO. Waiting for the fog variant before
+    /// the first frame is what put the transparent bucket in front of the whole picture; letting the bucket draw
+    /// unfogged until the lane lands costs nothing a viewer can see, because nothing else in the frame is fogged yet
+    /// either - the composite pass is gated on the fog kernels, which are deferred too.</para>
+    /// </summary>
+    internal static ID3D12PipelineState* TransparentNoFogPipelineState;
+    internal static ID3D12PipelineState* TransparentDoubleSidedNoFogPipelineState;
+    internal static ID3D12PipelineState* TransparentBackFaceNoFogPipelineState;
+    internal static ID3D12PipelineState* FadeNoFogPipelineState;
+    internal static ID3D12PipelineState* FadeDoubleSidedNoFogPipelineState;
+
     // Overlay-pass-specific variants (no depth, single-sample, backbuffer format): Overlay renders
     // directly to the backbuffer and the OM has no DSV, so the main PSO baked for
     // SceneColorFormat/MSAA/DSV is invalid under the Overlay OM and triggers a device error at draw time.
@@ -145,6 +162,24 @@ internal static unsafe class Pipeline
     internal static ID3D12PipelineState* OpaqueNoDepthDoubleSidedPipelineState;
     internal static ID3D12PipelineState* FadeNoDepthPipelineState;
     internal static ID3D12PipelineState* FadeNoDepthDoubleSidedPipelineState;
+
+    /// <summary>Step 5: pre-fog twins of the two Fade NoDepth variants (see <see cref="TransparentNoFogPipelineState"/>).</summary>
+    internal static ID3D12PipelineState* FadeNoDepthNoFogPipelineState;
+    internal static ID3D12PipelineState* FadeNoDepthDoubleSidedNoFogPipelineState;
+
+    /// <summary>
+    /// Step 5: state of the deferred fog-sampling family. <see cref="_fogVariantHlsl"/> is the exact source handed to the
+    /// background lane (null when the tier never samples fog, which makes every member below inert), <see
+    /// cref="_fogVariantStep"/> counts the PSOs built so far, and <see cref="_fogVariantActive"/> is the one flag the draw
+    /// path reads.
+    /// </summary>
+    static string? _fogVariantHlsl;
+    static int _fogVariantStep;
+    static bool _fogVariantActive;
+
+    /// <summary>How many of the fog family's PSOs one frame boundary may create. Measured at 17 ms each for the
+    /// transparent family, so seven in one boundary would be a 120 ms frame - the budget this change may not spend.</summary>
+    const int FogVariantPerBoundary = 2;
 
     /// <summary>Outline2D mask pass specific PSO: outputs a pure white mask, reads depth, and does not write depth.</summary>
     internal static ID3D12PipelineState* OutlineMaskPipelineState;
@@ -252,12 +287,17 @@ internal static unsafe class Pipeline
         OpaquePipelineState = CreatePipelineState(PipelineMode.Opaque);
         OpaqueDoubleSidedPipelineState = CreatePipelineState(PipelineMode.Opaque, PipelineCullVariant.None);
 
-        TransparentPipelineState = CreatePipelineState(PipelineMode.Transparent);
-        TransparentDoubleSidedPipelineState = CreatePipelineState(PipelineMode.Transparent, PipelineCullVariant.None);
-        TransparentBackFacePipelineState = CreatePipelineState(PipelineMode.Transparent, PipelineCullVariant.Front);
+        // Step 5: the transparent/fade bucket starts on the pre-fog family. With FOG_SAMPLING off its source is
+        // character-for-character the opaque source above, so every one of these is a blob-cache hit and only the PSO
+        // (blend / cull / depth) differs. The fog-sampling twins are compiled by the background lane and adopted later
+        // by PumpFogVariant; nothing in this frame can tell the difference, because the fog composite itself has not
+        // been compiled yet either.
+        TransparentNoFogPipelineState = CreatePipelineState(PipelineMode.Transparent, fogSampling: false);
+        TransparentDoubleSidedNoFogPipelineState = CreatePipelineState(PipelineMode.Transparent, PipelineCullVariant.None, fogSampling: false);
+        TransparentBackFaceNoFogPipelineState = CreatePipelineState(PipelineMode.Transparent, PipelineCullVariant.Front, fogSampling: false);
 
-        FadePipelineState = CreatePipelineState(PipelineMode.Fade);
-        FadeDoubleSidedPipelineState = CreatePipelineState(PipelineMode.Fade, PipelineCullVariant.None);
+        FadeNoFogPipelineState = CreatePipelineState(PipelineMode.Fade, fogSampling: false);
+        FadeDoubleSidedNoFogPipelineState = CreatePipelineState(PipelineMode.Fade, PipelineCullVariant.None, fogSampling: false);
 
         // Overlay-specific variants (overlay: true): no depth / single-sample / backbuffer format,
         // eagerly baked in the same style as the three main modes
@@ -273,10 +313,16 @@ internal static unsafe class Pipeline
         // identical to the corresponding regular variants).
         OpaqueNoDepthPipelineState = CreatePipelineState(PipelineMode.Opaque, depthWrite: false);
         OpaqueNoDepthDoubleSidedPipelineState = CreatePipelineState(PipelineMode.Opaque, PipelineCullVariant.None, depthWrite: false);
-        FadeNoDepthPipelineState = CreatePipelineState(PipelineMode.Fade, depthWrite: false);
-        FadeNoDepthDoubleSidedPipelineState = CreatePipelineState(PipelineMode.Fade, PipelineCullVariant.None, depthWrite: false);
+        FadeNoDepthNoFogPipelineState = CreatePipelineState(PipelineMode.Fade, depthWrite: false, fogSampling: false);
+        FadeNoDepthDoubleSidedNoFogPipelineState = CreatePipelineState(PipelineMode.Fade, PipelineCullVariant.None, depthWrite: false, fogSampling: false);
         OutlineMaskPipelineState = CreatePipelineState(PipelineMode.Opaque, depthWrite: false, outlineMask: true);
         OutlineMaskDoubleSidedPipelineState = CreatePipelineState(PipelineMode.Opaque, PipelineCullVariant.None, depthWrite: false, outlineMask: true);
+
+        // Step 5: hand the fog-sampling pixel shader to the background lane now. It is the single most expensive
+        // compile in the process (151 KB, 13.7 s measured) and it is the one shader the deferred fog feature is
+        // waiting on twice - once here as the consumer variant, once as fogInject's producer - so it enters the queue
+        // before the kernels exist and is therefore the first long source a lane picks up.
+        QueueFogVariantCompile();
 
         // 1-5 shadow PSO: decided at initialization from the tiered ShadowsEnabled setting
         // (contract clause 4), and not created when disabled
@@ -558,6 +604,72 @@ internal static unsafe class Pipeline
         // only consumes it and never triggers lazy creation again.
         _ = DXTextureCube.DummyBlack;
     }
+
+    // ─────────────────────── Step 5: deferred fog-sampling family ───────────────────────
+
+    /// <summary>Number of PSOs in the fog family: the three Transparent cull variants, two Fade, and two Fade NoDepth.</summary>
+    const int FogVariantCount = 7;
+
+    /// <summary>
+    /// Hands the fog-sampling pixel shader to the background lane, from <see cref="Init"/>.
+    ///
+    /// <para>The source is built by the same <see cref="BuildMainShaderSource"/> a PSO uses, with the macro inputs a
+    /// Transparent non-overlay variant would pass. That identity is the whole point: the lane compiles the exact key
+    /// <see cref="CreateFogVariant"/> later looks up, so adoption costs a cache hit and a 17 ms PSO creation instead of
+    /// a second 13.7 s compile on the frame that adopts it.</para>
+    /// </summary>
+    static void QueueFogVariantCompile()
+    {
+        if (!_fogSamplingEnabled) return;
+
+        // A compile-only call: CreatePipelineState builds the exact source a Transparent PSO would compile, hands the
+        // pixel shader to the lane, and returns before any pipeline object exists. Resolving the macro block (including
+        // the motion-vector / normal outputs) inside the same method is what keeps the lane's key and the adoption
+        // frame's key identical - a copy of the expression here could silently drift by one character.
+        CreatePipelineState(PipelineMode.Transparent, compileOnly: true);
+    }
+
+    /// <summary>
+    /// Step 5: builds the fog-sampling PSO family, <see cref="FogVariantPerBoundary"/> variants per frame boundary, as
+    /// soon as the background lane has put its pixel shader in the blob cache; then flips the draw path over as a unit.
+    ///
+    /// <para>The probe is the cache, not a flag: a PSO can only be created from a blob, so the blob's presence *is* the
+    /// readiness condition. It also covers the lane failing - the family never appears, the pre-fog family keeps
+    /// drawing, and the frame stays exactly as it was before fog was ever compiled.</para>
+    /// </summary>
+    internal static void PumpFogVariant()
+    {
+        if (_fogVariantActive || _fogVariantHlsl == null) return;
+
+        if (!ShaderCompiler.IsCached(_fogVariantHlsl, "PSMain", "ps_5_0")) return;
+
+        for (int i = 0; i < FogVariantPerBoundary && _fogVariantStep < FogVariantCount; i++)
+            CreateFogVariant(_fogVariantStep++);
+
+        if (_fogVariantStep < FogVariantCount) return;
+
+        _fogVariantActive = true;
+        StartupProfiler.Mark("fog-variant-ready");
+    }
+
+    static void CreateFogVariant(int step)
+    {
+        switch (step)
+        {
+            case 0: TransparentPipelineState = CreatePipelineState(PipelineMode.Transparent); break;
+            case 1: TransparentDoubleSidedPipelineState = CreatePipelineState(PipelineMode.Transparent, PipelineCullVariant.None); break;
+            case 2: TransparentBackFacePipelineState = CreatePipelineState(PipelineMode.Transparent, PipelineCullVariant.Front); break;
+            case 3: FadePipelineState = CreatePipelineState(PipelineMode.Fade); break;
+            case 4: FadeDoubleSidedPipelineState = CreatePipelineState(PipelineMode.Fade, PipelineCullVariant.None); break;
+            case 5: FadeNoDepthPipelineState = CreatePipelineState(PipelineMode.Fade, depthWrite: false); break;
+            default: FadeNoDepthDoubleSidedPipelineState = CreatePipelineState(PipelineMode.Fade, PipelineCullVariant.None, depthWrite: false); break;
+        }
+    }
+
+    /// <summary>Step 5: picks the fog or pre-fog PSO of one variant. The only thing that changes when the family is
+    /// adopted, so a frame either uses all seven fog variants or none of them.</summary>
+    static ID3D12PipelineState* FogAware(ID3D12PipelineState* fog, ID3D12PipelineState* noFog)
+        => _fogVariantActive ? fog : noFog;
 
     static unsafe ID3D12RootSignature* CreateRootSignature()
     {
@@ -1061,7 +1173,9 @@ internal static unsafe class Pipeline
         return rootSignature;
     }
 
-    static unsafe ID3D12PipelineState* CreatePipelineState(PipelineMode mode, PipelineCullVariant cullVariant = PipelineCullVariant.Back, bool shadowPass = false, bool depthWrite = true, bool overlay = false, bool outlineMask = false)
+    // Step 5: compileOnly produces the shader blobs (warming the blob cache) and returns null instead of a pipeline
+    // object. Only the deferred fog family uses it - its PSOs cannot exist until the background lane has the blob.
+    static unsafe ID3D12PipelineState* CreatePipelineState(PipelineMode mode, PipelineCullVariant cullVariant = PipelineCullVariant.Back, bool shadowPass = false, bool depthWrite = true, bool overlay = false, bool outlineMask = false, bool fogSampling = true, bool compileOnly = false)
     {
         var compileFlags = 0u;
 
@@ -1093,6 +1207,11 @@ internal static unsafe class Pipeline
         // 1-5 dual shadow switches (contract clause 3): SHADOW_ENABLED controls PCF sampling in the main PS
         // (following the selected quality tier), while SHADOW_PASS selects the depth-only VS variant
         // (reusing all deformation stages from the main VS plus light-space projection, with no PS).
+        // Step 5: whether this variant carries the fog-sampling pixel shader. Decided here rather than inside the macro
+        // block so that the pre-fog family can be built from the same source text as the opaque pass, and the fog
+        // family can be queued to the background lane without a PSO existing yet.
+        bool sampleFog = fogSampling && _fogSamplingEnabled && !overlay && !shadowPass && !outlineMask && mode != PipelineMode.Opaque;
+
         var hlsl = ((!overlay && DirectX.Device.HdrSceneColor) ? "#define HDR_CHAIN 1\n" : "#define HDR_CHAIN 0\n")
             + (RenderQuality.Current.ShadowsEnabled ? "#define SHADOW_ENABLED 1\n" : "#define SHADOW_ENABLED 0\n")
             + (shadowPass ? "#define SHADOW_PASS 1\n" : "#define SHADOW_PASS 0\n")
@@ -1108,7 +1227,7 @@ internal static unsafe class Pipeline
             // to be defined for every variant including the shadow pass: fxc parses the whole translation unit, so an
             // undefined macro inside PSMain would break a compile that only asks for VSMain.
             + "#define TEXTURE_LOD_BIAS " + RenderQuality.Current.TextureLodBiasLiteral + "\n"
-            + ((_fogSamplingEnabled && !overlay && !shadowPass && !outlineMask && mode != PipelineMode.Opaque)
+            + (sampleFog
                 ? "#define FOG_SAMPLING 1\n" : "#define FOG_SAMPLING 0\n")
             + "#if FOG_SAMPLING\nByteAddressBuffer fogFrame:register(t16);\n"
             + "Texture3D<float4> fogIntegrated:register(t17);\nTexture3D<float4> fogLocal:register(t18);\n"
@@ -2703,6 +2822,12 @@ float4 PSMain(PSInput input) : SV_TARGET
     float ao = defaultAo;
     float3 emissive = defaultEmissive;
     
+    // Every mode below hands its colour to this one variable instead of returning straight out. The fog then lands
+    // once, at the single return at the bottom of this function. Applied at each exit it cost 21 KB of bytecode per
+    // exit: fxc will not merge a FogAtWorld - four fog-column reads each carrying two 3D texture loads - across the
+    // four returns of this variant, and this is the shader the whole startup waits on (151 KB, 28 s measured).
+    float4 psColor = float4(0, 0, 0, 0);
+
     [branch] if (renderMode == 2)
     {
         float4 sampledMsdf = albedoMap.Sample(linearSampler, input.texCoord);
@@ -2728,13 +2853,15 @@ float4 PSMain(PSInput input) : SV_TARGET
         float3 target = saturate(albedo * input.instanceColor.rgb);
         float safeExposure = params0.y > 0.0 ? params0.y : 1.0;
         float3 textColor = AcesFilmInv(pow(target, 2.2)) / safeExposure;
-        return ApplySceneFog(float4(textColor, alpha * input.instanceColor.a * textGlobalAlpha * coverage), input.worldPos);
+        psColor = float4(textColor, alpha * input.instanceColor.a * textGlobalAlpha * coverage);
 #else
-        return float4(albedo * input.instanceColor.rgb, alpha * input.instanceColor.a * textGlobalAlpha * coverage);
+        // LDR text never sampled fog and still does not: its colour simply leaves through the same exit.
+        psColor = float4(albedo * input.instanceColor.rgb, alpha * input.instanceColor.a * textGlobalAlpha * coverage);
 #endif
     }
-
-    // Per-instance tint: applied here, after the text branch has already returned, so there is exactly one multiply
+    else
+    {
+    // Per-instance tint: applied here, after the text branch has handed its colour over, so there is exactly one multiply
     // site. tintMode is a per-primitive material flag, which is what lets a hull keep its authored look while the sail
     // beside it in the same instance cycles through seven hues.
     if (tintMode != 0u)
@@ -2784,16 +2911,18 @@ float4 PSMain(PSInput input) : SV_TARGET
 #if HDR_CHAIN
         // The LUT already stores linear HDR radiance, so output it directly and let the
         // FinalBlit exposure + ACES + gamma chain close it out (1-4 contract).
-        return ApplySceneFog(float4(skyRadiance, alpha), input.worldPos);
+        psColor = float4(skyRadiance, alpha);
 #else
         // LDR baseline (Overlay always takes this path): gamma-encode in place.
         // max(...,0) is not a quality safeguard. Radiance is physically non-negative, but the compiler cannot
         // infer that from sampled value * material color, so a raw pow would trigger X3571.
         // ShaderCompiler throws on any non-empty errorBlob because warnings are treated as fatal, so we cannot
         // depend on the current D3DCompile happening not to report it - SDK fxc already does.
-        return float4(pow(max(skyRadiance, 0.0), 1.0 / 2.2), alpha);
+        psColor = float4(pow(max(skyRadiance, 0.0), 1.0 / 2.2), alpha);
 #endif
     }
+    else
+    {
 
     // Sample textures when enabled
     [branch] if (useAlbedoMap != 0)
@@ -2822,15 +2951,17 @@ float4 PSMain(PSInput input) : SV_TARGET
         [branch] if (viewCameraPos.w > 0.5 && emissiveFactor.w > 0.0)
             albedo = albedo + emissiveFactor.rgb * alpha;
         // Sprite2D: unlit, output linear color directly and let the FinalBlit exposure + ACES + gamma chain close it out
-        return ApplySceneFog(float4(albedo, alpha), input.worldPos);
+        psColor = float4(albedo, alpha);
 #else
         // Sprite2D: unlit, output texture color directly with gamma correction.
         // max(...,0) mirrors the sky-path X3571 guard: fxc reports raw pow of a possibly-negative base,
         // and ShaderCompiler treats any non-empty errorBlob as fatal.
         float3 color = pow(max(albedo, 0.0), 1.0 / 2.2);
-        return float4(color, alpha);
+        psColor = float4(color, alpha);
 #endif
     }
+    else
+    {
     // renderMode == 1: PBR path (below)
     // renderMode == 2: reserved for TextMsdf, currently falls back to PBR
     
@@ -3146,7 +3277,24 @@ float4 PSMain(PSInput input) : SV_TARGET
     color = pow(max(color, 0.0), 1.0 / 2.2);
 #endif
 
-    return ApplySceneFog(float4(color, alpha), input.worldPos);
+    // Under HDR the linear colour is handed over and the fog lands at the single exit below, exactly once. The LDR
+    // arm never had a second fog exit to merge with, so it keeps its own call and just falls through to the return.
+#if HDR_CHAIN
+    psColor = float4(color, alpha);
+#else
+    psColor = ApplySceneFog(float4(color, alpha), input.worldPos);
+#endif
+    }
+    }
+    }
+
+    // One exit, one fog evaluation - the point of the rewrite above. Every mode reached this function's tail through
+    // its own return before, and each one paid for a private copy of the fog chain.
+#if HDR_CHAIN
+    return ApplySceneFog(psColor, input.worldPos);
+#else
+    return psColor;
+#endif
 }
 
 float4 PSOutlineMask(PSInput input) : SV_TARGET
@@ -3166,6 +3314,21 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
     return float4(outlineMaskColor.rgb, 1.0);
 }
 ";
+
+        // Step 5: the one caller that wants the bytecode and not a pipeline object. It takes the source from this very
+        // expression rather than formatting a copy of its own, so the key handed to the background lane is character-for-
+        // character the key the adoption frame's PSO will look up; PumpFogVariant probes with the same string.
+        if (compileOnly)
+        {
+            _fogVariantHlsl = hlsl;
+            ShaderCompiler.QueueBackground(new[]
+            {
+                // label: null - a graphics PSO never carries an A/B label, and the label is what selects the override
+                // flags, which are part of the cache key. Naming this request would compile one key and probe another.
+                new ShaderCompiler.PrewarmRequest(hlsl, "PSMain", label: null, "ps_5_0"),
+            });
+            return null;
+        }
 
         ID3D10Blob* vertexShaderBlob = ShaderCompiler.CompileShaderFromSource(hlsl, "VSMain", "vs_5_0", compileFlags);
         // Shadow pass has no color target, so it neither compiles nor binds a PS (contract clause 3).
@@ -3498,11 +3661,11 @@ float4 PSOutlineMask(PSInput input) : SV_TARGET
         {
             pso = mode switch
             {
-                PipelineMode.Transparent when cullVariant == PipelineCullVariant.None => TransparentDoubleSidedPipelineState,
-                PipelineMode.Transparent when cullVariant == PipelineCullVariant.Front => TransparentBackFacePipelineState,
-                PipelineMode.Transparent => TransparentPipelineState,
-                PipelineMode.Fade when !depthWrite => cullVariant == PipelineCullVariant.None ? FadeNoDepthDoubleSidedPipelineState : FadeNoDepthPipelineState,
-                PipelineMode.Fade => cullVariant == PipelineCullVariant.None ? FadeDoubleSidedPipelineState : FadePipelineState,
+                PipelineMode.Transparent when cullVariant == PipelineCullVariant.None => FogAware(TransparentDoubleSidedPipelineState, TransparentDoubleSidedNoFogPipelineState),
+                PipelineMode.Transparent when cullVariant == PipelineCullVariant.Front => FogAware(TransparentBackFacePipelineState, TransparentBackFaceNoFogPipelineState),
+                PipelineMode.Transparent => FogAware(TransparentPipelineState, TransparentNoFogPipelineState),
+                PipelineMode.Fade when !depthWrite => cullVariant == PipelineCullVariant.None ? FogAware(FadeNoDepthDoubleSidedPipelineState, FadeNoDepthDoubleSidedNoFogPipelineState) : FogAware(FadeNoDepthPipelineState, FadeNoDepthNoFogPipelineState),
+                PipelineMode.Fade => cullVariant == PipelineCullVariant.None ? FogAware(FadeDoubleSidedPipelineState, FadeDoubleSidedNoFogPipelineState) : FogAware(FadePipelineState, FadeNoFogPipelineState),
                 _ when !depthWrite => cullVariant == PipelineCullVariant.None ? OpaqueNoDepthDoubleSidedPipelineState : OpaqueNoDepthPipelineState,
                 _ => cullVariant == PipelineCullVariant.None ? OpaqueDoubleSidedPipelineState : OpaquePipelineState,
             };

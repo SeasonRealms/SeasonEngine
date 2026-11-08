@@ -1077,6 +1077,121 @@ internal unsafe static class Device
     }
 
     /// <summary>
+    /// L3.1: reads whole storage buffers back to the CPU. Allocates one readback resource, records one copy per
+    /// buffer into its own range of that resource, submits a throwaway command list and waits for it.
+    ///
+    /// <para><b>Why its own list instead of the frame's.</b> The caller is a capture path that runs after the
+    /// frame's list has been closed and submitted; appending to that list is impossible and reopening it would
+    /// reorder work the frame already recorded. A dedicated list plus a fence wait is the same shape
+    /// <see cref="CompleteCapture"/> uses, so the cost is known in advance: a full pipeline drain. That is also
+    /// why this is a diagnostic and never a rendering tool.</para>
+    ///
+    /// <para><b>Why the state round trip is symmetric.</b> Each buffer goes to <c>CopySource</c> before its copy
+    /// and back to <c>UnorderedAccess</c> afterwards inside the same list, so every resource ends the call in
+    /// exactly the state the next frame's dispatch expects. Leaving them in <c>CopySource</c> would surface only
+    /// through the debug layer, one frame later, on an unrelated dispatch -- the failure mode that costs the most
+    /// to attribute.</para>
+    ///
+    /// <para>Returns null on any failure rather than throwing: the only consumer is acceptance tooling, and a
+    /// readback that fails must not take down a process that already has its screenshot.</para>
+    /// </summary>
+    internal static unsafe byte[][]? ReadBuffersOnce(DXStorageBuffer[] buffers)
+    {
+        if (D3dDevice == null || DirectQueue == null || fenceValues == null || buffers == null || buffers.Length == 0)
+            return null;
+
+        uint total = 0;
+        for (int i = 0; i < buffers.Length; i++) total += AlignTo4(buffers[i].SizeInBytes);
+        if (total == 0) return null;
+
+        ID3D12Resource* readback = null;
+        ID3D12CommandAllocator* allocator = null;
+        ID3D12GraphicsCommandList* list = null;
+
+        try
+        {
+            var heapProps = new HeapProperties(HeapType.Readback);
+            var bufferDesc = new ResourceDesc(
+                ResourceDimension.Buffer, 0, total, 1, 1, 1,
+                Format.FormatUnknown, new SampleDesc(1, 0), TextureLayout.LayoutRowMajor, ResourceFlags.None);
+
+            Guid resourceIid = ID3D12Resource.Guid;
+            void* resource;
+            if (D3dDevice->CreateCommittedResource(&heapProps, HeapFlags.None, &bufferDesc,
+                ResourceStates.CopyDest, null, &resourceIid, &resource) != 0) return null;
+            readback = (ID3D12Resource*)resource;
+
+            Guid allocatorIid = ID3D12CommandAllocator.Guid;
+            if (D3dDevice->CreateCommandAllocator(CommandListType.Direct, &allocatorIid, (void**)&allocator) != 0) return null;
+
+            Guid listIid = ID3D12GraphicsCommandList.Guid;
+            if (D3dDevice->CreateCommandList(0, CommandListType.Direct, allocator, null, &listIid, (void**)&list) != 0) return null;
+
+            ulong cursor = 0;
+            for (int i = 0; i < buffers.Length; i++)
+            {
+                uint bytes = AlignTo4(buffers[i].SizeInBytes);
+                buffers[i].TransitionTo(list, ResourceStates.CopySource);
+                list->CopyBufferRegion(readback, cursor, buffers[i].Resource, 0, bytes);
+                cursor += bytes;
+            }
+            // UnorderedAccess, not "whatever each buffer was in": every consumer of these blocks re-prepares them
+            // from the compute write state each frame (DispatchCompute's gated transition, TryPrepareIndirectArgs),
+            // so restoring the found state would hand the next frame a barrier it did not expect, while this one is
+            // the state the very next dispatch assumes. The whole loop lives on one list because a read must not
+            // leave a buffer in CopySource for a frame that never re-prepares it.
+            for (int i = 0; i < buffers.Length; i++)
+                buffers[i].TransitionTo(list, ResourceStates.UnorderedAccess);
+
+            if (list->Close() != 0) return null;
+
+            ID3D12CommandList** lists = stackalloc ID3D12CommandList*[1];
+            lists[0] = (ID3D12CommandList*)list;
+            DirectQueue.NativeQueue->ExecuteCommandLists(1, lists);
+
+            // Signal+wait on the direct queue orders every earlier submission on that queue, so the copy is
+            // complete when the wait returns. A fence that never completes means a removed device, which
+            // WaitForFence raises rather than spinning on.
+            ulong fence = fenceValues[FrameIndex];
+            DirectQueue.Signal(fence);
+            DirectQueue.WaitForFence(fence);
+            fenceValues[FrameIndex] = fence + 1;
+
+            void* mapped;
+            if (readback->Map(0, null, &mapped) != 0) return null;
+
+            var result = new byte[buffers.Length][];
+            byte* source = (byte*)mapped;
+            for (int i = 0; i < buffers.Length; i++)
+            {
+                var data = new byte[buffers[i].SizeInBytes];
+                fixed (byte* target = data)
+                    Buffer.MemoryCopy(source, target, data.Length, data.Length);
+                result[i] = data;
+                source += AlignTo4(buffers[i].SizeInBytes);
+            }
+
+            readback->Unmap(0, null);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp?.AddLog(LogType.Error, $"{DateTime.UtcNow} [L3.1] storage readback failed: {ex}");
+            return null;
+        }
+        finally
+        {
+            if (list != null) list->Release();
+            if (allocator != null) allocator->Release();
+            if (readback != null) readback->Release();
+        }
+    }
+
+    /// <summary>CopyBufferRegion takes byte counts in four-byte units; every storage buffer here is already
+    /// 16-byte rounded, and rounding again keeps that a local invariant of this method.</summary>
+    static uint AlignTo4(uint bytes) => (bytes + 3u) & ~3u;
+
+    /// <summary>
     /// True when the device has been removed. GetDeviceRemovedReason is a raw vtable call and can raise
     /// an SEH exception instead of returning its HRESULT once the device is gone, so a throw counts as
     /// removed here rather than propagating out of a shutdown step that only wants to release resources.

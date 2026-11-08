@@ -7,8 +7,8 @@ namespace Season.Rendering;
 public sealed partial class InstanceCullEffect
 {
     // A7's three kernels on the WebGPU side. WGSL uniform structs are 16-byte aligned, and CullParams is
-    // exactly 64 bytes, bit-for-bit identical to the HLSL/GLSL/MSL sides; the dispatch workgroup count is
-    // supplied by C# and must match @workgroup_size.
+    // exactly 80 bytes since L2.2 (5 x 16), bit-for-bit identical to the HLSL/GLSL/MSL sides; the dispatch
+    // workgroup count is supplied by C# and must match @workgroup_size.
     // A7b removed the reset kernel: the frame-invariant part of the arg table is uploaded from InstanceCull.BuildArgsTemplate
     // when the primitive set changes, and the per-slot counter is a region of the arg buffer that gather clears every run.
     //
@@ -31,13 +31,24 @@ struct CullParams
     // (the orthographic ones) is the mask. Both words were padding before, so the block is still 64 bytes.
     texelNdc: f32,
     texelSlots: u32,
+    // L2.2: the pyramid slot. These four words are what takes the block from 64 to 80 bytes. Which slots may be
+    // confirmed visible is a mask (the main view only), the size is level 0 in texels, and the margin is level-0
+    // texels of slack on top of the block's circumradius.
+    occlusionSlots: u32,
+    occlusionWidth: u32,
+    occlusionHeight: u32,
+    occlusionMargin: f32,
 };
 
 @group(0) @binding(0) var<uniform> cullParams: CullParams;
 @group(0) @binding(1) var<storage, read> slotMatrices: array<f32>;
 @group(0) @binding(2) var<storage, read> worlds: array<f32>;
-@group(0) @binding(3) var<storage, read_write> drawArgs: array<atomic<u32>>;
-@group(0) @binding(4) var<storage, read_write> visibleIds: array<u32>;
+@group(0) @binding(3) var occlusionPyramid: texture_2d<f32>;
+@group(0) @binding(4) var<storage, read_write> drawArgs: array<atomic<u32>>;
+@group(0) @binding(5) var<storage, read_write> visibleIds: array<u32>;
+// The engine appends this at binding 15 whenever a sampled texture is declared, and it is the linear-clamp sampler,
+// so a fetch at a texel center is an exact texel read.
+@group(0) @binding(15) var occlusionSampler: sampler;
 
 // clip = pos * VP (row-vector convention): clip.x is the dot product of the position with column 0, and column 3 is w.
 fn visibleInSlot(slot: u32, center: vec3<f32>, radius: f32) -> bool
@@ -71,6 +82,61 @@ fn visibleInSlot(slot: u32, center: vec3<f32>, radius: f32) -> bool
     return true;
 }
 
+// L2.2: pyramid confirmation, main-view slot only. The pyramid stores the NEAREST depth of every 2x2 block of the
+// depth buffer -- it is the same min-reduce HiZ builds for SSR -- so the one statement it can support is a positive
+// one: if the sphere's farthest point is still nearer than the block's nearest surface, then at that block the
+// sphere is in front of everything and putting the instance in the slot is what the plane test would have decided
+// too. The opposite does not follow: a block holding something nearer says nothing about whether that something
+// covers the sphere. That asymmetry is why this helper can only confirm, and why the caller gates it on a mask
+// instead of tuning it with a threshold. See InstanceCull.OcclusionCull.
+fn pyramidConfirmsVisible(slot: u32, center: vec3<f32>, radius: f32) -> bool
+{
+    let m: u32 = slot * 16u;
+    let r0 = vec4<f32>(slotMatrices[m + 0u], slotMatrices[m + 1u], slotMatrices[m + 2u], slotMatrices[m + 3u]);
+    let r1 = vec4<f32>(slotMatrices[m + 4u], slotMatrices[m + 5u], slotMatrices[m + 6u], slotMatrices[m + 7u]);
+    let r2 = vec4<f32>(slotMatrices[m + 8u], slotMatrices[m + 9u], slotMatrices[m + 10u], slotMatrices[m + 11u]);
+    let r3 = vec4<f32>(slotMatrices[m + 12u], slotMatrices[m + 13u], slotMatrices[m + 14u], slotMatrices[m + 15u]);
+
+    let c0 = vec4<f32>(r0.x, r1.x, r2.x, r3.x);
+    let c1 = vec4<f32>(r0.y, r1.y, r2.y, r3.y);
+    let c2 = vec4<f32>(r0.z, r1.z, r2.z, r3.z);
+    let c3 = vec4<f32>(r0.w, r1.w, r2.w, r3.w);
+    let p = vec4<f32>(center, 1.0);
+
+    let clip = vec4<f32>(dot(c0, p), dot(c1, p), dot(c2, p), dot(c3, p));
+
+    // Each clip component is widened by the sphere's extent along that row, which is the row's xyz length, and every
+    // extent below is then divided by the smallest w the sphere reaches, so all four bounds stay conservative in the
+    // direction that matters: a rectangle that can only be too large and a depth that can only be too far.
+    let wMin: f32 = clip.w - radius * length(c3.xyz);
+    let invW: f32 = 1.0 / max(wMin, 1e-4);
+
+    // Level-0 texel holding the sphere's projected center, clamped so the fetch always stays in range. Clamping cannot
+    // confirm anything the projection did not put there -- the coverage test below is what decides that.
+    let size = vec2<f32>(f32(cullParams.occlusionWidth), f32(cullParams.occlusionHeight));
+    let uv = clip.xy * invW * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+    let texel = uv * size;
+    let coord = clamp(floor(texel), vec2<f32>(0.0, 0.0), size - vec2<f32>(1.0, 1.0));
+
+    // Screen radius in level-0 texels on the smaller axis, minus the block's own circumradius (a block spans one texel
+    // on each side of its center, so sqrt(0.5)) and the caller's margin. What is left is how far the block's center may
+    // sit from the projected center and still be covered by the sphere; a negative remainder means the sphere is too
+    // small to contain a whole block and nothing can be confirmed from it.
+    let rad = vec2<f32>(radius * length(c0.xyz) * invW * 0.5 * size.x,
+                        radius * length(c1.xyz) * invW * 0.5 * size.y);
+    let reach: f32 = min(rad.x, rad.y) - 0.70710678 - cullParams.occlusionMargin;
+    let delta = coord + vec2<f32>(0.5, 0.5) - texel;
+    let covered: bool = reach > 0.0 && dot(delta, delta) <= reach * reach;
+
+    // Farthest NDC depth the sphere can reach against the block's nearest surface. Sampling at a texel center is an
+    // exact texel read under the engine's linear-clamp sampler, the same invariant HiZ's reduce leans on. The explicit
+    // level keeps it legal in non-uniform control flow.
+    let farDepth: f32 = (clip.z + radius * length(c2.xyz)) * invW;
+    let tileNear: f32 = textureSampleLevel(occlusionPyramid, occlusionSampler, (coord + vec2<f32>(0.5, 0.5)) / size, 0.0).r;
+
+    return wMin > 1e-4 && covered && farDepth < tileNear;
+}
+
 @compute @workgroup_size(64, 1, 1)
 fn CSMain(@builtin(global_invocation_id) id: vec3<u32>)
 {
@@ -92,7 +158,11 @@ fn CSMain(@builtin(global_invocation_id) id: vec3<u32>)
     for (var slot: u32 = 0u; slot < cullParams.slotCount; slot = slot + 1u)
     {
         if ((cullParams.slotMask & (1u << slot)) == 0u) { continue; }
-        if (!visibleInSlot(slot, center, radius)) { continue; }
+        // L2.2: a confirmation replaces the plane test with the same verdict, so it can only ever keep an instance the
+        // plane test would also have kept. That is what makes the pixels independent of whether it fires at all.
+        let confirmed: bool = (cullParams.occlusionSlots & (1u << slot)) != 0u
+            && pyramidConfirmsVisible(slot, center, radius);
+        if (!confirmed && !visibleInSlot(slot, center, radius)) { continue; }
         // A7b: the counter lives in the arg buffer's accumulator region, not in the arg table's InstanceCount -- see
         // InstanceCull.SlotCountsOffset for why the two cannot be the same word. The offset is in bytes, this array in uints.
         // The declaration is array<atomic<u32>> and not array<u32>: WGSL has no implicit atomicity, so atomicAdd is only legal on
@@ -130,7 +200,9 @@ fn CSMain()
         maxCount = max(maxCount, drawArgs[(finalizeParams.slotCountsOffset >> 2u) + slot]);
     }
 
-    let groups: u32 = (maxCount + finalizeParams.groupSize - 1u) / finalizeParams.groupSize;
+    // At least one group: gather's k == 0 thread is the only writer of InstanceCount and the only clearer of the
+    // slot-count accumulator, so a 0-group dispatch would replay the previous frame's counts. See the HLSL kernel.
+    let groups: u32 = max((maxCount + finalizeParams.groupSize - 1u) / finalizeParams.groupSize, 1u);
     dispatchArgs[0] = groups;
     dispatchArgs[1] = finalizeParams.slotCount;
     dispatchArgs[2] = 1u;

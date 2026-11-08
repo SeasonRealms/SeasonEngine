@@ -266,7 +266,12 @@ public static class FrameProfiler
     static readonly PendingInterval[] open = new PendingInterval[MaxOpenDepth];
     static readonly int[] topOrder = new int[8];
 
-    /// <summary>True when <c>SEASON_PROFILE</c> or <c>SEASON_PROFILE_OUT</c> is set. Read on every instrumentation site as the first line.</summary>
+    /// <summary>
+    /// True when <c>SEASON_PROFILE</c> or <c>SEASON_PROFILE_OUT</c> is set, or when the host pushed one of them through
+    /// <see cref="Season.Basic.ProfileSwitch"/>. Read on every instrumentation site as the first line. The switch table is
+    /// consulted rather than the environment directly because a browser has no environment to set - it arrives through
+    /// the same host channel StartupProfiler uses.
+    /// </summary>
     public static readonly bool Enabled = ReadEnabled();
 
     static bool attached;
@@ -334,6 +339,13 @@ public static class FrameProfiler
 
     /// <summary>Whether a backend timer is attached and healthy. False until a backend implements <see cref="IGraphics.CreateGpuFrameTimer"/>.</summary>
     public static bool GpuTimingAvailable => timer is { Available: true };
+
+    /// <summary>
+    /// The attached backend timer, for the backends whose marks cannot be written when they are taken: neither Metal nor
+    /// WebGPU can record a timestamp outside a pass, so their timers hold the marks and the encoder-opening sites pick
+    /// them up. Null on the other two, where a mark is a command that stands on its own.
+    /// </summary>
+    internal static IGpuFrameTimer? AttachedTimer => timer;
 
     /// <summary>Increments every time <see cref="Intervals"/> and <see cref="Summary"/> are recomputed; lets the HUD cache its string.</summary>
     public static int Version => version;
@@ -1022,11 +1034,9 @@ public static class FrameProfiler
 
     static bool ReadEnabled()
     {
-        if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SEASON_PROFILE_OUT"))) return true;
+        if (!string.IsNullOrEmpty(Season.Basic.ProfileSwitch.Text("SEASON_PROFILE_OUT"))) return true;
 
-        string? value = Environment.GetEnvironmentVariable("SEASON_PROFILE");
-
-        return !string.IsNullOrEmpty(value) && value != "0";
+        return Season.Basic.ProfileSwitch.Flag("SEASON_PROFILE");
     }
 
     /// <summary>One pending Begin: where its name lives, which mark opened it and when the CPU started recording.</summary>

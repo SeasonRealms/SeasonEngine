@@ -134,6 +134,28 @@ internal static class AbCapture
         string.Equals(Environment.GetEnvironmentVariable(AnimationLodVariable), "off",
             StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// L4.1: the directional shadow band, in metres, for a capture run. Empty, unparsable or non-positive leaves the
+    /// persisted setting alone, which is what every other run does.
+    ///
+    /// This is not a sterile switch like the three above: it does not remove a contaminant, it moves the thing under
+    /// measurement. The cascade chain's coverage ends at <see cref="Season.Rendering.RenderQuality.ShadowDistance"/>,
+    /// and that single number decides how many instances the cull chain can even test -- measured on this scene, c0
+    /// keeps 26.5% of them and c2 keeps 99.7% purely because c2's slice reaches the band. Shrinking the band is the
+    /// honest alternative to a new cull test when nothing else is left to cull: it drops casters by the very predicate
+    /// the frustum already uses, and unlike a second test it also re-allocates the surviving texels to what is nearer.
+    /// </summary>
+    const string ShadowDistanceVariable = "SEASON_AB_SHADOW_DISTANCE";
+
+    static readonly float CaptureShadowDistance = ReadCaptureShadowDistance();
+
+    static float ReadCaptureShadowDistance()
+        => float.TryParse(Environment.GetEnvironmentVariable(ShadowDistanceVariable)?.Trim(),
+               System.Globalization.NumberStyles.Float,
+               System.Globalization.CultureInfo.InvariantCulture, out var metres) && metres > 0f
+            ? metres
+            : 0f;
+
     /// <summary>Full path of the output PNG; empty means the hook is off.</summary>
     static readonly string OutputPath = Environment.GetEnvironmentVariable(PathVariable);
 
@@ -224,6 +246,13 @@ internal static class AbCapture
         // but keeping the three switches in one place is what makes the isolation experiment readable.
         if (SterileAnimationLod)
             Season.Rendering.RenderQuality.Current.InstanceAnimationLod = false;
+
+        // L4.1: the band is applied here rather than at startup because the cascades re-derive from it every frame, so
+        // the hundreds of frames between stability and the capture are what let the atlas settle at the new coverage.
+        // The runtime instance is written rather than a Default* field for the same reason as anti-aliasing above: the
+        // persistable setting stays untouched, and the process exits at the capture.
+        if (CaptureShadowDistance > 0f)
+            Season.Rendering.RenderQuality.Current.ShadowDistance = CaptureShadowDistance;
 
         if (!SterileParticles) return;
         var submitters = Season.Rendering.FrameSchedule.ParticleSubmitters;
@@ -438,6 +467,11 @@ internal static class AbCapture
                 System.IO.Directory.CreateDirectory(directory);
             System.IO.File.WriteAllBytes(OutputPath, bytes);
 
+            // L3.1: the numbers in this line that live on the GPU rather than in a CPU counter. It runs here,
+            // after the capture's own readback has drained the pipeline, because that is the only moment in the
+            // process where "read a buffer now" costs nothing extra and cannot disturb the frame being measured.
+            Season.Rendering.InstanceCull.ReadCullSlice();
+
             // Sidecar file rather than AddLog: AddLog only records when in Debug and the LogTypes match, but "which
             // gather dispatch path this run actually took" is a prerequisite for judging whether A/B holds, and must
             // not depend on a channel that might be silently swallowed. The a7 section is an early-exit diagnostic:
@@ -458,7 +492,7 @@ internal static class AbCapture
                 // slots is the only machine-readable answer to "did the far map join the chain this frame": the far shadow map is a
                 // fog-side target with no debug view, so no pixel comparison can tell a culled far map from one that never joined.
                 // Local cube maps are absent from it by design (they keep the direct path); local= says whether the frame had one.
-                + $"a7=(enabled={InstanceCull.Enabled},targets={InstanceCull.Targets.Count},"
+                + $"a7=(enabled={InstanceCull.Enabled},chain={(InstanceCull.ChainEnabled ? 1 : 0)},targets={InstanceCull.Targets.Count},"
                 + $"slots={SlotNames(InstanceCull.ShadowSlotMask)},local={CascadedShadow.LocalActive},"
                 + $"sun={CascadedShadow.SunActive},spot={CascadedShadow.SpotActive},reuse={CascadedShadow.ReuseActive},"
                 // L1.2: the sub-texel threshold in texels, invariant-formatted because the sidecar is a space-separated key=value
@@ -472,6 +506,51 @@ internal static class AbCapture
                 + $"history={(OccPyramid.HistoryValid ? 1 : 0)},layer={OccPyramid.CurrentLayer},"
                 + $"level0={OccPyramid.Level0Width}x{OccPyramid.Level0Height},"
                 + $"depth={sceneDepthDesc?.Width ?? 0}x{sceneDepthDesc?.Height ?? 0}) "
+                // L2.2: sw is the switch and mask is what the cull kernel was actually handed. The image cannot show either:
+                // a confirmed slot and an unconfirmed one produce the same pixels by construction, so mask>0 is the only
+                // evidence in a capture that the new binding was exercised rather than merely compiled.
+                + $"occCull=(sw={(InstanceCull.OcclusionCull ? 1 : 0)},mask={InstanceCull.OcclusionMask}) "
+                // L2.3: open is the gate's verdict and the two numbers are what it decided on. A min-pyramid cannot cull,
+                // so the image shows no difference between "consulted" and "refused"; a closed gate on a frame whose
+                // pixels still match the open one is therefore the acceptance evidence itself, and mask>0 is what proves
+                // the gate opened on the frame it claims to.
+                // texels/depth are NaN when the gate never measured anything (no camera stamp, a singular inverse, or a
+                // frustum corner behind the camera). Printed as-is, so "refused to measure" cannot be read as "measured
+                // zero", which would be the one shape of this bug a sidecar could hide.
+                + $"occGate=(open={(InstanceCull.OcclusionGateOpen ? 1 : 0)},"
+                + $"texels={InstanceCull.OcclusionGateTexels.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)},"
+                + $"depth={InstanceCull.OcclusionGateDepth.ToString("0.#####", System.Globalization.CultureInfo.InvariantCulture)}) "
+                // L2.3: the sweep answers "two texels of budget is how many degrees of drag per frame", which the parked
+                // capture camera cannot. Always emitted, as "off", so a reader does not have to tell "the diagnostic was
+                // not armed" apart from "the line was truncated".
+                + (OccPyramid.GateSweepReport.Length > 0 ? OccPyramid.GateSweepReport + " " : "gateSweep=off ")
+                // L4.1: the band the runs above were captured under. It decides the cull chain's own input, so a kept
+                // count is unreadable without it: the same scene at 20 m and at 40 m is two different denominators.
+                + $"shadowDist={Season.Rendering.RenderQuality.Current.ShadowDistance.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)} "
+                // L3.1: what the cull chain actually kept. The token names its own failure (unsupported/empty/
+                // null) rather than being omitted, so "this backend cannot read back" and "culling kept
+                // everything" can never be read as the same thing.
+                + Season.Rendering.InstanceCull.CullSlice + " "
+                // L4.2: the millisecond half of the same report. The kept counts above say how much the chain removed; only
+                // these numbers say what removing it was worth, and only a backend with a timestamp query can fill them in.
+                // Both failure shapes keep a name instead of collapsing into zero: "off" is the profile switch being off,
+                // "--" is an attached timer that could not time this interval.
+                + ProfSlice()
+                // L4.3: the shape of the work the chain is asked to do, as opposed to what it produced (cullSlice) or what it cost
+                // (prof). The number that matters is groups: it is the sum of ceil(capacity/64) over the targets, i.e. how many X
+                // groups a single combined dispatch would need. "n targets, n groups" means every target is one group of its own and
+                // the only thing separating them is the dispatch itself -- which is the case that makes per-target dispatch pure
+                // overhead, and the case a merge would pay off in. A groups value well above n says the merge would still need real
+                // per-group work, and a value below n is impossible.
+                + CullTargetsSlice()
+                // L4.5: dispatches per frame, as opposed to targets per frame. They diverge on one group shape and the next
+                // token says which.
+                + CullStreamsSlice()
+                // L4.4: the denominator kept= should be read against, and the handoff's own outcome. Both exist because the
+                // two existing fields are ambiguous on their own: kept= had no shadow denominator, and a failed handoff was
+                // byte-identical in the capture to one that was never requested.
+                + SlotCandidatesSlice()
+                + MainViewHandoffSlice()
                 // P1: the same evidence for the skinning route. dispatches is what the FrameStart kernel actually served this frame, so a
                 // run that asked for SEASON_INSTANCE_SKINNING=gpu but served 0 is a fallback, not a comparison.
                 // P3 L2: pooled is how many shared (clip, tick) groups the frame actually collapsed. A frame that pools nothing is
@@ -515,6 +594,171 @@ internal static class AbCapture
         }
 
         return names.Length > 0 ? names.ToString() : "none";
+    }
+
+    /// <summary>
+    /// L4.2: the cull chain's cost in milliseconds, read from the profiler's own aggregate rather than timed here.
+    ///
+    /// Why the profiler instead of a second timer: contract 3-1 already brackets every compute effect with one interval named
+    /// <see cref="InstanceCullEffect.EffectName"/>, on all four backends, so the number exists on any frame where profiling is
+    /// on. A private timestamp path in the capture hook would be a fifth implementation to keep in sync and would still not
+    /// be comparable with the pass columns printed beside it. frame/total are what make the cull number readable: the same
+    /// 0.3 ms is a different verdict out of 8 ms and out of 40, and a cull column without them invites exactly that error.
+    ///
+    /// gpu=0 means the attached timer cannot write timestamps (the interval is still bracketed, its GPU column is NaN) and
+    /// cullN=0 means no frame has been published into the window yet. Neither is written as 0 ms.
+    /// </summary>
+    static string ProfSlice()
+    {
+        if (!FrameProfiler.Enabled) return "prof=off ";
+
+        var summary = FrameProfiler.Summary;
+        double cullGpu = double.NaN, cullP95 = double.NaN, cullCpu = double.NaN;
+        int cullSamples = 0;
+
+        foreach (var interval in FrameProfiler.Intervals)
+        {
+            if (interval.Kind != ProfileIntervalKind.Compute) continue;
+            if (!string.Equals(interval.Name, InstanceCullEffect.EffectName, StringComparison.Ordinal)) continue;
+            // A secondary view records the same effect again; the main view's interval is the one a capture describes.
+            if (interval.View != 0) continue;
+            cullGpu = interval.GpuMedianMs;
+            cullP95 = interval.GpuP95Ms;
+            cullCpu = interval.CpuMedianMs;
+            cullSamples = interval.Samples;
+            break;
+        }
+
+        return $"prof=(on=1,gpu={(FrameProfiler.GpuTimingAvailable ? 1 : 0)},"
+            + $"frame={Ms(summary.FrameMs)},total={Ms(summary.GpuTotalMs)},"
+            + $"cull={Ms(cullGpu)},cullP95={Ms(cullP95)},cullCpu={Ms(cullCpu)},cullN={cullSamples}) ";
+    }
+
+    /// <summary>Formats a measured millisecond value, keeping NaN as "--" so "could not measure" never reads as "free".</summary>
+    static string Ms(double value) => double.IsNaN(value)
+        ? "--"
+        : value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// L4.3: the work shape behind the cost columns -- how many targets the frame culled, how big each one is, and how many
+    /// dispatch groups they add up to.
+    ///
+    /// groups is <see cref="InstanceCull.GatherGroupsX"/> summed over the targets rather than ceil(capacity/64) written out
+    /// a second time: that function is the contract the fixed dispatch path actually uses, so summing it here is what makes
+    /// the token comparable with the measured milliseconds instead of a second opinion that can drift away from the first.
+    ///
+    /// What the ratio to n decides: n targets contributing n groups means every target is one group of its own, so the only
+    /// thing separating them is the dispatch itself -- that is the shape where merging targets replaces 26 dispatches with 1
+    /// and saves the fixed cost. A groups value well above n means a merge would still have to reproduce real per-group work,
+    /// and a value below n is impossible. wide counts the targets that already need more than one group.
+    /// </summary>
+    static string CullTargetsSlice()
+    {
+        var targets = InstanceCull.Targets;
+        if (targets.Count == 0) return "cullTargets=none ";
+
+        int instances = 0, capacity = 0, groups = 0;
+        int maxInstance = 0, maxCapacity = 0, maxPrimitives = 0, maxStreams = 0, wide = 0;
+
+        for (int i = 0; i < targets.Count; i++)
+        {
+            var target = targets[i];
+            int instance = target.CullInstanceCount;
+            int cap = target.CullCapacity;
+
+            instances += instance;
+            capacity += cap;
+
+            int g = (int)InstanceCull.GatherGroupsX(cap);
+            groups += g;
+            if (g > 1) wide++;
+            if (instance > maxInstance) maxInstance = instance;
+            if (cap > maxCapacity) maxCapacity = cap;
+            if (target.CullPrimitiveCount > maxPrimitives) maxPrimitives = target.CullPrimitiveCount;
+            if (target.CullStreamCount > maxStreams) maxStreams = target.CullStreamCount;
+        }
+
+        return $"cullTargets=(n={targets.Count},inst={instances},cap={capacity},groups={groups},wide={wide},"
+            + $"maxInst={maxInstance},maxCap={maxCapacity},primMax={maxPrimitives},streamMax={maxStreams}) ";
+    }
+
+    /// <summary>
+    /// L4.4: the denominator for the five shadow positions of <c>cullSlice</c>'s kept= field.
+    ///
+    /// The token already carried instances=, the sum over every target whose arg buffer read back as valid. That is not the
+    /// set that was tested: a target skipped inside DispatchTarget (zero count, unusable primitive table, short buffer) never
+    /// appears there either, but the two sets are still different -- instances= is taken before the dispatch checks and stays
+    /// at 26 targets on this scene while the dispatch counters average 25.35 per frame. Dividing kept= by the larger set
+    /// understates the cull rate by up to one target's instances, which here is the difference between "c2 culls 0.3%" and
+    /// "c2 culls nothing".
+    ///
+    /// shadow is shared by slots 0..4 because every dispatched target is tested against all of them; main is the denominator
+    /// for kept's last position. main=0 with a non-zero shadow means no target declared CullMainView this frame, which is a
+    /// different statement from "the main view culled everything".
+    /// </summary>
+    static string SlotCandidatesSlice()
+        => $"slotCand=(shadow={InstanceCull.ShadowCandidates},main={InstanceCull.MainCandidates}) ";
+
+    /// <summary>
+    /// L4.4: what became of the handoff, which is the one stage of the chain whose failure is invisible.
+    ///
+    /// A target that returns false from PrepareCullDraw draws its whole batch directly: correct image, no error, and the
+    /// only trace is that mainViewDraws stops moving for it. Dropping that return value made "admission failed on all 26
+    /// groups" and "no group asked for admission" produce identical captures. declared is this frame's count of targets
+    /// that opted into the main-view segment; ready and fallback are process-wide counts of the handoff itself. A positive
+    /// fallback next to a positive ready is the expected shape for a group whose buffers are merely too small, and ready
+    /// with no matching draws on the next capture is a group that handed off and then had nothing to draw from it.
+    /// </summary>
+    static string MainViewHandoffSlice()
+    {
+        var targets = InstanceCull.Targets;
+        int declared = 0;
+        for (int i = 0; i < targets.Count; i++)
+            if (targets[i].CullMainView) declared++;
+
+        return $"mvHandoff=(declared={declared},ready={InstanceCull.CullDrawReady},fallback={InstanceCull.CullDrawFallback}) ";
+    }
+
+    /// <summary>
+    /// L4.5: how many gather dispatches the chain issues, as opposed to how many targets it issues them for.
+    ///
+    /// The two diverge on exactly one group shape. An InstancedModel with CullPerPrimitiveStreams=true materializes one
+    /// reordered stream per opaque primitive -- each primitive's stream is "node world x instance world" plus its own morph
+    /// weights, so no single reordered stream could serve two of them -- and the gather loop dispatches once per stream. A
+    /// 10-primitive model therefore costs 10 dispatches while the per-target counter (fixedDispatches) records it as one.
+    /// That is why this token exists separately: target counts cannot see the difference, and the cost structure measured in
+    /// L4.3 is per dispatch, not per target.
+    ///
+    /// Whether the extra dispatches are worth attacking depends on the instance count behind them, so each multi-stream
+    /// group is listed with its count/capacity. Ten dispatches over eight instances is a different finding from ten over 123,
+    /// and only the second one has anything to gain from merging streams into a Z dimension. multi counts the groups with
+    /// more than one stream -- if that is 1, this is a single asset and not a pattern.
+    /// </summary>
+    static string CullStreamsSlice()
+    {
+        var targets = InstanceCull.Targets;
+        if (targets.Count == 0) return "cullStreams=none ";
+
+        int sum = 0, max = 0, multi = 0;
+        string detail = string.Empty;
+
+        for (int i = 0; i < targets.Count; i++)
+        {
+            var target = targets[i];
+            int streams = target.CullStreamCount;
+
+            sum += streams;
+            if (streams > max) max = streams;
+            if (streams <= 1) continue;
+
+            multi++;
+            if (multi > 4) continue;
+            if (detail.Length > 0) detail += ",";
+            detail += $"{target.CullInstanceCount}/{target.CullCapacity}x{streams}";
+        }
+
+        return $"cullStreams=(sum={sum},max={max},multi={multi},min={InstanceCull.MinCullInstances}"
+            + (detail.Length > 0 ? $",detail={detail}" : string.Empty) + ") ";
     }
 
     static void WriteSidecar(string text)

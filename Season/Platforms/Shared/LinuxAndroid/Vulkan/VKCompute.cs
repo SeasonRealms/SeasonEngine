@@ -174,8 +174,22 @@ internal sealed unsafe class VKComputeKernel : Season.Rendering.ComputeKernel
                 },
                 Layout = PipelineLayout,
             };
+            // Contract 3-2: one row per kernel, named after the kernel, so a slow row is traceable instead of every row
+            // reading "compute main". Its shader compile is a separate row (see ShaderCompiler), and the two together are
+            // this kernel's whole build cost - the DX report splits the same way.
+            long psoStart = StartupProfiler.Enabled ? StartupProfiler.Ticks() : 0;
+
             if (vk.CreateComputePipelines(device, default, 1, in info, null, out PipelineState) != Result.Success)
                 throw new Exception($"vkCreateComputePipelines ('{desc.Name}') failed");
+
+            if (psoStart != 0)
+            {
+                double psoMs = StartupProfiler.ElapsedMs(psoStart);
+
+                StartupProfiler.Item("pso", $"compute {desc.Name}", psoMs, 0, "kind=compute");
+
+                StartupProfiler.Add("compute.pso", psoMs);
+            }
         }
         finally
         {
@@ -286,7 +300,10 @@ internal sealed unsafe class VKStorageBuffer : Season.Rendering.StorageBuffer
         Usage = usage;
         // A0.1: IndirectBufferBit must be requested at creation time and cannot be appended afterward; this is why StorageBufferUsage
         // is a creation-time parameter rather than a submission-time parameter.
-        var usageFlags = BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferDstBit;
+        // L5.0: TransferSrcBit is here for TryReadStorageBuffers (A/B capture evidence). Like the two bits below it can only be
+        // declared at creation time, and adding it later is not an option, so it is paid on every buffer rather than being
+        // opted into -- the flag is a hint to the driver's memory-type selection, not a new queue or resource.
+        var usageFlags = BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferDstBit | BufferUsageFlags.TransferSrcBit;
         if (usage == Season.Rendering.StorageBufferUsage.ComputeAndIndirectArgs)
             usageFlags |= BufferUsageFlags.IndirectBufferBit;
         // A7: the instance stream materialized by gather must be bound directly as a vertex stream, and VertexBufferBit, like IndirectBufferBit,

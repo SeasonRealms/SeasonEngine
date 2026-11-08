@@ -523,4 +523,44 @@ internal static partial class WebGPUInterop
     /// which the caller turns into "unknown" rather than zero.</summary>
     [JSImport("globalThis.seasonWebGPU.queryGpuMemoryBytes")]
     internal static partial double QueryGpuMemoryBytes();
+
+    // ── Contract 3-1: GPU frame timing. WebGPU only writes a timestamp at a pass boundary, so indices travel with the
+    // pass descriptor (setPassTimestamps) or through a marker pass of their own (placeGpuTimestamp). resolveQuerySet plus
+    // a mapped readback live entirely on the JS side; takeGpuTimestamps is the non-blocking poll the shared ring asks
+    // every frame. ──
+
+    /// <summary>Creates the query-set ring, or returns false when the adapter has no <c>timestamp-query</c> feature.
+    /// Called once per process and only while profiling is enabled.</summary>
+    [JSImport("globalThis.seasonWebGPU.createGpuTimer")]
+    internal static partial bool CreateGpuTimer(int capacity);
+
+    [JSImport("globalThis.seasonWebGPU.disposeGpuTimer")]
+    internal static partial void DisposeGpuTimer();
+
+    /// <summary>Claims one slot for this frame. False means that slot's readback is still mapped and the caller should
+    /// try the next one.</summary>
+    [JSImport("globalThis.seasonWebGPU.beginGpuTimestamps")]
+    internal static partial bool BeginGpuTimestamps(int slot, double tag);
+
+    /// <summary>
+    /// Hands the indices the next pass must write: <paramref name="head"/> is the frame's opening mark (written by a
+    /// marker pass ahead of the first real pass), <paramref name="begin"/> opens the pass, <paramref name="end"/> closes
+    /// it. Any of them may be -1, meaning that boundary has nothing to write.
+    /// </summary>
+    [JSImport("globalThis.seasonWebGPU.setPassTimestamps")]
+    internal static partial void SetPassTimestamps(int head, int begin, int end);
+
+    /// <summary>Writes one index in a marker pass of its own, for marks that no pass descriptor can carry.</summary>
+    [JSImport("globalThis.seasonWebGPU.placeGpuTimestamp")]
+    internal static partial void PlaceGpuTimestamp(int index);
+
+    /// <summary>Arms the readback for this frame: the module resolves exactly <paramref name="marks"/> samples and
+    /// writes <paramref name="tail"/> - the frame's closing mark, or -1 - in a marker pass before it submits.</summary>
+    [JSImport("globalThis.seasonWebGPU.endGpuTimestamps")]
+    internal static partial void EndGpuTimestamps(int marks, int tail);
+
+    /// <summary>Empty array when nothing has come back. Otherwise element 0 is the frame token and the rest are that
+    /// frame's timestamps, in nanoseconds.</summary>
+    [JSImport("globalThis.seasonWebGPU.takeGpuTimestamps")]
+    internal static partial double[] TakeGpuTimestamps();
 }

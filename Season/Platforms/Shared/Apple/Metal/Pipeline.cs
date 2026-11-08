@@ -983,7 +983,7 @@ internal static class Pipeline
             LodMinClamp = 0,
             LodMaxClamp = float.MaxValue,
         };
-        return Device.MtlDevice.CreateSamplerState(desc) ?? throw new Exception("CreateSamplerState failed");
+        return MTLPipelineFactory.CreateSampler(desc, "static-linear");
     }
 
     /// <summary>Wrap sampler for cloud noise in step C of 2-5, using Repeat on all three axes plus Linear filtering, with all remaining parameters matching CreateStaticSampler.</summary>
@@ -1001,7 +1001,7 @@ internal static class Pipeline
             LodMinClamp = 0,
             LodMaxClamp = float.MaxValue,
         };
-        return Device.MtlDevice.CreateSamplerState(desc) ?? throw new Exception("CreateSamplerState(wrap) failed");
+        return MTLPipelineFactory.CreateSampler(desc, "wrap-linear");
     }
 
     /// <summary>Shadow comparison sampler for 1-5 using LessEqual hardware comparison plus linear filtering, where D32 comparison sampling with linear filtering is broadly supported on Metal.</summary>
@@ -1019,7 +1019,7 @@ internal static class Pipeline
             LodMinClamp = 0,
             LodMaxClamp = 0,
         };
-        return Device.MtlDevice.CreateSamplerState(desc) ?? throw new Exception("CreateSamplerState(shadow) failed");
+        return MTLPipelineFactory.CreateSampler(desc, "shadow-compare");
     }
 
     static IMTLDepthStencilState CreateDepthState(bool write, MTLCompareFunction cmp)
@@ -1029,7 +1029,7 @@ internal static class Pipeline
             DepthCompareFunction = cmp,
             DepthWriteEnabled = write,
         };
-        return Device.MtlDevice.CreateDepthStencilState(desc) ?? throw new Exception("CreateDepthStencilState failed");
+        return MTLPipelineFactory.CreateDepthState(desc, "main");
     }
 
     static MTLVertexDescriptor CreateVertexDescriptor()
@@ -1133,10 +1133,7 @@ internal static class Pipeline
             }
         }
 
-        var pso = Device.MtlDevice.CreateRenderPipelineState(psd, out NSError? err);
-        if (pso == null)
-            throw new Exception($"CreateRenderPipelineState [{psd.Label}] failed: {err?.LocalizedDescription ?? "(no NSError)"}");
-        return pso;
+        return MTLPipelineFactory.CreateRender(psd);
     }
 
     /// <summary>
@@ -1156,10 +1153,7 @@ internal static class Pipeline
             DepthAttachmentPixelFormat = depthFormat,
         };
 
-        var pso = Device.MtlDevice.CreateRenderPipelineState(psd, out NSError? err);
-        if (pso == null)
-            throw new Exception($"CreateRenderPipelineState [Shadow] failed: {err?.LocalizedDescription ?? "(no NSError)"}");
-        return pso;
+        return MTLPipelineFactory.CreateRender(psd);
     }
 
     /// <summary>
@@ -1184,10 +1178,7 @@ internal static class Pipeline
         att.PixelFormat = colorFormat;
         att.BlendingEnabled = false;
 
-        var pso = Device.MtlDevice.CreateRenderPipelineState(psd, out NSError? err);
-        if (pso == null)
-            throw new Exception($"CreateRenderPipelineState [OutlineMask] failed: {err?.LocalizedDescription ?? "(no NSError)"}");
-        return pso;
+        return MTLPipelineFactory.CreateRender(psd);
     }
 
     // ============================================================

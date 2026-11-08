@@ -54,6 +54,19 @@ internal sealed unsafe class DXComputeKernel : Season.Rendering.ComputeKernel
     /// aligned with Bindings and allocated once.</summary>
     internal readonly object?[] ResolvedScratch;
 
+    /// <summary>Set once Build has thrown. A kernel whose dispatch runs every frame must not re-enter fxc every frame;
+    /// the field is the difference between "one bad shader costs one compile" and "one bad shader costs a frame".</summary>
+    bool _buildFailed;
+
+    /// <summary>
+    /// Step 2: constructor cost, split from creation cost.
+    ///
+    /// Everything left here is derived from the descriptor alone - label bytes, slot arithmetic, scratch arrays. The
+    /// root signature, the fxc pass and the PSO moved into <see cref="Build"/>, so a registration can construct every
+    /// kernel it needs in microseconds and let the frame boundary pay for them in one parallel wave. This is what makes
+    /// the split legal: <see cref="Season.Rendering.ComputeKernel"/> exposes only Desc and Dispose to effects, so no
+    /// effect can observe that its kernel has no pipeline yet.
+    /// </summary>
     internal DXComputeKernel(Season.Rendering.ComputeKernelDesc desc)
     {
         Desc = desc;
@@ -62,6 +75,76 @@ internal sealed unsafe class DXComputeKernel : Season.Rendering.ComputeKernel
         var bindings = desc.Bindings;
         RootParamIndex = new int[bindings.Length];
         ResolvedScratch = new object?[bindings.Length];
+
+        uint paramCount = 0;
+
+        for (int i = 0; i < bindings.Length; i++)
+        {
+            if (bindings[i].Type == Season.Rendering.ComputeBindingType.Params)
+                ParamsNum32Bit = bindings[i].SizeInBytes / 4;
+
+            RootParamIndex[i] = (int)paramCount++;
+        }
+    }
+
+    /// <summary>
+    /// Step 2: true once the PSO exists. The first call builds it, and a failure is remembered.
+    ///
+    /// <para>Called from the frame-boundary drain after the shader wave has already put the blob in the compiler cache,
+    /// and from <c>TryDispatchCompute</c> as the fallback for a kernel registered mid-frame. That fallback is what makes
+    /// this whole change a pure optimisation: if a kernel is ever dispatched before any drain has seen it, it simply
+    /// pays its own build at the point of use, exactly as it would have before - unless it is <see cref="Season.Rendering.ComputeKernelDesc.Deferred"/>,
+    /// whose shader a background lane owns and which therefore declines instead of waiting.</para>
+    ///
+    /// <para>Returning false is the same observable outcome as pre-Step-2 <c>CreateComputeKernel</c> returning null -
+    /// the dispatch is skipped - with one difference worth naming: the effect stays registered and keeps recording
+    /// instead of declining at registration. A bad shader therefore looks like "this effect never draws" rather than
+    /// "this effect does not exist", and the log line below is what tells the two apart.</para>
+    /// </summary>
+    internal bool EnsureBuilt()
+    {
+        if (PipelineState != null) return true;
+
+        if (_buildFailed) return false;
+
+        // Step 5: a Deferred kernel is finished by the background lane, and this method must not become the place that
+        // blocks on it. On a cache miss the answer is "not yet": the dispatch is skipped and the frame draws without
+        // the feature, which is the state the effect already knows how to present (fog publishes FogOutputReady = false,
+        // cloth keeps its static vertices). Building on a miss would move the 19.9 s fxc call into a frame, i.e. undo
+        // the one thing the deferral bought.
+        if (Desc.Deferred && Desc.Source.Hlsl is { Length: > 0 } source
+            && !ShaderCompiler.IsCached(source, Desc.Source.EntryPoint, "cs_5_0", label: Desc.Name))
+            return false;
+
+        try
+        {
+            Build();
+
+            if (PipelineState != null) return true;
+        }
+        catch (Exception ex)
+        {
+            DeviceServices.BaseApp.AddLog(LogType.Error,
+                $"{DateTime.UtcNow} [CreateComputeKernel] '{Desc.Name}' compilation/creation failed: {ex.Message}");
+        }
+
+        _buildFailed = true;
+
+        return false;
+    }
+
+    /// <summary>
+    /// Creates the root signature and the compute PSO. Both are GPU-side and therefore main-thread work; the one part
+    /// of the original constructor that was moved to a worker pool is the fxc call, which now resolves from the cache
+    /// the prewarm filled.
+    ///
+    /// The root-parameter layout mirrors the constructor's slot arithmetic exactly. It is rebuilt here instead of
+    /// cached because the descriptor lists live on the stack only for the duration of the call, and re-walking a
+    /// handful of bindings is cheaper than owning an array to avoid it.
+    /// </summary>
+    void Build()
+    {
+        var bindings = Desc.Bindings;
 
         // ── Root signature: constants + one single-descriptor table per resource ──
         var ranges = stackalloc DescriptorRange[bindings.Length == 0 ? 1 : bindings.Length];
@@ -73,7 +156,6 @@ internal sealed unsafe class DXComputeKernel : Season.Rendering.ComputeKernel
         {
             if (bindings[i].Type == Season.Rendering.ComputeBindingType.Params)
             {
-                ParamsNum32Bit = bindings[i].SizeInBytes / 4;
                 rootParams[paramCount] = new RootParameter
                 {
                     ParameterType = RootParameterType.Type32BitConstants,
@@ -85,7 +167,7 @@ internal sealed unsafe class DXComputeKernel : Season.Rendering.ComputeKernel
                     },
                     ShaderVisibility = ShaderVisibility.All,
                 };
-                RootParamIndex[i] = (int)paramCount++;
+                paramCount++;
                 continue;
             }
 
@@ -116,7 +198,7 @@ internal sealed unsafe class DXComputeKernel : Season.Rendering.ComputeKernel
                 },
                 ShaderVisibility = ShaderVisibility.All,
             };
-            RootParamIndex[i] = (int)paramCount++;
+            paramCount++;
         }
 
         // s0: engine linear-clamp sampler, provided when SampledTexture exists
@@ -171,7 +253,7 @@ internal sealed unsafe class DXComputeKernel : Season.Rendering.ComputeKernel
         try
         {
             long compileStart = StartupProfiler.Enabled ? StartupProfiler.Ticks() : 0;
-            csBlob = ShaderCompiler.CompileShaderFromSource(desc.Source.Hlsl!, desc.Source.EntryPoint, "cs_5_0", label: desc.Name);
+            csBlob = ShaderCompiler.CompileShaderFromSource(Desc.Source.Hlsl!, Desc.Source.EntryPoint, "cs_5_0", label: Desc.Name);
             double compileMs = compileStart != 0 ? StartupProfiler.ElapsedMs(compileStart) : 0;
             var psoDesc = new ComputePipelineStateDesc
             {
@@ -191,7 +273,7 @@ internal sealed unsafe class DXComputeKernel : Season.Rendering.ComputeKernel
             {
                 double psoMs = StartupProfiler.ElapsedMs(psoStart);
 
-                StartupProfiler.Item("pso", $"compute {desc.Name}", psoMs,
+                StartupProfiler.Item("pso", $"compute {Desc.Name}", psoMs,
                     csBlob != null ? (long)csBlob->GetBufferSize() : 0,
                     $"cs_ms={compileMs:0.###} sig_ms={signatureMs:0.###}");
 

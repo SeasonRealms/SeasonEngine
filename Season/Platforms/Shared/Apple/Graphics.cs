@@ -3025,6 +3025,86 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         return true;
     }
 
+    // L5.1: storage buffer readback -- the Metal half of the same evidence D3D12 and Vulkan publish.
+
+    /// <summary>
+    /// L5.1: Metal answers, so a capture taken on iOS or Mac Catalyst publishes the real cullSlice instead of
+    /// <c>cullSlice=unsupported</c>.
+    ///
+    /// The copies go through one blit command buffer submitted on the graphics queue and waited on, which is the same shape
+    /// TextureUploadBatch uses in the opposite direction. Two things are simpler here than on Vulkan: Metal has no buffer
+    /// usage bits, so nothing has to be added at creation, and it has no queue-family ownership, so a blit may read a
+    /// <c>StorageModePrivate</c> buffer directly with no barrier at all -- the driver's automatic hazard tracking orders
+    /// the read after whatever kernel last wrote it.
+    ///
+    /// A fresh <c>StorageModeShared</c> staging buffer per call, disposed in the finally: this runs once, from the capture
+    /// path, and a resident readback target would spend device memory on every storage buffer for a development-time probe.
+    /// </summary>
+    public bool StorageBufferReadbackSupported => ComputeSupported;
+
+    public unsafe byte[][]? TryReadStorageBuffers(IReadOnlyList<Season.Rendering.StorageBuffer> buffers)
+    {
+        if (!StorageBufferReadbackSupported || buffers == null || buffers.Count == 0) return null;
+
+        // A blit encoder cannot be opened while a render encoder is live (rule 1), and the capture path that calls this
+        // already runs between frames, so this guards against a misplaced caller rather than an expected branch.
+        if (Metal.Device.GraphicsEncoder != null) return null;
+
+        var native = new MTLStorageBuffer[buffers.Count];
+        nuint total = 0;
+        for (int i = 0; i < buffers.Count; i++)
+        {
+            // Every element is validated before anything is allocated: a partial readback would hand the caller a short
+            // array with no way to tell which number went missing.
+            if (buffers[i] is not MTLStorageBuffer sb || sb.Buffer == null || sb.SizeInBytes == 0) return null;
+            native[i] = sb;
+            // Sized by the allocation, not by SizeInBytes: the constructor rounds capacity up to 16 bytes, and the surplus
+            // is dropped below, where each array is cut back to the size the caller asked for.
+            total += sb.AlignedSize;
+        }
+
+        IMTLBuffer? staging = null;
+        try
+        {
+            // The local keeps the null-forgiving path out of the hot loop: staging exists only so the finally can dispose
+            // it, and handing a nullable through would put a CS8604 on every copy.
+            var target = Metal.Device.ResourceManager.CreateBuffer(total, MTLResourceOptions.StorageModeShared);
+            staging = target;
+
+            using var cmd = Metal.Device.GraphicsQueue.CreateCommandBuffer();
+            using var blit = cmd.CreateBlitCommandEncoder(new MTLBlitPassDescriptor())
+                ?? throw new InvalidOperationException("Cannot create Metal readback blit encoder.");
+
+            nuint offset = 0;
+            for (int i = 0; i < buffers.Count; i++)
+            {
+                blit.CopyFromBuffer(native[i].Buffer, 0, target, offset, native[i].AlignedSize);
+                offset += native[i].AlignedSize;
+            }
+            blit.EndEncoding();
+
+            cmd.Commit();
+            Metal.Device.WaitForCompletion(cmd);
+
+            var result = new byte[buffers.Count][];
+            byte* source = (byte*)target.Contents;
+            nuint read = 0;
+            for (int i = 0; i < buffers.Count; i++)
+            {
+                int length = (int)native[i].SizeInBytes;
+                var bytes = new byte[length];
+                fixed (byte* dst = bytes) Unsafe.CopyBlock(dst, source + read, (uint)length);
+                result[i] = bytes;
+                read += native[i].AlignedSize;
+            }
+            return result;
+        }
+        finally
+        {
+            staging?.Dispose();
+        }
+    }
+
     // -- 1-7 Cubemap, see the contract summary in the IGraphics and RenderQuality class headers --
     // Cubes are registered by name into the dedicated static dictionary of MTLTextureCube.
     // They are not merged into DictionaryMtlTexture because that dictionary carries Texture2D semantics
@@ -3088,6 +3168,10 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         if (enc == null)
             return false;
         enc.Label = kernel.Label;
+
+        // Contract 3-1: marks taken since the previous encoder land at this compute encoder's head, so an effect's
+        // interval starts where the shared layer opened it rather than at its first dispatch.
+        Metal.MTLGpuFrameTimer.FlushInto(enc);
 
         enc.SetComputePipelineState(kernel.PipelineState);
 
@@ -3245,4 +3329,15 @@ internal unsafe partial class Graphics : IGraphics, Season.Rendering.ISegmentedS
         => Metal.Device.TryQueryGpuMemory(out long used, out long total)
             ? new GraphicsMemoryInfo(used, total)
             : GraphicsMemoryInfo.Unknown;
+
+    /// <summary>
+    /// Contract 3-1: the counter sample buffers behind GPU frame timing. One implementation covers both Apple targets -
+    /// iOS and MacCatalyst reach the device through this backend, and what differs between them (counter sampling at a
+    /// pass boundary, the presence of a timestamp counter set) is asked of the device at construction rather than
+    /// compiled per platform.
+    /// A GPU that cannot sample counters fails the construction, and the shared layer treats that exactly like a backend
+    /// without a timer: every GPU column reports "--", never a fallback zero. Built at most once per process, only while
+    /// profiling is enabled.
+    /// </summary>
+    public IGpuFrameTimer? CreateGpuFrameTimer() => new Metal.MTLGpuFrameTimer();
 }

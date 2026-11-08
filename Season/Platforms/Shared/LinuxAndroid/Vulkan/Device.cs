@@ -177,6 +177,14 @@ internal unsafe static class Device
     /// <summary>Monotonic frame-completion counter. AfterRender increments it by 1 each time and writes the result into the current frame's _fenceValues.</summary>
     static ulong _nextFenceValue;
 
+    /// <summary>
+    /// Contract 3-1: the completion value the frame submitted last carries on the swap-chain timeline. The GPU frame
+    /// timer reads it in OnSubmitted instead of signalling a value of its own, because an extra vkQueueSubmit per frame
+    /// would be the profiler measuring itself. Nothing here is a new signal - this is the value the submission already
+    /// produces, which is exactly what keeps the ring and deferred-release semantics untouched.
+    /// </summary>
+    internal static ulong LastSubmittedFrameValue;
+
     // -- Deferred release, aligned with DX Graphics.EnqueueDeferredRelease and PumpDeferredReleases --
     // Buffers and descriptor sets that may still be referenced by in-flight command buffers must never be destroyed immediately.
     // Desktop drivers may tolerate it, but Android tiler GPUs can read freed pages and corrupt the whole frame.
@@ -1343,6 +1351,7 @@ internal unsafe static class Device
         "SsrComposite\0"u8.ToArray(),
         "SceneWaterfall\0"u8.ToArray(),
         "ShadowFar\0"u8.ToArray(),
+        "ShadowLocal\0"u8.ToArray(),
     ];
 
     internal static void PushDebugGroup(byte[] utf8LabelZ)
@@ -1716,7 +1725,13 @@ internal unsafe static class Device
     internal static void BeginPass(in Season.Rendering.PassDesc desc)
     {
         ActivePassId = desc.Id;
-        PushDebugGroup(_passLabels[(int)desc.Id]);
+
+        // Clamped rather than indexed directly: the enum grew past this table once already (ShadowLocal), and the pass
+        // that exposed it threw from inside the frame loop instead of opening a capture group. The D3D12 table clamps
+        // for the same reason - a label is diagnostic metadata, never a reason to drop a frame.
+        int passIndex = (int)desc.Id;
+        if ((uint)passIndex >= (uint)_passLabels.Length) passIndex = _passLabels.Length - 1;
+        PushDebugGroup(_passLabels[passIndex]);
 
         // Msaa4x invariant: the multisampled pair is backend-private, so a scene pass can never carry an explicit
         // depth / velocity / normal attachment (those are all single-sampled shared targets). Initialization enforces
@@ -2517,6 +2532,12 @@ internal unsafe static class Device
         }
 
         _fenceValues[FrameIndex] = signalTimeline;
+
+        // Contract 3-1: the frame's timestamps are now in the queue. Publishing the value first lets the profiler arm
+        // its readback slot with the completion value this submission already signals; it must stay after the submit
+        // and before Present so the copy lands inside this frame's GPU work.
+        LastSubmittedFrameValue = signalTimeline;
+        Season.Rendering.FrameProfiler.OnSubmitted();
 
         // Present waits on RenderFinished, one semaphore per image.
         Trace("Present");

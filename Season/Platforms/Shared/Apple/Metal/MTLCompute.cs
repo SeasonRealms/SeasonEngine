@@ -67,9 +67,11 @@ internal sealed class MTLComputeKernel : Season.Rendering.ComputeKernel
         var function = library.CreateFunction(desc.Source.EntryPoint)
             ?? throw new Exception($"MSL function '{desc.Source.EntryPoint}' (compute '{desc.Name}') not found");
 
-        PipelineState = Device.MtlDevice.CreateComputePipelineState(function, out NSError error);
-        if (PipelineState == null)
-            throw new Exception($"CreateComputePipelineState ('{desc.Name}') failed: {error?.LocalizedDescription}");
+        // Contract 3-2: one row per kernel, named after the kernel, so a slow row is traceable instead of every row
+        // reading "compute main". Its library compile is a separate row (see MTLShaderCompiler), and the two together are
+        // this kernel's whole build cost - the DX and Vulkan reports split the same way. The row is written by
+        // MTLPipelineFactory.CreateCompute, the single creation path this backend's pipelines and states all go through.
+        PipelineState = MTLPipelineFactory.CreateCompute(function, desc.Name);
 
         // In render-quality 1-8, MaxTotalThreadsPerThreadgroup is a PSO property.
         // It varies with register pressure and is not a fixed 1024,
@@ -118,6 +120,13 @@ internal sealed class MTLStorageBuffer : Season.Rendering.StorageBuffer
     internal bool VertexInputReady;
 
     readonly nuint _alignedSize;
+
+    /// <summary>
+    /// L5.1: allocation size, i.e. <see cref="Season.Rendering.StorageBuffer.SizeInBytes"/> rounded up to 16 bytes. Exposed
+    /// for TryReadStorageBuffers, which must size its copy regions by the allocation: a region that stops mid-granule is
+    /// outside what the buffer actually owns.
+    /// </summary>
+    internal nuint AlignedSize => _alignedSize;
 
     /// <summary>Step 0 of 2-4: a StorageModeShared staging ring for CPU-to-GPU uploads, split by in-flight frame slot.
     /// Earlier, each UpdateStorageBuffer call created a buffer and disposed it immediately,

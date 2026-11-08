@@ -30,6 +30,15 @@ internal sealed class CostProfileScene : ICostProfileScene
     /// </summary>
     const int ReadyFrames = 240;
 
+    /// <summary>
+    /// How long the runner waits for the first painted fog frame. The gate below cannot simply wait forever: a tier with
+    /// <c>VolumetricFog = Off</c>, a view without the Fog bit, or an app that turned the effect off never publishes
+    /// <see cref="FrameSchedule.FogOutputReady"/>, and a window that never opens reports nothing at all. Ninety seconds
+    /// is comfortably past the slowest deferred compile measured here and finite, so the failure mode is a slightly late
+    /// window rather than a run with no table.
+    /// </summary>
+    const double FogWaitSeconds = 90;
+
     /// <summary>Where the orbit points. Slightly above ground so the horizon sits below centre.</summary>
     static readonly Vector3 Focus = new(0f, 6f, 0f);
 
@@ -44,6 +53,8 @@ internal sealed class CostProfileScene : ICostProfileScene
     long dispatchDelta = -1;
 
     int stableFrames;
+
+    readonly Stopwatch fogWait = new();
 
     internal CostProfileScene()
     {
@@ -136,9 +147,28 @@ internal sealed class CostProfileScene : ICostProfileScene
                 return false;
             }
 
-            if (stableFrames < ReadyFrames) stableFrames++;
+            if (stableFrames < ReadyFrames)
+            {
+                stableFrames++;
 
-            return stableFrames >= ReadyFrames;
+                return false;
+            }
+
+            // The scene can be geometrically complete while an effect is still compiling: volumetric fog is deferred
+            // to a background lane, so the first tens of seconds of a run draw without it. A window that opened before
+            // the fog shaders landed would measure a world missing the effect under test, so the gate also waits for a
+            // frame that actually painted fog. Only profile runs ever call this, so an ordinary launch is unaffected.
+            if (!FrameSchedule.FogOutputReady)
+            {
+                if (!fogWait.IsRunning) fogWait.Start();
+
+                // Still compiling: hold the window shut. The deadline exists only for a tier that never publishes fog
+                // at all - VolumetricFog = Off, a view without the Fog bit - where waiting without one would leave a
+                // run with no table whatsoever. Past it, a world missing the effect beats no measurement.
+                if (fogWait.Elapsed.TotalSeconds < FogWaitSeconds) return false;
+            }
+
+            return true;
         }
     }
 

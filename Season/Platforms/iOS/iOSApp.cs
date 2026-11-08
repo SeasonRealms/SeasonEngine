@@ -13,6 +13,10 @@ public static class iOSApp
 {
     public static void Run(BaseApp app)
     {
+        // Contract 3-2: the first line of engine code after the process entry point. Everything before it is reported as
+        // the process-start bridge; everything after it is a real interval.
+        StartupProfiler.Mark("app-run");
+
         var keyboard = new AppleKeyboardService();
         AppDelegate.Keyboard = keyboard;
 

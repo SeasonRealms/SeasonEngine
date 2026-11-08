@@ -74,8 +74,7 @@ internal sealed class MTLWaterPipeline : Season.Rendering.WaterPipeline
         {
             DepthCompareFunction = MTLCompareFunction.Always, DepthWriteEnabled = false,
         };
-        _noDepthState = Device.MtlDevice.CreateDepthStencilState(noDepth)
-            ?? throw new InvalidOperationException("Failed to create water depth state.");
+        _noDepthState = MTLPipelineFactory.CreateDepthState(noDepth, "water");
 
         _pipeline = CreatePipeline();
     }
@@ -102,9 +101,7 @@ internal sealed class MTLWaterPipeline : Season.Rendering.WaterPipeline
         color.DestinationRgbBlendFactor = MTLBlendFactor.OneMinusSourceAlpha;
         color.SourceAlphaBlendFactor = MTLBlendFactor.Zero;
         color.DestinationAlphaBlendFactor = MTLBlendFactor.One;
-        var pipeline = Device.MtlDevice.CreateRenderPipelineState(desc, out NSError? error);
-        return pipeline ?? throw new InvalidOperationException(
-            $"Failed to create water PSO: {error?.LocalizedDescription ?? "(no NSError)"}");
+        return MTLPipelineFactory.CreateRender(desc);
     }
 
     static bool Readable(IMTLTexture? texture, MTLTextureType type) => texture != null

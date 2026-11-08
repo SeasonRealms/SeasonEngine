@@ -292,6 +292,9 @@ public sealed class Sdf3DViewEffect : ComputeEffect
         }
     }
 
+    /// <summary>Step 1: registered only while the Views panel is open, so unregistering must release all three kernels and both buffers.</summary>
+    public override void OnUnregistered() => Dispose();
+
     public void Dispose()
     {
         _fill3d?.Dispose();

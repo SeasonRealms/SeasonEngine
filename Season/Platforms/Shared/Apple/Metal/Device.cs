@@ -203,6 +203,14 @@ internal static class Device
     static SemaphoreSlim _inFlight = null!;
     static bool _frameOpen;
 
+    /// <summary>
+    /// Contract 3-1: the completion value the frame submitted last carries on the shared command queue. The GPU frame
+    /// timer reads it in OnSubmitted instead of registering a value of its own, because an extra command buffer per
+    /// frame would be the profiler measuring itself. Nothing here is a new signal - this is the value the submission
+    /// already produces, which is exactly what keeps the frame ring and the in-flight throttling untouched.
+    /// </summary>
+    internal static ulong LastSubmittedFrameValue;
+
     /// <summary>Backbuffer render-pass descriptor for the current frame, acquired in BeforeRender and used by BeginPass after configuring load and store actions from PassDesc.</summary>
     static MTLRenderPassDescriptor? _backbufferRpd;
 
@@ -635,6 +643,10 @@ internal static class Device
         enc.Label = _passLabels[(int)desc.Id];
         frame.Encoder = enc;
         GraphicsEncoder = enc;
+
+        // Contract 3-1: the marks taken since the previous encoder are written here, before any draw, so a pass
+        // boundary is timestamped at the boundary and not at the first draw that happens to follow it.
+        MTLGpuFrameTimer.FlushInto(enc);
         ActiveColorTarget = desc.ColorTarget as MTLRenderTarget;
         ActiveColorTexture = rpd.ColorAttachments[0].Texture;
         // Read back from rpd rather than inferring from PassDesc: fog composite nulls out depth, and the backbuffer path's depth does not come from any RT.
@@ -866,6 +878,12 @@ internal static class Device
         frame.FenceValue = GraphicsQueue.RegisterSignal(cmdBuffer);
         cmdBuffer.Commit();
         _frameOpen = false;
+
+        // Contract 3-1: the frame's samples are now in the queue. Publishing the value first lets the profiler arm its
+        // readback slot with the completion value this submission already carries; it has to stay after Commit so the
+        // samples and the value describe the same submission.
+        LastSubmittedFrameValue = frame.FenceValue;
+        Season.Rendering.FrameProfiler.OnSubmitted();
 
         // For CaptureApp, wait for GPU completion so the staging buffer becomes readable.
         if (_capturePending)

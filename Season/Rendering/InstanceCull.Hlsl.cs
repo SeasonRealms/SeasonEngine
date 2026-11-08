@@ -55,6 +55,10 @@ struct CullParams
     uint slotCountsOffset;
     float texelNdc;     // L1.2: a caster's NDC radius below this is dropped from the slots in texelSlots
     uint texelSlots;    // L1.2: which slots that test may act on (the orthographic ones)
+    uint occlusionSlots;    // L2.2: which slots may be confirmed visible from the pyramid (the main view only)
+    uint occlusionWidth;    // L2.2: level 0 of the pyramid, in texels; zero unless occlusionSlots is set
+    uint occlusionHeight;   // L2.2: same
+    float occlusionMargin;  // L2.2: level-0 texels of slack on top of the block's circumradius
 };
 
 cbuffer CullParamsCB : register(b0)
@@ -63,6 +67,8 @@ cbuffer CullParamsCB : register(b0)
 };
 ByteAddressBuffer slotMatrices : register(t0);
 ByteAddressBuffer instanceWorlds : register(t1);
+Texture2D<float> occlusionPyramid : register(t2);
+SamplerState occlusionSampler : register(s0);
 RWByteAddressBuffer drawArgs : register(u0);
 RWByteAddressBuffer visibleIds : register(u1);
 
@@ -102,6 +108,62 @@ bool VisibleInSlot(uint slot, float3 center, float radius)
     return visible;
 }
 
+// L2.2: pyramid confirmation, main-view slot only. The pyramid stores the NEAREST depth of every 2x2 block of the
+// depth buffer -- it is the same min-reduce HiZ builds for SSR -- so the one statement it can support is a positive
+// one: if the sphere's farthest point is still nearer than the block's nearest surface, then at that block the
+// sphere is in front of everything and putting the instance in the slot is what the plane test would have decided
+// too. The opposite statement does not follow: a block holding something nearer says nothing about whether that
+// something covers the sphere. That asymmetry is why this helper can only confirm, and why the caller gates it on a
+// mask instead of tuning it with a threshold. See InstanceCull.OcclusionCull.
+//
+// Single exit with preinitialized results, the same shape as VisibleInSlot and for the same fxc reason.
+bool PyramidConfirmsVisible(uint slot, float3 center, float radius)
+{
+    uint m = slot * 64;
+    float4 r0 = asfloat(slotMatrices.Load4(m));
+    float4 r1 = asfloat(slotMatrices.Load4(m + 16));
+    float4 r2 = asfloat(slotMatrices.Load4(m + 32));
+    float4 r3 = asfloat(slotMatrices.Load4(m + 48));
+
+    float4 c0 = float4(r0.x, r1.x, r2.x, r3.x);
+    float4 c1 = float4(r0.y, r1.y, r2.y, r3.y);
+    float4 c2 = float4(r0.z, r1.z, r2.z, r3.z);
+    float4 c3 = float4(r0.w, r1.w, r2.w, r3.w);
+    float4 p = float4(center, 1.0);
+
+    float4 clip = float4(dot(c0, p), dot(c1, p), dot(c2, p), dot(c3, p));
+
+    // Each clip component is widened by the sphere's extent along that row, which is the row's xyz length, and every
+    // extent below is then divided by the smallest w the sphere reaches, so all four bounds stay conservative in the
+    // direction that matters: a rectangle that can only be too large and a depth that can only be too far.
+    float wMin = clip.w - radius * length(c3.xyz);
+    float invW = 1.0 / max(wMin, 1e-4);
+
+    // Level-0 texel holding the sphere's projected center, clamped so the fetch always stays in range. Clamping cannot
+    // confirm anything the projection did not put there -- the coverage test below is what decides that.
+    float2 size = float2(cullParams.occlusionWidth, cullParams.occlusionHeight);
+    float2 uv = clip.xy * invW * float2(0.5, -0.5) + 0.5;
+    float2 texel = uv * size;
+    float2 coord = clamp(floor(texel), float2(0.0, 0.0), size - 1.0);
+
+    // Screen radius in level-0 texels on the smaller axis, minus the block's own circumradius (a block spans one texel
+    // on each side of its center, so sqrt(0.5)) and the caller's margin. What is left is how far the block's center may
+    // sit from the projected center and still be covered by the sphere; a negative remainder means the sphere is too
+    // small to contain a whole block and nothing can be confirmed from it.
+    float2 rad = float2(radius * length(c0.xyz) * invW * 0.5 * size.x,
+                        radius * length(c1.xyz) * invW * 0.5 * size.y);
+    float reach = min(rad.x, rad.y) - 0.70710678 - cullParams.occlusionMargin;
+    float2 delta = coord + 0.5 - texel;
+    bool covered = reach > 0.0 && dot(delta, delta) <= reach * reach;
+
+    // Farthest NDC depth the sphere can reach against the block's nearest surface. Sampling at a texel center is an
+    // exact texel read under the engine's linear-clamp sampler, the same invariant HiZ's reduce leans on.
+    float farDepth = (clip.z + radius * length(c2.xyz)) * invW;
+    float tileNear = occlusionPyramid.SampleLevel(occlusionSampler, (coord + 0.5) / size, 0.0);
+
+    return wMin > 1e-4 && covered && farDepth < tileNear;
+}
+
 [numthreads(64, 1, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
@@ -125,7 +187,12 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     {
         if ((p.slotMask & (1u << slot)) == 0u)
             continue;
-        if (!VisibleInSlot(slot, center, radius))
+        // L2.2: a confirmation replaces the plane test rather than adding to it: both answer "is this instance in the
+        // main view", and the pyramid answers it with one fetch instead of six plane tests. An unconfirmed slot falls
+        // through unchanged, so a frame with the mask clear runs exactly the code it ran before.
+        bool confirmed = (p.occlusionSlots & (1u << slot)) != 0u
+            && PyramidConfirmsVisible(slot, center, radius);
+        if (!confirmed && !VisibleInSlot(slot, center, radius))
             continue;
 
         // Each slot is compressed independently: an instance can be visible in several cascades, and the index table holds one segment per slot.
@@ -170,9 +237,12 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     for (uint slot = 0; slot < p.slotCount; slot++)
         maxCount = max(maxCount, drawArgs.Load(p.slotCountsOffset + slot * 4));
 
-    // When maxCount is 0, groups is also 0: all four backends allow dispatching "0 groups" (it does nothing),
-    // so a frame whose whole group is culled away does not need another CPU-side branch.
-    uint groups = (maxCount + p.groupSize - 1) / p.groupSize;
+    // At least one group, even when maxCount is 0. Dispatching 0 groups is legal and does nothing -- but "nothing" is
+    // exactly the wrong thing here: gather's k == 0 thread is the only writer of the arg table's InstanceCount and the
+    // only clearer of the slot-count accumulator, and a 0-group dispatch has no such thread. The arg table would keep
+    // the previous frame's count and replay that frame's visible set once. One group of 64 threads that all fail
+    // k >= count on the first test costs less than the CPU-side branch that would be needed to avoid it.
+    uint groups = max((maxCount + p.groupSize - 1) / p.groupSize, 1u);
     dispatchArgs.Store3(0, uint3(groups, p.slotCount, 1));
 }
 """;

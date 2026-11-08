@@ -254,6 +254,25 @@ public interface IGraphics
     /// <summary>Unregisters a 3D texture exclusively owned by an effect, and defers the release according to the backend's in-flight resource contract.</summary>
     void ReleaseComputeTexture3D(string name) { }
 
+    /// <summary>
+    /// Step 2: finishes the kernels that were registered since the previous frame boundary.
+    ///
+    /// <para><b>Contract.</b> <see cref="CreateComputeKernel"/> may return a handle whose pipeline does not exist yet, so
+    /// the backend must be given one point per frame - at the boundary, before any compute phase can dispatch - to
+    /// complete them. The backend is free to do that work in parallel and to use whatever split it likes between CPU
+    /// compilation and GPU pipeline creation, because <see cref="Season.Rendering.ComputeKernel"/> gives effects no way
+    /// to observe the handle's internal state.</para>
+    ///
+    /// <para><b>Why it is optional.</b> A backend that compiles inside CreateComputeKernel is already complete at the
+    /// moment it returns and has nothing to flush; the default is therefore a no-op rather than an error, which is the
+    /// same shape the rest of this interface uses for capabilities it may not have.</para>
+    ///
+    /// <para><b>Called from</b> RenderPass.ExecuteFrame via BeginSceneFrame, on the frame-loop thread, once per frame,
+    /// before the first RecordPhase. Late registrations that arrive after this point are not lost: the backend's own
+    /// dispatch path must still work on a kernel that was never flushed.</para>
+    /// </summary>
+    void FlushPendingCompute() { }
+
     // Contract A0.1 indirect draw.
     // - IndirectDrawSupported means this backend can source an indexed draw's arguments from a
     //   StorageBufferUsage.ComputeAndIndirectArgs buffer. It does not add a pass, a render target, or a shader variant:
@@ -329,6 +348,35 @@ public interface IGraphics
     /// <see cref="Season.Rendering.StorageBufferUsage.ComputeAndVertexInput"/> or the backend is not integrated, in which case the
     /// frame must not draw from that stream (the backend falls back to the static vertices).</summary>
     bool TryPrepareVertexInput(Season.Rendering.StorageBuffer buffer) => false;
+
+    // Contract L3.1: diagnostic readback. This is the only entry point in the interface that moves buffer
+    // contents from the GPU back to the CPU, and it exists because one class of number has no other source.
+    // "How many instances did culling keep" lives entirely on the GPU (the index table is compressed and the
+    // per-slot counts are written by cull and cleared by gather), and it cannot be recovered from pixels: a
+    // frame that culled correctly and a frame that culled nothing are identical by construction, which is
+    // exactly the property A7 was accepted on. Re-deriving the answer on the CPU is the mistake
+    // InstanceCull.ReportStats exists to avoid.
+    // - The default returns null. Callers must read that as "this platform cannot answer", never as "the
+    //   buffer was empty": an empty buffer is a legitimate answer and comes back as a zeroed array.
+    // - It waits for the GPU. That is acceptable only because call sites are one-shot capture paths; a
+    //   per-frame caller would serialize the pipeline against itself for a number nobody renders from.
+
+    /// <summary>Whether <see cref="TryReadStorageBuffers"/> can answer on this backend.</summary>
+    bool StorageBufferReadbackSupported => false;
+
+    /// <summary>
+    /// Copies each storage buffer's full contents back to the CPU in one submission, or returns null when the
+    /// backend has no readback path. Entry <c>i</c> is <see cref="Season.Rendering.StorageBuffer.SizeInBytes"/>
+    /// long and holds what the GPU last wrote to buffer <c>i</c>.
+    ///
+    /// <para>Batched rather than one buffer per call because the cull chain owns one argument block per group:
+    /// reading twenty-six blocks one call at a time would cost twenty-six queue waits for the same twenty-six
+    /// kilobytes, while one submission costs one wait no matter how many blocks ride along.</para>
+    ///
+    /// <para>Must be called between frames, outside a Pass and outside the frame's own list recording: the
+    /// backend submits a copy list of its own and waits for it before returning.</para>
+    /// </summary>
+    byte[][]? TryReadStorageBuffers(IReadOnlyList<Season.Rendering.StorageBuffer> buffers) => null;
 
     /// <summary>Returns null when the indirect instanced quad draw capability is missing, in which case the particle effect is not registered at all; a non-null return means the ExecuteIndirect-equivalent primitive has been integrated.</summary>
     Season.Rendering.ParticleDrawPipeline? CreateParticleDrawPipeline() => null;

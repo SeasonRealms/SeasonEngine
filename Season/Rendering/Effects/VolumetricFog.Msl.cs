@@ -346,10 +346,23 @@ kernel void CSMain(constant float4& params [[buffer(0)]],texture3d<float,access:
     // nothing. Two-point Gauss-Legendre over the span. The default is the old centre sample, so a slice thinner than half
     // a metre (everything the near field produces) is bit-identical to the previous behaviour.
     float SliceVisibility(float3 ray,float depth,float z0,float span,int light) const {
-        float result=Visibility(F(8).xyz+ray*depth,depth,light);
-        if(light==int(F(34).z) && span>=0.5f) {
-            float a=z0+span*0.21132487f,b=z0+span*0.78867513f;
-            result=0.5f*(Visibility(F(8).xyz+ray*a,a,light)+Visibility(F(8).xyz+ray*b,b,light));
+        // One exit, both arms writing the same variable, matching DX. The centre sample is only taken when the
+        // resample does not run: the two Gauss taps below overwrite it anyway, so computing it first spent one
+        // full evaluation of the shadow chain on a value that was then thrown away, on exactly the froxels far
+        // enough out to make that chain expensive.
+        float result=0;
+        if(light!=int(F(34).z) || span<0.5f) {
+            result=Visibility(F(8).xyz+ray*depth,depth,light);
+        } else {
+            // Both Gauss points as one loop body. Metal's compiler inlines at -O2 by default, and Visibility is
+            // small enough to be under its threshold at every call site, so the two-call form is the one that
+            // emits the chain twice. Same weights, same order, so the result is unchanged.
+            float sum=0;
+            for(int gaussIndex=0;gaussIndex<2;gaussIndex++) {
+                float gaussT=gaussIndex==0?z0+span*0.21132487f:z0+span*0.78867513f;
+                sum+=Visibility(F(8).xyz+ray*gaussT,gaussT,light);
+            }
+            result=0.5f*sum;
         }
         return result;
     }

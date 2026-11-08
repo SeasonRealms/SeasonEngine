@@ -874,6 +874,10 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         var cc = (target != null && target.Desc.ColorFormat == Season.Rendering.RtFormat.Rgba16Float)
             ? LinearizeClearColor(desc.ClearColor)
             : desc.ClearColor;
+        // Contract 3-1: the mark that opened this pass was taken just before this call, so it rides on the pass
+        // descriptor together with the index FrameProfiler.EndPass is about to take - the only two instants WebGPU
+        // can timestamp at all.
+        WgpuFrameTimer.PreparePass(hasEnd: true);
         WebGPUInterop.BeginPass(
             (int)desc.Id,
             target?.Name,
@@ -897,6 +901,8 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         // (empty batches early-return, so flushing across multiple passes is harmless).
         FlushDrawMesh3DBatch();
         FlushDrawSkinnedMeshBatch();
+        // Contract 3-1: the closing index was reserved when the pass opened, so nothing has to be handed over here;
+        // FrameProfiler.EndPass consumes that index once g.EndPass() has closed the encoder.
         WebGPUInterop.EndPass();
     }
 
@@ -1339,6 +1345,9 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
         }
 
         args.Params.CopyTo(_computeParamsScratch);
+        // Contract 3-1: a compute interval may span several dispatches, so only its opening mark rides on this pass; the
+        // closing one is placed as soon as FrameProfiler.EndCompute takes it.
+        WgpuFrameTimer.PreparePass(hasEnd: false);
         bool dispatched = WebGPUInterop.DispatchCompute(
             kernel.JsName,
             _computeParamsScratch.AsSpan(0, args.Params.Length),
@@ -5127,4 +5136,10 @@ internal void BeginSkinnedModelDraw(string skinKey, byte[] boneMatricesBytes)
             return GraphicsMemoryInfo.Unknown;
         }
     }
+
+    /// <summary>
+    /// Contract 3-1: null when the adapter has no timestamp support, which is the same answer the other backends give
+    /// when their timing path is missing - the profiler then keeps its CPU columns and reports the GPU column unknown.
+    /// </summary>
+    public IGpuFrameTimer? CreateGpuFrameTimer() => WgpuFrameTimer.TryCreate();
 }

@@ -284,6 +284,19 @@ internal class App : BaseApp
 
     internal Views views;
 
+    // Step 1: kernel handles for the on-demand debug sources. Null while Views is closed (or when the backend
+    // declined them); RegisterDebugEffects creates them and SyncDebugEffects disposes them on close.
+    PlasmaEffect debugPlasma;
+    SceneColorCopyEffect debugSceneColor;
+    DepthViewEffect debugDepthView;
+    VelocityViewEffect debugVelocityView;
+    NormalViewEffect debugNormalView;
+    Sdf3DViewEffect debugSdf3D;
+    bool debugEffectsActive;
+
+    // 2-4: DDGI is a real feature and stays registered at boot; only its debug slice is deferred (see SyncDebugEffects).
+    DdgiEffect ddgi;
+
     // P3 acceptance: two secondary views over this scene - a rear-view mirror and a minimap - drawn into their own
     // fixed-size attachments and displayed as ordinary overlay sprites. Created once in Create so both view slots and
     // their published textures live for the whole session; a backend that declines them leaves this null and the app
@@ -590,25 +603,6 @@ internal class App : BaseApp
         Season.Rendering.FrameSchedule.RegisterCompute(
             Season.Basic.Graphics.Instance, new Season.Rendering.InstanceSkinningEffect());
 
-        // 1-6 compute-baseline validation: register the built-in PlasmaEffect.
-        // It dispatches every frame in the FrameStart phase and writes a 256x256 storage texture.
-        // When registration succeeds, Sprite2D can display it directly by TextureName without extra changes.
-        // If the platform lacks compute support or this backend has no shader source, registration returns false and the control is skipped gracefully.
-        if (Season.Rendering.FrameSchedule.RegisterCompute(
-                Season.Basic.Graphics.Instance, new Season.Rendering.Effects.PlasmaEffect()))
-        {
-
-        }
-
-        // 2-1 Step A first acceptance: register SceneColorCopyEffect.
-        // In the AfterScene phase it downsamples offscreen SceneColor into a 480x270 rgba16float storage texture.
-        // At the moment only D3D12 provides HLSL source, and other backends or direct-render paths degrade gracefully at registration time.
-        if (Season.Rendering.FrameSchedule.RegisterCompute(
-                Season.Basic.Graphics.Instance, new Season.Rendering.Effects.SceneColorCopyEffect()))
-        {
-
-        }
-
         // 2-3 Step B: register TaaEffect.
         // It performs a full-resolution resolve in the AfterScene phase with a ping-pong pair of textures.
         // Contract rule 13 requires it to be registered before BloomEffect because AfterScene effects are recorded in registration order,
@@ -659,16 +653,6 @@ internal class App : BaseApp
 
         }
 
-        // 2-2 Step A first acceptance: register DepthViewEffect.
-        // In AfterScene it linearizes full-resolution SceneDepth into a 480x270 grayscale storage texture.
-        // AO Off, AO fallback, or a missing SceneDepth all degrade gracefully at registration time.
-        // After Step C, all four backends have shader coverage.
-        if (Season.Rendering.FrameSchedule.RegisterCompute(
-                Season.Basic.Graphics.Instance, new Season.Rendering.Effects.DepthViewEffect()))
-        {
-
-        }
-
         // 2-2 Step B: register GtaoEffect.
         // In AfterScene it runs gtaoMain plus a bidirectional separable blur in three dispatches,
         // then writes FrameSchedule.AoTexture for FinalBlit and uber-shader AO composition.
@@ -708,48 +692,16 @@ internal class App : BaseApp
         {
         }
 
-        // 2-3 Step A first acceptance: register VelocityViewEffect.
-        // In AfterScene it downsamples full-resolution SceneVelocity into a 480x270 direction-and-magnitude visualization texture.
-        // MotionVectors Off or a missing SceneVelocity both degrade gracefully at registration time.
-        // Acceptance criteria are documented in VelocityViewEffect; this step does not perform TAA resolve.
-        if (Season.Rendering.FrameSchedule.RegisterCompute(
-                Season.Basic.Graphics.Instance, new Season.Rendering.Effects.VelocityViewEffect()))
-        {
-
-        }
-
-        // A0.2 first acceptance: register NormalViewEffect.
-        // In AfterScene it downsamples full-resolution SceneNormal into a 480x270 world-normal (or roughness/metallic) view.
-        // SceneNormals Off, or velocity dropped during initialization (which drops the normals with it), degrades gracefully
-        // at registration time. Acceptance criteria are documented in NormalViewEffect.
-        if (Season.Rendering.FrameSchedule.RegisterCompute(
-                Season.Basic.Graphics.Instance, new Season.Rendering.Effects.NormalViewEffect()))
-        {
-
-        }
-
-        // 1-8 acceptance: register Sdf3DViewEffect.
-        // In FrameStart it runs a three-dispatch chain that covers 3D texture read/write,
-        // the R16Float format, 4x4x4 and 64x1x1 workgroups, and four constant-buffer expansions in UpdateStorageBuffer.
-        // What gets displayed is the final 3D-to-2D slice kernel output at 256x256,
-        // since Sprite2D cannot consume the 3D texture directly.
-        // Missing shader source or unsupported 3D formats degrade gracefully at registration time.
-        if (Season.Rendering.FrameSchedule.RegisterCompute(
-                Season.Basic.Graphics.Instance, new Season.Rendering.Effects.Sdf3DViewEffect()))
-        {
-
-        }
+        // 1-8 acceptance moved to RegisterDebugEffects: Sdf3DViewEffect is debug-only and is registered on demand.
 
         // 2-4 Step 1 acceptance: register DdgiEffect.
-        // In AfterScene it runs two dispatches: upload the proxy list every frame,
-        // then gather the minimum distance per voxel into an R16Float volume of size res^3,
-        // followed by a 256x256 debug slice.
+        // In AfterScene it uploads the proxy list every frame and gathers the minimum distance per voxel into an
+        // R16Float volume of size res^3. Its 256x256 debug slice is a debug-only source: it is compiled later by
+        // SyncDebugEffects -> ddgi.EnableDebugSlice, and only while the Views panel is open.
         // Non-DDGI GiMode, missing shader source, or unsupported 3D formats degrade gracefully at registration time.
-        if (Season.Rendering.FrameSchedule.RegisterCompute(
-                Season.Basic.Graphics.Instance, new Season.Rendering.Effects.DdgiEffect()))
-        {
-
-        }
+        ddgi = new Season.Rendering.Effects.DdgiEffect();
+        if (!Season.Rendering.FrameSchedule.RegisterCompute(Season.Basic.Graphics.Instance, ddgi))
+            ddgi = null;
 
         // 2-5 Step A: register SkyAtmosphereEffect.
         // In FrameStart it maintains two LUTs: transmittance on demand and Sky-View every frame.
@@ -803,6 +755,125 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
         // D1: screen-space decals. They are not in a Compute phase, but a standalone Pass at a fixed position (before the fog composite),
         // so their registration order is independent of the phases above; when the backend does not implement them, this returns false and leaves zero residue.
         Season.Rendering.FrameSchedule.RegisterDecals(Season.Basic.Graphics.Instance);
+    }
+
+    /// <summary>
+    /// Step 1: the debug-only compute sources, registered on demand instead of at boot.
+    ///
+    /// Every kernel below has exactly one consumer - a thumbnail inside Views - and Views exists only in Mode.Debug
+    /// (Setting.cs news it up when the mode picker lands on Debug). Compiling nine unique fxc sources in every launch
+    /// for images nobody asked to see is what this split removes; the boot path now pays for none of them.
+    ///
+    /// The nine sources:
+    /// - Plasma: 1-6 compute-baseline template, FrameStart, one 256x256 storage texture.
+    /// - SceneColorCopy: 2-1 Step A, downsamples offscreen SceneColor to 480x270 in AfterScene.
+    /// - DepthView: 2-2 Step A, linearizes SceneDepth into a grayscale image.
+    /// - VelocityView: 2-3 Step A, direction-and-magnitude visualization of SceneVelocity.
+    /// - NormalView: A0.2, world-normal (or roughness/metallic) view of SceneNormal.
+    /// - Sdf3DView fill/probe/slice: 1-8 acceptance, covering 3D read/write, R16Float, 4x4x4 and 64x1x1 workgroups
+    ///   and the >128B constant path.
+    /// - The DDGI debug slice is the ninth: it lives inside DdgiEffect, which is a real feature and stays registered
+    ///   at boot, so only ddgi.EnableDebugSlice is deferred here.
+    ///
+    /// A decline (no compute support, no source for this backend) is not an error: the thumbnail just stays blank,
+    /// the same shape the panel already showed before these effects existed.
+    /// </summary>
+    void RegisterDebugEffects()
+    {
+        var g = Season.Basic.Graphics.Instance;
+
+        debugPlasma = new PlasmaEffect();
+        if (!Season.Rendering.FrameSchedule.RegisterCompute(g, debugPlasma))
+            debugPlasma = null;
+
+        debugSceneColor = new SceneColorCopyEffect();
+        if (!Season.Rendering.FrameSchedule.RegisterCompute(g, debugSceneColor))
+            debugSceneColor = null;
+
+        debugDepthView = new DepthViewEffect();
+        if (!Season.Rendering.FrameSchedule.RegisterCompute(g, debugDepthView))
+            debugDepthView = null;
+
+        debugVelocityView = new VelocityViewEffect();
+        if (!Season.Rendering.FrameSchedule.RegisterCompute(g, debugVelocityView))
+            debugVelocityView = null;
+
+        debugNormalView = new NormalViewEffect();
+        if (!Season.Rendering.FrameSchedule.RegisterCompute(g, debugNormalView))
+            debugNormalView = null;
+
+        debugSdf3D = new Sdf3DViewEffect();
+        if (!Season.Rendering.FrameSchedule.RegisterCompute(g, debugSdf3D))
+            debugSdf3D = null;
+
+        ddgi?.EnableDebugSlice(g);
+    }
+
+    /// <summary>
+    /// Step 1 entry for the caller that is about to <em>name</em> these textures.
+    ///
+    /// Order matters and it is not the obvious one: a Sprite2D resolves its texture by name exactly once, inside
+    /// LoadSprite2D, when AddControl queues it. A name the backend dictionary does not know yet falls through to the
+    /// "decode it as a file" path, fails, and is never requeued - DrawSprite2D only ever does a dictionary lookup, so
+    /// that thumbnail stays blank for the rest of the process. Views is the only consumer of these nine textures and
+    /// it names all of them in its constructor, which means the kernels have to own their storage textures
+    /// <em>before</em> the panel is constructed. That is one frame earlier than calling this from SyncDebugEffects
+    /// would achieve, which is why the Setting callback calls this first instead of only flipping a field.
+    ///
+    /// Same frame boundary as <see cref="SyncDebugEffects"/>: the Setting callback runs inside Update, on the frame
+    /// loop thread, with no pass open and no command list mid-recording. Idempotent - debugEffectsActive is the
+    /// latch, so SyncDebugEffects sees no transition and returns.
+    /// </summary>
+    internal void EnsureDebugEffects()
+    {
+        if (debugEffectsActive)
+            return;
+
+        debugEffectsActive = true;
+
+        RegisterDebugEffects();
+    }
+
+    /// <summary>
+    /// Step 1 gate, called at the top of Update, which is the frame boundary the registry contract asks for
+    /// (frame-loop thread, no pass open, no command list mid-recording).
+    ///
+    /// The open direction normally never fires here: Setting calls <see cref="EnsureDebugEffects"/> before it
+    /// constructs Views, because the textures have to exist before the sprites name them (see that method). This
+    /// branch stays as the fallback for a Views created some other way, and it is what makes the pair symmetric.
+    ///
+    /// A transition is attempted once: a backend that declines the kernels is not retried every frame, it just keeps
+    /// blank thumbnails. Closing the panel unregisters through OnUnregistered, which disposes each kernel, while the
+    /// storage textures stay in the backend dictionary - CreateComputeTexture is idempotent on a name that already
+    /// has the right size - so reopening the panel rebinds the same textures and re-compiles only the kernels,
+    /// which the fxc source cache turns back into milliseconds.
+    ///
+    /// Note that today Mode has four values and Setting's removal branch is unreachable, so Views is built once per
+    /// process: this close path is the contract's other half rather than something a normal session reaches.
+    /// </summary>
+    void SyncDebugEffects()
+    {
+        bool wanted = views != null;
+
+        if (wanted == debugEffectsActive)
+            return;
+
+        debugEffectsActive = wanted;
+
+        if (wanted)
+        {
+            RegisterDebugEffects();
+            return;
+        }
+
+        if (debugPlasma != null) { Season.Rendering.FrameSchedule.UnregisterCompute(debugPlasma); debugPlasma = null; }
+        if (debugSceneColor != null) { Season.Rendering.FrameSchedule.UnregisterCompute(debugSceneColor); debugSceneColor = null; }
+        if (debugDepthView != null) { Season.Rendering.FrameSchedule.UnregisterCompute(debugDepthView); debugDepthView = null; }
+        if (debugVelocityView != null) { Season.Rendering.FrameSchedule.UnregisterCompute(debugVelocityView); debugVelocityView = null; }
+        if (debugNormalView != null) { Season.Rendering.FrameSchedule.UnregisterCompute(debugNormalView); debugNormalView = null; }
+        if (debugSdf3D != null) { Season.Rendering.FrameSchedule.UnregisterCompute(debugSdf3D); debugSdf3D = null; }
+
+        ddgi?.DisableDebugSlice();
     }
 
     /// <summary>
@@ -1399,6 +1470,10 @@ fogEffect = new Season.Rendering.Effects.VolumetricFogEffect();
 
     public override bool Update(float time, float? alpha = null, float? posX = null, float? posY = null, float? width = null, float? height = null, float? posZ = null, float? depth = null)
     {
+        // Step 1: the open direction is handled by Setting (EnsureDebugEffects, so the textures exist before Views
+        // names them); this is the frame boundary where the panel's removal would be noticed. See SyncDebugEffects.
+        SyncDebugEffects();
+
         // Per-pixel A/B forensic hooks (see AbCapture): when disabled, these two lines are a pass-through and a
         // static boolean check respectively. delta must be substituted before base.Update, otherwise Time has already
         // been advanced by one frame on wall-clock time. Contract 3-1's fixed timestep uses the same switch:

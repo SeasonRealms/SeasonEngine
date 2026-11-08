@@ -559,8 +559,7 @@ fragment float4 blit_fs_outline_composite(BlitVSOut vsOut [[stage_in]],
             att.DestinationAlphaBlendFactor = MTLBlendFactor.Zero;
         }
 
-        return Device.MtlDevice.CreateRenderPipelineState(psd, out Foundation.NSError? err)
-            ?? throw new Exception($"CreateRenderPipelineState [{label}] failed: {err?.LocalizedDescription ?? "(no NSError)"}");
+        return MTLPipelineFactory.CreateRender(psd);
     }
 
     static void EnsureInitialized()
@@ -602,8 +601,7 @@ fragment float4 blit_fs_outline_composite(BlitVSOut vsOut [[stage_in]],
             DepthCompareFunction = MTLCompareFunction.Always,
             DepthWriteEnabled = false,
         };
-        _depthState = Device.MtlDevice.CreateDepthStencilState(dsd)
-            ?? throw new Exception("CreateDepthStencilState [FinalBlit] failed");
+        _depthState = MTLPipelineFactory.CreateDepthState(dsd, "final-blit");
 
         var smp = new MTLSamplerDescriptor
         {
@@ -612,8 +610,7 @@ fragment float4 blit_fs_outline_composite(BlitVSOut vsOut [[stage_in]],
             SAddressMode = MTLSamplerAddressMode.ClampToEdge,
             TAddressMode = MTLSamplerAddressMode.ClampToEdge,
         };
-        _linearSampler = Device.MtlDevice.CreateSamplerState(smp)
-            ?? throw new Exception("CreateSamplerState [FinalBlit linear] failed");
+        _linearSampler = MTLPipelineFactory.CreateSampler(smp, "final-blit-linear");
 
         // Step D of 2-1:
         // FXAA neighborhood taps use point-clamp sampling,
@@ -625,8 +622,7 @@ fragment float4 blit_fs_outline_composite(BlitVSOut vsOut [[stage_in]],
             SAddressMode = MTLSamplerAddressMode.ClampToEdge,
             TAddressMode = MTLSamplerAddressMode.ClampToEdge,
         };
-        _pointSampler = Device.MtlDevice.CreateSamplerState(smpPoint)
-            ?? throw new Exception("CreateSamplerState [FinalBlit point] failed");
+        _pointSampler = MTLPipelineFactory.CreateSampler(smpPoint, "final-blit-point");
     }
 
     /// <summary>Pushes the 64-byte BlitParams block through buffer 0 with the same layout as VK push constants and DX
@@ -865,14 +861,12 @@ internal sealed class MTLFogCompositePipeline : FogCompositePipeline
             };
             desc.ColorAttachments[0].PixelFormat = MTLPixelFormat.RGBA16Float;
             desc.ColorAttachments[0].BlendingEnabled = false;
-            _pipeline = Device.MtlDevice.CreateRenderPipelineState(desc, out Foundation.NSError? error)
-                ?? throw new InvalidOperationException($"Fog composite PSO creation failed: {error?.LocalizedDescription}");
+            _pipeline = MTLPipelineFactory.CreateRender(desc);
             using var depth = new MTLDepthStencilDescriptor
             {
                 DepthCompareFunction = MTLCompareFunction.Always, DepthWriteEnabled = false,
             };
-            _depthState = Device.MtlDevice.CreateDepthStencilState(depth)
-                ?? throw new InvalidOperationException("Fog composite depth state creation failed.");
+            _depthState = MTLPipelineFactory.CreateDepthState(depth, "fog-composite");
         }
         catch { Dispose(); throw; }
         if (!_weather) Current = this;
@@ -1112,14 +1106,12 @@ fragment float4 PSMain(float4 position [[position]], texture2d<float> reflection
             color.DestinationRgbBlendFactor = MTLBlendFactor.One;
             color.SourceAlphaBlendFactor = MTLBlendFactor.One;
             color.DestinationAlphaBlendFactor = MTLBlendFactor.One;
-            _pipeline = Device.MtlDevice.CreateRenderPipelineState(desc, out Foundation.NSError? error)
-                ?? throw new InvalidOperationException($"SSR composite PSO creation failed: {error?.LocalizedDescription}");
+            _pipeline = MTLPipelineFactory.CreateRender(desc);
             using var depth = new MTLDepthStencilDescriptor
             {
                 DepthCompareFunction = MTLCompareFunction.Always, DepthWriteEnabled = false,
             };
-            _depthState = Device.MtlDevice.CreateDepthStencilState(depth)
-                ?? throw new InvalidOperationException("SSR composite depth state creation failed.");
+            _depthState = MTLPipelineFactory.CreateDepthState(depth, "ssr-composite");
         }
         catch { Dispose(); throw; }
     }

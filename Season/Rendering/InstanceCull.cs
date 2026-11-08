@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 // https://github.com/SeasonRealms/SeasonEngine
 
+using OcclusionPyramid = Season.Rendering.Effects.OcclusionPyramidEffect;
+
 namespace Season.Rendering;
 
 /// <summary>
@@ -227,6 +229,70 @@ public static class InstanceCull
     }
 
     /// <summary>
+    /// L2.2: whether the cull kernel consults the main view's depth pyramid before the plane test.
+    ///
+    /// What this is not: an occlusion cull. <see cref="OcclusionPyramid"/> stores the **nearest** depth of every
+    /// 2x2 block, the same min-reduce <see cref="Effects.HiZEffect"/> builds for screen-space reflections, and a
+    /// nearest-depth pyramid can only ever prove that something *is* visible -- "the sphere's farthest point is
+    /// still in front of this block's nearest surface, so at that block the sphere is not hidden". The other
+    /// direction does not follow: a block holding something nearer says nothing about whether that something
+    /// covers the sphere. Proving occlusion needs the *farthest* surface per block, which is a one-word change in
+    /// that chain's reduce and is deliberately left to its own step.
+    ///
+    /// So the kernel is written in the only direction the data supports: a confirmed sphere goes into the slot
+    /// with the six-plane test skipped, an unconfirmed one falls through to the plane test exactly as before. The
+    /// verdict is the plane test's either way -- a confirmed sphere was visible somewhere in the pyramid's frame,
+    /// and if it has since left the frustum the rasterizer clips it rather than drawing it differently -- which is
+    /// why turning this on must not change a single pixel. That equality is the acceptance criterion, and it is
+    /// also the point of shipping a test that cannot cull yet: the four backends' binding, parameter block,
+    /// projection and sampling get proven identical on a path whose result is observationally free, before the
+    /// reduce flips and the very same block starts removing instances. A drift between the four dialects can only
+    /// change how often the confirmation fires, never what the frame looks like.
+    ///
+    /// Off by default, because as written it is a cost rather than a saving: a texture fetch and four square roots
+    /// to replace six dot products, on the one slot that is as large as the screen. Set
+    /// SEASON_CULL_OCCLUSION=1 to arm it, and see <see cref="OcclusionSlots"/> for the slots it may act on.
+    /// </summary>
+    public static bool OcclusionCull { get; set; } = ReadOcclusionCull();
+
+    static bool ReadOcclusionCull()
+    {
+        var raw = Environment.GetEnvironmentVariable("SEASON_CULL_OCCLUSION")?.Trim();
+
+        return raw is "1" or "on" or "true" or "yes";
+    }
+
+    /// <summary>
+    /// L2.2: the slots the pyramid may confirm, which is the main view alone. <see cref="OcclusionPyramid"/> is
+    /// built from the main view's SceneDepth and from nothing else, so confirming a cascade against it would be
+    /// answering about a different camera; expressing that as a mask rather than as a boot-time decision keeps the
+    /// kernel free of a slot test and keeps the reason next to <see cref="TexelSlots"/>, where the same shape is
+    /// used for the same kind of reason.
+    /// </summary>
+    public static readonly uint OcclusionSlots = 1u << MainViewSlot;
+
+    /// <summary>
+    /// L2.2: level-0 texels of slack added on top of the block's own circumradius before a confirmation is allowed.
+    ///
+    /// It is not a safety margin. A confirmation can only *keep* an instance that the plane test might have dropped,
+    /// and an instance kept while outside the frustum is clipped, so the image is unaffected either way; what the
+    /// margin buys is how often the confirmation fires while the camera moves and the pyramid is one frame stale.
+    /// It is a number rather than a literal in the kernel so that it can be read next to the reasoning: one level-0
+    /// texel is two screen pixels, so 1 allows the block to sit two pixels inside the sphere's footprint.
+    /// </summary>
+    public const float OcclusionMargin = 1f;
+
+    /// <summary>
+    /// L2.2: the 1x1 texture bound to the cull kernel's t2 whenever no pyramid is available.
+    ///
+    /// It is never sampled: the parameter block's mask is zero on every frame that binds it, and the kernel gates
+    /// the whole pyramid block on that mask. It exists because the binding is static while the pyramid is optional,
+    /// and an unresolvable texture name makes the backend skip the dispatch -- which would lose every slot of the
+    /// frame rather than skip one test, exactly the silent-failure shape this file's other guards exist to avoid.
+    /// </summary>
+    public const string OcclusionFallbackTexture = "compute://instancecull/occlusion-none";
+
+    /// <summary>
     /// Slots whose reordered records get the original instance index written into M14 by gather: all of them.
     /// The main view needs it for motion vectors (t9/t10) and per-instance palettes; the shadow slots need it as soon as a skinned group draws
     /// from them, because its bone palette is laid out by that same index (the compacted slot, see the interface note) and a compacted SV_InstanceID would read another instance's pose.
@@ -313,6 +379,42 @@ public static class InstanceCull
     /// </summary>
     public static bool Enabled { get; internal set; }
 
+    /// <summary>
+    /// The operator's switch on the chain, as opposed to <see cref="Enabled"/>'s capability flag.
+    ///
+    /// They have to be two fields. <see cref="Enabled"/> is written by the effect and doubles as the "this backend has
+    /// kernels" signal every draw path consults, so forcing it false is also what a failed shader compile looks like --
+    /// a measurement taken that way would be measuring a different binary than the one that ships. This one only stops
+    /// <see cref="InstanceCullEffect"/> from recording anything, which is the same state as a frame whose slot mask came
+    /// out empty: every draw falls back to the direct whole-batch path, which is exactly the image the project had
+    /// before A7 existed.
+    ///
+    /// Default on. SEASON_CULL_OFF=1 turns the chain off, and the switch is read through
+    /// <see cref="Season.Basic.ProfileSwitch"/> rather than the environment directly so the Android and web hosts -- which
+    /// have no environment to set -- can push it like every other switch. Its only purpose is the on/off measurement that
+    /// turns the per-frame instance counts into "what culling was worth".
+    /// </summary>
+    public static bool ChainEnabled { get; set; } = !Season.Basic.ProfileSwitch.Flag("SEASON_CULL_OFF");
+
+    /// <summary>
+    /// L4.5: instance count below which a multi-stream group leaves the chain, 0 (the default) to keep every group in it.
+    ///
+    /// A per-primitive-stream group dispatches gather once per opaque primitive, and the number of primitives has nothing to do
+    /// with the number of instances. Measured on this scene: one InstancedModel has 10 primitives over 20 instances and another
+    /// has 5 over 10, so 15 of the frame's 39 gather dispatches materialize 30 records between them -- 1.5 records per
+    /// dispatch, against a dispatch cost that L4.3 measured at several microseconds regardless of payload. Those two groups
+    /// are 38% of the dispatches and 10% of the instances.
+    ///
+    /// Leaving the chain is not a new mode: the group simply stops being dispatched, its _cullDrawReady stays false, and the
+    /// draw side takes the direct whole-batch path -- the same fallback every admission miss already takes, on every backend.
+    /// The cost is that these instances are no longer culled, which for a group this small is what the CPU side already did
+    /// before A7 existed.
+    ///
+    /// Restricted to multi-stream groups on purpose. A single-stream group costs two dispatches per frame no matter how few
+    /// instances it has, so taking it out of the chain would trade two dispatches for a CPU cull path and gain nothing.
+    /// </summary>
+    public static readonly int MinCullInstances = (int)Season.Basic.ProfileSwitch.Number("SEASON_CULL_MIN_INSTANCES", 0);
+
     /// <summary>Cull targets registered for this frame. Added by each backend's group on creation and removed by reference on disposal.</summary>
     public static readonly List<IInstanceCullTarget> Targets = new();
 
@@ -348,6 +450,65 @@ public static class InstanceCull
     /// and only set by a dispatch that rewrote this one first.
     /// </summary>
     public static bool MainViewCulled { get; internal set; }
+
+    /// <summary>
+    /// L4.4: the denominator <see cref="CullSlice"/>'s kept= field should be read against, for the shadow slots.
+    ///
+    /// It is not the same number as the <c>instances=</c> field the token already carries. That one sums
+    /// <see cref="IInstanceCullTarget.CullInstanceCount"/> over the targets whose arg buffer passed the readback's own
+    /// validity check, i.e. over the targets that <em>could</em> have been culled; this one counts only the targets that
+    /// actually dispatched, and a target is skipped for reasons the arg buffer cannot show (a zero instance count, a
+    /// primitive table the kernel cannot take, a capacity smaller than this frame's instances). The difference is visible
+    /// in the counters: fixed dispatches average 25.35 per frame against 26 registered targets, so a capture that divides
+    /// kept= by instances= is dividing by a denominator up to one target too large.
+    ///
+    /// Written in the same frame as the dispatch, cleared on entry to Record with the other frame state.
+    /// </summary>
+    public static int ShadowCandidates { get; internal set; }
+
+    /// <summary>L4.4: the same denominator for <see cref="MainViewSlot"/>, i.e. the numerator in <c>kept</c>'s last position.</summary>
+    public static int MainCandidates { get; internal set; }
+
+    /// <summary>
+    /// L4.4: how many calls to <see cref="IInstanceCullTarget.PrepareCullDraw"/> returned true. The return value used to be
+    /// discarded, which made a group that failed admission indistinguishable in a capture from one that never asked: both
+    /// draw directly, both look correct, and only the count of main-view draws would differ for reasons a reader could not
+    /// attribute. Paired with <see cref="CullDrawFallback"/> so "admission never failed" and "admission was never tried"
+    /// stay distinguishable.
+    /// </summary>
+    public static long CullDrawReady;
+
+    /// <summary>L4.4: the same count for calls that returned false, i.e. groups that culled this frame and still drew the whole batch.</summary>
+    public static long CullDrawFallback;
+
+    /// <summary>
+    /// L2.2: the mask actually handed to the cull kernel as this frame's occlusion bit, zero when the pyramid was
+    /// not consulted. Diagnostics only, and it exists for the same reason as <see cref="MainViewCulled"/>: the
+    /// image is expected to be identical with the test armed and disarmed, so "the test ran at all" is not
+    /// observable from a screenshot and has to be published somewhere.
+    /// </summary>
+    public static uint OcclusionMask { get; internal set; }
+
+    /// <summary>
+    /// L2.3: whether <see cref="OcclusionPyramid"/>'s camera stamp matched this frame's camera closely enough to be
+    /// consulted. False deliberately covers three different situations - "measured and too stale", "could not be
+    /// measured", and "never reached the check" - because all three have the same consequence: the mask stays zero
+    /// and the kernel takes the plane test. <see cref="OcclusionGateTexels"/> is what tells them apart.
+    /// </summary>
+    public static bool OcclusionGateOpen { get; internal set; }
+
+    /// <summary>
+    /// L2.3: the worst screen displacement of the previous view's frustum corners, in level-0 texels, as measured by
+    /// <see cref="OcclusionPyramid.GateOpen"/>. NaN when no measurement was made.
+    ///
+    /// Diagnostics only, but load-bearing ones: with the pyramid unable to cull anything yet (see
+    /// <see cref="OcclusionCull"/>), the image is identical whether the gate is open or closed, so these two numbers
+    /// are the entire observable effect of L2.3 in a capture.
+    /// </summary>
+    public static float OcclusionGateTexels { get; internal set; }
+
+    /// <summary>L2.3: the worst NDC depth displacement of those corners; NaN when no measurement was made.</summary>
+    public static float OcclusionGateDepth { get; internal set; }
 
     /// <summary>
     /// Number of indirect-dispatch gathers within the process. For diagnostics; the two numbers together are the only evidence of "which path this A/B run actually took":
@@ -439,6 +600,132 @@ public static class InstanceCull
             $"targets {Targets.Count} (mv {mainViewTargets})  gather {igDelta}i/{fgDelta}f  mvdraws {mvDelta}  " +
             $"budget {string.Join(" ", targets)}" +
             (Targets.Count > StatsTargetLimit ? $" +{Targets.Count - StatsTargetLimit}" : string.Empty));
+    }
+
+    /// <summary>
+    /// L3.1: the cull chain's actual output, read back off the GPU once per capture. Empty until
+    /// <see cref="ReadCullSlice"/> runs, and a self-describing token either way so a sidecar never has to
+    /// distinguish "the diagnostic did not run" from "the line was truncated".
+    /// </summary>
+    public static string CullSlice { get; private set; } = "cullSlice=pending";
+
+    /// <summary>
+    /// L3.1: reads every group's indirect argument block back and sums what the GPU actually kept.
+    ///
+    /// <para><b>What this is for.</b> A7's whole result is one number per slot -- how many instances survived
+    /// the plane tests -- and until now that number existed only on the GPU. <see cref="ReportStats"/> says so
+    /// explicitly: pixels cannot recover it, because a frame that culled correctly and a frame that culled
+    /// nothing are identical by construction. So the only honest way to say what culling is worth is to read
+    /// the arg table, which is what this does.</para>
+    ///
+    /// <para><b>Which slice.</b> Primitive 0 of each slot, which is the row cull publishes the count into;
+    /// gather fans the same count out across the remaining primitives, so reading one row per slot is the
+    /// whole answer and reading sixteen would be the same number sixteen times.</para>
+    ///
+    /// <para><b>Why the denominators differ per slot.</b> Every registered group is tested against the shadow
+    /// slots, so those divide by the sum of every group's instance count. Only the groups that opted into
+    /// indirect main-view drawing are tested against <see cref="MainViewSlot"/>, so that row divides by their
+    /// sum alone -- dividing it by the full count would report a low "survival rate" that is really just "most
+    /// groups do not draw the main view this way".</para>
+    ///
+    /// <para>Called once, from the capture path, after the capture frame's GPU work has finished: the read
+    /// costs a pipeline drain by design (see IGraphics.TryReadStorageBuffers). Public because the capture
+    /// harness lives in the app assembly, which is not the one this class is compiled into.</para>
+    ///
+    /// <para><b>Which backends answer.</b> This is backend capability, not a missing case
+    /// (<see cref="Season.Basic.IGraphics.StorageBufferReadbackSupported"/>). D3D12, Vulkan and Metal implement
+    /// <see cref="Season.Basic.IGraphics.TryReadStorageBuffers"/>; only Web cannot, because WGPU's <c>mapAsync</c> is
+    /// asynchronous while this contract returns bytes. The two GPU-API siblings get there very differently. Vulkan copies on
+    /// the graphics queue rather than the transfer queue, because the buffers are <c>SharingMode.Exclusive</c> and Device
+    /// prefers a dedicated transfer family where one exists, which would turn every readback into a pair of queue-family
+    /// ownership transfers; it also needs the <c>TransferSrc</c> bit that every storage buffer now requests at creation.
+    /// Metal needs neither: it has no buffer usage bits and no queue-family ownership, so one blit encoder reads the
+    /// <c>StorageModePrivate</c> buffers straight into a Shared staging block, ordered by the driver's automatic hazard
+    /// tracking.</para>
+    ///
+    /// <para>Where this returns null the capture reports <c>cullSlice=unsupported</c>, and its effectiveness evidence is
+    /// <c>slotCand</c>, <c>fixedDispatches</c> and <c>mvHandoff</c>, all of which are CPU-side and run on every backend.
+    /// What stays unmeasured there is a silent case: binding wrong in a way that keeps every instance. Only Web is in that
+    /// position now. Vulkan's own acceptance path (<c>SEASON_PROBE_CULL_MASK</c> in <c>.dbg/_wsl_vk_shot/cullmask.sh</c>)
+    /// still asks the cheaper yes/no question rather than switching to a survival rate, but it no longer has to.</para>
+    /// </summary>
+    public static void ReadCullSlice()
+    {
+        var g = Graphics.Instance;
+        if (g == null || !g.StorageBufferReadbackSupported)
+        {
+            CullSlice = "cullSlice=unsupported";
+            return;
+        }
+
+        var targets = Targets;
+        var buffers = new List<StorageBuffer>(targets.Count);
+        long instances = 0;
+        long mainInstances = 0;
+
+        for (int i = 0; i < targets.Count; i++)
+        {
+            var target = targets[i];
+            // Only groups that were actually dispatched this frame have this frame's counts in their block.
+            // A zero-count group is not drawn at all, and one asking for more than its capacity was skipped
+            // by DispatchTarget before the kernel ran; either way its block still holds an older frame's
+            // numbers, and folding those in would quietly inflate the denominator.
+            if (target.CullInstanceCount <= 0 || target.CullInstanceCount > target.CullCapacity) continue;
+            var args = target.CullArgs;
+            if (args == null || args.SizeInBytes < ArgsTotalBytes) continue;
+
+            buffers.Add(args);
+            instances += target.CullInstanceCount;
+            // Gated on the frame-level flag as well: when the main view was not prepared, no target received
+            // the main-view bit no matter what it asked for, and counting those groups would report them as
+            // culled by a slot that was never invoked.
+            if (target.CullMainView && MainViewCulled) mainInstances += target.CullInstanceCount;
+        }
+
+        if (buffers.Count == 0)
+        {
+            CullSlice = "cullSlice=empty";
+            return;
+        }
+
+        var data = g.TryReadStorageBuffers(buffers);
+        if (data == null)
+        {
+            CullSlice = "cullSlice=null";
+            return;
+        }
+
+        var perSlot = new long[MaxSlots];
+        for (int i = 0; i < data.Length && i < buffers.Count; i++)
+        {
+            var block = data[i];
+            if (block == null || block.Length < ArgsBytes) continue;
+            for (int slot = 0; slot < MaxSlots; slot++)
+                perSlot[slot] += BitConverter.ToUInt32(block, (int)ArgsOffset(slot, 0) + 4);
+        }
+
+        var log = new StringBuilder("cullSlice=(groups=").Append(buffers.Count)
+            .Append(",instances=").Append(instances)
+            .Append(",main=").Append(perSlot[MainViewSlot]).Append('/').Append(mainInstances)
+            // Every slot in one field, position = slot number (0..2 sun cascades, 3 spot, 4 far map, 5 main
+            // view). The shadow rows share the denominator above, since every group is tested against them; the
+            // main row's own denominator is the pair in main=. A missing cascade would leave a reader unable to
+            // tell "the big cascades cull most" from "the chain only ever helped cascade 0".
+            .Append(",kept=");
+        for (int slot = 0; slot < MaxSlots; slot++)
+        {
+            if (slot > 0) log.Append('/');
+            log.Append(perSlot[slot]);
+        }
+
+        // Percent with one decimal, invariant: the sidecar is a space-separated key=value line, and a culture
+        // that writes "64,1" would split the field in two.
+        log.Append(",mainPct=").Append(mainInstances > 0
+                ? (100.0 * perSlot[MainViewSlot] / mainInstances).ToString("0.0", CultureInfo.InvariantCulture)
+                : "na")
+            .Append(')');
+
+        CullSlice = log.ToString();
     }
 
     /// <summary>Byte offset of the (slot, primitive) entry in the indirect arg table.</summary>
@@ -564,7 +851,14 @@ public static class InstanceCull
 /// </summary>
 public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
 {
-    public override string Name => "instanceCull";
+    /// <summary>
+    /// Contract 3-1 names a compute interval by <see cref="ComputeEffect.Name"/>, and a capture reads the measured
+    /// milliseconds back by that same string. It is a constant so the two cannot drift: a renamed literal would turn the
+    /// capture's cull column into "no samples", which reads exactly like a backend that has no timestamps.
+    /// </summary>
+    public const string EffectName = "instanceCull";
+
+    public override string Name => EffectName;
 
     public override ComputePhase Phase => ComputePhase.FrameStart;
 
@@ -589,14 +883,23 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
     readonly Vector4[] _slotMatrices = new Vector4[InstanceCull.MaxSlots * 4];
     readonly uint[] _gatherParams = new uint[8];
     readonly uint[] _finalizeParams = new uint[4];
-    readonly float[] _cullParams = new float[16];
-    readonly ComputeResourceRef[] _cullRefs = new ComputeResourceRef[4];
+    // 64 bytes up to L1.2, plus the four L2.2 words: occlusionSlots / occlusionWidth / occlusionHeight / occlusionMargin.
+    readonly float[] _cullParams = new float[20];
+    readonly ComputeResourceRef[] _cullRefs = new ComputeResourceRef[5];
     readonly ComputeResourceRef[] _finalizeRefs = new ComputeResourceRef[2];
     readonly ComputeResourceRef[] _gatherRefs = new ComputeResourceRef[4];
 
     IGraphics? _graphics;
     ComputeKernel? _cull, _finalize, _gather;
     StorageBuffer? _slotBuffer;
+
+    // L2.2: this frame's pyramid decision, resolved once in Record and then read by every target's dispatch. The
+    // same four values must travel together -- a non-zero mask names a texture, and a zero mask must never name
+    // the live pyramid -- so they are set and cleared as a set rather than recomputed per target.
+    uint _occlusionSlots;
+    uint _occlusionWidth;
+    uint _occlusionHeight;
+    string _occlusionTexture = InstanceCull.OcclusionFallbackTexture;
 
     /// <summary>
     /// The 12-byte dispatch arg block, written by the finalize kernel and read by gather.
@@ -623,6 +926,12 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
             if (_cull == null || _finalize == null || _gather == null) { Dispose(); return false; }
             _slotBuffer = g.CreateStorageBuffer(InstanceCull.SlotMatrixBytes);
             if (_slotBuffer == null || _slotBuffer.SizeInBytes < InstanceCull.SlotMatrixBytes) { Dispose(); return false; }
+
+            // L2.2: the cull kernel's t2 is a static binding while the pyramid it samples is optional, so something
+            // always has to resolve there. Creating it inside this try is deliberate: a failure throws out and drops
+            // all of A7 to CPU culling, which is the safe outcome, whereas a binding that resolves to nothing makes
+            // the backend skip the dispatch and lose every slot of the frame.
+            g.CreateComputeTexture(InstanceCull.OcclusionFallbackTexture, 1, 1, ComputeStorageFormat.R16Float);
 
             // The dispatch arg block is created whenever the backend supports it, independent of the switch: the switch is "which path this frame wants to take", the buffer is "which path can be taken".
             // Decoupling the two lets the A/B switch frame by frame within the same process without a restart -- exactly what pixel-for-pixel comparison needs.
@@ -657,6 +966,23 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         // Cleared before every early return below: an early return happens on a frame where this effect wrote nothing at all, and a stale
         // mask would then tell the draw side to read rows that still hold the previous frame's counts.
         InstanceCull.ShadowSlotMask = 0;
+        // L4.4: the denominators are frame state exactly like the mask above, and for the same reason -- a frame that
+        // dispatches nothing must not report the previous frame's candidate counts.
+        InstanceCull.ShadowCandidates = 0;
+        InstanceCull.MainCandidates = 0;
+        // L2.2: cleared with it and for the same reason. A frame that dispatches nothing must not leave the previous
+        // frame's pyramid decision standing, and the invariant that a zero mask never names the live pyramid is what
+        // lets the fallback stand-in be a texture nobody ever reads.
+        _occlusionSlots = 0u;
+        _occlusionWidth = 0u;
+        _occlusionHeight = 0u;
+        _occlusionTexture = InstanceCull.OcclusionFallbackTexture;
+        InstanceCull.OcclusionMask = 0u;
+        // L2.3: NaN, not zero. A frame that never reached the gate has not measured a displacement, and printing
+        // "0 texels" would claim it had.
+        InstanceCull.OcclusionGateOpen = false;
+        InstanceCull.OcclusionGateTexels = float.NaN;
+        InstanceCull.OcclusionGateDepth = float.NaN;
 
         if (!ReferenceEquals(g, _graphics) || _cull == null || _finalize == null
             || _gather == null || _slotBuffer == null) return;
@@ -665,6 +991,20 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         // Reports the previous frame's draw and gather counters; see the method for why this is the only evidence that the indirect
         // paths ran rather than silently falling back to the direct ones.
         InstanceCull.ReportStats();
+
+        // Kill switch, placed after ReportStats rather than at the top of Record: the counters that method diffs are incremented
+        // while the frame draws, so leaving it running is what makes a capture show "gather 0i/0f" for an off run instead of a
+        // number frozen at the moment the switch was flipped.
+        //
+        // Returning here is deliberately the same shape as any other early return: the mask was cleared a few lines up, so the
+        // draw side reads "no slot is readable" and takes the direct whole-batch path. MainViewCulled is cleared with it because
+        // it is the other half of the same handshake -- leaving the previous frame's true would tell a group that opted into
+        // indirect main-view drawing to read a segment this frame never wrote.
+        if (!InstanceCull.ChainEnabled)
+        {
+            InstanceCull.MainViewCulled = false;
+            return;
+        }
 
         // The slot mask is determined here rather than letting the kernel guess from an "invalid matrix": inactive slots simply do not participate,
         // their arg table keeps the InstanceCount=0 written by reset, and the draw side then naturally draws nothing.
@@ -727,6 +1067,44 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         int slotMask = shadowMask | (mainView ? mainBit : 0);
         if (slotMask == 0) return;
 
+        // L2.2: arm the pyramid. Every condition is CPU-side and this phase is where they can be read: Ready is the
+        // previous frame's AfterOpaque result, which is exactly the depth the test describes, and Level0Width/Height
+        // are zero until the first Allocate, which also covers "the effect was never registered". The mask keeps its
+        // slot restriction even here, so the kernel still receives a decision rather than a convention.
+        //
+        // L2.3 adds one more condition inside, and it is the one this whole phase exists for: the pyramid was built
+        // by a camera, and if that camera is no longer the one being tested against, its depths describe a picture
+        // that is not on screen. Arming a stale pyramid is the failure mode that shows up as holes during a fast
+        // drag, and refusing the whole frame's pyramid is cheaper than qualifying it per instance.
+        if (InstanceCull.OcclusionCull && OcclusionPyramid.Ready)
+        {
+            uint slots = InstanceCull.OcclusionSlots & (uint)slotMask;
+            // `view` is non-null and prepared whenever `slots` is non-zero: the mask only ever carries the main-view
+            // bit, and that bit is only set when this same view passed the `Prepared` test above. Written as a
+            // pattern so the compiler sees it too, rather than asserted.
+            if (slots != 0u && view is { Prepared: true } && OcclusionPyramid.Level0Width > 0u && OcclusionPyramid.Level0Height > 0u)
+            {
+                // L2.3: evaluated even when the answer will be "ignore the pyramid", because these two numbers are
+                // the only place a capture can see how stale the pyramid actually was. Nothing else in the frame
+                // depends on them, and a stale frame that skipped the measurement would be indistinguishable from
+                // a fresh one in the sidecar.
+                bool fresh = OcclusionPyramid.GateOpen(view.ViewProjection,
+                    out float gateTexels, out float gateDepth);
+                InstanceCull.OcclusionGateTexels = gateTexels;
+                InstanceCull.OcclusionGateDepth = gateDepth;
+                InstanceCull.OcclusionGateOpen = fresh;
+
+                if (fresh)
+                {
+                    _occlusionSlots = slots;
+                    _occlusionWidth = OcclusionPyramid.Level0Width;
+                    _occlusionHeight = OcclusionPyramid.Level0Height;
+                    _occlusionTexture = OcclusionPyramid.CurrentName(0);
+                    InstanceCull.OcclusionMask = slots;
+                }
+            }
+        }
+
         // Clear inactive slots: the matrix buffer is reused across frames; a leftover matrix from the previous frame, if read, would make some slot draw ghost instances.
         for (int slot = 0; slot < InstanceCull.MaxSlots; slot++)
             if ((slotMask & (1 << slot)) == 0) Array.Clear(_slotMatrices, slot * 4, 4);
@@ -739,7 +1117,12 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         {
             var target = InstanceCull.Targets[i];
             int mask = shadowMask | (mainView && target.CullMainView ? mainBit : 0);
-            if (mask != 0) DispatchTarget(g, target, mask);
+            if (mask == 0) continue;
+            // Only targets that actually dispatched count towards a denominator: a target skipped inside is one the
+            // arg-buffer readback still sees, and dividing kept= by that larger set would understate the cull rate.
+            if (!DispatchTarget(g, target, mask)) continue;
+            if (shadowMask != 0) InstanceCull.ShadowCandidates += target.CullInstanceCount;
+            if ((mask & mainBit) != 0) InstanceCull.MainCandidates += target.CullInstanceCount;
         }
     }
 
@@ -752,40 +1135,50 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         _slotMatrices[o + 3] = new Vector4(vp.M41, vp.M42, vp.M43, vp.M44);
     }
 
-    void DispatchTarget(IGraphics g, IInstanceCullTarget target, int slotMask)
+    /// <summary>
+    /// Runs this target's dispatches and reports whether it ran them. The bool is not a corner case: it separates "this
+    /// group was culled" from "this group was asked to cull and could not", and only the first one is evidence that the
+    /// draw's indirect path covers it.
+    /// </summary>
+    bool DispatchTarget(IGraphics g, IInstanceCullTarget target, int slotMask)
     {
         int count = target.CullInstanceCount;
-        if (count <= 0) return;
+        if (count <= 0) return false;
 
         // The upload is placed before reading CullPrimitiveCount, not after the capacity check:
         // on the Web backend that property publishes the count of "arg table uploaded"; if it is read before the upload, on the first run it is still -1,
         // the check exits early on the spot, and the upload therefore never has a chance to happen -- an ordering that deadlocks itself.
-        if (!target.PrepareCullInputs()) return;
+        if (!target.PrepareCullInputs()) return false;
 
         int capacity = target.CullCapacity;
         int primitives = target.CullPrimitiveCount;
-        if (capacity < count || primitives <= 0 || primitives > InstanceCull.MaxPrimitives) return;
+        if (capacity < count || primitives <= 0 || primitives > InstanceCull.MaxPrimitives) return false;
 
         var source = target.CullSourceWorlds;
         var args = target.CullArgs;
         var visible = target.CullVisible;
         int streams = target.CullStreamCount;
-        if (source == null || args == null || visible == null || streams <= 0) return;
+        if (source == null || args == null || visible == null || streams <= 0) return false;
+
+        // L4.5: too few instances spread over too many streams -- the dispatch count is set by the primitive count, so each
+        // dispatch here materializes a handful of records. Bounded below 1 so a threshold of 1 never matches and the switch
+        // is inert until someone sets it.
+        if (streams > 1 && count < InstanceCull.MinCullInstances && InstanceCull.MinCullInstances > 1) return false;
 
         // The capacity checks live in the shared layer so the four backends do not each repeat them: args is fixed-size, and visible and the reordered stream must hold the full capacity.
         // source only needs to hold this frame's instances -- it is uploaded by instance count, with no spare room reserved.
-        if (args.SizeInBytes < InstanceCull.ArgsTotalBytes) return;
-        if (visible.SizeInBytes < (uint)(InstanceCull.MaxSlots * capacity) * 4u) return;
-        if (source.SizeInBytes < (uint)count * InstanceCull.WorldStride) return;
+        if (args.SizeInBytes < InstanceCull.ArgsTotalBytes) return false;
+        if (visible.SizeInBytes < (uint)(InstanceCull.MaxSlots * capacity) * 4u) return false;
+        if (source.SizeInBytes < (uint)count * InstanceCull.WorldStride) return false;
         // Every stream is checked before anything is dispatched: a stream found short after the cull already ran would leave the args
         // saying "N visible" over a reordered segment that was never written, and the draw side would read last frame's records.
         for (int s = 0; s < streams; s++)
         {
             var streamSource = target.CullStreamSource(s);
             var streamSorted = target.CullStreamSorted(s);
-            if (streamSource == null || streamSorted == null) return;
-            if (streamSource.SizeInBytes < (uint)count * InstanceCull.WorldStride) return;
-            if (streamSorted.SizeInBytes < InstanceCull.SortedBytes(capacity)) return;
+            if (streamSource == null || streamSorted == null) return false;
+            if (streamSource.SizeInBytes < (uint)count * InstanceCull.WorldStride) return false;
+            if (streamSorted.SizeInBytes < InstanceCull.SortedBytes(capacity)) return false;
         }
 
         // 1) cull: one thread per instance, testing the sphere against the six clipping planes for each slot.
@@ -826,11 +1219,21 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         // The mask, not the threshold, is what keeps the spot slot and the main view out of the test: their projections are
         // perspective, so a "diameter in texels" computed from the matrix alone would describe the near plane instead.
         _cullParams[15] = BitConverter.UInt32BitsToSingle(InstanceCull.TexelSlots);
+        // L2.2: the pyramid, armed only for the slots this target's mask allows -- a group that kept the direct path never
+        // consults it, even on a frame whose main view was culled. The size is sent only alongside a live mask: it is what
+        // the kernel uses to turn a UV into a level-0 texel, and a zero there would divide the texture away.
+        uint occlusion = _occlusionSlots & (uint)slotMask;
+        _cullParams[16] = BitConverter.UInt32BitsToSingle(occlusion);
+        _cullParams[17] = BitConverter.UInt32BitsToSingle(occlusion != 0u ? _occlusionWidth : 0u);
+        _cullParams[18] = BitConverter.UInt32BitsToSingle(occlusion != 0u ? _occlusionHeight : 0u);
+        _cullParams[19] = InstanceCull.OcclusionMargin;
 
         _cullRefs[0] = _slotBuffer!;
         _cullRefs[1] = source;
-        _cullRefs[2] = args;
-        _cullRefs[3] = visible;
+        // L2.2: the stand-in is bound exactly when the mask is zero, so its contents are never read.
+        _cullRefs[2] = occlusion != 0u ? _occlusionTexture : InstanceCull.OcclusionFallbackTexture;
+        _cullRefs[3] = args;
+        _cullRefs[4] = visible;
         g.DispatchCompute(new ComputeDispatchArgs
         {
             Kernel = _cull!,
@@ -914,7 +1317,11 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         }
 
         // The handoff goes here rather than at draw time: draw happens inside the shadow Pass, and resource states cannot be switched inside a Pass.
-        target.PrepareCullDraw();
+        // Its result used to be dropped. Keeping it is what lets a capture say whether a culling group got to draw its
+        // segment or fell back to the whole batch -- both produce the same image, so nothing else could tell them apart.
+        if (target.PrepareCullDraw()) InstanceCull.CullDrawReady++;
+        else InstanceCull.CullDrawFallback++;
+        return true;
     }
 
     public override void OnUnregistered() => Dispose();
@@ -936,14 +1343,15 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
     }
 
     // ── Kernel declarations ──
-    // cull:     [0] Params 64B / [1] StorageBufferRead slotMatrices -> t0 / [2] StorageBufferRead source -> t1
-    //           [3] StorageBufferReadWrite args -> u0 / [4] StorageBufferReadWrite visible -> u1
+    // cull:     [0] Params 80B / [1] StorageBufferRead slotMatrices -> t0 / [2] StorageBufferRead source -> t1
+    //           [3] SampledTexture occlusionPyramid -> t2 + s0 (L2.2)
+    //           [4] StorageBufferReadWrite args -> u0 / [5] StorageBufferReadWrite visible -> u1
     // finalize: [0] Params 16B / [1] StorageBufferRead args -> t0 / [2] StorageBufferReadWrite dispatch -> u0
     // gather:   [0] Params 32B / [1] StorageBufferRead visible -> t0 / [2] StorageBufferRead source -> t1
     //           [3] StorageBufferReadWrite sorted -> u0 / [4] StorageBufferReadWrite args -> u1
     // The old reset kernel is gone: its frame-invariant output is uploaded from InstanceCull.BuildArgsTemplate when the primitive
     // set changes, and the per-slot counter it used to clear is now cleared by gather at the end of every run.
-    // 64B is far below the 128B cross-backend limit of Vulkan push constants and WebGPU uniforms.
+    // 80B is still below the 128B cross-backend limit of Vulkan push constants and WebGPU uniforms.
 
     static ComputeKernelDesc CreateCullKernel() => new()
     {
@@ -954,9 +1362,14 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         },
         Bindings = new[]
         {
-            new ComputeBindingDesc { Type = ComputeBindingType.Params, SizeInBytes = 64 },
+            new ComputeBindingDesc { Type = ComputeBindingType.Params, SizeInBytes = 80 },
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferRead },
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferRead },
+            // L2.2: the pyramid as a sampled texture, not a storage one. The kernel only reads it, and this is the only
+            // binding the four dialects declare differently -- t2 + s0 on D3D12, binding 3 on Vulkan, texture(0) +
+            // sampler(0) on Metal, binding 3 with the engine's sampler at 15 on WebGPU -- so it is worth naming here
+            // that the position of this entry is the whole contract between them.
+            new ComputeBindingDesc { Type = ComputeBindingType.SampledTexture },
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferReadWrite },
             new ComputeBindingDesc { Type = ComputeBindingType.StorageBufferReadWrite },
         },

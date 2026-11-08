@@ -13,6 +13,10 @@ public static class MacCatalystApp
 {
     public static void Run(BaseApp app)
     {
+        // Contract 3-2: the first line of engine code after the process entry point. Everything before it is reported as
+        // the process-start bridge; everything after it is a real interval.
+        StartupProfiler.Mark("app-run");
+
         // Global exception capture as the last line of defense for async void callbacks,
         // thread-pool work, and managed exceptions escaping across the native boundary.
         // Mirrors LinuxApp.Run. Without these handlers such failures abort the process

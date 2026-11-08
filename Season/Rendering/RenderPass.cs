@@ -552,8 +552,15 @@ public static class FrameSchedule
         in Matrix4x4 projection, in Matrix4x4 unjitteredViewProjection)
         => Frame.Capture(lights, view, projection, unjitteredViewProjection);
 
-    static void BeginSceneFrame(BaseApp app)
+    static void BeginSceneFrame(IGraphics g, BaseApp app)
     {
+        // Step 2: the one point per frame where a backend may finish kernels that were registered since the previous
+        // boundary. It sits above every phase on purpose - App.Create registers the whole effect stack before the first
+        // frame exists, so this is the first moment the batch is complete and the last moment before RecordPhase could
+        // dispatch one of them. Every platform reaches a frame through ExecuteFrame, so the call site is shared even
+        // though only the D3D12 backend currently defers any work to it.
+        g.FlushPendingCompute();
+
         // Per-view state is reset by ViewTargets.BeginFrame inside ExecuteView; here the frame-level state is reset:
         // every view's snapshot expires, then the main view's capture (made at the camera update point, before the
         // frame) is promoted. A secondary view promotes its own capture inside ExecuteView, after PrepareView.
@@ -799,7 +806,10 @@ public static class FrameSchedule
     /// <summary>
     /// Register a compute effect: return false when the backend does not support it or Initialize fails
     /// (missing shader sources / compilation failure on this backend), leaving zero leftovers and no entry in the table; on success it Records automatically every frame according to its phase.
-    /// Must be called after backend graphics are ready and before the frame loop starts.
+    /// Must be called on the frame-loop thread at a frame boundary: after the backend graphics are ready, with no
+    /// pass open and no command list mid-recording. Boot-time registration (App.Create) and on-demand registration
+    /// from a frame hook (App.Update) both land on that boundary, which is why an effect that only serves a
+    /// runtime-opened panel - the Views debug thumbnails - can be registered and unregistered while the app runs.
     /// </summary>
     public static bool RegisterCompute(IGraphics g, ComputeEffect effect)
     {
@@ -1091,7 +1101,7 @@ public static class FrameSchedule
 
     static void ExecuteFrame(IGraphics g, BaseApp app, in Vector4 clearColor)
     {
-        BeginSceneFrame(app);
+        BeginSceneFrame(g, app);
         Frame.AdvanceFrame();
 
         // Contract 1-9: every platform reaches a frame through this one method, so it is where the shared statistics are

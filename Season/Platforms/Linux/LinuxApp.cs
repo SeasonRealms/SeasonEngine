@@ -109,6 +109,10 @@ public static class LinuxApp
 
         try
         {
+        // Contract 3-2: the first line of engine code after the process entry point. Everything before it is reported as
+        // the process-start bridge; everything after it is a real interval.
+        StartupProfiler.Mark("app-run");
+
         _keyboard = new LinuxKeyboardService();
 
         DeviceServices.Initialize(
@@ -195,6 +199,10 @@ public static class LinuxApp
 
         InitializeVulkan(window, pixelW, pixelH);
 
+        // Contract 3-2: everything before this point is the blocking half of startup; from here the frame loop runs and
+        // the asynchronous load queue is what the report waits on.
+        StartupProfiler.Mark("frame-loop-begin");
+
         RunLoop(window);
         }
         catch (Exception ex)
@@ -223,6 +231,10 @@ public static class LinuxApp
     /// </summary>
     static unsafe void InitializeVulkan(IntPtr window, int width, int height)
     {
+        // Contract 3-2: initialization starts here. The gap from app-run to this point is window creation and the window
+        // manager's size confirmation, which is the part of the black screen no engine scope covers.
+        StartupProfiler.Mark("engine-init-begin");
+
         // Immediate-2D compatibility mode (Season.Rendering.Immediate2DMode):
         // the app renders exclusively through the immediate 2D backend, so everything the 3D path
         // would need is skipped below - no PSO bake, no offscreen targets, no effect registration,
@@ -319,6 +331,9 @@ public static class LinuxApp
         }
 
         // 2) Bootstrap the Vulkan Instance, Surface, Device, and queues.
+        // Contract 3-2: every stage below is a wall-clock interval on the thread that runs initialization, and the
+        // scopes also give the report its nesting - the shader/pso rows land inside the stage that caused them.
+        using (StartupProfiler.Scope("Device.Init"))
         VkDevice.Init(
             window: window,
             debug: true,
@@ -334,16 +349,18 @@ public static class LinuxApp
             });
 
         // 3) Create the SwapChain and upper-layer resource manager.
-        VkDevice.CreateSwapChain(width, height);
+        using (StartupProfiler.Scope("CreateSwapChain")) VkDevice.CreateSwapChain(width, height);
 
         // 4) Display (Depth + RenderPass + Framebuffers)
-        VkDevice.CreateDescriptorHeapsAndViews();
+        using (StartupProfiler.Scope("DescriptorHeaps")) VkDevice.CreateDescriptorHeapsAndViews();
 
         // 5) Initialize the three Pipeline variants, which depend on the RenderPass.
         // Skipped in immediate-2D mode: the main PSO family is never compiled, which is where the
         // startup bake cost would otherwise go.
         if (!immediate2D)
-            VkPipeline.Init(VkDevice.Display.RenderPass);
+        {
+            using (StartupProfiler.Scope("Pipeline.Init")) VkPipeline.Init(VkDevice.Display.RenderPass);
+        }
 
         // 6) Initialize the globally shared lighting UBO.
         // Pbr3D and SpriteQuad b1 both read from it,
@@ -351,17 +368,23 @@ public static class LinuxApp
         // Skipped in immediate-2D mode: no 3D pass consumes it, and the matching per-frame
         // VKPrimitiveGroup.Update in the render loop is skipped as well.
         if (!immediate2D)
-            VKPrimitiveGroup.InitLights();
+        {
+            using (StartupProfiler.Scope("InitLights")) VKPrimitiveGroup.InitLights();
+        }
 
         // 7) Set up the 2D orthographic camera.
-        VKSprite2D.Init();
+        using (StartupProfiler.Scope("Sprite2D.Init")) VKSprite2D.Init();
 
         // 8) Create per-frame CommandPool, buffers, semaphores, and the white placeholder texture.
-        VkDevice.CreateGraphicsCommandLists();
+        using (StartupProfiler.Scope("CommandLists")) VkDevice.CreateGraphicsCommandLists();
 
         // 9) Inject the IGraphics implementation so BaseApp can run unchanged.
         Season.Basic.Graphics.Instance = new Season.Platforms.Shared.LinuxAndroid.Graphics();
         _graphicsReady = true;
+
+        // Contract 3-2: the target block below is one stage on purpose - the individual creations are a few hundred
+        // microseconds each, and what a startup report has to answer is "how much of the black screen was targets".
+        var renderTargets = StartupProfiler.Scope("RenderTargets");
 
         // 10) Offscreen SceneColor for step 2:
         // when not null, FrameSchedule automatically appends FinalBlit to present on screen,
@@ -560,6 +583,8 @@ public static class LinuxApp
             });
         }
 
+        renderTargets.Dispose();
+
         // One-shot tier report: the desktop-class defaults (HDR + TAA tier + GTAO + shadows + bloom)
         // are what the frame would pay for, so this line is what a terminal session needs to tell
         // which pipeline the frame actually pays for, and whether the validation layer activated.
@@ -570,7 +595,9 @@ public static class LinuxApp
         if (immediate2D)
             Diag("[RenderQuality] immediate-2D mode: the main PSO family was not compiled and no offscreen target, shadow map or post effect exists this session; every frame renders only the Overlay pass directly into the backbuffer");
 
-        DeviceServices.BaseApp.Create();
+        // Contract 3-2: the app's own construction - UI tree, scene panels, effect registration, and the RequestLoad calls
+        // that fill the queue below. It runs synchronously inside this call, so its duration is main-thread blocking time.
+        using (StartupProfiler.Scope("BaseApp.Create")) DeviceServices.BaseApp.Create();
     }
 
     /// <summary>

@@ -37,6 +37,10 @@ public sealed partial class ClothSimulationEffect
         WorkgroupX = GroupSize,
         WorkgroupY = 1,
         WorkgroupZ = 1,
+        // Step 5: cloth is the second Deferred feature. Its Record() already refuses to hand a surface over while the
+        // dispatch is false (the streams keep their static vertices), so a flag nobody has written yet never reaches a
+        // vertex buffer - the same path a failed dispatch has always taken.
+        Deferred = true,
     };
 
     const string HlslSource = @"

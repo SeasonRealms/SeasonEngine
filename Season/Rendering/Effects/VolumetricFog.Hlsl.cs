@@ -276,7 +276,10 @@ float LocalFaceVisibility(float3 p,uint matrixRow,int2 origin,float4 meta) {
 }
 float FogLocalShadow(float3 p,int light) {
     float result=1;
-    [unroll] for(int slotIndex=0;slotIndex<2;slotIndex++) {
+    // Two slots, read as a loop rather than unrolled. The body carries the whole LocalFaceVisibility chain - sixteen
+    // taps, a seam blend and two more face reads - and having it inline twice is most of this kernel's code size. The
+    // loop body is identical either way, so every froxel gets exactly the value it got before; only the code is shared.
+    [loop] for(int slotIndex=0;slotIndex<2;slotIndex++) {
         uint row=456+slotIndex*25; float4 meta=F(row+24);
         if(light==int(meta.x)) {
             float3 d=p-F(35+light*4).xyz, ad=abs(d);
@@ -337,10 +340,24 @@ float Visibility(float3 p,float depth,int light) {
 // Two-point Gauss-Legendre over the span. The default is the old centre sample, so a slice thinner than half a metre
 // (everything the near field produces) is bit-identical to the previous behaviour.
 float SliceVisibility(float3 ray,float depth,float z0,float span,int light) {
-    float result=Visibility(F(8).xyz+ray*depth,depth,light);
-    if(light==int(F(34).z) && span>=0.5) {
-        float a=z0+span*0.21132487,b=z0+span*0.78867513;
-        result=0.5*(Visibility(F(8).xyz+ray*a,a,light)+Visibility(F(8).xyz+ray*b,b,light));
+    // One exit, both branches writing the same variable. With an early return ahead of the loop, fxc reports X4000
+    // (potentially uninitialised) on this function, and this file compiles with warnings as errors - the loop alone
+    // triggers it, not the [loop] attribute, so the shape is what has to change.
+    float result=0;
+    if(light!=int(F(34).z) || span<0.5) {
+        // When the resample runs below, it overwrites the centre value anyway, so not computing it here saves one
+        // full evaluation of the shadow chain per froxel.
+        result=Visibility(F(8).xyz+ray*depth,depth,light);
+    } else {
+        // Both Gauss points as one loop body. Written as two calls, fxc inlines the entire shadow chain twice and
+        // that duplication is what dominated this kernel's compile; the arithmetic is untouched - same weights, same
+        // order - so every froxel gets exactly the value it got before.
+        float sum=0;
+        [loop] for(int gaussIndex=0;gaussIndex<2;gaussIndex++) {
+            float gaussT=gaussIndex==0?z0+span*0.21132487:z0+span*0.78867513;
+            sum+=Visibility(F(8).xyz+ray*gaussT,gaussT,light);
+        }
+        result=0.5*sum;
     }
     return result;
 }

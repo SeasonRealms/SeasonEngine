@@ -438,6 +438,12 @@ internal class SettingPanel : BoardPanel
                             {
                                 if (App.Instance.views == null)
                                 {
+                                    // Textures before names, and this order is load-bearing: Views' Sprite2Ds resolve
+                                    // their textures once, when AddControl queues them, and a name the backend does not
+                                    // know yet is decoded as a file, fails, and is never retried. Registering the debug
+                                    // kernels first is what makes those nine thumbnails resolve at all; doing it from
+                                    // App.Update's frame hook instead leaves them permanently blank.
+                                    App.Instance.EnsureDebugEffects();
                                     App.Instance.views = new Views();
                                     App.Instance.AddPanel(App.Instance.views);
                                 }

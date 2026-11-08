@@ -79,13 +79,114 @@ internal static unsafe class ShaderCompiler
             if (_spirvCache.TryGetValue(key, out var cached))
             {
                 CacheHitCount++;
+
+                // Contract 3-2: the dedup ratio is what makes the compile bill readable - six PSOs over one source are one
+                // glslang invocation, and only this counter shows whether that reuse actually happened.
+                StartupProfiler.Add("shader.cache-hit");
+
+                if (stage == ShaderStageFlags.ComputeBit) StartupProfiler.Add("shader.cache-hit.cs");
+
                 return cached;
             }
+        }
 
-            var spirv = CompileGlslUncached(glslSource, stage, debug);
+        // glslang runs outside the lock, matching the DX and Metal compilers: holding it across the parse/link/
+        // generate pass would serialize every caller, which is exactly what a parallel prewarm must not do.
+        // glslang_initialize_process exists to make this safe - the per-thread pools it creates are the reason
+        // ShaderCreate/ProgramCreate are allowed off the main thread.
+        // Contract 3-2: glslang is the one place every shader on this backend is actually translated, and on the
+        // pre-first-frame path it runs on the calling (main) thread - the duration below is main-thread blocking time.
+        long compileStart = StartupProfiler.Enabled ? StartupProfiler.Ticks() : 0;
+
+        var spirv = CompileGlslUncached(glslSource, stage, debug);
+
+        lock (_cacheLock)
+        {
+            // Two callers can miss the same key together; whoever lands second keeps the winner's SPIR-V. Same shape as
+            // the DX compiler: the loser reports a cache hit, because the row has to belong to the entry that survived.
+            if (_spirvCache.TryGetValue(key, out var raced))
+            {
+                CacheHitCount++;
+
+                StartupProfiler.Add("shader.cache-hit");
+
+                if (stage == ShaderStageFlags.ComputeBit) StartupProfiler.Add("shader.cache-hit.cs");
+
+                return raced;
+            }
+
             _spirvCache[key] = spirv;
             CompileCount++;
+
+            if (compileStart != 0)
+            {
+                double ms = StartupProfiler.ElapsedMs(compileStart);
+
+                // fileName is the caller's own name for this shader (pipeline.vert, fog_composite.frag, taaResolve.comp),
+                // so the startup report says which program the seconds went into instead of only "fragment main".
+                StartupProfiler.Item("shader", $"{StageName(stage)} {fileName}", ms, spirv.Length,
+                    $"caller={fileName} src={glslSource.Length}");
+
+                StartupProfiler.Add("shader.compile");
+
+                if (stage == ShaderStageFlags.ComputeBit) StartupProfiler.Add("shader.compile.cs", ms, spirv.Length);
+            }
+
             return spirv;
+        }
+    }
+
+    /// <summary>
+    /// Step 2 counterpart of the DX12 prewarm: compiles a batch of GLSL compute sources on a worker pool, longest
+    /// first, and blocks until every one is done. Wired up ahead of the DX12 path so the Vulkan backend can accept the
+    /// same frame-boundary drain without changing shape; it stays unused until Vulkan kernels are built lazily too.
+    /// Failures are swallowed for the same reason they are on DX12: the request that decides whether registration
+    /// succeeds is the kernel's own build, which owns the degrade-instead-of-throw contract.
+    /// </summary>
+    public static void Prewarm(IReadOnlyList<(string Glsl, ShaderStageFlags Stage)> requests)
+    {
+        if (requests.Count == 0) return;
+
+        var unique = new List<(string Glsl, ShaderStageFlags Stage)>(requests.Count);
+        var seen = new HashSet<(string, ShaderStageFlags)>(requests.Count);
+
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var request = requests[i];
+            if (string.IsNullOrEmpty(request.Glsl)) continue;
+            if (seen.Add(request)) unique.Add(request);
+        }
+
+        if (unique.Count == 0) return;
+
+        unique.Sort(static (a, b) => b.Glsl.Length.CompareTo(a.Glsl.Length));
+
+        var options = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount) };
+
+        // Contract 3-2: one row for the whole wave, so "N shaders took X s" and "the wave took Y s" can be read side by
+        // side and the difference attributed to parallelism rather than guessed at.
+        long start = StartupProfiler.Enabled ? StartupProfiler.Ticks() : 0;
+
+        Parallel.ForEach(unique, options, static request =>
+        {
+            try
+            {
+                CompileGlsl(request.Glsl, request.Stage);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[ShaderCompiler] prewarm {request.Stage}: {ex.GetType().Name}: {ex.Message}");
+            }
+        });
+
+        if (start != 0)
+        {
+            double wallMs = StartupProfiler.ElapsedMs(start);
+
+            StartupProfiler.Add("shader.prewarm", wallMs);
+
+            StartupProfiler.Item("stage", "shader.prewarm", wallMs, 0,
+                $"sources={unique.Count} threads={options.MaxDegreeOfParallelism}");
         }
     }
 
@@ -216,6 +317,22 @@ internal static unsafe class ShaderCompiler
         ShaderStageFlags.TessellationEvaluationBit => GlslangStage.TessEvaluation,
         ShaderStageFlags.ComputeBit => GlslangStage.Compute,
         _ => throw new ArgumentOutOfRangeException(nameof(stage), $"Unsupported shader stage: {stage}")
+    };
+
+    /// <summary>
+    /// Contract 3-2: the stage as it appears in a report row. Spelled out rather than numeric so a Vulkan row and a DX
+    /// row (<c>vs_6_0</c>, <c>cs_5_0</c>) can be matched by eye without a legend; the family prefix stays first so the
+    /// summary sorters keep grouping vertex rows apart from fragment rows.
+    /// </summary>
+    static string StageName(ShaderStageFlags stage) => stage switch
+    {
+        ShaderStageFlags.VertexBit => "vertex",
+        ShaderStageFlags.FragmentBit => "fragment",
+        ShaderStageFlags.GeometryBit => "geometry",
+        ShaderStageFlags.TessellationControlBit => "tesscontrol",
+        ShaderStageFlags.TessellationEvaluationBit => "tesseval",
+        ShaderStageFlags.ComputeBit => "compute",
+        _ => stage.ToString()
     };
 
     static Exception BuildShaderError(string phase, IntPtr shader, ShaderStageFlags stage)

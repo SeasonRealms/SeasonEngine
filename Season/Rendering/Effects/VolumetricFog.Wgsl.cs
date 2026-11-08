@@ -326,10 +326,23 @@ fn Visibility(p: vec3f,depth: f32,light: i32) -> f32 {
 // Two-point Gauss-Legendre over the span. The default is the old centre sample, so a slice thinner than half a metre
 // (everything the near field produces) is bit-identical to the previous behaviour.
 fn SliceVisibility(ray: vec3f,depth: f32,z0: f32,span: f32,light: i32) -> f32 {
-    var result=Visibility(F(8u).xyz+ray*depth,depth,light);
-    if(light==i32(F(34u).z) && span>=0.5) {
-        let a=z0+span*0.21132487; let b=z0+span*0.78867513;
-        result=0.5*(Visibility(F(8u).xyz+ray*a,a,light)+Visibility(F(8u).xyz+ray*b,b,light));
+    // One exit, both arms writing the same variable, matching DX. The centre sample is only taken when the
+    // resample does not run: the two Gauss taps below overwrite it anyway, so computing it first spent one full
+    // evaluation of the shadow chain on a value that was then thrown away, on exactly the froxels far enough out
+    // to make that chain expensive.
+    var result=0.0;
+    if(light!=i32(F(34u).z) || span<0.5) {
+        result=Visibility(F(8u).xyz+ray*depth,depth,light);
+    } else {
+        // Both Gauss points as one loop body, so the backend below Tint is handed one call site rather than two.
+        // Tint itself keeps the function, but the driver that lowers this further is free to inline, and the
+        // two-call form is what it would then duplicate. Same weights, same order, so the result is unchanged.
+        var sum=0.0;
+        for(var gaussIndex=0u;gaussIndex<2u;gaussIndex++) {
+            let gaussT=select(z0+span*0.78867513,z0+span*0.21132487,gaussIndex==0u);
+            sum+=Visibility(F(8u).xyz+ray*gaussT,gaussT,light);
+        }
+        result=0.5*sum;
     }
     return result;
 }

@@ -2360,8 +2360,30 @@ vec4 ApplySceneFog(vec4 color, vec3 worldPos);
                 Subpass = 0
             };
 
+            // Contract 3-2: PSO creation is the second half of the startup bake - glslang produced the SPIR-V, the driver
+            // still has to turn it into a pipeline object, and on this backend that conversion is synchronous under this
+            // call. The name mirrors the variant switches so a slow row can be traced back to the PSO it belongs to.
+            long psoStart = StartupProfiler.Enabled ? StartupProfiler.Ticks() : 0;
+
             if (Device.Vk.CreateGraphicsPipelines(Device.LogicalDevice, default, 1, in info, null, out var pso) != Result.Success)
                 throw new Exception($"vkCreateGraphicsPipelines failed [{mode}]");
+
+            if (psoStart != 0)
+            {
+                // Same suffix grammar as the DX compiler's row, so the two startup reports can be diffed variant by
+                // variant instead of by name.
+                string psoName = $"{mode}" +
+                    (cullMode == CullModeFlags.BackBit ? string.Empty : "/" + cullMode) +
+                    (shadowPass ? "/shadow" : string.Empty) +
+                    (overlay ? "/overlay" : string.Empty) +
+                    (outlineMask ? "/outline" : string.Empty) +
+                    (velocity ? "/velocity" : string.Empty) +
+                    (depthWriteOverride ? string.Empty : "/nodepth");
+
+                StartupProfiler.Item("pso", psoName, StartupProfiler.ElapsedMs(psoStart), 0,
+                    $"rts={colorBlend.AttachmentCount} samples={multisample.RasterizationSamples} stages={info.StageCount}");
+            }
+
             return pso;
         }
         finally
