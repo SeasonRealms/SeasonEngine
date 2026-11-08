@@ -8,7 +8,7 @@
     change a navigation link, update it in: index.html, 404.html,
     features/index.html, docs/index.html, roadmap/index.html
   - This page is a public summary of Roadmap.md in the repository root. When
-    Roadmap.md changes, update the baseline tables and the phase view here.
+    Roadmap.md changes, update the baseline tables and the priority layers here.
     Release-engineering and commercial items from Roadmap.md are deliberately
     NOT reproduced here.
 -->
@@ -331,7 +331,7 @@
                                 <tbody>
                                     <tr><td>A0.1 Indirect draw and dispatch</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>Four backends, including Metal and WebGPU</td></tr>
                                     <tr><td>A0.2 Scene normal target</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>&mdash;</td></tr>
-                                    <tr><td>A0.3 Texture compression</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>Moved to P3; it was never a rendering feature</td></tr>
+                                    <tr><td>A0.3 Texture compression</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>Merged into the asset pipeline; it was never a rendering feature</td></tr>
                                     <tr><td>A0.4 Per-view matrix split</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>&mdash;</td></tr>
                                     <tr><td>A1 Motion blur</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>Depth of field followed it in the same pass slot</td></tr>
                                     <tr><td>A2 Screen-space reflections</td><td><span class="se-badge se-badge--shipped">Shipped</span></td><td>Accelerated by a depth pyramid; DDGI fallback on miss</td></tr>
@@ -343,6 +343,10 @@
                                     <tr><td>A8 Mesh LOD</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>Needs a decimator, which needs the asset pipeline first</td></tr>
                                     <tr><td>A9 Terrain</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>Blocked on A8</td></tr>
                                     <tr><td>A10 Occlusion culling</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>Should reuse the SSR pyramid; needs A7's baseline first</td></tr>
+                                    <tr><td>A11 FrameSchedule instantiation</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>The frame schedule is a static class; it needs one instance per frame owner</td></tr>
+                                    <tr><td>A12 Binding layering</td><td><span class="se-badge se-badge--partial">Partial</span></td><td>Vulkan has named per-frame binding slots; the 2464-byte constant block is still one struct</td></tr>
+                                    <tr><td>A13 Material system</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>Every material is a glTF import; there is no material asset and no instance</td></tr>
+                                    <tr><td>A14 Streaming and async upload</td><td><span class="se-badge se-badge--absent">Absent</span></td><td>Batched upload only; no residency policy and no eviction</td></tr>
                                 </tbody>
                             </table>
                         </div>
@@ -357,9 +361,12 @@
                         </ul>
 
                         <p class="se-muted">
-                            Nothing left in this track is a rendering feature. Every one of the four open items is an
-                            asset pipeline, a measurement, or an optimisation that has to be justified by one &mdash;
-                            which is why A8 and A9 now sit behind Track P rather than in front of it.
+                            The four original open items are not rendering features: each is an asset pipeline, a
+                            measurement, or an optimisation that has to be justified by one &mdash; which is why A8
+                            and A9 sit behind the measurement layer rather than in front of it. The four rows added
+                            above (A11&ndash;A14) are not features either. They are the structural debt that ten
+                            visual features in one year produced, and they are the four places where the next ten
+                            would slow down.
                         </p>
                     </section>
 
@@ -536,15 +543,15 @@
                         <ul class="se-list">
                             <li><strong>P0 — measurement on all four backends, first.</strong> The profiler is real, but the GPU timer interface has exactly one implementation, Direct3D 12. The GPU column is empty on Vulkan, Metal and WebGPU &mdash; the three backends where a managed engine's frame budget actually needs defending, because that is where the integrated GPUs and the browsers are. Timestamp queries per backend, plus an explicit "unsupported" state instead of a silent NaN. Until this lands, every item below can only be argued.</li>
                             <li><strong>P1 — contract code generation.</strong> The graphics interface is roughly seventy-five methods implemented by hand four times. Backend similarity runs from about 30&nbsp;% to 90&nbsp;% per object family, and the low end is D3D12-specific logic, not extractable duplication &mdash; so the realistic saving is three to five thousand lines, not the six to eight a similarity ratio suggests. The real payoff is that the four implementations cannot drift apart silently.</li>
+                            <li><strong>P1b — struct and constant mirroring.</strong> A smaller generation problem sitting next to P1, and easy to mistake for it. The frame-wide constant block is 2464 bytes and is mirrored by hand into four shader languages and, in one web file, into a single hardcoded byte length. Every other size in the system is derived, so that constant is the one place where a layout change fails silently &mdash; the upload is simply discarded, with no error on either side. Ordered after the block split, because generating headers for one unsplit struct would document the problem rather than reduce it.</li>
                             <li><strong>P2 — shader precompile and PSO disk cache.</strong> All four backends compile at startup and nothing survives a restart: D3D12 has no pipeline library, Vulkan persists no pipeline cache. A content-addressed cache on disk, keyed by source hash plus pipeline state, with the runtime compilers still present as fallback &mdash; an optimisation, never an entry requirement, so a fresh clone still runs with an empty cache.</li>
                             <li><strong>P3 — texture compression and a KTX2 container</strong>, formerly A0.3. BC7/BC5/BC6H on desktop, ASTC on mobile, ETC2 as the Android floor, one file for every platform. Its payoffs are package size, web load time, VRAM and bandwidth &mdash; none of which is a picture, all of which are the difference between a browser build someone waits for and one they close.</li>
                             <li><strong>P4 — temporal upscaling and dynamic resolution.</strong> TAA already owns everything an upscaler needs: jittered history, a velocity buffer, variance clipping, a resolve. A TAAU-style upscale from 67&nbsp;% or 50&nbsp;% is a small increment on an effect that works, and the largest single GPU win on integrated hardware. Build it against a fixed scale and measure it first; a dynamic resolution controller without a profiler behind it oscillates, and P0 is what stops that.</li>
                         </ul>
 
                         <p class="se-muted">
-                            Two of these are visible in a release note and two are not, and the order is set by the
-                            one that makes the other four measurable rather than by the one that looks best in a
-                            screenshot.
+                            Most of these are invisible in a screenshot, and the order is set by the item that makes
+                            the others measurable rather than by the one that looks best in a release note.
                         </p>
                     </section>
 
@@ -588,63 +595,80 @@
                         </p>
                     </section>
 
-                    <!-- phases ------------------------------------------------------ -->
+                    <!-- priority layers ---------------------------------------------- -->
                     <section class="se-card">
-                        <h2 class="se-mt0">Phase view</h2>
-                        <p class="se-muted">Dates are intent, not commitment.</p>
+                        <h2 class="se-mt0">Priority layers</h2>
+                        <p class="se-muted">
+                            A layer is a dependency band, not a date. Everything in L0 can start today; nothing in L1
+                            can finish before its L0 dependency lands. L2 and L3 are deliberately undated, because
+                            what they cost depends on how L1 lands. Track P keeps its own P0&ndash;P4 item numbers &mdash;
+                            the layers use L so the two are never confused.
+                        </p>
 
                         <div class="se-grid se-grid--2" style="margin-top:18px;">
                             <div>
-                                <h3>Phase 0 — Ship something <span class="se-pill">2026 H2</span></h3>
+                                <h3>L0 &mdash; Make the claims measurable</h3>
                                 <ul class="se-list">
-                                    <li>Release engineering in full</li>
-                                    <li><strong>P0 GPU timers on Vulkan, Metal and WebGPU</strong> — the one item that turns every later optimisation into a number</li>
-                                    <li><strong>D1 recorded numbers and CI</strong>, so the four acceptance rulers run on a commit instead of in someone's memory</li>
-                                    <li><strong>C1 completion</strong> — generated image to material, generated audio to source, a generated-assets folder</li>
-                                    <li><strong>F1 headless run and capture</strong>, which is packaging on top of the capture and profiler code already present</li>
+                                    <li><strong>D1 recorded numbers and CI</strong> &mdash; a fixed camera path, per-feature toggles, the four acceptance rulers run by a commit</li>
+                                    <li><strong>P0 GPU timers on Vulkan, Metal and WebGPU</strong> &mdash; coverage goes from one backend of four to four of four</li>
+                                    <li><strong>A ten-thousand-instance stress scene</strong>, because A7 cannot be judged on the island</li>
+                                    <li><strong>A7 proved or demoted</strong> against that scene, using the switch that already exists</li>
+                                    <li><strong>D2 allocation budget</strong> and <strong>D6 the build guard</strong></li>
                                 </ul>
-                                <p class="se-muted">Outcome: the funnel exists, the paid tier has a reason to be bought, and the first profile table is published.</p>
+                                <p class="se-muted">Outcome: every row below cites a number instead of an intention, and one feature is decided rather than carried.</p>
                             </div>
                             <div>
-                                <h3>Phase 1 — Demonstrability <span class="se-pill">2027 H1</span></h3>
+                                <h3>L1 &mdash; Make the world data</h3>
                                 <ul class="se-list">
-                                    <li><strong>B0</strong> shell/scene decoupling, then <strong>B1</strong> world serialization, then <strong>undo as the command layer's first requirement</strong></li>
-                                    <li><strong>F0 and F2</strong> — the command surface and the world verbs, against the registry B1 introduces</li>
-                                    <li><strong>P2 shader and PSO cache</strong> — the first-run hitch is what a store reviewer notices</li>
-                                    <li><strong>P3 texture compression and KTX2</strong>, required before the web hosts are worth showing to anyone</li>
-                                    <li><strong>D4</strong> sample ladder, the compute-effect walkthrough, and a feature-by-backend matrix generated rather than written</li>
+                                    <li><strong>B0</strong> shell and scene decoupling, then <strong>B1</strong> world serialization</li>
+                                    <li><strong>F0</strong> the command layer with undo first, then <strong>F2</strong> the world verbs and <strong>F1</strong> headless capture</li>
+                                    <li><strong>A12</strong> split the frame-wide constant block, then <strong>P1b</strong> generate the shader-side declarations from it</li>
+                                    <li><strong>P1</strong> contract code generation and the shared middle core, in three steps</li>
+                                    <li><strong>A13</strong> material assets and instances</li>
+                                    <li><strong>Asset pipeline and texture compression</strong> as one project, including the decimator</li>
+                                    <li><strong>C1 completion</strong> and <strong>D4</strong> the sample ladder</li>
                                 </ul>
-                                <p class="se-muted">Outcome: someone can create and save a world, an agent can drive that same world through commands, and the performance claim has a number attached.</p>
+                                <p class="se-muted">Outcome: a world is a file, an agent can drive it, a person can undo it, and a texture costs a quarter of what it did.</p>
                             </div>
                             <div>
-                                <h3>Phase 2 — Scale <span class="se-pill">2027 H2</span></h3>
+                                <h3>L2 &mdash; Renderer architecture and the agent loop</h3>
                                 <ul class="se-list">
-                                    <li><strong>A7 justified or demoted</strong> against the Phase 1 baseline, using the A/B switch that already exists</li>
-                                    <li><strong>A10 occlusion culling</strong> on the existing depth pyramid, once A7 has a number</li>
-                                    <li><strong>B4</strong> mass-unit reference world — the scene that makes the strategy-scale claim falsifiable</li>
-                                    <li><strong>A8 mesh LOD</strong> and the decimator, then <strong>A9 terrain</strong></li>
-                                    <li><strong>P4 temporal upscaling</strong>, then dynamic resolution on top of the Phase 0 profiler</li>
+                                    <li><strong>A11</strong> one frame instance instead of a static facade</li>
+                                    <li><strong>A14</strong> streaming and asynchronous upload, keyed on material identity</li>
+                                    <li><strong>A10 occlusion culling</strong> on the depth pyramid that already runs for SSR</li>
+                                    <li><strong>P4 temporal upscaling</strong>, then dynamic resolution on top of the profiler</li>
+                                    <li><strong>C2</strong> cloud models plus Roslyn runtime C#</li>
+                                    <li><strong>P2</strong> shader precompile and PSO disk cache</li>
                                 </ul>
-                                <p class="se-muted">Outcome: the strategy-scale claim is measured rather than asserted, and mesh LOD stops being the shared blocker for both Track A and Track C.</p>
+                                <p class="se-muted">Outcome: the frame path has no static state, the first launch is not a compile, and an agent can extend the engine rather than only drive it.</p>
                             </div>
                             <div>
-                                <h3>Phase 3 — Creation <span class="se-pill">2028 H1</span></h3>
+                                <h3>L3 &mdash; Scale, tools, and new audiences</h3>
                                 <ul class="se-list">
-                                    <li><strong>C2</strong> cloud models plus Roslyn runtime C#, desktop only — and the enabler for everything below</li>
-                                    <li><strong>F3</strong> agent tools over the command surface, with dry-run diffs</li>
-                                    <li><strong>B2</strong> editing affordances, <strong>B3</strong> asset catalogue, and <strong>F4</strong> the four-pane editor on top of both</li>
-                                    <li><strong>D3</strong> asset pipeline consolidated, including the glTF exporter C3 needs</li>
+                                    <li><strong>A8 mesh LOD</strong>, then <strong>A9 terrain</strong>, then <strong>B4</strong> the mass-unit reference world</li>
+                                    <li><strong>C3</strong> mesh post-processing and glTF export</li>
+                                    <li><strong>B2</strong> editing affordances, <strong>B3</strong> asset catalogue, <strong>F3</strong> agent tools, <strong>F4</strong> the four-pane editor</li>
+                                    <li><strong>Track E</strong>, then Quest &mdash; a new platform claim, not a feature on the existing one</li>
+                                    <li><strong>Physics and networking</strong>, recorded and deliberately not ranked</li>
+                                    <li>Console technical adaptation &mdash; acknowledged, scheduled nowhere</li>
                                 </ul>
-                                <p class="se-muted">Outcome: natural-language world creation, sitting on a world format that was designed for it and a command layer that can undo it.</p>
+                                <p class="se-muted">Outcome: the strategy-scale claim is measured, and the editor is a view over commands that already work.</p>
                             </div>
                         </div>
 
-                        <p style="margin-top:24px;"><strong>Phase 4 and beyond.</strong> C3 completion — mesh
-                        post-processing and glTF export, so generated meshes stop living in a preview window; C4
-                        auto-rigging if quality justifies it; Track E starting as a Windows and Direct3D 12 pilot, then
-                        Quest; Mac and mobile store presence. Console technical adaptation is acknowledged and
-                        scheduled nowhere — it is gated on SDK access, which is gated on the engine's standing rather
-                        than on engineering effort.</p>
+                        <p style="margin-top:24px;"><strong>Three things this ordering changes.</strong></p>
+                        <ul class="se-list">
+                            <li><strong>A7 moved to the front.</strong> A feature that exists, is switchable and has never
+                            been measured is worse than a feature that does not exist, because it gets quoted in the
+                            README. Deciding it costs one A/B run.</li>
+                            <li><strong>Undo moved out of the editor and into the command layer.</strong> A command layer
+                            without undo is an API with extra steps, and a world format that stores references cannot be
+                            made undoable afterwards &mdash; which is why the world record has to carry addresses from
+                            the first commit.</li>
+                            <li><strong>Texture compression and the asset pipeline merged</strong>, as did contract code
+                            generation and the shared middle core. Each pair was two rows in two tracks and was always
+                            one project.</li>
+                        </ul>
                     </section>
 
                     <!-- non-goals --------------------------------------------------- -->

@@ -20,6 +20,7 @@ Work is grouped into tracks that map to the questions the project actually faces
 | **F. Agent surface** | Can a machine drive the engine as well as a person can? | The next audience: tooling, automation, and the paid layer's own workflow |
 | **P. Performance** | Does the frame budget hold, and can every claim above be measured? | Whoever runs this on a laptop GPU |
 | **E. VR / XR** | Can the renderer claim reach the platforms where single-view assumptions stop applying? | A later audience, after the desktop story ships |
+| **X. Simulation & network** | Can the engine carry physics and a network client without becoming a different engine? | Later users; decoupled on purpose so a contributor can start either at any time |
 
 Track D is not in the original three. It exists because several items in A, B, and C are unprovable or unshippable
 without it. Track F is newer, and it comes from a single observation: this engine's behaviour model — one C# class per
@@ -28,7 +29,8 @@ needs no node graph and no inspector to drive it; it needs three verbs and a way
 far cheaper way to keep a demonstration honest than a person clicking through it every release. Track P is what used to
 be scattered across A and D: the work that decides whether the frame budget survives contact with integrated hardware,
 where most of this engine's audience will actually run it. Track E stays deliberately last, and its only pre-payment —
-A0.4, the per-view matrix split — has already shipped.
+A0.4, the per-view matrix split — has already shipped. Track X exists only to hold two decisions still — physics and
+networking — and to state in one place that neither blocks anything above it.
 
 **Ordering inside each track is by dependency, not by appeal.** Where an item is blocked by another, it says so.
 Several attractive features are deliberately placed late because their prerequisites are infrastructure work across
@@ -255,11 +257,12 @@ anywhere in the engine.
 The first consumer was not VR — it was the rear-view mirrors in `Apps/Engine/Panels/RearViews.cs`, which is exactly
 the test the roadmap predicted. Track E still needs E0 and E1; it no longer needs this.
 
-#### A0.3 Texture compression and a container format — *moved to P3*
+#### A0.3 Texture compression and a container format — *moved out of this track, and merged*
 
-Still not started, and now reclassified. It is not a rendering feature and it never was: its payoffs are package size,
-web load time and VRAM bandwidth. Those are build economics, so the item lives in Track P, where the rest of the same
-argument lives.
+Still not started, and now reclassified twice. It is not a rendering feature and it never was: its payoffs are package
+size, web load time and VRAM bandwidth, which are build economics, so the item lives in Track P. It is also the same
+project as the asset pipeline (D3) — the transcode step, the decimator and the import cache are one offline tool — so the
+layering treats D3 and P3 as one row (L1.10) rather than two.
 
 ### A1. Motion blur — **Shipped**
 
@@ -430,13 +433,58 @@ consumers — which is a better design anyway.
 The reasons to keep it behind a measurement are the same as A7's: it only pays off when overdraw of hidden geometry is
 actually the cost, and in a scene that is not dense that is never true.
 
+### A11. FrameSchedule, instantiated — *the static facade is now the only thing holding the frame together*
+
+`FrameSchedule` is still a static class whose members are assigned from outside: `FrameSchedule.PrepareView =
+OnPrepareView`, `FrameSchedule.AfterViews`, `FrameSchedule.SceneDepth`, `FrameSchedule.ActiveTargets`. That was the right
+shape while there was one frame and one camera. It stopped being the right shape when A0.4 made views plural, because the
+class answers "which frame?" with "the frame".
+
+The work is mechanical: one instance per frame owner, held by the device and passed through the pass schedule instead of
+read off a type. No behaviour change. It is on the list because every later item that wants a second frame running at the
+same time — headless capture (F1), the editor's preview pane (F4), XR's dual view (E1) — first has to answer that
+question, and today there is exactly one possible answer.
+
+### A12. Binding layering — *split the block before generating code from it*
+
+`SceneLightParams` measures 2464 bytes. Every feature that needed a parameter appended a `Vector4` at the tail, because
+inserting in the middle moves every hardcoded offset in four shader sets. The tail has now grown past the point where the
+struct is a lighting block: it is a frame-wide grab bag that happens to begin with a camera position.
+
+Vulkan has already started the answer in the other direction — `SceneFrameInputs` holds per-frame bindings as named slots
+instead of one set. The item is to finish that: lighting, shadows, sky and atmosphere, weather, reflection, as separate
+blocks with separate lifetimes, so a feature that writes four fields stops replaying a 2.4 KB upload to change them.
+
+Deliberately ordered before P1. Generating a four-language header from one 2464-byte struct only gives the drift a better
+format; generating five small headers from five small blocks gives it a cheaper one.
+
+### A13. Material system and material instances — *every material today is a glTF import*
+
+There is no material asset. `MaterialParams` is the GPU-side struct, `MaterialFields` reads glTF's PBR block, and
+`ShadowMaterialSharing` dedupes what comes out of it. A scene cannot declare a material, override one field of an imported
+one, or share a variant across two meshes without editing the source asset.
+
+The minimum viable shape is the one the rest of this engine already uses: a material is data — a type name plus
+parameters — an instance is an override set, and the renderer resolves both into the struct it already uploads. No node
+graph, no shader authoring; the four hand-written shader sets stay hand-written.
+
+### A14. Streaming and asynchronous upload — *the prerequisite A9 and B4 both quietly assume*
+
+Textures go up in batches (`TextureUploadBatch` on three of the four backends), on the frame that first needs them, at
+their final size. There is no residency policy, no background transfer queue and no eviction. For the current island that
+is invisible; for a terrain of any size it is the whole problem, and for a ten-thousand-unit world the hitch lands on
+whichever frame first touches new geometry.
+
+Deliberately after A13 rather than before: a streaming system without a material identity has nothing to key residency
+on.
+
 ### Track A status summary
 
 | Item | Status | What is left |
 |---|---|---|
 | A0.1 Indirect draw and dispatch | Shipped, four backends | — |
 | A0.2 Scene normal target | Shipped | — |
-| A0.3 Texture compression | Not started | Moved to P3 |
+| A0.3 Texture compression | Not started | Merged into the asset pipeline (L1.10) |
 | A0.4 Per-view matrix split | Shipped | — |
 | A1 Motion blur | Shipped | — |
 | A2 Screen-space reflections | Shipped | — |
@@ -448,10 +496,16 @@ actually the cost, and in a scene that is not dense that is never true.
 | A8 Mesh LOD | Absent | Needs a decimator; needs the asset pipeline first |
 | A9 Terrain | Absent | Blocked on A8 |
 | A10 Occlusion culling | Absent | Should reuse `HiZ.cs`; needs A7's baseline first |
+| A11 FrameSchedule instantiation | Absent | Static facade; needs one instance per frame owner |
+| A12 Binding layering | Partial | `SceneFrameInputs` exists on Vulkan; the 2464-byte block is unsplit |
+| A13 Material system | Absent | Materials are 100 % glTF-imported |
+| A14 Streaming and async upload | Absent | Batched upload only; no residency, no eviction |
 
-The shape of the remaining rendering work changed accordingly. Nothing left in this track is a rendering feature —
-every one of the four open items is an asset pipeline, a measurement, or an optimisation that has to be justified by
-one. That is the difference between a renderer that is unfinished and a renderer that is done and unproven.
+The shape of the remaining rendering work changed accordingly. The four original open items (A7–A10) are not rendering
+features: each is an asset pipeline, a measurement, or an optimisation that has to be justified by one. The four added
+here (A11–A14) are not features either — they are the structural debt that ten visual features in one year produced, and
+they are the four places where the next ten would slow down. That is the difference between a renderer that is
+unfinished and a renderer that is done and unproven.
 
 ---
 
@@ -915,6 +969,23 @@ because they are generated from one description.
 This is also what makes the four-language shader corpus survivable. The shaders stay hand-written per backend; the
 boilerplate around them stops being hand-written.
 
+The shared core is built in three steps, and the order matters because each step is useful on its own: bodies that are
+already byte-identical move first, then bodies that differ only in data layout, then the skeletons that differ in control
+flow. The first step is free, the second is mechanical, and the third is the only one where a behaviour change is
+possible — which is exactly the boundary at which the work should be reviewed.
+
+### P1b. Struct and constant mirroring
+
+A second and much smaller generation problem lives next to the first, and is easy to mistake for it. `SceneLightParams`
+measures 2464 bytes and is mirrored by hand in two directions: shader-side declarations in HLSL, GLSL, MSL and WGSL, and
+one hardcoded byte length (`SCENE_LIGHT_BYTES`) in the web host's JavaScript. Every other size in the system is derived
+(`Unsafe.SizeOf`), so that constant is the one place where a layout change fails silently — the upload is discarded with
+no error at either end.
+
+Scope: generate the four shader-side block declarations and the JS constant from the C# struct definitions, and fail the
+build when the generated length disagrees. It depends on A12, because generating headers for one unsplit 2464-byte struct
+would document the problem rather than reduce it.
+
 ### P2. Shader precompile and PSO disk cache
 
 All four backends compile at startup: FXC to DXBC on D3D12, glslang to SPIR-V on Vulkan, Metal source compile, WGSL on
@@ -935,6 +1006,9 @@ uncompressed stays an anti-goal.
 The reason it belongs in this track and not in Track A is the shape of the payoff: package size, web load time, VRAM and
 bandwidth. None of those is a picture. All of them are the difference between a browser build someone waits for and one
 they close.
+
+Execution note: this is not a separate project from D3. The transcode step, the decimator and the import cache are the
+same offline tool, so the layering keeps them as one row (L1.10) instead of two that would drift apart.
 
 ### P4. Temporal upscaling and dynamic resolution
 
@@ -982,6 +1056,26 @@ argument layout.
 
 ---
 
+## Track X — Simulation and networking
+
+Both were named as "later features" in the previous analysis and are recorded here so that they stop being re-proposed as
+new ideas. Both sit outside the layering for the same reason: nothing in Tracks A–P depends on them, so neither can be
+used to justify delaying a layer, and neither has to wait for one.
+
+| Item | What it is | What it is not | Suggested basis |
+|---|---|---|---|
+| **X0. Physics and collision** | Rigid bodies and a character controller integrated into the existing frame loop. Physics touches no backend, so the four-backend cost that governs everything else in this document does not apply here | A second scene graph, or physics-driven animation | BepuPhysics v2 — pure C#, allocation-conscious, no native dependency to package per platform |
+| **X1. Networking** | A client that connects, exchanges world and unit state, and reconciles. Server authority is the default, not an option | Rollback netcode, a shard system, or a hosted service | LiteNetLib — small, no code generation, no reflection |
+
+`Season/Net/WebClient.cs` already does progress-reporting downloads with cancellation. That is the top of this iceberg,
+not the bottom — but it does mean the engine has an HTTP client and no excuse to grow a second one.
+
+The one link worth naming: both want B1 if their state is to be saved. A physics body that cannot be written to a world
+file and a session that cannot be resumed are demos, which is a further argument for B1 being early rather than an
+argument for moving X0 or X1 up.
+
+---
+
 ## Dependency map
 
 ```
@@ -996,24 +1090,32 @@ SHIPPED, and their edges are now historical:
   A0.4 per-view split ──> E1 dual-view
 
 STILL OPEN:
-D1 recorded baseline ──> A7 (justification)
+D1 recorded baseline ──> A7 (justification) ◄── B4-lite stress scene
                      ├─> A10 occlusion
                      ├─> D2 allocation contract
                      ├─> B4 scale claim
                      └─> P4 dynamic resolution controller
 
 P0 GPU timers on four backends ──> P1, P2, P3, P4 are arguments until this lands
-mesh decimation ──> A8 mesh LOD ──> A9 terrain
-                └─> C3 (the half that is still missing)
 
-B0 shell/scene split ──> B1 serialization ──> F2 world commands ──> F4 editor panes
-                                          │                     └─> B2 editing ──> B3 catalogue
+A12 split the 2464-byte block ──> P1b shader-side struct headers
+                            └───> P1 IGraphics codegen + shared middle core
+mesh decimation (in the asset pipeline) ──> A8 mesh LOD ──> A9 terrain
+                                        └─> C3 (the half that is still missing)
+A13 materials ──> A14 streaming ──> A9 terrain, B4
+            └─> C1 generated image to material ──> B3 catalogue
+
+B0 shell/scene split ──> B1 serialization ──> F0 commands (undo first) ──> F2 world verbs
+                                          │                             ├─> F4 editor panes
+                                          │                             └─> B2 editing ──> B3 catalogue
                                           └─> C2 runtime C# ──> F3 code.compile / code.apply
+A11 frame instance ──> F1 capture, F4 preview pane, E1 dual view
 
-C1 output-to-engine ──> raises the value of the existing paid tier immediately
 A0.4 (shipped) ──> E1 dual-view ──> E2 per-eye state ──> E5 Quest
 E0 OpenXR binding ──> E3 input, E4 UI
 RenderQuality ladder ──> E5 XR quality preset (Quest)
+
+X0 physics, X1 networking ──> depend on nothing above; want B1 only to persist state
 ```
 
 Convergences worth designing for deliberately rather than discovering later:
@@ -1031,68 +1133,154 @@ Convergences worth designing for deliberately rather than discovering later:
 
 ---
 
-## Phase view
+## Priority layering
 
-Dates are intent, not commitment.
+Two naming notes first, because "P" has been doing two jobs in this document.
 
-### Phase 0 — Ship something (2026 H2)
+1. The layers are **L0–L3**, not P0–P3. Track P numbers its own items P0–P4, so the earlier proposal's "P0" meant both
+   *the GPU timers* and *the top priority*. Layers take L; Track P keeps its item numbers.
+2. A layer is a **dependency band, not a date**. Everything in L0 can start today. Nothing in L1 can be finished before
+   its L0 dependency lands. L2 and L3 are deliberately undated, because what they cost depends on how L1 lands.
 
-Nothing here is new capability. All of it is the difference between a private repository and a public project.
+### What survived from the proposed table
 
-- Gate 0 remainder: product ids, manifest identity, source delivery, privacy contact
-- **P0 GPU timers on Vulkan, Metal and WebGPU** — the one item that turns every later optimisation into a number
-- **D1 recorded numbers and CI**, so the four rulers in `docs/acceptance` run on a commit instead of in someone's memory
-- **C1 completion** — generated image to material, generated audio to source, a generated-assets folder
-- **F1 headless run and capture**, which is packaging on top of `AbCapture` and costs almost nothing
-- Store submission; first community posts
+The proposed table had sixteen rows. One was already done when it was written down: *update the Roadmap status table so
+the document stops contradicting the source*. That was done in the 2026-11-07 audit, and it is the only row that can be
+struck.
 
-Outcome: the funnel exists, the paid tier has a reason to be bought, and the first profile table is published.
+The removal step is therefore short and unflattering: **fifteen of sixteen rows are still open, and the one that closed
+was documentation.** The table read as a plan whose first step was complete. It was a plan whose first step was
+describing the plan.
 
-### Phase 1 — Demonstrability (2027 H1)
+Two rows are corrected as well as re-ranked:
 
-- **B0 shell/scene decoupling**, then **B1 world serialization**, then **undo as the command layer's first requirement**
-- **F0 and F2** — the command surface and the world verbs, against the same registry B1 introduces
-- **P2 shader and PSO cache** — the first-run hitch is what a store reviewer notices
-- **P3 texture compression and KTX2** — required before the web hosts are worth showing to anyone
-- **D4 sample ladder**, the compute-effect walkthrough, and a feature-by-backend matrix generated rather than written
+- **Contract code generation** turned out to be two projects sharing a name. Track P's P1 generates per-backend
+  forwarding for `IGraphics`, which is the 3–5K line item. The proposal's "C# struct and constants → four-language
+  headers" is different and smaller: the shader-side declarations for `SceneLightParams`, a struct now measured at 2464
+  bytes whose only external mirror is one hand-maintained constant (`SCENE_LIGHT_BYTES`) in one web file. They are
+  separated below as P1 and P1b, because collapsing them is how the cheap one gets deferred behind the expensive one.
+- **The shared middle layer** still carried the old 6–8K line estimate. The audited figure is 3–5K, and the return is not
+  the line count: it is that a change stops being made four times without drifting. It is ranked inside P1, because the
+  generated forwarding and the shared core are one argument, not two.
 
-Outcome: someone can create and save a world, an agent can drive that same world through commands, and the performance
-claim has a number attached.
+The proposed table also omitted everything outside performance and renderer architecture: A8, B0, B2 through B4, C1
+through C4, D3 through D5, F1 through F4, all of Track E, and Gate 0. The layering below is the union — thirty-seven
+rows, plus Gate 0.
 
-### Phase 2 — Scale (2027 H2)
+### Gate 0 — before L0
 
-- **A7 justified or demoted** against the Phase 1 baseline, using the `SEASON_CULL_INDIRECT` switch that already exists
-- **A10 occlusion culling** on the existing Hi-Z pyramid, once A7 has a number
-- **B4 mass-unit reference world** — the scene that makes the strategy-scale claim falsifiable
-- **A8 mesh LOD** and the decimator, then **A9 terrain**
-- **P4 temporal upscaling**, then dynamic resolution on top of the P0 profiler
+Unchanged: product ids, manifest identity, source delivery, privacy contact. Not engineering, not optional. Every layer
+below would otherwise be measured on a build that cannot be distributed.
 
-Outcome: the strategy-scale claim is measured rather than asserted, and mesh LOD stops being the shared blocker for
-both Track A and Track C.
+One Gate 0 item closed by the audit rather than by this pass: the commercial-reference check in `Engine.csproj`. The
+engine no longer references the AI layer at all, so what remains is a build guard (D6), not a migration.
 
-### Phase 3 — Creation (2028 H1)
+### L0 — Make the claims measurable
 
-- **C2 cloud LLM plus Roslyn runtime C#**, desktop only — and the enabler for everything below
-- **F3 agent tools** over the command surface, with dry-run diffs
-- **B2 editing affordances**, **B3 asset catalogue**, and **F4 the four-pane editor** on top of both
-- **D3 asset pipeline** consolidated, including the glTF exporter C3 needs
+No new picture comes out of this layer. It exists because fifteen of the rows below are arguments until it lands, and
+because the proposed table gave measurement three rows out of sixteen — one of which was the document itself — while the
+other thirteen were the things measurement was supposed to judge.
 
-Outcome: natural-language world creation, sitting on a world format that was designed for it and a command layer that
-can undo it.
+| # | Item | Depends on | Cost | Why this rank |
+|---|---|---|---|---|
+| L0.1 | **D1 — recorded numbers and CI**: a fixed camera path, per-feature toggles, the four acceptance rulers run by a commit | — | Scene script plus a CI job | The tools exist (`AbCapture`, `FrameProfiler`, the `RenderQuality` switches). The proposed table had this as two rows — "fixed camera path" and "per-feature cost table" — and they are one artefact |
+| L0.2 | **P0 — GPU timers on Vulkan, Metal and WebGPU** | The D3D12 implementation as the template | 150–250 lines per backend | Coverage goes from 1/4 to 4/4 with the interface, the statistics and the readback already present |
+| L0.3 | **B4-lite — a 10k-instance stress scene** | Nothing; a scene file is enough | Scene plus a script | A7 cannot be judged on the island. At fifty instances every culling strategy is free |
+| L0.4 | **A7 — prove or demote** | L0.1, L0.2, L0.3 | One A/B run | `SEASON_CULL_INDIRECT` already exists. Either the GPU path wins on the stress scene, or A7 is deleted — both outcomes are worth more than the feature |
+| L0.5 | **D2 — frame allocation budget** | L0.1 | One document, one test | The GC objection is already instrumented; what is missing is a number to compare against |
+| L0.6 | **D6 — the build guard** | The CI job from L0.1 | One job step | Keeps the repository's most expensive possible mistake from returning silently |
 
-### Phase 4 and beyond
+Outcome: every row below cites a number instead of an intention, and one feature is decided rather than carried.
 
-- **C3 completion** — mesh post-processing and glTF export, so generated meshes stop living in a preview window
-- **C4 auto-rigging**, if output quality justifies it
-- **Track E** starting as a Windows + D3D12 pilot (E0 → E1 → E2 → E3 → E4); A0.4 is already in place
-- **E5 Quest**, after the desktop pilot proves the session, dual-view, and input abstractions hold
-- Mac and mobile store presence
-- **Console technical adaptation** — acknowledged, not scheduled; see the section below
+### L1 — Make the world data
 
-Track E is the last thing here, not a first-class platform claim: it is a new audience for an engine that must first
-win the audience it already targets. Console adaptation sits even further out, and for a different reason — see the
-section below — because it is gated on SDK access, which is gated on the engine's standing, not on engineering effort
-alone.
+The premise of Track F is that this engine's behaviour model — one C# class per behaviour, a world record that is a type
+name plus construction parameters — is already a command surface. L1 turns that observation into a fact. It is also the
+same work Track B needs, which is why those two tracks share a layer instead of running in sequence.
+
+| # | Item | Depends on | Cost | Why this rank |
+|---|---|---|---|---|
+| L1.1 | **B0 — decouple the app shell from the scene** | — | Small | Nothing in this track can be run twice in one process until it lands. It was missing from the proposed table entirely, although B1 depends on it |
+| L1.2 | **B1 — world serialization**: type name plus construction parameters, a world file, a scene registry | B0 | Medium | The agent foundation, the terrain and streaming prerequisite, and the thing that makes undo possible |
+| L1.3 | **F0 — the command layer**, with undo as its first requirement | L1.2 | Medium | Undo has to live in the command record, not be added to it later. This is the order that "B2 editing" had backwards |
+| L1.4 | **F2 — the world verbs**: spawn, remove, set, query, save, load | L1.2, L1.3 | Medium | The same payload schema as B1's record, on purpose. Three schemas is how this project would fail at this |
+| L1.5 | **F1 — headless run and capture** | — | Small | Packaging on `AbCapture`, and the cheapest way to keep a demonstration honest |
+| L1.6 | **A12 — split the 2464-byte block** | — | Medium | Cheap before P1b generates headers from it, expensive afterwards |
+| L1.7 | **P1b — struct and constant mirroring**: the shader-side declarations for the split blocks, and `SCENE_LIGHT_BYTES`, generated from the C# structs | L1.6 | Small | One hand-maintained constant is all that stands between a layout change and a silently discarded upload |
+| L1.8 | **P1 — contract code generation and the shared middle layer**: one declarative description of the `IGraphics` object families, per-backend forwarding generated, then byte-identical bodies → data layout → skeleton | L1.6 | Medium | Net −3–5K lines. The return is not the lines; it is that a change stops needing four edits |
+| L1.9 | **A13 — material assets and instances** | — | Medium | C1's material half and B3's catalogue both need an identity for a material that is not "whatever the glTF said" |
+| L1.10 | **Asset pipeline and texture compression** (D3 and P3 as one project): BC7/BC5/BC6H, ASTC, ETC2, KTX2, an offline transcode step, mesh decimation | — | Large | Three thresholds at once — package size, web load time, and the decimator A8 and C3 both wait on. It was two rows in two tracks and was always one project |
+| L1.11 | **C1 — completion**: generated image to material, generated audio to source, a generated-assets folder | L1.9 | Small | The paid tier's reason to be bought, closed off cheaply |
+| L1.12 | **D4 — sample ladder and a generated backend matrix** | L0.1 | Small | The hand-maintained matrix on the features page is already out of date; generation is the only fix that stays fixed |
+
+Outcome: a world is a file, an agent can drive it, a person can undo it, a material has an identity, and a texture costs
+a quarter of what it did.
+
+### L2 — Renderer architecture and the agent loop
+
+| # | Item | Depends on | Cost | Why this rank |
+|---|---|---|---|---|
+| L2.1 | **A11 — FrameSchedule, instantiated** | — | Medium | The static facade is the last frame-scoped global state in the render path, and F1, F4 and E1 all need a second frame to exist |
+| L2.2 | **A14 — streaming and asynchronous upload** | L1.9 | Medium | A9 and B4 both quietly assume residency exists. Keyed on material identity, hence after L1.9 |
+| L2.3 | **A10 — occlusion culling on the existing Hi-Z pyramid** | L0.4 | Medium | Turns an SSR accelerator into a frame resource with two consumers. Still needs A7's baseline first |
+| L2.4 | **P4 — temporal upscaling**, then dynamic resolution | L0.1, L0.2 | Medium | The largest single GPU win on the integrated hardware most of this audience runs; the controller half is worthless without the profiler |
+| L2.5 | **C2 — cloud LLM and Roslyn runtime C#** | L1.2, L1.4 | Medium | The enabler for F3, and it closes the loop F2 opens: a verb that is missing can be written instead of requested |
+| L2.6 | **P2 — shader precompile and PSO disk cache** | — | Large | Removes the first-run hitch and the `glslang` payload inside the APK. First row to defer if L2 slips; nothing below depends on it |
+| L2.7 | **D5 — platform honesty** | L0.1, L0.2 | Small | The backend matrix becomes a claim only when the fourth column is populated |
+
+Outcome: the frame path has no static state, the first launch is not a compile, and an agent can extend the engine rather
+than only drive it.
+
+### L3 — Scale, tools, and new audiences
+
+L3 is large and it is not one thing. The three groups below do not compete for the same work, which is why they can run
+in any interleaving once L2 lands.
+
+#### L3a — Content scale
+
+| # | Item | Depends on | Cost | Why this rank |
+|---|---|---|---|---|
+| L3a.1 | **A8 — mesh LOD** | L1.10 (the decimator) | Medium | Stops being the shared blocker for A9 and C3 |
+| L3a.2 | **A9 — terrain and terrain LOD** | L3a.1, L2.2, L2.3, L1.10 | Large | Four prerequisites, and three of them are now scheduled rather than assumed |
+| L3a.3 | **B4 — the mass-unit reference world** | L0.3, L2.2 | Large | The scene that makes the strategy-scale claim falsifiable, and the real A7 workload rather than the synthetic one |
+| L3a.4 | **C3 — mesh post-processing and glTF export** | L1.10 | Medium | So generated meshes stop living in a preview window |
+
+#### L3b — Production tools
+
+| # | Item | Depends on | Cost | Why this rank |
+|---|---|---|---|---|
+| L3b.1 | **B2 — editing affordances** | L1.3 (undo), L1.9 | Medium | Undo already exists by the time this starts, which is the entire point of the ordering |
+| L3b.2 | **B3 — asset catalogue** | L1.9, L1.10 | Medium | It is a view over identities that L1 creates |
+| L3b.3 | **F3 — what the agent actually gets**: dry-run diffs, twelve verbs, no capability the editor lacks | L2.5 | Medium | The safety rule and the tool surface are one design, not two |
+| L3b.4 | **F4 — the four-pane editor** | L3b.1, L3b.2, L2.1 | Medium | The same surface, rendered. Last in its track because it adds no verbs |
+
+#### L3c — New audiences
+
+| # | Item | Depends on | Cost | Why this rank |
+|---|---|---|---|---|
+| L3c.1 | **Track E, E0 → E4**: OpenXR binding, dual view, per-eye state, XR input, world-space UI | Desktop maturity; A0.4 shipped | Large | A new platform claim, not a feature on the existing one |
+| L3c.2 | **E5 — Quest** | L3c.1, L2.4 | Large | The XR quality preset is a `RenderQuality` configuration, which is why L2.4 comes first |
+| L3c.3 | **C4 — auto-rigging** | L3a.4 | Research | Not a commitment. Listed so it stops being re-proposed as new |
+| L3c.4 | **X0 / X1 — physics and networking** | Only B1, and only for persistence | Large | Outside the layer dependencies by design; see Track X |
+
+Console technical adaptation stays outside every layer: acknowledged, not scheduled, and gated on SDK access rather than
+on engineering effort. See the section below.
+
+### What the layering changes about the previous answer
+
+1. **A7 moved from "later" to L0.** It is cheap to decide and expensive to carry. A feature that exists, is switchable,
+   and has never been measured is worse than a feature that does not exist, because it gets quoted in the README.
+2. **Undo moved from B2 to F0.** The previous order built editing and then added undo to it. A command layer without
+   undo is an API with extra steps, and retrofitting undo into a world format that stores references instead of addresses
+   does not work — which is why B1's record has to carry addresses from the first commit.
+3. **Texture compression and the asset pipeline merged**, and so did contract code generation and the shared middle
+   layer. Each pair was two rows in two tracks and was always one argument.
+4. **Physics and networking left the schedule.** They carry no dependency in either direction, so a layer that contains
+   them is a layer that can be redrawn at will. They are recorded in Track X and deliberately not ranked.
+
+One thing the layering does not do: it does not put a date on L2 or L3. The previous phase view did, and the last audit
+found nine shipped features that no phase had scheduled. A layer states what must be true before it starts, which
+survives that; a date does not.
 
 ---
 
@@ -1119,7 +1307,7 @@ blocked one:
 What neither side controls alone: the proprietary graphics/audio/storage APIs sit behind NDAs and vendor SDK
 agreements. Getting access is a conversation with the console vendors, and that conversation only becomes productive
 once the engine has enough users shipping games that the vendors have a reason to take it seriously. That is a
-scale-and-standing gate, not an engineering gate, which is exactly why nothing here carries a phase.
+scale-and-standing gate, not an engineering gate, which is exactly why nothing here carries a layer or a date.
 
 Steam is the deliberate exception and is not part of this section: it is not a console, the Linux + Vulkan backend
 already runs, and Steamworks is a public SDK. It is a distribution channel decision, evaluable on its own and far
