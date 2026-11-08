@@ -455,7 +455,10 @@ internal static class AbCapture
                 // Local cube maps are absent from it by design (they keep the direct path); local= says whether the frame had one.
                 + $"a7=(enabled={InstanceCull.Enabled},targets={InstanceCull.Targets.Count},"
                 + $"slots={SlotNames(InstanceCull.ShadowSlotMask)},local={CascadedShadow.LocalActive},"
-                + $"sun={CascadedShadow.SunActive},spot={CascadedShadow.SpotActive},reuse={CascadedShadow.ReuseActive}) "
+                + $"sun={CascadedShadow.SunActive},spot={CascadedShadow.SpotActive},reuse={CascadedShadow.ReuseActive},"
+                // L1.2: the sub-texel threshold in texels, invariant-formatted because the sidecar is a space-separated key=value
+                // line and a culture that writes "1,5" would split one field into two. 0 means the kernel's test is inactive.
+                + $"texelCull={InstanceCull.ShadowTexelCull.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}) "
                 // P1: the same evidence for the skinning route. dispatches is what the FrameStart kernel actually served this frame, so a
                 // run that asked for SEASON_INSTANCE_SKINNING=gpu but served 0 is a fallback, not a comparison.
                 // P3 L2: pooled is how many shared (clip, tick) groups the frame actually collapsed. A frame that pools nothing is

@@ -34,12 +34,15 @@ struct CullParams
     uint capacity;
     uint slotMask;
     uint slotCountsOffset;
-    uint pad1;
-    uint pad2;
+    float texelNdc;     // L1.2: a caster's NDC radius below this is dropped from the slots in texelSlots
+    uint texelSlots;    // L1.2: which slots that test may act on (the orthographic ones)
 };
 
 // clip = pos * VP (row-vector convention): clip.x is the dot product of the position with column 0, and column 3 is w.
-static bool visible_in_slot(const device float* slotMatrices, uint slot, float3 center, float radius)
+// The two L1.2 scalars are passed in rather than read from cullParams: this is a static function outside the kernel, and the
+// parameter block is only in scope inside CSMain.
+static bool visible_in_slot(const device float* slotMatrices, uint slot, float3 center, float radius,
+                            float texelNdc, uint texelSlots)
 {
     uint m = slot * 16u;
     float4 r0 = float4(slotMatrices[m + 0u], slotMatrices[m + 1u], slotMatrices[m + 2u], slotMatrices[m + 3u]);
@@ -59,6 +62,15 @@ static bool visible_in_slot(const device float* slotMatrices, uint slot, float3 
     if (dot(c3 - c1, p) < -radius) return false;
     if (dot(c3 + c2, p) < -radius) return false;
     if (dot(c3 - c2, p) < -radius) return false;
+
+    // L1.2: sub-texel casters. The lengths of the first two columns are this slot's world-to-NDC scale per axis, so radius
+    // times the larger of them is the caster's NDC radius. Taking the larger is the conservative side: a caster is only
+    // truly texel-sized when it shrinks below one on both axes. texelNdc is 0 when the test is off, and a radius is never
+    // negative, so "off" is this comparison staying false rather than a separate branch to keep in sync across backends.
+    float sx = length(float3(r0.x, r1.x, r2.x));
+    float sy = length(float3(r0.y, r1.y, r2.y));
+    if ((texelSlots & (1u << slot)) != 0u && radius * max(sx, sy) < texelNdc)
+        return false;
     return true;
 }
 
@@ -89,7 +101,7 @@ kernel void CSMain(uint3 id [[thread_position_in_grid]],
     {
         if ((cullParams.slotMask & (1u << slot)) == 0u)
             continue;
-        if (!visible_in_slot(slotMatrices, slot, center, radius))
+        if (!visible_in_slot(slotMatrices, slot, center, radius, cullParams.texelNdc, cullParams.texelSlots))
             continue;
         // A7b: the counter lives in the arg buffer's accumulator region, not in the arg table's InstanceCount -- see
         // InstanceCull.SlotCountsOffset for why the two cannot be the same word. The offset is in bytes, this array in uints.

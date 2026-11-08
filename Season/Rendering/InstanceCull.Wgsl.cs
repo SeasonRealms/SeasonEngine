@@ -27,8 +27,10 @@ struct CullParams
     capacity: u32,
     slotMask: u32,
     slotCountsOffset: u32,
-    pad1: u32,
-    pad2: u32,
+    // L1.2: a caster's NDC radius below this is dropped from the slots in texelSlots; which slots that test may act on
+    // (the orthographic ones) is the mask. Both words were padding before, so the block is still 64 bytes.
+    texelNdc: f32,
+    texelSlots: u32,
 };
 
 @group(0) @binding(0) var<uniform> cullParams: CullParams;
@@ -58,6 +60,14 @@ fn visibleInSlot(slot: u32, center: vec3<f32>, radius: f32) -> bool
     if (dot(c3 - c1, p) < -radius) { return false; }
     if (dot(c3 + c2, p) < -radius) { return false; }
     if (dot(c3 - c2, p) < -radius) { return false; }
+
+    // L1.2: sub-texel casters. The lengths of the first two columns are this slot's world-to-NDC scale per axis, so radius
+    // times the larger of them is the caster's NDC radius. Taking the larger is the conservative side: a caster is only
+    // truly texel-sized when it shrinks below one on both axes. texelNdc is 0 when the test is off, and a radius is never
+    // negative, so "off" is this comparison staying false rather than a separate branch to keep in sync across backends.
+    let sx = length(vec3<f32>(r0.x, r1.x, r2.x));
+    let sy = length(vec3<f32>(r0.y, r1.y, r2.y));
+    if ((cullParams.texelSlots & (1u << slot)) != 0u && radius * max(sx, sy) < cullParams.texelNdc) { return false; }
     return true;
 }
 

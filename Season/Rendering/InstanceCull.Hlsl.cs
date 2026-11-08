@@ -53,8 +53,8 @@ struct CullParams
     uint capacity;
     uint slotMask;
     uint slotCountsOffset;
-    uint pad1;
-    uint pad2;
+    float texelNdc;     // L1.2: a caster's NDC radius below this is dropped from the slots in texelSlots
+    uint texelSlots;    // L1.2: which slots that test may act on (the orthographic ones)
 };
 
 cbuffer CullParamsCB : register(b0)
@@ -68,6 +68,8 @@ RWByteAddressBuffer visibleIds : register(u1);
 
 // clip = pos * VP (row-vector convention), so clip.x is the dot product of the position with "column 0", and column 3 is w.
 // The six planes thus fall out directly from row-column combinations, without needing to transpose first.
+// Single exit with a preinitialized result: fxc calls a multi-exit callee "potentially uninitialized" (X4000) once it grows
+// past a handful of returns, and these warnings are fatal -- the same reason SampleShadowTile in Pipeline.cs is shaped this way.
 bool VisibleInSlot(uint slot, float3 center, float radius)
 {
     uint m = slot * 64;
@@ -82,13 +84,22 @@ bool VisibleInSlot(uint slot, float3 center, float radius)
     float4 c3 = float4(r0.w, r1.w, r2.w, r3.w);
     float4 p = float4(center, 1.0);
 
-    if (dot(c3 + c0, p) < -radius) return false;
-    if (dot(c3 - c0, p) < -radius) return false;
-    if (dot(c3 + c1, p) < -radius) return false;
-    if (dot(c3 - c1, p) < -radius) return false;
-    if (dot(c3 + c2, p) < -radius) return false;
-    if (dot(c3 - c2, p) < -radius) return false;
-    return true;
+    bool visible = dot(c3 + c0, p) >= -radius;
+    visible = visible && dot(c3 - c0, p) >= -radius;
+    visible = visible && dot(c3 + c1, p) >= -radius;
+    visible = visible && dot(c3 - c1, p) >= -radius;
+    visible = visible && dot(c3 + c2, p) >= -radius;
+    visible = visible && dot(c3 - c2, p) >= -radius;
+
+    // L1.2: sub-texel casters. The lengths of the first two columns are this slot's world-to-NDC scale per axis, so radius
+    // times the larger of them is the caster's NDC radius. Taking the larger is the conservative side: a caster is only
+    // truly texel-sized when it shrinks below one on both axes. texelNdc is 0 when the test is off, and a radius is never
+    // negative, so "off" is this comparison staying false rather than a separate branch to keep in sync across backends.
+    bool orthographic = (cullParams.texelSlots & (1u << slot)) != 0u;
+    float scale = max(length(float3(r0.x, r1.x, r2.x)), length(float3(r0.y, r1.y, r2.y)));
+    visible = visible && (!orthographic || radius * scale >= cullParams.texelNdc);
+
+    return visible;
 }
 
 [numthreads(64, 1, 1)]

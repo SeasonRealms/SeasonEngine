@@ -184,6 +184,49 @@ public static class InstanceCull
     public const int MaxPrimitives = 16;
 
     /// <summary>
+    /// L1.2: sub-texel shadow caster cull, in texels of the shadow map. A caster whose projected diameter stays under this
+    /// many texels can only ever touch that many texels of the map, and PCF spreads even those across a filter wider than
+    /// the caster, so dropping it trades a measurable vertex count for a shadow edge at most that many texels softer.
+    /// 0 disables the test: the kernel multiplies a radius by a scale and compares against 0, which nothing falls under.
+    ///
+    /// Only the orthographic slots take part (see <see cref="TexelSlots"/>). Their world-to-NDC scale is a constant, so
+    /// "diameter in texels" is a single multiply. The spot slot and the main view are perspective, where the same product
+    /// is the diameter at the near plane: a small caster just in front of a lamp would be dropped while it covers many
+    /// texels on screen. That exclusion is done with a mask rather than with a distance term, because a distance term is
+    /// per-instance work spent on a case only two slots have -- and because it is the same predicate the shadow system
+    /// already uses to decide what a texel is (see CascadedShadow's texel snap).
+    ///
+    /// Set SEASON_SHADOW_TEXEL_CULL=&lt;texels&gt; before launch, or assign at runtime from a panel. 1.0 is what the name
+    /// states; past roughly 2.0 thin silhouettes (grass, railings, branches) begin to lose their contact shadow.
+    /// </summary>
+    public static float ShadowTexelCull { get; set; } = ReadShadowTexelCull();
+
+    static float ReadShadowTexelCull()
+    {
+        var raw = Environment.GetEnvironmentVariable("SEASON_SHADOW_TEXEL_CULL")?.Trim();
+
+        return float.TryParse(raw, System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out var texels) && texels > 0f ? texels : 0f;
+    }
+
+    /// <summary>
+    /// Slots the sub-texel test may drop an instance from: the sun cascades and the far map, i.e. exactly the orthographic
+    /// ones. Named on the CPU rather than derived in the kernel, because the kernel cannot tell an orthographic slot from a
+    /// perspective one without inspecting the matrix it is about to test, and a wrong guess there drops visible instances.
+    /// </summary>
+    public static readonly uint TexelSlots = BuildTexelSlots();
+
+    static uint BuildTexelSlots()
+    {
+        uint slots = 0u;
+
+        for (int slot = 0; slot < CascadedShadow.MaxCascades; slot++)
+            slots |= 1u << slot;
+
+        return slots | (1u << CascadedShadow.FarSlot);
+    }
+
+    /// <summary>
     /// Slots whose reordered records get the original instance index written into M14 by gather: all of them.
     /// The main view needs it for motion vectors (t9/t10) and per-instance palettes; the shadow slots need it as soon as a skinned group draws
     /// from them, because its bone palette is laid out by that same index (the compacted slot, see the interface note) and a compacted SV_InstanceID would read another instance's pose.
@@ -769,8 +812,20 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         // pad0 carries the accumulator's byte offset: the block is a 16-byte-aligned mix of floats and uints, so the offset
         // has to travel as the raw bit pattern like the five counts above.
         _cullParams[13] = BitConverter.UInt32BitsToSingle(InstanceCull.SlotCountsOffset);
-        _cullParams[14] = 0f;
-        _cullParams[15] = 0f;
+        // L1.2: the unit conversion happens once on the CPU. A quadrant tile is ShadowAtlasSize/2 pixels across and spans two
+        // units of NDC, so one texel is 2/(ShadowAtlasSize/2) = 4/ShadowAtlasSize of NDC and a caster of diameter
+        // 2*radius*scale covers radius*scale*ShadowAtlasSize/2 texels. "Under T texels" is therefore radius*scale < 2T/atlas.
+        // The same expression is exact for the far map as well: it is a fixed 1024 across, exactly half the default 2048 atlas,
+        // so the tile's half-width and the far map's size cancel. A larger atlas only makes the far test more conservative
+        // (fewer casters dropped, never a wrong one). The atlas size is guarded because a zero there would divide into an
+        // infinite threshold, which drops every caster in the slots the mask allows -- the test fails off, not closed.
+        int atlasSize = RenderQuality.Current.ShadowAtlasSize;
+        _cullParams[14] = InstanceCull.ShadowTexelCull > 0f && atlasSize > 0
+            ? 2f * InstanceCull.ShadowTexelCull / atlasSize
+            : 0f;
+        // The mask, not the threshold, is what keeps the spot slot and the main view out of the test: their projections are
+        // perspective, so a "diameter in texels" computed from the matrix alone would describe the near plane instead.
+        _cullParams[15] = BitConverter.UInt32BitsToSingle(InstanceCull.TexelSlots);
 
         _cullRefs[0] = _slotBuffer!;
         _cullRefs[1] = source;

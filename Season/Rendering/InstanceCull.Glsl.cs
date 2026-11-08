@@ -31,8 +31,8 @@ layout(push_constant) uniform CullParams
     uint capacity;
     uint slotMask;
     uint slotCountsOffset;
-    uint pad1;
-    uint pad2;
+    float texelNdc;     // L1.2: a caster's NDC radius below this is dropped from the slots in texelSlots
+    uint texelSlots;    // L1.2: which slots that test may act on (the orthographic ones)
 } cullParams;
 
 layout(std430, binding = 1) readonly buffer SlotMatrices { float slotMatrices[]; };
@@ -62,6 +62,15 @@ bool visibleInSlot(uint slot, vec3 center, float radius)
     if (dot(c3 - c1, p) < -radius) return false;
     if (dot(c3 + c2, p) < -radius) return false;
     if (dot(c3 - c2, p) < -radius) return false;
+
+    // L1.2: sub-texel casters. The lengths of the first two columns are this slot's world-to-NDC scale per axis, so radius
+    // times the larger of them is the caster's NDC radius. Taking the larger is the conservative side: a caster is only
+    // truly texel-sized when it shrinks below one on both axes. texelNdc is 0 when the test is off, and a radius is never
+    // negative, so "off" is this comparison staying false rather than a separate branch to keep in sync across backends.
+    float sx = length(vec3(r0.x, r1.x, r2.x));
+    float sy = length(vec3(r0.y, r1.y, r2.y));
+    if ((cullParams.texelSlots & (1u << slot)) != 0u && radius * max(sx, sy) < cullParams.texelNdc)
+        return false;
     return true;
 }
 
