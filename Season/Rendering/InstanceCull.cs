@@ -327,6 +327,77 @@ public static class InstanceCull
     /// </summary>
     public static long MainViewDraws;
 
+    /// <summary>
+    /// Cadence of <see cref="ReportStats"/>, matched to the shadow system's report interval so that both lines describe the same window
+    /// and can be read side by side.
+    /// </summary>
+    const int StatsFrameInterval = 60;
+
+    /// <summary>How many targets <see cref="ReportStats"/> lists individually before folding the rest into a count.</summary>
+    const int StatsTargetLimit = 6;
+
+    static long _statsFrames;
+    static long _statsMainViewDraws;
+    static long _statsIndirectGathers;
+    static long _statsFixedGathers;
+
+    /// <summary>
+    /// Every <see cref="StatsFrameInterval"/> frames, reports which slots the chain covered and whether the indirect paths were actually
+    /// taken. It exists because a pixel comparison cannot distinguish "the fast path ran and matched" from "the fast path never ran":
+    /// with A7 enabled but every draw silently falling back, the image is identical by construction and the A/B proves nothing.
+    ///
+    /// What it deliberately does not report is the per-slot visible count. That number lives on the GPU, there is no readback anywhere in
+    /// the engine, and inventing a CPU proxy would be the same mistake this line exists to prevent. So these numbers answer "did the path
+    /// run" and "how large is the instance budget", not "how much did culling remove" -- for the latter, only a debug slice of the arg
+    /// table or a real readback path can answer.
+    ///
+    /// Reading <see cref="IInstanceCullTarget.CullInstanceCount"/> and friends is safe here: they are latched during Update, before this
+    /// phase, and every backend returns them from a field. The draw and gather counters, on the other hand, describe the previous frame,
+    /// because they are incremented while that frame draws.
+    /// </summary>
+    internal static void ReportStats()
+    {
+        _statsFrames++;
+        if (_statsFrames % StatsFrameInterval != 0 || Targets.Count == 0) return;
+
+        long mv = MainViewDraws, ig = IndirectGatherDispatches, fg = FixedGatherDispatches;
+        long mvDelta = mv - _statsMainViewDraws;
+        long igDelta = ig - _statsIndirectGathers;
+        long fgDelta = fg - _statsFixedGathers;
+        _statsMainViewDraws = mv;
+        _statsIndirectGathers = ig;
+        _statsFixedGathers = fg;
+
+        // Slot names come from the frame's own mask, so the line reports what was culled rather than what the numbering allows.
+        var slots = new List<string>(MaxSlots);
+        for (int slot = 0; slot < MaxSlots; slot++)
+        {
+            if ((ShadowSlotMask & (1 << slot)) == 0) continue;
+            slots.Add(slot == MainViewSlot ? "main"
+                : slot == CascadedShadow.FarSlot ? "far"
+                : slot == CascadedShadow.SpotSlot ? "spot"
+                : $"c{slot}");
+        }
+
+        int mainViewTargets = 0;
+        for (int i = 0; i < Targets.Count; i++)
+            if (Targets[i].CullMainView) mainViewTargets++;
+
+        // instances/capacity x streams, with a trailing '*' on the groups that asked for a main-view segment this frame.
+        var targets = new List<string>(Math.Min(Targets.Count, StatsTargetLimit));
+        for (int i = 0; i < Targets.Count && i < StatsTargetLimit; i++)
+        {
+            var t = Targets[i];
+            targets.Add($"{t.CullInstanceCount}/{t.CullCapacity}x{t.CullStreamCount}{(t.CullMainView ? "*" : string.Empty)}");
+        }
+
+        DeviceServices.BaseApp?.AddLog(LogType.Backend,
+            $"{DateTime.UtcNow} [InstanceCull] slots {(slots.Count > 0 ? string.Join(",", slots) : "none")}  " +
+            $"targets {Targets.Count} (mv {mainViewTargets})  gather {igDelta}i/{fgDelta}f  mvdraws {mvDelta}  " +
+            $"budget {string.Join(" ", targets)}" +
+            (Targets.Count > StatsTargetLimit ? $" +{Targets.Count - StatsTargetLimit}" : string.Empty));
+    }
+
     /// <summary>Byte offset of the (slot, primitive) entry in the indirect arg table.</summary>
     public static uint ArgsOffset(int slot, int primitive)
         => (uint)(slot * MaxPrimitives + primitive) * ArgsStride;
@@ -547,6 +618,10 @@ public sealed partial class InstanceCullEffect : ComputeEffect, IDisposable
         if (!ReferenceEquals(g, _graphics) || _cull == null || _finalize == null
             || _gather == null || _slotBuffer == null) return;
         if (InstanceCull.Targets.Count == 0) return;
+
+        // Reports the previous frame's draw and gather counters; see the method for why this is the only evidence that the indirect
+        // paths ran rather than silently falling back to the direct ones.
+        InstanceCull.ReportStats();
 
         // The slot mask is determined here rather than letting the kernel guess from an "invalid matrix": inactive slots simply do not participate,
         // their arg table keeps the InstanceCount=0 written by reset, and the draw side then naturally draws nothing.
