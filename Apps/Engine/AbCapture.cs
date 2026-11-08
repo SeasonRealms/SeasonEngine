@@ -450,7 +450,11 @@ internal static class AbCapture
                 + $"mainView={(InstanceCull.MainViewCulled ? 1 : 0)} "
                 // mainViewDraws is the draw-side half of that evidence: the slot can be culled while every draw still falls back.
                 + $"mainViewDraws={InstanceCull.MainViewDraws} "
+                // slots is the only machine-readable answer to "did the far map join the chain this frame": the far shadow map is a
+                // fog-side target with no debug view, so no pixel comparison can tell a culled far map from one that never joined.
+                // Local cube maps are absent from it by design (they keep the direct path); local= says whether the frame had one.
                 + $"a7=(enabled={InstanceCull.Enabled},targets={InstanceCull.Targets.Count},"
+                + $"slots={SlotNames(InstanceCull.ShadowSlotMask)},local={CascadedShadow.LocalActive},"
                 + $"sun={CascadedShadow.SunActive},spot={CascadedShadow.SpotActive},reuse={CascadedShadow.ReuseActive}) "
                 // P1: the same evidence for the skinning route. dispatches is what the FrameStart kernel actually served this frame, so a
                 // run that asked for SEASON_INSTANCE_SKINNING=gpu but served 0 is a fallback, not a comparison.
@@ -474,6 +478,27 @@ internal static class AbCapture
             WriteSidecar($"error={ex}");
             Environment.Exit(3);
         }
+    }
+
+    /// <summary>
+    /// Names the shadow slots the cull chain wrote this frame, in slot order, so a sidecar can be read without decoding a bitmask.
+    /// The far map is the reason this exists: the other slots are already legible through their own consumers, but a far map that
+    /// joined the chain and one that stayed out produce the same capture unless the fog happens to show a silhouette.
+    /// </summary>
+    static string SlotNames(int mask)
+    {
+        var names = new System.Text.StringBuilder();
+
+        for (int slot = 0; slot < InstanceCull.MaxSlots; slot++)
+        {
+            if ((mask & (1 << slot)) == 0) continue;
+            if (names.Length > 0) names.Append(',');
+            names.Append(slot == CascadedShadow.FarSlot ? "far"
+                : slot == CascadedShadow.SpotSlot ? "spot"
+                : $"c{slot}");
+        }
+
+        return names.Length > 0 ? names.ToString() : "none";
     }
 
     static void WriteSidecar(string text)
